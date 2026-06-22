@@ -11,8 +11,8 @@ use crate::{
     parsers::{
         CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser, Glm4MoeParser,
         InklingParser, JsonParser, KimiK2Parser, KimiK3Parser, LlamaParser, MinimaxM2Parser,
-        MistralParser, PassthroughParser, PythonicParser, QwenParser, QwenXmlParser,
-        SarashinaParser, Step3Parser,
+        MinimaxM3Parser, MistralParser, PassthroughParser, PythonicParser, QwenParser,
+        QwenXmlParser, SarashinaParser, Step3Parser,
     },
     traits::ToolParser,
 };
@@ -347,6 +347,7 @@ impl ParserFactory {
             InklingParser::build_structural_tag,
         );
         registry.register_parser("minimax_m2", || Box::new(MinimaxM2Parser::new()));
+        registry.register_parser("minimax_m3", || Box::new(MinimaxM3Parser::new()));
         registry.register_parser("cohere", || Box::new(CohereParser::new()));
 
         // Register default model mappings
@@ -456,8 +457,14 @@ impl ParserFactory {
         registry.map_model("Inkling*", "inkling");
 
         // MiniMax models
+        // General MiniMax IDs default to the M2 parser.
         registry.map_model("minimax*", "minimax_m2");
         registry.map_model("MiniMax*", "minimax_m2");
+        // M3 IDs route to the M3 parser via longer (more specific) patterns.
+        registry.map_model("minimax-m3*", "minimax_m3");
+        registry.map_model("MiniMax-M3*", "minimax_m3");
+        registry.map_model("MiniMaxAI/MiniMax-M3*", "minimax_m3");
+        registry.map_model("mm-m3*", "minimax_m3");
 
         // Cohere models
         registry.map_model("command-r*", "cohere");

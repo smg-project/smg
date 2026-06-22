@@ -46,6 +46,10 @@ pub enum ThinkingKeyName {
     EnableThinking,
     /// Template uses `thinking` (DeepSeek V3.1, Kimi-K2.5)
     Thinking,
+    /// Template uses the tri-state `thinking_mode` string (MiniMax M3):
+    /// "enabled" prefills the think-start token, "disabled" prefills the
+    /// think-end token, "adaptive"/absent adds no prefix.
+    ThinkingMode,
 }
 
 impl ThinkingKeyName {
@@ -54,6 +58,7 @@ impl ThinkingKeyName {
         match self {
             ThinkingKeyName::EnableThinking => "enable_thinking",
             ThinkingKeyName::Thinking => "thinking",
+            ThinkingKeyName::ThinkingMode => "thinking_mode",
         }
     }
 }
@@ -78,6 +83,19 @@ pub enum ThinkingToggle {
 /// Detect whether the chat template supports a thinking/reasoning toggle
 /// and what its default value is.
 pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<ThinkingKeyName>) {
+    // Tri-state string toggle, detected only when the template actually
+    // branches on the variable: only `thinking_mode == "enabled"` prefills
+    // the think-start token, so the toggle defaults OFF.
+    if template.contains("thinking_mode ==")
+        || template.contains("thinking_mode is defined")
+        || template.contains("if thinking_mode")
+    {
+        return (
+            ThinkingToggle::DefaultOff,
+            Some(ThinkingKeyName::ThinkingMode),
+        );
+    }
+
     let has_enable_thinking = template.contains("enable_thinking");
     // Trailing space prevents matching "thinking_mode", "thinking_budget", etc.
     let has_thinking_var = template.contains("if thinking ")
@@ -1098,7 +1116,16 @@ impl ChatTemplateState {
                 .is_none_or(|k| !k.contains_key(kwarg_key))
             {
                 let mut kwargs = params.template_kwargs.cloned().unwrap_or_default();
-                kwargs.insert(kwarg_key.to_string(), serde_json::Value::Bool(thinking));
+                let value = match key {
+                    ThinkingKeyName::EnableThinking | ThinkingKeyName::Thinking => {
+                        serde_json::Value::Bool(thinking)
+                    }
+                    // The tri-state key compares strings, not booleans.
+                    ThinkingKeyName::ThinkingMode => serde_json::Value::String(
+                        if thinking { "enabled" } else { "disabled" }.to_string(),
+                    ),
+                };
+                kwargs.insert(kwarg_key.to_string(), value);
                 let params = ChatTemplateParams {
                     template_kwargs: Some(&kwargs),
                     thinking: None,
@@ -1290,6 +1317,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out, "True");
+    }
+
+    #[test]
+    fn thinking_mode_detects_tristate_and_injects_strings() {
+        // MiniMax M3-style tri-state toggle.
+        let template = r#"{%- if thinking_mode is defined and thinking_mode == "enabled" -%}<mm:think>{%- endif -%}"#;
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (
+                ThinkingToggle::DefaultOff,
+                Some(ThinkingKeyName::ThinkingMode)
+            )
+        );
+
+        // Mentioning the variable without branching on it must not trigger
+        // tri-state detection.
+        assert_eq!(
+            detect_thinking_toggle("{{ enable_thinking }}{# thinking_mode note #}"),
+            (
+                ThinkingToggle::DefaultOn,
+                Some(ThinkingKeyName::EnableThinking)
+            )
+        );
+
+        // The resolved boolean preference injects the template's string values.
+        let state = ChatTemplateState::new(Some(
+            "{% if thinking_mode is defined %}{{ thinking_mode }}{% endif %}".to_string(),
+        ))
+        .unwrap();
+        assert_eq!(
+            state.thinking_key_name(),
+            Some(ThinkingKeyName::ThinkingMode)
+        );
+        for (thinking, rendered) in [(true, "enabled"), (false, "disabled")] {
+            let out = state
+                .apply(
+                    &[],
+                    ChatTemplateParams {
+                        thinking: Some(thinking),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(out, rendered);
+        }
     }
 
     /// Regression: a conditional expression used as a keyword-argument value.

@@ -136,11 +136,21 @@ pub(crate) fn extract_thinking_from_kwargs(
 ) -> Option<bool> {
     let kwargs = kwargs?;
     match tokenizer.thinking_key_name() {
-        Some(ThinkingKeyName::EnableThinking) => kwargs.get("enable_thinking"),
-        Some(ThinkingKeyName::Thinking) => kwargs.get("thinking"),
+        Some(ThinkingKeyName::EnableThinking) => {
+            kwargs.get("enable_thinking").and_then(Value::as_bool)
+        }
+        Some(ThinkingKeyName::Thinking) => kwargs.get("thinking").and_then(Value::as_bool),
+        // Tri-state string toggle: "adaptive" (or any other value) means the
+        // template adds no prefix, so it maps to no preference.
+        Some(ThinkingKeyName::ThinkingMode) => {
+            match kwargs.get("thinking_mode").and_then(Value::as_str) {
+                Some("enabled") => Some(true),
+                Some("disabled") => Some(false),
+                _ => None,
+            }
+        }
         None => None,
     }
-    .and_then(|v| v.as_bool())
 }
 
 /// Report `Some(true)` when the renderer will enter thinking mode because of
@@ -332,43 +342,47 @@ mod tests {
         assert_eq!(resolve_thinking_pref(None, None, None), None);
     }
 
+    use llm_tokenizer::traits::{Encoder, Encoding};
+    struct T(llm_tokenizer::MockTokenizer);
+    impl Encoder for T {
+        fn encode(&self, i: &str, s: bool) -> anyhow::Result<Encoding> {
+            self.0.encode(i, s)
+        }
+        fn encode_batch(&self, i: &[&str], s: bool) -> anyhow::Result<Vec<Encoding>> {
+            self.0.encode_batch(i, s)
+        }
+    }
+    impl llm_tokenizer::traits::Decoder for T {
+        fn decode(&self, ids: &[u32], s: bool) -> anyhow::Result<String> {
+            self.0.decode(ids, s)
+        }
+    }
+    impl Tokenizer for T {
+        fn vocab_size(&self) -> usize {
+            self.0.vocab_size()
+        }
+        fn get_special_tokens(&self) -> &llm_tokenizer::traits::SpecialTokens {
+            self.0.get_special_tokens()
+        }
+        fn token_to_id(&self, t: &str) -> Option<u32> {
+            self.0.token_to_id(t)
+        }
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            self.0.id_to_token(id)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
+            &["low", "high", "max"]
+        }
+        fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
+            Some(ThinkingKeyName::ThinkingMode)
+        }
+    }
+
     #[test]
     fn template_effort_thinking_covers_kwargs_and_top_level_field() {
-        use llm_tokenizer::traits::{Encoder, Encoding};
-        struct T(llm_tokenizer::MockTokenizer);
-        impl Encoder for T {
-            fn encode(&self, i: &str, s: bool) -> anyhow::Result<Encoding> {
-                self.0.encode(i, s)
-            }
-            fn encode_batch(&self, i: &[&str], s: bool) -> anyhow::Result<Vec<Encoding>> {
-                self.0.encode_batch(i, s)
-            }
-        }
-        impl llm_tokenizer::traits::Decoder for T {
-            fn decode(&self, ids: &[u32], s: bool) -> anyhow::Result<String> {
-                self.0.decode(ids, s)
-            }
-        }
-        impl Tokenizer for T {
-            fn vocab_size(&self) -> usize {
-                self.0.vocab_size()
-            }
-            fn get_special_tokens(&self) -> &llm_tokenizer::traits::SpecialTokens {
-                self.0.get_special_tokens()
-            }
-            fn token_to_id(&self, t: &str) -> Option<u32> {
-                self.0.token_to_id(t)
-            }
-            fn id_to_token(&self, id: u32) -> Option<String> {
-                self.0.id_to_token(id)
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-            fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
-                &["low", "high", "max"]
-            }
-        }
         let tok = T(llm_tokenizer::MockTokenizer::new());
 
         // Top-level field arms thinking when the renderer would interpret it.
@@ -399,6 +413,31 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn thinking_mode_kwargs_map_to_tristate_pref() {
+        let tok = T(llm_tokenizer::MockTokenizer::new());
+        let kw = |v: Value| std::collections::HashMap::from([("thinking_mode".to_string(), v)]);
+
+        assert_eq!(
+            extract_thinking_from_kwargs(Some(&kw(Value::String("enabled".to_string()))), &tok),
+            Some(true)
+        );
+        assert_eq!(
+            extract_thinking_from_kwargs(Some(&kw(Value::String("disabled".to_string()))), &tok),
+            Some(false)
+        );
+        assert_eq!(
+            extract_thinking_from_kwargs(Some(&kw(Value::String("adaptive".to_string()))), &tok),
+            None
+        );
+        // Non-string values are not a preference for the tri-state key.
+        assert_eq!(
+            extract_thinking_from_kwargs(Some(&kw(Value::Bool(true))), &tok),
+            None
+        );
+        assert_eq!(extract_thinking_from_kwargs(None, &tok), None);
     }
 
     #[test]
