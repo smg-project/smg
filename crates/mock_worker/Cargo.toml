@@ -5,6 +5,10 @@ edition = "2021"
 publish = false
 description = "Multi-port mock HTTP/gRPC inference worker for SMG gateway scale testing"
 
+[lib]
+name = "mock_worker"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mock-worker"
 path = "src/main.rs"

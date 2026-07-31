@@ -6,15 +6,9 @@
 //! TokenSpeed scheduler service (the gateway tokenizes and speaks token ids).
 //! All responses are canned — there is no real model.
 
-mod config;
-mod engine;
-mod grpc;
-mod http;
-mod zmq;
-
 use std::{process::ExitCode, sync::Arc};
 
-use crate::config::Config;
+use mock_worker::{config::Config, grpc, http, zmq};
 
 #[tokio::main]
 async fn main() -> ExitCode {

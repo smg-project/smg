@@ -145,6 +145,7 @@ smg = { path = ".", features = ["test-util"] }
 # Enable the mock engine for the ZMQ client's loopback tests.
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
 criterion = { version = "0.8", features = ["html_reports"] }
+mock-worker = { path = "../crates/mock_worker" }
 tower = { version = "0.5", features = ["util"] }
 # Used by PD metrics integration tests to capture metric emission via a
 # thread-local Prometheus recorder (same versions as the runtime deps above).

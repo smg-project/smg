@@ -185,6 +185,15 @@ impl AppContextBuilder {
         self
     }
 
+    /// Set an already-built tenant rate limiter directly, bypassing
+    /// `maybe_rate_limit_manager`'s config-loading. For callers (test
+    /// harnesses) that build `AppContext` piecemeal rather than through
+    /// `from_config` and so can't reach that private, config-driven setter.
+    pub fn rate_limit_manager(mut self, rate_limit_manager: Option<Arc<RateLimitManager>>) -> Self {
+        self.rate_limit_manager = rate_limit_manager;
+        self
+    }
+
     /// Build the tenant rate limiter from config. `Ok(None)` (feature
     /// disabled) is a valid, non-fatal outcome. `Err` (enabled but the
     /// policy YAML failed to load/parse/validate) fails startup — an

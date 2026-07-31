@@ -309,16 +309,37 @@ impl AppTestContext {
 }
 
 /// Helper function to create AppContext for tests
+pub fn create_test_context(
+    config: RouterConfig,
+) -> Pin<Box<dyn Future<Output = Arc<AppContext>> + Send>> {
+    create_test_context_with_tokenizer_registry(config, Arc::new(TokenizerRegistry::new()))
+}
+
+/// Same as [`create_test_context`], but with a caller-supplied tokenizer
+/// registry instead of an always-empty one, and real (not `None`) parser
+/// factories -- `GrpcRouter::new` requires both to be `Some`. For tests that
+/// build a real gRPC router (e.g. against a gRPC mock worker, which has no
+/// tokenizer artifacts of its own to autoload from).
 #[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
-pub fn create_test_context(
+pub fn create_test_context_with_tokenizer_registry(
     config: RouterConfig,
+    tokenizer_registry: Arc<TokenizerRegistry>,
 ) -> Pin<Box<dyn Future<Output = Arc<AppContext>> + Send>> {
     Box::pin(async move {
         let client = reqwest::Client::new();
+        let reasoning_parser_factory = Some(ReasoningParserFactory::new());
+        let tool_parser_factory = Some(ToolParserFactory::new());
+
+        // Build the tenant rate limiter from `config` the same way
+        // `AppContext::from_config` does (that path's own
+        // `maybe_rate_limit_manager` is private, so it's replicated here via
+        // the public direct setter added for this purpose).
+        let tenant_rate_limit_manager = smg::rate_limit::RateLimitManager::from_config(&config)
+            .expect("tenant rate limit config should be valid");
 
         // Initialize rate limiter
         let rate_limiter = match config.max_concurrent_requests {
@@ -363,9 +384,10 @@ pub fn create_test_context(
                 .router_config(config.clone())
                 .client(client)
                 .rate_limiter(rate_limiter)
-                .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
-                .reasoning_parser_factory(None) // reasoning_parser_factory
-                .tool_parser_factory(None) // tool_parser_factory
+                .rate_limit_manager(tenant_rate_limit_manager)
+                .tokenizer_registry(tokenizer_registry) // tokenizer
+                .reasoning_parser_factory(reasoning_parser_factory)
+                .tool_parser_factory(tool_parser_factory)
                 .worker_registry(worker_registry)
                 .policy_registry(policy_registry)
                 .response_storage(response_storage)
