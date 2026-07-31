@@ -550,10 +550,16 @@ impl GrpcRouter {
         // Clone values needed for retry closure. Canonicalize once, up
         // front, so every attempt (and the reservation `RateLimitReserveStage`
         // makes on the first one) targets the same model -- see
-        // `resolve_canonical_model_id`'s doc comment.
-        let request = Arc::new(body.clone());
-        let headers_cloned = headers.cloned();
+        // `resolve_canonical_model_id`'s doc comment. The body's own `model`
+        // field is rewritten to match: by this point `model_id_cloned` is
+        // already canonical, so `RequestContext::new`'s own alias resolve
+        // would no-op and otherwise leave the alias sitting in the body for
+        // response metadata and parser selection to read.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
+        let mut canonical_body = body.clone();
+        canonical_body.model = model_id_cloned.clone();
+        let request = Arc::new(canonical_body);
+        let headers_cloned = headers.cloned();
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
         let rate_limit_cell = Arc::new(RateLimitCell::new());
@@ -619,10 +625,13 @@ impl GrpcRouter {
         debug!("Processing generate request for model: {}", model_id);
 
         // Clone values needed for retry closure. Canonicalize once, up
-        // front -- see `resolve_canonical_model_id`'s doc comment.
-        let request = Arc::new(body.clone());
-        let headers_cloned = headers.cloned();
+        // front -- see `resolve_canonical_model_id`'s doc comment. Rewrite
+        // the body's `model` field to match; see `route_chat_impl`.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
+        let mut canonical_body = body.clone();
+        canonical_body.model = model_id_cloned.clone();
+        let request = Arc::new(canonical_body);
+        let headers_cloned = headers.cloned();
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
         let pipeline = &self.pipeline;
@@ -784,10 +793,13 @@ impl GrpcRouter {
         debug!("Processing messages request for model: {}", model_id);
 
         // Clone values needed for retry closure. Canonicalize once, up
-        // front -- see `resolve_canonical_model_id`'s doc comment.
-        let request = Arc::new(body.clone());
-        let headers_cloned = headers.cloned();
+        // front -- see `resolve_canonical_model_id`'s doc comment. Rewrite
+        // the body's `model` field to match; see `route_chat_impl`.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
+        let mut canonical_body = body.clone();
+        canonical_body.model = model_id_cloned.clone();
+        let request = Arc::new(canonical_body);
+        let headers_cloned = headers.cloned();
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
         let pipeline = &self.messages_pipeline;
@@ -849,10 +861,13 @@ impl GrpcRouter {
         debug!("Processing completion request for model: {}", model_id);
 
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
-        // doc comment.
-        let request = Arc::new(body.clone());
-        let headers_cloned = headers.cloned();
+        // doc comment. Rewrite the body's `model` field to match; see
+        // `route_chat_impl`.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
+        let mut canonical_body = body.clone();
+        canonical_body.model = model_id_cloned.clone();
+        let request = Arc::new(canonical_body);
+        let headers_cloned = headers.cloned();
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
         let pipeline = &self.completion_pipeline;

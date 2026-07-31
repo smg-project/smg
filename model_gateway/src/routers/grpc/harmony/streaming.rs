@@ -483,12 +483,21 @@ impl HarmonyStreamingProcessor {
         let total_cached: u32 = cached_tokens.values().sum();
 
         if let Some(handle) = reservation {
-            handle
-                .settle_success(UsageSettlement {
-                    actual_input_tokens: total_prompt,
-                    completion_tokens: total_completion,
-                })
-                .await;
+            // `prompt_tokens` is only ever populated from a `Complete` message
+            // (prefill or decode); a clean EOF that never produced one has no
+            // authoritative usage to settle with -- treating that as "0 input
+            // tokens" would incorrectly refund the reservation's estimate.
+            // Keep the reserved amount as final instead.
+            if prompt_tokens.is_empty() {
+                handle.close_reserved_only().await;
+            } else {
+                handle
+                    .settle_success(UsageSettlement {
+                        actual_input_tokens: total_prompt,
+                        completion_tokens: total_completion,
+                    })
+                    .await;
+            }
         }
 
         // Emit final usage if requested

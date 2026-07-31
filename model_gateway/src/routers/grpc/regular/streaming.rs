@@ -67,6 +67,10 @@ struct CompletionStreamOutcome {
     reasoning_tokens: u32,
     completion_tokens: u32,
     first_token_time: Option<Instant>,
+    /// Whether a `Complete` message (the only source of authoritative usage)
+    /// was ever seen for this unit -- a clean EOF without one leaves
+    /// `prompt_tokens` at 0, indistinguishable from a genuinely empty prompt.
+    saw_complete: bool,
 }
 
 /// Shared streaming processor for both single and prefill/decode dispatch modes
@@ -707,12 +711,21 @@ impl StreamingProcessor {
         let total_prompt: u32 = prompt_tokens.values().sum();
         let total_completion: u32 = completion_tokens.total();
         if let Some(handle) = reservation {
-            handle
-                .settle_success(UsageSettlement {
-                    actual_input_tokens: total_prompt,
-                    completion_tokens: total_completion,
-                })
-                .await;
+            // `prompt_tokens` is only ever populated from a `Complete` message
+            // (line ~573 above); a clean EOF that never produced one has no
+            // authoritative usage to settle with -- treating that as "0 input
+            // tokens" would incorrectly refund the reservation's estimate.
+            // Keep the reserved amount as final instead.
+            if prompt_tokens.is_empty() {
+                handle.close_reserved_only().await;
+            } else {
+                handle
+                    .settle_success(UsageSettlement {
+                        actual_input_tokens: total_prompt,
+                        completion_tokens: total_completion,
+                    })
+                    .await;
+            }
         }
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
@@ -902,6 +915,11 @@ impl StreamingProcessor {
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
         // Same prompt for every index; the last Complete's value is as good as any.
         let mut prompt_tokens: u32 = 0;
+        // Authoritative usage only ever arrives via a `Complete` message; a
+        // clean EOF without one leaves `prompt_tokens` at its 0 initializer,
+        // which is indistinguishable from a genuinely empty prompt -- track
+        // separately so settle can tell "no usage" from "zero tokens".
+        let mut saw_complete = false;
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
 
@@ -964,6 +982,7 @@ impl StreamingProcessor {
                     let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
                     prompt_tokens = complete.prompt_tokens();
+                    saw_complete = true;
 
                     // Send final chunk with finish_reason
                     let finish_response = serde_json::json!({
@@ -1000,12 +1019,16 @@ impl StreamingProcessor {
         // Record streaming metrics
         let total_completion: u32 = completion_tokens_map.values().sum();
         if let Some(handle) = reservation {
-            handle
-                .settle_success(UsageSettlement {
-                    actual_input_tokens: prompt_tokens,
-                    completion_tokens: total_completion,
-                })
-                .await;
+            if saw_complete {
+                handle
+                    .settle_success(UsageSettlement {
+                        actual_input_tokens: prompt_tokens,
+                        completion_tokens: total_completion,
+                    })
+                    .await;
+            } else {
+                handle.close_reserved_only().await;
+            }
         }
         Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
 
@@ -1088,6 +1111,11 @@ impl StreamingProcessor {
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
         // Same prompt for every index; the last Complete's value is as good as any.
         let mut prompt_tokens: u32 = 0;
+        // Authoritative usage only ever arrives via a `Complete` message; a
+        // clean EOF without one leaves `prompt_tokens` at its 0 initializer,
+        // which is indistinguishable from a genuinely empty prompt -- track
+        // separately so settle can tell "no usage" from "zero tokens".
+        let mut saw_complete = false;
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
 
@@ -1190,6 +1218,7 @@ impl StreamingProcessor {
                     let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
                     prompt_tokens = complete.prompt_tokens();
+                    saw_complete = true;
 
                     // Parse finish_reason
                     let finish_reason = utils::parse_finish_reason(
@@ -1234,12 +1263,16 @@ impl StreamingProcessor {
         // Record streaming metrics
         let total_completion: u32 = completion_tokens_map.values().sum();
         if let Some(handle) = reservation {
-            handle
-                .settle_success(UsageSettlement {
-                    actual_input_tokens: prompt_tokens,
-                    completion_tokens: total_completion,
-                })
-                .await;
+            if saw_complete {
+                handle
+                    .settle_success(UsageSettlement {
+                        actual_input_tokens: prompt_tokens,
+                        completion_tokens: total_completion,
+                    })
+                    .await;
+            } else {
+                handle.close_reserved_only().await;
+            }
         }
         Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
 
@@ -1825,6 +1858,11 @@ impl StreamingProcessor {
         // Token tracking
         let mut completion_tokens = CompletionTokenTracker::new();
         let mut prompt_tokens: u32 = 0;
+        // Authoritative usage only ever arrives via a `Complete` message; a
+        // clean EOF without one leaves `prompt_tokens` at its 0 initializer,
+        // which is indistinguishable from a genuinely empty prompt -- track
+        // separately so settle can tell "no usage" from "zero tokens".
+        let mut saw_complete = false;
         let mut finish_reason_str = String::new();
         let mut matched_stop: Option<Value> = None;
         // Set once the local stop decoder fires: pins "stop" and ignores later
@@ -2257,6 +2295,7 @@ impl StreamingProcessor {
                     }
 
                     prompt_tokens = complete.prompt_tokens();
+                    saw_complete = true;
                     completion_tokens.record_complete(&complete);
                     // A local stop-decoder match already pinned "stop"; don't let
                     // the engine's finish reason overwrite it.
@@ -2411,12 +2450,16 @@ impl StreamingProcessor {
         grpc_stream.mark_completed();
 
         if let Some(handle) = reservation {
-            handle
-                .settle_success(UsageSettlement {
-                    actual_input_tokens: prompt_tokens,
-                    completion_tokens: completion_tokens.total(),
-                })
-                .await;
+            if saw_complete {
+                handle
+                    .settle_success(UsageSettlement {
+                        actual_input_tokens: prompt_tokens,
+                        completion_tokens: completion_tokens.total(),
+                    })
+                    .await;
+            } else {
+                handle.close_reserved_only().await;
+            }
         }
 
         // Record metrics
@@ -2595,11 +2638,13 @@ impl StreamingProcessor {
                     let mut total_reasoning = 0u32;
                     let mut total_completion = 0u32;
                     let mut first_token_time: Option<Instant> = None;
+                    let mut all_saw_complete = true;
                     for outcome in outcomes {
                         total_prompt += outcome.prompt_tokens;
                         total_cached += outcome.cached_tokens;
                         total_reasoning += outcome.reasoning_tokens;
                         total_completion += outcome.completion_tokens;
+                        all_saw_complete &= outcome.saw_complete;
                         first_token_time = match (first_token_time, outcome.first_token_time) {
                             (Some(current), Some(candidate)) => Some(current.min(candidate)),
                             (current, candidate) => current.or(candidate),
@@ -2608,13 +2653,21 @@ impl StreamingProcessor {
 
                     // All units succeeded (fail-fast `try_join_all` above), so
                     // this is the one settle point for every mode (Single/PD/Batch).
+                    // But a unit that never saw a `Complete` message has no
+                    // authoritative usage to contribute -- settling the
+                    // aggregate anyway would understate total_prompt/total_completion
+                    // and incorrectly refund part of the reservation.
                     if let Some(handle) = &reservation {
-                        handle
-                            .settle_success(UsageSettlement {
-                                actual_input_tokens: total_prompt,
-                                completion_tokens: total_completion,
-                            })
-                            .await;
+                        if all_saw_complete {
+                            handle
+                                .settle_success(UsageSettlement {
+                                    actual_input_tokens: total_prompt,
+                                    completion_tokens: total_completion,
+                                })
+                                .await;
+                        } else {
+                            handle.close_reserved_only().await;
+                        }
                     }
 
                     if include_usage {
@@ -2732,6 +2785,7 @@ impl StreamingProcessor {
         let mut total_cached = 0u32;
         let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
         let mut total_completion = CompletionTokenTracker::new();
+        let mut saw_complete = false;
 
         while let Some(response) = grpc_stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
@@ -2849,6 +2903,7 @@ impl StreamingProcessor {
                 }
                 ProtoResponseVariant::Complete(complete) => {
                     let index = index_offset + complete.index();
+                    saw_complete = true;
                     total_prompt = total_prompt.max(complete.prompt_tokens());
                     total_cached = total_cached.max(complete.cached_tokens());
                     reasoning_tokens.insert(index, complete.reasoning_tokens());
@@ -2983,6 +3038,7 @@ impl StreamingProcessor {
             reasoning_tokens: reasoning_tokens.values().sum(),
             completion_tokens: total_completion.total(),
             first_token_time,
+            saw_complete,
         })
     }
 
