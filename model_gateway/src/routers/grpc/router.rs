@@ -461,6 +461,21 @@ impl GrpcRouter {
             .unwrap_or_else(|| self.retry_config.clone())
     }
 
+    /// Resolve `model_id` to its canonical form once, before a retry loop
+    /// starts. Every dispatch attempt for that logical request must reuse
+    /// this same value -- re-resolving the alias fresh per attempt (as
+    /// `RequestContext::new` otherwise would) lets an alias repointed
+    /// mid-retry dispatch a different model than whatever the tenant
+    /// rate-limit reservation was actually made for, bypassing that model's
+    /// own policy and settling its usage against the wrong budget.
+    fn resolve_canonical_model_id(&self, model_id: &str) -> String {
+        self.worker_registry
+            .resolve_model_alias(model_id)
+            .as_deref()
+            .unwrap_or(model_id)
+            .to_string()
+    }
+
     /// Retry metrics for one backoff, labeled per mode: Regular emits a single
     /// `regular` worker label; PD/EPD emit `prefill` and `decode` (never
     /// `encode`).
@@ -532,15 +547,18 @@ impl GrpcRouter {
             _ => &self.pipeline,
         };
 
-        // Clone values needed for retry closure
+        // Clone values needed for retry closure. Canonicalize once, up
+        // front, so every attempt (and the reservation `RateLimitReserveStage`
+        // makes on the first one) targets the same model -- see
+        // `resolve_canonical_model_id`'s doc comment.
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
-        let model_id_cloned = model_id.to_string();
+        let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
         let rate_limit_cell = Arc::new(RateLimitCell::new());
 
-        let retry_config = self.resolve_retry_config(model_id);
+        let retry_config = self.resolve_retry_config(&model_id_cloned);
 
         let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
@@ -600,16 +618,17 @@ impl GrpcRouter {
     ) -> Response {
         debug!("Processing generate request for model: {}", model_id);
 
-        // Clone values needed for retry closure
+        // Clone values needed for retry closure. Canonicalize once, up
+        // front -- see `resolve_canonical_model_id`'s doc comment.
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
-        let model_id_cloned = model_id.to_string();
+        let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
         let pipeline = &self.pipeline;
         let rate_limit_cell = Arc::new(RateLimitCell::new());
 
-        let retry_config = self.resolve_retry_config(model_id);
+        let retry_config = self.resolve_retry_config(&model_id_cloned);
 
         let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
@@ -764,16 +783,17 @@ impl GrpcRouter {
     ) -> Response {
         debug!("Processing messages request for model: {}", model_id);
 
-        // Clone values needed for retry closure
+        // Clone values needed for retry closure. Canonicalize once, up
+        // front -- see `resolve_canonical_model_id`'s doc comment.
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
-        let model_id_cloned = model_id.to_string();
+        let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
         let pipeline = &self.messages_pipeline;
         let rate_limit_cell = Arc::new(RateLimitCell::new());
 
-        let retry_config = self.resolve_retry_config(model_id);
+        let retry_config = self.resolve_retry_config(&model_id_cloned);
 
         let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
@@ -828,15 +848,17 @@ impl GrpcRouter {
     ) -> Response {
         debug!("Processing completion request for model: {}", model_id);
 
+        // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
+        // doc comment.
         let request = Arc::new(body.clone());
         let headers_cloned = headers.cloned();
-        let model_id_cloned = model_id.to_string();
+        let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
         let pipeline = &self.completion_pipeline;
         let rate_limit_cell = Arc::new(RateLimitCell::new());
 
-        let retry_config = self.resolve_retry_config(model_id);
+        let retry_config = self.resolve_retry_config(&model_id_cloned);
 
         let response = RetryExecutor::execute_response_with_retry(
             &retry_config,

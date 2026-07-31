@@ -190,22 +190,56 @@ fn fresh_tenant() -> TenantRequestMeta {
     TenantRequestMeta::new(TenantKey::new("integration-test-tenant"))
 }
 
-/// A budget too small for even one reservation must deny immediately, with
-/// `Retry-After`, before ever reaching the worker.
+/// A denial with a finite wait (the request *could* eventually fit, just
+/// not right now) must carry `Retry-After`. A fresh bucket always starts
+/// full, so a finite-wait denial requires a prior request to have already
+/// consumed some of the budget -- unlike the "can never fit, no matter how
+/// long you wait" case (see `impossible_request_denies_without_retry_after`
+/// below), which can be hit on the very first request.
 #[tokio::test]
 async fn denial_returns_429_with_retry_after() {
     let grpc_port = start_mock_grpc_worker(4).await;
-    // 1 token/minute can't admit a 2-token reserve.
+    let (router, _dir) = build_router(Some(6), grpc_port).await;
+    let request = generate_request();
+
+    let first = router
+        .route_generate(None, &fresh_tenant(), &request, MODEL)
+        .await;
+    assert_eq!(first.status(), http::StatusCode::OK);
+
+    // Same budget arithmetic as the settle test below: after settling the
+    // first request's real usage, only 1 token remains -- not enough for a
+    // second 2-token reserve, but well within the 6-token capacity, so this
+    // is a genuine "wait and retry" denial, not an impossible one.
+    let second = router
+        .route_generate(None, &fresh_tenant(), &request, MODEL)
+        .await;
+    assert_eq!(second.status(), http::StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        second.headers().get(http::header::RETRY_AFTER).is_some(),
+        "a finite-wait denial must carry Retry-After"
+    );
+}
+
+/// A request whose estimated cost exceeds the tenant's *total* budget can
+/// never be admitted, no matter how long the client waits -- the backend's
+/// `u64::MAX` "never" sentinel must not leak into the HTTP response as a
+/// literal ~584-billion-year `Retry-After` value.
+#[tokio::test]
+async fn impossible_request_denies_without_retry_after() {
+    let grpc_port = start_mock_grpc_worker(4).await;
+    // 1 token/minute can never admit this request's 2-token reserve, ever.
     let (router, _dir) = build_router(Some(1), grpc_port).await;
 
     let request = generate_request();
-    let tenant = fresh_tenant();
-    let response = router.route_generate(None, &tenant, &request, MODEL).await;
+    let response = router
+        .route_generate(None, &fresh_tenant(), &request, MODEL)
+        .await;
 
     assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
     assert!(
-        response.headers().get(http::header::RETRY_AFTER).is_some(),
-        "denial response must carry Retry-After"
+        response.headers().get(http::header::RETRY_AFTER).is_none(),
+        "an impossible request's 'never' sentinel must not leak into Retry-After"
     );
 }
 

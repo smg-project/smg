@@ -12,7 +12,7 @@ use crate::{
     routers::{
         error,
         grpc::{
-            common::stages::{PipelineStage, RateLimitCell, RateLimitOutcome},
+            common::stages::{PipelineStage, RateLimitCell},
             context::{FinalResponse, RequestContext, RequestType},
         },
     },
@@ -90,11 +90,7 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                         .input
                         .rate_limit_cell
                         .as_deref()
-                        .and_then(RateLimitCell::peek)
-                        .and_then(|outcome| match outcome {
-                            RateLimitOutcome::Admitted(handle) => Some(handle),
-                            RateLimitOutcome::Denied => None,
-                        });
+                        .and_then(RateLimitCell::take_for_streaming_handoff);
 
                     let response = self
                         .streaming_processor
