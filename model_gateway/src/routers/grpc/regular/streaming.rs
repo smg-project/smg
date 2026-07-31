@@ -90,6 +90,10 @@ struct GenerateStreamContext {
     return_logprob: bool,
     backend_type: &'static str,
     model: String,
+    /// Number of choices (`sampling_params.n`) this request expects to
+    /// complete -- a clean EOF with fewer `Complete` messages than this has
+    /// only partial usage, not authoritative usage for the whole request.
+    expected_choices: u32,
 }
 
 impl StreamingProcessor {
@@ -681,7 +685,10 @@ impl StreamingProcessor {
         // Phase 5: Usage chunk
         if let Some(stream_opts) = stream_options {
             if stream_opts.include_usage.unwrap_or(false) {
-                let total_prompt: u32 = prompt_tokens.values().sum();
+                // Every `n>1` choice shares one prompt; each Complete reports
+                // that same full length, so max (not sum) is the actual
+                // prompt cost -- summing would multiply it by `n`.
+                let total_prompt: u32 = prompt_tokens.values().copied().max().unwrap_or(0);
                 let total_completion: u32 = completion_tokens.total();
                 let total_cached: u32 = cached_tokens.values().sum();
                 let total_reasoning: u32 = reasoning_tokens.values().sum();
@@ -708,15 +715,16 @@ impl StreamingProcessor {
         grpc_stream.mark_completed();
 
         // Record streaming metrics
-        let total_prompt: u32 = prompt_tokens.values().sum();
+        let total_prompt: u32 = prompt_tokens.values().copied().max().unwrap_or(0);
         let total_completion: u32 = completion_tokens.total();
         if let Some(handle) = reservation {
             // `prompt_tokens` is only ever populated from a `Complete` message
-            // (line ~573 above); a clean EOF that never produced one has no
-            // authoritative usage to settle with -- treating that as "0 input
-            // tokens" would incorrectly refund the reservation's estimate.
+            // (line ~573 above), one entry per index. A clean EOF that didn't
+            // produce one for every expected `n>1` choice has only partial
+            // usage -- settling with that would understate the real cost.
             // Keep the reserved amount as final instead.
-            if prompt_tokens.is_empty() {
+            let expected_choices = original_request.n.unwrap_or(1).max(1);
+            if (prompt_tokens.len() as u32) < expected_choices {
                 handle.close_reserved_only().await;
             } else {
                 handle
@@ -823,6 +831,12 @@ impl StreamingProcessor {
             return_logprob: generate_request.return_logprob.unwrap_or(false),
             backend_type: self.backend_type,
             model: dispatch.model.clone(),
+            expected_choices: generate_request
+                .sampling_params
+                .as_ref()
+                .and_then(|p| p.n)
+                .unwrap_or(1)
+                .max(1),
         };
 
         // Spawn background task based on execution mode
@@ -915,11 +929,10 @@ impl StreamingProcessor {
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
         // Same prompt for every index; the last Complete's value is as good as any.
         let mut prompt_tokens: u32 = 0;
-        // Authoritative usage only ever arrives via a `Complete` message; a
-        // clean EOF without one leaves `prompt_tokens` at its 0 initializer,
-        // which is indistinguishable from a genuinely empty prompt -- track
-        // separately so settle can tell "no usage" from "zero tokens".
-        let mut saw_complete = false;
+        // Indices that received a `Complete` message -- the only source of
+        // authoritative usage. Chunks alone (tracked in `completion_tokens_map`)
+        // don't count: an index can start generating and never finish.
+        let mut completed_indices: HashSet<u32> = HashSet::new();
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
 
@@ -982,7 +995,7 @@ impl StreamingProcessor {
                     let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
                     prompt_tokens = complete.prompt_tokens();
-                    saw_complete = true;
+                    completed_indices.insert(index);
 
                     // Send final chunk with finish_reason
                     let finish_response = serde_json::json!({
@@ -1019,7 +1032,7 @@ impl StreamingProcessor {
         // Record streaming metrics
         let total_completion: u32 = completion_tokens_map.values().sum();
         if let Some(handle) = reservation {
-            if saw_complete {
+            if completed_indices.len() as u32 >= ctx.expected_choices {
                 handle
                     .settle_success(UsageSettlement {
                         actual_input_tokens: prompt_tokens,
@@ -1111,11 +1124,10 @@ impl StreamingProcessor {
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
         // Same prompt for every index; the last Complete's value is as good as any.
         let mut prompt_tokens: u32 = 0;
-        // Authoritative usage only ever arrives via a `Complete` message; a
-        // clean EOF without one leaves `prompt_tokens` at its 0 initializer,
-        // which is indistinguishable from a genuinely empty prompt -- track
-        // separately so settle can tell "no usage" from "zero tokens".
-        let mut saw_complete = false;
+        // Indices that received a `Complete` message -- the only source of
+        // authoritative usage. Chunks alone (tracked in `completion_tokens_map`)
+        // don't count: an index can start generating and never finish.
+        let mut completed_indices: HashSet<u32> = HashSet::new();
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
 
@@ -1218,7 +1230,7 @@ impl StreamingProcessor {
                     let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
                     prompt_tokens = complete.prompt_tokens();
-                    saw_complete = true;
+                    completed_indices.insert(index);
 
                     // Parse finish_reason
                     let finish_reason = utils::parse_finish_reason(
@@ -1263,7 +1275,7 @@ impl StreamingProcessor {
         // Record streaming metrics
         let total_completion: u32 = completion_tokens_map.values().sum();
         if let Some(handle) = reservation {
-            if saw_complete {
+            if completed_indices.len() as u32 >= ctx.expected_choices {
                 handle
                     .settle_success(UsageSettlement {
                         actual_input_tokens: prompt_tokens,
@@ -2785,7 +2797,6 @@ impl StreamingProcessor {
         let mut total_cached = 0u32;
         let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
         let mut total_completion = CompletionTokenTracker::new();
-        let mut saw_complete = false;
 
         while let Some(response) = grpc_stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
@@ -2903,7 +2914,6 @@ impl StreamingProcessor {
                 }
                 ProtoResponseVariant::Complete(complete) => {
                     let index = index_offset + complete.index();
-                    saw_complete = true;
                     total_prompt = total_prompt.max(complete.prompt_tokens());
                     total_cached = total_cached.max(complete.cached_tokens());
                     reasoning_tokens.insert(index, complete.reasoning_tokens());
@@ -3031,6 +3041,14 @@ impl StreamingProcessor {
         }
 
         grpc_stream.mark_completed();
+
+        // `reasoning_tokens` is populated once per index, only from a
+        // `Complete` message -- its length is exactly the number of this
+        // unit's `n>1` choices that actually finished cleanly. A clean EOF
+        // partway through (some choices completed, others didn't) must not
+        // be treated as full usage.
+        let expected_choices = completion_request.n.unwrap_or(1).max(1);
+        let saw_complete = reasoning_tokens.len() as u32 >= expected_choices;
 
         Ok(CompletionStreamOutcome {
             prompt_tokens: total_prompt,

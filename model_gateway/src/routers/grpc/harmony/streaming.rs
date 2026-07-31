@@ -1,7 +1,7 @@
 //! Harmony streaming response processor
 
 use std::{
-    collections::{hash_map::Entry::Vacant, HashMap},
+    collections::{hash_map::Entry::Vacant, HashMap, HashSet},
     io,
     sync::Arc,
     time::Instant,
@@ -286,6 +286,12 @@ impl HarmonyStreamingProcessor {
         let mut final_scanners: HashMap<u32, TextStopScanner> = HashMap::new();
         let mut router_stopped: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut completion_tokens = CompletionTokenTracker::new();
+        // Indices that received a *decode* `Complete` -- unlike `prompt_tokens`
+        // (which may already be populated from the prefill phase before this
+        // loop even starts, in PD mode), this is only ever set from this
+        // stream's own Complete messages, so it can't be fooled by prefill
+        // data into thinking decode produced authoritative usage it didn't.
+        let mut decode_completed_indices: HashSet<u32> = HashSet::new();
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut encoder = SseEncoder::new();
 
@@ -410,6 +416,7 @@ impl HarmonyStreamingProcessor {
                 }
                 ProtoResponseVariant::Complete(complete_wrapper) => {
                     let index = complete_wrapper.index();
+                    decode_completed_indices.insert(index);
 
                     // Store final metadata
                     matched_stops.insert(index, complete_wrapper.matched_stop_json());
@@ -477,18 +484,23 @@ impl HarmonyStreamingProcessor {
         // Mark stream as completed successfully to prevent abort on drop
         decode_stream.mark_completed();
 
-        // Compute totals once for both usage chunk and metrics
-        let total_prompt: u32 = prompt_tokens.values().sum();
+        // Compute totals once for both usage chunk and metrics. Every `n>1`
+        // choice shares one prompt; each Complete reports that same full
+        // length, so max (not sum) is the actual prompt cost.
+        let total_prompt: u32 = prompt_tokens.values().copied().max().unwrap_or(0);
         let total_completion: u32 = completion_tokens.total();
         let total_cached: u32 = cached_tokens.values().sum();
 
         if let Some(handle) = reservation {
-            // `prompt_tokens` is only ever populated from a `Complete` message
-            // (prefill or decode); a clean EOF that never produced one has no
-            // authoritative usage to settle with -- treating that as "0 input
-            // tokens" would incorrectly refund the reservation's estimate.
-            // Keep the reserved amount as final instead.
-            if prompt_tokens.is_empty() {
+            // A clean decode EOF with fewer decode `Complete` messages than
+            // this request's `n>1` choices has only partial usage -- settling
+            // with that would understate the real cost. Deliberately checked
+            // against `decode_completed_indices`, not `prompt_tokens`: in PD
+            // mode `prompt_tokens` can already be non-empty from the prefill
+            // phase alone, which would otherwise mask a decode phase that
+            // never actually finished.
+            let expected_choices = original_request.n.unwrap_or(1).max(1);
+            if (decode_completed_indices.len() as u32) < expected_choices {
                 handle.close_reserved_only().await;
             } else {
                 handle
