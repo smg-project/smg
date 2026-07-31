@@ -7,10 +7,11 @@ use axum::response::Response;
 use tracing::error;
 
 use crate::{
+    rate_limit::ReservationAttachment,
     routers::{
         error,
         grpc::{
-            common::stages::PipelineStage,
+            common::stages::{PipelineStage, RateLimitCell, RateLimitOutcome},
             context::{FinalResponse, RequestContext},
             regular::{processor, streaming},
         },
@@ -93,18 +94,40 @@ impl GenerateResponseProcessingStage {
         })?;
 
         if is_streaming {
+            // Reserved (if tenant rate limiting is enabled): settled with real
+            // usage inside the streaming processor on success, or abandoned
+            // via ReservationAttachment's Drop below on early disconnect/error.
+            let reservation = ctx
+                .input
+                .rate_limit_cell
+                .as_deref()
+                .and_then(RateLimitCell::peek)
+                .and_then(|outcome| match outcome {
+                    RateLimitOutcome::Admitted(handle) => Some(handle),
+                    RateLimitOutcome::Denied => None,
+                });
+
             // Streaming: Use StreamingProcessor and return SSE response
             let response = self.streaming_processor.clone().process_streaming_generate(
                 execution_result,
                 ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
                 dispatch,
                 tokenizer,
+                reservation.clone(),
             );
 
-            // Attach load guards to response body for proper RAII lifecycle
-            let response = match ctx.state.load_guards.take() {
-                Some(guards) => AttachedBody::wrap_response(response, guards),
-                None => response,
+            // Attach load guards (and the reservation's disconnect/error
+            // safety net) to the response body for proper RAII lifecycle.
+            let response = match (ctx.state.load_guards.take(), reservation) {
+                (Some(guards), Some(handle)) => AttachedBody::wrap_response(
+                    response,
+                    (guards, ReservationAttachment::new(handle)),
+                ),
+                (Some(guards), None) => AttachedBody::wrap_response(response, guards),
+                (None, Some(handle)) => {
+                    AttachedBody::wrap_response(response, ReservationAttachment::new(handle))
+                }
+                (None, None) => response,
             };
 
             return Ok(Some(response));

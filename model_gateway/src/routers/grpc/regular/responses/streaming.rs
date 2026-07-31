@@ -94,6 +94,10 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             params.model_id,
             ctx.components.clone(),
             Some(params.tenant_request_meta),
+            // Responses endpoint hasn't opted into tenant rate limiting yet
+            // (out of scope for this phase; see RequestPipeline::build's
+            // stage-insertion comment).
+            None,
         )
         .await;
 
@@ -582,6 +586,8 @@ async fn execute_tool_loop_streaming_internal(
                 params.model_id.clone(),
                 ctx.components.clone(),
                 Some(params.tenant_request_meta.clone()),
+                // Responses endpoint hasn't opted into tenant rate limiting yet.
+                None,
             )
             .await;
 

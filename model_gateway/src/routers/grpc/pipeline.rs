@@ -52,6 +52,7 @@ use crate::{
     middleware::TenantRequestMeta,
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     policies::PolicyRegistry,
+    rate_limit::{RateLimitManager, UsageSettlement},
     routers::error,
     worker::WorkerRegistry,
 };
@@ -82,6 +83,9 @@ pub(crate) struct PipelineDeps {
     reasoning_parser_factory: ReasoningParserFactory,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
+    /// `None` when tenant rate limiting is disabled; read only by the
+    /// endpoints that insert `RateLimitReserveStage` (chat/messages/completion/harmony).
+    rate_limit_manager: Option<Arc<RateLimitManager>>,
 }
 
 impl PipelineDeps {
@@ -94,6 +98,7 @@ impl PipelineDeps {
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
+        rate_limit_manager: Option<Arc<RateLimitManager>>,
     ) -> Self {
         Self {
             worker_registry,
@@ -102,6 +107,7 @@ impl PipelineDeps {
             reasoning_parser_factory,
             configured_tool_parser,
             configured_reasoning_parser,
+            rate_limit_manager,
         }
     }
 
@@ -110,6 +116,7 @@ impl PipelineDeps {
     pub(crate) fn pair(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
+        rate_limit_manager: Option<Arc<RateLimitManager>>,
     ) -> Self {
         Self {
             worker_registry,
@@ -118,6 +125,7 @@ impl PipelineDeps {
             reasoning_parser_factory: ReasoningParserFactory::default(),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            rate_limit_manager,
         }
     }
 
@@ -180,6 +188,7 @@ impl PipelineDeps {
             reasoning_parser_factory: ReasoningParserFactory::default(),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            rate_limit_manager: None,
         }
     }
 }
@@ -218,6 +227,27 @@ impl RequestPipeline {
             metrics_labels::ERROR_INTERNAL,
         );
         error::internal_error("wrong_response_type", "Internal error: wrong response type")
+    }
+
+    /// Settle a non-streaming success's reservation with real usage, if this
+    /// logical request reserved one. No-op if the cell is unset (feature
+    /// disabled or endpoint opted out) or was never admitted (e.g. prep
+    /// failed before the reserve stage ran). Idempotent -- `settle_success`
+    /// is a no-op if the handle was already resolved.
+    async fn settle_reservation(
+        cell: Option<&RateLimitCell>,
+        actual_input_tokens: u32,
+        completion_tokens: u32,
+    ) {
+        let Some(RateLimitOutcome::Admitted(handle)) = cell.and_then(RateLimitCell::peek) else {
+            return;
+        };
+        handle
+            .settle_success(UsageSettlement {
+                actual_input_tokens,
+                completion_tokens,
+            })
+            .await;
     }
 
     fn no_response_produced(
@@ -259,6 +289,7 @@ impl RequestPipeline {
                 let (processor, streaming_processor) = deps.configured_processors(backend);
                 let mut stages: Vec<Box<dyn PipelineStage>> = vec![
                     Box::new(ChatGeneratePreparationStage::new()),
+                    Box::new(RateLimitReserveStage::new(deps.rate_limit_manager.clone())),
                     Box::new(WorkerSelectionStage::new(
                         deps.worker_registry.clone(),
                         deps.policy_registry.clone(),
@@ -287,6 +318,7 @@ impl RequestPipeline {
                 let (processor, streaming_processor) = deps.configured_processors(backend);
                 let mut stages: Vec<Box<dyn PipelineStage>> = vec![
                     Box::new(MessagePreparationStage),
+                    Box::new(RateLimitReserveStage::new(deps.rate_limit_manager.clone())),
                     Box::new(WorkerSelectionStage::new(
                         deps.worker_registry.clone(),
                         deps.policy_registry.clone(),
@@ -316,6 +348,7 @@ impl RequestPipeline {
                 let (processor, streaming_processor) = PipelineDeps::default_processors(backend);
                 let mut stages: Vec<Box<dyn PipelineStage>> = vec![
                     Box::new(CompletionPreparationStage),
+                    Box::new(RateLimitReserveStage::new(deps.rate_limit_manager.clone())),
                     Box::new(WorkerSelectionStage::new(
                         deps.worker_registry.clone(),
                         deps.policy_registry.clone(),
@@ -347,6 +380,7 @@ impl RequestPipeline {
                 }
                 vec![
                     Box::new(harmony::stages::HarmonyPreparationStage::new()),
+                    Box::new(RateLimitReserveStage::new(deps.rate_limit_manager.clone())),
                     Box::new(WorkerSelectionStage::new(
                         deps.worker_registry.clone(),
                         deps.policy_registry.clone(),
@@ -416,11 +450,13 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
     ) -> Response {
         let start = Instant::now();
         let streaming = request.stream;
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
+        ctx.input.rate_limit_cell = rate_limit_cell;
         let model = ctx.input.model_id.clone();
 
         // Record request start
@@ -469,6 +505,13 @@ impl RequestPipeline {
 
         match ctx.state.response.final_response {
             Some(FinalResponse::Chat(response)) => {
+                let usage = response.usage.as_ref();
+                Self::settle_reservation(
+                    ctx.input.rate_limit_cell.as_deref(),
+                    usage.map_or(0, |u| u.prompt_tokens),
+                    usage.map_or(0, |u| u.completion_tokens),
+                )
+                .await;
                 Metrics::record_router_duration(
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
@@ -506,11 +549,13 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
     ) -> Response {
         let start = Instant::now();
         let streaming = request.stream;
         let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
+        ctx.input.rate_limit_cell = rate_limit_cell;
         let model_id = ctx.input.model_id.clone();
 
         // Record request start
@@ -558,6 +603,15 @@ impl RequestPipeline {
 
         match ctx.state.response.final_response {
             Some(FinalResponse::Generate(response)) => {
+                let actual_input_tokens = response.first().map_or(0, |r| r.meta_info.prompt_tokens);
+                let completion_tokens =
+                    response.iter().map(|r| r.meta_info.completion_tokens).sum();
+                Self::settle_reservation(
+                    ctx.input.rate_limit_cell.as_deref(),
+                    actual_input_tokens,
+                    completion_tokens,
+                )
+                .await;
                 Metrics::record_router_duration(
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
@@ -597,11 +651,13 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
     ) -> Response {
         let start = Instant::now();
         let streaming = request.stream;
         let mut ctx = RequestContext::for_completion(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
+        ctx.input.rate_limit_cell = rate_limit_cell;
         let model = ctx.input.model_id.clone();
 
         Metrics::record_router_request(
@@ -648,6 +704,13 @@ impl RequestPipeline {
 
         match ctx.state.response.final_response {
             Some(FinalResponse::Completion(response)) => {
+                let usage = response.usage.as_ref();
+                Self::settle_reservation(
+                    ctx.input.rate_limit_cell.as_deref(),
+                    usage.map_or(0, |u| u.prompt_tokens),
+                    usage.map_or(0, |u| u.completion_tokens),
+                )
+                .await;
                 Metrics::record_router_duration(
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
@@ -891,11 +954,13 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
     ) -> Response {
         let start = Instant::now();
         let streaming = request.stream.unwrap_or(false);
         let mut ctx = RequestContext::for_messages(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
+        ctx.input.rate_limit_cell = rate_limit_cell;
         let model = ctx.input.model_id.clone();
 
         // Record request start
@@ -944,6 +1009,12 @@ impl RequestPipeline {
 
         match ctx.state.response.final_response {
             Some(FinalResponse::Messages(response)) => {
+                Self::settle_reservation(
+                    ctx.input.rate_limit_cell.as_deref(),
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                )
+                .await;
                 Metrics::record_router_duration(
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
@@ -1216,6 +1287,7 @@ mod build_parity_tests {
             (Endpoint::Chat, Mode::Regular) => (
                 v(&[
                     "ChatGeneratePreparationStage",
+                    "RateLimitReserveStage",
                     "WorkerSelectionStage(Regular)",
                     "ClientAcquisitionStage",
                     "ChatGenerateRequestBuildingStage(ChatRequestBuildingStage(inject_pd_metadata=false, Single), GenerateRequestBuildingStage(inject_pd_metadata=false, Single))",
@@ -1228,6 +1300,7 @@ mod build_parity_tests {
             (Endpoint::Chat, Mode::PrefillDecode) => (
                 v(&[
                     "ChatGeneratePreparationStage",
+                    "RateLimitReserveStage",
                     "WorkerSelectionStage(PrefillDecode)",
                     "ClientAcquisitionStage",
                     "ChatGenerateRequestBuildingStage(ChatRequestBuildingStage(inject_pd_metadata=true, PrefillDecode), GenerateRequestBuildingStage(inject_pd_metadata=true, PrefillDecode))",
@@ -1240,6 +1313,7 @@ mod build_parity_tests {
             (Endpoint::Chat, Mode::EncodePrefillDecode) => (
                 v(&[
                     "ChatGeneratePreparationStage",
+                    "RateLimitReserveStage",
                     "WorkerSelectionStage(EncodePrefillDecode)",
                     "ClientAcquisitionStage",
                     "EncodeStage",
@@ -1253,6 +1327,7 @@ mod build_parity_tests {
             (Endpoint::Messages, Mode::Regular) => (
                 v(&[
                     "MessagePreparationStage",
+                    "RateLimitReserveStage",
                     "WorkerSelectionStage(Regular)",
                     "ClientAcquisitionStage",
                     "MessageRequestBuildingStage(inject_pd_metadata=false, Single)",
@@ -1265,6 +1340,7 @@ mod build_parity_tests {
             (Endpoint::Messages, Mode::PrefillDecode) => (
                 v(&[
                     "MessagePreparationStage",
+                    "RateLimitReserveStage",
                     "WorkerSelectionStage(PrefillDecode)",
                     "ClientAcquisitionStage",
                     "MessageRequestBuildingStage(inject_pd_metadata=true, PrefillDecode)",
@@ -1277,6 +1353,7 @@ mod build_parity_tests {
             (Endpoint::Messages, Mode::EncodePrefillDecode) => (
                 v(&[
                     "MessagePreparationStage",
+                    "RateLimitReserveStage",
                     "WorkerSelectionStage(EncodePrefillDecode)",
                     "ClientAcquisitionStage",
                     "EncodeStage",
@@ -1290,6 +1367,7 @@ mod build_parity_tests {
             (Endpoint::Completion, Mode::Regular) => (
                 v(&[
                     "CompletionPreparationStage",
+                    "RateLimitReserveStage",
                     "WorkerSelectionStage(Regular)",
                     "ClientAcquisitionStage",
                     "CompletionRequestBuildingStage(inject_pd_metadata=false, Single)",
@@ -1302,6 +1380,7 @@ mod build_parity_tests {
             (Endpoint::Completion, Mode::PrefillDecode) => (
                 v(&[
                     "CompletionPreparationStage",
+                    "RateLimitReserveStage",
                     "WorkerSelectionStage(PrefillDecode)",
                     "ClientAcquisitionStage",
                     "CompletionRequestBuildingStage(inject_pd_metadata=true, PrefillDecode)",
@@ -1314,6 +1393,7 @@ mod build_parity_tests {
             (Endpoint::Completion, Mode::EncodePrefillDecode) => (
                 v(&[
                     "CompletionPreparationStage",
+                    "RateLimitReserveStage",
                     "WorkerSelectionStage(EncodePrefillDecode)",
                     "ClientAcquisitionStage",
                     "EncodeStage",
@@ -1327,6 +1407,7 @@ mod build_parity_tests {
             (Endpoint::Harmony, Mode::Regular) => (
                 v(&[
                     "HarmonyPreparationStage",
+                    "RateLimitReserveStage",
                     "WorkerSelectionStage(Regular)",
                     "ClientAcquisitionStage",
                     "HarmonyRequestBuildingStage(inject_pd_metadata=false, Single)",
@@ -1339,6 +1420,7 @@ mod build_parity_tests {
             (Endpoint::Harmony, Mode::PrefillDecode) => (
                 v(&[
                     "HarmonyPreparationStage",
+                    "RateLimitReserveStage",
                     "WorkerSelectionStage(PrefillDecode)",
                     "ClientAcquisitionStage",
                     "HarmonyRequestBuildingStage(inject_pd_metadata=true, PrefillDecode)",
@@ -1481,7 +1563,7 @@ mod alias_pipeline_tests {
             .unwrap();
 
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        let deps = PipelineDeps::pair(worker_registry.clone(), policy_registry);
+        let deps = PipelineDeps::pair(worker_registry.clone(), policy_registry, None);
         let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
         let components = Arc::new(SharedComponents {
             tokenizer_registry,
@@ -1526,5 +1608,148 @@ mod alias_pipeline_tests {
             }
             WorkerSelection::Single { .. } => panic!("expected PD worker selection"),
         }
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_reserve_tests {
+    use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
+    use openai_protocol::generate::GenerateRequest;
+    use serde_json::json;
+
+    use super::*;
+    use crate::{config::types::RouterConfig, rate_limit::RateLimitManager, tenant::TenantKey};
+
+    const MODEL: &str = "reserve-test-model";
+
+    async fn test_components() -> Arc<SharedComponents> {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+        let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
+        tokenizer_registry
+            .load(
+                "tokenizer-id",
+                MODEL,
+                "test",
+                || async move { Ok(tokenizer) },
+            )
+            .await
+            .unwrap();
+        Arc::new(SharedComponents {
+            tokenizer_registry,
+            worker_registry,
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            configured_tool_parser: None,
+            configured_reasoning_parser: None,
+            multimodal: None,
+        })
+    }
+
+    /// Real `RateLimitManager` backed by a tiny in-memory budget --
+    /// `RateLimitManager::new` is private to the `rate_limit` module, so
+    /// `from_config` (with a temp YAML) is the only way to build one from
+    /// here. The YAML is read synchronously inside `from_config`, before the
+    /// tempdir is dropped at the end of this function, so no leak is needed.
+    fn manager_with_tokens_per_minute(tpm: u32) -> Arc<RateLimitManager> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rate_limit.yaml");
+        std::fs::write(
+            &path,
+            format!("default_policy:\n  tokens_per_minute: {tpm}\n  requests_per_minute: 1000\n"),
+        )
+        .unwrap();
+        let rc = RouterConfig::builder()
+            .worker_startup_timeout_secs(1)
+            .tenant_rate_limit_enabled(true)
+            .tenant_rate_limit_config(Some(path.to_str().unwrap().to_string()))
+            .build_unchecked();
+        RateLimitManager::from_config(&rc).unwrap().unwrap()
+    }
+
+    fn ctx_with_tokens(components: Arc<SharedComponents>, num_tokens: usize) -> RequestContext {
+        let request: GenerateRequest = serde_json::from_value(json!({
+            "model": MODEL,
+            "text": "Hello"
+        }))
+        .unwrap();
+        let mut ctx =
+            RequestContext::for_generate(Arc::new(request), None, MODEL.to_string(), components);
+        ctx.state.preparation = Some(PreparationOutput::Generate {
+            original_text: None,
+            token_ids: vec![0; num_tokens],
+        });
+        ctx.input.tenant_request_meta = Some(TenantRequestMeta::new(TenantKey::new("test-tenant")));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn reserves_exactly_once_across_retry_attempts() {
+        // Admits one 5-token reservation but not two (5 + 5 > 6).
+        let manager = manager_with_tokens_per_minute(6);
+        let components = test_components().await;
+        let mut ctx = ctx_with_tokens(components, 5);
+        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
+
+        let stage = RateLimitReserveStage::new(Some(manager));
+
+        // Simulate two retry attempts sharing the same cell, as router.rs does.
+        assert!(
+            stage.execute(&mut ctx).await.unwrap().is_none(),
+            "first attempt should reserve and be admitted"
+        );
+        assert!(
+            stage.execute(&mut ctx).await.unwrap().is_none(),
+            "second attempt should see the cached Admitted outcome and skip reserving again"
+        );
+
+        assert!(matches!(
+            ctx.input.rate_limit_cell.as_ref().unwrap().peek(),
+            Some(RateLimitOutcome::Admitted(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn denial_is_cached_for_should_retry_to_read() {
+        // Too small for even one 5-token reservation.
+        let manager = manager_with_tokens_per_minute(3);
+        let components = test_components().await;
+        let mut ctx = ctx_with_tokens(components, 5);
+        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
+
+        let stage = RateLimitReserveStage::new(Some(manager));
+
+        let result = stage.execute(&mut ctx).await;
+        let response = result.expect_err("should be denied");
+        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+
+        // This is the signal router.rs's `should_retry` reads to stop the
+        // retry loop instead of retrying a rate-limit denial.
+        assert!(matches!(
+            ctx.input.rate_limit_cell.as_ref().unwrap().peek(),
+            Some(RateLimitOutcome::Denied)
+        ));
+    }
+
+    #[tokio::test]
+    async fn disabled_manager_is_a_no_op() {
+        let components = test_components().await;
+        let mut ctx = ctx_with_tokens(components, 5);
+        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
+
+        let stage = RateLimitReserveStage::new(None);
+        assert!(stage.execute(&mut ctx).await.unwrap().is_none());
+        assert!(ctx.input.rate_limit_cell.as_ref().unwrap().peek().is_none());
+    }
+
+    #[tokio::test]
+    async fn endpoint_without_a_cell_is_a_no_op() {
+        // Responses/embeddings/classify don't set rate_limit_cell today.
+        let manager = manager_with_tokens_per_minute(6);
+        let components = test_components().await;
+        let mut ctx = ctx_with_tokens(components, 5);
+
+        let stage = RateLimitReserveStage::new(Some(manager));
+        assert!(stage.execute(&mut ctx).await.unwrap().is_none());
     }
 }

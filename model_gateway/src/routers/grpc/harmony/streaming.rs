@@ -33,6 +33,7 @@ use super::{
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    rate_limit::{SharedReservationHandle, UsageSettlement},
     routers::{
         common::{
             openai_bridge::{self, descriptor, FormatRegistry, ResponseFormat},
@@ -110,6 +111,7 @@ impl HarmonyStreamingProcessor {
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: context::DispatchMetadata,
         router_stop_strings: Vec<String>,
+        reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Response {
         // Create SSE channel
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
@@ -124,6 +126,7 @@ impl HarmonyStreamingProcessor {
                         chat_request,
                         &tx,
                         router_stop_strings,
+                        reservation,
                     )
                     .await;
 
@@ -149,6 +152,7 @@ impl HarmonyStreamingProcessor {
                         chat_request,
                         &tx,
                         router_stop_strings,
+                        reservation,
                     )
                     .await;
 
@@ -192,6 +196,7 @@ impl HarmonyStreamingProcessor {
         original_request: Arc<ChatCompletionRequest>,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         router_stop_strings: Vec<String>,
+        reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         let mut prompt_tokens = HashMap::new();
         let mut cached_tokens = HashMap::new();
@@ -203,6 +208,7 @@ impl HarmonyStreamingProcessor {
             &mut prompt_tokens,
             &mut cached_tokens,
             &router_stop_strings,
+            reservation,
         )
         .await
     }
@@ -215,6 +221,7 @@ impl HarmonyStreamingProcessor {
         original_request: Arc<ChatCompletionRequest>,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         router_stop_strings: Vec<String>,
+        reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         // Phase 1: Process prefill stream (collect metadata)
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
@@ -238,6 +245,7 @@ impl HarmonyStreamingProcessor {
             &mut prompt_tokens,
             &mut cached_tokens,
             &router_stop_strings,
+            reservation,
         )
         .await?;
 
@@ -261,6 +269,7 @@ impl HarmonyStreamingProcessor {
         prompt_tokens: &mut HashMap<u32, u32>,
         cached_tokens: &mut HashMap<u32, u32>,
         router_stop_strings: &[String],
+        reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         // Timing for metrics
         let start_time = Instant::now();
@@ -472,6 +481,15 @@ impl HarmonyStreamingProcessor {
         let total_prompt: u32 = prompt_tokens.values().sum();
         let total_completion: u32 = completion_tokens.total();
         let total_cached: u32 = cached_tokens.values().sum();
+
+        if let Some(handle) = reservation {
+            handle
+                .settle_success(UsageSettlement {
+                    actual_input_tokens: total_prompt,
+                    completion_tokens: total_completion,
+                })
+                .await;
+        }
 
         // Emit final usage if requested
         if let Some(true) = stream_options.as_ref().and_then(|so| so.include_usage) {

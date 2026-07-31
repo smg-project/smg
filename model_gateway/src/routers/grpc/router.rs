@@ -21,8 +21,11 @@ use serde_json::json;
 use tracing::debug;
 
 use super::{
-    common::responses::{
-        handlers::cancel_response_impl, utils::validate_worker_availability, ResponsesContext,
+    common::{
+        responses::{
+            handlers::cancel_response_impl, utils::validate_worker_availability, ResponsesContext,
+        },
+        stages::{RateLimitCell, RateLimitOutcome},
     },
     context::SharedComponents,
     harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
@@ -364,9 +367,16 @@ impl GrpcRouter {
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
+            ctx.rate_limit_manager.clone(),
         );
         // Deps for the parser-free endpoints (completion/embeddings/classify).
-        let pair_deps = PipelineDeps::pair(worker_registry.clone(), policy_registry.clone());
+        // Only completion's stage list actually reads `rate_limit_manager`;
+        // embeddings/classify never insert `RateLimitReserveStage`.
+        let pair_deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            policy_registry.clone(),
+            ctx.rate_limit_manager.clone(),
+        );
 
         // Present in every mode: chat/generate, messages, completion.
         let pipeline = RequestPipeline::build(Endpoint::Chat, mode, &configured_deps)
@@ -479,6 +489,22 @@ impl GrpcRouter {
         }
     }
 
+    /// Close a reservation that a non-2xx final response never got the
+    /// chance to settle (prep failure repeated across every attempt,
+    /// retries exhausted, a non-retryable dispatch failure). No-op if
+    /// nothing was ever reserved. Safe to call unconditionally alongside a
+    /// success path's own inline `settle_success`/streaming `settle_success`+
+    /// `ReservationAttachment` -- `close_reserved_only` is CAS-guarded, only
+    /// the first resolution of a handle wins.
+    async fn close_reservation_if_unsettled(cell: &RateLimitCell, status: StatusCode) {
+        if status.is_success() {
+            return;
+        }
+        if let Some(RateLimitOutcome::Admitted(handle)) = cell.peek() {
+            handle.close_reserved_only().await;
+        }
+    }
+
     /// Main route_chat implementation
     async fn route_chat_impl(
         &self,
@@ -512,10 +538,11 @@ impl GrpcRouter {
         let model_id_cloned = model_id.to_string();
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
 
         let retry_config = self.resolve_retry_config(model_id);
 
-        RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
             // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
@@ -524,14 +551,29 @@ impl GrpcRouter {
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
                 let tenant_meta = tenant_meta_cloned.clone();
+                let rate_limit_cell = Arc::clone(&rate_limit_cell);
                 async move {
                     pipeline
-                        .execute_chat(request, headers, model_id, components, Some(tenant_meta))
+                        .execute_chat(
+                            request,
+                            headers,
+                            model_id,
+                            components,
+                            Some(tenant_meta),
+                            Some(rate_limit_cell),
+                        )
                         .await
                 }
             },
-            // Should retry: check if status is retryable
-            |res, _attempt| is_retryable_status(res.status()),
+            // Should retry: a rate-limit denial must never be retried
+            // (retrying immediately against the same tenant budget defeats
+            // retry_after_secs); otherwise check if status is retryable.
+            |res, _attempt| {
+                if matches!(rate_limit_cell.peek(), Some(RateLimitOutcome::Denied)) {
+                    return false;
+                }
+                is_retryable_status(res.status())
+            },
             // On backoff: record retry metrics
             |delay, attempt| {
                 self.record_retry(metrics_labels::ENDPOINT_CHAT);
@@ -542,7 +584,10 @@ impl GrpcRouter {
                 self.record_retries_exhausted(metrics_labels::ENDPOINT_CHAT);
             },
         )
-        .await
+        .await;
+
+        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
+        response
     }
 
     /// Main route_generate implementation
@@ -562,10 +607,11 @@ impl GrpcRouter {
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
         let pipeline = &self.pipeline;
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
 
         let retry_config = self.resolve_retry_config(model_id);
 
-        RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
             // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
@@ -574,14 +620,27 @@ impl GrpcRouter {
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
                 let tenant_meta = tenant_meta_cloned.clone();
+                let rate_limit_cell = Arc::clone(&rate_limit_cell);
                 async move {
                     pipeline
-                        .execute_generate(request, headers, model_id, components, Some(tenant_meta))
+                        .execute_generate(
+                            request,
+                            headers,
+                            model_id,
+                            components,
+                            Some(tenant_meta),
+                            Some(rate_limit_cell),
+                        )
                         .await
                 }
             },
-            // Should retry: check if status is retryable
-            |res, _attempt| is_retryable_status(res.status()),
+            // Should retry: a rate-limit denial must never be retried; see route_chat_impl.
+            |res, _attempt| {
+                if matches!(rate_limit_cell.peek(), Some(RateLimitOutcome::Denied)) {
+                    return false;
+                }
+                is_retryable_status(res.status())
+            },
             // On backoff: record retry metrics
             |delay, attempt| {
                 self.record_retry(metrics_labels::ENDPOINT_GENERATE);
@@ -592,7 +651,10 @@ impl GrpcRouter {
                 self.record_retries_exhausted(metrics_labels::ENDPOINT_GENERATE);
             },
         )
-        .await
+        .await;
+
+        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
+        response
     }
 
     /// Main route_responses implementation
@@ -709,10 +771,11 @@ impl GrpcRouter {
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
         let pipeline = &self.messages_pipeline;
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
 
         let retry_config = self.resolve_retry_config(model_id);
 
-        RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
             |_attempt| {
                 let request = Arc::clone(&request);
@@ -720,13 +783,27 @@ impl GrpcRouter {
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
                 let tenant_meta = tenant_meta_cloned.clone();
+                let rate_limit_cell = Arc::clone(&rate_limit_cell);
                 async move {
                     pipeline
-                        .execute_messages(request, headers, model_id, components, Some(tenant_meta))
+                        .execute_messages(
+                            request,
+                            headers,
+                            model_id,
+                            components,
+                            Some(tenant_meta),
+                            Some(rate_limit_cell),
+                        )
                         .await
                 }
             },
-            |res, _attempt| is_retryable_status(res.status()),
+            // Should retry: a rate-limit denial must never be retried; see route_chat_impl.
+            |res, _attempt| {
+                if matches!(rate_limit_cell.peek(), Some(RateLimitOutcome::Denied)) {
+                    return false;
+                }
+                is_retryable_status(res.status())
+            },
             |delay, attempt| {
                 self.record_retry(metrics_labels::ENDPOINT_MESSAGES);
                 Metrics::record_worker_retry_backoff(attempt, delay);
@@ -735,7 +812,10 @@ impl GrpcRouter {
                 self.record_retries_exhausted(metrics_labels::ENDPOINT_MESSAGES);
             },
         )
-        .await
+        .await;
+
+        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
+        response
     }
 
     /// Main route_completion implementation
@@ -754,10 +834,11 @@ impl GrpcRouter {
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
         let pipeline = &self.completion_pipeline;
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
 
         let retry_config = self.resolve_retry_config(model_id);
 
-        RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
             |_attempt| {
                 let request = Arc::clone(&request);
@@ -765,6 +846,7 @@ impl GrpcRouter {
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
                 let tenant_meta = tenant_meta_cloned.clone();
+                let rate_limit_cell = Arc::clone(&rate_limit_cell);
                 async move {
                     pipeline
                         .execute_completion(
@@ -773,11 +855,18 @@ impl GrpcRouter {
                             model_id,
                             components,
                             Some(tenant_meta),
+                            Some(rate_limit_cell),
                         )
                         .await
                 }
             },
-            |res, _attempt| is_retryable_status(res.status()),
+            // Should retry: a rate-limit denial must never be retried; see route_chat_impl.
+            |res, _attempt| {
+                if matches!(rate_limit_cell.peek(), Some(RateLimitOutcome::Denied)) {
+                    return false;
+                }
+                is_retryable_status(res.status())
+            },
             |delay, attempt| {
                 self.record_retry(metrics_labels::ENDPOINT_COMPLETIONS);
                 Metrics::record_worker_retry_backoff(attempt, delay);
@@ -786,7 +875,10 @@ impl GrpcRouter {
                 self.record_retries_exhausted(metrics_labels::ENDPOINT_COMPLETIONS);
             },
         )
-        .await
+        .await;
+
+        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
+        response
     }
 
     /// Main route_classify implementation

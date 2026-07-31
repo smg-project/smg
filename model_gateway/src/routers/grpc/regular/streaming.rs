@@ -36,6 +36,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    rate_limit::{SharedReservationHandle, UsageSettlement},
     routers::{
         common::sse::SseEncoder,
         grpc::{
@@ -120,6 +121,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         skip_special_tokens: bool,
+        reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Response {
         use bytes::Bytes;
         use tokio::sync::mpsc;
@@ -154,6 +156,7 @@ impl StreamingProcessor {
                             stop_params,
                             chat_request,
                             &tx,
+                            reservation,
                         )
                         .await;
 
@@ -186,6 +189,7 @@ impl StreamingProcessor {
                             chat_request,
                             &tx,
                             pd_timing,
+                            reservation,
                         )
                         .await;
 
@@ -220,6 +224,7 @@ impl StreamingProcessor {
     }
 
     /// Process streaming chunks from a single stream (Regular mode)
+    #[expect(clippy::too_many_arguments)]
     pub async fn process_streaming_chunks(
         &self,
         grpc_stream: ProtoStream,
@@ -228,6 +233,7 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         self.process_streaming_chunks_inner(
             grpc_stream,
@@ -237,6 +243,7 @@ impl StreamingProcessor {
             original_request,
             tx,
             None,
+            reservation,
         )
         .await
     }
@@ -254,6 +261,7 @@ impl StreamingProcessor {
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
         pd_timing: Option<context::PdTiming>,
+        reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         // Metrics timing
         let start_time = Instant::now();
@@ -698,6 +706,14 @@ impl StreamingProcessor {
         // Record streaming metrics
         let total_prompt: u32 = prompt_tokens.values().sum();
         let total_completion: u32 = completion_tokens.total();
+        if let Some(handle) = reservation {
+            handle
+                .settle_success(UsageSettlement {
+                    actual_input_tokens: total_prompt,
+                    completion_tokens: total_completion,
+                })
+                .await;
+        }
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.backend_type,
@@ -724,6 +740,7 @@ impl StreamingProcessor {
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
         pd_timing: context::PdTiming,
+        reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         // Phase 1.5: Collect input_logprobs from prefill stream if requested
         if original_request.logprobs {
@@ -753,6 +770,7 @@ impl StreamingProcessor {
                 original_request,
                 tx,
                 Some(pd_timing),
+                reservation,
             )
             .await;
 
@@ -777,6 +795,7 @@ impl StreamingProcessor {
         generate_request: Arc<GenerateRequest>,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
+        reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Response {
         // Create SSE channel
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
@@ -803,7 +822,8 @@ impl StreamingProcessor {
                 )]
                 tokio::spawn(async move {
                     let result =
-                        Self::process_generate_streaming(tokenizer, stream, ctx, &tx).await;
+                        Self::process_generate_streaming(tokenizer, stream, ctx, &tx, reservation)
+                            .await;
 
                     if let Err(e) = result {
                         utils::send_error_sse(&tx, &e, "internal_error");
@@ -825,7 +845,13 @@ impl StreamingProcessor {
                 )]
                 tokio::spawn(async move {
                     let result = Self::process_generate_prefill_decode_streaming(
-                        tokenizer, prefill, *decode, ctx, &tx, pd_timing,
+                        tokenizer,
+                        prefill,
+                        *decode,
+                        ctx,
+                        &tx,
+                        pd_timing,
+                        reservation,
                     )
                     .await;
 
@@ -866,6 +892,7 @@ impl StreamingProcessor {
         mut stream: ProtoStream,
         ctx: GenerateStreamContext,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
@@ -873,6 +900,8 @@ impl StreamingProcessor {
         // Track state per index for n>1 case
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+        // Same prompt for every index; the last Complete's value is as good as any.
+        let mut prompt_tokens: u32 = 0;
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
 
@@ -934,6 +963,7 @@ impl StreamingProcessor {
                     let completion_tokens = *completion_tokens_map.get(&index).unwrap_or(&0);
                     let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
+                    prompt_tokens = complete.prompt_tokens();
 
                     // Send final chunk with finish_reason
                     let finish_response = serde_json::json!({
@@ -969,6 +999,14 @@ impl StreamingProcessor {
 
         // Record streaming metrics
         let total_completion: u32 = completion_tokens_map.values().sum();
+        if let Some(handle) = reservation {
+            handle
+                .settle_success(UsageSettlement {
+                    actual_input_tokens: prompt_tokens,
+                    completion_tokens: total_completion,
+                })
+                .await;
+        }
         Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
 
         Ok(())
@@ -982,6 +1020,7 @@ impl StreamingProcessor {
         ctx: GenerateStreamContext,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
         pd_timing: context::PdTiming,
+        reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         // Collect input_logprobs from prefill stream if requested
         let input_token_logprobs = if ctx.return_logprob {
@@ -1016,6 +1055,7 @@ impl StreamingProcessor {
             input_token_logprobs,
             tx,
             Some(pd_timing),
+            reservation,
         )
         .await;
 
@@ -1036,6 +1076,7 @@ impl StreamingProcessor {
         input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
         pd_timing: Option<context::PdTiming>,
+        reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
@@ -1045,6 +1086,8 @@ impl StreamingProcessor {
         let mut accumulated_output_logprobs: HashMap<u32, Option<Vec<Vec<Option<f64>>>>> =
             HashMap::new();
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+        // Same prompt for every index; the last Complete's value is as good as any.
+        let mut prompt_tokens: u32 = 0;
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
 
@@ -1146,6 +1189,7 @@ impl StreamingProcessor {
                         .and_then(|o| o.as_ref());
                     let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
+                    prompt_tokens = complete.prompt_tokens();
 
                     // Parse finish_reason
                     let finish_reason = utils::parse_finish_reason(
@@ -1189,6 +1233,14 @@ impl StreamingProcessor {
 
         // Record streaming metrics
         let total_completion: u32 = completion_tokens_map.values().sum();
+        if let Some(handle) = reservation {
+            handle
+                .settle_success(UsageSettlement {
+                    actual_input_tokens: prompt_tokens,
+                    completion_tokens: total_completion,
+                })
+                .await;
+        }
         Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
 
         Ok(())
@@ -1606,6 +1658,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         skip_special_tokens: bool,
+        reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Response {
         let stop_params = (
             messages_request
@@ -1638,6 +1691,7 @@ impl StreamingProcessor {
                             stop_params,
                             messages_request,
                             &tx,
+                            reservation,
                         )
                         .await;
 
@@ -1676,6 +1730,7 @@ impl StreamingProcessor {
                             stop_params,
                             messages_request,
                             &tx,
+                            reservation,
                         )
                         .await;
 
@@ -1721,6 +1776,7 @@ impl StreamingProcessor {
     ///
     /// Implements the Anthropic streaming protocol with content block
     /// state tracking. Always n=1 (no per-index HashMap).
+    #[expect(clippy::too_many_arguments)]
     pub async fn process_messages_streaming_chunks(
         &self,
         mut grpc_stream: ProtoStream,
@@ -1729,6 +1785,7 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<CreateMessageRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
@@ -2353,6 +2410,15 @@ impl StreamingProcessor {
         // Mark stream completed
         grpc_stream.mark_completed();
 
+        if let Some(handle) = reservation {
+            handle
+                .settle_success(UsageSettlement {
+                    actual_input_tokens: prompt_tokens,
+                    completion_tokens: completion_tokens.total(),
+                })
+                .await;
+        }
+
         // Record metrics
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
@@ -2382,6 +2448,7 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<CreateMessageRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         // Consume prefill stream (Messages API does not expose prompt logprobs)
         while let Some(response) = prefill_stream.next().await {
@@ -2401,6 +2468,7 @@ impl StreamingProcessor {
                 stop_params,
                 original_request,
                 tx,
+                reservation,
             )
             .await;
 
@@ -2427,6 +2495,7 @@ impl StreamingProcessor {
         completion_request: Arc<CompletionRequest>,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
+        reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Response {
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
 
@@ -2535,6 +2604,17 @@ impl StreamingProcessor {
                             (Some(current), Some(candidate)) => Some(current.min(candidate)),
                             (current, candidate) => current.or(candidate),
                         };
+                    }
+
+                    // All units succeeded (fail-fast `try_join_all` above), so
+                    // this is the one settle point for every mode (Single/PD/Batch).
+                    if let Some(handle) = &reservation {
+                        handle
+                            .settle_success(UsageSettlement {
+                                actual_input_tokens: total_prompt,
+                                completion_tokens: total_completion,
+                            })
+                            .await;
                     }
 
                     if include_usage {

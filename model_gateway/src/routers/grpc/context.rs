@@ -23,7 +23,7 @@ use tracing::debug;
 
 use super::{
     backend_client::BackendClient,
-    common::stages::encode::EncodeDispatchPlan,
+    common::stages::{encode::EncodeDispatchPlan, RateLimitCell},
     multimodal::{MultimodalComponents, MultimodalIntermediate},
     proto_wrapper::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
@@ -53,6 +53,11 @@ pub(crate) struct RequestInput {
     /// Canonical model ID used after aliases are resolved at request entry.
     pub model_id: String,
     pub tenant_request_meta: Option<TenantRequestMeta>,
+    /// Shared across every retry attempt of one logical request so
+    /// `RateLimitReserveStage` reserves at most once. `None` for endpoints
+    /// that haven't opted into tenant rate limiting yet (Responses,
+    /// embeddings, classify).
+    pub rate_limit_cell: Option<Arc<RateLimitCell>>,
 }
 
 /// Request type variants
@@ -508,6 +513,7 @@ impl RequestContext {
                 headers,
                 model_id,
                 tenant_request_meta: None,
+                rate_limit_cell: None,
             },
             components,
             state: ProcessingState::default(),
