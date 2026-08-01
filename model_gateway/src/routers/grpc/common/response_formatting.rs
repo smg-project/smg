@@ -12,11 +12,14 @@ use crate::routers::grpc::proto_wrapper::{ProtoGenerateComplete, ProtoGenerateSt
 
 /// Build usage information from collected gRPC responses
 ///
-/// Sums completion_tokens across all responses, since each is a distinct
-/// generation. `prompt_tokens` takes the max instead: chat/generate requests
-/// have exactly one prompt shared by every `n>1` choice, and each response
-/// reports that same full prompt length, so summing would charge it once per
-/// choice instead of once per request (Completion's own batched usage
+/// Sums completion_tokens (and reasoning_tokens, each choice's own
+/// independent reasoning trace) across all responses, since each is a
+/// distinct generation. `prompt_tokens` and `cached_tokens` take the max
+/// instead: chat/generate requests have exactly one prompt shared by every
+/// `n>1` choice -- cached_tokens is a property of that same prompt (how much
+/// of it hit the KV cache), not of the individual completion -- and each
+/// response reports that same full length, so summing would charge it once
+/// per choice instead of once per request (Completion's own batched usage
 /// computation already does this correctly per-prompt; mirrored here).
 pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
     let total_prompt_tokens: u32 = responses
@@ -25,7 +28,11 @@ pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
         .max()
         .unwrap_or(0);
     let total_completion_tokens: u32 = responses.iter().map(|r| r.completion_tokens()).sum();
-    let total_cached_tokens: u32 = responses.iter().map(|r| r.cached_tokens()).sum();
+    let total_cached_tokens: u32 = responses
+        .iter()
+        .map(|r| r.cached_tokens())
+        .max()
+        .unwrap_or(0);
     let total_reasoning_tokens: u32 = responses.iter().map(|r| r.reasoning_tokens()).sum();
 
     Usage::from_counts(total_prompt_tokens, total_completion_tokens)
@@ -83,9 +90,14 @@ mod tests {
 
     use super::*;
 
-    fn complete(prompt_tokens: u32, completion_tokens: u32) -> ProtoGenerateComplete {
+    fn complete(
+        prompt_tokens: u32,
+        cached_tokens: u32,
+        completion_tokens: u32,
+    ) -> ProtoGenerateComplete {
         ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
             prompt_tokens,
+            cached_tokens,
             completion_tokens,
             ..Default::default()
         })
@@ -93,12 +105,17 @@ mod tests {
 
     #[test]
     fn build_usage_charges_the_shared_prompt_once_for_n_greater_than_1() {
-        let responses = vec![complete(10, 4), complete(10, 6)];
+        let responses = vec![complete(10, 8, 4), complete(10, 8, 6)];
         let usage = build_usage(&responses);
 
         assert_eq!(
             usage.prompt_tokens, 10,
             "n>1 choices share one prompt -- must not be multiplied per choice"
+        );
+        assert_eq!(
+            usage.prompt_tokens_details.as_ref().map(|d| d.cached_tokens),
+            Some(8),
+            "cached_tokens is a property of the shared prompt too -- must not be multiplied per choice"
         );
         assert_eq!(
             usage.completion_tokens, 10,

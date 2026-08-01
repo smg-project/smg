@@ -687,10 +687,12 @@ impl StreamingProcessor {
             if stream_opts.include_usage.unwrap_or(false) {
                 // Every `n>1` choice shares one prompt; each Complete reports
                 // that same full length, so max (not sum) is the actual
-                // prompt cost -- summing would multiply it by `n`.
+                // prompt cost -- summing would multiply it by `n`. cached_tokens
+                // is a property of that same shared prompt, not of the
+                // individual completion, so it takes the same treatment.
                 let total_prompt: u32 = prompt_tokens.values().copied().max().unwrap_or(0);
                 let total_completion: u32 = completion_tokens.total();
-                let total_cached: u32 = cached_tokens.values().sum();
+                let total_cached: u32 = cached_tokens.values().copied().max().unwrap_or(0);
                 let total_reasoning: u32 = reasoning_tokens.values().sum();
 
                 let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
