@@ -308,6 +308,162 @@ impl AppTestContext {
     }
 }
 
+/// Shared `AppContext` construction tail for the `create_test_context_*`
+/// family below: registries, storage backends, worker monitor, job queue,
+/// workflow engines, OpenAI-mode external worker registration, and MCP
+/// orchestrator startup are identical across all of them. Only the
+/// tokenizer registry, parser factories, rate-limit manager, and MCP config
+/// vary by caller, so those are the only parameters.
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn build_test_app_context(
+    config: RouterConfig,
+    tokenizer_registry: Arc<TokenizerRegistry>,
+    reasoning_parser_factory: Option<ReasoningParserFactory>,
+    tool_parser_factory: Option<ToolParserFactory>,
+    rate_limit_manager: Option<Arc<smg::rate_limit::RateLimitManager>>,
+    mcp_config: smg_mcp::McpConfig,
+) -> Arc<AppContext> {
+    use smg_mcp::McpOrchestrator;
+
+    let client = reqwest::Client::new();
+
+    // Initialize rate limiter
+    let rate_limiter = match config.max_concurrent_requests {
+        n if n <= 0 => None,
+        n => {
+            let rate_limit_tokens = config
+                .rate_limit_tokens_per_second
+                .filter(|&t| t > 0)
+                .unwrap_or(n);
+            Some(Arc::new(TokenBucket::new(
+                n as usize,
+                rate_limit_tokens as usize,
+            )))
+        }
+    };
+
+    // Initialize registries
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
+
+    // Initialize storage backends (Memory for tests).
+    let response_storage = Arc::new(MemoryResponseStorage::new());
+    let conversation_storage = Arc::new(MemoryConversationStorage::new());
+    let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+
+    // Initialize load monitor
+    let worker_monitor = Some(Arc::new(WorkerMonitor::new(
+        worker_registry.clone(),
+        policy_registry.clone(),
+        client.clone(),
+        config.load_monitor_interval_secs,
+        config.engine_metrics,
+    )));
+
+    // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
+    let worker_job_queue = Arc::new(OnceLock::new());
+    let workflow_engines = Arc::new(OnceLock::new());
+    let mcp_orchestrator_lock = Arc::new(OnceLock::new());
+
+    let app_context = Arc::new(
+        AppContext::builder()
+            .router_config(config.clone())
+            .client(client)
+            .rate_limiter(rate_limiter)
+            .rate_limit_manager(rate_limit_manager)
+            .tokenizer_registry(tokenizer_registry)
+            .reasoning_parser_factory(reasoning_parser_factory)
+            .tool_parser_factory(tool_parser_factory)
+            .worker_registry(worker_registry)
+            .policy_registry(policy_registry)
+            .response_storage(response_storage)
+            .conversation_storage(conversation_storage)
+            .conversation_item_storage(conversation_item_storage)
+            .worker_monitor(worker_monitor)
+            .worker_job_queue(worker_job_queue)
+            .workflow_engines(workflow_engines)
+            .mcp_orchestrator(mcp_orchestrator_lock)
+            .build()
+            .unwrap(),
+    );
+
+    // Mirror production wiring: start the WorkerMonitor event
+    // loop so tests exercise the event-driven group reconciliation
+    // path instead of an inert monitor.
+    if let Some(monitor) = &app_context.worker_monitor {
+        monitor.start_event_loop();
+    }
+
+    // Initialize JobQueue after AppContext is created
+    let weak_context = Arc::downgrade(&app_context);
+    let job_queue =
+        smg::workflow::JobQueue::new(smg::workflow::JobQueueConfig::default(), weak_context);
+    app_context
+        .worker_job_queue
+        .set(job_queue)
+        .expect("JobQueue should only be initialized once");
+
+    // Initialize typed workflow engines
+    use smg::workflow::WorkflowEngines;
+    let engines = WorkflowEngines::new(&config);
+    app_context
+        .workflow_engines
+        .set(engines)
+        .expect("WorkflowEngines should only be initialized once");
+
+    // Register external workers for OpenAI mode
+    if let RoutingMode::OpenAI { worker_urls, .. } = &config.mode {
+        for url in worker_urls {
+            // Create a worker that supports common test models
+            let models = vec![
+                ModelCard::new("mock-model"),
+                ModelCard::new("gpt-4"),
+                ModelCard::new("gpt-3.5-turbo"),
+            ];
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .runtime_type(RuntimeType::External)
+                    .models(models)
+                    .health_config(openai_protocol::worker::HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            );
+            app_context.worker_registry.register(worker);
+        }
+    }
+
+    let mcp_orchestrator = McpOrchestrator::new(mcp_config)
+        .await
+        .expect("Failed to create MCP orchestrator");
+    app_context
+        .mcp_orchestrator
+        .set(Arc::new(mcp_orchestrator))
+        .ok()
+        .expect("McpOrchestrator should only be initialized once");
+
+    app_context
+}
+
+/// An empty MCP config -- no servers, defaults everywhere -- for the
+/// `create_test_context_*` variants that don't exercise MCP themselves.
+fn empty_mcp_config() -> smg_mcp::McpConfig {
+    smg_mcp::McpConfig {
+        servers: vec![],
+        pool: Default::default(),
+        proxy: None,
+        warmup: vec![],
+        inventory: Default::default(),
+        policy: Default::default(),
+    }
+}
+
 /// Helper function to create AppContext for tests
 pub fn create_test_context(
     config: RouterConfig,
@@ -321,7 +477,6 @@ pub fn create_test_context(
 /// build a real gRPC router (e.g. against a gRPC mock worker, which has no
 /// tokenizer artifacts of its own to autoload from).
 #[expect(
-    clippy::unwrap_used,
     clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
@@ -330,298 +485,40 @@ pub fn create_test_context_with_tokenizer_registry(
     tokenizer_registry: Arc<TokenizerRegistry>,
 ) -> Pin<Box<dyn Future<Output = Arc<AppContext>> + Send>> {
     Box::pin(async move {
-        let client = reqwest::Client::new();
-        let reasoning_parser_factory = Some(ReasoningParserFactory::new());
-        let tool_parser_factory = Some(ToolParserFactory::new());
-
         // Build the tenant rate limiter from `config` the same way
         // `AppContext::from_config` does (that path's own
         // `maybe_rate_limit_manager` is private, so it's replicated here via
         // the public direct setter added for this purpose).
         let tenant_rate_limit_manager = smg::rate_limit::RateLimitManager::from_config(&config)
             .expect("tenant rate limit config should be valid");
-
-        // Initialize rate limiter
-        let rate_limiter = match config.max_concurrent_requests {
-            n if n <= 0 => None,
-            n => {
-                let rate_limit_tokens = config
-                    .rate_limit_tokens_per_second
-                    .filter(|&t| t > 0)
-                    .unwrap_or(n);
-                Some(Arc::new(TokenBucket::new(
-                    n as usize,
-                    rate_limit_tokens as usize,
-                )))
-            }
-        };
-
-        // Initialize registries
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
-
-        // Initialize storage backends (Memory for tests).
-        let response_storage = Arc::new(MemoryResponseStorage::new());
-        let conversation_storage = Arc::new(MemoryConversationStorage::new());
-        let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
-
-        // Initialize load monitor
-        let worker_monitor = Some(Arc::new(WorkerMonitor::new(
-            worker_registry.clone(),
-            policy_registry.clone(),
-            client.clone(),
-            config.load_monitor_interval_secs,
-            config.engine_metrics,
-        )));
-
-        // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
-        let worker_job_queue = Arc::new(OnceLock::new());
-        let workflow_engines = Arc::new(OnceLock::new());
-        let mcp_orchestrator_lock = Arc::new(OnceLock::new());
-
-        let app_context = Arc::new(
-            AppContext::builder()
-                .router_config(config.clone())
-                .client(client)
-                .rate_limiter(rate_limiter)
-                .rate_limit_manager(tenant_rate_limit_manager)
-                .tokenizer_registry(tokenizer_registry) // tokenizer
-                .reasoning_parser_factory(reasoning_parser_factory)
-                .tool_parser_factory(tool_parser_factory)
-                .worker_registry(worker_registry)
-                .policy_registry(policy_registry)
-                .response_storage(response_storage)
-                .conversation_storage(conversation_storage)
-                .conversation_item_storage(conversation_item_storage)
-                .worker_monitor(worker_monitor)
-                .worker_job_queue(worker_job_queue)
-                .workflow_engines(workflow_engines)
-                .mcp_orchestrator(mcp_orchestrator_lock)
-                .build()
-                .unwrap(),
-        );
-
-        // Mirror production wiring: start the WorkerMonitor event
-        // loop so tests exercise the event-driven group reconciliation
-        // path instead of an inert monitor.
-        if let Some(monitor) = &app_context.worker_monitor {
-            monitor.start_event_loop();
-        }
-
-        // Initialize JobQueue after AppContext is created
-        let weak_context = Arc::downgrade(&app_context);
-        let job_queue =
-            smg::workflow::JobQueue::new(smg::workflow::JobQueueConfig::default(), weak_context);
-        app_context
-            .worker_job_queue
-            .set(job_queue)
-            .expect("JobQueue should only be initialized once");
-
-        // Initialize typed workflow engines
-        use smg::workflow::WorkflowEngines;
-        let engines = WorkflowEngines::new(&config);
-        app_context
-            .workflow_engines
-            .set(engines)
-            .expect("WorkflowEngines should only be initialized once");
-
-        // Register external workers for OpenAI mode
-        if let RoutingMode::OpenAI { worker_urls, .. } = &config.mode {
-            for url in worker_urls {
-                // Create a worker that supports common test models
-                let models = vec![
-                    ModelCard::new("mock-model"),
-                    ModelCard::new("gpt-4"),
-                    ModelCard::new("gpt-3.5-turbo"),
-                ];
-                let worker: Arc<dyn Worker> = Arc::new(
-                    BasicWorkerBuilder::new(url)
-                        .worker_type(WorkerType::Regular)
-                        .runtime_type(RuntimeType::External)
-                        .models(models)
-                        .health_config(openai_protocol::worker::HealthCheckConfig {
-                            disable_health_check: true,
-                            ..Default::default()
-                        })
-                        .build(),
-                );
-                app_context.worker_registry.register(worker);
-            }
-        }
-
-        // Initialize MCP orchestrator with empty config
-        use smg_mcp::{McpConfig, McpOrchestrator};
-        let empty_config = McpConfig {
-            servers: vec![],
-            pool: Default::default(),
-            proxy: None,
-            warmup: vec![],
-            inventory: Default::default(),
-            policy: Default::default(),
-        };
-        let mcp_orchestrator = McpOrchestrator::new(empty_config)
-            .await
-            .expect("Failed to create MCP orchestrator");
-        app_context
-            .mcp_orchestrator
-            .set(Arc::new(mcp_orchestrator))
-            .ok()
-            .expect("McpOrchestrator should only be initialized once");
-
-        app_context
+        build_test_app_context(
+            config,
+            tokenizer_registry,
+            Some(ReasoningParserFactory::new()),
+            Some(ToolParserFactory::new()),
+            tenant_rate_limit_manager,
+            empty_mcp_config(),
+        )
+        .await
     })
 }
 
 /// Helper function to create AppContext for tests with parser factories initialized
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
 pub fn create_test_context_with_parsers(
     config: RouterConfig,
 ) -> Pin<Box<dyn Future<Output = Arc<AppContext>> + Send>> {
-    Box::pin(async move {
-        let client = reqwest::Client::new();
-
-        // Initialize rate limiter
-        let rate_limiter = match config.max_concurrent_requests {
-            n if n <= 0 => None,
-            n => {
-                let rate_limit_tokens = config
-                    .rate_limit_tokens_per_second
-                    .filter(|&t| t > 0)
-                    .unwrap_or(n);
-                Some(Arc::new(TokenBucket::new(
-                    n as usize,
-                    rate_limit_tokens as usize,
-                )))
-            }
-        };
-
-        // Initialize registries
-        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
-
-        // Initialize storage backends (Memory for tests).
-        let response_storage = Arc::new(MemoryResponseStorage::new());
-        let conversation_storage = Arc::new(MemoryConversationStorage::new());
-        let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
-
-        // Initialize load monitor
-        let worker_monitor = Some(Arc::new(WorkerMonitor::new(
-            worker_registry.clone(),
-            policy_registry.clone(),
-            client.clone(),
-            config.load_monitor_interval_secs,
-            config.engine_metrics,
-        )));
-
-        // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
-        let worker_job_queue = Arc::new(OnceLock::new());
-        let workflow_engines = Arc::new(OnceLock::new());
-        let mcp_orchestrator_lock = Arc::new(OnceLock::new());
-
-        // Initialize parser factories
-        let reasoning_parser_factory = Some(ReasoningParserFactory::new());
-        let tool_parser_factory = Some(ToolParserFactory::new());
-
-        let app_context = Arc::new(
-            AppContext::builder()
-                .router_config(config.clone())
-                .client(client)
-                .rate_limiter(rate_limiter)
-                .tokenizer_registry(tokenizer_registry)
-                .reasoning_parser_factory(reasoning_parser_factory)
-                .tool_parser_factory(tool_parser_factory)
-                .worker_registry(worker_registry)
-                .policy_registry(policy_registry)
-                .response_storage(response_storage)
-                .conversation_storage(conversation_storage)
-                .conversation_item_storage(conversation_item_storage)
-                .worker_monitor(worker_monitor)
-                .worker_job_queue(worker_job_queue)
-                .workflow_engines(workflow_engines)
-                .mcp_orchestrator(mcp_orchestrator_lock)
-                .build()
-                .unwrap(),
-        );
-
-        // Mirror production wiring: start the WorkerMonitor event
-        // loop so tests exercise the event-driven group reconciliation
-        // path instead of an inert monitor.
-        if let Some(monitor) = &app_context.worker_monitor {
-            monitor.start_event_loop();
-        }
-
-        // Initialize JobQueue after AppContext is created
-        let weak_context = Arc::downgrade(&app_context);
-        let job_queue =
-            smg::workflow::JobQueue::new(smg::workflow::JobQueueConfig::default(), weak_context);
-        app_context
-            .worker_job_queue
-            .set(job_queue)
-            .expect("JobQueue should only be initialized once");
-
-        // Initialize typed workflow engines
-        use smg::workflow::WorkflowEngines;
-        let engines = WorkflowEngines::new(&config);
-        app_context
-            .workflow_engines
-            .set(engines)
-            .expect("WorkflowEngines should only be initialized once");
-
-        // Register external workers for OpenAI mode
-        if let RoutingMode::OpenAI { worker_urls, .. } = &config.mode {
-            for url in worker_urls {
-                // Create a worker that supports common test models
-                let models = vec![
-                    ModelCard::new("mock-model"),
-                    ModelCard::new("gpt-4"),
-                    ModelCard::new("gpt-3.5-turbo"),
-                ];
-                let worker: Arc<dyn Worker> = Arc::new(
-                    BasicWorkerBuilder::new(url)
-                        .worker_type(WorkerType::Regular)
-                        .runtime_type(RuntimeType::External)
-                        .models(models)
-                        .health_config(openai_protocol::worker::HealthCheckConfig {
-                            disable_health_check: true,
-                            ..Default::default()
-                        })
-                        .build(),
-                );
-                app_context.worker_registry.register(worker);
-            }
-        }
-
-        // Initialize MCP orchestrator with empty config
-        use smg_mcp::{McpConfig, McpOrchestrator};
-        let empty_config = McpConfig {
-            servers: vec![],
-            pool: Default::default(),
-            proxy: None,
-            warmup: vec![],
-            inventory: Default::default(),
-            policy: Default::default(),
-        };
-        let mcp_orchestrator = McpOrchestrator::new(empty_config)
-            .await
-            .expect("Failed to create MCP orchestrator");
-        app_context
-            .mcp_orchestrator
-            .set(Arc::new(mcp_orchestrator))
-            .ok()
-            .expect("McpOrchestrator should only be initialized once");
-
-        app_context
-    })
+    Box::pin(build_test_app_context(
+        config,
+        Arc::new(TokenizerRegistry::new()),
+        Some(ReasoningParserFactory::new()),
+        Some(ToolParserFactory::new()),
+        None,
+        empty_mcp_config(),
+    ))
 }
 
 /// Helper function to create AppContext for tests with MCP config from file
 #[expect(
-    clippy::unwrap_used,
     clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
@@ -629,133 +526,20 @@ pub fn create_test_context_with_mcp_config(
     config: RouterConfig,
     mcp_config_path: &str,
 ) -> Pin<Box<dyn Future<Output = Arc<AppContext>> + Send>> {
-    use smg_mcp::{McpConfig, McpOrchestrator};
-
     let mcp_config_path = mcp_config_path.to_owned();
     Box::pin(async move {
-        let client = reqwest::Client::new();
-
-        // Initialize rate limiter
-        let rate_limiter = match config.max_concurrent_requests {
-            n if n <= 0 => None,
-            n => {
-                let rate_limit_tokens = config
-                    .rate_limit_tokens_per_second
-                    .filter(|&t| t > 0)
-                    .unwrap_or(n);
-                Some(Arc::new(TokenBucket::new(
-                    n as usize,
-                    rate_limit_tokens as usize,
-                )))
-            }
-        };
-
-        // Initialize registries
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
-
-        // Initialize storage backends (Memory for tests).
-        let response_storage = Arc::new(MemoryResponseStorage::new());
-        let conversation_storage = Arc::new(MemoryConversationStorage::new());
-        let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
-
-        // Initialize load monitor
-        let worker_monitor = Some(Arc::new(WorkerMonitor::new(
-            worker_registry.clone(),
-            policy_registry.clone(),
-            client.clone(),
-            config.load_monitor_interval_secs,
-            config.engine_metrics,
-        )));
-
-        // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
-        let worker_job_queue = Arc::new(OnceLock::new());
-        let workflow_engines = Arc::new(OnceLock::new());
-        let mcp_orchestrator_lock = Arc::new(OnceLock::new());
-
-        let app_context = Arc::new(
-            AppContext::builder()
-                .router_config(config.clone())
-                .client(client)
-                .rate_limiter(rate_limiter)
-                .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
-                .reasoning_parser_factory(None) // reasoning_parser_factory
-                .tool_parser_factory(None) // tool_parser_factory
-                .worker_registry(worker_registry)
-                .policy_registry(policy_registry)
-                .response_storage(response_storage)
-                .conversation_storage(conversation_storage)
-                .conversation_item_storage(conversation_item_storage)
-                .worker_monitor(worker_monitor)
-                .worker_job_queue(worker_job_queue)
-                .workflow_engines(workflow_engines)
-                .mcp_orchestrator(mcp_orchestrator_lock)
-                .build()
-                .unwrap(),
-        );
-
-        // Mirror production wiring: start the WorkerMonitor event
-        // loop so tests exercise the event-driven group reconciliation
-        // path instead of an inert monitor.
-        if let Some(monitor) = &app_context.worker_monitor {
-            monitor.start_event_loop();
-        }
-
-        // Initialize JobQueue after AppContext is created
-        let weak_context = Arc::downgrade(&app_context);
-        let job_queue =
-            smg::workflow::JobQueue::new(smg::workflow::JobQueueConfig::default(), weak_context);
-        app_context
-            .worker_job_queue
-            .set(job_queue)
-            .expect("JobQueue should only be initialized once");
-
-        // Initialize typed workflow engines
-        use smg::workflow::WorkflowEngines;
-        let engines = WorkflowEngines::new(&config);
-        app_context
-            .workflow_engines
-            .set(engines)
-            .expect("WorkflowEngines should only be initialized once");
-
-        // Register external workers for OpenAI mode
-        if let RoutingMode::OpenAI { worker_urls, .. } = &config.mode {
-            for url in worker_urls {
-                // Create a worker that supports common test models
-                let models = vec![
-                    ModelCard::new("mock-model"),
-                    ModelCard::new("gpt-4"),
-                    ModelCard::new("gpt-3.5-turbo"),
-                ];
-                let worker: Arc<dyn Worker> = Arc::new(
-                    BasicWorkerBuilder::new(url)
-                        .worker_type(WorkerType::Regular)
-                        .runtime_type(RuntimeType::External)
-                        .models(models)
-                        .health_config(openai_protocol::worker::HealthCheckConfig {
-                            disable_health_check: true,
-                            ..Default::default()
-                        })
-                        .build(),
-                );
-                app_context.worker_registry.register(worker);
-            }
-        }
-
-        // Initialize MCP orchestrator from config file
-        let mcp_config = McpConfig::from_file(&mcp_config_path)
+        let mcp_config = smg_mcp::McpConfig::from_file(&mcp_config_path)
             .await
             .expect("Failed to load MCP config from file");
-        let mcp_orchestrator = McpOrchestrator::new(mcp_config)
-            .await
-            .expect("Failed to create MCP orchestrator");
-        app_context
-            .mcp_orchestrator
-            .set(Arc::new(mcp_orchestrator))
-            .ok()
-            .expect("McpOrchestrator should only be initialized once");
-
-        app_context
+        build_test_app_context(
+            config,
+            Arc::new(TokenizerRegistry::new()),
+            None,
+            None,
+            None,
+            mcp_config,
+        )
+        .await
     })
 }
 

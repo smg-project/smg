@@ -26,7 +26,8 @@ use std::{sync::Arc, time::Duration};
 
 use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use openai_protocol::{
-    generate::GenerateRequest, model_card::ModelCard, worker::HealthCheckConfig,
+    completion::CompletionRequest, generate::GenerateRequest, model_card::ModelCard,
+    worker::HealthCheckConfig,
 };
 use portpicker::pick_unused_port;
 use smg::{
@@ -186,6 +187,19 @@ fn generate_request() -> GenerateRequest {
     .unwrap()
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn completion_request() -> CompletionRequest {
+    serde_json::from_value(serde_json::json!({
+        "model": MODEL,
+        "prompt": PROMPT_TEXT,
+        "stream": false,
+    }))
+    .unwrap()
+}
+
 fn fresh_tenant() -> TenantRequestMeta {
     TenantRequestMeta::new(TenantKey::new("integration-test-tenant"))
 }
@@ -297,4 +311,46 @@ async fn feature_disabled_is_a_no_op() {
         .await;
 
     assert_eq!(response.status(), http::StatusCode::OK);
+}
+
+/// `RateLimitReserveStage` is inserted identically into the Chat, Messages,
+/// Completion, and Generate pipelines (`pipeline.rs::build()`), and the
+/// tests above already prove the mechanism end-to-end (real reserve, real
+/// settle, real denial with/without `Retry-After`) through Generate. This
+/// mirrors that same impossible-budget proof through Completion, to confirm
+/// the stage is actually live on a second wired pipeline too, not just
+/// constructed and never reached.
+///
+/// Chat and Messages are deliberately not covered the same way here: both
+/// need `apply_chat_template` to turn their `messages` array into a prompt
+/// before preparation ever reaches the reserve stage, and `MockTokenizer`
+/// (`crates/tokenizer/src/mock.rs`) doesn't implement it -- confirmed by
+/// running this exact test against `route_chat`, which fails earlier with
+/// `process_messages_failed: Chat template not supported by this
+/// tokenizer`, a 400 from the Chat preparation stage, not a 429 from rate
+/// limiting. That's a pre-existing gap in the shared mock tokenizer,
+/// unrelated to this PR; extending it (or swapping in a template-capable
+/// fake) is out of scope here. Harmony and PD dispatch are also not covered:
+/// Harmony needs a harmony-flavored model registered so `HarmonyDetector`
+/// routes into it, and PD needs a distinct prefill+decode worker pair --
+/// both larger harness investments than this suite carries for its other
+/// cases, and the underlying reserve/settle mechanics they'd exercise are
+/// identical to what's already proven above and in `pipeline.rs`'s own
+/// `rate_limit_reserve_tests` (which drives `RateLimitReserveStage` directly
+/// rather than through a real backend).
+#[tokio::test]
+async fn completion_denial_reaches_the_client() {
+    let grpc_port = start_mock_grpc_worker(4).await;
+    let (router, _dir) = build_router(Some(1), grpc_port).await;
+
+    let request = completion_request();
+    let response = router
+        .route_completion(None, &fresh_tenant(), &request, MODEL)
+        .await;
+
+    assert_eq!(
+        response.status(),
+        http::StatusCode::TOO_MANY_REQUESTS,
+        "RateLimitReserveStage must be reachable through route_completion, not just route_generate"
+    );
 }

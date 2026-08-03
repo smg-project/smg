@@ -16,7 +16,7 @@ use std::sync::{
 use async_trait::async_trait;
 use axum::response::Response;
 use parking_lot::Mutex;
-use tracing::error;
+use tracing::{error, warn};
 
 use super::PipelineStage;
 use crate::{
@@ -145,6 +145,10 @@ impl PipelineStage for RateLimitReserveStage {
                     // No tenant identity resolved (shouldn't happen once
                     // tenant_resolution middleware runs, but fail open rather
                     // than block a request over missing rate-limit context).
+                    warn!(
+                        function = "RateLimitReserveStage::execute",
+                        "tenant_request_meta missing; skipping rate-limit reservation"
+                    );
                     return Ok(None);
                 };
                 let prep = ctx.state.preparation.as_ref().ok_or_else(|| {

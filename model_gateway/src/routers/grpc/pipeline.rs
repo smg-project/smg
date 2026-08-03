@@ -1618,7 +1618,11 @@ mod rate_limit_reserve_tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{config::types::RouterConfig, rate_limit::RateLimitManager, tenant::TenantKey};
+    use crate::{
+        config::types::RouterConfig,
+        rate_limit::{RateLimitManager, Reservation, ReserveRequest},
+        tenant::TenantKey,
+    };
 
     const MODEL: &str = "reserve-test-model";
 
@@ -1751,5 +1755,38 @@ mod rate_limit_reserve_tests {
 
         let stage = RateLimitReserveStage::new(Some(manager));
         assert!(stage.execute(&mut ctx).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn settle_reservation_with_zero_usage_refunds_the_full_estimate() {
+        // Budget 6; reserve 5 leaves 1. A response with no `usage` settles
+        // with 0/0 (see the `usage.map_or(0, ...)` call sites in
+        // execute_chat/execute_generate/etc.) -- that must refund the full
+        // 5-token debit back to the tenant, not silently keep it (nothing
+        // was actually consumed) and not leave the reservation stuck open
+        // (which would leak budget forever).
+        let manager = manager_with_tokens_per_minute(6);
+        let components = test_components().await;
+        let mut ctx = ctx_with_tokens(components, 5);
+        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
+
+        let stage = RateLimitReserveStage::new(Some(manager.clone()));
+        assert!(stage.execute(&mut ctx).await.unwrap().is_none());
+
+        RequestPipeline::settle_reservation(ctx.input.rate_limit_cell.as_deref(), 0, 0).await;
+
+        // The full 6-token budget must be available again -- would be
+        // denied if settle had kept the original 5-token debit instead of
+        // truing it up to the real (zero) usage.
+        let check = ReserveRequest {
+            request_charge_id: uuid::Uuid::now_v7(),
+            tenant_key: TenantKey::new("test-tenant"),
+            model_id: Some(MODEL.to_string()),
+            estimated_input_tokens: 6,
+        };
+        assert!(matches!(
+            manager.reserve(check).await,
+            Reservation::Admitted(_)
+        ));
     }
 }

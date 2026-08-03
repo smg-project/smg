@@ -7,16 +7,12 @@ use axum::response::Response;
 use tracing::error;
 
 use super::super::{HarmonyResponseProcessor, HarmonyStreamingProcessor};
-use crate::{
-    rate_limit::ReservationAttachment,
-    routers::{
-        error,
-        grpc::{
-            common::stages::{PipelineStage, RateLimitCell},
-            context::{FinalResponse, RequestContext, RequestType},
-        },
+use crate::routers::{
+    error,
+    grpc::{
+        common::stages::{helpers, PipelineStage, RateLimitCell},
+        context::{FinalResponse, RequestContext, RequestType},
     },
-    worker::AttachedBody,
 };
 
 /// String `stop` sequences the ROUTER must enforce, as reported by the
@@ -84,8 +80,9 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                 if is_streaming {
                     // Reserved (if tenant rate limiting is enabled): settled
                     // with real usage inside the streaming processor on
-                    // success, or abandoned via ReservationAttachment's Drop
-                    // below on early disconnect/error.
+                    // success, or abandoned via the attached
+                    // ReservationAttachment's Drop below on early
+                    // disconnect/error.
                     let reservation = ctx
                         .input
                         .rate_limit_cell
@@ -106,18 +103,11 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                     // Attach load guards (and the reservation's
                     // disconnect/error safety net) to the response body for
                     // proper RAII lifecycle.
-                    let response = match (ctx.state.load_guards.take(), reservation) {
-                        (Some(guards), Some(handle)) => AttachedBody::wrap_response(
-                            response,
-                            (guards, ReservationAttachment::new(handle)),
-                        ),
-                        (Some(guards), None) => AttachedBody::wrap_response(response, guards),
-                        (None, Some(handle)) => AttachedBody::wrap_response(
-                            response,
-                            ReservationAttachment::new(handle),
-                        ),
-                        (None, None) => response,
-                    };
+                    let response = helpers::attach_response_guards(
+                        response,
+                        ctx.state.load_guards.take(),
+                        reservation,
+                    );
 
                     return Ok(Some(response));
                 }

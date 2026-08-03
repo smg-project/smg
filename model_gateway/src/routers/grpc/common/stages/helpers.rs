@@ -13,13 +13,14 @@ use tracing::{debug, warn};
 
 use crate::{
     middleware::{RequestId, TenantRequestMeta},
+    rate_limit::{ReservationAttachment, SharedReservationHandle},
     routers::grpc::{
-        context::{RequestType, WorkerSelection},
+        context::{LoadGuards, RequestType, WorkerSelection},
         proto_wrapper::ProtoGenerateRequest,
     },
     worker::{
-        sampling_defaults::SamplingDefaults, RuntimeType, Worker, DEFAULT_BOOTSTRAP_PORT,
-        DEFAULT_SAMPLING_PARAMS_LABEL,
+        sampling_defaults::SamplingDefaults, AttachedBody, RuntimeType, Worker,
+        DEFAULT_BOOTSTRAP_PORT, DEFAULT_SAMPLING_PARAMS_LABEL,
     },
 };
 
@@ -78,6 +79,28 @@ impl SamplingDefaultsMask {
 
     fn any(self) -> bool {
         self.temperature || self.top_p || self.top_k || self.min_p || self.repetition_penalty
+    }
+}
+
+/// Attach load guards and/or a rate-limit reservation to a streaming
+/// response body so each survives (and, for the reservation, resolves via
+/// `ReservationAttachment`'s `Drop`) exactly as long as the body does,
+/// regardless of how the client disconnects. A no-op returning `response`
+/// unchanged when both are `None`.
+pub(crate) fn attach_response_guards(
+    response: axum::response::Response,
+    guards: Option<LoadGuards>,
+    reservation: Option<Arc<SharedReservationHandle>>,
+) -> axum::response::Response {
+    match (guards, reservation) {
+        (Some(guards), Some(handle)) => {
+            AttachedBody::wrap_response(response, (guards, ReservationAttachment::new(handle)))
+        }
+        (Some(guards), None) => AttachedBody::wrap_response(response, guards),
+        (None, Some(handle)) => {
+            AttachedBody::wrap_response(response, ReservationAttachment::new(handle))
+        }
+        (None, None) => response,
     }
 }
 

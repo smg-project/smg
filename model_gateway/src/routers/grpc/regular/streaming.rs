@@ -67,9 +67,10 @@ struct CompletionStreamOutcome {
     reasoning_tokens: u32,
     completion_tokens: u32,
     first_token_time: Option<Instant>,
-    /// Whether a `Complete` message (the only source of authoritative usage)
-    /// was ever seen for this unit -- a clean EOF without one leaves
-    /// `prompt_tokens` at 0, indistinguishable from a genuinely empty prompt.
+    /// Whether *every* expected `n>1` choice in this unit received a
+    /// `Complete` message (the only source of authoritative usage) -- a
+    /// clean EOF partway through leaves this `false` even if some choices
+    /// did complete, so a partial result is never mistaken for full usage.
     saw_complete: bool,
 }
 
@@ -2799,6 +2800,12 @@ impl StreamingProcessor {
         let mut total_cached = 0u32;
         let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
         let mut total_completion = CompletionTokenTracker::new();
+        // Indices that received a `Complete` message -- tracked separately
+        // from `reasoning_tokens` (which exists for a different purpose and
+        // only incidentally gets exactly one insert per completed index
+        // today) so the completeness gate below doesn't silently break if
+        // that insert behavior ever changes.
+        let mut completed_indices: HashSet<u32> = HashSet::new();
 
         while let Some(response) = grpc_stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
@@ -2916,6 +2923,7 @@ impl StreamingProcessor {
                 }
                 ProtoResponseVariant::Complete(complete) => {
                     let index = index_offset + complete.index();
+                    completed_indices.insert(index);
                     total_prompt = total_prompt.max(complete.prompt_tokens());
                     total_cached = total_cached.max(complete.cached_tokens());
                     reasoning_tokens.insert(index, complete.reasoning_tokens());
@@ -3044,13 +3052,12 @@ impl StreamingProcessor {
 
         grpc_stream.mark_completed();
 
-        // `reasoning_tokens` is populated once per index, only from a
-        // `Complete` message -- its length is exactly the number of this
-        // unit's `n>1` choices that actually finished cleanly. A clean EOF
-        // partway through (some choices completed, others didn't) must not
-        // be treated as full usage.
+        // `completed_indices` counts distinct indices that finished cleanly
+        // via a `Complete` message. A clean EOF partway through this unit's
+        // `n>1` choices (some completed, others didn't) must not be treated
+        // as full usage.
         let expected_choices = completion_request.n.unwrap_or(1).max(1);
-        let saw_complete = reasoning_tokens.len() as u32 >= expected_choices;
+        let saw_complete = completed_indices.len() as u32 >= expected_choices;
 
         Ok(CompletionStreamOutcome {
             prompt_tokens: total_prompt,

@@ -449,16 +449,23 @@ impl GrpcRouter {
     /// default. Applied at every retrying endpoint
     /// (chat/generate/messages/completion) in every mode.
     ///
-    /// Resolves the alias itself. Retry overrides are keyed by canonical model
-    /// ID, and this runs before the pipeline canonicalizes in
-    /// `RequestContext::new`, so an alias would miss the override and fall
-    /// back to the router default without saying so.
-    fn resolve_retry_config(&self, model_id: &str) -> RetryConfig {
-        let canonical_model = self.worker_registry.resolve_model_alias(model_id);
-        let model_id = canonical_model.as_deref().unwrap_or(model_id);
+    /// Retry overrides are keyed by canonical model ID, so `model_id` must
+    /// already be canonical (e.g. via [`Self::resolve_canonical_model_id`]) --
+    /// every `route_*_impl` resolves that once before the retry loop starts,
+    /// so this never needs to resolve an alias itself. Retry overrides are
+    /// read before the pipeline canonicalizes in `RequestContext::new`, so an
+    /// alias reaching this unresolved would miss the override and silently
+    /// fall back to the router default.
+    fn resolve_retry_config_for_canonical(&self, canonical_model_id: &str) -> RetryConfig {
         self.worker_registry
-            .get_retry_config(model_id)
+            .get_retry_config(canonical_model_id)
             .unwrap_or_else(|| self.retry_config.clone())
+    }
+
+    /// A rate-limit denial must never be retried -- retrying immediately
+    /// against the same tenant budget defeats `retry_after_secs`.
+    fn reservation_denied(cell: &RateLimitCell) -> bool {
+        matches!(cell.peek(), Some(RateLimitOutcome::Denied))
     }
 
     /// Resolve `model_id` to its canonical form once, before a retry loop
@@ -564,7 +571,7 @@ impl GrpcRouter {
         let tenant_meta_cloned = tenant_meta.clone();
         let rate_limit_cell = Arc::new(RateLimitCell::new());
 
-        let retry_config = self.resolve_retry_config(&model_id_cloned);
+        let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
         let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
@@ -593,7 +600,7 @@ impl GrpcRouter {
             // (retrying immediately against the same tenant budget defeats
             // retry_after_secs); otherwise check if status is retryable.
             |res, _attempt| {
-                if matches!(rate_limit_cell.peek(), Some(RateLimitOutcome::Denied)) {
+                if Self::reservation_denied(&rate_limit_cell) {
                     return false;
                 }
                 is_retryable_status(res.status())
@@ -637,7 +644,7 @@ impl GrpcRouter {
         let pipeline = &self.pipeline;
         let rate_limit_cell = Arc::new(RateLimitCell::new());
 
-        let retry_config = self.resolve_retry_config(&model_id_cloned);
+        let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
         let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
@@ -664,7 +671,7 @@ impl GrpcRouter {
             },
             // Should retry: a rate-limit denial must never be retried; see route_chat_impl.
             |res, _attempt| {
-                if matches!(rate_limit_cell.peek(), Some(RateLimitOutcome::Denied)) {
+                if Self::reservation_denied(&rate_limit_cell) {
                     return false;
                 }
                 is_retryable_status(res.status())
@@ -805,7 +812,7 @@ impl GrpcRouter {
         let pipeline = &self.messages_pipeline;
         let rate_limit_cell = Arc::new(RateLimitCell::new());
 
-        let retry_config = self.resolve_retry_config(&model_id_cloned);
+        let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
         let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
@@ -831,7 +838,7 @@ impl GrpcRouter {
             },
             // Should retry: a rate-limit denial must never be retried; see route_chat_impl.
             |res, _attempt| {
-                if matches!(rate_limit_cell.peek(), Some(RateLimitOutcome::Denied)) {
+                if Self::reservation_denied(&rate_limit_cell) {
                     return false;
                 }
                 is_retryable_status(res.status())
@@ -873,7 +880,7 @@ impl GrpcRouter {
         let pipeline = &self.completion_pipeline;
         let rate_limit_cell = Arc::new(RateLimitCell::new());
 
-        let retry_config = self.resolve_retry_config(&model_id_cloned);
+        let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
         let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
@@ -899,7 +906,7 @@ impl GrpcRouter {
             },
             // Should retry: a rate-limit denial must never be retried; see route_chat_impl.
             |res, _attempt| {
-                if matches!(rate_limit_cell.peek(), Some(RateLimitOutcome::Denied)) {
+                if Self::reservation_denied(&rate_limit_cell) {
                     return false;
                 }
                 is_retryable_status(res.status())
@@ -1468,13 +1475,13 @@ mod pd_tests {
         ctx.worker_registry
             .set_model_retry_config("model-a", override_config, true);
 
-        let resolved = router.resolve_retry_config("model-a");
+        let resolved = router.resolve_retry_config_for_canonical("model-a");
         assert_eq!(
             resolved.max_retries, override_retries,
             "PD completion must use the per-model override, not the router default"
         );
 
-        let fallback = router.resolve_retry_config("model-without-override");
+        let fallback = router.resolve_retry_config_for_canonical("model-without-override");
         assert_eq!(fallback.max_retries, default_retries);
     }
 
@@ -1641,17 +1648,23 @@ mod pd_tests {
             true,
         );
 
+        // Mirrors the real call sequence every route_*_impl uses: resolve the
+        // canonical model once, then look up the retry config for it.
+        let retry_config_for = |model_id: &str| {
+            router.resolve_retry_config_for_canonical(&router.resolve_canonical_model_id(model_id))
+        };
+
         assert_eq!(
-            router.resolve_retry_config("canonical-model").max_retries,
+            retry_config_for("canonical-model").max_retries,
             override_retries
         );
         assert_eq!(
-            router.resolve_retry_config("model-alias").max_retries,
+            retry_config_for("model-alias").max_retries,
             override_retries,
             "an aliased request must get the same retry override as the canonical ID"
         );
         assert_eq!(
-            router.resolve_retry_config("unrelated-model").max_retries,
+            retry_config_for("unrelated-model").max_retries,
             default_retries
         );
     }
