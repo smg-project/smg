@@ -54,6 +54,11 @@ on:
         type: string
         default: "nixl"
         description: "KV transfer backend for vLLM PD workers: nixl or mooncake"
+      connection_mode:
+        required: false
+        type: string
+        default: ""
+        description: "Wire override for local backends: zmq runs the local cases over ZMQ"
 
 jobs:
   run:
@@ -66,6 +71,7 @@ jobs:
       E2E_RUNTIME: ${{ inputs.engine }}
       E2E_GPU_TIER: ${{ inputs.gpu_tier }}
       E2E_VLLM_KV_BACKEND: ${{ inputs.vllm_kv_backend }}
+      E2E_CONNECTION_MODE: ${{ inputs.connection_mode }}
       ROUTER_LOCAL_MODEL_PATH: /models
     steps:
       - name: Checkout code
@@ -165,6 +171,12 @@ jobs:
           SUFFIX=""
           if [ "${{ inputs.engine }}" = "vllm" ]; then
             SUFFIX="-${{ inputs.vllm_kv_backend }}"
+          fi
+          # gRPC and ZMQ chat legs share engine/GPU/test-dir and differ only by
+          # wire mode; fold it in so their log artifacts don't collide.
+          MODE="${{ inputs.connection_mode }}"
+          if [ -n "$MODE" ]; then
+            SUFFIX="${SUFFIX}-${MODE}"
           fi
           ARTIFACT="e2e-worker-logs-${{ inputs.engine }}-gpu${{ inputs.gpu_tier }}-${LABEL}${SUFFIX}"
           bash scripts/ci_dump_worker_logs.sh e2e-logs "$ARTIFACT"
