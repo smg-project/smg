@@ -261,6 +261,7 @@ impl HarmonyStreamingProcessor {
     /// and `cached_tokens` maps may be pre-populated from a prefill phase
     /// (prefill/decode stream) or empty (single stream). Values from `Complete` messages
     /// are inserted only if not already present.
+    #[expect(clippy::too_many_arguments)]
     async fn process_chat_decode_stream(
         mut decode_stream: ProtoStream,
         dispatch: &context::DispatchMetadata,
@@ -284,7 +285,7 @@ impl HarmonyStreamingProcessor {
         // the engine's own Complete is not re-emitted.
         let mut analysis_scanners: HashMap<u32, TextStopScanner> = HashMap::new();
         let mut final_scanners: HashMap<u32, TextStopScanner> = HashMap::new();
-        let mut router_stopped: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut router_stopped: HashSet<u32> = HashSet::new();
         let mut completion_tokens = CompletionTokenTracker::new();
         // Indices that received a *decode* `Complete` -- unlike `prompt_tokens`
         // (which may already be populated from the prefill phase before this
