@@ -30,17 +30,19 @@ pub struct EngineLoad {
     pub kv_cache_usage: f64,
 }
 
-/// Wave control for engines that step as a lockstep group: when a wave drains,
-/// every rank pauses, and a request handed to one rank leaves the others asleep
-/// until something wakes them. vLLM's MoE data parallelism works this way (its
-/// ranks all-reduce every step); dense DP ranks are independent and never
-/// report one.
+/// A *wave* is vLLM's term (not ours) for one round of work by a data-parallel
+/// group whose ranks step in lockstep: they all-reduce every step, so they drain
+/// the wave together and then all park. A request handed to one parked rank
+/// leaves the others asleep until someone starts the next wave. Upstream names:
+/// `current_wave`, `wave_complete`, `START_DP_WAVE` in
+/// `vllm/v1/engine/core.py`. Only vLLM's MoE data parallelism steps this way;
+/// dense DP ranks are independent and report no waves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaveEvent {
-    /// The group drained this wave and is now paused.
+    /// The group drained this wave and is now parked (vLLM `wave_complete`).
     Complete(u32),
     /// A rank took a request for an already-drained wave and needs the rest of
-    /// the group started on this one.
+    /// the group started on this one (vLLM `start_wave`).
     Start(u32),
 }
 

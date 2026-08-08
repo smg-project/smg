@@ -128,6 +128,11 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
                     ));
                 }
             }
+            Ok(EngineInbound::StartDpWave { wave, .. }) => {
+                // The mock is a single independent engine, never a lockstep
+                // group, so it never pauses and has no wave to start.
+                tracing::debug!("zmq engine {engine_index} ignoring start of wave {wave}");
+            }
             Ok(EngineInbound::Other(byte)) => {
                 tracing::debug!("zmq engine {engine_index} ignoring request type {byte}");
             }

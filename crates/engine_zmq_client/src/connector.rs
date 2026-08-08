@@ -101,8 +101,9 @@ impl<O: EngineOutput> RequestRegistry<O> {
     }
 }
 
-/// Wave bookkeeping for a lockstep engine group, mirroring the state vLLM's DP
-/// coordinator keeps: which wave the group is on, and whether it is stepping.
+/// Per-group wave bookkeeping (see [`WaveEvent`] for what a wave is), mirroring
+/// the state vLLM's DP coordinator keeps: which wave the group is on, and
+/// whether it is stepping.
 #[derive(Default)]
 struct WaveState {
     current: u32,
