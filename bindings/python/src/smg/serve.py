@@ -169,6 +169,20 @@ class WorkerLauncher(ABC):
             filtered.append(arg)
         return filtered
 
+    def _backend_arg_defaults(
+        self, backend_args: list[str], defaults: dict[str, list[str]]
+    ) -> list[str]:
+        """Expand each default the caller did not set themselves.
+
+        Unlike ``_filter_backend_args``, which strips flags the launcher owns
+        outright, these are engine defaults SMG needs for the wire to behave as
+        the API promises but an operator may legitimately override.
+        """
+        supplied = {arg.split("=", 1)[0] for arg in backend_args}
+        return [
+            token for flag, tokens in defaults.items() if flag not in supplied for token in tokens
+        ]
+
     def launch(
         self, args: argparse.Namespace, backend_args: list[str], host: str, port: int, env: dict
     ) -> subprocess.Popen:
@@ -342,6 +356,23 @@ class TokenspeedWorkerLauncher(WorkerLauncher):
             "--zmq-engine-index",
             "0",
         ]
+        cmd.extend(
+            self._backend_arg_defaults(
+                backend_args,
+                {
+                    # ``tool_choice=required``/``{function}`` and
+                    # ``response_format=json_schema`` reach the engine as
+                    # constraints on the wire, but TokenSpeed drops them without
+                    # complaint unless a grammar backend is configured, and its
+                    # default is none. Without this an unenforced constraint is
+                    # silently answered as freeform text.
+                    "--grammar-backend": ["--grammar-backend", "xgrammar"],
+                    # Output logprobs default off, so ``logprobs=true`` would
+                    # come back null rather than with per-token data.
+                    "--enable-output-logprobs": ["--enable-output-logprobs"],
+                },
+            )
+        )
         cmd.extend(
             self._filter_backend_args(
                 backend_args,

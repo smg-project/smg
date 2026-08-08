@@ -859,6 +859,35 @@ class TestTokenspeedWorkerLauncher:
         assert "--mem-fraction-static" in cmd
         assert "0.8" in cmd
 
+    def test_build_zmq_command_enables_constraint_enforcement(self):
+        # TokenSpeed defaults its grammar backend to none and drops wire
+        # constraints without complaint, so tool_choice=required and
+        # response_format=json_schema would answer as freeform text.
+        launcher = TokenspeedWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="zmq")
+        cmd = launcher.build_command(args, [], "127.0.0.1", 31000)
+
+        assert cmd[cmd.index("--grammar-backend") + 1] == "xgrammar"
+        assert "--enable-output-logprobs" in cmd
+
+    def test_build_zmq_command_defaults_yield_to_the_operator(self):
+        launcher = TokenspeedWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="zmq")
+        cmd = launcher.build_command(args, ["--grammar-backend", "llguidance"], "127.0.0.1", 31000)
+
+        assert cmd.count("--grammar-backend") == 1
+        assert cmd[cmd.index("--grammar-backend") + 1] == "llguidance"
+        # An override of one default leaves the others in place.
+        assert "--enable-output-logprobs" in cmd
+
+    def test_build_zmq_command_default_honors_equals_form(self):
+        launcher = TokenspeedWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="zmq")
+        cmd = launcher.build_command(args, ["--grammar-backend=none"], "127.0.0.1", 31000)
+
+        assert "--grammar-backend=none" in cmd
+        assert "xgrammar" not in cmd
+
     def test_build_command_rejects_non_zmq_modes(self):
         launcher = TokenspeedWorkerLauncher()
         for mode in ("grpc", "http"):
