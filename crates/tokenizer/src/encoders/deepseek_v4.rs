@@ -1,4 +1,8 @@
-// Ported from https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/encoding/encoding_dsv4.py
+// Ported from the `encoding/encoding_dsv4.py` shipped with the DeepSeek V4
+// checkpoints. Two revisions of that file exist in the wild and they disagree
+// only in the reasoning-effort block:
+//   - https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash (also -DSpark, -Pro)
+//   - https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731
 
 use std::fmt::Write as _;
 
@@ -9,13 +13,50 @@ use thiserror::Error;
 // "thinking" / "chat" mode invariant identical across DeepSeek versions.
 pub use super::deepseek_v32::ThinkingMode;
 
+/// Which reasoning-effort prompt revision the checkpoint was trained with.
+///
+/// The 0731 refresh shifted the effort levels down one: the text the original
+/// checkpoint emits for `max` became 0731's `high`, and 0731's `max` is a new,
+/// stronger prompt. Everything else in the encoding is byte-identical, so this
+/// is the only per-checkpoint switch the encoder needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EffortEncoding {
+    /// `DeepSeek-V4-Flash` / `-DSpark` / `-Pro`: accepts `high`/`max`, only
+    /// `max` emits a prefix (`high` is accepted but renders nothing).
+    #[default]
+    Original,
+    /// `DeepSeek-V4-Flash-0731`: accepts `low`/`high`/`max`; `low` is the
+    /// default and renders nothing.
+    V0731,
+}
+
+impl EffortEncoding {
+    /// Native effort names this revision's Python encoder accepts.
+    pub fn valid_native_values(self) -> &'static [&'static str] {
+        match self {
+            Self::Original => &["high", "max"],
+            Self::V0731 => &["low", "high", "max"],
+        }
+    }
+
+    /// Parse a native effort name against this revision's accepted set.
+    pub fn parse_native(self, value: &str) -> Option<ReasoningEffort> {
+        match (self, value) {
+            (Self::V0731, "low") => Some(ReasoningEffort::Low),
+            (_, "high") => Some(ReasoningEffort::High),
+            (_, "max") => Some(ReasoningEffort::Max),
+            _ => None,
+        }
+    }
+}
+
 /// Reasoning effort for the V4 prompt prefix.
 ///
-/// Mirrors the Python `reasoning_effort` parameter, which only accepts
-/// `None`, `"high"`, or `"max"`. Only `Max` actually emits a prefix today;
-/// `High` is accepted for parity with the Python signature.
+/// Union of the levels across both encoding revisions; which values are
+/// accepted and what they render is decided by [`EffortEncoding`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
+    Low,
     High,
     Max,
 }
@@ -29,6 +70,7 @@ pub struct EncodeParams {
     pub add_default_bos_token: bool,
     pub drop_thinking: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub effort_encoding: EffortEncoding,
 }
 impl Default for EncodeParams {
     fn default() -> Self {
@@ -36,6 +78,7 @@ impl Default for EncodeParams {
             add_default_bos_token: true,
             drop_thinking: true,
             reasoning_effort: None,
+            effort_encoding: EffortEncoding::Original,
         }
     }
 }
@@ -95,7 +138,11 @@ fn task_sp_token(task: &str) -> Option<&'static str> {
 // ---------------------------------------------------------------------------
 // Templates
 // ---------------------------------------------------------------------------
-const REASONING_EFFORT_MAX: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
+// Original `REASONING_EFFORT_MAX`; the 0731 refresh reuses this exact text
+// for its `high` level.
+const REASONING_EFFORT_ABSOLUTE_MAXIMUM: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
+// 0731's `max` level.
+const REASONING_EFFORT_BEYOND_MAXIMUM: &str = "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\nYou MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\nDo not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
 
 /// Mirrors V4's `TOOLS_TEMPLATE`. The block name is `tool_calls` (not
 /// `function_calls` like V3.2) and the wording is updated.
@@ -234,6 +281,7 @@ fn render_message(
     thinking_mode: ThinkingMode,
     drop_thinking: bool,
     reasoning_effort: Option<ReasoningEffort>,
+    effort_encoding: EffortEncoding,
 ) -> Result<String, DsEncodingError> {
     if index >= messages.len() {
         return Err(DsEncodingError::IndexOutOfRange {
@@ -260,12 +308,21 @@ fn render_message(
     let tool_calls_owned = tool_calls_raw.map(|tc| tool_calls_from_openai_format(tc));
     let tool_calls = tool_calls_owned.as_deref();
 
-    // Reasoning effort prefix (only at index 0 in thinking mode with max effort)
-    if index == 0
-        && thinking_mode == ThinkingMode::Thinking
-        && reasoning_effort == Some(ReasoningEffort::Max)
-    {
-        prompt.push_str(REASONING_EFFORT_MAX);
+    // Reasoning effort prefix (only at index 0 in thinking mode). Which levels
+    // emit which text depends on the checkpoint's encoding revision.
+    if index == 0 && thinking_mode == ThinkingMode::Thinking {
+        match (effort_encoding, reasoning_effort) {
+            (EffortEncoding::Original, Some(ReasoningEffort::Max)) => {
+                prompt.push_str(REASONING_EFFORT_ABSOLUTE_MAXIMUM);
+            }
+            (EffortEncoding::V0731, Some(ReasoningEffort::High)) => {
+                prompt.push_str(REASONING_EFFORT_ABSOLUTE_MAXIMUM);
+            }
+            (EffortEncoding::V0731, Some(ReasoningEffort::Max)) => {
+                prompt.push_str(REASONING_EFFORT_BEYOND_MAXIMUM);
+            }
+            _ => {}
+        }
     }
 
     match role {
@@ -671,6 +728,7 @@ pub fn encode_messages(
             thinking_mode,
             effective_drop_thinking,
             params.reasoning_effort,
+            params.effort_encoding,
         )?);
     }
     Ok(prompt)
@@ -705,23 +763,87 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_max_prepends_prefix() {
+    fn original_encoding_only_max_prepends_prefix() {
         let msgs = [user("Hello")];
+        // `max` emits the prefix immediately after BOS.
         let params = EncodeParams {
             reasoning_effort: Some(ReasoningEffort::Max),
             ..EncodeParams::default()
         };
         let out = encode_messages(&msgs, ThinkingMode::Thinking, &params).unwrap();
-        // The prefix appears immediately after BOS, before the user message.
-        let expected_start = format!("{BOS_TOKEN}{REASONING_EFFORT_MAX}");
+        let expected_start = format!("{BOS_TOKEN}{REASONING_EFFORT_ABSOLUTE_MAXIMUM}");
         assert!(
             out.starts_with(&expected_start),
-            "expected prompt to start with BOS+REASONING_EFFORT_MAX, got: {:?}",
+            "expected prompt to start with BOS + the original max prefix, got: {:?}",
             &out[..120.min(out.len())]
         );
-        // Without max effort, the prefix is absent.
+        // `high` is accepted but renders nothing in the original encoding.
+        let params_high = EncodeParams {
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..EncodeParams::default()
+        };
+        let out_high = encode_messages(&msgs, ThinkingMode::Thinking, &params_high).unwrap();
+        assert!(!out_high.contains("Reasoning Effort"));
+        // Outside thinking mode the prefix is absent.
         let out_chat = encode_messages(&msgs, ThinkingMode::Chat, &params).unwrap();
         assert!(!out_chat.contains("Reasoning Effort"));
+    }
+
+    #[test]
+    fn v0731_encoding_shifts_effort_levels() {
+        let msgs = [user("Hello")];
+        for (effort, expected_prefix) in [
+            (None, None),
+            (Some(ReasoningEffort::Low), None),
+            (
+                Some(ReasoningEffort::High),
+                Some("Reasoning Effort: Absolute maximum"),
+            ),
+            (
+                Some(ReasoningEffort::Max),
+                Some("Reasoning Effort: Beyond maximum"),
+            ),
+        ] {
+            let params = EncodeParams {
+                reasoning_effort: effort,
+                effort_encoding: EffortEncoding::V0731,
+                ..EncodeParams::default()
+            };
+            let out = encode_messages(&msgs, ThinkingMode::Thinking, &params).unwrap();
+            match expected_prefix {
+                Some(prefix) => assert!(
+                    out.starts_with(&format!("{BOS_TOKEN}{prefix}")),
+                    "effort {effort:?}: {:?}",
+                    &out[..120.min(out.len())]
+                ),
+                None => assert!(!out.contains("Reasoning Effort"), "effort {effort:?}"),
+            }
+            // Chat mode never emits an effort prefix.
+            let out_chat = encode_messages(&msgs, ThinkingMode::Chat, &params).unwrap();
+            assert!(!out_chat.contains("Reasoning Effort"), "effort {effort:?}");
+        }
+    }
+
+    #[test]
+    fn effort_encoding_native_value_sets() {
+        assert_eq!(
+            EffortEncoding::Original.parse_native("max"),
+            Some(ReasoningEffort::Max)
+        );
+        assert_eq!(
+            EffortEncoding::Original.parse_native("high"),
+            Some(ReasoningEffort::High)
+        );
+        // `low` only exists in the 0731 revision.
+        assert_eq!(EffortEncoding::Original.parse_native("low"), None);
+        assert_eq!(
+            EffortEncoding::V0731.parse_native("low"),
+            Some(ReasoningEffort::Low)
+        );
+        for encoding in [EffortEncoding::Original, EffortEncoding::V0731] {
+            assert_eq!(encoding.parse_native("medium"), None);
+            assert_eq!(encoding.parse_native("turbo"), None);
+        }
     }
 
     #[test]

@@ -291,4 +291,159 @@ mod tests {
             "thinking mode should leave a <think> token open"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // 0731-vs-original effort-encoding identification
+    // -----------------------------------------------------------------------
+
+    /// Stand-ins for the `encoding/encoding_dsv4.py` each checkpoint ships;
+    /// only the effort block differs between revisions, so the fingerprint is
+    /// the 0731-only `max` prompt text.
+    const BASE_ENCODER_SNIPPET: &str = r#"REASONING_EFFORT_MAX = (
+    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+)"#;
+    const V0731_ENCODER_SNIPPET: &str = r#"REASONING_EFFORT_PROMPTS = {
+    "low": "",
+    "high": "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n",
+    "max": "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n",
+}"#;
+
+    /// Build `<temp>/<model_name>/` with a V4 config and optionally the
+    /// checkpoint's shipped Python encoder.
+    fn write_v4_model_dir(model_name: &str, encoder_source: Option<&str>) -> (TempDir, String) {
+        let temp = TempDir::new().unwrap();
+        let model_dir = temp.path().join(model_name);
+        fs::create_dir(&model_dir).unwrap();
+        let tok_path = model_dir.join("tokenizer.json");
+        fs::write(&tok_path, MIN_TOKENIZER_JSON).unwrap();
+        fs::write(
+            model_dir.join("config.json"),
+            json!({ "architectures": ["DeepseekV4ForCausalLM"] }).to_string(),
+        )
+        .unwrap();
+        if let Some(source) = encoder_source {
+            let encoding_dir = model_dir.join("encoding");
+            fs::create_dir(&encoding_dir).unwrap();
+            fs::write(encoding_dir.join("encoding_dsv4.py"), source).unwrap();
+        }
+        (temp, tok_path.to_str().unwrap().to_string())
+    }
+
+    fn render_with_native_effort(
+        tokenizer: &HuggingFaceTokenizer,
+        effort: &str,
+    ) -> anyhow::Result<String> {
+        let messages = vec![json!({ "role": "user", "content": "Hello" })];
+        let kwargs = HashMap::from([("reasoning_effort".to_string(), json!(effort))]);
+        let params = ChatTemplateParams {
+            template_kwargs: Some(&kwargs),
+            ..Default::default()
+        };
+        tokenizer.apply_chat_template(&messages, params)
+    }
+
+    #[test]
+    fn shipped_0731_encoder_selects_0731_effort_encoding() {
+        // The dir name says nothing about 0731 — the shipped encoder decides.
+        let (_tmp, tok) = write_v4_model_dir("my-local-v4-copy", Some(V0731_ENCODER_SNIPPET));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+
+        let out = render_with_native_effort(&tokenizer, "max").unwrap();
+        assert!(out.contains("Reasoning Effort: Beyond maximum"), "{out}");
+        let out = render_with_native_effort(&tokenizer, "high").unwrap();
+        assert!(out.contains("Reasoning Effort: Absolute maximum"), "{out}");
+        assert!(!out.contains("Beyond maximum"), "{out}");
+        // `low` is valid in 0731 and renders no prefix.
+        let out = render_with_native_effort(&tokenizer, "low").unwrap();
+        assert!(!out.contains("Reasoning Effort:"), "{out}");
+    }
+
+    #[test]
+    fn shipped_base_encoder_wins_over_0731_dir_name() {
+        // Fingerprint beats the name: a dir named 0731 that ships the base
+        // encoder still gets the original effort encoding.
+        let (_tmp, tok) = write_v4_model_dir("DeepSeek-V4-Flash-0731", Some(BASE_ENCODER_SNIPPET));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+
+        let out = render_with_native_effort(&tokenizer, "max").unwrap();
+        assert!(out.contains("Reasoning Effort: Absolute maximum"), "{out}");
+        assert!(!out.contains("Beyond maximum"), "{out}");
+        // The original Python encoder accepts `high` but renders nothing.
+        let out = render_with_native_effort(&tokenizer, "high").unwrap();
+        assert!(!out.contains("Reasoning Effort:"), "{out}");
+        // `low` does not exist in the original revision.
+        let err = render_with_native_effort(&tokenizer, "low").unwrap_err();
+        assert!(
+            err.to_string().contains("must be one of high, max"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_encoder_falls_back_to_dir_name() {
+        let (_tmp, tok) = write_v4_model_dir("DeepSeek-V4-Flash-0731", None);
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let out = render_with_native_effort(&tokenizer, "max").unwrap();
+        assert!(out.contains("Reasoning Effort: Beyond maximum"), "{out}");
+
+        let (_tmp, tok) = write_v4_model_dir("DeepSeek-V4-Flash", None);
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let out = render_with_native_effort(&tokenizer, "max").unwrap();
+        assert!(out.contains("Reasoning Effort: Absolute maximum"), "{out}");
+        assert!(!out.contains("Beyond maximum"), "{out}");
+    }
+
+    #[test]
+    fn invalid_native_effort_is_rejected_loudly() {
+        let (_tmp, tok) = write_v4_model_dir("DeepSeek-V4-Flash-0731", None);
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        for effort in ["medium", "turbo", "MAX"] {
+            let err = render_with_native_effort(&tokenizer, effort).unwrap_err();
+            assert!(
+                err.to_string().contains("must be one of low, high, max"),
+                "effort {effort}: unexpected error: {err}"
+            );
+        }
+        // Non-string values are rejected too.
+        let messages = vec![json!({ "role": "user", "content": "Hello" })];
+        let kwargs = HashMap::from([("reasoning_effort".to_string(), json!(3))]);
+        let err = tokenizer
+            .apply_chat_template(
+                &messages,
+                ChatTemplateParams {
+                    template_kwargs: Some(&kwargs),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("must be one of low, high, max"));
+    }
+
+    #[test]
+    fn native_effort_enables_thinking_unless_overridden() {
+        let (_tmp, tok) = write_v4_model_dir("DeepSeek-V4-Flash-0731", None);
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![json!({ "role": "user", "content": "Hello" })];
+
+        // Effort alone implies thinking mode (the prefix only exists there).
+        let out = render_with_native_effort(&tokenizer, "max").unwrap();
+        assert!(out.ends_with("<think>"), "{out}");
+
+        // An explicit thinking=false still wins and suppresses the prefix.
+        let kwargs = HashMap::from([
+            ("reasoning_effort".to_string(), json!("max")),
+            ("thinking".to_string(), json!(false)),
+        ]);
+        let out = tokenizer
+            .apply_chat_template(
+                &messages,
+                ChatTemplateParams {
+                    template_kwargs: Some(&kwargs),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(out.ends_with("</think>"), "{out}");
+        assert!(!out.contains("Reasoning Effort:"), "{out}");
+    }
 }
