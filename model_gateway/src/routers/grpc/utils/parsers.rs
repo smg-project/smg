@@ -46,17 +46,41 @@ pub(crate) fn extract_thinking_from_kwargs(
     .and_then(|v| v.as_bool())
 }
 
+/// For renderers where a native `chat_template_kwargs.reasoning_effort`
+/// switches the template into thinking mode (DeepSeek V4), report that
+/// preference so downstream reasoning parsing is armed consistently with what
+/// the renderer will emit.
+fn extract_template_effort_thinking(
+    kwargs: Option<&std::collections::HashMap<String, Value>>,
+    tokenizer: &dyn Tokenizer,
+) -> Option<bool> {
+    if !tokenizer.template_reasoning_effort_enables_thinking() {
+        return None;
+    }
+    match kwargs?.get("reasoning_effort").and_then(Value::as_str) {
+        Some("low" | "high" | "max") => Some(true),
+        _ => None,
+    }
+}
+
 /// Precedence for the effective thinking preference: an explicit template
-/// toggle (already extracted from kwargs) always wins; otherwise fall back to
-/// the protocol-level OpenAI `reasoning_effort` mapping
-/// ([`thinking_from_reasoning_effort`]).
-fn resolve_thinking_pref(explicit: Option<bool>, reasoning_effort: Option<&str>) -> Option<bool> {
-    explicit.or_else(|| thinking_from_reasoning_effort(reasoning_effort))
+/// toggle (already extracted from kwargs) always wins, then a native template
+/// effort for renderers that support it, then the protocol-level OpenAI
+/// `reasoning_effort` mapping ([`thinking_from_reasoning_effort`]).
+fn resolve_thinking_pref(
+    explicit: Option<bool>,
+    template_effort: Option<bool>,
+    reasoning_effort: Option<&str>,
+) -> Option<bool> {
+    explicit
+        .or(template_effort)
+        .or_else(|| thinking_from_reasoning_effort(reasoning_effort))
 }
 
 /// Resolve the user's effective thinking preference, honoring an explicit
-/// template thinking kwarg first (it always wins), then falling back to the
-/// OpenAI `reasoning_effort` mapping.
+/// template thinking kwarg first (it always wins), then a native template
+/// effort for renderers that support it, then falling back to the OpenAI
+/// `reasoning_effort` mapping.
 pub fn resolve_user_thinking(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
@@ -64,6 +88,7 @@ pub fn resolve_user_thinking(
 ) -> Option<bool> {
     resolve_thinking_pref(
         extract_thinking_from_kwargs(kwargs, tokenizer),
+        extract_template_effort_thinking(kwargs, tokenizer),
         reasoning_effort,
     )
 }
@@ -196,17 +221,41 @@ mod tests {
 
     #[test]
     fn resolve_thinking_pref_explicit_kwarg_wins() {
-        // An explicit template toggle always wins over the reasoning_effort mapping.
-        assert_eq!(resolve_thinking_pref(Some(true), Some("none")), Some(true));
+        // An explicit template toggle always wins over the template effort and
+        // the reasoning_effort mapping.
         assert_eq!(
-            resolve_thinking_pref(Some(false), Some("high")),
+            resolve_thinking_pref(Some(true), None, Some("none")),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_thinking_pref(Some(false), Some(true), Some("high")),
             Some(false)
         );
+        // A native template effort wins over the public effort mapping.
+        assert_eq!(
+            resolve_thinking_pref(None, Some(true), Some("none")),
+            Some(true)
+        );
         // No explicit toggle -> fall back to the reasoning_effort mapping.
-        assert_eq!(resolve_thinking_pref(None, Some("none")), Some(false));
-        assert_eq!(resolve_thinking_pref(None, Some("minimal")), Some(false));
-        assert_eq!(resolve_thinking_pref(None, Some("high")), None);
-        assert_eq!(resolve_thinking_pref(None, None), None);
+        assert_eq!(resolve_thinking_pref(None, None, Some("none")), Some(false));
+        assert_eq!(
+            resolve_thinking_pref(None, None, Some("minimal")),
+            Some(false)
+        );
+        assert_eq!(resolve_thinking_pref(None, None, Some("high")), None);
+        assert_eq!(resolve_thinking_pref(None, None, None), None);
+    }
+
+    #[test]
+    fn deepseek_v4_reasoning_parser_is_available_without_override() {
+        let factory = ReasoningParserFactory::new();
+        let model = "deepseek-ai/DeepSeek-V4-Flash-0731";
+
+        assert!(check_reasoning_parser_availability(&factory, None, model));
+        let parser = create_reasoning_parser(&factory, None, model)
+            .expect("DeepSeek V4 parser should be selected automatically");
+        assert_eq!(parser.model_type(), "deepseek_v4");
+        assert!(!parser.is_in_reasoning());
     }
 
     #[test]
