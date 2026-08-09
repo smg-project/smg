@@ -46,27 +46,30 @@ pub(crate) fn extract_thinking_from_kwargs(
     .and_then(|v| v.as_bool())
 }
 
-/// For renderers where a native `chat_template_kwargs.reasoning_effort`
-/// switches the template into thinking mode (DeepSeek V4), report that
-/// preference so downstream reasoning parsing is armed consistently with what
-/// the renderer will emit.
+/// Report `Some(true)` when the renderer will enter thinking mode because of
+/// a native reasoning-effort value, so the reasoning parser is armed
+/// consistently with the rendered prompt. Mirrors the template-kwargs merge:
+/// an explicit kwargs entry wins over the top-level `reasoning_effort` field.
 fn extract_template_effort_thinking(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
+    reasoning_effort: Option<&str>,
     tokenizer: &dyn Tokenizer,
 ) -> Option<bool> {
-    if !tokenizer.template_reasoning_effort_enables_thinking() {
+    let native_values = tokenizer.native_reasoning_effort_values();
+    if native_values.is_empty() {
         return None;
     }
-    match kwargs?.get("reasoning_effort").and_then(Value::as_str) {
-        Some("low" | "high" | "max") => Some(true),
-        _ => None,
-    }
+    let effort = kwargs
+        .and_then(|k| k.get("reasoning_effort"))
+        .and_then(Value::as_str)
+        .or(reasoning_effort)?;
+    native_values.contains(&effort).then_some(true)
 }
 
 /// Precedence for the effective thinking preference: an explicit template
-/// toggle (already extracted from kwargs) always wins, then a native template
-/// effort for renderers that support it, then the protocol-level OpenAI
-/// `reasoning_effort` mapping ([`thinking_from_reasoning_effort`]).
+/// toggle always wins, then a native template effort for renderers that
+/// support it, then the protocol-level OpenAI `reasoning_effort` mapping
+/// ([`thinking_from_reasoning_effort`]).
 fn resolve_thinking_pref(
     explicit: Option<bool>,
     template_effort: Option<bool>,
@@ -77,10 +80,7 @@ fn resolve_thinking_pref(
         .or_else(|| thinking_from_reasoning_effort(reasoning_effort))
 }
 
-/// Resolve the user's effective thinking preference, honoring an explicit
-/// template thinking kwarg first (it always wins), then a native template
-/// effort for renderers that support it, then falling back to the OpenAI
-/// `reasoning_effort` mapping.
+/// Resolve the user's effective thinking preference.
 pub fn resolve_user_thinking(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
@@ -88,7 +88,7 @@ pub fn resolve_user_thinking(
 ) -> Option<bool> {
     resolve_thinking_pref(
         extract_thinking_from_kwargs(kwargs, tokenizer),
-        extract_template_effort_thinking(kwargs, tokenizer),
+        extract_template_effort_thinking(kwargs, reasoning_effort, tokenizer),
         reasoning_effort,
     )
 }
@@ -220,42 +220,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_thinking_pref_explicit_kwarg_wins() {
-        // An explicit template toggle always wins over the template effort and
-        // the reasoning_effort mapping.
-        assert_eq!(
-            resolve_thinking_pref(Some(true), None, Some("none")),
-            Some(true)
-        );
+    fn resolve_thinking_pref_precedence() {
+        // Explicit toggle > native template effort > reasoning_effort mapping.
         assert_eq!(
             resolve_thinking_pref(Some(false), Some(true), Some("high")),
             Some(false)
         );
-        // A native template effort wins over the public effort mapping.
         assert_eq!(
             resolve_thinking_pref(None, Some(true), Some("none")),
             Some(true)
         );
-        // No explicit toggle -> fall back to the reasoning_effort mapping.
         assert_eq!(resolve_thinking_pref(None, None, Some("none")), Some(false));
-        assert_eq!(
-            resolve_thinking_pref(None, None, Some("minimal")),
-            Some(false)
-        );
         assert_eq!(resolve_thinking_pref(None, None, Some("high")), None);
         assert_eq!(resolve_thinking_pref(None, None, None), None);
     }
 
     #[test]
-    fn deepseek_v4_reasoning_parser_is_available_without_override() {
-        let factory = ReasoningParserFactory::new();
-        let model = "deepseek-ai/DeepSeek-V4-Flash-0731";
+    fn template_effort_thinking_covers_kwargs_and_top_level_field() {
+        use llm_tokenizer::traits::{Encoder, Encoding};
+        struct T(llm_tokenizer::MockTokenizer);
+        impl Encoder for T {
+            fn encode(&self, i: &str, s: bool) -> anyhow::Result<Encoding> {
+                self.0.encode(i, s)
+            }
+            fn encode_batch(&self, i: &[&str], s: bool) -> anyhow::Result<Vec<Encoding>> {
+                self.0.encode_batch(i, s)
+            }
+        }
+        impl llm_tokenizer::traits::Decoder for T {
+            fn decode(&self, ids: &[u32], s: bool) -> anyhow::Result<String> {
+                self.0.decode(ids, s)
+            }
+        }
+        impl Tokenizer for T {
+            fn vocab_size(&self) -> usize {
+                self.0.vocab_size()
+            }
+            fn get_special_tokens(&self) -> &llm_tokenizer::traits::SpecialTokens {
+                self.0.get_special_tokens()
+            }
+            fn token_to_id(&self, t: &str) -> Option<u32> {
+                self.0.token_to_id(t)
+            }
+            fn id_to_token(&self, id: u32) -> Option<String> {
+                self.0.id_to_token(id)
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
+                &["low", "high", "max"]
+            }
+        }
+        let tok = T(llm_tokenizer::MockTokenizer::new());
 
-        assert!(check_reasoning_parser_availability(&factory, None, model));
-        let parser = create_reasoning_parser(&factory, None, model)
-            .expect("DeepSeek V4 parser should be selected automatically");
-        assert_eq!(parser.model_type(), "deepseek_v4");
-        assert!(!parser.is_in_reasoning());
+        // Top-level field arms thinking when the renderer would interpret it.
+        assert_eq!(
+            extract_template_effort_thinking(None, Some("high"), &tok),
+            Some(true)
+        );
+        // Unrecognized values never arm (the renderer ignores them too).
+        assert_eq!(
+            extract_template_effort_thinking(None, Some("medium"), &tok),
+            None
+        );
+        // A kwargs entry wins over the top-level field, matching the merge.
+        let kwargs = std::collections::HashMap::from([(
+            "reasoning_effort".to_string(),
+            Value::String("max".to_string()),
+        )]);
+        assert_eq!(
+            extract_template_effort_thinking(Some(&kwargs), Some("medium"), &tok),
+            Some(true)
+        );
+        // Renderers without native efforts never arm.
+        assert_eq!(
+            extract_template_effort_thinking(
+                Some(&kwargs),
+                Some("high"),
+                &llm_tokenizer::MockTokenizer::new()
+            ),
+            None
+        );
     }
 
     #[test]

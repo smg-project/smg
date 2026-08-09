@@ -298,8 +298,8 @@ impl Tokenizer for CachedTokenizer {
         self.inner.thinking_key_name()
     }
 
-    fn template_reasoning_effort_enables_thinking(&self) -> bool {
-        self.inner.template_reasoning_effort_enables_thinking()
+    fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
+        self.inner.native_reasoning_effort_values()
     }
 
     fn think_in_prefill(&self) -> bool {

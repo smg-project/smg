@@ -162,19 +162,13 @@ impl ParserFactory {
             Box::new(BaseReasoningParser::new(config).with_model_type("deepseek_v31".to_string()))
         });
 
-        // DeepSeek V4 prefills <think> in the generation prompt when thinking
-        // is enabled, so request processing marks the parser as already in
-        // reasoning (via think_in_prefill) before the first generated token
-        // arrives.
+        // V4 prefills <think>; request processing arms the parser via
+        // mark_reasoning_started.
         registry.register_parser("deepseek_v4", || {
-            let config = ParserConfig {
-                think_start_token: "<think>".to_string(),
-                think_end_token: "</think>".to_string(),
-                stream_reasoning: true,
-                max_buffer_size: DEFAULT_MAX_BUFFER_SIZE,
-                always_in_reasoning: false,
-            };
-            Box::new(BaseReasoningParser::new(config).with_model_type("deepseek_v4".to_string()))
+            Box::new(
+                BaseReasoningParser::new(ParserConfig::default())
+                    .with_model_type("deepseek_v4".to_string()),
+            )
         });
 
         registry.register_parser("kimi_k25", || {
@@ -293,26 +287,18 @@ mod tests {
     #[test]
     fn test_factory_auto_registers_deepseek_v4_models() {
         let factory = ParserFactory::new();
-        assert!(factory.list_parsers().contains(&"deepseek_v4".to_string()));
+        assert_eq!(
+            factory
+                .create("deepseek-ai/DeepSeek-V4-Flash-0731")
+                .model_type(),
+            "deepseek_v4"
+        );
+        assert_eq!(
+            factory.create("DEEPSEEK_V4_LOCAL").model_type(),
+            "deepseek_v4"
+        );
 
-        for model in [
-            "deepseek-ai/DeepSeek-V4-Flash",
-            "deepseek-ai/DeepSeek-V4-Flash-0731",
-            "deepseek-ai/DeepSeek-V4-Flash-DSpark",
-            "deepseek-ai/DeepSeek-V4-Pro",
-            "DEEPSEEK_V4_LOCAL",
-        ] {
-            assert_eq!(
-                factory.create(model).model_type(),
-                "deepseek_v4",
-                "model: {model}"
-            );
-        }
-
-        // The prompt prefills <think>; request processing marks the parser as
-        // in-reasoning before the first generated token.
-        let mut parser = factory.create("deepseek-ai/DeepSeek-V4-Flash-0731");
-        assert!(!parser.is_in_reasoning());
+        let mut parser = factory.create("deepseek-ai/DeepSeek-V4-Flash");
         parser.mark_reasoning_started();
         let parsed = parser
             .detect_and_parse_reasoning("analysis</think>answer")

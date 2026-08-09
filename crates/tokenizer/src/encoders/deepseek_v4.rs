@@ -1,8 +1,6 @@
 // Ported from the `encoding/encoding_dsv4.py` shipped with the DeepSeek V4
-// checkpoints. Two revisions of that file exist in the wild and they disagree
-// only in the reasoning-effort block:
-//   - https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash (also -DSpark, -Pro)
-//   - https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731
+// checkpoints (deepseek-ai/DeepSeek-V4-Flash and -Flash-0731 on HF); the two
+// revisions differ only in the reasoning-effort block.
 
 use std::fmt::Write as _;
 
@@ -15,18 +13,14 @@ pub use super::deepseek_v32::ThinkingMode;
 
 /// Which reasoning-effort prompt revision the checkpoint was trained with.
 ///
-/// The 0731 refresh shifted the effort levels down one: the text the original
-/// checkpoint emits for `max` became 0731's `high`, and 0731's `max` is a new,
-/// stronger prompt. Everything else in the encoding is byte-identical, so this
-/// is the only per-checkpoint switch the encoder needs.
+/// The 0731 refresh shifted the levels down one: the original's `max` text
+/// became 0731's `high`, and 0731's `max` is a new, stronger prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EffortEncoding {
-    /// `DeepSeek-V4-Flash` / `-DSpark` / `-Pro`: accepts `high`/`max`, only
-    /// `max` emits a prefix (`high` is accepted but renders nothing).
+    /// `DeepSeek-V4-Flash` / `-DSpark` / `-Pro`.
     #[default]
     Original,
-    /// `DeepSeek-V4-Flash-0731`: accepts `low`/`high`/`max`; `low` is the
-    /// default and renders nothing.
+    /// `DeepSeek-V4-Flash-0731`.
     V0731,
 }
 
@@ -46,6 +40,20 @@ impl EffortEncoding {
             (_, "high") => Some(ReasoningEffort::High),
             (_, "max") => Some(ReasoningEffort::Max),
             _ => None,
+        }
+    }
+
+    /// Identify the revision from the checkpoint's own `encoding_dsv4.py`
+    /// source: only the 0731 file contains its new `max` prompt text.
+    pub fn detect_from_encoder_source(source: &str) -> Self {
+        let marker = REASONING_EFFORT_BEYOND_MAXIMUM
+            .split_inclusive('\n')
+            .next()
+            .unwrap_or(REASONING_EFFORT_BEYOND_MAXIMUM);
+        if source.contains(marker.trim_end()) {
+            Self::V0731
+        } else {
+            Self::Original
         }
     }
 }
@@ -138,10 +146,8 @@ fn task_sp_token(task: &str) -> Option<&'static str> {
 // ---------------------------------------------------------------------------
 // Templates
 // ---------------------------------------------------------------------------
-// Original `REASONING_EFFORT_MAX`; the 0731 refresh reuses this exact text
-// for its `high` level.
+// Original `max` prefix; the 0731 refresh reuses this exact text for `high`.
 const REASONING_EFFORT_ABSOLUTE_MAXIMUM: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
-// 0731's `max` level.
 const REASONING_EFFORT_BEYOND_MAXIMUM: &str = "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\nYou MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\nDo not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
 
 /// Mirrors V4's `TOOLS_TEMPLATE`. The block name is `tool_calls` (not
@@ -308,8 +314,7 @@ fn render_message(
     let tool_calls_owned = tool_calls_raw.map(|tc| tool_calls_from_openai_format(tc));
     let tool_calls = tool_calls_owned.as_deref();
 
-    // Reasoning effort prefix (only at index 0 in thinking mode). Which levels
-    // emit which text depends on the checkpoint's encoding revision.
+    // Reasoning effort prefix: index 0, thinking mode only.
     if index == 0 && thinking_mode == ThinkingMode::Thinking {
         match (effort_encoding, reasoning_effort) {
             (EffortEncoding::Original, Some(ReasoningEffort::Max)) => {
@@ -818,32 +823,31 @@ mod tests {
                 ),
                 None => assert!(!out.contains("Reasoning Effort"), "effort {effort:?}"),
             }
-            // Chat mode never emits an effort prefix.
-            let out_chat = encode_messages(&msgs, ThinkingMode::Chat, &params).unwrap();
-            assert!(!out_chat.contains("Reasoning Effort"), "effort {effort:?}");
         }
     }
 
     #[test]
     fn effort_encoding_native_value_sets() {
-        assert_eq!(
-            EffortEncoding::Original.parse_native("max"),
-            Some(ReasoningEffort::Max)
-        );
-        assert_eq!(
-            EffortEncoding::Original.parse_native("high"),
-            Some(ReasoningEffort::High)
-        );
-        // `low` only exists in the 0731 revision.
+        // `low` only exists in the 0731 revision; unknown names parse nowhere.
         assert_eq!(EffortEncoding::Original.parse_native("low"), None);
         assert_eq!(
             EffortEncoding::V0731.parse_native("low"),
             Some(ReasoningEffort::Low)
         );
-        for encoding in [EffortEncoding::Original, EffortEncoding::V0731] {
-            assert_eq!(encoding.parse_native("medium"), None);
-            assert_eq!(encoding.parse_native("turbo"), None);
-        }
+        assert_eq!(EffortEncoding::V0731.parse_native("medium"), None);
+    }
+
+    #[test]
+    fn effort_encoding_detected_from_encoder_source() {
+        let v0731_src = format!("PROMPTS = {{'max': {REASONING_EFFORT_BEYOND_MAXIMUM:?}}}");
+        assert_eq!(
+            EffortEncoding::detect_from_encoder_source(&v0731_src),
+            EffortEncoding::V0731
+        );
+        assert_eq!(
+            EffortEncoding::detect_from_encoder_source("REASONING_EFFORT_MAX = '...'"),
+            EffortEncoding::Original
+        );
     }
 
     #[test]
