@@ -16,6 +16,17 @@ use crate::{
 /// Type alias for parser creator functions.
 type ParserCreator = Arc<dyn Fn() -> Box<dyn ReasoningParser> + Send + Sync>;
 
+fn conditional_deepseek_parser(model_type: &str) -> Box<dyn ReasoningParser> {
+    let config = ParserConfig {
+        think_start_token: "<think>".to_string(),
+        think_end_token: "</think>".to_string(),
+        stream_reasoning: true,
+        max_buffer_size: DEFAULT_MAX_BUFFER_SIZE,
+        always_in_reasoning: false,
+    };
+    Box::new(BaseReasoningParser::new(config).with_model_type(model_type.to_string()))
+}
+
 /// Registry for model-specific parsers.
 #[derive(Clone)]
 pub struct ParserRegistry {
@@ -152,15 +163,12 @@ impl ParserFactory {
 
         // standard think tokens, always_in_reasoning=false
         registry.register_parser("deepseek_v31", || {
-            let config = ParserConfig {
-                think_start_token: "<think>".to_string(),
-                think_end_token: "</think>".to_string(),
-                stream_reasoning: true,
-                max_buffer_size: DEFAULT_MAX_BUFFER_SIZE,
-                always_in_reasoning: false,
-            };
-            Box::new(BaseReasoningParser::new(config).with_model_type("deepseek_v31".to_string()))
+            conditional_deepseek_parser("deepseek_v31")
         });
+
+        // DeepSeek V4 uses the same delimiters, but has its own name so CLI
+        // configuration and model-based selection match the served model.
+        registry.register_parser("deepseek_v4", || conditional_deepseek_parser("deepseek_v4"));
 
         registry.register_parser("kimi_k25", || {
             let config = ParserConfig {
@@ -190,6 +198,7 @@ impl ParserFactory {
         registry.register_pattern("deepseek-r1", "deepseek_r1");
         registry.register_pattern("deepseek-v3.1", "deepseek_v31");
         registry.register_pattern("deepseek-v3-1", "deepseek_v31");
+        registry.register_pattern("deepseek-v4", "deepseek_v4");
         registry.register_pattern("qwen3-thinking", "qwen3_thinking");
         registry.register_pattern("qwen-thinking", "qwen3_thinking");
         registry.register_pattern("qwen3", "qwen3");
@@ -271,6 +280,21 @@ mod tests {
         let factory = ParserFactory::new();
         let parser = factory.create("deepseek-r1-distill");
         assert_eq!(parser.model_type(), "deepseek_r1");
+    }
+
+    #[test]
+    fn test_factory_creates_deepseek_v4() {
+        let factory = ParserFactory::new();
+        let mut parser = factory.create("deepseek-v4-pro");
+        assert_eq!(parser.model_type(), "deepseek_v4");
+
+        // The V4 prompt consumes `<think>` before generation starts.
+        parser.mark_reasoning_started();
+        let result = parser
+            .detect_and_parse_reasoning("reasoning</think>answer")
+            .unwrap();
+        assert_eq!(result.reasoning_text, "reasoning");
+        assert_eq!(result.normal_text, "answer");
     }
 
     #[test]

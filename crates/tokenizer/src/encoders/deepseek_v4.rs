@@ -1,4 +1,4 @@
-// Ported from https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/encoding/encoding_dsv4.py
+// Ported from https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/encoding_dsv4.py
 
 use std::fmt::Write as _;
 

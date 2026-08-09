@@ -68,10 +68,10 @@ mod tests {
             ..Default::default()
         };
         let out = tokenizer.apply_chat_template(&messages, params).unwrap();
-        // V4 emits BOS + <｜User｜>Hello<｜Assistant｜></think> in chat mode.
+        // DeepSeek V4 defaults to thinking mode.
         assert!(out.contains("<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>"));
         assert!(out.contains("<\u{FF5C}User\u{FF5C}>Hello<\u{FF5C}Assistant\u{FF5C}>"));
-        assert!(out.ends_with("</think>"));
+        assert!(out.ends_with("<think>"));
     }
 
     #[test]
@@ -201,14 +201,13 @@ mod tests {
         // gate thinking on the `thinking` kwarg. The trait methods must
         // surface this so the gateway can call `mark_reasoning_started` on
         // the conditional reasoning parser (deepseek_v31 etc).
-        for arch in &["DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM"] {
-            let (_tmp, tok) = write_dir(Some(&[*arch]));
+        for (arch, expected) in [
+            ("DeepseekV32ForCausalLM", ThinkingToggle::DefaultOff),
+            ("DeepseekV4ForCausalLM", ThinkingToggle::DefaultOn),
+        ] {
+            let (_tmp, tok) = write_dir(Some(&[arch]));
             let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
-            assert_eq!(
-                tokenizer.thinking_toggle(),
-                ThinkingToggle::DefaultOff,
-                "{arch}: expected DefaultOff toggle"
-            );
+            assert_eq!(tokenizer.thinking_toggle(), expected, "{arch}");
             assert_eq!(
                 tokenizer.thinking_key_name(),
                 Some(ThinkingKeyName::Thinking),
@@ -222,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_renderers_honor_thinking_kwarg_only() {
+    fn deepseek_renderers_honor_thinking_kwarg() {
         // `thinking: true` → prompt ends with <think> (thinking mode).
         // `enable_thinking: true` alone → ignored (chat mode), matching
         // `thinking_key_name() == Some(Thinking)` and sglang's DeepSeek path.
@@ -247,21 +246,20 @@ mod tests {
                 "{arch}: thinking=true should enter thinking mode: {out_thinking}"
             );
 
-            let mut enable_thinking_kwargs: HashMap<String, serde_json::Value> = HashMap::new();
-            enable_thinking_kwargs
-                .insert("enable_thinking".to_string(), serde_json::Value::Bool(true));
-            let out_enable = tokenizer
+            let mut chat_kwargs: HashMap<String, serde_json::Value> = HashMap::new();
+            chat_kwargs.insert("thinking".to_string(), serde_json::Value::Bool(false));
+            let out_chat = tokenizer
                 .apply_chat_template(
                     &messages,
                     ChatTemplateParams {
-                        template_kwargs: Some(&enable_thinking_kwargs),
+                        template_kwargs: Some(&chat_kwargs),
                         ..Default::default()
                     },
                 )
                 .unwrap();
             assert!(
-                out_enable.ends_with("</think>"),
-                "{arch}: enable_thinking alone must NOT enter thinking mode: {out_enable}"
+                out_chat.ends_with("</think>"),
+                "{arch}: thinking=false should enter chat mode: {out_chat}"
             );
         }
     }
@@ -290,5 +288,49 @@ mod tests {
             out.ends_with("<think>"),
             "thinking mode should leave a <think> token open"
         );
+    }
+
+    #[test]
+    fn deepseek_v4_normalizes_compatible_reasoning_efforts() {
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV4ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![json!({ "role": "user", "content": "Hello" })];
+
+        for effort in ["low", "medium", "high"] {
+            let kwargs = HashMap::from([(
+                "reasoning_effort".to_string(),
+                serde_json::Value::String(effort.to_string()),
+            )]);
+            let out = tokenizer
+                .apply_chat_template(
+                    &messages,
+                    ChatTemplateParams {
+                        template_kwargs: Some(&kwargs),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert!(
+                !out.contains("Reasoning Effort: Absolute maximum"),
+                "{effort}"
+            );
+            assert!(out.ends_with("<think>"), "{effort}");
+        }
+
+        let kwargs = HashMap::from([(
+            "reasoning_effort".to_string(),
+            serde_json::Value::String("xhigh".to_string()),
+        )]);
+        let out = tokenizer
+            .apply_chat_template(
+                &messages,
+                ChatTemplateParams {
+                    template_kwargs: Some(&kwargs),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(out.contains("Reasoning Effort: Absolute maximum"));
+        assert!(out.ends_with("<think>"));
     }
 }

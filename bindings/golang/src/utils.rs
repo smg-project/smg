@@ -31,12 +31,5 @@ pub(crate) fn chat_requires_reasoning(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
-    should_mark_reasoning_started(
-        resolve_user_thinking(
-            request.chat_template_kwargs.as_ref(),
-            request.reasoning_effort.as_deref(),
-            tokenizer,
-        ),
-        tokenizer,
-    )
+    should_mark_reasoning_started(resolve_user_thinking(request, tokenizer), tokenizer)
 }

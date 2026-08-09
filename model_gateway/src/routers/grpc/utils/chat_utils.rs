@@ -495,12 +495,10 @@ pub(crate) fn process_chat_messages_with_placeholders(
             add_generation_prompt: true,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
-            // Project OpenAI `reasoning_effort` (none/minimal) onto the model's
-            // thinking toggle; the tokenizer applies it under the correct key.
+            // Project the protocol-level DeepSeek `thinking` field and OpenAI
+            // compatibility values onto the model's thinking toggle.
             // An explicit chat_template_kwargs toggle still wins (in apply).
-            thinking: openai_protocol::chat::thinking_from_reasoning_effort(
-                request.reasoning_effort.as_deref(),
-            ),
+            thinking: request.thinking_preference(),
             ..Default::default()
         };
 
@@ -779,12 +777,15 @@ pub(crate) fn parse_finish_reason(
 
 #[cfg(test)]
 mod tests {
-    use llm_tokenizer::chat_template::ChatTemplateContentFormat;
+    use std::fs as test_fs;
+
+    use llm_tokenizer::{chat_template::ChatTemplateContentFormat, HuggingFaceTokenizer};
     use openai_protocol::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::{AudioUrl, ContentPart, ImageUrl, InputAudio, VideoUrl},
     };
     use serde_json::json;
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -794,6 +795,78 @@ mod tests {
             tokens.insert(*modality, (*token).to_string());
         }
         tokens
+    }
+
+    fn deepseek_v4_tokenizer() -> (TempDir, HuggingFaceTokenizer) {
+        const TOKENIZER_JSON: &str = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": { "type": "Whitespace" },
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "BPE",
+                "vocab": { "hello": 0, "<s>": 1, "</s>": 2 },
+                "merges": []
+            }
+        }"#;
+
+        let dir = TempDir::new().unwrap();
+        let tokenizer_path = dir.path().join("tokenizer.json");
+        test_fs::write(&tokenizer_path, TOKENIZER_JSON).unwrap();
+        test_fs::write(
+            dir.path().join("config.json"),
+            r#"{"architectures":["DeepseekV4ForCausalLM"]}"#,
+        )
+        .unwrap();
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        (dir, tokenizer)
+    }
+
+    fn deepseek_request(extra: Value) -> ChatCompletionRequest {
+        let mut request = json!({
+            "model": "deepseek-v4-pro",
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+        request.as_object_mut().unwrap().extend(
+            extra
+                .as_object()
+                .expect("extra request fields must be an object")
+                .clone(),
+        );
+        serde_json::from_value(request).unwrap()
+    }
+
+    #[test]
+    fn deepseek_v4_official_thinking_request_controls_prompt() {
+        let (_dir, tokenizer) = deepseek_v4_tokenizer();
+
+        let default_prompt = process_chat_messages(&deepseek_request(json!({})), &tokenizer, None)
+            .unwrap()
+            .text;
+        assert!(default_prompt.ends_with("<think>"));
+
+        let disabled_prompt = process_chat_messages(
+            &deepseek_request(json!({"thinking": {"type": "disabled"}})),
+            &tokenizer,
+            None,
+        )
+        .unwrap()
+        .text;
+        assert!(disabled_prompt.ends_with("</think>"));
+
+        let max_prompt = process_chat_messages(
+            &deepseek_request(json!({"reasoning_effort": "xhigh"})),
+            &tokenizer,
+            None,
+        )
+        .unwrap()
+        .text;
+        assert!(max_prompt.contains("Reasoning Effort: Absolute maximum"));
+        assert!(max_prompt.ends_with("<think>"));
     }
 
     #[test]

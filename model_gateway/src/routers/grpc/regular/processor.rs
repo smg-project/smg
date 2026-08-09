@@ -115,11 +115,7 @@ impl ResponseProcessor {
                 // If the template injected `<think>` in the prefill (thinking toggle
                 // is supported and effectively ON), start in reasoning mode.
                 if utils::should_mark_reasoning_started(
-                    utils::resolve_user_thinking(
-                        original_request.chat_template_kwargs.as_ref(),
-                        original_request.reasoning_effort.as_deref(),
-                        tokenizer.as_ref(),
-                    ),
+                    utils::resolve_user_thinking(original_request, tokenizer.as_ref()),
                     tokenizer.as_ref(),
                 ) {
                     parser.mark_reasoning_started();
@@ -533,21 +529,25 @@ impl ResponseProcessor {
         #[expect(clippy::unwrap_used, reason = "safe: checked len == 1 above")]
         let complete = all_responses.into_iter().next().unwrap();
 
-        // Check parser availability. Run parser when the user explicitly enabled thinking,
+        // Check parser availability. Run parser when thinking is effectively ON —
+        // explicitly enabled, or left to a template default of on (DeepSeek V4) —
         // or when the selected parser needs structural special tokens (e.g. Inkling).
         let reasoning_requires_special_tokens = utils::reasoning_parser_requires_special_tokens(
             &self.reasoning_parser_factory,
             self.configured_reasoning_parser.as_deref(),
             &messages_request.model,
         );
+        let user_thinking = match &messages_request.thinking {
+            Some(
+                messages::ThinkingConfig::Enabled { .. }
+                | messages::ThinkingConfig::Adaptive { .. },
+            ) => Some(true),
+            Some(messages::ThinkingConfig::Disabled) => Some(false),
+            None => None,
+        };
         let separate_reasoning = reasoning_requires_special_tokens
-            || matches!(
-                &messages_request.thinking,
-                Some(
-                    messages::ThinkingConfig::Enabled { .. }
-                        | messages::ThinkingConfig::Adaptive { .. }
-                )
-            );
+            || user_thinking == Some(true)
+            || utils::should_mark_reasoning_started(user_thinking, tokenizer.as_ref());
         let reasoning_parser_available = separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
@@ -628,18 +628,8 @@ impl ResponseProcessor {
                 &messages_request.model,
             ) {
                 // If thinking is effectively ON and template has a toggle, start in reasoning mode.
-                {
-                    let user_thinking = match &messages_request.thinking {
-                        Some(
-                            messages::ThinkingConfig::Enabled { .. }
-                            | messages::ThinkingConfig::Adaptive { .. },
-                        ) => Some(true),
-                        Some(messages::ThinkingConfig::Disabled) => Some(false),
-                        None => None,
-                    };
-                    if utils::should_mark_reasoning_started(user_thinking, tokenizer.as_ref()) {
-                        parser.mark_reasoning_started();
-                    }
+                if utils::should_mark_reasoning_started(user_thinking, tokenizer.as_ref()) {
+                    parser.mark_reasoning_started();
                 }
 
                 match parser.detect_and_parse_reasoning(&processed_text) {

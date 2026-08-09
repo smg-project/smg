@@ -137,6 +137,21 @@ impl MessageContent {
 // Chat Completion Request
 // ============================================================================
 
+/// DeepSeek thinking-mode configuration for the OpenAI-compatible API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChatThinkingConfig {
+    Enabled {},
+    Disabled {},
+}
+
+impl ChatThinkingConfig {
+    #[inline]
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled {})
+    }
+}
+
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Default, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_chat_cross_parameters"))]
@@ -198,6 +213,9 @@ pub struct ChatCompletionRequest {
 
     /// Cache key for prompts (beta feature)
     pub prompt_cache_key: Option<String>,
+
+    /// Enable or disable DeepSeek thinking mode.
+    pub thinking: Option<ChatThinkingConfig>,
 
     /// Effort level for reasoning models.
     ///
@@ -330,6 +348,19 @@ pub struct ChatCompletionRequest {
     /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
     #[serde(flatten)]
     pub other: Map<String, Value>,
+}
+
+impl ChatCompletionRequest {
+    /// Resolve the protocol-level thinking preference.
+    ///
+    /// The explicit DeepSeek `thinking` field wins over compatibility mappings
+    /// from OpenAI's `reasoning_effort`.
+    #[inline]
+    pub fn thinking_preference(&self) -> Option<bool> {
+        self.thinking
+            .map(ChatThinkingConfig::is_enabled)
+            .or_else(|| thinking_from_reasoning_effort(self.reasoning_effort.as_deref()))
+    }
 }
 
 /// Map an OpenAI `reasoning_effort` to a thinking on/off preference.
@@ -801,7 +832,7 @@ pub struct ChatStreamChoice {
 mod tests {
     use serde_json::{json, Value};
 
-    use super::{thinking_from_reasoning_effort, ChatCompletionRequest};
+    use super::{thinking_from_reasoning_effort, ChatCompletionRequest, ChatThinkingConfig};
 
     fn request_with_output_fields(fields: &[(&str, Value)]) -> ChatCompletionRequest {
         let mut value = json!({
@@ -852,6 +883,53 @@ mod tests {
                 .to_string()
                 .contains("reasoning_effort must be a string, number, or null"));
         }
+    }
+
+    #[test]
+    fn deepseek_thinking_config_is_strict_and_typed() {
+        for (value, expected) in [
+            (json!({"type": "enabled"}), ChatThinkingConfig::Enabled {}),
+            (json!({"type": "disabled"}), ChatThinkingConfig::Disabled {}),
+        ] {
+            let request = request_with_output_fields(&[("thinking", value.clone())]);
+            assert_eq!(request.thinking, Some(expected));
+            assert!(!request.other.contains_key("thinking"));
+            assert_eq!(
+                serde_json::to_value(request).unwrap().get("thinking"),
+                Some(&value)
+            );
+        }
+
+        for value in [
+            json!({"type": "auto"}),
+            json!({"type": "enabled", "budget_tokens": 1024}),
+            json!(true),
+        ] {
+            let mut request = json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            });
+            request["thinking"] = value.clone();
+            assert!(
+                serde_json::from_value::<ChatCompletionRequest>(request).is_err(),
+                "accepted invalid thinking value: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_deepseek_thinking_wins_over_reasoning_effort() {
+        let request = request_with_output_fields(&[
+            ("thinking", json!({"type": "enabled"})),
+            ("reasoning_effort", json!("none")),
+        ]);
+        assert_eq!(request.thinking_preference(), Some(true));
+
+        let request = request_with_output_fields(&[
+            ("thinking", json!({"type": "disabled"})),
+            ("reasoning_effort", json!("max")),
+        ]);
+        assert_eq!(request.thinking_preference(), Some(false));
     }
 
     #[test]

@@ -470,6 +470,7 @@ impl Router {
                 headers,
                 typed_req,
                 route,
+                model_id,
                 canonical_model,
                 worker.as_ref(),
                 is_stream,
@@ -982,6 +983,9 @@ impl Router {
 
     // Send typed request directly without conversion.
     //
+    // `model_id` is already canonical: the caller resolved any alias before
+    // routing, so model-specific request rewrites match on the registered ID.
+    //
     // `canonical_model` is set only when the client addressed the model by an
     // alias. The worker was registered under the canonical ID and has never
     // heard of the alias, so the body it receives carries the canonical name.
@@ -994,6 +998,7 @@ impl Router {
         headers: Option<&HeaderMap>,
         typed_req: &T,
         route: &'static str,
+        model_id: &str,
         canonical_model: Option<&str>,
         worker: &dyn Worker,
         is_stream: bool,
@@ -1026,6 +1031,10 @@ impl Router {
             }
         };
         strip_default_sglang_fields(&mut json_val);
+
+        if route == "/v1/chat/completions" {
+            super::deepseek_compat::apply_deepseek_v4_http_compat(&mut json_val, model_id);
+        }
 
         let mut request_builder = self.client.post(&endpoint_url).json(&json_val);
 

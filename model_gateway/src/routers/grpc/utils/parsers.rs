@@ -4,7 +4,7 @@ use llm_tokenizer::{
     chat_template::{ThinkingKeyName, ThinkingToggle},
     traits::Tokenizer,
 };
-use openai_protocol::chat::thinking_from_reasoning_effort;
+use openai_protocol::chat::ChatCompletionRequest;
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ReasoningParser};
 use serde_json::Value;
 use tool_parser::{
@@ -46,26 +46,16 @@ pub(crate) fn extract_thinking_from_kwargs(
     .and_then(|v| v.as_bool())
 }
 
-/// Precedence for the effective thinking preference: an explicit template
-/// toggle (already extracted from kwargs) always wins; otherwise fall back to
-/// the protocol-level OpenAI `reasoning_effort` mapping
-/// ([`thinking_from_reasoning_effort`]).
-fn resolve_thinking_pref(explicit: Option<bool>, reasoning_effort: Option<&str>) -> Option<bool> {
-    explicit.or_else(|| thinking_from_reasoning_effort(reasoning_effort))
-}
-
-/// Resolve the user's effective thinking preference, honoring an explicit
-/// template thinking kwarg first (it always wins), then falling back to the
-/// OpenAI `reasoning_effort` mapping.
+/// Resolve the user's effective thinking preference: an explicit template
+/// kwarg wins, then the protocol-level preference
+/// ([`ChatCompletionRequest::thinking_preference`] — DeepSeek's official
+/// `thinking` field, then the OpenAI `reasoning_effort` compatibility mapping).
 pub fn resolve_user_thinking(
-    kwargs: Option<&std::collections::HashMap<String, Value>>,
-    reasoning_effort: Option<&str>,
+    request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> Option<bool> {
-    resolve_thinking_pref(
-        extract_thinking_from_kwargs(kwargs, tokenizer),
-        reasoning_effort,
-    )
+    extract_thinking_from_kwargs(request.chat_template_kwargs.as_ref(), tokenizer)
+        .or_else(|| request.thinking_preference())
 }
 
 /// Check if a reasoning parser is available for the given model
@@ -192,21 +182,142 @@ pub(crate) fn create_tool_parser(
 
 #[cfg(test)]
 mod tests {
+    use llm_tokenizer::{
+        mock::MockTokenizer,
+        traits::{Decoder, Encoder, Encoding, SpecialTokens, TokenIdType},
+    };
+    use serde_json::json;
+
     use super::*;
 
-    #[test]
-    fn resolve_thinking_pref_explicit_kwarg_wins() {
-        // An explicit template toggle always wins over the reasoning_effort mapping.
-        assert_eq!(resolve_thinking_pref(Some(true), Some("none")), Some(true));
-        assert_eq!(
-            resolve_thinking_pref(Some(false), Some("high")),
-            Some(false)
+    /// A mock tokenizer whose template uses the `thinking` toggle key, like the
+    /// DeepSeek V4 renderer.
+    struct ThinkingKeyTokenizer(MockTokenizer);
+
+    impl Encoder for ThinkingKeyTokenizer {
+        fn encode(&self, input: &str, add_special_tokens: bool) -> anyhow::Result<Encoding> {
+            self.0.encode(input, add_special_tokens)
+        }
+        fn encode_batch(
+            &self,
+            inputs: &[&str],
+            add_special_tokens: bool,
+        ) -> anyhow::Result<Vec<Encoding>> {
+            self.0.encode_batch(inputs, add_special_tokens)
+        }
+    }
+
+    impl Decoder for ThinkingKeyTokenizer {
+        fn decode(
+            &self,
+            token_ids: &[TokenIdType],
+            skip_special_tokens: bool,
+        ) -> anyhow::Result<String> {
+            self.0.decode(token_ids, skip_special_tokens)
+        }
+    }
+
+    impl Tokenizer for ThinkingKeyTokenizer {
+        fn vocab_size(&self) -> usize {
+            self.0.vocab_size()
+        }
+        fn get_special_tokens(&self) -> &SpecialTokens {
+            self.0.get_special_tokens()
+        }
+        fn token_to_id(&self, token: &str) -> Option<TokenIdType> {
+            self.0.token_to_id(token)
+        }
+        fn id_to_token(&self, id: TokenIdType) -> Option<String> {
+            self.0.id_to_token(id)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn thinking_toggle(&self) -> ThinkingToggle {
+            ThinkingToggle::DefaultOn
+        }
+        fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
+            Some(ThinkingKeyName::Thinking)
+        }
+    }
+
+    fn request_with(extra: Value) -> ChatCompletionRequest {
+        let mut request = json!({
+            "model": "deepseek-v4-pro",
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+        request.as_object_mut().unwrap().extend(
+            extra
+                .as_object()
+                .expect("extra request fields must be an object")
+                .clone(),
         );
-        // No explicit toggle -> fall back to the reasoning_effort mapping.
-        assert_eq!(resolve_thinking_pref(None, Some("none")), Some(false));
-        assert_eq!(resolve_thinking_pref(None, Some("minimal")), Some(false));
-        assert_eq!(resolve_thinking_pref(None, Some("high")), None);
-        assert_eq!(resolve_thinking_pref(None, None), None);
+        serde_json::from_value(request).unwrap()
+    }
+
+    #[test]
+    fn resolve_user_thinking_template_kwarg_wins() {
+        let tokenizer = ThinkingKeyTokenizer(MockTokenizer::new());
+
+        // The template's own toggle key beats the protocol `thinking` field
+        // and the reasoning_effort mapping.
+        let request = request_with(json!({
+            "chat_template_kwargs": {"thinking": true},
+            "thinking": {"type": "disabled"},
+            "reasoning_effort": "none",
+        }));
+        assert_eq!(resolve_user_thinking(&request, &tokenizer), Some(true));
+
+        let request = request_with(json!({
+            "chat_template_kwargs": {"thinking": false},
+            "thinking": {"type": "enabled"},
+        }));
+        assert_eq!(resolve_user_thinking(&request, &tokenizer), Some(false));
+
+        // A kwarg under a key the template does not use is ignored.
+        let request = request_with(json!({
+            "chat_template_kwargs": {"enable_thinking": false},
+            "thinking": {"type": "enabled"},
+        }));
+        assert_eq!(resolve_user_thinking(&request, &tokenizer), Some(true));
+    }
+
+    #[test]
+    fn resolve_user_thinking_falls_back_to_protocol_preference() {
+        let tokenizer = ThinkingKeyTokenizer(MockTokenizer::new());
+
+        // DeepSeek's official `thinking` field beats reasoning_effort.
+        let request = request_with(json!({
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": "none",
+        }));
+        assert_eq!(resolve_user_thinking(&request, &tokenizer), Some(true));
+
+        let request = request_with(json!({
+            "thinking": {"type": "disabled"},
+            "reasoning_effort": "high",
+        }));
+        assert_eq!(resolve_user_thinking(&request, &tokenizer), Some(false));
+
+        // reasoning_effort none/minimal map to off; levels express no opinion.
+        for (effort, expected) in [
+            ("none", Some(false)),
+            ("minimal", Some(false)),
+            ("high", None),
+        ] {
+            let request = request_with(json!({"reasoning_effort": effort}));
+            assert_eq!(
+                resolve_user_thinking(&request, &tokenizer),
+                expected,
+                "{effort}"
+            );
+        }
+
+        // No signal at all -> no preference; the template default decides.
+        assert_eq!(
+            resolve_user_thinking(&request_with(json!({})), &tokenizer),
+            None
+        );
     }
 
     #[test]
