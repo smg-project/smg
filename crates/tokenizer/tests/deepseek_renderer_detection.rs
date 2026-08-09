@@ -29,16 +29,38 @@ mod tests {
         }
     }"#;
     fn write_dir(architectures: Option<&[&str]>) -> (TempDir, String) {
+        write_model_dir(None, architectures, None)
+    }
+
+    /// Build a model dir (optionally named, under the temp root) with the
+    /// minimal tokenizer, an optional V4-style config, and an optional
+    /// shipped Python encoder.
+    fn write_model_dir(
+        model_name: Option<&str>,
+        architectures: Option<&[&str]>,
+        encoder_source: Option<&str>,
+    ) -> (TempDir, String) {
         let temp = TempDir::new().unwrap();
-        let tok_path = temp.path().join("tokenizer.json");
+        let model_dir = match model_name {
+            Some(name) => {
+                let dir = temp.path().join(name);
+                fs::create_dir(&dir).unwrap();
+                dir
+            }
+            None => temp.path().to_path_buf(),
+        };
+        let tok_path = model_dir.join("tokenizer.json");
         fs::write(&tok_path, MIN_TOKENIZER_JSON).unwrap();
         if let Some(archs) = architectures {
-            let cfg_path = temp.path().join("config.json");
             let body = json!({ "architectures": archs }).to_string();
-            fs::write(&cfg_path, body).unwrap();
+            fs::write(model_dir.join("config.json"), body).unwrap();
         }
-        let p = tok_path.to_str().unwrap().to_string();
-        (temp, p)
+        if let Some(source) = encoder_source {
+            let encoding_dir = model_dir.join("encoding");
+            fs::create_dir(&encoding_dir).unwrap();
+            fs::write(encoding_dir.join("encoding_dsv4.py"), source).unwrap();
+        }
+        (temp, tok_path.to_str().unwrap().to_string())
     }
 
     #[test]
@@ -308,25 +330,12 @@ mod tests {
     "max": "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n",
 }"#;
 
-    /// Build `<temp>/<model_name>/` with a V4 config and optionally the
-    /// checkpoint's shipped Python encoder.
     fn write_v4_model_dir(model_name: &str, encoder_source: Option<&str>) -> (TempDir, String) {
-        let temp = TempDir::new().unwrap();
-        let model_dir = temp.path().join(model_name);
-        fs::create_dir(&model_dir).unwrap();
-        let tok_path = model_dir.join("tokenizer.json");
-        fs::write(&tok_path, MIN_TOKENIZER_JSON).unwrap();
-        fs::write(
-            model_dir.join("config.json"),
-            json!({ "architectures": ["DeepseekV4ForCausalLM"] }).to_string(),
+        write_model_dir(
+            Some(model_name),
+            Some(&["DeepseekV4ForCausalLM"]),
+            encoder_source,
         )
-        .unwrap();
-        if let Some(source) = encoder_source {
-            let encoding_dir = model_dir.join("encoding");
-            fs::create_dir(&encoding_dir).unwrap();
-            fs::write(encoding_dir.join("encoding_dsv4.py"), source).unwrap();
-        }
-        (temp, tok_path.to_str().unwrap().to_string())
     }
 
     fn render_with_native_effort(

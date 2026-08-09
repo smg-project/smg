@@ -35,10 +35,13 @@ impl EffortEncoding {
 
     /// Parse a native effort name against this revision's accepted set.
     pub fn parse_native(self, value: &str) -> Option<ReasoningEffort> {
-        match (self, value) {
-            (Self::V0731, "low") => Some(ReasoningEffort::Low),
-            (_, "high") => Some(ReasoningEffort::High),
-            (_, "max") => Some(ReasoningEffort::Max),
+        if !self.valid_native_values().contains(&value) {
+            return None;
+        }
+        match value {
+            "low" => Some(ReasoningEffort::Low),
+            "high" => Some(ReasoningEffort::High),
+            "max" => Some(ReasoningEffort::Max),
             _ => None,
         }
     }
