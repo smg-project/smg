@@ -108,6 +108,16 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
             reason = marker.kwargs.get("reason", f"Not supported on {current_runtime}")
             pytest.skip(f"Skipping for {current_runtime}: {reason}")
 
+    # TEMPORARY — remove with the TOKENSPEED_REF bump that picks up the fix
+    # for https://github.com/lightseekorg/tokenspeed/issues/1036: the pinned
+    # tokenspeed has no MXFP4-MoE-with-expert-bias kernel on sm 9.0 (the
+    # triton MoE rewrite dropped bias; marlin/flashinfer/gluon don't cover
+    # H100), so gpt-oss dies at model load on CI's H100 runners.
+    if current_runtime == "tokenspeed":
+        model_marker = resolve_class_marker(item, "model")
+        if model_marker and model_marker.args and "gpt-oss" in str(model_marker.args[0]):
+            pytest.skip("tokenspeed cannot load gpt-oss on H100 (tokenspeed#1036)")
+
 
 # ---------------------------------------------------------------------------
 # Environment-variable-based test filtering
