@@ -112,3 +112,7 @@ def test_qwen35_9b_spec_present_and_multimodal():
     ts_args = spec["tokenspeed_args"]
     assert "--attention-backend" in ts_args
     assert ts_args[ts_args.index("--attention-backend") + 1] == "fa3"
+    # Hybrid-attention pool + paged-cache PD adjunct rejects layerwise
+    # transfer; the spec must pin it off or PD/EPD workers die at startup.
+    idx = ts_args.index("--disaggregation-layerwise-interval")
+    assert ts_args[idx + 1] == "0"
