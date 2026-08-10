@@ -183,6 +183,14 @@ MODEL_SPECS: dict[str, dict] = {
             "4",
             "--gpu-memory-utilization",
             "0.8",
+            # This model's hybrid-attention KV pool opts into tokenspeed's
+            # paged-cache PD adjunct on prefill/decode roles, which rejects
+            # layerwise transfer — yet layerwise defaults ON (interval=1), so
+            # the engine dies at startup under its own defaults. Scoped here
+            # rather than to every disaggregation worker: non-hybrid models
+            # support layerwise and should keep exercising that default path.
+            "--disaggregation-layerwise-interval",
+            "0",
         ],
         # TokenSpeed-only (GDN + MoE arch won't load under sglang/vllm/trt), so
         # keep it out of the tier-wide pre-download; the EPD job fetches it by id.
