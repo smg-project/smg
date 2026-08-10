@@ -685,6 +685,24 @@ impl TokenSpeedSchedulerClient {
 
 impl From<tokenspeed_proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapshot {
     fn from(load: tokenspeed_proto::SchedulerLoad) -> Self {
+        let memory =
+            load.memory.map(
+                |memory| openai_protocol::worker::EngineMemoryMetricsSnapshot {
+                    weight_gb: memory.weight_gb,
+                    kv_cache_gb: memory.kv_cache_gb,
+                    graph_gb: memory.graph_gb,
+                    token_capacity: memory.token_capacity,
+                },
+            );
+        let queues =
+            load.queues.map(
+                |queues| openai_protocol::worker::EngineQueueMetricsSnapshot {
+                    waiting: queues.waiting,
+                    grammar: queues.grammar,
+                    paused: queues.paused,
+                    retracted: queues.retracted,
+                },
+            );
         Self {
             dp_rank: load.dp_rank,
             num_running_reqs: load.num_running_reqs,
@@ -698,6 +716,8 @@ impl From<tokenspeed_proto::SchedulerLoad> for openai_protocol::worker::Schedule
             cache_hit_rate: load.cache_hit_rate,
             utilization: load.utilization,
             max_running_requests: load.max_running_requests,
+            memory,
+            queues,
             // TokenSpeed has no disagg section; canonical PD fields stay None.
             ..Default::default()
         }
@@ -706,11 +726,102 @@ impl From<tokenspeed_proto::SchedulerLoad> for openai_protocol::worker::Schedule
 
 impl From<tokenspeed_proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadResponse {
     fn from(resp: tokenspeed_proto::GetLoadsResponse) -> Self {
+        let aggregate = resp.aggregate.map(|aggregate| {
+            openai_protocol::worker::EngineAggregateMetricsSnapshot {
+                total_running_reqs: aggregate.total_running_reqs,
+                total_waiting_reqs: aggregate.total_waiting_reqs,
+                total_reqs: aggregate.total_reqs,
+                avg_token_usage: aggregate.avg_token_usage,
+                avg_throughput: aggregate.avg_throughput,
+                avg_utilization: aggregate.avg_utilization,
+            }
+        });
         Self {
             timestamp: resp.timestamp,
+            version: resp.version,
             dp_rank_count: resp.dp_rank_count,
             loads: resp.loads.into_iter().map(Into::into).collect(),
+            aggregate,
         }
+    }
+}
+
+#[cfg(test)]
+mod load_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn conversion_preserves_version_sections_and_aggregate() {
+        let response = tokenspeed_proto::GetLoadsResponse {
+            timestamp: "2026-08-09T12:34:56Z".to_owned(),
+            version: "dsv4-engine/0.1.0".to_owned(),
+            dp_rank_count: 1,
+            loads: vec![tokenspeed_proto::SchedulerLoad {
+                dp_rank: 0,
+                num_running_reqs: 3,
+                num_waiting_reqs: 2,
+                num_total_reqs: 5,
+                num_used_tokens: 98_304,
+                max_total_num_tokens: 196_608,
+                max_running_requests: 32,
+                num_waiting_uncached_tokens: 1_280,
+                token_usage: 0.5,
+                gen_throughput: 105.25,
+                cache_hit_rate: 0.75,
+                utilization: 0.5,
+                memory: Some(tokenspeed_proto::MemoryMetrics {
+                    weight_gb: 44.0,
+                    kv_cache_gb: 12.5,
+                    graph_gb: 0.75,
+                    token_capacity: 196_608,
+                }),
+                queues: Some(tokenspeed_proto::QueueMetrics {
+                    waiting: 2,
+                    grammar: 0,
+                    paused: 0,
+                    retracted: 0,
+                }),
+            }],
+            aggregate: Some(tokenspeed_proto::AggregateMetrics {
+                total_running_reqs: 3,
+                total_waiting_reqs: 2,
+                total_reqs: 5,
+                avg_token_usage: 0.5,
+                avg_throughput: 105.25,
+                avg_utilization: 0.5,
+            }),
+        };
+
+        let converted = openai_protocol::worker::WorkerLoadResponse::from(response);
+        assert_eq!(converted.timestamp, "2026-08-09T12:34:56Z");
+        assert_eq!(converted.version, "dsv4-engine/0.1.0");
+        let load = &converted.loads[0];
+        assert!(matches!(
+            load.memory,
+            Some(ref memory)
+                if memory.weight_gb == 44.0
+                    && memory.kv_cache_gb == 12.5
+                    && memory.graph_gb == 0.75
+                    && memory.token_capacity == 196_608
+        ));
+        assert!(matches!(
+            load.queues,
+            Some(ref queues)
+                if queues.waiting == 2
+                    && queues.grammar == 0
+                    && queues.paused == 0
+                    && queues.retracted == 0
+        ));
+        assert!(matches!(
+            converted.aggregate,
+            Some(ref aggregate)
+                if aggregate.total_running_reqs == 3
+                    && aggregate.total_waiting_reqs == 2
+                    && aggregate.total_reqs == 5
+                    && aggregate.avg_token_usage == 0.5
+                    && aggregate.avg_throughput == 105.25
+                    && aggregate.avg_utilization == 0.5
+        ));
     }
 }
 

@@ -224,8 +224,8 @@ pub struct WorkerMonitor {
     pub worker_load_manager: Arc<WorkerLoadManager>,
     client: reqwest::Client,
     default_interval: Duration,
-    /// When set, poll loads and re-export `smg_engine_*` gauges even if no
-    /// load-aware routing policy is active (`--engine-metrics`).
+    /// When set, force load polling even if no load-aware routing policy is
+    /// active (`--engine-metrics`). Every successful poll is re-exported.
     engine_metrics: bool,
     /// `--disable-load-monitoring`: restore the conditional poll gate (a
     /// load-aware/dp-rank policy, engine metrics, or overload protection on a
@@ -476,19 +476,20 @@ impl WorkerMonitor {
     /// channel snapshot and the DP cache. Used by the event loop on
     /// `Removed`, `Replaced`, and `StatusChanged` away from `Ready`.
     ///
-    /// Also sentinels the worker's `smg_engine_*` series when engine-metrics
-    /// re-export is on, since metrics-rs cannot delete series.
+    /// Also sentinels the worker's `smg_engine_*` series after this monitor has
+    /// published a load for it, since metrics-rs cannot delete series.
     fn evict_worker_loads(&self, worker: &Arc<dyn Worker>) {
         let url = worker.url();
         // No load feed, no verdict: a flag left set would strand the worker
         // out of routing with nothing to ever clear it.
         self.worker_registry.set_worker_overloaded(worker, false);
+        let had_published_load = self.load_tx.borrow().contains_key(url);
         self.load_tx.send_modify(|map| {
             map.remove(url);
         });
         self.worker_load_manager.remove_worker(url);
         self.native_loads_absent.remove(url);
-        if self.engine_metrics {
+        if had_published_load {
             // A worker can serve multiple models (one load group per model),
             // so sentinel every model's series — not just the primary.
             let dp_size = worker.dp_size().unwrap_or(1);
@@ -1027,12 +1028,12 @@ async fn group_monitor_loop(
             monitor.worker_load_manager.remove_workers(&dp_evict);
         }
 
-        // Re-export the freshly fetched loads as `smg_engine_*` gauges. Reuses
-        // this poll's data; no extra fetch. Model label comes from the group.
-        if monitor.engine_metrics {
-            for (url, load) in &group_loads {
-                Metrics::record_engine_load(url, &group_key.model_id, load);
-            }
+        // Every successful load poll is also the canonical observability
+        // sample. Load-aware policies already require this poll; the explicit
+        // engine-metrics option only forces polling when routing does not.
+        // Reusing the response avoids a second Engine RPC.
+        for (url, load) in &group_loads {
+            Metrics::record_engine_load(url, &group_key.model_id, load);
         }
 
         // Atomically merge into the shared watch channel: clear stale

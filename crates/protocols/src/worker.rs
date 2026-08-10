@@ -1272,6 +1272,10 @@ pub struct SchedulerLoadSnapshot {
     pub cache_hit_rate: f64,
     pub utilization: f64,
     pub max_running_requests: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<EngineMemoryMetricsSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queues: Option<EngineQueueMetricsSnapshot>,
     /// PD disaggregation signals, populated only when the backend reports a
     /// `disagg` section. `None` for HTTP or older engines. Canonical schema
     /// other engines map into; SGLang derives the queue depths from its
@@ -1289,13 +1293,45 @@ pub struct SchedulerLoadSnapshot {
     pub disagg_mode: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EngineMemoryMetricsSnapshot {
+    pub weight_gb: f64,
+    pub kv_cache_gb: f64,
+    pub graph_gb: f64,
+    pub token_capacity: i32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EngineQueueMetricsSnapshot {
+    pub waiting: i32,
+    pub grammar: i32,
+    pub paused: i32,
+    pub retracted: i32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EngineAggregateMetricsSnapshot {
+    pub total_running_reqs: i32,
+    pub total_waiting_reqs: i32,
+    pub total_reqs: i32,
+    pub avg_token_usage: f64,
+    pub avg_throughput: f64,
+    pub avg_utilization: f64,
+}
+
 /// Full load response for a single worker across all DP ranks.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorkerLoadResponse {
     pub timestamp: String,
+    pub version: String,
     pub dp_rank_count: i32,
     pub loads: Vec<SchedulerLoadSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<EngineAggregateMetricsSnapshot>,
 }
 
 impl WorkerLoadResponse {

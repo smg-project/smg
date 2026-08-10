@@ -1978,6 +1978,7 @@ mod tests {
                 cache_hit_rate: 0.25,
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let rendered = render_with_recorder(|| {
@@ -2010,6 +2011,7 @@ mod tests {
                 decode_queue_reqs: Some(4),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let rendered = render_with_recorder(|| {

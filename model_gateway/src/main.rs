@@ -527,8 +527,8 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
     disable_load_monitoring: bool,
 
-    /// Re-export engine GetLoads signals (incl. PD) as smg_engine_* Prometheus
-    /// gauges, polling even without a load-aware routing policy.
+    /// Force GetLoads polling for smg_engine_* Prometheus gauges even without
+    /// a load-aware routing policy. Routing-owned polls are always re-exported.
     #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
     engine_metrics: bool,
 

@@ -761,6 +761,24 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
         // the two canonical totals: prefill = prealloc + inflight, decode =
         // prealloc + transfer + retracted.
         let disagg = load.disaggregation;
+        let memory =
+            load.memory.map(
+                |memory| openai_protocol::worker::EngineMemoryMetricsSnapshot {
+                    weight_gb: memory.weight_gb,
+                    kv_cache_gb: memory.kv_cache_gb,
+                    graph_gb: memory.graph_gb,
+                    token_capacity: memory.token_capacity,
+                },
+            );
+        let queues =
+            load.queues.map(
+                |queues| openai_protocol::worker::EngineQueueMetricsSnapshot {
+                    waiting: queues.waiting,
+                    grammar: queues.grammar,
+                    paused: queues.paused,
+                    retracted: queues.retracted,
+                },
+            );
         Self {
             dp_rank: load.dp_rank,
             num_running_reqs: load.num_running_reqs,
@@ -774,6 +792,8 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             cache_hit_rate: load.cache_hit_rate,
             utilization: load.utilization,
             max_running_requests: load.max_running_requests,
+            memory,
+            queues,
             kv_transfer_latency_ms: disagg.as_ref().map(|d| d.kv_transfer_latency_ms),
             kv_transfer_speed_gb_s: disagg.as_ref().map(|d| d.kv_transfer_speed_gb_s),
             prefill_queue_reqs: disagg.as_ref().map(|d| {
@@ -792,10 +812,22 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
 
 impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadResponse {
     fn from(resp: proto::GetLoadsResponse) -> Self {
+        let aggregate = resp.aggregate.map(|aggregate| {
+            openai_protocol::worker::EngineAggregateMetricsSnapshot {
+                total_running_reqs: aggregate.total_running_reqs,
+                total_waiting_reqs: aggregate.total_waiting_reqs,
+                total_reqs: aggregate.total_reqs,
+                avg_token_usage: aggregate.avg_token_usage,
+                avg_throughput: aggregate.avg_throughput,
+                avg_utilization: aggregate.avg_utilization,
+            }
+        });
         Self {
             timestamp: resp.timestamp,
+            version: resp.version,
             dp_rank_count: resp.dp_rank_count,
             loads: resp.loads.into_iter().map(Into::into).collect(),
+            aggregate,
         }
     }
 }
