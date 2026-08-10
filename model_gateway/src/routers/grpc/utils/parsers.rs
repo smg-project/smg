@@ -46,17 +46,41 @@ pub(crate) fn extract_thinking_from_kwargs(
     .and_then(|v| v.as_bool())
 }
 
-/// Precedence for the effective thinking preference: an explicit template
-/// toggle (already extracted from kwargs) always wins; otherwise fall back to
-/// the protocol-level OpenAI `reasoning_effort` mapping
-/// ([`thinking_from_reasoning_effort`]).
-fn resolve_thinking_pref(explicit: Option<bool>, reasoning_effort: Option<&str>) -> Option<bool> {
-    explicit.or_else(|| thinking_from_reasoning_effort(reasoning_effort))
+/// Report `Some(true)` when the renderer will enter thinking mode because of
+/// a native reasoning-effort value, so the reasoning parser is armed
+/// consistently with the rendered prompt. Mirrors the template-kwargs merge:
+/// an explicit kwargs entry wins over the top-level `reasoning_effort` field.
+fn extract_template_effort_thinking(
+    kwargs: Option<&std::collections::HashMap<String, Value>>,
+    reasoning_effort: Option<&str>,
+    tokenizer: &dyn Tokenizer,
+) -> Option<bool> {
+    let native_values = tokenizer.native_reasoning_effort_values();
+    if native_values.is_empty() {
+        return None;
+    }
+    let effort = kwargs
+        .and_then(|k| k.get("reasoning_effort"))
+        .and_then(Value::as_str)
+        .or(reasoning_effort)?;
+    native_values.contains(&effort).then_some(true)
 }
 
-/// Resolve the user's effective thinking preference, honoring an explicit
-/// template thinking kwarg first (it always wins), then falling back to the
-/// OpenAI `reasoning_effort` mapping.
+/// Precedence for the effective thinking preference: an explicit template
+/// toggle always wins, then a native template effort for renderers that
+/// support it, then the protocol-level OpenAI `reasoning_effort` mapping
+/// ([`thinking_from_reasoning_effort`]).
+fn resolve_thinking_pref(
+    explicit: Option<bool>,
+    template_effort: Option<bool>,
+    reasoning_effort: Option<&str>,
+) -> Option<bool> {
+    explicit
+        .or(template_effort)
+        .or_else(|| thinking_from_reasoning_effort(reasoning_effort))
+}
+
+/// Resolve the user's effective thinking preference.
 pub fn resolve_user_thinking(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
@@ -64,6 +88,7 @@ pub fn resolve_user_thinking(
 ) -> Option<bool> {
     resolve_thinking_pref(
         extract_thinking_from_kwargs(kwargs, tokenizer),
+        extract_template_effort_thinking(kwargs, reasoning_effort, tokenizer),
         reasoning_effort,
     )
 }
@@ -195,18 +220,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_thinking_pref_explicit_kwarg_wins() {
-        // An explicit template toggle always wins over the reasoning_effort mapping.
-        assert_eq!(resolve_thinking_pref(Some(true), Some("none")), Some(true));
+    fn resolve_thinking_pref_precedence() {
+        // Explicit toggle > native template effort > reasoning_effort mapping.
         assert_eq!(
-            resolve_thinking_pref(Some(false), Some("high")),
+            resolve_thinking_pref(Some(false), Some(true), Some("high")),
             Some(false)
         );
-        // No explicit toggle -> fall back to the reasoning_effort mapping.
-        assert_eq!(resolve_thinking_pref(None, Some("none")), Some(false));
-        assert_eq!(resolve_thinking_pref(None, Some("minimal")), Some(false));
-        assert_eq!(resolve_thinking_pref(None, Some("high")), None);
-        assert_eq!(resolve_thinking_pref(None, None), None);
+        assert_eq!(
+            resolve_thinking_pref(None, Some(true), Some("none")),
+            Some(true)
+        );
+        assert_eq!(resolve_thinking_pref(None, None, Some("none")), Some(false));
+        assert_eq!(resolve_thinking_pref(None, None, Some("high")), None);
+        assert_eq!(resolve_thinking_pref(None, None, None), None);
+    }
+
+    #[test]
+    fn template_effort_thinking_covers_kwargs_and_top_level_field() {
+        use llm_tokenizer::traits::{Encoder, Encoding};
+        struct T(llm_tokenizer::MockTokenizer);
+        impl Encoder for T {
+            fn encode(&self, i: &str, s: bool) -> anyhow::Result<Encoding> {
+                self.0.encode(i, s)
+            }
+            fn encode_batch(&self, i: &[&str], s: bool) -> anyhow::Result<Vec<Encoding>> {
+                self.0.encode_batch(i, s)
+            }
+        }
+        impl llm_tokenizer::traits::Decoder for T {
+            fn decode(&self, ids: &[u32], s: bool) -> anyhow::Result<String> {
+                self.0.decode(ids, s)
+            }
+        }
+        impl Tokenizer for T {
+            fn vocab_size(&self) -> usize {
+                self.0.vocab_size()
+            }
+            fn get_special_tokens(&self) -> &llm_tokenizer::traits::SpecialTokens {
+                self.0.get_special_tokens()
+            }
+            fn token_to_id(&self, t: &str) -> Option<u32> {
+                self.0.token_to_id(t)
+            }
+            fn id_to_token(&self, id: u32) -> Option<String> {
+                self.0.id_to_token(id)
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
+                &["low", "high", "max"]
+            }
+        }
+        let tok = T(llm_tokenizer::MockTokenizer::new());
+
+        // Top-level field arms thinking when the renderer would interpret it.
+        assert_eq!(
+            extract_template_effort_thinking(None, Some("high"), &tok),
+            Some(true)
+        );
+        // Unrecognized values never arm (the renderer ignores them too).
+        assert_eq!(
+            extract_template_effort_thinking(None, Some("medium"), &tok),
+            None
+        );
+        // A kwargs entry wins over the top-level field, matching the merge.
+        let kwargs = std::collections::HashMap::from([(
+            "reasoning_effort".to_string(),
+            Value::String("max".to_string()),
+        )]);
+        assert_eq!(
+            extract_template_effort_thinking(Some(&kwargs), Some("medium"), &tok),
+            Some(true)
+        );
+        // Renderers without native efforts never arm.
+        assert_eq!(
+            extract_template_effort_thinking(
+                Some(&kwargs),
+                Some("high"),
+                &llm_tokenizer::MockTokenizer::new()
+            ),
+            None
+        );
     }
 
     #[test]

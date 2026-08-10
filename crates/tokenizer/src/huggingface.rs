@@ -30,7 +30,7 @@ use crate::{
 enum Renderer {
     Jinja,
     DeepseekV32,
-    DeepseekV4,
+    DeepseekV4(deepseek_v4::EffortEncoding),
 }
 
 /// HuggingFace tokenizer wrapper
@@ -570,7 +570,7 @@ impl TokenizerTrait for HuggingFaceTokenizer {
                 self.chat_template.apply(messages, params)
             }
             Renderer::DeepseekV32 => apply_deepseek_v32(messages, &params),
-            Renderer::DeepseekV4 => apply_deepseek_v4(messages, &params),
+            Renderer::DeepseekV4(encoding) => apply_deepseek_v4(messages, &params, encoding),
         }
     }
 
@@ -583,23 +583,30 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             // DeepSeek V3.2 and V4 encoders gate thinking on the `thinking`
             // kwarg, default off. The Jinja processor has no knowledge of
             // the native encoder so we must report it directly.
-            Renderer::DeepseekV32 | Renderer::DeepseekV4 => ThinkingToggle::DefaultOff,
+            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) => ThinkingToggle::DefaultOff,
             Renderer::Jinja => self.chat_template.thinking_toggle(),
         }
     }
 
     fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
         match self.renderer {
-            Renderer::DeepseekV32 | Renderer::DeepseekV4 => Some(ThinkingKeyName::Thinking),
+            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) => Some(ThinkingKeyName::Thinking),
             Renderer::Jinja => self.chat_template.thinking_key_name(),
         }
     }
+    fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
+        match self.renderer {
+            Renderer::DeepseekV4(encoding) => encoding.valid_native_values(),
+            Renderer::DeepseekV32 | Renderer::Jinja => &[],
+        }
+    }
+
     fn think_in_prefill(&self) -> bool {
         match self.renderer {
             // Both encoders emit `<｜Assistant｜><think>` at the end of the
             // prompt when thinking mode is on; the completion therefore starts
             // mid-reasoning and the parser must be told so.
-            Renderer::DeepseekV32 | Renderer::DeepseekV4 => true,
+            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) => true,
             Renderer::Jinja => self.chat_template.think_in_prefill(),
         }
     }
@@ -644,10 +651,28 @@ fn detect_renderer_from_config(dir: &Path) -> Renderer {
         return Renderer::DeepseekV32;
     }
     if arch_strs.contains(&"DeepseekV4ForCausalLM") {
-        debug!(?path, "selected DeepseekV4 chat-template renderer");
-        return Renderer::DeepseekV4;
+        let encoding = detect_dsv4_effort_encoding(dir);
+        debug!(
+            ?path,
+            ?encoding,
+            "selected DeepseekV4 chat-template renderer"
+        );
+        return Renderer::DeepseekV4(encoding);
     }
     Renderer::Jinja
+}
+
+/// Pick the effort-prompt revision for a V4 checkpoint. `config.json` and
+/// `tokenizer_config.json` are identical across the V4 family, so the only
+/// discriminator is the shipped `encoding/encoding_dsv4.py`; when it is
+/// absent, fall back to a `0731` marker in the path (covers HF-hub cache
+/// dirs like `models--deepseek-ai--DeepSeek-V4-Flash-0731/...`).
+fn detect_dsv4_effort_encoding(dir: &Path) -> deepseek_v4::EffortEncoding {
+    match std::fs::read_to_string(dir.join("encoding").join("encoding_dsv4.py")) {
+        Ok(source) => deepseek_v4::EffortEncoding::detect_from_encoder_source(&source),
+        Err(_) if dir.to_string_lossy().contains("0731") => deepseek_v4::EffortEncoding::V0731,
+        Err(_) => deepseek_v4::EffortEncoding::Original,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -660,17 +685,21 @@ fn detect_renderer_from_config(dir: &Path) -> Renderer {
 /// `ThinkingConfig`) — same precedence as the Jinja path. Default off, matching
 /// the `ThinkingKeyName::Thinking` / `DefaultOff` contract reported here.
 fn derive_thinking_mode(params: &ChatTemplateParams) -> deepseek_v32::ThinkingMode {
-    let enabled = params
-        .template_kwargs
-        .and_then(|k| k.get("thinking"))
-        .and_then(serde_json::Value::as_bool)
-        .or(params.thinking)
-        .unwrap_or(false);
-    if enabled {
+    if explicit_thinking(params).unwrap_or(false) {
         deepseek_v32::ThinkingMode::Thinking
     } else {
         deepseek_v32::ThinkingMode::Chat
     }
+}
+
+/// Explicit thinking preference: `template_kwargs["thinking"]` wins, else
+/// `params.thinking`.
+fn explicit_thinking(params: &ChatTemplateParams) -> Option<bool> {
+    params
+        .template_kwargs
+        .and_then(|k| k.get("thinking"))
+        .and_then(serde_json::Value::as_bool)
+        .or(params.thinking)
 }
 
 /// Per DeepSeek's encoding README, preserve all reasoning when a system or
@@ -728,23 +757,28 @@ fn apply_deepseek_v32(
 fn apply_deepseek_v4(
     messages: &[serde_json::Value],
     params: &ChatTemplateParams,
+    effort_encoding: deepseek_v4::EffortEncoding,
 ) -> Result<String> {
     let owned = inject_tools_into_messages(messages, params.tools);
     let msgs: &[serde_json::Value] = owned.as_deref().unwrap_or(messages);
-    let thinking_mode = derive_thinking_mode(params);
+    // Values the revision doesn't recognize are ignored, matching the
+    // template-owns-interpretation contract for merged public efforts.
     let reasoning_effort = params
         .template_kwargs
         .and_then(|k| k.get("reasoning_effort"))
         .and_then(|v| v.as_str())
-        .and_then(|s| match s {
-            "max" => Some(deepseek_v4::ReasoningEffort::Max),
-            "high" => Some(deepseek_v4::ReasoningEffort::High),
-            _ => None,
-        });
+        .and_then(|s| effort_encoding.parse_native(s));
+    // A recognized effort implies thinking; an explicit toggle still wins.
+    let thinking_mode = if explicit_thinking(params).unwrap_or_else(|| reasoning_effort.is_some()) {
+        deepseek_v32::ThinkingMode::Thinking
+    } else {
+        deepseek_v32::ThinkingMode::Chat
+    };
     let encode_params = deepseek_v4::EncodeParams {
         add_default_bos_token: true,
         drop_thinking: resolve_drop_thinking(msgs),
         reasoning_effort,
+        effort_encoding,
     };
     deepseek_v4::encode_messages(msgs, thinking_mode, &encode_params)
         .map_err(|e| Error::msg(format!("DeepSeek V4 encode failed: {e}")))

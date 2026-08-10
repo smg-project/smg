@@ -297,6 +297,11 @@ impl Tokenizer for CachedTokenizer {
     fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
         self.inner.thinking_key_name()
     }
+
+    fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
+        self.inner.native_reasoning_effort_values()
+    }
+
     fn think_in_prefill(&self) -> bool {
         self.inner.think_in_prefill()
     }

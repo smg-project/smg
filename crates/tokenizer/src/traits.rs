@@ -109,6 +109,13 @@ pub trait Tokenizer: Encoder + Decoder {
         None
     }
 
+    /// `chat_template_kwargs.reasoning_effort` values that switch this
+    /// tokenizer's renderer into thinking mode. Empty for renderers that
+    /// don't interpret the kwarg natively.
+    fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Whether the template injects `<think>` in the generation prompt.
     fn think_in_prefill(&self) -> bool {
         false
