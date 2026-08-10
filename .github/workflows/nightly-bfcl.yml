@@ -161,16 +161,16 @@ jobs:
               # Concurrent TP=4 per arm (0-3 + 4-7).
               {"name": "deepseek-v4", "runner": "blackwell", "tp": 4,
                "gpu_a": "0,1,2,3", "gpu_b": "4,5,6,7",
-               # Base V4-Flash: the -0731 refresh is not supported yet.
-               "model": "deepseek-ai/DeepSeek-V4-Flash", "bfcl_model": "deepseek-ai/DeepSeek-V4-Flash-FC",
+               # -0731 encoding + deepseek_v4 SMG reasoning parser landed in #2080;
+               # B300 A/B validated at parity (simple_python/irrelevance/multiple).
+               "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "bfcl_model": "deepseek-ai/DeepSeek-V4-Flash-0731-FC",
                "vllm_tool": "deepseek_v4", "vllm_reason": "deepseek_v4",
-               "smg_tool": "deepseek_v4",
-               "smg_reason": "deepseek_v31",  # TODO(confirm): no deepseek_v4 SMG reasoning parser yet
+               "smg_tool": "deepseek_v4", "smg_reason": "deepseek_v4",
                # --kv-cache-dtype fp8 + --block-size 256 REQUIRED: V4's FlashMLA fp8
                # kernel asserts fp8 kv-cache (else EngineCore dies at startup).
                "vllm_extra": "--tokenizer-mode deepseek_v4 --trust-remote-code --kv-cache-dtype fp8 --block-size 256",
                "gpu_mem": "0.90", "startup_timeout": "2400", "model_cache": "/raid/models",
-               # No healthy baseline yet; kept tight until the leg scores cleanly.
+               # Kept tight until the first clean nightly score on this leg.
                "run_timeout": "5400",
                "arm_mode": "concurrent", "max_model_len": "auto"},
               {"name": "minimax-m2.7", "runner": "blackwell", "tp": 4,

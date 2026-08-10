@@ -166,10 +166,10 @@ jobs:
               # Concurrent TP=4 per arm (0-3 + 4-7); num_tasks-capped.
               {"name": "deepseek-v4", "runner": "blackwell", "tp": 4,
                "gpu_a": "0,1,2,3", "gpu_b": "4,5,6,7",
-               # Base V4-Flash: the -0731 refresh is not supported yet.
-               "model": "deepseek-ai/DeepSeek-V4-Flash",
+               # -0731 encoding + deepseek_v4 SMG reasoning parser landed in #2080.
+               "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
                "vllm_tool": "deepseek_v4", "vllm_reason": "deepseek_v4",
-               "smg_tool": "deepseek_v4", "smg_reason": "deepseek_v31",
+               "smg_tool": "deepseek_v4", "smg_reason": "deepseek_v4",
                "vllm_extra": "--tokenizer-mode deepseek_v4 --trust-remote-code --kv-cache-dtype fp8 --block-size 256",
                "gpu_mem": "0.90", "startup_timeout": "2400", "model_cache": "/raid/models",
                "arm_mode": "concurrent", "max_model_len": "auto", "num_tasks": 30,

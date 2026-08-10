@@ -64,7 +64,7 @@ Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`)
 |---|---|---|---|---|
 | Qwen3.6-27B (`qwen3.6`) | `4-gpu-h100` | 2 | `qwen3_xml` / `qwen3` | `qwen_xml` / `qwen3` |
 | gpt-oss-120b (`gpt-oss`) | `4-gpu-h100` | 2 | `openai` / — | _(none — SMG auto-routes harmony)_ / — |
-| DeepSeek-V4-Flash (`deepseek-v4`) | `blackwell` | 4 | `deepseek_v4` / `deepseek_v4` (+`--tokenizer-mode deepseek_v4 --trust-remote-code`) | `deepseek_v4` / `deepseek_v31`† |
+| DeepSeek-V4-Flash-0731 (`deepseek-v4`) | `blackwell` | 4 | `deepseek_v4` / `deepseek_v4` (+`--tokenizer-mode deepseek_v4 --trust-remote-code`) | `deepseek_v4` / `deepseek_v4` |
 | MiniMax-M2.7 (`minimax-m2.7`) | `blackwell` | 4 | `minimax_m2` / `minimax_m2` (+`--trust-remote-code`) | `minimax_m2` / `minimax` |
 | Kimi-K2.6 int4 (`kimi-k2.6`) | `blackwell` | 4 | `kimi_k2` / `kimi_k2` (+`--trust-remote-code`) | `kimik2` / `kimi_k25`† |
 
@@ -75,10 +75,10 @@ Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`)
 > `—` in **both** reasoning-parser columns for gpt-oss is likewise intentional:
 > harmony carries its own reasoning channel, so neither arm sets a reasoning parser.
 >
-> **† Reasoning-parser fallbacks.** SMG's reasoning registry has no `deepseek_v4` or
-> `kimi_k2` entry yet; the closest existing parsers (`deepseek_v31`, `kimi_k25`) are
-> used. Confirm on the first nightly; adding exact parsers to `crates/reasoning_parser`
-> is a follow-up if outputs diverge.
+> **† Reasoning-parser fallbacks.** SMG's reasoning registry has no `kimi_k2` entry
+> yet; the closest existing parser (`kimi_k25`) is used. Confirm on the first
+> nightly; adding exact parsers to `crates/reasoning_parser` is a follow-up if
+> outputs diverge.
 >
 > The mid-2026 SKU ids and a couple of vLLM parser names may shift; confirm against
 > the installed vLLM build: `vllm serve --help | grep -A40 tool-call-parser`.
@@ -89,7 +89,7 @@ The nightly (`.github/workflows/nightly-bfcl.yml`) runs the A/B as a GitHub Acti
 matrix — one leg per model, `fail-fast: false`, each on its own runner:
 
 - `4-gpu-h100` — Qwen3.6-27B and gpt-oss-120b, TP=2 per arm (GPUs 0,1 + 2,3).
-- `blackwell` (B200) — DeepSeek-V4-Flash, MiniMax-M2.7, Kimi-K2.6 int4, TP=4 per arm
+- `blackwell` (B200) — DeepSeek-V4-Flash-0731, MiniMax-M2.7, Kimi-K2.6 int4, TP=4 per arm
   (GPUs 0-3 + 4-7).
 
 All legs use `max_model_len` **32768**: the `multi_turn` categories emit ~18k-token
@@ -107,7 +107,7 @@ Each leg sets `arm_mode`:
   saved score files. Flip a leg's `arm_mode` to enable it.
 
 Per the A/B's premise, model size is irrelevant — a smaller same-family checkpoint
-exercises the identical parser — so the matrix uses DeepSeek-V4-Flash and int4
+exercises the identical parser — so the matrix uses DeepSeek-V4-Flash-0731 and int4
 Kimi-K2.6 to validate the `deepseek_v4` / `kimi_k2` parsers without the full weights.
 
 `workflow_dispatch` can target one leg via the `only` input and override

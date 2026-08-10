@@ -97,7 +97,7 @@ dominated by model-load time, serialized by a host lock, so a PR run is not fast
 |---|---|---|---|---|
 | qwen3.6 | Qwen/Qwen3.6-27B | 4-gpu-h100 (2) | `qwen3_xml` / `qwen3` | `qwen_xml` / `qwen3` |
 | gpt-oss | openai/gpt-oss-120b | 4-gpu-h100 (2) | `openai` / — | — / — (harmony auto) |
-| deepseek-v4 | deepseek-ai/DeepSeek-V4-Flash | blackwell (4) | `deepseek_v4` / `deepseek_v4` | `deepseek_v4` / `deepseek_v31` |
+| deepseek-v4 | deepseek-ai/DeepSeek-V4-Flash-0731 | blackwell (4) | `deepseek_v4` / `deepseek_v4` | `deepseek_v4` / `deepseek_v4` |
 | minimax-m2.7 | MiniMaxAI/MiniMax-M2.7 | blackwell (4) | `minimax_m2` / `minimax_m2` | `minimax_m2` / `minimax` |
 | kimi-k2.6 | moonshotai/Kimi-K2.6 | blackwell (4) | `kimi_k2` / `kimi_k2` | `kimik2` / `kimi_k25` |
 | glm-5.2 | zai-org/GLM-5.2-FP8 | blackwell (8, seq) | `glm47` / `glm45` | `glm47_moe` / `glm45` |
