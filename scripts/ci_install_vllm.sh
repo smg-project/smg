@@ -87,6 +87,15 @@ fi
 echo "Installing flashinfer-jit-cache..."
 CUDA_TAG=$(python3 -c "import torch; print(torch.version.cuda.replace('.', ''))")
 FLASHINFER_VERSION=$(python3 -c "import importlib.metadata as m; print(m.version('flashinfer-python'))")
+# flashinfer hosts one wheel index per CUDA tag and lags new CUDA minors
+# (torch moved to +cu132 while the newest index is cu130; a missing index
+# 404s and uv reports it as "package not found"). CUDA minor versions are
+# ABI-compatible, so walk down to the nearest published tag in this major.
+CUDA_MAJOR_FLOOR=$((CUDA_TAG / 10 * 10))
+while [ "${CUDA_TAG}" -gt "${CUDA_MAJOR_FLOOR}" ] \
+    && ! curl -sfo /dev/null "https://flashinfer.ai/whl/cu${CUDA_TAG}/flashinfer-jit-cache/"; do
+    CUDA_TAG=$((CUDA_TAG - 1))
+done
 uv pip install "flashinfer-jit-cache==${FLASHINFER_VERSION}" \
     --index-url "https://flashinfer.ai/whl/cu${CUDA_TAG}"
 

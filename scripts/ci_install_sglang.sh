@@ -52,6 +52,17 @@ uv pip install --prerelease=allow "sglang[all]==0.5.16"
 FLASHINFER_VERSION=$(uv pip show flashinfer-python 2>/dev/null | grep "^Version:" | awk '{print $2}')
 CU_VERSION=$(python3 -c "import torch; print('cu' + torch.version.cuda.replace('.', ''))" 2>/dev/null || echo "cu130")
 if [ -n "$FLASHINFER_VERSION" ]; then
+    # flashinfer hosts one wheel index per CUDA tag and lags new CUDA minors
+    # (a missing index 404s and uv reports it as "package not found"). CUDA
+    # minor versions are ABI-compatible, so walk down to the nearest
+    # published tag in this major.
+    CUDA_TAG=${CU_VERSION#cu}
+    CUDA_MAJOR_FLOOR=$((CUDA_TAG / 10 * 10))
+    while [ "${CUDA_TAG}" -gt "${CUDA_MAJOR_FLOOR}" ] \
+        && ! curl -sfo /dev/null "https://flashinfer.ai/whl/cu${CUDA_TAG}/flashinfer-jit-cache/"; do
+        CUDA_TAG=$((CUDA_TAG - 1))
+    done
+    CU_VERSION="cu${CUDA_TAG}"
     echo "Installing flashinfer-jit-cache==${FLASHINFER_VERSION} (${CU_VERSION})..."
     uv pip install "flashinfer-jit-cache==${FLASHINFER_VERSION}" \
         --index-url "https://flashinfer.ai/whl/${CU_VERSION}"
