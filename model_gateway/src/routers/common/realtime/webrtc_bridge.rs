@@ -26,6 +26,28 @@ use tracing::{debug, info, trace, warn};
 use super::registry::{ConnectionState, RealtimeRegistry};
 
 // ---------------------------------------------------------------------------
+// Termination policy
+// ---------------------------------------------------------------------------
+
+/// Tear down a bridge that has received no peer traffic for this long. A live
+/// call carries constant RTP plus ICE/DTLS keepalives, so total silence this
+/// long means the peer vanished without a graceful close (network drop, crash).
+/// This is the backstop for the case `Event::Closed` never arrives — without it
+/// the relay task, its two UDP sockets, both `Rtc` states, the registry entry,
+/// and the worker-load guard would leak until process restart.
+const BRIDGE_MAX_IDLE: Duration = Duration::from_secs(60);
+
+/// Absolute cap on a single bridged call — a final backstop against any leak,
+/// generous enough not to cut off a legitimately long realtime session.
+const BRIDGE_MAX_SESSION: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// Whether the relay should terminate on its idle / max-duration backstop.
+/// Pure and side-effect-free for testability.
+fn bridge_should_time_out(session_elapsed: Duration, idle_elapsed: Duration) -> bool {
+    session_elapsed > BRIDGE_MAX_SESSION || idle_elapsed > BRIDGE_MAX_IDLE
+}
+
+// ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
 
@@ -334,6 +356,13 @@ impl WebRtcBridge {
 
         let mut cancelled = false;
 
+        // Liveness backstop: a peer that vanishes without a graceful
+        // `Event::Closed` (network drop, crash, sustained ICE disconnect) simply
+        // stops sending; track when we last heard from either peer so the loop
+        // can tear down instead of leaking the task/sockets/Rtc/registry entry.
+        let session_start = Instant::now();
+        let mut last_activity = Instant::now();
+
         // Seed initial timeout by draining any outputs produced during setup.
         let t_c = self.process_outputs(Side::Client).await;
         let t_u = self.process_outputs(Side::Upstream).await;
@@ -347,10 +376,12 @@ impl WebRtcBridge {
 
             tokio::select! {
                 result = self.client_socket.recv_from(&mut buf_client) => {
+                    last_activity = Instant::now();
                     self.handle_udp_recv(result, &buf_client, Side::Client);
                 }
 
                 result = self.upstream_socket.recv_from(&mut buf_upstream) => {
+                    last_activity = Instant::now();
                     self.handle_udp_recv(result, &buf_upstream, Side::Upstream);
                 }
 
@@ -371,6 +402,18 @@ impl WebRtcBridge {
             let t_c = self.process_outputs(Side::Client).await;
             let t_u = self.process_outputs(Side::Upstream).await;
             next_timeout = earliest_timeout(t_c, t_u);
+
+            // Backstop for a peer that vanished without a graceful close: no
+            // traffic ⇒ idle timeout fires; also cap absolute session length.
+            if bridge_should_time_out(session_start.elapsed(), last_activity.elapsed()) {
+                warn!(
+                    call_id = self.call_id,
+                    session_secs = session_start.elapsed().as_secs(),
+                    idle_secs = last_activity.elapsed().as_secs(),
+                    "WebRTC bridge timed out (idle or max duration); tearing down"
+                );
+                break;
+            }
 
             // Exit if either peer is dead
             if !self.client_rtc.is_alive() || !self.upstream_rtc.is_alive() {
@@ -574,6 +617,17 @@ impl WebRtcBridge {
             Event::MediaAdded(added) => {
                 debug!(call_id = self.call_id, mid = ?added.mid, kind = ?added.kind, "Client media added");
             }
+            // Graceful peer close (DTLS close_notify / SCTP association lost,
+            // e.g. a browser `pc.close()`). str0m does not flip `is_alive()`
+            // itself, so disconnect the reporting side to make the relay loop's
+            // `is_alive()` exit fire — otherwise the call leaks until restart.
+            Event::Closed => {
+                info!(
+                    call_id = self.call_id,
+                    "Client peer closed; tearing down bridge"
+                );
+                self.client_rtc.disconnect();
+            }
             _ => {}
         }
     }
@@ -631,6 +685,15 @@ impl WebRtcBridge {
             }
             Event::MediaAdded(added) => {
                 debug!(call_id = self.call_id, mid = ?added.mid, kind = ?added.kind, "Upstream media added");
+            }
+            // Graceful peer close — disconnect the reporting side so the relay
+            // loop's `is_alive()` exit fires (str0m does not flip it itself).
+            Event::Closed => {
+                info!(
+                    call_id = self.call_id,
+                    "Upstream peer closed; tearing down bridge"
+                );
+                self.upstream_rtc.disconnect();
             }
             _ => {}
         }
@@ -939,4 +1002,33 @@ fn parse_stun_xor_mapped_address(resp: &[u8], txn_id: &[u8]) -> Option<SocketAdd
         off += (attr_len + 3) & !3;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_beyond_max_triggers_timeout() {
+        assert!(bridge_should_time_out(
+            Duration::from_secs(1),
+            BRIDGE_MAX_IDLE + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn session_beyond_max_triggers_timeout() {
+        assert!(bridge_should_time_out(
+            BRIDGE_MAX_SESSION + Duration::from_secs(1),
+            Duration::from_secs(0)
+        ));
+    }
+
+    #[test]
+    fn active_call_within_limits_does_not_time_out() {
+        assert!(!bridge_should_time_out(
+            Duration::from_secs(600),
+            Duration::from_secs(1)
+        ));
+    }
 }
