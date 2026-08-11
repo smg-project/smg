@@ -93,6 +93,12 @@ repos:
         stages: [commit-msg]
         always_run: true
 
+      - id: no-internal-refs
+        name: No internal-only references
+        description: Reject internal hostnames, tracker ids, corporate emails, and AI attribution
+        entry: scripts/check-no-internal-refs.sh
+        language: system
+
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.0
     hooks:

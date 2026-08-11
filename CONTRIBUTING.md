@@ -85,6 +85,18 @@ Signed-off-by: Your Name <your.email@example.com>
   have the right to submit it.
 - **No AI attribution.** `Co-Authored-By: Claude` / `noreply@anthropic.com` and
   similar are rejected by the `no-ai-co-author` pre-commit hook.
+- **No internal-only references.** This repository is public. Internal
+  hostnames, tracker identifiers (`D…`/`T…`/`S…`), and corporate email addresses
+  are rejected by the `no-internal-refs` pre-commit hook, which also runs in CI
+  over every file — so `--no-verify` does not get a leak past review. Describe
+  behaviour and constraints from first principles instead of naming an internal
+  system. Codenames are deliberately not listed in the hook (writing them down
+  here would be the leak); point `SMG_INTERNAL_REF_PATTERNS` at a file of extra
+  regexes outside the repository to catch your own.
+
+  Agents can be stopped a step earlier, before the text reaches disk, by wiring
+  `scripts/claude-hooks/block-internal-refs.sh` as a `PreToolUse` hook for
+  `Write|Edit` in your own Claude Code settings.
 
 ---
 
