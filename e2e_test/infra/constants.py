@@ -63,6 +63,9 @@ ENV_RUNTIME = (
 ENV_CONNECTION_MODE = (
     "E2E_CONNECTION_MODE"  # Per-lane wire override — see get_connection_mode_override
 )
+ENV_ZMQ_ENGINE_COUNT = (
+    "E2E_ZMQ_ENGINE_COUNT"  # DP engines per ZMQ worker (grouped vLLM launch; empty = 1)
+)
 ENV_STARTUP_TIMEOUT = "E2E_STARTUP_TIMEOUT"
 ENV_SKIP_MODEL_POOL = "SKIP_MODEL_POOL"
 ENV_SKIP_BACKEND_SETUP = "SKIP_BACKEND_SETUP"
@@ -152,6 +155,22 @@ def get_connection_mode_override() -> "ConnectionMode | None":
         raise ValueError(
             f"{ENV_CONNECTION_MODE}={value!r} is not a valid connection mode; use one of {valid}"
         ) from None
+
+
+def get_zmq_engine_count() -> int:
+    """DP engines per ZMQ worker (grouped vLLM launch).
+
+    Set ``E2E_ZMQ_ENGINE_COUNT`` to run a ZMQ lane with grouped workers: the
+    worker launches that many engines on one socket set and the gateway's
+    handshake awaits them all. Unset/blank means one engine per worker.
+    """
+    value = os.environ.get(ENV_ZMQ_ENGINE_COUNT, "").strip()
+    if not value:
+        return 1
+    count = int(value)
+    if count < 1:
+        raise ValueError(f"{ENV_ZMQ_ENGINE_COUNT}={value!r} must be a positive integer")
+    return count
 
 
 ENV_VLLM_KV_BACKEND = "E2E_VLLM_KV_BACKEND"
