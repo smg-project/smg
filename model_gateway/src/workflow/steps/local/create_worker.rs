@@ -133,6 +133,25 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             });
         }
 
+        // A grouped ZMQ worker (`dp_size: N` on the spec) awaits N engines on
+        // one socket set. TokenSpeed's msgpack wire carries no DP-rank routing
+        // yet, so fail its groups at registration for the same reason as the
+        // runtime check above.
+        let zmq_engine_group = config
+            .dp_size
+            .filter(|&n| n > 1 && *connection_mode == ConnectionMode::Zmq);
+        if zmq_engine_group.is_some() && runtime_type == RuntimeType::TokenSpeed {
+            return Err(WorkflowError::StepFailed {
+                step_id: StepId::new("create_worker"),
+                message: format!(
+                    "ZMQ worker {} configures dp_size={} but the TokenSpeed wire \
+                     does not support DP>1 yet; only vllm engine groups are supported",
+                    config.url,
+                    config.dp_size.unwrap_or_default()
+                ),
+            });
+        }
+
         // Normalize URL
         let url = normalize_url(&config.url, *connection_mode);
 
@@ -215,6 +234,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 }
                 if let Some(ref address) = config.zmq_handshake_address {
                     builder = builder.zmq_handshake_address(address.clone());
+                }
+                if let Some(group_size) = zmq_engine_group {
+                    builder = builder.zmq_engine_group(group_size);
                 }
                 // ZMQ promotion is event-driven: the worker signals the manager
                 // the instant its handshake completes, so wire the registry's
@@ -417,10 +439,12 @@ fn normalize_url(url: &str, connection_mode: ConnectionMode) -> String {
 
 /// Reject a data-parallel worker the ZMQ path cannot serve.
 ///
-/// A ZMQ worker binds a single EngineCore connection (engine_count=1); DP>1
-/// needs the coordinator + wave protocol (not yet implemented), so fail loudly
-/// rather than silently under-connecting. Only ZMQ with `dp_size > 1` is
-/// rejected; gRPC/HTTP data parallelism and single-engine ZMQ are fine.
+/// dp-aware expansion creates one rank-pinned worker per DP rank, but each
+/// ZMQ worker owns its own socket bind — N expanded workers would fight over
+/// the same ipc paths. ZMQ DP runs as a *grouped* worker instead (`dp_size: N`
+/// on the worker spec: one worker, one socket set, N engines dialing in), so
+/// reject the expansion loudly and point at the grouped form. gRPC/HTTP
+/// expansion and single-engine ZMQ are fine.
 fn validate_zmq_dp(
     connection_mode: ConnectionMode,
     dp_size: usize,
@@ -430,8 +454,8 @@ fn validate_zmq_dp(
         return Err(WorkflowError::StepFailed {
             step_id: StepId::new("create_worker"),
             message: format!(
-                "ZMQ worker {url} cannot run data-parallel (dp_size={dp_size}); \
-                 DP>1 over ZMQ is not yet supported"
+                "ZMQ worker {url} cannot be dp-aware expanded (dp_size={dp_size}); \
+                 configure a grouped ZMQ worker (`dp_size` on the worker spec) instead"
             ),
         });
     }

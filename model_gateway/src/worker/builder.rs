@@ -253,6 +253,15 @@ impl BasicWorkerBuilder {
         self
     }
 
+    /// Configure a grouped ZMQ DP worker: one worker and one socket set that
+    /// `size` engines dial into. Sets `dp_size` without a rank — the URL is
+    /// untouched and the worker is not rank-pinned; the connector balances
+    /// across the group's engines internally.
+    pub fn zmq_engine_group(mut self, size: usize) -> Self {
+        self.spec.dp_size = Some(size);
+        self
+    }
+
     /// Build the BasicWorker instance
     pub fn build(mut self) -> BasicWorker {
         use std::sync::{atomic::AtomicBool, Arc};
@@ -379,6 +388,28 @@ mod tests {
 
     use super::*;
     use crate::worker::worker::Worker;
+
+    #[test]
+    fn zmq_engine_group_sets_size_without_rank_or_url_rewrite() {
+        // A grouped ZMQ worker is one worker awaiting N engines: dp_size set,
+        // no rank, URL untouched — the opposite of dp_config's rank expansion.
+        let worker = BasicWorkerBuilder::new("ipc:///tmp/w.ipc")
+            .connection_mode(ConnectionMode::Zmq)
+            .zmq_engine_group(4)
+            .build();
+        assert_eq!(worker.metadata().spec.url, "ipc:///tmp/w.ipc");
+        assert_eq!(worker.metadata().spec.dp_size, Some(4));
+        assert_eq!(worker.metadata().spec.dp_rank, None);
+        assert_eq!(worker.metadata().zmq_engine_count(), 4);
+    }
+
+    #[test]
+    fn ungrouped_worker_awaits_one_engine() {
+        let worker = BasicWorkerBuilder::new("ipc:///tmp/w.ipc")
+            .connection_mode(ConnectionMode::Zmq)
+            .build();
+        assert_eq!(worker.metadata().zmq_engine_count(), 1);
+    }
 
     #[test]
     fn zmq_handshake_address_reaches_the_built_spec() {

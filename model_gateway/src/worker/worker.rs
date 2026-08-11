@@ -57,14 +57,21 @@ async fn connect_zmq_backend(
     model_id: String,
     runtime: RuntimeType,
     handshake_override: Option<String>,
+    engine_count: usize,
 ) -> WorkerResult<Arc<BackendClient>> {
-    zmq_client::connect_for_worker(&base_url, model_id, runtime, handshake_override.as_deref())
-        .await
-        .map(|client| Arc::new(BackendClient::Zmq(client)))
-        .map_err(|reason| WorkerError::ConnectionFailed {
-            url: base_url,
-            reason,
-        })
+    zmq_client::connect_for_worker(
+        &base_url,
+        model_id,
+        runtime,
+        handshake_override.as_deref(),
+        engine_count,
+    )
+    .await
+    .map(|client| Arc::new(BackendClient::Zmq(client)))
+    .map_err(|reason| WorkerError::ConnectionFailed {
+        url: base_url,
+        reason,
+    })
 }
 
 /// Default bootstrap port for PD disaggregation (used by SGLang and vLLM Mooncake)
@@ -758,6 +765,15 @@ impl WorkerMetadata {
         self.spec.dp_size
     }
 
+    /// Number of ZMQ engines this worker's handshake awaits. A grouped ZMQ
+    /// worker carries `dp_size = Some(N)` with no `dp_rank` — one worker, one
+    /// socket set, N engines dialing in (the connector balances across them
+    /// and drives the wave protocol for lockstep groups). Rank-expanded DP
+    /// workers never reach ZMQ connect (rejected at registration).
+    pub fn zmq_engine_count(&self) -> usize {
+        self.spec.dp_size.unwrap_or(1).max(1)
+    }
+
     /// Transform a request for DP-aware routing.
     ///
     /// When the worker has a `dp_rank`, injects `data_parallel_rank`
@@ -1322,10 +1338,17 @@ impl Worker for BasicWorker {
                 let model_id = self.metadata.model_id().to_string();
                 let runtime = self.metadata.spec.runtime_type;
                 let handshake_override = self.metadata.spec.zmq_handshake_address.clone();
+                let engine_count = self.metadata.zmq_engine_count();
                 let cell = self.backend_client.load_full();
                 let client = cell
                     .get_or_try_init(|| {
-                        connect_zmq_backend(base_url, model_id, runtime, handshake_override)
+                        connect_zmq_backend(
+                            base_url,
+                            model_id,
+                            runtime,
+                            handshake_override,
+                            engine_count,
+                        )
                     })
                     .await?;
                 Ok(Some(Arc::clone(client)))
@@ -1416,6 +1439,7 @@ impl Worker for BasicWorker {
             let url = self.metadata.spec.url.clone();
             let runtime = self.metadata.spec.runtime_type;
             let handshake_override = self.metadata.spec.zmq_handshake_address.clone();
+            let engine_count = self.metadata.zmq_engine_count();
             // Capture the readiness signal and the revision at hand-off. The
             // manager only promotes if this revision still matches, so a
             // same-URL replacement racing the handshake is discarded.
@@ -1429,7 +1453,13 @@ impl Worker for BasicWorker {
             let _handle = tokio::spawn(async move {
                 match cell
                     .get_or_try_init(|| {
-                        connect_zmq_backend(base_url, model_id, runtime, handshake_override)
+                        connect_zmq_backend(
+                            base_url,
+                            model_id,
+                            runtime,
+                            handshake_override,
+                            engine_count,
+                        )
                     })
                     .await
                 {

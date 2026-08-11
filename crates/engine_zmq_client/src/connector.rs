@@ -126,10 +126,15 @@ struct ClientInner<P: EngineProtocol> {
 
 impl<P: EngineProtocol> ClientInner<P> {
     /// Pick the engine for a request: by `data_parallel_rank` if set, else the
-    /// sole engine. SMG routing is authoritative for rank selection. The rank is
-    /// matched against the engine's ZMQ index (Python `EngineCoreProc`'s 2-byte
+    /// least-loaded engine. An SMG-pinned rank is authoritative; it is matched
+    /// against the engine's ZMQ index (Python `EngineCoreProc`'s 2-byte
     /// identity), which is version-independent — unlike the `data_parallel_rank`
     /// field, which not every vLLM version sends in `EngineCoreReadyResponse`.
+    ///
+    /// Unpinned requests balance on the piggybacked per-rank load — queue
+    /// depth first, then in-flight batch size — mirroring vLLM's own frontend
+    /// DP client. An engine that has not reported load yet scores zero, so
+    /// cold ranks fill first; with one engine this degenerates to that engine.
     fn select_engine(&self, data_parallel_rank: Option<u32>) -> Result<EngineId> {
         match data_parallel_rank {
             Some(rank) => self
@@ -141,13 +146,22 @@ impl<P: EngineProtocol> ClientInner<P> {
                     rank,
                     num_engines: self.engines.len() as u32,
                 }),
-            None => self
-                .engines
-                .first()
-                .map(|engine| engine.engine_id.clone())
-                .ok_or(Error::ClientClosed {
-                    message: "no engines connected".to_string(),
-                }),
+            None => {
+                let load = self.load.lock();
+                self.engines
+                    .iter()
+                    .min_by_key(|engine| {
+                        engine
+                            .engine_id
+                            .engine_index()
+                            .and_then(|index| load.get(&index))
+                            .map_or((0, 0), |l| (l.num_waiting, l.num_running))
+                    })
+                    .map(|engine| engine.engine_id.clone())
+                    .ok_or(Error::ClientClosed {
+                        message: "no engines connected".to_string(),
+                    })
+            }
         }
     }
 

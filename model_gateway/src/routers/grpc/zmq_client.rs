@@ -305,16 +305,19 @@ async fn unlink_stale_socket(address: &str) -> Result<(), String> {
     }
 }
 
-/// Bind the SMG-side ZMQ sockets and complete the handshake with the engine:
-/// the single connect path for a worker's `ipc://` URL, shared by the lazy
-/// client accessor and the background handshake driver. `model_id` is the
-/// config-resolved served model (EngineCore reports none). Errors are plain
-/// reasons; the worker layer wraps them in its own error type.
+/// Bind the SMG-side ZMQ sockets and complete the handshake with the
+/// engine(s): the single connect path for a worker's `ipc://` URL, shared by
+/// the lazy client accessor and the background handshake driver. `model_id` is
+/// the config-resolved served model (EngineCore reports none). `engine_count`
+/// is the number of DP engines that will dial this worker's sockets (1 for an
+/// ungrouped worker). Errors are plain reasons; the worker layer wraps them in
+/// its own error type.
 pub(crate) async fn connect_for_worker(
     base_url: &str,
     model_id: String,
     runtime: RuntimeType,
     handshake_override: Option<&str>,
+    engine_count: usize,
 ) -> Result<ZmqEngineClient, String> {
     let (handshake, input, output) = zmq_socket_addresses(base_url, handshake_override)?;
     ensure_ipc_socket_dir(base_url).await?;
@@ -339,12 +342,14 @@ pub(crate) async fn connect_for_worker(
         );
         EosTokenIds::default()
     };
-    tracing::info!("Binding ZMQ client for worker {base_url} (handshake={handshake})");
+    tracing::info!(
+        "Binding ZMQ client for worker {base_url} (handshake={handshake}, engines={engine_count})"
+    );
     ZmqEngineClient::connect(
         &handshake,
         &input,
         &output,
-        1,
+        engine_count,
         model_id,
         eos,
         runtime,
