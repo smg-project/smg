@@ -462,8 +462,6 @@ struct Router {
     mcp_config_path: Option<String>,
     storage_hook_wasm_path: Option<String>,
     backend: BackendType,
-    /// DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped).
-    zmq_engine_count: Option<usize>,
     history_backend: HistoryBackendType,
     oracle_config: Option<PyOracleConfig>,
     postgres_config: Option<PyPostgresConfig>,
@@ -497,6 +495,10 @@ struct Router {
     model_aliases: HashMap<String, String>,
     worker_startup_delay: u64,
     worker_ports_annotation: String,
+    /// DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped).
+    /// Appended last: positional constructor compatibility (see the field
+    /// ordering rule on this struct's signature).
+    zmq_engine_count: Option<usize>,
 }
 
 impl Router {
@@ -956,7 +958,6 @@ impl Router {
         mcp_config_path = None,
         storage_hook_wasm_path = None,
         backend = BackendType::Sglang,
-        zmq_engine_count = None,
         history_backend = HistoryBackendType::Memory,
         oracle_config = None,
         postgres_config = None,
@@ -993,6 +994,7 @@ impl Router {
         model_aliases = HashMap::new(),
         worker_startup_delay = 0,
         worker_ports_annotation = String::from("smg.ai/worker-ports"),
+        zmq_engine_count = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1087,7 +1089,6 @@ impl Router {
         mcp_config_path: Option<String>,
         storage_hook_wasm_path: Option<String>,
         backend: BackendType,
-        zmq_engine_count: Option<usize>,
         history_backend: HistoryBackendType,
         oracle_config: Option<PyOracleConfig>,
         postgres_config: Option<PyPostgresConfig>,
@@ -1123,6 +1124,7 @@ impl Router {
         model_aliases: HashMap<String, String>,
         worker_startup_delay: u64,
         worker_ports_annotation: String,
+        zmq_engine_count: Option<usize>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1236,7 +1238,6 @@ impl Router {
             mcp_config_path,
             storage_hook_wasm_path,
             backend,
-            zmq_engine_count,
             history_backend,
             oracle_config,
             postgres_config,
@@ -1267,6 +1268,7 @@ impl Router {
             model_aliases,
             worker_startup_delay,
             worker_ports_annotation,
+            zmq_engine_count,
         })
     }
 

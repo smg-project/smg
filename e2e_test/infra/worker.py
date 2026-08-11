@@ -624,8 +624,16 @@ def start_workers(
     gpus_per_worker = gpus or spec.get("tp", 1)
     if gpus is None and mode == ConnectionMode.ZMQ:
         # A grouped ZMQ worker launches get_zmq_engine_count() engines, each
-        # tp-wide, in one process — size its GPU slice accordingly.
-        gpus_per_worker *= get_zmq_engine_count()
+        # tp-wide, in one process — size its GPU slice accordingly. Only the
+        # vLLM launcher starts engine groups; a grouped count on any other
+        # runtime would reserve GPUs for engines that never launch and leave
+        # the gateway awaiting handshakes that never come.
+        zmq_engine_count = get_zmq_engine_count()
+        if zmq_engine_count > 1 and engine != "vllm":
+            raise ValueError(
+                f"E2E_ZMQ_ENGINE_COUNT={zmq_engine_count} is vLLM-only; got engine={engine!r}"
+            )
+        gpus_per_worker *= zmq_engine_count
     timeout = spec.get("startup_timeout", timeout)
 
     # Detect IB device for PD workers

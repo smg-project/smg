@@ -38,17 +38,25 @@ def _zmq_ipc_url(port: int) -> str:
 
 
 def _backend_arg_int(backend_args: list[str], flag: str, default: int) -> int:
-    """Read an integer flag from raw backend args (``--flag N`` or ``--flag=N``)."""
+    """Read an integer flag from raw backend args (``--flag N`` or ``--flag=N``).
+
+    An unparseable value falls back to the default with a warning — the
+    launcher owns this flag downstream, so silence would quietly discard the
+    operator's intent.
+    """
     for i, arg in enumerate(backend_args):
+        value = None
         if arg == flag and i + 1 < len(backend_args):
+            value = backend_args[i + 1]
+        elif arg.startswith(f"{flag}="):
+            value = arg.split("=", 1)[1]
+        if value is not None:
             try:
-                return int(backend_args[i + 1])
+                return int(value)
             except ValueError:
-                return default
-        if arg.startswith(f"{flag}="):
-            try:
-                return int(arg.split("=", 1)[1])
-            except ValueError:
+                logger.warning(
+                    "Ignoring non-integer value %r for %s; using %d", value, flag, default
+                )
                 return default
     return default
 

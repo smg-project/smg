@@ -600,7 +600,10 @@ jobs:
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
-      gpu_tier: "2"
+      # Tier selects the TEST SET (and model downloads): this lane runs the
+      # tier-1 chat suite; the second GPU serves the second engine of the
+      # group, not 2-GPU-marked tests.
+      gpu_tier: "1"
       runner: 2-gpu-h100
       timeout: 46
       test_timeout: 40

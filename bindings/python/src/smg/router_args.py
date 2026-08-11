@@ -154,8 +154,6 @@ class RouterArgs:
     mcp_config_path: str | None = None
     # Backend selection
     backend: str = "sglang"
-    # DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped)
-    zmq_engine_count: int | None = None
     # WASM support
     enable_wasm: bool = False
     # Storage hooks (WASM)
@@ -206,6 +204,8 @@ class RouterArgs:
     # Append new fields here to preserve positional callers.
     model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
     worker_startup_delay: int = 0
+    # DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped)
+    zmq_engine_count: int | None = None
 
     @staticmethod
     def add_cli_args(
