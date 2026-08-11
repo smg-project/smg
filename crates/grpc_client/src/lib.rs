@@ -76,6 +76,13 @@ pub const FLUSH_RPC_DEADLINE_MARGIN: std::time::Duration = std::time::Duration::
 /// a long time while the backend serializes large traces.
 pub const PROFILE_RPC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(630);
 
+/// Local deadline for the fire-and-forget abort RPC issued from
+/// [`abort_on_drop::AbortOnDropStream`]'s `Drop`. The abort is a tiny unary RPC,
+/// but it runs in a detached task no caller can cancel; bounding it stops those
+/// tasks from accumulating without limit against a wedged backend — which is
+/// exactly when streams are mass-dropped (clients time out and disconnect).
+pub const ABORT_RPC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Shared admin-op implementations (`flush_cache`, `start_profile`,
 /// `stop_profile`) for engine clients whose protos expose the common
 /// admin RPCs (request/response messages live in `common.proto`).
