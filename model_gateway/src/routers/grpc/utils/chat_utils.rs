@@ -703,11 +703,14 @@ pub(crate) fn get_history_tool_calls_count(request: &ChatCompletionRequest) -> u
 ///
 /// # Returns
 /// A unique ID string:
-/// - Kimi-K3 (XTML): `{name}:{tool_index}` — an opaque, per-message zero-based
-///   ordinal. K3 never renders the id into the prompt and matches tool results
-///   back to calls by opaque id equality scoped to the most recent assistant
-///   message, so the id carries no `functions.` prefix and no history offset.
-///   Mirrors the K3 reference decode parser (`{tool_name}:{xtml_index - 1}`).
+/// - Kimi-K3 (XTML): `{name}_{history_count + tool_index}` — an opaque ordinal
+///   that keeps counting across turns, so a second turn's three calls are
+///   `3,4,5` rather than restarting at `0`. The `_` separator matches the
+///   reference K3 server's id shape (`Bash_0`); K2's `:` is protocol-visible
+///   inside the prompt, but K3 never renders the id and matches tool results
+///   back to calls by opaque id equality, so the separator is free to differ.
+///   The history offset keeps ids unique over a conversation (OpenAI treats
+///   `tool_call_id` as globally unique, and clients correlate by it).
 /// - Kimi-K2: `functions.{name}:{history_count + tool_index}` (globally unique).
 /// - others: `call_{24-char-uuid}`.
 pub(crate) fn generate_tool_call_id(
@@ -733,8 +736,8 @@ pub(crate) fn generate_tool_call_id(
         .any(|window| window.eq_ignore_ascii_case(b"k3"));
 
     if is_k3 {
-        // Kimi-K3 (XTML) opaque format: {name}:{per-message zero-based ordinal}.
-        format!("{tool_name}:{tool_index}")
+        // Kimi-K3 (XTML) opaque format: {name}_{global_index}.
+        format!("{tool_name}_{}", history_count + tool_index)
     } else {
         // Kimi-K2 format: functions.{name}:{global_index}.
         format!("functions.{}:{}", tool_name, history_count + tool_index)
@@ -1451,15 +1454,37 @@ mod tests {
 
     #[test]
     fn test_generate_tool_call_id_kimi_k3_opaque_format() {
-        // K3: `{name}:{per-message zero-based ordinal}` — no `functions.` prefix,
-        // no history offset (matches the K3 reference decode parser).
+        // K3: `{name}_{history + index}` — no `functions.` prefix, `_` (not K2's
+        // `:`) as the separator, and a history offset that keeps ids unique
+        // across turns.
         assert_eq!(
             generate_tool_call_id("moonshotai/Kimi-K3", "get_weather", 0, 0),
-            "get_weather:0"
+            "get_weather_0"
         );
         assert_eq!(
             generate_tool_call_id("kimi_k3", "get_weather", 1, 5),
-            "get_weather:1"
+            "get_weather_6"
+        );
+    }
+
+    #[test]
+    fn test_generate_tool_call_id_kimi_k3_continues_across_turns() {
+        // A first turn emitting three parallel calls yields 0,1,2; the next
+        // turn's three calls continue at 3,4,5 instead of colliding with them.
+        // K3 matches tool results back to calls by opaque id equality, so a
+        // repeated id would be ambiguous to any caller correlating by id.
+        let first: Vec<String> = (0..3)
+            .map(|i| generate_tool_call_id("Kimi-K3", "get_weather", i, 0))
+            .collect();
+        let second: Vec<String> = (0..3)
+            .map(|i| generate_tool_call_id("Kimi-K3", "get_weather", i, 3))
+            .collect();
+
+        assert_eq!(first, ["get_weather_0", "get_weather_1", "get_weather_2"]);
+        assert_eq!(second, ["get_weather_3", "get_weather_4", "get_weather_5"]);
+        assert!(
+            first.iter().all(|id| !second.contains(id)),
+            "ids must not repeat across turns: {first:?} vs {second:?}"
         );
     }
 
