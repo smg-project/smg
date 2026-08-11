@@ -143,18 +143,18 @@ struct WireEngineCoreOutputs {
     finished_requests: Option<BTreeSet<String>>,
     /// In DP mode, signals that the current wave finished and engines are paused.
     #[serde(default)]
-    wave_complete: Option<u32>,
+    wave_complete: Option<u64>,
     /// In DP mode, signals that a request arrived for an old wave and the next
     /// wave needs to start in other engines.
     #[serde(default)]
-    start_wave: Option<u32>,
+    start_wave: Option<u64>,
 }
 
 /// Data-parallel control notifications multiplexed through `EngineCoreOutputs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DpControlMessage {
-    WaveComplete(u32),
-    StartWave(u32),
+    WaveComplete(u64),
+    StartWave(u64),
 }
 
 /// A batch of per-request outputs plus the piggybacked scheduler stats.

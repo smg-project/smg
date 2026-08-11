@@ -96,12 +96,14 @@ impl EngineProtocol for VllmProtocol {
         encode_msgpack(&[request_id.to_string()])
     }
 
-    fn encode_start_wave(wave: u32, exclude_engine_index: u32) -> Result<Option<(Bytes, Vec<u8>)>> {
+    fn encode_start_wave(wave: u64) -> Result<Option<(Bytes, Vec<u8>)>> {
         // Python decodes this with the generic msgpack decoder and unpacks it
-        // positionally as `new_wave, exclude_eng_index`.
+        // positionally as `new_wave, exclude_eng_index`. The sentinel matches
+        // no rank, so every rank adopts `wave`.
+        const NO_EXCLUDED_RANK: u32 = u32::MAX;
         Ok(Some((
             EngineCoreRequestType::StartDpWave.to_frame(),
-            encode_msgpack(&(wave, exclude_engine_index))?,
+            encode_msgpack(&(wave, NO_EXCLUDED_RANK))?,
         )))
     }
 

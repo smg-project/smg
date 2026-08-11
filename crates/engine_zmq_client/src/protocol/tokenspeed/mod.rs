@@ -121,10 +121,7 @@ impl EngineProtocol for TokenSpeedProtocol {
         encode_msgpack(&[request_id.to_string()])
     }
 
-    fn encode_start_wave(
-        _wave: u32,
-        _exclude_engine_index: u32,
-    ) -> Result<Option<(Bytes, Vec<u8>)>> {
+    fn encode_start_wave(_wave: u64) -> Result<Option<(Bytes, Vec<u8>)>> {
         // TokenSpeed has no wave protocol: its scheduler never pauses a group
         // of ranks, so there is nothing to wake.
         Ok(None)
