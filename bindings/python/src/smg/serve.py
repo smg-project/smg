@@ -37,6 +37,22 @@ def _zmq_ipc_url(port: int) -> str:
     return f"ipc://{_ZMQ_SOCKET_DIR}/engine-{port}"
 
 
+def _backend_arg_int(backend_args: list[str], flag: str, default: int) -> int:
+    """Read an integer flag from raw backend args (``--flag N`` or ``--flag=N``)."""
+    for i, arg in enumerate(backend_args):
+        if arg == flag and i + 1 < len(backend_args):
+            try:
+                return int(backend_args[i + 1])
+            except ValueError:
+                return default
+        if arg.startswith(f"{flag}="):
+            try:
+                return int(arg.split("=", 1)[1])
+            except ValueError:
+                return default
+    return default
+
+
 def _zmq_handshake_port(ipc_url: str) -> int:
     """The tcp handshake port SMG derives from an ipc:// URL.
 
@@ -274,13 +290,16 @@ class VllmWorkerLauncher(WorkerLauncher):
     def _build_zmq_command(
         self, args: argparse.Namespace, backend_args: list[str], port: int
     ) -> list[str]:
-        """Launch a headless vLLM EngineCore that dials SMG's ZMQ handshake.
+        """Launch a headless vLLM EngineCore group that dials SMG's ZMQ handshake.
 
         SMG (the router) binds the tcp handshake + ipc data-plane sockets it
-        derives from the ipc:// worker URL; this engine connects in. Each worker
-        is a standalone engine (`--data-parallel-size 1`); running several is
-        dense data parallelism as N independent ZMQ workers.
+        derives from the ipc:// worker URL; the engines connect in. An
+        engine-level ``--data-parallel-size N`` (after ``--``) launches a
+        grouped worker: N engines on one socket set, balanced by the
+        connector. The default stays one standalone engine per worker;
+        running several workers is dense data parallelism.
         """
+        engine_dp = _backend_arg_int(backend_args, "--data-parallel-size", 1)
         rpc_port = _zmq_handshake_port(_zmq_ipc_url(port))
         cmd = [
             sys.executable,
@@ -290,9 +309,9 @@ class VllmWorkerLauncher(WorkerLauncher):
             getattr(args, "model", ""),
             "--headless",
             "--data-parallel-size",
-            "1",
+            str(engine_dp),
             "--data-parallel-size-local",
-            "1",
+            str(engine_dp),
             "--data-parallel-address",
             "127.0.0.1",
             "--data-parallel-rpc-port",
@@ -877,6 +896,11 @@ class ServeOrchestrator:
         # --backend does not reach.)
         if getattr(self.args, "connection_mode", "grpc") == "zmq":
             router_args.backend = self.backend
+            # A grouped vLLM launch (engine-level --data-parallel-size N after
+            # `--`) needs the router to await N engines per worker handshake.
+            engine_dp = _backend_arg_int(self.backend_args, "--data-parallel-size", 1)
+            if engine_dp > 1 and self.backend == "vllm":
+                router_args.zmq_engine_count = engine_dp
         # Router-level retries and circuit breaker are redundant when there is a
         # single worker — per-worker resilience already handles failures — so
         # disable them by default for dp<=1. Users who want them must run dp>1.

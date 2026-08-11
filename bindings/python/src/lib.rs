@@ -462,6 +462,8 @@ struct Router {
     mcp_config_path: Option<String>,
     storage_hook_wasm_path: Option<String>,
     backend: BackendType,
+    /// DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped).
+    zmq_engine_count: Option<usize>,
     history_backend: HistoryBackendType,
     oracle_config: Option<PyOracleConfig>,
     postgres_config: Option<PyPostgresConfig>,
@@ -769,6 +771,7 @@ impl Router {
             .health_check_port(self.health_check_port)
             .connection_mode(self.connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
+            .zmq_engine_count(self.zmq_engine_count)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
@@ -953,6 +956,7 @@ impl Router {
         mcp_config_path = None,
         storage_hook_wasm_path = None,
         backend = BackendType::Sglang,
+        zmq_engine_count = None,
         history_backend = HistoryBackendType::Memory,
         oracle_config = None,
         postgres_config = None,
@@ -1083,6 +1087,7 @@ impl Router {
         mcp_config_path: Option<String>,
         storage_hook_wasm_path: Option<String>,
         backend: BackendType,
+        zmq_engine_count: Option<usize>,
         history_backend: HistoryBackendType,
         oracle_config: Option<PyOracleConfig>,
         postgres_config: Option<PyPostgresConfig>,
@@ -1231,6 +1236,7 @@ impl Router {
             mcp_config_path,
             storage_hook_wasm_path,
             backend,
+            zmq_engine_count,
             history_backend,
             oracle_config,
             postgres_config,

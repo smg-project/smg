@@ -154,6 +154,8 @@ class RouterArgs:
     mcp_config_path: str | None = None
     # Backend selection
     backend: str = "sglang"
+    # DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped)
+    zmq_engine_count: int | None = None
     # WASM support
     enable_wasm: bool = False
     # Storage hooks (WASM)
@@ -1010,6 +1012,16 @@ class RouterArgs:
             help=(
                 "Backend runtime to use (default: sglang). For ZMQ workers, vllm/"
                 "tokenspeed also pin the wire protocol (it cannot be auto-detected)"
+            ),
+        )
+        backend_group.add_argument(
+            f"--{prefix}zmq-engine-count",
+            type=int,
+            default=RouterArgs.zmq_engine_count,
+            help=(
+                "DP engines per startup ZMQ worker: each ipc:// worker becomes a "
+                "grouped worker whose handshake awaits this many engines on one "
+                "socket set (vLLM only; default: 1)"
             ),
         )
         backend_group.add_argument(

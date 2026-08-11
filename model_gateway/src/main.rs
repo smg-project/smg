@@ -314,6 +314,11 @@ struct CliArgs {
     #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
     worker_startup_check_interval: u64,
 
+    /// DP engines per startup ZMQ worker: each ipc:// worker becomes a grouped
+    /// worker whose handshake awaits this many engines on one socket set.
+    #[arg(long, help_heading = "Worker Configuration")]
+    zmq_engine_count: Option<usize>,
+
     /// Interval in seconds between load monitor checks for PowerOfTwo routing
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
@@ -1469,6 +1474,7 @@ impl CliArgs {
             .policy(policy)
             .connection_mode(connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
+            .zmq_engine_count(self.zmq_engine_count)
             .host(&self.host)
             .port(self.port)
             .health_check_port(self.health_check_port)

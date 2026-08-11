@@ -770,6 +770,30 @@ class TestVllmWorkerLauncher:
         for arg in backend_args:
             assert arg in cmd
 
+    def test_build_zmq_command_defaults_to_single_engine(self):
+        launcher = VllmWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="zmq")
+        cmd = launcher.build_command(args, [], "127.0.0.1", 31000)
+        assert cmd[cmd.index("--data-parallel-size") + 1] == "1"
+        assert cmd[cmd.index("--data-parallel-size-local") + 1] == "1"
+
+    def test_build_zmq_command_grouped_engine_dp(self):
+        """Engine-level --data-parallel-size N launches a grouped worker:
+        the launcher owns both dp flags (operator's copy is filtered) and
+        emits N for size and size-local."""
+        launcher = VllmWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="zmq")
+        cmd = launcher.build_command(args, ["--data-parallel-size", "2"], "127.0.0.1", 31000)
+        assert cmd.count("--data-parallel-size") == 1
+        assert cmd[cmd.index("--data-parallel-size") + 1] == "2"
+        assert cmd[cmd.index("--data-parallel-size-local") + 1] == "2"
+
+    def test_build_zmq_command_grouped_engine_dp_equals_form(self):
+        launcher = VllmWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="zmq")
+        cmd = launcher.build_command(args, ["--data-parallel-size=4"], "127.0.0.1", 31000)
+        assert cmd[cmd.index("--data-parallel-size") + 1] == "4"
+
     def test_worker_url(self):
         launcher = VllmWorkerLauncher()
         args = argparse.Namespace(connection_mode="grpc")
