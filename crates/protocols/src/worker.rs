@@ -243,6 +243,10 @@ pub enum RuntimeType {
     Mlx,
     /// TokenSpeed runtime.
     TokenSpeed,
+    /// Generic OpenAI-compatible HTTP backend whose engine could not be
+    /// identified (e.g. a nested SMG gateway fronting the real engine).
+    /// Routed as plain OpenAI HTTP; no engine-specific features are assumed.
+    Generic,
     /// External OpenAI-compatible API (not local inference).
     External,
 }
@@ -263,6 +267,7 @@ impl RuntimeType {
             RuntimeType::Trtllm => "trtllm",
             RuntimeType::Mlx => "mlx",
             RuntimeType::TokenSpeed => "tokenspeed",
+            RuntimeType::Generic => "generic",
             RuntimeType::External => "external",
         }
     }
@@ -290,6 +295,8 @@ impl std::str::FromStr for RuntimeType {
             Ok(RuntimeType::Mlx)
         } else if s.eq_ignore_ascii_case("tokenspeed") {
             Ok(RuntimeType::TokenSpeed)
+        } else if s.eq_ignore_ascii_case("generic") {
+            Ok(RuntimeType::Generic)
         } else if s.eq_ignore_ascii_case("external") {
             Ok(RuntimeType::External)
         } else {
@@ -1432,6 +1439,33 @@ mod connection_mode_tests {
     fn from_url_returns_none_for_bare_or_unknown() {
         assert_eq!(ConnectionMode::from_url("host:30000"), None);
         assert_eq!(ConnectionMode::from_url("ftp://host"), None);
+    }
+}
+
+#[cfg(test)]
+mod runtime_type_tests {
+    use super::RuntimeType;
+
+    #[test]
+    fn generic_round_trips_through_str_and_serde() {
+        assert_eq!(RuntimeType::Generic.as_str(), "generic");
+        assert_eq!(
+            "generic".parse::<RuntimeType>().unwrap(),
+            RuntimeType::Generic
+        );
+        assert_eq!(
+            serde_json::to_string(&RuntimeType::Generic).unwrap(),
+            "\"generic\""
+        );
+        assert_eq!(
+            serde_json::from_str::<RuntimeType>("\"generic\"").unwrap(),
+            RuntimeType::Generic
+        );
+    }
+
+    #[test]
+    fn generic_counts_as_specified() {
+        assert!(RuntimeType::Generic.is_specified());
     }
 }
 

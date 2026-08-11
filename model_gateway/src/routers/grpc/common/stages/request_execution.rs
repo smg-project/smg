@@ -274,6 +274,7 @@ impl RequestExecutionStage {
             }
             Some(RuntimeType::Trtllm)
             | Some(RuntimeType::Mlx)
+            | Some(RuntimeType::Generic)
             | Some(RuntimeType::External)
             | Some(RuntimeType::Unspecified) => {
                 error!(
