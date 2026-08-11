@@ -102,7 +102,8 @@ impl PipelineStage for MessageResponseProcessingStage {
                     tokenizer,
                     skip_special_tokens,
                     reservation.clone(),
-                );
+                )
+                .await;
 
             // Attach load guards (and the reservation's disconnect/error
             // safety net) for RAII lifecycle.

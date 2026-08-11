@@ -2,7 +2,6 @@
 
 use std::{
     collections::HashMap,
-    io,
     sync::{Arc, OnceLock},
 };
 
@@ -22,24 +21,33 @@ use openai_protocol::{
     generate::GenerateFinishReason,
 };
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::Semaphore;
 use tracing::error;
 use uuid::Uuid;
 
 use crate::routers::{
+    common::sse,
     error,
     grpc::{context::RequestContext, multimodal::PlaceholderTokens, ProcessedMessages},
 };
 
 /// Type alias for the SSE channel sender used across streaming endpoints.
-pub(crate) type SseSender = mpsc::UnboundedSender<Result<Bytes, io::Error>>;
+///
+/// Re-exports the bounded [`crate::routers::common::sse::SseSender`] so the gRPC
+/// streaming paths share one definition with the rest of the gateway and cannot
+/// drift back to an unbounded channel. Bounded => `send` is async and applies
+/// backpressure to a slow client.
+pub(crate) type SseSender = sse::SseSender;
 
 /// Send an SSE error event with a typed error body.
 ///
 /// Produces `data: {"error":{"message":"...","type":"..."}}\n\n` using
 /// `serde_json` so that quotes, newlines, and other special characters in the
 /// error message are properly escaped.
-pub(crate) fn send_error_sse(tx: &SseSender, message: impl ToString, error_type: &str) {
+///
+/// `async` because the sender is bounded: awaits if the buffer is full so the
+/// terminal error frame still applies backpressure rather than being dropped.
+pub(crate) async fn send_error_sse(tx: &SseSender, message: impl ToString, error_type: &str) {
     let chunk = format!(
         "data: {}\n\n",
         json!({
@@ -49,7 +57,7 @@ pub(crate) fn send_error_sse(tx: &SseSender, message: impl ToString, error_type:
             }
         })
     );
-    let _ = tx.send(Ok(Bytes::from(chunk)));
+    let _ = tx.send(Ok(Bytes::from(chunk))).await;
 }
 
 /// Resolve tokenizer from registry and cache it in request context.

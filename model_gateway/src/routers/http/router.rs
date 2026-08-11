@@ -29,7 +29,7 @@ use reqwest::{
     Client,
 };
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::error;
 
 use crate::{
@@ -50,6 +50,7 @@ use crate::{
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
             retry::{is_retryable_status, RetryExecutor},
+            sse::SSE_CHANNEL_BUFFER,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
@@ -1069,7 +1070,9 @@ impl Router {
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
             let stream = res.bytes_stream();
-            let (tx, rx) = mpsc::unbounded_channel();
+            // Bounded channel applies backpressure: a slow client makes the
+            // relay await on `send` instead of buffering the whole response.
+            let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
 
             // Spawn task to forward stream
             #[expect(
@@ -1081,19 +1084,19 @@ impl Router {
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
+                            if tx.send(Ok(bytes)).await.is_err() {
                                 break;
                             }
                         }
                         Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {e}")));
+                            let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                             break;
                         }
                     }
                 }
             });
 
-            let stream = UnboundedReceiverStream::new(rx);
+            let stream = ReceiverStream::new(rx);
             let body = Body::from_stream(stream);
 
             let mut response = Response::new(body);

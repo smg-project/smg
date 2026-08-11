@@ -4,7 +4,6 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    io,
     sync::Arc,
     time::Instant,
 };
@@ -30,7 +29,6 @@ use openai_protocol::{
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, mpsc::UnboundedSender};
 use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
 use tracing::{debug, error, warn};
 
@@ -38,7 +36,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     rate_limit::{SharedReservationHandle, UsageSettlement},
     routers::{
-        common::sse::SseEncoder,
+        common::sse::{sse_channel, SseEncoder, SseSender},
         grpc::{
             common::{response_formatting::CompletionTokenTracker, responses::build_sse_response},
             context,
@@ -123,7 +121,7 @@ impl StreamingProcessor {
     ///
     /// Note: Caller should attach load guards to the returned response using
     /// `WorkerLoadGuard::attach_to_response()` for proper RAII lifecycle management.
-    pub fn process_streaming_response(
+    pub async fn process_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
         chat_request: Arc<ChatCompletionRequest>,
@@ -133,7 +131,6 @@ impl StreamingProcessor {
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Response {
         use bytes::Bytes;
-        use tokio::sync::mpsc;
 
         let stop_params = (
             chat_request.stop.clone(),
@@ -144,7 +141,7 @@ impl StreamingProcessor {
         );
 
         // Create SSE channel
-        let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
+        let (tx, rx) = sse_channel();
 
         // Spawn background task based on execution mode
         match execution_result {
@@ -170,10 +167,10 @@ impl StreamingProcessor {
                         .await;
 
                     if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error");
+                        utils::send_error_sse(&tx, &e, "internal_error").await;
                     }
 
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
                 });
             }
             context::ExecutionResult::PrefillDecode {
@@ -203,10 +200,10 @@ impl StreamingProcessor {
                         .await;
 
                     if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error");
+                        utils::send_error_sse(&tx, &e, "internal_error").await;
                     }
 
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
                 });
             }
             context::ExecutionResult::Embedding { .. } => {
@@ -214,8 +211,9 @@ impl StreamingProcessor {
                     &tx,
                     "Embeddings not supported in streaming mode",
                     "invalid_request_error",
-                );
-                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                )
+                .await;
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
             }
             // Batch results exist only on the completions pipeline.
             context::ExecutionResult::Batch { .. } => {
@@ -223,8 +221,9 @@ impl StreamingProcessor {
                     &tx,
                     "Batched results not supported in chat streaming",
                     "invalid_request_error",
-                );
-                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                )
+                .await;
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
             }
         }
 
@@ -241,7 +240,7 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
-        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         self.process_streaming_chunks_inner(
@@ -268,7 +267,7 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
-        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
@@ -473,6 +472,7 @@ impl StreamingProcessor {
                             .build();
                         Self::format_sse_chunk_into(&mut sse_buffer, &first_chunk);
                         tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                            .await
                             .map_err(|_| "Failed to send first chunk".to_string())?;
                         is_firsts.insert(index, false);
                     }
@@ -499,6 +499,7 @@ impl StreamingProcessor {
                         if let Some(chunk) = reasoning_chunk {
                             Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
                             tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                                .await
                                 .map_err(|_| "Failed to send reasoning chunk".to_string())?;
                         }
                         delta = normal_text;
@@ -550,6 +551,7 @@ impl StreamingProcessor {
                             for chunk in tool_chunks {
                                 Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
                                 tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                                    .await
                                     .map_err(|_| "Failed to send tool call chunk".to_string())?;
                             }
 
@@ -574,6 +576,7 @@ impl StreamingProcessor {
                                 .build();
                         Self::format_sse_chunk_into(&mut sse_buffer, &content_chunk);
                         tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                            .await
                             .map_err(|_| "Failed to send content chunk".to_string())?;
                     }
                 }
@@ -599,6 +602,7 @@ impl StreamingProcessor {
                                         format!("Failed to serialize content chunk: {e}")
                                     })?;
                                 tx.send(Ok(sse_chunk))
+                                    .await
                                     .map_err(|_| "Failed to send flushed content".to_string())?;
                             }
                         }
@@ -654,6 +658,7 @@ impl StreamingProcessor {
                         .encode_data(&tool_chunk)
                         .map_err(|e| format!("Failed to serialize tool chunk: {e}"))?;
                     tx.send(Ok(sse_chunk))
+                        .await
                         .map_err(|_| "Failed to send unstreamed tool args".to_string())?;
                 }
             }
@@ -680,6 +685,7 @@ impl StreamingProcessor {
                 .encode_data(&finish_chunk)
                 .map_err(|e| format!("Failed to serialize finish chunk: {e}"))?;
             tx.send(Ok(sse_chunk))
+                .await
                 .map_err(|_| "Failed to send finish chunk".to_string())?;
         }
 
@@ -710,6 +716,7 @@ impl StreamingProcessor {
                     .encode_data(&usage_chunk)
                     .map_err(|e| format!("Failed to serialize usage chunk: {e}"))?;
                 tx.send(Ok(sse_chunk))
+                    .await
                     .map_err(|_| "Failed to send usage chunk".to_string())?;
             }
         }
@@ -762,7 +769,7 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
-        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         pd_timing: context::PdTiming,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
@@ -813,7 +820,7 @@ impl StreamingProcessor {
     ///
     /// Note: Caller should attach load guards to the returned response using
     /// `WorkerLoadGuard::attach_to_response()` for proper RAII lifecycle management.
-    pub fn process_streaming_generate(
+    pub async fn process_streaming_generate(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
         generate_request: Arc<GenerateRequest>,
@@ -822,7 +829,7 @@ impl StreamingProcessor {
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Response {
         // Create SSE channel
-        let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
+        let (tx, rx) = sse_channel();
 
         // Build context once, clone for spawned task
         let ctx = GenerateStreamContext {
@@ -856,10 +863,10 @@ impl StreamingProcessor {
                             .await;
 
                     if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error");
+                        utils::send_error_sse(&tx, &e, "internal_error").await;
                     }
 
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
                 });
             }
             context::ExecutionResult::PrefillDecode {
@@ -886,10 +893,10 @@ impl StreamingProcessor {
                     .await;
 
                     if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error");
+                        utils::send_error_sse(&tx, &e, "internal_error").await;
                     }
 
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
                 });
             }
             context::ExecutionResult::Embedding { .. } => {
@@ -897,8 +904,9 @@ impl StreamingProcessor {
                     &tx,
                     "Embeddings not supported in streaming generate",
                     "invalid_request_error",
-                );
-                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                )
+                .await;
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
             }
             // Batch results exist only on the completions pipeline.
             context::ExecutionResult::Batch { .. } => {
@@ -906,8 +914,9 @@ impl StreamingProcessor {
                     &tx,
                     "Batched results not supported in streaming generate",
                     "invalid_request_error",
-                );
-                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                )
+                .await;
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
             }
         }
 
@@ -921,7 +930,7 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         mut stream: ProtoStream,
         ctx: GenerateStreamContext,
-        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         let start_time = Instant::now();
@@ -988,6 +997,7 @@ impl StreamingProcessor {
                         .encode_data(&chunk_response)
                         .map_err(|e| format!("Failed to serialize generate chunk: {e}"))?;
                     tx.send(Ok(sse_data))
+                        .await
                         .map_err(|_| "Failed to send chunk".to_string())?;
                 }
                 ProtoResponseVariant::Complete(complete) => {
@@ -1021,6 +1031,7 @@ impl StreamingProcessor {
                         .encode_data(&finish_response)
                         .map_err(|e| format!("Failed to serialize generate finish: {e}"))?;
                     tx.send(Ok(sse_data))
+                        .await
                         .map_err(|_| "Failed to send finish chunk".to_string())?;
 
                     // Continue to process all completions if n>1
@@ -1057,7 +1068,7 @@ impl StreamingProcessor {
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
         ctx: GenerateStreamContext,
-        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         pd_timing: context::PdTiming,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
@@ -1113,7 +1124,7 @@ impl StreamingProcessor {
         mut stream: ProtoStream,
         ctx: GenerateStreamContext,
         input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
-        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
@@ -1217,6 +1228,7 @@ impl StreamingProcessor {
                         .encode_data(&chunk_response)
                         .map_err(|e| format!("Failed to serialize generate chunk: {e}"))?;
                     tx.send(Ok(sse_data))
+                        .await
                         .map_err(|_| "Failed to send chunk".to_string())?;
                 }
                 ProtoResponseVariant::Complete(complete) => {
@@ -1264,6 +1276,7 @@ impl StreamingProcessor {
                         .encode_data(&finish_response)
                         .map_err(|e| format!("Failed to serialize generate finish: {e}"))?;
                     tx.send(Ok(sse_data))
+                        .await
                         .map_err(|_| "Failed to send finish chunk".to_string())?;
 
                     // Continue to process all completions if n>1
@@ -1633,13 +1646,14 @@ impl StreamingProcessor {
     }
 
     /// Send a `MessageStreamEvent` through the SSE channel using a reusable buffer.
-    fn send_messages_event(
-        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+    async fn send_messages_event(
+        tx: &SseSender,
         buffer: &mut Vec<u8>,
         event: &MessageStreamEvent,
     ) -> Result<(), String> {
         Self::format_messages_sse_into(buffer, event)?;
         tx.send(Ok(Bytes::from(buffer.clone())))
+            .await
             .map_err(|_| "Client disconnected".to_string())
     }
 
@@ -1699,7 +1713,7 @@ impl StreamingProcessor {
     ///
     /// Parallel to [`Self::process_streaming_response`] for chat, but emits
     /// Anthropic SSE format (`event: {type}\ndata: {json}\n\n`).
-    pub fn process_messages_streaming_response(
+    pub async fn process_messages_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
         messages_request: Arc<CreateMessageRequest>,
@@ -1719,7 +1733,7 @@ impl StreamingProcessor {
             false, // ignore_eos — not available in Messages API
         );
 
-        let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
+        let (tx, rx) = sse_channel();
 
         match execution_result {
             context::ExecutionResult::Single { stream } => {
@@ -1751,7 +1765,7 @@ impl StreamingProcessor {
                             },
                         };
                         let mut buf = Vec::with_capacity(256);
-                        let _ = Self::send_messages_event(&tx, &mut buf, &error_event);
+                        let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
                     }
                     // No data: [DONE] — Anthropic uses message_stop instead
                 });
@@ -1790,7 +1804,7 @@ impl StreamingProcessor {
                             },
                         };
                         let mut buf = Vec::with_capacity(256);
-                        let _ = Self::send_messages_event(&tx, &mut buf, &error_event);
+                        let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
                     }
                 });
             }
@@ -1802,7 +1816,7 @@ impl StreamingProcessor {
                     },
                 };
                 let mut buf = Vec::with_capacity(256);
-                let _ = Self::send_messages_event(&tx, &mut buf, &error_event);
+                let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
             }
             // Batch results exist only on the completions pipeline.
             context::ExecutionResult::Batch { .. } => {
@@ -1813,7 +1827,7 @@ impl StreamingProcessor {
                     },
                 };
                 let mut buf = Vec::with_capacity(256);
-                let _ = Self::send_messages_event(&tx, &mut buf, &error_event);
+                let _ = Self::send_messages_event(&tx, &mut buf, &error_event).await;
             }
         }
 
@@ -1832,7 +1846,7 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<CreateMessageRequest>,
-        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         let start_time = Instant::now();
@@ -1998,7 +2012,8 @@ impl StreamingProcessor {
             &MessageStreamEvent::MessageStart {
                 message: start_message,
             },
-        )?;
+        )
+        .await?;
 
         // Phase 2: Main streaming loop
         while let Some(response) = grpc_stream.next().await {
@@ -2065,7 +2080,8 @@ impl StreamingProcessor {
                                         signature: String::new(),
                                     },
                                 },
-                            )?;
+                            )
+                            .await?;
                             thinking_block_open = true;
                         }
                         Self::send_messages_event(
@@ -2077,7 +2093,8 @@ impl StreamingProcessor {
                                     thinking: reasoning_chunk_text,
                                 },
                             },
-                        )?;
+                        )
+                        .await?;
                     }
 
                     // Transition: reasoning ended, close thinking block
@@ -2088,7 +2105,8 @@ impl StreamingProcessor {
                             &MessageStreamEvent::ContentBlockStop {
                                 index: current_block_index,
                             },
-                        )?;
+                        )
+                        .await?;
                         thinking_block_open = false;
                         current_block_index += 1;
                     }
@@ -2107,7 +2125,8 @@ impl StreamingProcessor {
                                         &MessageStreamEvent::ContentBlockStop {
                                             index: current_block_index,
                                         },
-                                    )?;
+                                    )
+                                    .await?;
                                     text_block_open = false;
                                     current_block_index += 1;
                                 }
@@ -2133,7 +2152,8 @@ impl StreamingProcessor {
                                             input: Value::Object(serde_json::Map::new()),
                                         },
                                     },
-                                )?;
+                                )
+                                .await?;
                                 tool_block_open = true;
                             }
                             // Emit arguments delta
@@ -2147,7 +2167,8 @@ impl StreamingProcessor {
                                             partial_json: normal_text,
                                         },
                                     },
-                                )?;
+                                )
+                                .await?;
                             }
                         } else if let Some(ref mut parser) = streaming_tool_parser {
                             // Regular/required tool choice: use incremental parser
@@ -2169,7 +2190,8 @@ impl StreamingProcessor {
                                                         citations: None,
                                                     },
                                                 },
-                                            )?;
+                                            )
+                                            .await?;
                                             text_block_open = true;
                                         }
                                         Self::send_messages_event(
@@ -2179,7 +2201,8 @@ impl StreamingProcessor {
                                                 index: current_block_index,
                                                 delta: ContentBlockDelta::TextDelta { text },
                                             },
-                                        )?;
+                                        )
+                                        .await?;
                                     }
 
                                     // Emit tool call events
@@ -2195,7 +2218,8 @@ impl StreamingProcessor {
                                                     &MessageStreamEvent::ContentBlockStop {
                                                         index: current_block_index,
                                                     },
-                                                )?;
+                                                )
+                                                .await?;
                                                 text_block_open = false;
                                                 current_block_index += 1;
                                             }
@@ -2206,7 +2230,8 @@ impl StreamingProcessor {
                                                     &MessageStreamEvent::ContentBlockStop {
                                                         index: current_block_index,
                                                     },
-                                                )?;
+                                                )
+                                                .await?;
                                                 current_block_index += 1;
                                             }
 
@@ -2227,7 +2252,7 @@ impl StreamingProcessor {
                                                         input: Value::Object(serde_json::Map::new()),
                                                     },
                                                 },
-                                            )?;
+                                            ).await?;
                                             tool_block_open = true;
                                         }
 
@@ -2242,7 +2267,8 @@ impl StreamingProcessor {
                                                         partial_json: tool_call_item.parameters,
                                                     },
                                                 },
-                                            )?;
+                                            )
+                                            .await?;
                                         }
                                     }
                                 }
@@ -2267,7 +2293,8 @@ impl StreamingProcessor {
                                         citations: None,
                                     },
                                 },
-                            )?;
+                            )
+                            .await?;
                             text_block_open = true;
                         }
                         Self::send_messages_event(
@@ -2277,7 +2304,8 @@ impl StreamingProcessor {
                                 index: current_block_index,
                                 delta: ContentBlockDelta::TextDelta { text: normal_text },
                             },
-                        )?;
+                        )
+                        .await?;
                     }
                 }
                 ProtoResponseVariant::Complete(complete) => {
@@ -2295,7 +2323,8 @@ impl StreamingProcessor {
                                             citations: None,
                                         },
                                     },
-                                )?;
+                                )
+                                .await?;
                                 text_block_open = true;
                             }
                             Self::send_messages_event(
@@ -2305,7 +2334,8 @@ impl StreamingProcessor {
                                     index: current_block_index,
                                     delta: ContentBlockDelta::TextDelta { text },
                                 },
-                            )?;
+                            )
+                            .await?;
                         }
                     }
 
@@ -2338,7 +2368,8 @@ impl StreamingProcessor {
                                 &MessageStreamEvent::ContentBlockStop {
                                     index: current_block_index,
                                 },
-                            )?;
+                            )
+                            .await?;
                             text_block_open = false;
                             current_block_index += 1;
                         }
@@ -2349,7 +2380,8 @@ impl StreamingProcessor {
                                 &MessageStreamEvent::ContentBlockStop {
                                     index: current_block_index,
                                 },
-                            )?;
+                            )
+                            .await?;
                             current_block_index += 1;
                         }
 
@@ -2370,7 +2402,8 @@ impl StreamingProcessor {
                                     input: Value::Object(serde_json::Map::new()),
                                 },
                             },
-                        )?;
+                        )
+                        .await?;
                         tool_block_open = true;
                     }
 
@@ -2384,7 +2417,8 @@ impl StreamingProcessor {
                                     partial_json: tool_call_item.parameters,
                                 },
                             },
-                        )?;
+                        )
+                        .await?;
                     }
                 }
             }
@@ -2398,7 +2432,8 @@ impl StreamingProcessor {
                 &MessageStreamEvent::ContentBlockStop {
                     index: current_block_index,
                 },
-            )?;
+            )
+            .await?;
             current_block_index += 1;
         }
 
@@ -2409,7 +2444,8 @@ impl StreamingProcessor {
                 &MessageStreamEvent::ContentBlockStop {
                     index: current_block_index,
                 },
-            )?;
+            )
+            .await?;
             current_block_index += 1;
         }
 
@@ -2420,7 +2456,8 @@ impl StreamingProcessor {
                 &MessageStreamEvent::ContentBlockStop {
                     index: current_block_index,
                 },
-            )?;
+            )
+            .await?;
         }
 
         // Phase 4: Emit message_delta with stop_reason and usage
@@ -2456,10 +2493,11 @@ impl StreamingProcessor {
                     server_tool_use: None,
                 },
             },
-        )?;
+        )
+        .await?;
 
         // Phase 5: Emit message_stop
-        Self::send_messages_event(tx, &mut sse_buffer, &MessageStreamEvent::MessageStop)?;
+        Self::send_messages_event(tx, &mut sse_buffer, &MessageStreamEvent::MessageStop).await?;
 
         // Mark stream completed
         grpc_stream.mark_completed();
@@ -2505,7 +2543,7 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<CreateMessageRequest>,
-        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         // Consume prefill stream (Messages API does not expose prompt logprobs)
@@ -2547,7 +2585,7 @@ impl StreamingProcessor {
     /// write typed SSE events (with prompt-major index offsets) into one
     /// channel, and the coordinator emits the single aggregated usage chunk,
     /// metrics record, and `[DONE]`.
-    pub fn process_completion_streaming_response(
+    pub async fn process_completion_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
         completion_request: Arc<CompletionRequest>,
@@ -2555,13 +2593,13 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Response {
-        let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
+        let (tx, rx) = sse_channel();
 
         let units = match Self::completion_stream_units(execution_result) {
             Ok(units) => units,
             Err(message) => {
-                utils::send_error_sse(&tx, message, "invalid_request_error");
-                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                utils::send_error_sse(&tx, message, "invalid_request_error").await;
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
                 return build_sse_response(rx);
             }
         };
@@ -2645,7 +2683,7 @@ impl StreamingProcessor {
 
             match outcomes {
                 Err(e) => {
-                    utils::send_error_sse(&tx, &e, "internal_error");
+                    utils::send_error_sse(&tx, &e, "internal_error").await;
                 }
                 Ok(outcomes) => {
                     let mut total_prompt = 0u32;
@@ -2702,7 +2740,7 @@ impl StreamingProcessor {
                         };
                         let mut sse_buffer = Vec::with_capacity(256);
                         Self::format_completion_sse_into(&mut sse_buffer, &usage_chunk);
-                        let _ = tx.send(Ok(Bytes::from(sse_buffer)));
+                        let _ = tx.send(Ok(Bytes::from(sse_buffer))).await;
                     }
                     Metrics::record_streaming_metrics(StreamingMetricsParams {
                         router_type: metrics_labels::ROUTER_GRPC,
@@ -2717,7 +2755,7 @@ impl StreamingProcessor {
                 }
             }
 
-            let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+            let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
         });
 
         build_sse_response(rx)
@@ -2775,7 +2813,7 @@ impl StreamingProcessor {
         completion_request: Arc<CompletionRequest>,
         prompt_text: &str,
         index_offset: u32,
-        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
     ) -> Result<CompletionStreamOutcome, String> {
         let mut first_token_time: Option<Instant> = None;
 
@@ -2873,6 +2911,7 @@ impl StreamingProcessor {
 
                         Self::format_completion_sse_into(&mut sse_buffer, &stream_resp);
                         tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                            .await
                             .map_err(|_| "Channel closed".to_string())?;
                     }
 
@@ -2899,6 +2938,7 @@ impl StreamingProcessor {
                             };
                             Self::format_completion_sse_into(&mut sse_buffer, &suffix_chunk);
                             tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                                .await
                                 .map_err(|_| "Channel closed".to_string())?;
                         }
 
@@ -2918,6 +2958,7 @@ impl StreamingProcessor {
                         };
                         Self::format_completion_sse_into(&mut sse_buffer, &final_chunk);
                         tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                            .await
                             .map_err(|_| "Channel closed".to_string())?;
                     }
                 }
@@ -2954,6 +2995,7 @@ impl StreamingProcessor {
                         };
                         Self::format_completion_sse_into(&mut sse_buffer, &echo_chunk);
                         tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                            .await
                             .map_err(|_| "Channel closed".to_string())?;
                         *is_first = false;
                     }
@@ -2977,6 +3019,7 @@ impl StreamingProcessor {
                                 };
                                 Self::format_completion_sse_into(&mut sse_buffer, &stream_resp);
                                 tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                                    .await
                                     .map_err(|_| "Channel closed".to_string())?;
                             }
                         }
@@ -2999,6 +3042,7 @@ impl StreamingProcessor {
                         };
                         Self::format_completion_sse_into(&mut sse_buffer, &stream_resp);
                         tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                            .await
                             .map_err(|_| "Channel closed".to_string())?;
                     }
 
@@ -3044,6 +3088,7 @@ impl StreamingProcessor {
                     };
                     Self::format_completion_sse_into(&mut sse_buffer, &final_chunk);
                     tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                        .await
                         .map_err(|_| "Channel closed".to_string())?;
                 }
                 ProtoResponseVariant::None => continue,
@@ -3082,7 +3127,7 @@ impl StreamingProcessor {
         original_request: Arc<CompletionRequest>,
         prompt_text: &str,
         index_offset: u32,
-        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
     ) -> Result<CompletionStreamOutcome, String> {
         while let Some(response) = prefill_stream.next().await {
             let gen_response =

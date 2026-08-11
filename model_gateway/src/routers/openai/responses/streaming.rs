@@ -25,8 +25,7 @@ use openai_protocol::{
 };
 use serde_json::{json, Value};
 use smg_mcp::{McpOrchestrator, McpServerBinding, McpToolSession};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 
 use super::{
@@ -49,7 +48,7 @@ use crate::{
             },
             mcp_utils::DEFAULT_MAX_ITERATIONS,
             persistence_utils::persist_conversation_items,
-            sse::SseEncoder,
+            sse::{sse_channel, SseEncoder, SseSender},
         },
         error,
         openai::{
@@ -213,21 +212,21 @@ fn build_mcp_tools_value(original_body: &ResponsesRequest) -> Option<Value> {
 /// Send an SSE event to the client channel
 /// Returns false if the client disconnected
 #[inline]
-fn send_sse_event(
-    tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+async fn send_sse_event(
+    tx: &SseSender,
     enc: &mut SseEncoder,
     event_name: &str,
     data: &Value,
 ) -> bool {
     match enc.encode_event(event_name, data) {
-        Ok(bytes) => tx.send(Ok(bytes)).is_ok(),
+        Ok(bytes) => tx.send(Ok(bytes)).await.is_ok(),
         Err(e) => {
             // Unreachable in practice (static event name + Value); fall back to
             // manual framing like send_final_response_event rather than treating
             // an encode error as a client disconnect.
             warn!("failed to encode SSE event '{event_name}', falling back: {e}");
             let block = format!("event: {event_name}\ndata: {data}\n\n");
-            tx.send(Ok(Bytes::from(block))).is_ok()
+            tx.send(Ok(Bytes::from(block))).await.is_ok()
         }
     }
 }
@@ -244,10 +243,10 @@ fn map_event_name(event_name: &str) -> &str {
 
 /// Send buffered function call arguments as a synthetic delta event.
 /// Returns false if client disconnected.
-fn send_buffered_arguments(
+async fn send_buffered_arguments(
     parsed_data: &mut Value,
     handler: &StreamingToolHandler,
-    tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    tx: &SseSender,
     enc: &mut SseEncoder,
     sequence_number: &mut u64,
     mapped_output_index: &mut Option<usize>,
@@ -307,7 +306,7 @@ fn send_buffered_arguments(
         }
     }
 
-    if !send_sse_event(tx, enc, McpEvent::CALL_ARGUMENTS_DELTA, &delta_event) {
+    if !send_sse_event(tx, enc, McpEvent::CALL_ARGUMENTS_DELTA, &delta_event).await {
         return false;
     }
 
@@ -326,10 +325,10 @@ pub(super) struct SseEventData<'a> {
 
 /// Forward and transform a streaming event to the client.
 /// Returns false if client disconnected.
-pub(super) fn forward_streaming_event(
+pub(super) async fn forward_streaming_event(
     event: SseEventData<'_>,
     handler: &mut StreamingToolHandler,
-    tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    tx: &SseSender,
     enc: &mut SseEncoder,
     ctx: &StreamingEventContext<'_>,
     sequence_number: &mut u64,
@@ -352,7 +351,7 @@ pub(super) fn forward_streaming_event(
             Ok(v) => v,
             Err(_) => {
                 let chunk = format!("{raw_block}\n\n");
-                return tx.send(Ok(Bytes::from(chunk))).is_ok();
+                return tx.send(Ok(Bytes::from(chunk))).await.is_ok();
             }
         },
     };
@@ -373,6 +372,7 @@ pub(super) fn forward_streaming_event(
             sequence_number,
             &mut mapped_output_index,
         )
+        .await
     {
         return false;
     }
@@ -414,12 +414,12 @@ pub(super) fn forward_streaming_event(
         Err(_) => Bytes::from(format!("{raw_block}\n\n")),
     };
 
-    if tx.send(Ok(final_bytes)).is_err() {
+    if tx.send(Ok(final_bytes)).await.is_err() {
         return false;
     }
 
     if event_name == Some(OutputItemEvent::ADDED)
-        && !maybe_inject_tool_in_progress(&parsed_data, tx, enc, sequence_number)
+        && !maybe_inject_tool_in_progress(&parsed_data, tx, enc, sequence_number).await
     {
         return false;
     }
@@ -431,9 +431,9 @@ pub(super) fn forward_streaming_event(
 /// Handles mcp_call, web_search_call, code_interpreter_call, file_search_call,
 /// and image_generation_call items.
 /// Returns false if client disconnected.
-fn maybe_inject_tool_in_progress(
+async fn maybe_inject_tool_in_progress(
     parsed_data: &Value,
-    tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    tx: &SseSender,
     enc: &mut SseEncoder,
     sequence_number: &mut u64,
 ) -> bool {
@@ -463,14 +463,14 @@ fn maybe_inject_tool_in_progress(
     });
     *sequence_number += 1;
 
-    send_sse_event(tx, enc, event_type, &event)
+    send_sse_event(tx, enc, event_type, &event).await
 }
 
 /// Send final response.completed event to client
 /// Returns false if client disconnected
-pub(super) fn send_final_response_event(
+pub(super) async fn send_final_response_event(
     handler: &StreamingToolHandler,
-    tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    tx: &SseSender,
     enc: &mut SseEncoder,
     sequence_number: &mut u64,
     state: &ToolLoopState,
@@ -513,7 +513,7 @@ pub(super) fn send_final_response_event(
     *sequence_number += 1;
 
     match enc.encode_event(ResponseEvent::COMPLETED, &completed_payload) {
-        Ok(bytes) => tx.send(Ok(bytes)).is_ok(),
+        Ok(bytes) => tx.send(Ok(bytes)).await.is_ok(),
         Err(e) => {
             warn!("failed to encode response.completed via SseEncoder, falling back: {e}");
             let completed_event = format!(
@@ -521,7 +521,7 @@ pub(super) fn send_final_response_event(
                 ResponseEvent::COMPLETED,
                 completed_payload
             );
-            tx.send(Ok(Bytes::from(completed_event))).is_ok()
+            tx.send(Ok(Bytes::from(completed_event))).await.is_ok()
         }
     }
 }
@@ -570,7 +570,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
     let preserved_headers = preserve_response_headers(response.headers());
     let mut upstream_stream = response.bytes_stream();
 
-    let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
+    let (tx, rx) = sse_channel();
 
     let should_store = req.original_body.store.unwrap_or(true);
     let original_request = req.original_body;
@@ -608,7 +608,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
                         if receiver_connected {
                             let chunk_to_send = format!("{block_cow}\n\n");
-                            if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
+                            if tx.send(Ok(Bytes::from(chunk_to_send))).await.is_err() {
                                 receiver_connected = false;
                             }
                         }
@@ -625,7 +625,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
                 Err(err) => {
                     upstream_failed = true;
                     let io_err = io::Error::other(err);
-                    let _ = tx.send(Err(io_err));
+                    let _ = tx.send(Err(io_err)).await;
                     break;
                 }
             }
@@ -664,7 +664,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
         }
     });
 
-    let body_stream = UnboundedReceiverStream::new(rx);
+    let body_stream = ReceiverStream::new(rx);
     let mut response = Response::new(Body::from_stream(body_stream));
     *response.status_mut() = status_code;
 
@@ -692,7 +692,7 @@ pub(super) fn handle_streaming_with_tool_interception(
 ) -> Response {
     let payload = req.payload;
 
-    let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
+    let (tx, rx) = sse_channel();
     let should_store = req.original_body.store.unwrap_or(true);
     let original_request = req.original_body;
     let previous_response_id = req.previous_response_id;
@@ -765,7 +765,8 @@ pub(super) fn handle_streaming_with_tool_interception(
                         &mut sse_encoder,
                         "error",
                         &json!({"error": {"message": e.to_string()}}),
-                    );
+                    )
+                    .await;
                     return;
                 }
             };
@@ -779,7 +780,8 @@ pub(super) fn handle_streaming_with_tool_interception(
                     &mut sse_encoder,
                     "error",
                     &json!({"error": {"message": format!("Upstream error {}: {}", status, body)}}),
-                );
+                )
+                .await;
                 return;
             }
 
@@ -847,7 +849,9 @@ pub(super) fn handle_streaming_with_tool_interception(
                                             &mut sse_encoder,
                                             &streaming_ctx,
                                             &mut sequence_number,
-                                        ) {
+                                        )
+                                        .await
+                                        {
                                             return;
                                         }
                                     }
@@ -865,7 +869,9 @@ pub(super) fn handle_streaming_with_tool_interception(
                                                     list_tools_index,
                                                     &mut sequence_number,
                                                     server_key,
-                                                ) {
+                                                )
+                                                .await
+                                                {
                                                     // Client disconnected
                                                     return;
                                                 }
@@ -919,6 +925,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                                             &streaming_ctx,
                                             &mut sequence_number,
                                         )
+                                        .await
                                     {
                                         return;
                                     }
@@ -938,7 +945,8 @@ pub(super) fn handle_streaming_with_tool_interception(
                             &mut sse_encoder,
                             "error",
                             &json!({"error": {"message": format!("Stream error: {}", e)}}),
-                        );
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -958,7 +966,9 @@ pub(super) fn handle_streaming_with_tool_interception(
                     &mut sequence_number,
                     &state,
                     &streaming_ctx,
-                ) {
+                )
+                .await
+                {
                     return;
                 }
 
@@ -1001,7 +1011,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                     }
                 }
 
-                let _ = tx.send(Ok(Bytes::from_static(SSE_DONE.as_bytes())));
+                let _ = tx.send(Ok(Bytes::from_static(SSE_DONE.as_bytes()))).await;
                 return;
             }
 
@@ -1030,8 +1040,9 @@ pub(super) fn handle_streaming_with_tool_interception(
                     &mut sse_encoder,
                     "error",
                     &json!({"error": {"message": "Exceeded max_tool_calls limit"}}),
-                );
-                let _ = tx.send(Ok(Bytes::from_static(SSE_DONE.as_bytes())));
+                )
+                .await;
+                let _ = tx.send(Ok(Bytes::from_static(SSE_DONE.as_bytes()))).await;
                 return;
             }
 
@@ -1073,15 +1084,15 @@ pub(super) fn handle_streaming_with_tool_interception(
                         &mut sse_encoder,
                         "error",
                         &json!({"error": {"message": format!("Failed to build resume payload: {}", e)}}),
-                    );
-                    let _ = tx.send(Ok(Bytes::from_static(SSE_DONE.as_bytes())));
+                    ).await;
+                    let _ = tx.send(Ok(Bytes::from_static(SSE_DONE.as_bytes()))).await;
                     return;
                 }
             }
         }
     });
 
-    let body_stream = UnboundedReceiverStream::new(rx);
+    let body_stream = ReceiverStream::new(rx);
     let mut response = Response::new(Body::from_stream(body_stream));
     *response.status_mut() = StatusCode::OK;
     response

@@ -35,8 +35,7 @@ use smg_data_connector::{
     ResponseStorage,
 };
 use smg_mcp::{McpServerBinding, McpToolSession, ToolExecutionInput};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
@@ -53,6 +52,7 @@ use crate::{
         common::{
             mcp_utils::{prepare_hosted_dispatch_args, DEFAULT_MAX_ITERATIONS},
             openai_bridge::{self, ResponseFormat},
+            sse::{sse_channel, SseSender},
         },
         grpc::{
             common::responses::{
@@ -105,7 +105,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     let (_parts, body) = chat_response.into_parts();
 
     // Create channel for transformed SSE events
-    let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+    let (tx, rx) = sse_channel();
 
     // Spawn background task to transform stream
     let original_request_clone = original_request.clone();
@@ -131,11 +131,11 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
         .await
         {
             warn!("Error transforming SSE stream: {}", e);
-            utils::send_error_sse(&tx, &e, "stream_error");
+            utils::send_error_sse(&tx, &e, "stream_error").await;
         }
 
         // Send final [DONE] event
-        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
     });
 
     // Build SSE response with transformed stream
@@ -150,7 +150,7 @@ async fn process_and_transform_sse_stream(
     conversation_storage: Arc<dyn ConversationStorage>,
     conversation_item_storage: Arc<dyn ConversationItemStorage>,
     request_context: Option<StorageRequestContext>,
-    tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    tx: SseSender,
 ) -> Result<(), String> {
     // Create accumulator for final response
     let mut accumulator = StreamingResponseAccumulator::new(&original_request);
@@ -166,11 +166,13 @@ async fn process_and_transform_sse_stream(
     let event = event_emitter.emit_created();
     event_emitter
         .send_event(&event, &tx)
+        .await
         .map_err(|_| "Failed to send response.created event".to_string())?;
 
     let event = event_emitter.emit_in_progress();
     event_emitter
         .send_event(&event, &tx)
+        .await
         .map_err(|_| "Failed to send response.in_progress event".to_string())?;
 
     // Convert body to data stream
@@ -200,12 +202,16 @@ async fn process_and_transform_sse_stream(
                     accumulator.process_chunk(&chat_chunk);
 
                     // Process chunk through event emitter (emits proper OpenAI events)
-                    event_emitter.process_chunk(&chat_chunk, &tx)?;
+                    event_emitter.process_chunk(&chat_chunk, &tx).await?;
                 }
                 Err(_) => {
                     // Not a valid chat chunk - might be error event, pass through
                     debug!("Non-chunk SSE event, passing through: {}", event);
-                    if tx.send(Ok(Bytes::from(format!("{event}\n\n")))).is_err() {
+                    if tx
+                        .send(Ok(Bytes::from(format!("{event}\n\n"))))
+                        .await
+                        .is_err()
+                    {
                         return Err("Client disconnected".to_string());
                     }
                 }
@@ -233,7 +239,7 @@ async fn process_and_transform_sse_stream(
     });
 
     let completed_event = event_emitter.emit_completed(usage_json.as_ref());
-    event_emitter.send_event(&completed_event, &tx)?;
+    event_emitter.send_event(&completed_event, &tx).await?;
 
     // Finalize and persist accumulated response
     let final_response = accumulator.finalize();
@@ -443,7 +449,7 @@ pub(super) fn execute_tool_loop_streaming(
     mcp_servers: Vec<McpServerBinding>,
 ) -> Response {
     // Create SSE channel for client
-    let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+    let (tx, rx) = sse_channel();
 
     // Clone data for background task
     let ctx_clone = ctx.clone();
@@ -467,15 +473,15 @@ pub(super) fn execute_tool_loop_streaming(
 
         if let Err(e) = result {
             warn!("Streaming tool loop error: {}", e);
-            utils::send_error_sse(&tx, &e, "tool_loop_error");
+            utils::send_error_sse(&tx, &e, "tool_loop_error").await;
         }
 
         // Send [DONE]
-        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
     });
 
     // Build SSE response
-    let stream = UnboundedReceiverStream::new(rx);
+    let stream = ReceiverStream::new(rx);
     let body = Body::from_stream(stream);
 
     #[expect(
@@ -510,7 +516,7 @@ async fn execute_tool_loop_streaming_internal(
     original_request: &ResponsesRequest,
     params: ResponsesCallContext,
     mcp_servers: Vec<McpServerBinding>,
-    tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    tx: SseSender,
 ) -> Result<(), String> {
     let mut state = ToolLoopState::new(original_request.input.clone());
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
@@ -532,9 +538,9 @@ async fn execute_tool_loop_streaming_internal(
 
     // Emit initial response.created and response.in_progress events
     let event = emitter.emit_created();
-    emitter.send_event(&event, &tx)?;
+    emitter.send_event(&event, &tx).await?;
     let event = emitter.emit_in_progress();
-    emitter.send_event(&event, &tx)?;
+    emitter.send_event(&event, &tx).await?;
 
     // Get MCP tools and convert to chat format (do this once before loop)
     let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&session);
@@ -565,7 +571,9 @@ async fn execute_tool_loop_streaming_internal(
             for binding in session.mcp_servers() {
                 let tools_for_server = session.list_tools_for_server(&binding.server_key);
 
-                emitter.emit_mcp_list_tools_sequence(&binding.label, &tools_for_server, &tx)?;
+                emitter
+                    .emit_mcp_list_tools_sequence(&binding.label, &tools_for_server, &tx)
+                    .await?;
             }
             mcp_list_tools_emitted = true;
         }
@@ -680,12 +688,12 @@ async fn execute_tool_loop_streaming_internal(
 
                 // Emit output_item.added
                 let event = emitter.emit_output_item_added(output_index, &item);
-                emitter.send_event(&event, &tx)?;
+                emitter.send_event(&event, &tx).await?;
 
                 // Emit tool_call.in_progress
                 let event =
                     emitter.emit_tool_call_in_progress(output_index, &item_id, response_format);
-                emitter.send_event(&event, &tx)?;
+                emitter.send_event(&event, &tx).await?;
 
                 // Emit arguments events for mcp_call only (skip for builtin tools)
                 if matches!(response_format, ResponseFormat::Passthrough) {
@@ -695,7 +703,7 @@ async fn execute_tool_loop_streaming_internal(
                         &item_id,
                         &tool_call.arguments,
                     );
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, &tx).await?;
 
                     // Emit mcp_call_arguments.done
                     let event = emitter.emit_mcp_call_arguments_done(
@@ -703,14 +711,14 @@ async fn execute_tool_loop_streaming_internal(
                         &item_id,
                         &tool_call.arguments,
                     );
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, &tx).await?;
                 }
 
                 // Emit searching/interpreting event for builtin tools
                 if let Some(event) =
                     emitter.emit_tool_call_searching(output_index, &item_id, response_format)
                 {
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, &tx).await?;
                 }
 
                 // Execute the MCP tool
@@ -775,7 +783,7 @@ async fn execute_tool_loop_streaming_internal(
                 if success {
                     let event =
                         emitter.emit_tool_call_completed(output_index, &item_id, response_format);
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, &tx).await?;
                 } else {
                     let err_text = tool_output
                         .error_message
@@ -790,19 +798,19 @@ async fn execute_tool_loop_streaming_internal(
                     // content.
                     if matches!(response_format, ResponseFormat::Passthrough) {
                         let event = emitter.emit_mcp_call_failed(output_index, &item_id, &err_text);
-                        emitter.send_event(&event, &tx)?;
+                        emitter.send_event(&event, &tx).await?;
                     } else {
                         let event = emitter.emit_tool_call_completed(
                             output_index,
                             &item_id,
                             response_format,
                         );
-                        emitter.send_event(&event, &tx)?;
+                        emitter.send_event(&event, &tx).await?;
                     }
                 }
 
                 let event = emitter.emit_output_item_done(output_index, &item_done);
-                emitter.send_event(&event, &tx)?;
+                emitter.send_event(&event, &tx).await?;
                 emitter.complete_output_item(output_index);
 
                 Metrics::record_mcp_tool_duration(
@@ -855,7 +863,7 @@ async fn execute_tool_loop_streaming_internal(
 
                     // Emit output_item.added
                     let event = emitter.emit_output_item_added(output_index, &item);
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, &tx).await?;
 
                     // Emit function_call_arguments.delta
                     let event = emitter.emit_function_call_arguments_delta(
@@ -863,7 +871,7 @@ async fn execute_tool_loop_streaming_internal(
                         &item_id,
                         &tool_call.arguments,
                     );
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, &tx).await?;
 
                     // Emit function_call_arguments.done
                     let event = emitter.emit_function_call_arguments_done(
@@ -871,7 +879,7 @@ async fn execute_tool_loop_streaming_internal(
                         &item_id,
                         &tool_call.arguments,
                     );
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, &tx).await?;
 
                     // Build complete item
                     let item_complete = json!({
@@ -885,7 +893,7 @@ async fn execute_tool_loop_streaming_internal(
 
                     // Emit output_item.done
                     let event = emitter.emit_output_item_done(output_index, &item_complete);
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, &tx).await?;
 
                     emitter.complete_output_item(output_index);
                 }
@@ -912,7 +920,7 @@ async fn execute_tool_loop_streaming_internal(
         // Emit reasoning item if present
         if let Some(reasoning) = reasoning_content {
             if !reasoning.is_empty() {
-                emitter.emit_reasoning_item(&tx, Some(reasoning))?;
+                emitter.emit_reasoning_item(&tx, Some(reasoning)).await?;
             }
         }
 
@@ -928,7 +936,7 @@ async fn execute_tool_loop_streaming_internal(
             })
         });
         let event = emitter.emit_completed(usage_json.as_ref());
-        emitter.send_event(&event, &tx)?;
+        emitter.send_event(&event, &tx).await?;
 
         break;
     }
@@ -940,7 +948,7 @@ async fn execute_tool_loop_streaming_internal(
 async fn convert_and_accumulate_stream(
     body: Body,
     emitter: &mut ResponseStreamEventEmitter,
-    tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    tx: &SseSender,
 ) -> Result<ChatCompletionResponse, String> {
     let mut accumulator = ChatResponseAccumulator::new();
     let mut stream = body.into_data_stream();
@@ -960,7 +968,7 @@ async fn convert_and_accumulate_stream(
             let json_str = json_str.trim();
             if let Ok(chat_chunk) = serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
                 // Convert chat chunk to Responses API events and emit
-                emitter.process_chunk(&chat_chunk, tx)?;
+                emitter.process_chunk(&chat_chunk, tx).await?;
 
                 // Accumulate for tool call detection
                 accumulator.process_chunk(&chat_chunk);
