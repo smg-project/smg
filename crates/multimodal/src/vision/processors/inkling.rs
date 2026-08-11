@@ -21,12 +21,22 @@ pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
 pub const DEFAULT_RESCALE_IMAGE_MAX_UPSCALED_LONG_EDGE: u32 = 2048;
 const PAD_RAW_VALUE: f32 = -1.0 / 255.0;
 
+/// Default cap on the total number of patches materialized for one preprocess
+/// call. Each patch is `temporal(2)*patch*patch*3` f32 (≈38 KiB at the default
+/// patch size), so this bounds the up-front tensor reservation. Without a cap, a
+/// small crafted image that decodes to huge dimensions drives a multi-GB
+/// allocation that aborts the process. Override via the `in_patch_limit`
+/// preprocessor-config key.
+pub const DEFAULT_INKLING_MAX_PATCHES: usize = 32_768;
+
 #[derive(Debug, Clone)]
 pub struct InklingImageProcessor {
     patch_size: usize,
     temporal_patch_size: usize,
     rescale_image_frac: Option<f64>,
     rescale_image_max_upscaled_long_edge: Option<u32>,
+    /// Upper bound on total patches per preprocess call; `None` disables it.
+    max_patches: Option<usize>,
 }
 
 impl Default for InklingImageProcessor {
@@ -46,6 +56,7 @@ impl InklingImageProcessor {
             rescale_image_max_upscaled_long_edge: Some(
                 DEFAULT_RESCALE_IMAGE_MAX_UPSCALED_LONG_EDGE,
             ),
+            max_patches: Some(DEFAULT_INKLING_MAX_PATCHES),
         }
     }
 
@@ -64,6 +75,16 @@ impl InklingImageProcessor {
             processor.rescale_image_max_upscaled_long_edge =
                 value.as_u64().and_then(|v| u32::try_from(v).ok());
         }
+        // Only override on a well-formed value; a missing/malformed key keeps the
+        // default cap rather than silently disabling the budget.
+        if let Some(limit) = config
+            .extra
+            .get("in_patch_limit")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok())
+        {
+            processor.max_patches = Some(limit);
+        }
         processor
     }
 
@@ -76,6 +97,20 @@ impl InklingImageProcessor {
 
     fn num_patch_features(&self) -> usize {
         self.temporal_patch_size * self.patch_size * self.patch_size * 3
+    }
+
+    /// Reject a preprocess whose total patch count would drive an oversized
+    /// tensor allocation, *before* any memory is reserved.
+    fn ensure_patch_budget(&self, total_patches: usize) -> Result<(), TransformError> {
+        if let Some(limit) = self.max_patches {
+            if total_patches > limit {
+                return Err(TransformError::ShapeError(format!(
+                    "Inkling image is too large: {total_patches} patches exceed the limit of \
+                     {limit} (raise the `in_patch_limit` preprocessor setting to allow it)"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), TransformError> {
@@ -94,6 +129,11 @@ impl InklingImageProcessor {
         if matches!(self.rescale_image_max_upscaled_long_edge, Some(0)) {
             return Err(TransformError::ShapeError(
                 "Inkling rescale_image_max_upscaled_long_edge must be positive".to_string(),
+            ));
+        }
+        if matches!(self.max_patches, Some(0)) {
+            return Err(TransformError::ShapeError(
+                "Inkling max_patches must be positive".to_string(),
             ));
         }
         Ok(())
@@ -238,7 +278,17 @@ impl VisionPreProcessor for InklingImageProcessor {
             total_patches += num_patches;
         }
 
-        let mut patches = Vec::with_capacity(total_patches * processor.num_patch_features());
+        // Enforce the patch budget BEFORE reserving. A small crafted image can
+        // decode to huge dimensions; the reservation below would otherwise abort
+        // the whole process (with_capacity/handle_alloc_error is uncatchable).
+        processor.ensure_patch_budget(total_patches)?;
+        let capacity = total_patches * processor.num_patch_features();
+        let mut patches: Vec<f32> = Vec::new();
+        patches.try_reserve_exact(capacity).map_err(|e| {
+            TransformError::ShapeError(format!(
+                "Inkling: cannot reserve {capacity} f32 for image patches: {e}"
+            ))
+        })?;
         for image in images {
             processor.append_image_patches(image, &mean, &std, &mut patches);
         }
@@ -308,7 +358,61 @@ mod tests {
             temporal_patch_size: DEFAULT_TEMPORAL_PATCH_SIZE,
             rescale_image_frac: None,
             rescale_image_max_upscaled_long_edge: None,
+            max_patches: None,
         }
+    }
+
+    #[test]
+    fn ensure_patch_budget_enforces_limit_and_none_disables() {
+        let mut processor = InklingImageProcessor::new();
+        processor.max_patches = Some(10);
+        assert!(processor.ensure_patch_budget(10).is_ok());
+        assert!(processor.ensure_patch_budget(11).is_err());
+        processor.max_patches = None;
+        assert!(processor.ensure_patch_budget(usize::MAX).is_ok());
+    }
+
+    #[test]
+    fn preprocess_rejects_image_exceeding_in_patch_limit() {
+        let processor = InklingImageProcessor::new();
+        let config = PreProcessorConfig {
+            patch_size: Some(PatchSize {
+                height: Some(2),
+                width: Some(2),
+            }),
+            temporal_patch_size: Some(2),
+            // test_image() is 2x2 → 2 patches at patch_size 2, over the limit of 1.
+            extra: std::collections::HashMap::from([(
+                "in_patch_limit".to_string(),
+                serde_json::json!(1),
+            )]),
+            ..PreProcessorConfig::default()
+        };
+        let err = processor
+            .preprocess(&[test_image()], &config)
+            .expect_err("must reject an image exceeding in_patch_limit");
+        assert!(
+            matches!(err, TransformError::ShapeError(_)),
+            "expected ShapeError, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn preprocess_succeeds_within_in_patch_limit() {
+        let processor = InklingImageProcessor::new();
+        let config = PreProcessorConfig {
+            patch_size: Some(PatchSize {
+                height: Some(2),
+                width: Some(2),
+            }),
+            temporal_patch_size: Some(2),
+            extra: std::collections::HashMap::from([(
+                "in_patch_limit".to_string(),
+                serde_json::json!(8),
+            )]),
+            ..PreProcessorConfig::default()
+        };
+        assert!(processor.preprocess(&[test_image()], &config).is_ok());
     }
 
     fn norm(raw: f32, channel: usize) -> f32 {
@@ -434,6 +538,7 @@ mod tests {
             temporal_patch_size: DEFAULT_TEMPORAL_PATCH_SIZE,
             rescale_image_frac: Some(1.5),
             rescale_image_max_upscaled_long_edge: None,
+            max_patches: None,
         };
 
         assert_eq!(processor.scaled_image_dimensions(3, 2), (5, 3));
@@ -445,6 +550,7 @@ mod tests {
             rescale_image_max_upscaled_long_edge: Some(
                 DEFAULT_RESCALE_IMAGE_MAX_UPSCALED_LONG_EDGE,
             ),
+            max_patches: None,
         };
         assert_eq!(
             capped_processor.scaled_image_dimensions(1200, 600),
