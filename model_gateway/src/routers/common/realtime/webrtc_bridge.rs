@@ -57,7 +57,10 @@ fn bridge_ended_successfully(
     client_alive: bool,
     upstream_alive: bool,
 ) -> bool {
-    cancelled || (!upstream_timed_out && (!client_alive || upstream_alive))
+    // Failure only when the upstream failed (died or timed out silently) *while
+    // the client was still connected*. A client that hung up first is always a
+    // success, even if the upstream had also gone idle by then.
+    cancelled || !client_alive || (!upstream_timed_out && upstream_alive)
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,5 +1086,8 @@ mod tests {
         assert!(!bridge_ended_successfully(false, true, true, true));
         // client-side idle timeout (upstream not flagged), both still alive → success.
         assert!(bridge_ended_successfully(false, false, true, true));
+        // client hung up first, even if the upstream had also gone idle → success
+        // (a client close must never be recorded as an upstream 502).
+        assert!(bridge_ended_successfully(false, true, false, true));
     }
 }
