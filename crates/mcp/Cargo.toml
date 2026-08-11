@@ -35,7 +35,7 @@ url = "2.5"
 # rmcp 1.7 dropped the standalone SSE client transport
 # (`transport-sse-client-reqwest`); the MCP spec superseded HTTP+SSE with
 # Streamable HTTP, which is still here.
-rmcp = { version = "1.7", features = ["client", "server",
+rmcp = { version = "3.1", features = ["client", "server",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
     "transport-streamable-http-server",
