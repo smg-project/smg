@@ -47,6 +47,19 @@ fn bridge_should_time_out(session_elapsed: Duration, idle_elapsed: Duration) -> 
     session_elapsed > BRIDGE_MAX_SESSION || idle_elapsed > BRIDGE_MAX_IDLE
 }
 
+/// Classify a bridge's terminal outcome. `true` = success (client hangup,
+/// cancellation, or max-session with both peers healthy); `false` = worker
+/// failure (upstream died, or timed out silently, while the client was still
+/// connected — recorded as a 502). Pure and side-effect-free for testability.
+fn bridge_ended_successfully(
+    cancelled: bool,
+    upstream_timed_out: bool,
+    client_alive: bool,
+    upstream_alive: bool,
+) -> bool {
+    cancelled || (!upstream_timed_out && (!client_alive || upstream_alive))
+}
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -355,13 +368,18 @@ impl WebRtcBridge {
         let mut buf_upstream = vec![0u8; 4096];
 
         let mut cancelled = false;
+        // Set when the idle backstop fires with the *upstream* side silent, so the
+        // outcome is classified as a worker failure (502) rather than success.
+        let mut upstream_timed_out = false;
 
         // Liveness backstop: a peer that vanishes without a graceful
         // `Event::Closed` (network drop, crash, sustained ICE disconnect) simply
-        // stops sending; track when we last heard from either peer so the loop
-        // can tear down instead of leaking the task/sockets/Rtc/registry entry.
+        // stops sending. Track per-peer when we last accepted a *valid* packet so
+        // the loop tears down even when only one side goes silent while the other
+        // keeps sending — otherwise the live side would refresh a shared timer.
         let session_start = Instant::now();
-        let mut last_activity = Instant::now();
+        let mut client_last_activity = Instant::now();
+        let mut upstream_last_activity = Instant::now();
 
         // Seed initial timeout by draining any outputs produced during setup.
         let t_c = self.process_outputs(Side::Client).await;
@@ -376,13 +394,15 @@ impl WebRtcBridge {
 
             tokio::select! {
                 result = self.client_socket.recv_from(&mut buf_client) => {
-                    last_activity = Instant::now();
-                    self.handle_udp_recv(result, &buf_client, Side::Client);
+                    if self.handle_udp_recv(result, &buf_client, Side::Client) {
+                        client_last_activity = Instant::now();
+                    }
                 }
 
                 result = self.upstream_socket.recv_from(&mut buf_upstream) => {
-                    last_activity = Instant::now();
-                    self.handle_udp_recv(result, &buf_upstream, Side::Upstream);
+                    if self.handle_udp_recv(result, &buf_upstream, Side::Upstream) {
+                        upstream_last_activity = Instant::now();
+                    }
                 }
 
                 () = tokio::time::sleep(sleep_dur) => {
@@ -403,13 +423,19 @@ impl WebRtcBridge {
             let t_u = self.process_outputs(Side::Upstream).await;
             next_timeout = earliest_timeout(t_c, t_u);
 
-            // Backstop for a peer that vanished without a graceful close: no
-            // traffic ⇒ idle timeout fires; also cap absolute session length.
-            if bridge_should_time_out(session_start.elapsed(), last_activity.elapsed()) {
+            // Backstop for a peer that vanished without a graceful close: if
+            // *either* side is silent past the idle limit (or the session hits its
+            // max), tear down. Record an upstream-side idle timeout so the outcome
+            // is classified as a worker failure below.
+            let client_idle = client_last_activity.elapsed();
+            let upstream_idle = upstream_last_activity.elapsed();
+            if bridge_should_time_out(session_start.elapsed(), client_idle.max(upstream_idle)) {
+                upstream_timed_out = upstream_idle > BRIDGE_MAX_IDLE;
                 warn!(
                     call_id = self.call_id,
                     session_secs = session_start.elapsed().as_secs(),
-                    idle_secs = last_activity.elapsed().as_secs(),
+                    client_idle_secs = client_idle.as_secs(),
+                    upstream_idle_secs = upstream_idle.as_secs(),
                     "WebRTC bridge timed out (idle or max duration); tearing down"
                 );
                 break;
@@ -427,8 +453,14 @@ impl WebRtcBridge {
             }
         }
 
-        // Upstream dying while client is still connected is a worker failure.
-        let success = cancelled || !self.client_rtc.is_alive() || self.upstream_rtc.is_alive();
+        // Upstream dying — or timing out silently — while the client is still
+        // connected is a worker failure; cancellation and client hangup succeed.
+        let success = bridge_ended_successfully(
+            cancelled,
+            upstream_timed_out,
+            self.client_rtc.is_alive(),
+            self.upstream_rtc.is_alive(),
+        );
 
         self.client_rtc.disconnect();
         self.upstream_rtc.disconnect();
@@ -484,34 +516,41 @@ impl WebRtcBridge {
 // ---------------------------------------------------------------------------
 
 impl WebRtcBridge {
+    /// Feed a received datagram into the peer's `Rtc`. Returns `true` only when a
+    /// valid datagram was accepted by str0m, so the caller counts it as liveness
+    /// activity — a recv error or a rejected/garbage datagram must not refresh
+    /// the idle timeout (otherwise a peer could be kept "alive" by junk traffic).
     fn handle_udp_recv(
         &mut self,
         result: std::io::Result<(usize, SocketAddr)>,
         buf: &[u8],
         side: Side,
-    ) {
+    ) -> bool {
         let label = Self::side_label(side);
         let (n, source) = match result {
             Ok(pair) => pair,
             Err(e) => {
                 warn!(call_id = self.call_id, error = %e, "{label} UDP recv error");
-                return;
+                return false;
             }
         };
 
         trace!(call_id = self.call_id, %source, n, "{label} UDP packet");
         let dest = self.candidate_addr(side);
         match Receive::new(Protocol::Udp, source, dest, &buf[..n]) {
-            Ok(recv) => {
-                if let Err(e) = self
-                    .rtc(side)
-                    .handle_input(Input::Receive(Instant::now(), recv))
-                {
+            Ok(recv) => match self
+                .rtc(side)
+                .handle_input(Input::Receive(Instant::now(), recv))
+            {
+                Ok(()) => true,
+                Err(e) => {
                     warn!(call_id = self.call_id, error = %e, %source, "{label}_rtc rejected input");
+                    false
                 }
-            }
+            },
             Err(e) => {
                 debug!(call_id = self.call_id, error = %e, %source, n, "{label} Receive::new failed");
+                false
             }
         }
     }
@@ -1030,5 +1069,19 @@ mod tests {
             Duration::from_secs(600),
             Duration::from_secs(1)
         ));
+    }
+
+    #[test]
+    fn outcome_classification_matches_who_left() {
+        // cancelled → success regardless of anything else.
+        assert!(bridge_ended_successfully(true, true, true, true));
+        // client hung up (client not alive) → success.
+        assert!(bridge_ended_successfully(false, false, false, true));
+        // upstream died while client connected → worker failure.
+        assert!(!bridge_ended_successfully(false, false, true, false));
+        // upstream timed out silently while client connected → worker failure.
+        assert!(!bridge_ended_successfully(false, true, true, true));
+        // client-side idle timeout (upstream not flagged), both still alive → success.
+        assert!(bridge_ended_successfully(false, false, true, true));
     }
 }
