@@ -40,7 +40,7 @@ def _zmq_ipc_url(port: int) -> str:
 def _backend_arg_int(backend_args: list[str], flag: str, default: int) -> int:
     """Read an integer flag from raw backend args (``--flag N`` or ``--flag=N``).
 
-    An unparseable value falls back to the default with a warning — the
+    An unparsable value falls back to the default with a warning — the
     launcher owns this flag downstream, so silence would quietly discard the
     operator's intent.
     """

@@ -279,26 +279,28 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// progress: its peers must be stepping too, because every rank joins the
     /// same all-reduce. Upstream vLLM has a DP coordinator process broadcast the
     /// restart; SMG owns rank selection, so it sends the same signal over the
-    /// input socket each rank already listens on. A no-op for independent ranks
-    /// and for a group that is already running.
+    /// input socket each rank already listens on. A no-op for independent
+    /// ranks.
+    ///
+    /// The wake is UNCONDITIONAL for a lockstep group. Gating it on the
+    /// tracked `running` flag raced the drain: between the ranks agreeing to
+    /// park and this client processing their `wave_complete`, a submit would
+    /// see a stale "running" state, skip the wake, and — without a
+    /// coordinator, a parked engine does not self-wake on ADD — strand the
+    /// request until the silence watchdog killed the group. Redundant wakes
+    /// are idempotent on the engine (`new_wave >= current_wave` while
+    /// stepping is a no-op; a stale wave is ignored), so the gate bought one
+    /// saved message per submit at the price of a stall window.
     async fn wake_group(&self, holder_index: u32) -> Result<()> {
         let Some(state) = self.wave.as_ref() else {
             return Ok(());
         };
         let wave = {
             let mut state = state.lock();
-            if state.running {
-                return Ok(());
-            }
             state.running = true;
             state.current
         };
-        if let Err(error) = self.broadcast_start_wave(wave, holder_index).await {
-            // The group is still asleep, so let the next submit try again.
-            state.lock().running = false;
-            return Err(error);
-        }
-        Ok(())
+        self.broadcast_start_wave(wave, holder_index).await
     }
 
     /// Fold a wave notification from an engine into the group's state.
@@ -1144,8 +1146,9 @@ mod tests {
         ));
     }
 
-    /// While the group runs, submits carry no wake; once it reports the wave
-    /// drained, the next submit wakes it again on the following wave.
+    /// Every submit to a lockstep group wakes it — including submits that
+    /// race the group's drain — and after a drained wave the wake names the
+    /// wave the engines moved on to.
     #[tokio::test]
     async fn a_drained_wave_re_arms_the_wake() {
         let (client, mut engines, _ns) = connect_ranks(2, true).await;
@@ -1156,12 +1159,29 @@ mod tests {
             EngineInbound::StartDpWave { wave: 0, .. }
         ));
 
-        // Running group: the second submit only sends the Add.
+        // The wake is unconditional: even while the client believes the group
+        // is running, a submit re-sends the (engine-idempotent) wake. Gating
+        // on the tracked state raced the drain — a parked engine holding a
+        // fresh Add never self-wakes without a coordinator, and the stranded
+        // request would hit the silence watchdog.
         let _second = client.submit(request_for("req-2", 0)).await.unwrap();
         match engines[0].recv().await.unwrap() {
             EngineInbound::Add(request) => assert_eq!(request.request_id, "req-2"),
-            other => panic!("expected the Add with no wake, got {other:?}"),
+            other => panic!("expected the Add first, got {other:?}"),
         }
+        // Rank 1 already holds its own req-1 Add; the racing submit's wake
+        // arrives behind it.
+        match engines[1].recv().await.unwrap() {
+            EngineInbound::Add(request) => assert_eq!(request.request_id, "req-1"),
+            other => panic!("expected rank 1's own Add, got {other:?}"),
+        }
+        assert!(matches!(
+            engines[1].recv().await.unwrap(),
+            EngineInbound::StartDpWave {
+                wave: 0,
+                exclude_engine_index: 0,
+            }
+        ));
 
         // The group drains wave 0 and parks itself.
         engines[0]
