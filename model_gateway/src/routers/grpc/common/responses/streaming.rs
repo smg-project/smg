@@ -683,9 +683,27 @@ impl ResponseStreamEventEmitter {
             .output_items
             .iter()
             .filter_map(|item| {
-                item.item_data
-                    .as_ref()
-                    .and_then(|data| serde_json::from_value(data.clone()).ok())
+                let data = item.item_data.as_ref()?;
+                match serde_json::from_value::<ResponseOutputItem>(data.clone()) {
+                    Ok(parsed) => Some(parsed),
+                    Err(e) => {
+                        // Data loss: a hand-built item that does not round-trip
+                        // into the typed enum is silently missing from the
+                        // persisted response. Make it loud instead of invisible.
+                        let item_type = data
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("unknown");
+                        warn!(
+                            error = %e,
+                            item_type,
+                            output_index = item.output_index,
+                            "finalize: dropping persisted /v1/responses output item that \
+                             failed typed parse"
+                        );
+                        None
+                    }
+                }
             })
             .collect();
 
@@ -726,12 +744,19 @@ impl ResponseStreamEventEmitter {
         // Allocate output index and generate ID
         let (output_index, item_id) = self.allocate_output_index(OutputItemKind::Reasoning);
 
-        // Build reasoning item structure
+        // Build reasoning item structure. Typed `ResponseOutputItem::Reasoning`
+        // requires `content: Vec<ResponseReasoningContent>` — a bare scalar fails
+        // the typed round-trip in `finalize()` and drops the item from the
+        // persisted response.
+        let content = match &reasoning_content {
+            Some(text) => json!([{ "type": "reasoning_text", "text": text }]),
+            None => json!([]),
+        };
         let item = json!({
             "id": item_id,
             "type": "reasoning",
             "summary": [],
-            "content": reasoning_content,
+            "content": content,
             "encrypted_content": null,
             "status": null
         });
@@ -826,7 +851,10 @@ impl ResponseStreamEventEmitter {
                         }
 
                         if self.has_emitted_output_item_added {
-                            // Build complete message item for output_item.done
+                            // Build complete message item for output_item.done.
+                            // Typed `ResponseOutputItem::Message` requires `status`;
+                            // without it the item fails the typed round-trip in
+                            // `finalize()` and is dropped from the persisted response.
                             let item = json!({
                                 "id": item_id,
                                 "type": "message",
@@ -834,7 +862,8 @@ impl ResponseStreamEventEmitter {
                                 "content": [{
                                     "type": "output_text",
                                     "text": std::mem::take(&mut self.accumulated_text)
-                                }]
+                                }],
+                                "status": "completed"
                             });
                             let event = self.emit_output_item_done(output_index, &item);
                             self.send_event(&event, tx)?;
@@ -1051,5 +1080,64 @@ mod tests {
         );
         assert!(usage.get("prompt_tokens").is_none());
         assert!(usage.get("completion_tokens").is_none());
+    }
+
+    #[test]
+    fn hand_built_reasoning_and_message_items_round_trip_into_typed_output() {
+        // The exact shapes the emitter now builds must deserialize into the typed
+        // `ResponseOutputItem`, or `finalize()` silently drops them from the
+        // persisted response.
+        let reasoning = json!({
+            "id": "rs_1",
+            "type": "reasoning",
+            "summary": [],
+            "content": [{ "type": "reasoning_text", "text": "thinking" }],
+            "encrypted_content": null,
+            "status": null
+        });
+        assert!(
+            matches!(
+                serde_json::from_value::<ResponseOutputItem>(reasoning),
+                Ok(ResponseOutputItem::Reasoning { .. })
+            ),
+            "reasoning item must deserialize into the typed enum"
+        );
+
+        let message = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "hello" }],
+            "status": "completed"
+        });
+        assert!(
+            matches!(
+                serde_json::from_value::<ResponseOutputItem>(message),
+                Ok(ResponseOutputItem::Message { .. })
+            ),
+            "message item must deserialize into the typed enum"
+        );
+    }
+
+    #[test]
+    fn finalize_preserves_reasoning_item_built_by_the_emitter() {
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".to_string(), "test-model".to_string(), 1);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        emitter
+            .emit_reasoning_item(&tx, Some("thinking".to_string()))
+            .expect("emit reasoning item");
+
+        let wire = serde_json::to_value(emitter.finalize(None)).expect("serialize finalized");
+        let output = wire
+            .get("output")
+            .and_then(|o| o.as_array())
+            .expect("output array present");
+        assert!(
+            output
+                .iter()
+                .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("reasoning")),
+            "reasoning item must survive finalize (not be silently dropped); got {output:?}"
+        );
     }
 }

@@ -1125,7 +1125,9 @@ impl HarmonyStreamingProcessor {
                             emitter.emit_content_part_done(output_index, item_id, content_index);
                         emitter.send_event_best_effort(&event, tx);
 
-                        // Emit output_item.done
+                        // Emit output_item.done. Typed `ResponseOutputItem::Message`
+                        // requires `status`; without it the persisted response drops
+                        // this assistant message in finalize()'s typed round-trip.
                         let item = json!({
                             "id": item_id,
                             "type": "message",
@@ -1133,7 +1135,8 @@ impl HarmonyStreamingProcessor {
                             "content": [{
                                 "type": "output_text",
                                 "text": accumulated_final_text.clone()
-                            }]
+                            }],
+                            "status": "completed"
                         });
                         let event = emitter.emit_output_item_done(output_index, &item);
 
