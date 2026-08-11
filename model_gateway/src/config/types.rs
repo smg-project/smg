@@ -54,6 +54,18 @@ pub struct RouterConfig {
     pub worker_startup_check_interval_secs: u64,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// TTL in seconds for entries in the event-driven cache-aware positional
+    /// indexer: entries neither stored to nor read by a query within this
+    /// window are evicted by a periodic background prune. Bounds index growth
+    /// when a backend stops emitting removal events (crash, stream downgrade).
+    /// `None`/`0` disables the TTL pass (default, preserving unbounded growth).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_indexer_ttl_secs: Option<u64>,
+    /// Capacity ceiling per model for the positional indexer, enforced by the
+    /// same periodic prune: beyond it, oldest-touched entries are evicted down
+    /// to 90% of the ceiling. `None`/`0` disables the ceiling (default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_indexer_max_entries: Option<usize>,
     /// Re-export engine `GetLoads` signals as `smg_engine_*` gauges, polling
     /// even when no load-aware routing policy is active. Decouples engine
     /// observability from routing.
@@ -817,6 +829,8 @@ impl Default for RouterConfig {
             worker_startup_delay_secs: 0,
             worker_startup_check_interval_secs: 30,
             load_monitor_interval_secs: 10,
+            kv_indexer_ttl_secs: None,
+            kv_indexer_max_entries: None,
             engine_metrics: false,
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,
