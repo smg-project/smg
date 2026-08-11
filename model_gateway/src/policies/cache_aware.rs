@@ -943,31 +943,48 @@ impl CacheAwarePolicy {
         }
 
         // Select worker with best overlap among those that actually match.
-        // Tie-break: lower load, then smaller tree size.
-        let best_idx = healthy_indices
-            .iter()
-            .copied()
-            .filter(|&idx| {
-                indexer
-                    .worker_id(workers[idx].url())
-                    .and_then(|id| overlap.scores.get(&id))
-                    .copied()
-                    .unwrap_or(0)
-                    > 0
-            })
-            .max_by_key(|&idx| {
-                let wid = indexer.worker_id(workers[idx].url());
-                let score = wid
-                    .and_then(|id| overlap.scores.get(&id))
-                    .copied()
-                    .unwrap_or(0);
-                let load = workers[idx].load();
-                let tree_size = wid
-                    .and_then(|id| overlap.tree_sizes.get(&id))
-                    .copied()
-                    .unwrap_or(0);
-                (score, std::cmp::Reverse(load), std::cmp::Reverse(tree_size))
-            })?;
+        // Tie-break: lower load, then UNIFORMLY AT RANDOM. The previous final
+        // key (smaller total tree size, then slice order) was a spreading
+        // proxy but deterministic: equal-overlap equal-load workers herd onto
+        // one index until the global tree-size ordering flips. Tree size is a
+        // per-worker aggregate unrelated to this request's placement, and it
+        // tracks event-stream health — an event-lagged worker looks "small"
+        // and attracts the whole tie. Uniform random gives the same spreading
+        // goal memorylessly; the next request's overlap scores restore
+        // affinity to whichever worker actually cached the prefix.
+        let mut best: Option<(u32, usize)> = None;
+        let mut tied: Vec<usize> = Vec::new();
+        for &idx in healthy_indices {
+            let Some(score) = indexer
+                .worker_id(workers[idx].url())
+                .and_then(|id| overlap.scores.get(&id))
+                .copied()
+                .filter(|&s| s > 0)
+            else {
+                continue;
+            };
+            let load = workers[idx].load();
+            match best {
+                Some((best_score, best_load)) => {
+                    if score > best_score || (score == best_score && load < best_load) {
+                        best = Some((score, load));
+                        tied.clear();
+                        tied.push(idx);
+                    } else if score == best_score && load == best_load {
+                        tied.push(idx);
+                    }
+                }
+                None => {
+                    best = Some((score, load));
+                    tied.push(idx);
+                }
+            }
+        }
+        let best_idx = match tied.len() {
+            0 => return None,
+            1 => tied[0],
+            n => tied[rand::rng().random_range(0..n)],
+        };
 
         debug!(
             worker = workers[best_idx].url(),
@@ -1816,6 +1833,62 @@ mod tests {
     }
 
     #[test]
+    fn test_score_overlap_random_tie_break_spreads_equal_workers() {
+        // Two workers with identical cached blocks and equal load: the pick
+        // must not be deterministic (equal candidates herded onto one worker
+        // before), so across many draws both must be selected.
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .build(),
+            ),
+        ];
+
+        let chunks: [&[u32]; 2] = [&[1, 2, 3, 4], &[5, 6, 7, 8]];
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &chunks, 4);
+        // Same content cached on w2 under distinct backend seq hashes.
+        let w2 = indexer.intern_worker("http://w2:8000").unwrap();
+        let mut wb2 = WorkerBlockMap::default();
+        let blocks: Vec<StoredBlock> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, tokens)| StoredBlock {
+                seq_hash: SequenceHash(100 + i as u64),
+                content_hash: compute_content_hash(tokens),
+            })
+            .collect();
+        indexer.apply_stored(w2, &blocks, None, &mut wb2).unwrap();
+
+        let mut seen = [false; 2];
+        for _ in 0..200 {
+            let idx = CacheAwarePolicy::score_overlap(
+                &workers,
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+                &[0, 1],
+                &indexer,
+                4,
+            )
+            .expect("both workers fully match");
+            seen[idx] = true;
+            if seen[0] && seen[1] {
+                break;
+            }
+        }
+        assert!(
+            seen[0] && seen[1],
+            "equal-overlap equal-load tie must spread across workers, saw only one"
+        );
+    }
+
+    #[test]
     fn test_score_overlap_no_match_returns_none() {
         let policy = CacheAwarePolicy::with_config(test_config());
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
@@ -1888,7 +1961,7 @@ mod tests {
     }
 
     #[test]
-    fn test_score_overlap_tree_size_tiebreak() {
+    fn test_score_overlap_tree_size_not_a_tiebreak() {
         let policy = CacheAwarePolicy::with_config(test_config());
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -1935,9 +2008,24 @@ mod tests {
             .apply_stored(w2_id, &extra, Some(SequenceHash(1)), &mut wb2)
             .unwrap();
 
-        // Equal overlap, equal load → tie-break by tree size → w1 wins (smaller)
-        let result = CacheAwarePolicy::score_overlap(&workers, &[1, 2, 3, 4], &[0, 1], &indexer, 4);
-        assert_eq!(result, Some(0)); // w1 (smaller tree)
+        // Equal overlap, equal load, different tree sizes: tree size is no
+        // longer a tie-break key — the pick is uniform over the tie, so both
+        // workers must appear across draws (the old smaller-tree preference
+        // herded every tie onto w1 until the global size ordering flipped).
+        let mut seen = [false; 2];
+        for _ in 0..200 {
+            let idx =
+                CacheAwarePolicy::score_overlap(&workers, &[1, 2, 3, 4], &[0, 1], &indexer, 4)
+                    .expect("both workers match");
+            seen[idx] = true;
+            if seen[0] && seen[1] {
+                break;
+            }
+        }
+        assert!(
+            seen[0] && seen[1],
+            "tie must spread over both workers regardless of tree size, saw {seen:?}"
+        );
     }
 
     #[test]

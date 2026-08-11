@@ -4,6 +4,7 @@ use std::{
 };
 
 use openai_protocol::worker::WorkerLoadResponse;
+use rand::RngExt;
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
@@ -224,6 +225,10 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+        // Argmin with reservoir tie-breaking: equal-score workers (the common
+        // idle/homogeneous case scores exactly equal) are sampled uniformly
+        // instead of first-index-wins, which herded ties onto one worker.
+        let mut rng = rand::rng();
         let mut best = healthy[0];
         let mut best_score = self.score(
             &workers[best],
@@ -232,6 +237,7 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
             nominal_throughput,
             fleet_has_loads,
         );
+        let mut tied = 1u32;
         for &idx in &healthy[1..] {
             let s = self.score(
                 &workers[idx],
@@ -243,6 +249,14 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
             if s < best_score {
                 best = idx;
                 best_score = s;
+                tied = 1;
+            } else if s == best_score {
+                // Keep each tying candidate with probability 1/k so the final
+                // pick is uniform over all ties without collecting them.
+                tied += 1;
+                if rng.random_range(0..tied) == 0 {
+                    best = idx;
+                }
             }
         }
 
@@ -347,6 +361,36 @@ mod tests {
                 .health_config(no_health_check())
                 .build(),
         )
+    }
+
+    #[test]
+    fn equal_score_ties_spread_across_workers() {
+        // Three identically-loaded workers score exactly equal; the argmin
+        // must sample ties uniformly rather than herd on the first index.
+        // Fresh policy per draw: selection credits in-flight tokens to the
+        // winner, which breaks the tie for subsequent draws on one instance.
+        let urls = ["http://a:8000", "http://b:8000", "http://c:8000"];
+        let mut seen = [false; 3];
+        for _ in 0..150 {
+            let policy = LeastLoadPolicy::new();
+            let workers: Vec<Arc<dyn Worker>> = urls.iter().map(|u| mk(u)).collect();
+            let mut loads = HashMap::new();
+            for url in urls {
+                loads.insert(url.to_string(), make_load(1000, 0.2, 100.0));
+            }
+            policy.update_loads(&loads);
+            let idx = policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .unwrap();
+            seen[idx] = true;
+            if seen.iter().all(|&s| s) {
+                break;
+            }
+        }
+        assert!(
+            seen.iter().all(|&s| s),
+            "equal-score ties must spread across all workers, saw {seen:?}"
+        );
     }
 
     #[test]
