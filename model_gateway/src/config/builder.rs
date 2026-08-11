@@ -154,6 +154,13 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// DP engines per startup ZMQ worker (grouped worker; see
+    /// `RouterConfig::zmq_engine_count`).
+    pub fn zmq_engine_count(mut self, count: Option<usize>) -> Self {
+        self.config.zmq_engine_count = count;
+        self
+    }
+
     pub fn connection_mode(mut self, mode: ConnectionMode) -> Self {
         self.config.connection_mode = mode;
         self

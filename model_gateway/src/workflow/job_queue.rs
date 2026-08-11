@@ -10,7 +10,7 @@ use std::{
 
 use dashmap::DashMap;
 use openai_protocol::worker::{
-    JobStatus, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
+    ConnectionMode, JobStatus, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
 };
 use smg_mcp::McpConfig;
 use tokio::sync::{mpsc, Semaphore};
@@ -571,6 +571,14 @@ impl JobQueue {
                     // keeps auto-detection in detect_backend.
                     if let Some(runtime) = router_config.startup_worker_runtime_type {
                         spec.runtime_type = runtime;
+                    }
+                    // Grouped ZMQ worker: the handshake awaits this many DP
+                    // engines on one socket set. Only ZMQ URLs — dp_size on an
+                    // HTTP/gRPC startup worker would misread as dp-awareness.
+                    if let Some(count) = router_config.zmq_engine_count.filter(|&n| n > 1) {
+                        if ConnectionMode::from_url(&spec.url) == Some(ConnectionMode::Zmq) {
+                            spec.dp_size = Some(count);
+                        }
                     }
                     // Health config is resolved at worker build time from router
                     // defaults + per-worker overrides (spec.health). No need to

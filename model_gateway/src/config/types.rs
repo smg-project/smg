@@ -27,6 +27,12 @@ pub struct RouterConfig {
     /// this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_worker_runtime_type: Option<RuntimeType>,
+    /// DP engines per startup ZMQ worker: each `--worker-urls` ZMQ worker
+    /// becomes a grouped worker whose handshake awaits this many engines on
+    /// one socket set (`dp_size` on the worker spec, no rank). `None`/1 keeps
+    /// today's one-engine workers; HTTP/gRPC workers ignore this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zmq_engine_count: Option<usize>,
     pub policy: PolicyConfig,
     /// Per-request sticky-routing override (honors `X-SMG-Routing-Key`).
     #[serde(default)]
@@ -852,6 +858,7 @@ impl Default for RouterConfig {
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
             startup_worker_runtime_type: None,
+            zmq_engine_count: None,
             model_path: None,
             tokenizer_path: None,
             chat_template: None,
