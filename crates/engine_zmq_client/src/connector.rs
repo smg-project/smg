@@ -2,9 +2,10 @@
 // [`ConnectedTransport`]. Adapted from the Apache-2.0 reference
 // `vllm-engine-core-client` (vllm-project/vllm) client, scoped to SMG's needs:
 //
-// - No client-side DP load balancing. SMG routing picks the rank and stamps
-//   `data_parallel_rank`; the connector consumes the piggybacked per-rank
-//   `scheduler_stats` as the load signal.
+// - DP load balancing for unpinned requests: the connector picks the
+//   least-loaded engine from the piggybacked per-rank `scheduler_stats`
+//   (mirroring vLLM's frontend DP client). An SMG-stamped
+//   `data_parallel_rank` remains authoritative.
 // - No DP coordinator process: for a lockstep engine group the connector plays
 //   the wake role itself, over the input socket each rank already listens on.
 // - No utility RPC (deferred).
@@ -762,6 +763,57 @@ mod tests {
         let load = client.engine_load(0).expect("load recorded");
         assert_eq!(load.num_running, 3);
         assert_eq!(load.num_waiting, 5);
+    }
+
+    #[tokio::test]
+    async fn unpinned_requests_prefer_the_least_loaded_engine() {
+        let (client, mut engines, _ns) = connect_ranks(2, false).await;
+
+        // Make engine 0 report load via a pinned warm-up request; engine 1
+        // never reports and therefore scores zero.
+        let mut stream = client.submit(request_for("warm", 0)).await.unwrap();
+        engines[0].recv_request().await.unwrap();
+        let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            outputs: vec![EngineCoreOutput {
+                request_id: "warm".into(),
+                new_token_ids: vec![7],
+                finish_reason: Some(EngineCoreFinishReason::Stop),
+                ..Default::default()
+            }],
+            scheduler_stats: Some(Box::new(SchedulerStats {
+                num_running_reqs: 3,
+                num_waiting_reqs: 5,
+                ..Default::default()
+            })),
+            finished_requests: Some(std::collections::BTreeSet::from(["warm".to_string()])),
+            ..Default::default()
+        });
+        engines[0]
+            .send_output(vec![Bytes::from(encode_msgpack(&outputs).unwrap())])
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+        assert!(client.engine_load(0).is_some(), "warm-up load recorded");
+
+        // An unpinned request must now land on the idle engine 1, not
+        // engines.first().
+        let _stream = client
+            .submit(EngineCoreRequest {
+                request_id: "cold".into(),
+                prompt_token_ids: Some(vec![1, 2, 3]),
+                ..EngineCoreRequest::default()
+            })
+            .await
+            .unwrap();
+        let inbound = tokio::time::timeout(TIMEOUT, engines[1].recv())
+            .await
+            .expect("unpinned request should route to the least-loaded engine")
+            .unwrap();
+        match inbound {
+            EngineInbound::Add(request) => assert_eq!(request.request_id, "cold"),
+            other => panic!("expected Add on engine 1, got {other:?}"),
+        }
     }
 
     #[tokio::test]
