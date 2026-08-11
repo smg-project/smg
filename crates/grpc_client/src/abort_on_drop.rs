@@ -30,7 +30,7 @@ use tracing::{debug, warn};
 /// Upper bound on how long a deferred abort waits for the stream's first
 /// item before aborting anyway. Bounds the detached drain task when the
 /// backend never produces output (e.g. its upstream handoff peer died).
-const DEFERRED_ABORT_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const DEFERRED_ABORT_MAX_WAIT: Duration = Duration::from_secs(30);
 
 /// Bridge between the generic [`AbortOnDropStream`] and an engine-specific
 /// client. Implementors provide an async function that the wrapper calls
@@ -273,6 +273,11 @@ mod tests {
 
         // Short real deadline keeps the test fast; it returns only because the
         // timeout fires against the never-resolving abort.
-        abort_within(Duration::from_millis(10), HangingClient, "req-1".to_string()).await;
+        abort_within(
+            Duration::from_millis(10),
+            HangingClient,
+            "req-1".to_string(),
+        )
+        .await;
     }
 }
