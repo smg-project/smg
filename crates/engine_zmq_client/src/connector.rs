@@ -518,8 +518,6 @@ impl<P: EngineProtocol> Drop for Client<P> {
     }
 }
 
-/// Route decoded outputs to per-request streams and forward auto-abort requests
-/// to their engines. Runs until the output channel closes or the engine dies.
 /// If the engine emits no output for this long while requests are in flight, the
 /// dispatcher treats it as dead. A hard engine death (SIGKILL/OOM) sends no
 /// `ENGINE_CORE_DEAD` sentinel, and a bound PULL socket never errors when its
@@ -528,6 +526,8 @@ impl<P: EngineProtocol> Drop for Client<P> {
 /// infinite hang.
 const ENGINE_SILENCE_DEATH_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Route decoded outputs to per-request streams and forward auto-abort requests
+/// to their engines. Runs until the output channel closes or the engine dies.
 async fn run_dispatcher<P: EngineProtocol>(
     mut out_rx: mpsc::Receiver<Result<EngineBatch<P::Output>>>,
     mut abort_rx: mpsc::UnboundedReceiver<(EngineId, String)>,
