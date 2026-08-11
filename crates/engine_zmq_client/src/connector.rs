@@ -10,7 +10,14 @@
 //   the wake role itself, over the input socket each rank already listens on.
 // - No utility RPC (deferred).
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use bytes::Bytes;
 use futures::Stream;
@@ -117,7 +124,17 @@ struct ClientInner<P: EngineProtocol> {
     engines: Vec<ConnectedEngine>,
     registry: Mutex<RequestRegistry<P::Output>>,
     /// Latest per-rank load, keyed by engine index. SMG's DP load signal.
+    /// `select_engine` optimistically bumps the chosen rank's `num_waiting`
+    /// so a burst between reports spreads instead of dogpiling; the next
+    /// real report overwrites the estimate.
     load: Mutex<HashMap<u32, EngineLoad>>,
+    /// Exact per-rank count of this client's own unfinished requests: a floor
+    /// under the (possibly stale) reported load, so routing never trusts a
+    /// snapshot that says an engine we just loaded is idle.
+    inflight: Mutex<HashMap<u32, u64>>,
+    /// Rotates the selection scan start so all-zero ties (cold start, fresh
+    /// stats) don't systematically favor the first engine.
+    scan_start: AtomicUsize,
     /// Wave state for a lockstep engine group; `None` when the ranks step
     /// independently (dense DP, DP=1) and so never pause together.
     wave: Option<Mutex<WaveState>>,
@@ -132,10 +149,15 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// identity), which is version-independent — unlike the `data_parallel_rank`
     /// field, which not every vLLM version sends in `EngineCoreReadyResponse`.
     ///
-    /// Unpinned requests balance on the piggybacked per-rank load — queue
-    /// depth first, then in-flight batch size — mirroring vLLM's own frontend
-    /// DP client. An engine that has not reported load yet scores zero, so
-    /// cold ranks fill first; with one engine this degenerates to that engine.
+    /// Unpinned requests use vLLM's own frontend DP scoring
+    /// (`DPLBAsyncMPClient.get_core_engine_for_request`), single-client form:
+    /// an engine's score is the greater of this client's exact in-flight count
+    /// and the reported `waiting + running` (the floor survives stale
+    /// snapshots), plus a KV-pressure penalty — a queue on a KV-bound engine
+    /// drains slowly, so `waiting` is scaled up as `kv_cache_usage` passes
+    /// 50%. The chosen rank's `num_waiting` is bumped optimistically so a
+    /// burst between reports spreads, and the scan start rotates so all-zero
+    /// ties don't always resolve to the first engine.
     fn select_engine(&self, data_parallel_rank: Option<u32>) -> Result<EngineId> {
         match data_parallel_rank {
             Some(rank) => self
@@ -148,20 +170,56 @@ impl<P: EngineProtocol> ClientInner<P> {
                     num_engines: self.engines.len() as u32,
                 }),
             None => {
-                let load = self.load.lock();
-                self.engines
-                    .iter()
-                    .min_by_key(|engine| {
-                        engine
-                            .engine_id
-                            .engine_index()
-                            .and_then(|index| load.get(&index))
-                            .map_or((0, 0), |l| (l.num_waiting, l.num_running))
-                    })
-                    .map(|engine| engine.engine_id.clone())
-                    .ok_or(Error::ClientClosed {
+                if self.engines.is_empty() {
+                    return Err(Error::ClientClosed {
                         message: "no engines connected".to_string(),
-                    })
+                    });
+                }
+                let mut load = self.load.lock();
+                let inflight = self.inflight.lock();
+                let count = self.engines.len();
+                let start = self.scan_start.fetch_add(1, Ordering::Relaxed) % count;
+                let mut best: Option<(f64, usize)> = None;
+                for offset in 0..count {
+                    let position = (start + offset) % count;
+                    let index = self.engines[position].engine_id.engine_index();
+                    let reported = index
+                        .and_then(|i| load.get(&i))
+                        .copied()
+                        .unwrap_or_default();
+                    let own = index.and_then(|i| inflight.get(&i)).copied().unwrap_or(0);
+                    let mut score = own.max(reported.num_waiting + reported.num_running) as f64;
+                    if reported.num_waiting > 0 {
+                        score += reported.num_waiting as f64
+                            * 6.0
+                            * (reported.kv_cache_usage - 0.5).max(0.0);
+                    }
+                    if best.is_none_or(|(best_score, _)| score < best_score) {
+                        best = Some((score, position));
+                    }
+                }
+                let (_, position) = best.unwrap_or((0.0, 0));
+                let engine = &self.engines[position];
+                if let Some(index) = engine.engine_id.engine_index() {
+                    load.entry(index).or_default().num_waiting += 1;
+                }
+                Ok(engine.engine_id.clone())
+            }
+        }
+    }
+
+    /// Record a request landing on / leaving an engine, for the in-flight
+    /// floor `select_engine` scores with.
+    fn inflight_add(&self, engine_id: &EngineId) {
+        if let Some(index) = engine_id.engine_index() {
+            *self.inflight.lock().entry(index).or_insert(0) += 1;
+        }
+    }
+
+    fn inflight_remove(&self, engine_index: u32, finished: u64) {
+        if finished > 0 {
+            if let Some(count) = self.inflight.lock().get_mut(&engine_index) {
+                *count = count.saturating_sub(finished);
             }
         }
     }
@@ -304,6 +362,8 @@ impl<P: EngineProtocol> Client<P> {
             engines,
             registry: Mutex::new(RequestRegistry::default()),
             load: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
+            scan_start: AtomicUsize::new(0),
             wave: lockstep.then(|| Mutex::new(WaveState::default())),
             abort_tx,
         });
@@ -365,6 +425,7 @@ impl<P: EngineProtocol> Client<P> {
             self.inner.registry.lock().remove_all([&request_id]);
             return Err(error);
         }
+        self.inner.inflight_add(&engine_id);
 
         // The rank now holds the request; its peers must be awake for it to
         // step. Waking after the send keeps the group parked (and so unable to
@@ -377,6 +438,9 @@ impl<P: EngineProtocol> Client<P> {
             // The request can never make progress with its peers asleep, so
             // take it back rather than leaving it stranded on the engine.
             self.inner.registry.lock().remove_all([&request_id]);
+            if let Some(index) = engine_id.engine_index() {
+                self.inner.inflight_remove(index, 1);
+            }
             let _ = self.inner.abort(&engine_id, &request_id).await;
             return Err(error);
         }
@@ -434,16 +498,29 @@ async fn run_dispatcher<P: EngineProtocol>(
                         if let Some(event) = batch.wave {
                             inner.observe_wave(event, batch.engine_index).await;
                         }
+                        // Unique finished ids: a terminal output and the
+                        // out-of-band finished list may name the same request.
+                        let mut finished: HashSet<String> = batch
+                            .finished_request_ids
+                            .iter()
+                            .cloned()
+                            .collect();
                         let mut registry = inner.registry.lock();
                         for output in batch.outputs {
+                            if output.finished() {
+                                finished.insert(output.request_id().to_string());
+                            }
                             registry.route(output);
                         }
                         registry.remove_all(&batch.finished_request_ids);
+                        drop(registry);
+                        inner.inflight_remove(batch.engine_index, finished.len() as u64);
                     }
                     Some(Err(error)) => {
                         if matches!(error, Error::EngineCoreDead | Error::Transport(_)) {
                             warn!(%error, "engine transport failed; failing all in-flight requests");
                             inner.registry.lock().fail_all(Arc::new(error));
+                            inner.inflight.lock().clear();
                             return;
                         }
                         // A per-message decode error is non-fatal; keep going.
@@ -455,6 +532,9 @@ async fn run_dispatcher<P: EngineProtocol>(
             abort = abort_rx.recv() => {
                 if let Some((engine_id, request_id)) = abort {
                     inner.registry.lock().remove_all([&request_id]);
+                    if let Some(index) = engine_id.engine_index() {
+                        inner.inflight_remove(index, 1);
+                    }
                     if let Err(error) = inner.abort(&engine_id, &request_id).await {
                         warn!(%error, %request_id, "failed to send abort");
                     }
@@ -813,6 +893,34 @@ mod tests {
         match inbound {
             EngineInbound::Add(request) => assert_eq!(request.request_id, "cold"),
             other => panic!("expected Add on engine 1, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cold_burst_spreads_across_engines() {
+        // No engine has reported load yet: the in-flight floor plus the
+        // rotating scan start must spread a burst instead of dogpiling the
+        // first engine (which is what a pure snapshot-min would do).
+        let (client, mut engines, _ns) = connect_ranks(2, false).await;
+        let unpinned = |id: &str| EngineCoreRequest {
+            request_id: id.into(),
+            prompt_token_ids: Some(vec![1, 2, 3]),
+            ..EngineCoreRequest::default()
+        };
+        let _first = client.submit(unpinned("burst-0")).await.unwrap();
+        let _second = client.submit(unpinned("burst-1")).await.unwrap();
+
+        for engine in &mut engines {
+            let inbound = tokio::time::timeout(TIMEOUT, engine.recv())
+                .await
+                .expect("each engine should receive exactly one of the burst")
+                .unwrap();
+            match inbound {
+                EngineInbound::Add(request) => {
+                    assert!(request.request_id.starts_with("burst-"));
+                }
+                other => panic!("expected Add, got {other:?}"),
+            }
         }
     }
 
