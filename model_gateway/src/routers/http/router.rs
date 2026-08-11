@@ -508,10 +508,16 @@ impl Router {
             return error::service_unavailable("no_workers", "No available workers");
         }
 
+        // Caller Authorization takes precedence over each worker's API key;
+        // forward all other allow-listed headers without duplicating auth.
+        let client_auth = header_utils::extract_auth_header(headers, None);
         let filtered_headers: Vec<_> = headers
             .map(|hdrs| {
                 hdrs.iter()
-                    .filter(|(name, _)| header_utils::should_forward_request_header(name.as_str()))
+                    .filter(|(name, _)| {
+                        !name.as_str().eq_ignore_ascii_case("authorization")
+                            && header_utils::should_forward_request_header(name.as_str())
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -524,7 +530,7 @@ impl Router {
                 let method = method.clone();
 
                 let headers = filtered_headers.clone();
-
+                let client_auth = client_auth.clone();
                 let api_key = worker.api_key().cloned();
 
                 async move {
@@ -539,11 +545,12 @@ impl Router {
                         }
                     };
 
-                    if let Some(key) = api_key {
-                        let mut auth_header = String::with_capacity(7 + key.len());
-                        auth_header.push_str("Bearer ");
-                        auth_header.push_str(&key);
-                        request_builder = request_builder.header("Authorization", auth_header);
+                    // Caller header wins; fall back to the worker's API key.
+                    let auth = client_auth.or_else(|| {
+                        api_key.and_then(|k| HeaderValue::from_str(&format!("Bearer {k}")).ok())
+                    });
+                    if let Some(auth) = auth {
+                        request_builder = request_builder.header("Authorization", auth);
                     }
 
                     for (name, value) in headers {
@@ -763,28 +770,13 @@ impl Router {
         let endpoint_url = worker.endpoint_url(route);
         let mut request_builder = self.client.post(&endpoint_url).multipart(form);
 
-        if let Some(key) = worker.api_key().cloned() {
-            let mut auth_header = String::with_capacity(7 + key.len());
-            auth_header.push_str("Bearer ");
-            auth_header.push_str(&key);
-            request_builder = request_builder.header("Authorization", auth_header);
-        }
-
-        if let Some(headers) = headers {
-            for (name, value) in headers {
-                // Skip Content-Type and Content-Length — reqwest sets the
-                // correct multipart boundary itself.
-                let name_str = name.as_str();
-                if name_str.eq_ignore_ascii_case("content-type")
-                    || name_str.eq_ignore_ascii_case("content-length")
-                {
-                    continue;
-                }
-                if header_utils::should_forward_request_header(name_str) {
-                    request_builder = request_builder.header(name, value);
-                }
-            }
-        }
+        // reqwest sets the multipart Content-Type (with boundary) itself; the
+        // forward allow-list already excludes Content-Type/Content-Length.
+        request_builder = header_utils::apply_forwarded_request_headers(
+            request_builder,
+            headers,
+            worker.api_key(),
+        );
 
         let res = match request_builder.send().await {
             Ok(res) => res,
@@ -1029,21 +1021,11 @@ impl Router {
 
         let mut request_builder = self.client.post(&endpoint_url).json(&json_val);
 
-        if let Some(key) = api_key {
-            // Pre-allocate string with capacity to avoid reallocation
-            let mut auth_header = String::with_capacity(7 + key.len());
-            auth_header.push_str("Bearer ");
-            auth_header.push_str(&key);
-            request_builder = request_builder.header("Authorization", auth_header);
-        }
-
-        if let Some(headers) = headers {
-            for (name, value) in headers {
-                if header_utils::should_forward_request_header(name.as_str()) {
-                    request_builder = request_builder.header(name, value);
-                }
-            }
-        }
+        request_builder = header_utils::apply_forwarded_request_headers(
+            request_builder,
+            headers,
+            api_key.as_ref(),
+        );
 
         let res = match request_builder.send().await {
             Ok(res) => res,
