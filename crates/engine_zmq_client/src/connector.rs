@@ -118,10 +118,16 @@ struct ClientInner<P: EngineProtocol> {
     /// Reported values only — `select_engine` never mutates this map; its
     /// reservations live in `inflight`.
     load: Mutex<HashMap<u32, EngineLoad>>,
-    /// Exact per-rank count of this client's own unfinished requests: a floor
-    /// under the (possibly stale) reported load, so routing never trusts a
-    /// snapshot that says an engine we just loaded is idle.
-    inflight: Mutex<HashMap<u32, u64>>,
+    /// This client's own unfinished request ids, per rank: a floor under the
+    /// (possibly stale) reported load, so routing never trusts a snapshot that
+    /// says an engine we just loaded is idle. Keyed by id rather than counted,
+    /// because a request has several racing ways to finish — the explicit
+    /// [`Client::abort`], a dropped stream's auto-abort, and the engine's own
+    /// terminal output or finished-id report — and only the first of them may
+    /// count. Identity makes every release idempotent; counters would let one
+    /// request retire several slots and leave the rank looking emptier than it
+    /// is.
+    inflight: Mutex<HashMap<u32, HashSet<String>>>,
     /// Rotates the selection scan start so all-zero ties (cold start, fresh
     /// stats) don't systematically favor the first engine.
     scan_start: AtomicUsize,
@@ -150,15 +156,15 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// 50%. The scan start rotates so all-zero ties don't always resolve to
     /// the first engine.
     ///
-    /// Selection RESERVES the choice: the in-flight count is incremented here,
-    /// under the same lock the scores were read with, so a burst between load
-    /// reports spreads across ranks instead of dogpiling one snapshot.
+    /// Selection RESERVES the choice: `request_id` is recorded as in flight
+    /// here, under the same lock the scores were read with, so a burst between
+    /// load reports spreads across ranks instead of dogpiling one snapshot.
     /// Reported load is never mutated — reservations live only in `inflight`,
     /// and every failed submit path must release its reservation via
-    /// [`Self::unreserve`]. (vLLM additionally bumps its report cache because
+    /// [`Self::release`]. (vLLM additionally bumps its report cache because
     /// multiple client processes share its engines; this connector is the
     /// sole client of its group, so the in-flight floor already covers it.)
-    fn select_engine(&self, data_parallel_rank: Option<u32>) -> Result<EngineId> {
+    fn select_engine(&self, data_parallel_rank: Option<u32>, request_id: &str) -> Result<EngineId> {
         match data_parallel_rank {
             Some(rank) => {
                 let engine_id = self
@@ -170,7 +176,11 @@ impl<P: EngineProtocol> ClientInner<P> {
                         rank,
                         num_engines: self.engines.len() as u32,
                     })?;
-                *self.inflight.lock().entry(rank).or_insert(0) += 1;
+                self.inflight
+                    .lock()
+                    .entry(rank)
+                    .or_default()
+                    .insert(request_id.to_string());
                 Ok(engine_id)
             }
             None => {
@@ -191,7 +201,7 @@ impl<P: EngineProtocol> ClientInner<P> {
                         .and_then(|i| load.get(&i))
                         .copied()
                         .unwrap_or_default();
-                    let own = index.and_then(|i| inflight.get(&i)).copied().unwrap_or(0);
+                    let own = index.and_then(|i| inflight.get(&i)).map_or(0, HashSet::len) as u64;
                     let mut score = own.max(reported.num_waiting + reported.num_running) as f64;
                     if reported.num_waiting > 0 {
                         score += reported.num_waiting as f64
@@ -205,26 +215,32 @@ impl<P: EngineProtocol> ClientInner<P> {
                 let (_, position) = best.unwrap_or((0.0, 0));
                 let engine = &self.engines[position];
                 if let Some(index) = engine.engine_id.engine_index() {
-                    *inflight.entry(index).or_insert(0) += 1;
+                    inflight
+                        .entry(index)
+                        .or_default()
+                        .insert(request_id.to_string());
                 }
                 Ok(engine.engine_id.clone())
             }
         }
     }
 
-    /// Release a [`Self::select_engine`] reservation whose submit did not
-    /// reach the engine (registry/encode/send/wake failure).
-    fn unreserve(&self, engine_id: &EngineId) {
-        if let Some(index) = engine_id.engine_index() {
-            self.inflight_remove(index, 1);
+    /// Retire in-flight request ids from a rank. Idempotent: an id already
+    /// retired by a racing path is simply absent.
+    fn release<'a>(&self, engine_index: u32, request_ids: impl IntoIterator<Item = &'a String>) {
+        let mut inflight = self.inflight.lock();
+        let Some(ids) = inflight.get_mut(&engine_index) else {
+            return;
+        };
+        for request_id in request_ids {
+            ids.remove(request_id);
         }
     }
 
-    fn inflight_remove(&self, engine_index: u32, finished: u64) {
-        if finished > 0 {
-            if let Some(count) = self.inflight.lock().get_mut(&engine_index) {
-                *count = count.saturating_sub(finished);
-            }
+    /// Retire one request from the rank named by `engine_id`, if it has one.
+    fn release_one(&self, engine_id: &EngineId, request_id: &String) {
+        if let Some(index) = engine_id.engine_index() {
+            self.release(index, [request_id]);
         }
     }
 
@@ -425,15 +441,22 @@ impl<P: EngineProtocol> Client<P> {
     /// Dropping the returned stream before it finishes aborts the request.
     pub async fn submit(&self, request: P::Request) -> Result<RequestStream<P>> {
         P::validate(&request)?;
+        let request_id = P::request_id(&request).to_string();
+        // Register before selecting: registration is the admission gate (it
+        // rejects a duplicate id), and in-flight slots are held by id, so a
+        // reservation taken before that gate could collide with the live
+        // request's own slot and release it on rollback.
+        let receiver = self.inner.registry.lock().register(request_id.clone())?;
+
         // Selection reserves the engine's in-flight slot; every failure path
         // from here to a successful hand-off must release it.
-        let engine_id = self.inner.select_engine(P::data_parallel_rank(&request))?;
-
-        let request_id = P::request_id(&request).to_string();
-        let receiver = match self.inner.registry.lock().register(request_id.clone()) {
-            Ok(receiver) => receiver,
+        let engine_id = match self
+            .inner
+            .select_engine(P::data_parallel_rank(&request), &request_id)
+        {
+            Ok(engine_id) => engine_id,
             Err(error) => {
-                self.inner.unreserve(&engine_id);
+                self.inner.registry.lock().remove_all([&request_id]);
                 return Err(error);
             }
         };
@@ -442,7 +465,7 @@ impl<P: EngineProtocol> Client<P> {
             Ok(encoded) => encoded,
             Err(error) => {
                 self.inner.registry.lock().remove_all([&request_id]);
-                self.inner.unreserve(&engine_id);
+                self.inner.release_one(&engine_id, &request_id);
                 return Err(error);
             }
         };
@@ -453,7 +476,7 @@ impl<P: EngineProtocol> Client<P> {
         {
             // Roll back the registry entry so a failed send doesn't leak it.
             self.inner.registry.lock().remove_all([&request_id]);
-            self.inner.unreserve(&engine_id);
+            self.inner.release_one(&engine_id, &request_id);
             return Err(error);
         }
 
@@ -464,7 +487,7 @@ impl<P: EngineProtocol> Client<P> {
             // The request can never make progress with its peers asleep, so
             // take it back rather than leaving it stranded on the engine.
             self.inner.registry.lock().remove_all([&request_id]);
-            self.inner.unreserve(&engine_id);
+            self.inner.release_one(&engine_id, &request_id);
             let _ = self.inner.abort(&engine_id, &request_id).await;
             return Err(error);
         }
@@ -480,12 +503,10 @@ impl<P: EngineProtocol> Client<P> {
 
     /// Explicitly abort an in-flight request.
     pub async fn abort(&self, engine_id: &EngineId, request_id: &str) -> Result<()> {
-        self.inner
-            .registry
-            .lock()
-            .remove_all([&request_id.to_string()]);
-        self.inner.unreserve(engine_id);
-        self.inner.abort(engine_id, request_id).await
+        let request_id = request_id.to_string();
+        self.inner.registry.lock().remove_all([&request_id]);
+        self.inner.release_one(engine_id, &request_id);
+        self.inner.abort(engine_id, &request_id).await
     }
 }
 
@@ -539,7 +560,7 @@ async fn run_dispatcher<P: EngineProtocol>(
                         }
                         registry.remove_all(&batch.finished_request_ids);
                         drop(registry);
-                        inner.inflight_remove(batch.engine_index, finished.len() as u64);
+                        inner.release(batch.engine_index, &finished);
                     }
                     Some(Err(error)) => {
                         if matches!(error, Error::EngineCoreDead | Error::Transport(_)) {
@@ -557,9 +578,7 @@ async fn run_dispatcher<P: EngineProtocol>(
             abort = abort_rx.recv() => {
                 if let Some((engine_id, request_id)) = abort {
                     inner.registry.lock().remove_all([&request_id]);
-                    if let Some(index) = engine_id.engine_index() {
-                        inner.inflight_remove(index, 1);
-                    }
+                    inner.release_one(&engine_id, &request_id);
                     if let Err(error) = inner.abort(&engine_id, &request_id).await {
                         warn!(%error, %request_id, "failed to send abort");
                     }
@@ -980,6 +999,71 @@ mod tests {
             EngineInbound::Add(request) => assert_eq!(request.request_id, "after"),
             other => panic!("expected Add on engine 1, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn retiring_one_request_twice_frees_only_its_own_slot() {
+        // A request has several racing ways to finish: the explicit abort API,
+        // the dropped stream's auto-abort, and the engine's own finished
+        // report. Counting each one would retire slots the request never held
+        // and leave the rank looking emptier than it is; slots are keyed by
+        // request id so only the first retirement lands.
+        let (client, mut engines, _ns) = connect_ranks(2, false).await;
+        let pinned = |id: &str| EngineCoreRequest {
+            request_id: id.into(),
+            prompt_token_ids: Some(vec![1, 2, 3]),
+            data_parallel_rank: Some(0),
+            ..EngineCoreRequest::default()
+        };
+        let doomed = client.submit(pinned("doomed")).await.unwrap();
+        let _held = client.submit(pinned("held")).await.unwrap();
+        engines[0].recv().await.unwrap();
+        engines[0].recv().await.unwrap();
+
+        // Abort retires "doomed"; dropping its unfinished stream sends the
+        // auto-abort for the same id behind it.
+        client
+            .abort(&engines_id(&client, 0), "doomed")
+            .await
+            .unwrap();
+        drop(doomed);
+        for _ in 0..2 {
+            tokio::time::timeout(TIMEOUT, engines[0].recv())
+                .await
+                .expect("both aborts should reach the engine")
+                .unwrap();
+        }
+
+        // Engine 0 still holds "held". An unpinned request must therefore go
+        // to the idle engine 1 — it would go to 0 if the second retirement had
+        // freed "held"'s slot too.
+        let _next = client
+            .submit(EngineCoreRequest {
+                request_id: "next".into(),
+                prompt_token_ids: Some(vec![1, 2, 3]),
+                ..EngineCoreRequest::default()
+            })
+            .await
+            .unwrap();
+        match tokio::time::timeout(TIMEOUT, engines[1].recv())
+            .await
+            .expect("request should route to the idle engine")
+            .unwrap()
+        {
+            EngineInbound::Add(request) => assert_eq!(request.request_id, "next"),
+            other => panic!("expected Add on engine 1, got {other:?}"),
+        }
+    }
+
+    /// The `EngineId` of one connected rank, by index.
+    fn engines_id(client: &EngineCoreClient, engine_index: u32) -> EngineId {
+        client
+            .engines()
+            .iter()
+            .find(|engine| engine.engine_id.engine_index() == Some(engine_index))
+            .expect("connected rank")
+            .engine_id
+            .clone()
     }
 
     #[tokio::test]
