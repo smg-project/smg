@@ -79,8 +79,8 @@ struct CompletionStreamOutcome {
 pub(crate) struct StreamingProcessor {
     tool_parser_factory: ToolParserFactory,
     reasoning_parser_factory: ReasoningParserFactory,
-    configured_tool_parser: Option<String>,
-    configured_reasoning_parser: Option<String>,
+    /// Per-request parser-name resolution (model-card override → configured).
+    parser_resolver: utils::ParserResolver,
     backend_type: &'static str,
 }
 
@@ -101,15 +101,13 @@ impl StreamingProcessor {
     pub fn new(
         tool_parser_factory: ToolParserFactory,
         reasoning_parser_factory: ReasoningParserFactory,
-        configured_tool_parser: Option<String>,
-        configured_reasoning_parser: Option<String>,
+        parser_resolver: utils::ParserResolver,
         backend_type: &'static str,
     ) -> Self {
         Self {
             tool_parser_factory,
             reasoning_parser_factory,
-            configured_tool_parser,
-            configured_reasoning_parser,
+            parser_resolver,
             backend_type,
         }
     }
@@ -319,11 +317,15 @@ impl StreamingProcessor {
         let created = dispatch.created;
         let system_fingerprint = dispatch.weight_version.as_deref();
 
+        // Per-request effective parser names (model-card override → configured).
+        let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
+        let tool_parser_name = self.parser_resolver.tool_parser(model);
+
         // Check parser availability once upfront (log warning only once per request)
         let reasoning_parser_available = separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_deref(),
+                reasoning_parser_name.as_deref(),
                 model,
             );
 
@@ -344,7 +346,7 @@ impl StreamingProcessor {
         let has_structural_tag = self
             .tool_parser_factory
             .registry()
-            .has_structural_tag_for_parser(self.configured_tool_parser.as_deref());
+            .has_structural_tag_for_parser(tool_parser_name.as_deref());
         let used_json_schema = if has_structural_tag {
             false
         } else {
@@ -365,7 +367,7 @@ impl StreamingProcessor {
         let tool_parser_available = tools.is_some()
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
-                self.configured_tool_parser.as_deref(),
+                tool_parser_name.as_deref(),
                 model,
             );
 
@@ -490,6 +492,7 @@ impl StreamingProcessor {
                                 &mut reasoning_parsers,
                                 thinking_override,
                                 think_in_prefill,
+                                reasoning_parser_name.as_deref(),
                                 request_id,
                                 model,
                                 created,
@@ -537,6 +540,7 @@ impl StreamingProcessor {
                                     &mut tool_parsers,
                                     &mut has_tool_calls,
                                     tools_ref,
+                                    tool_parser_name.as_deref(),
                                     request_id,
                                     model,
                                     created,
@@ -1357,6 +1361,10 @@ impl StreamingProcessor {
         reasoning_parsers: &mut HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
         thinking_override: bool,
         think_in_prefill: bool,
+        // Resolved once per request by the caller: re-resolving here could
+        // disagree with the upfront availability check if the worker registry
+        // changed mid-stream, turning the `expect` below into a panic.
+        reasoning_parser_name: Option<&str>,
         request_id: &str,
         model: &str,
         created: u64,
@@ -1370,7 +1378,7 @@ impl StreamingProcessor {
         reasoning_parsers.entry(index).or_insert_with(|| {
             let mut parser = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_deref(),
+                reasoning_parser_name,
                 model,
             )
             .expect("Parser should be available - checked upfront");
@@ -1480,6 +1488,8 @@ impl StreamingProcessor {
         tool_parsers: &mut HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>>,
         has_tool_calls: &mut HashMap<u32, bool>,
         tools: &[Tool],
+        // Resolved once per request by the caller (see process_reasoning_stream).
+        tool_parser_name: Option<&str>,
         request_id: &str,
         model: &str,
         created: u64,
@@ -1499,12 +1509,8 @@ impl StreamingProcessor {
                 utils::create_tool_parser(&self.tool_parser_factory, Some("json"), model)
                     .expect("JSON parser should be available")
             } else {
-                utils::create_tool_parser(
-                    &self.tool_parser_factory,
-                    self.configured_tool_parser.as_deref(),
-                    model,
-                )
-                .expect("Parser should be available - checked upfront")
+                utils::create_tool_parser(&self.tool_parser_factory, tool_parser_name, model)
+                    .expect("Parser should be available - checked upfront")
             };
             Arc::new(tokio::sync::Mutex::new(parser))
         });
@@ -1653,13 +1659,15 @@ impl StreamingProcessor {
         reasoning_parser: &mut Option<Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
         thinking_override: bool,
         think_in_prefill: bool,
+        // Resolved once per request by the caller (see process_reasoning_stream).
+        reasoning_parser_name: Option<&str>,
         model: &str,
     ) -> (String, String, bool) {
         // Lazily create parser
         if reasoning_parser.is_none() {
             if let Some(mut parser) = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_deref(),
+                reasoning_parser_name,
                 model,
             ) {
                 if thinking_override {
@@ -1884,11 +1892,15 @@ impl StreamingProcessor {
         // engine output (the backend has no stop-string detection over ZMQ).
         let mut stopped = false;
 
+        // Per-request effective parser names (model-card override → configured).
+        let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
+        let tool_parser_name = self.parser_resolver.tool_parser(model);
+
         // Check parser availability once upfront. Run parser when the user explicitly
         // enabled thinking, or when the selected parser needs structural special tokens.
         let reasoning_requires_special_tokens = utils::reasoning_parser_requires_special_tokens(
             &self.reasoning_parser_factory,
-            self.configured_reasoning_parser.as_deref(),
+            reasoning_parser_name.as_deref(),
             model,
         );
         let separate_reasoning = reasoning_requires_special_tokens
@@ -1902,7 +1914,7 @@ impl StreamingProcessor {
         let reasoning_parser_available = separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_deref(),
+                reasoning_parser_name.as_deref(),
                 model,
             );
 
@@ -1928,14 +1940,14 @@ impl StreamingProcessor {
             && tool_choice_enabled
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
-                self.configured_tool_parser.as_deref(),
+                tool_parser_name.as_deref(),
                 model,
             );
 
         let has_structural_tag = self
             .tool_parser_factory
             .registry()
-            .has_structural_tag_for_parser(self.configured_tool_parser.as_deref());
+            .has_structural_tag_for_parser(tool_parser_name.as_deref());
         let used_json_schema = !has_structural_tag
             && matches!(
                 &original_request.tool_choice,
@@ -1966,7 +1978,7 @@ impl StreamingProcessor {
                 let parser_name = if used_json_schema {
                     Some("json")
                 } else {
-                    self.configured_tool_parser.as_deref()
+                    tool_parser_name.as_deref()
                 };
                 utils::create_tool_parser(&self.tool_parser_factory, parser_name, model)
             } else {
@@ -2045,6 +2057,7 @@ impl StreamingProcessor {
                                 &mut reasoning_parser,
                                 thinking_override,
                                 think_in_prefill,
+                                reasoning_parser_name.as_deref(),
                                 model,
                             )
                             .await
