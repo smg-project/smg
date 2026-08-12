@@ -12,8 +12,9 @@ use crate::{
 /// `param_name -> declared JSON-schema type` for the named function (empty if the
 /// function or its `properties` are absent). Lets XML-style parsers coerce by the
 /// declared type instead of guessing from text (e.g. keep a numeric-looking
-/// `string` as a string). Only scalar `type` is read; unions/nullable schemas
-/// have no single type, so they fall back to the caller's inference.
+/// `string` as a string). For simple unions, a string branch takes precedence;
+/// otherwise the first non-null scalar type is used. `$ref` resolution remains
+/// the responsibility of the caller.
 pub fn param_types_for_function(tools: &[Tool], func_name: &str) -> HashMap<String, String> {
     let mut types = HashMap::new();
     let Some(tool) = tools.iter().find(|t| t.function.name == func_name) else {
@@ -26,12 +27,39 @@ pub fn param_types_for_function(tools: &[Tool], func_name: &str) -> HashMap<Stri
         .and_then(Value::as_object)
     {
         for (key, schema) in props {
-            if let Some(ty) = schema.get("type").and_then(Value::as_str) {
-                types.insert(key.clone(), ty.to_string());
+            if let Some(ty) = declared_schema_type(schema) {
+                types.insert(key.clone(), ty);
             }
         }
     }
     types
+}
+
+fn declared_schema_type(schema: &Value) -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+
+    match schema.get("type") {
+        Some(Value::String(ty)) => candidates.push(ty.clone()),
+        Some(Value::Array(types)) => candidates.extend(
+            types
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string),
+        ),
+        _ => {}
+    }
+
+    for keyword in ["anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
+            candidates.extend(branches.iter().filter_map(declared_schema_type));
+        }
+    }
+
+    candidates
+        .iter()
+        .find(|ty| ty.as_str() == "string")
+        .or_else(|| candidates.iter().find(|ty| ty.as_str() != "null"))
+        .cloned()
 }
 
 /// Coerce a raw value by its declared JSON-schema type. For `string`, a JSON

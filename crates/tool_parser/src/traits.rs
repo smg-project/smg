@@ -36,6 +36,15 @@ pub trait ToolParser: Send + Sync {
         tools: &[Tool],
     ) -> ParserResult<StreamingParseResult>;
 
+    /// Finish a streaming parse at end-of-input.
+    ///
+    /// Stateful parsers can override this to drain complete buffered calls or
+    /// reject an incomplete structured marker. The default is intentionally a
+    /// no-op so existing parser implementations retain their current behavior.
+    async fn finalize(&mut self, _tools: &[Tool]) -> ParserResult<StreamingParseResult> {
+        Ok(StreamingParseResult::default())
+    }
+
     /// Check if text contains tool calls in this parser's format
     fn has_tool_markers(&self, text: &str) -> bool;
 

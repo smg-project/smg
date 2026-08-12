@@ -126,7 +126,7 @@ impl ParserRegistry {
     /// Map a model name/pattern to a parser
     pub fn map_model(&self, model: impl Into<String>, parser: impl Into<String>) {
         let mut mapping = self.model_mapping.write();
-        mapping.insert(model.into(), parser.into());
+        mapping.insert(model.into().to_ascii_lowercase(), parser.into());
     }
 
     /// Get a pooled parser by exact name.
@@ -236,23 +236,33 @@ impl ParserRegistry {
     /// Returns None if no mapping matches (caller decides fallback).
     pub fn resolve_model_to_parser(&self, model: &str) -> Option<String> {
         let mapping = self.model_mapping.read();
-        // Try exact match
-        if let Some(parser_name) = mapping.get(model) {
-            return Some(parser_name.clone());
-        }
-        // Case-insensitive substring matching (longest pattern wins) so namespaced
-        // and differently-cased ids (e.g. "org/Inkling-Chat") still resolve.
-        let model_lower = model.to_lowercase();
-        mapping
-            .iter()
-            .filter_map(|(pattern, parser_name)| {
-                let stem = pattern.strip_suffix('*')?;
-                model_lower
-                    .contains(&stem.to_lowercase())
-                    .then_some((stem, parser_name))
-            })
-            .max_by_key(|(stem, _)| stem.len())
-            .map(|(_, parser_name)| parser_name.clone())
+        // Case-insensitive resolution (longest pattern wins) so namespaced and
+        // differently-cased ids (e.g. "org/Inkling-Chat", "THUDM/GLM-5.2") still
+        // resolve. Match against both the full normalized id and the basename
+        // (last path segment) using prefix semantics — prefix (not substring)
+        // matching keeps resolution fail-closed and avoids false positives from
+        // a stem appearing mid-segment.
+        let normalized = model.to_ascii_lowercase();
+        let basename = normalized
+            .rsplit(['/', '\\'])
+            .find(|part| !part.is_empty())
+            .unwrap_or(normalized.as_str());
+
+        let resolved = std::iter::once(normalized.as_str())
+            .chain((basename != normalized.as_str()).then_some(basename))
+            .find_map(|candidate| {
+                mapping.get(candidate).cloned().or_else(|| {
+                    mapping
+                        .iter()
+                        .filter(|(pattern, _)| {
+                            pattern.ends_with('*')
+                                && candidate.starts_with(&pattern[..pattern.len() - 1])
+                        })
+                        .max_by_key(|(pattern, _)| pattern.len())
+                        .map(|(_, parser_name)| parser_name.clone())
+                })
+            });
+        resolved
     }
 
     /// Check if a parser can be created for a specific model without actually creating it.
@@ -329,6 +339,8 @@ impl ParserFactory {
         registry.register_parser("deepseek_v4", || Box::new(DeepSeekDsmlParser::v4()));
         registry.register_parser("glm45_moe", || Box::new(Glm4MoeParser::glm45()));
         registry.register_parser("glm47_moe", || Box::new(Glm4MoeParser::glm47()));
+        registry.register_parser("glm45", || Box::new(Glm4MoeParser::glm45()));
+        registry.register_parser("glm47", || Box::new(Glm4MoeParser::glm47()));
         registry.register_parser("step3", || Box::new(Step3Parser::new()));
         registry.register_parser("sarashina", || Box::new(SarashinaParser::new()));
         registry.register_parser_with_structural_tag(
