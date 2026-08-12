@@ -330,6 +330,44 @@ impl PolicyRegistry {
             .unwrap_or_else(|| self.get_default_policy())
     }
 
+    /// Every distinct policy this registry might dispatch requests
+    /// through for `model_id`, ordered from most-specific to least
+    /// (per-model → default → PD/EPD legs). Deduplicated by `Arc`
+    /// pointer identity so a policy that appears in multiple slots
+    /// (e.g. the same `CacheAwarePolicy` as both default and prefill
+    /// leg) is returned once.
+    ///
+    /// The tree-sync bridge uses this to reach every `CacheAwarePolicy`
+    /// that could have produced a delta for `model_id` — reaching
+    /// only `model_policies` misses PD-leg and default-fallback
+    /// deployments, and inbound deltas never resolve.
+    pub(crate) fn policies_for_model(&self, model_id: &str) -> Vec<Arc<dyn LoadBalancingPolicy>> {
+        let mut out: Vec<Arc<dyn LoadBalancingPolicy>> = Vec::new();
+        let mut push = |candidate: Arc<dyn LoadBalancingPolicy>| {
+            let ptr = Arc::as_ptr(&candidate) as *const ();
+            if !out
+                .iter()
+                .any(|existing| Arc::as_ptr(existing) as *const () == ptr)
+            {
+                out.push(candidate);
+            }
+        };
+        if let Some(policy) = self.get_policy(model_id) {
+            push(policy);
+        }
+        push(Arc::clone(&self.default_policy));
+        if let Some(p) = self.prefill_policy.get() {
+            push(Arc::clone(p));
+        }
+        if let Some(p) = self.decode_policy.get() {
+            push(Arc::clone(p));
+        }
+        if let Some(p) = self.encode_policy.get() {
+            push(Arc::clone(p));
+        }
+        out
+    }
+
     /// Determine policy for a new model
     fn determine_policy_for_model(
         &self,

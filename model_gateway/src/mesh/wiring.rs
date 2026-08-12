@@ -197,41 +197,33 @@ impl PolicyRegistryTreeHandle {
         Self { registry }
     }
 
-    /// Fetch the policy Arc and pass it to `f` if it is cache-aware.
-    /// Returns `f`'s result, or the caller's `default` if this node
-    /// has no cache-aware policy for `model_id`. The policy Arc is
-    /// held for the duration of `f`, so downcast borrows are safe
+    /// Visit every distinct [`CacheAwarePolicy`] the registry could
+    /// dispatch requests through for `model_id`, in
+    /// most-specific-first order (per-model → default → PD/EPD legs),
+    /// invoking `f` on each. The `Arc<dyn ...>` is held for the
+    /// duration of each `f` call, so downcast borrows are safe
     /// against concurrent registry churn.
     ///
-    /// Emits a single `debug!` on the fallthrough branch so operators
-    /// can distinguish "legitimate empty result from a cache-aware
-    /// policy" (silent) from "this node is not authoritative for that
-    /// model" (grep-able) — the two look identical on the wire
-    /// otherwise, and the second case can drive spurious repair
-    /// traffic.
-    fn with_cache_aware<R>(
-        &self,
-        model_id: &str,
-        default: R,
-        f: impl FnOnce(&CacheAwarePolicy) -> R,
-    ) -> R {
-        let Some(policy) = self.registry.get_policy(model_id) else {
+    /// Emits a single `debug!` when the chain contains no
+    /// cache-aware policy so operators can distinguish a legitimate
+    /// empty result from "this node is not authoritative for that
+    /// model" — the two look identical on the wire otherwise, and
+    /// the second case can drive spurious repair traffic.
+    fn for_each_cache_aware(&self, model_id: &str, mut f: impl FnMut(&CacheAwarePolicy)) {
+        let policies = self.registry.policies_for_model(model_id);
+        let mut hit = false;
+        for policy in &policies {
+            if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                hit = true;
+                f(cache_aware);
+            }
+        }
+        if !hit {
             debug!(
                 model_id,
-                "tree-sync bridge: no policy registered for model on this node",
+                candidate_policies = policies.len(),
+                "tree-sync bridge: no cache-aware policy for model on this node",
             );
-            return default;
-        };
-        match policy.as_any().downcast_ref::<CacheAwarePolicy>() {
-            Some(cache_aware) => f(cache_aware),
-            None => {
-                debug!(
-                    model_id,
-                    policy = policy.name(),
-                    "tree-sync bridge: policy is not cache-aware on this node",
-                );
-                default
-            }
         }
     }
 }
@@ -251,9 +243,19 @@ impl TreeHandle for PolicyRegistryTreeHandle {
         node_hash: u64,
         worker_url: &str,
     ) -> bool {
-        self.with_cache_aware(model_id, false, |policy| {
-            policy.apply_known_remote_insert(model_id, tree_kind, node_hash, worker_url)
-        })
+        // First cache-aware policy in the chain that knows this
+        // hash wins; further policies are skipped because the delta
+        // has already been applied where it belongs.
+        let mut applied = false;
+        self.for_each_cache_aware(model_id, |policy| {
+            if applied {
+                return;
+            }
+            if policy.apply_known_remote_insert(model_id, tree_kind, node_hash, worker_url) {
+                applied = true;
+            }
+        });
+        applied
     }
 
     fn open_repair_stream(
@@ -261,16 +263,31 @@ impl TreeHandle for PolicyRegistryTreeHandle {
         model_id: &str,
         tree_kind: TreeKind,
     ) -> Option<Box<dyn Iterator<Item = RepairEntry> + Send>> {
-        // `open_repair_stream` returns an owned iterator, so the policy
-        // borrow only lives inside this closure — after it returns the
-        // iterator is self-contained (the underlying tree is Arc-shared).
-        self.with_cache_aware(model_id, None, |policy| {
-            policy.open_repair_stream(model_id, tree_kind)
-        })
+        // Return the first non-empty stream in the chain: the
+        // returned iterator is self-contained (underlying tree is
+        // Arc-shared) so the policy borrow can end when the closure
+        // returns.
+        let mut stream: Option<Box<dyn Iterator<Item = RepairEntry> + Send>> = None;
+        self.for_each_cache_aware(model_id, |policy| {
+            if stream.is_some() {
+                return;
+            }
+            stream = policy.open_repair_stream(model_id, tree_kind);
+        });
+        stream
     }
 
     fn apply_repair_page(&self, page: &TreeRepairPage) -> usize {
-        self.with_cache_aware(&page.model_id, 0, |policy| policy.apply_repair_page(page))
+        // Seed every cache-aware policy in the chain from the same
+        // page: in PD/EPD deployments both the prefill leg and the
+        // decode leg maintain their own routing tree and each needs
+        // the peer's state; delivering the page once per leg is
+        // cheap (per-entry `insert_text` / `insert_tokens`).
+        let mut total: usize = 0;
+        self.for_each_cache_aware(&page.model_id, |policy| {
+            total = total.saturating_add(policy.apply_repair_page(page));
+        });
+        total
     }
 }
 
@@ -362,16 +379,7 @@ mod tests {
     #[tokio::test]
     async fn tree_adapter_registers_and_flips_populate_flag() {
         let mesh = MeshKV::new("node-a".into());
-        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 60,
-            max_tree_size: 128,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-        }));
+        let policy_registry = Arc::new(PolicyRegistry::new(cache_aware_policy_config()));
         let _adapters = MeshAdapters::start(
             &mesh,
             "node-a".into(),
@@ -612,5 +620,100 @@ mod tests {
             "token select_worker must publish an additional TreeDelta \
              (before {after_string}, after {after_token})",
         );
+    }
+
+    /// The `TreeHandle` bridge must return the documented fallback
+    /// values (`false` / `None` / `0`) when the model has no
+    /// cache-aware policy in the chain — otherwise the tree adapter
+    /// cannot distinguish "delta legitimately unknown" from "no
+    /// policy on this node" and drives spurious repair traffic.
+    #[tokio::test]
+    async fn bridge_returns_fallbacks_when_no_cache_aware_policy() {
+        use crate::mesh::adapters::tree_sync::TreeRepairPage;
+
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::Random));
+        let handle = PolicyRegistryTreeHandle::new(policy_registry);
+
+        assert!(
+            !handle.apply_known_remote_insert("no-such-model", TreeKind::String, 42, "http://w"),
+            "apply_known_remote_insert must return false when no cache-aware policy is reachable",
+        );
+        assert!(
+            handle
+                .open_repair_stream("no-such-model", TreeKind::String)
+                .is_none(),
+            "open_repair_stream must return None when no cache-aware policy is reachable",
+        );
+        let page = TreeRepairPage {
+            session_id: uuid::Uuid::nil(),
+            model_id: "no-such-model".into(),
+            tree_kind: TreeKind::String,
+            page_index: 0,
+            entries: Vec::new(),
+            next_cursor: None,
+            is_last: true,
+        };
+        assert_eq!(
+            handle.apply_repair_page(&page),
+            0,
+            "apply_repair_page must return 0 when no cache-aware policy is reachable",
+        );
+    }
+
+    /// A cache-aware default policy (no per-model entry, no PD legs)
+    /// must be reachable through the bridge — that's the shape a
+    /// single-model non-PD deployment has, and the fallback CodeRabbit
+    /// flagged as missing.
+    #[tokio::test]
+    async fn bridge_dispatches_through_default_policy() {
+        use kv_index::hash_node_path;
+
+        use crate::mesh::adapters::tree_sync::TreeRepairPage;
+
+        let policy_registry = Arc::new(PolicyRegistry::new(cache_aware_policy_config()));
+        // Do NOT touch `get_policy_or_default("m")` — we want the
+        // default policy path, not a per-model entry. Manually seed
+        // the default policy's hash_index so `apply_known_remote_insert`
+        // has something to resolve.
+        let default_policy = policy_registry.get_default_policy();
+        let cache_aware = default_policy
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .expect("default policy is cache-aware");
+        cache_aware.set_populate_hash_index_for_test_true();
+        let text = "hello world";
+        let path_hash = hash_node_path(text);
+        cache_aware.seed_hash_index_for_test(
+            crate::worker::UNKNOWN_MODEL_ID,
+            TreeKind::String,
+            path_hash,
+            text,
+        );
+
+        let handle = PolicyRegistryTreeHandle::new(policy_registry);
+        assert!(
+            handle.apply_known_remote_insert(
+                crate::worker::UNKNOWN_MODEL_ID,
+                TreeKind::String,
+                path_hash,
+                "http://w1:8000",
+            ),
+            "bridge must reach default_policy for models without a per-model entry",
+        );
+
+        // apply_repair_page over the same model should reach the
+        // default policy too — empty page trivially returns 0
+        // entries applied, but the fact that it does not panic
+        // proves the chain walked.
+        let page = TreeRepairPage {
+            session_id: uuid::Uuid::nil(),
+            model_id: crate::worker::UNKNOWN_MODEL_ID.into(),
+            tree_kind: TreeKind::String,
+            page_index: 0,
+            entries: Vec::new(),
+            next_cursor: None,
+            is_last: true,
+        };
+        assert_eq!(handle.apply_repair_page(&page), 0);
     }
 }

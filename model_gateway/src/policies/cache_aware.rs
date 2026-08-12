@@ -266,6 +266,52 @@ impl CacheAwarePolicy {
         self.should_populate_hash_index()
     }
 
+    /// Test-only: flip populate on without going through the mesh
+    /// wiring path. Used by bridge tests that need to seed
+    /// `hash_index` directly.
+    #[cfg(test)]
+    pub fn set_populate_hash_index_for_test_true(&self) {
+        self.set_populate_hash_index(true);
+    }
+
+    /// Test-only: seed a single hash-index entry so bridge tests
+    /// can exercise the inbound resolution path without driving a
+    /// full request through `select_worker`. `matched` is the
+    /// matched-prefix shape the populate site would normally store
+    /// (full text for string / full token vec for token) — for a
+    /// unit test that only asserts the lookup succeeded, any
+    /// non-empty value works because the underlying tree seeds
+    /// itself in `apply_known_remote_insert`.
+    #[cfg(test)]
+    pub fn seed_hash_index_for_test(
+        &self,
+        model_id: &str,
+        tree_kind: TreeKind,
+        node_hash: u64,
+        matched: &str,
+    ) {
+        let entry = self.hash_index.entry(model_id.to_string()).or_default();
+        match tree_kind {
+            TreeKind::String => {
+                entry.string_tree.insert(node_hash, matched.to_string());
+                // Ensure the string_tree map has a matching tree so
+                // apply_known_remote_insert doesn't hit the
+                // populate-site invariant warning.
+                self.string_trees
+                    .entry(model_id.to_string())
+                    .or_insert_with(|| Arc::new(Tree::new()));
+            }
+            TreeKind::Token => {
+                entry
+                    .token_tree
+                    .insert(node_hash, matched.bytes().map(u32::from).collect());
+                self.token_trees
+                    .entry(model_id.to_string())
+                    .or_insert_with(|| Arc::new(TokenTree::new()));
+            }
+        }
+    }
+
     /// Attach the mesh outbound bridge and enable hash-index population
     /// in one atomic step; pass `None` to detach and disable both. The
     /// pair moves together because the hash-index has no non-mesh
@@ -278,10 +324,10 @@ impl CacheAwarePolicy {
     /// `set_kv_event_monitor` / `set_load_receiver`.
     pub fn set_mesh_tree_sync(&self, adapter: Option<Arc<TreeSyncAdapter>>) {
         let populate = adapter.is_some();
-        {
-            let mut guard = self.mesh_tree_sync.write();
-            *guard = adapter;
-        }
+        let mut guard = self.mesh_tree_sync.write();
+        *guard = adapter;
+        // Store under the guard so no observer can see the pair
+        // split (adapter attached ↔ populate flag on).
         self.populate_hash_index.store(populate, Ordering::Relaxed);
     }
 
@@ -1112,7 +1158,9 @@ impl CacheAwarePolicy {
                     // the node_hash keys the hash_index entry we
                     // just wrote, so a receiver that repairs against
                     // us will land the same worker onto the same
-                    // tree node.
+                    // tree node. `epoch: 0` — the field is a reserved
+                    // slot the current receiver does not consult
+                    // (see `TreeDelta::epoch`).
                     self.sync_local_insert(
                         model_id,
                         TreeDelta {

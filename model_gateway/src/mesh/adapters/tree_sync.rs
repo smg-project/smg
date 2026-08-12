@@ -114,8 +114,13 @@ pub struct TreeDelta {
     pub node_hash: u64,
     /// Worker URL that cached the prefix.
     pub worker_url: String,
-    /// Cache-event epoch for intra-batch ordering on the receiver;
-    /// the stream transport itself doesn't inspect it.
+    /// Reserved on-wire slot for a future intra-batch ordering
+    /// value. The current receiver does not consult it — it appears
+    /// only in `trace!`/`debug!` log lines — so producers may set
+    /// `0` until a consumer that orders by epoch lands. Kept on
+    /// `TreeDelta` (rather than added later) so a newer receiver
+    /// paired with an older producer just sees zeros instead of a
+    /// deserialization mismatch.
     pub epoch: u64,
 }
 
