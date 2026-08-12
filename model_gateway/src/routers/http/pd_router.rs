@@ -66,6 +66,27 @@ struct PDRequestContext<'a> {
     headers: Option<HeaderMap>,
 }
 
+/// PD worker-selection failure. Typed (not a bare `String`) so worker-filter
+/// exhaustion keeps its distinct client-facing error code (`workers_filtered`)
+/// through the selection helpers, consistent with the gRPC and HTTP-regular
+/// paths; ordinary unavailability keeps the historical
+/// `server_selection_failed` wrapping. Both are 503s.
+#[derive(Debug)]
+enum PdSelectionError {
+    Unavailable(String),
+    AllFiltered(String),
+}
+
+impl std::fmt::Display for PdSelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PdSelectionError::Unavailable(msg) | PdSelectionError::AllFiltered(msg) => {
+                f.write_str(msg)
+            }
+        }
+    }
+}
+
 impl PDRouter {
     async fn proxy_to_first_prefill_worker(
         &self,
@@ -172,12 +193,19 @@ impl PDRouter {
         })
     }
 
-    fn handle_server_selection_error(error: String) -> Response {
+    fn handle_server_selection_error(error: PdSelectionError) -> Response {
         error!("Failed to select PD pair error={}", error);
-        error::service_unavailable(
-            "server_selection_failed",
-            format!("No available servers: {error}"),
-        )
+        match error {
+            PdSelectionError::Unavailable(msg) => error::service_unavailable(
+                "server_selection_failed",
+                format!("No available servers: {msg}"),
+            ),
+            // Filter exhaustion keeps its distinct code, matching the gRPC
+            // and HTTP-regular paths: unavailability, not a selection bug.
+            PdSelectionError::AllFiltered(msg) => {
+                error::service_unavailable("workers_filtered", msg)
+            }
+        }
     }
 
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
@@ -810,7 +838,7 @@ impl PDRouter {
         request_text: Option<&str>,
         model_id: &str,
         headers: Option<&HeaderMap>,
-    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
+    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), PdSelectionError> {
         debug!("Selecting PD pair: model_id={:?}", model_id);
 
         let is_unknown_model = model_id == UNKNOWN_MODEL_ID;
@@ -904,11 +932,11 @@ impl PDRouter {
         hash_ring: Option<Arc<HashRing>>,
         worker_type: &str,
         leg: crate::policies::WorkerLeg,
-    ) -> Result<Arc<dyn Worker>, String> {
+    ) -> Result<Arc<dyn Worker>, PdSelectionError> {
         if workers.is_empty() {
-            return Err(format!(
+            return Err(PdSelectionError::Unavailable(format!(
                 "No {worker_type} workers available. Please check if {worker_type} servers are configured and healthy."
-            ));
+            )));
         }
 
         let available_workers: Vec<Arc<dyn Worker>> = workers
@@ -918,9 +946,9 @@ impl PDRouter {
             .collect();
 
         if available_workers.is_empty() {
-            return Err(format!(
+            return Err(PdSelectionError::Unavailable(format!(
                 "No available {worker_type} workers (all circuits open or unhealthy)"
-            ));
+            )));
         }
 
         let selected_idx = match self.policy_registry.select_worker(
@@ -936,16 +964,16 @@ impl PDRouter {
         ) {
             crate::policies::SelectionOutcome::Selected(idx) => idx,
             crate::policies::SelectionOutcome::NotSelected => {
-                return Err(format!(
+                return Err(PdSelectionError::Unavailable(format!(
                     "Policy {} failed to select a {} worker",
                     policy.name(),
                     worker_type
-                ));
+                )));
             }
             crate::policies::SelectionOutcome::AllFiltered => {
-                return Err(format!(
+                return Err(PdSelectionError::AllFiltered(format!(
                     "All candidate {worker_type} workers were excluded by request worker filters"
-                ));
+                )));
             }
         };
 
@@ -1747,7 +1775,10 @@ mod tests {
         let result = router.select_pd_pair(None, UNKNOWN_MODEL_ID, None).await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("No prefill workers available"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No prefill workers available"));
     }
 
     #[test]

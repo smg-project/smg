@@ -204,6 +204,7 @@ class RouterArgs:
     # Append new fields here to preserve positional callers.
     model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
     worker_startup_delay: int = 0
+    worker_filter_header: str | None = None
 
     @staticmethod
     def add_cli_args(
@@ -505,6 +506,17 @@ class RouterArgs:
             f"--{prefix}routing-key-override",
             action="store_true",
             help="Honor X-SMG-Routing-Key for sticky routing on any policy",
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-filter-header",
+            type=str,
+            default=None,
+            help=(
+                "Enable the label worker filter: name of the request header"
+                " carrying comma-separated key=value pairs a worker's labels"
+                " must all match (e.g. x-smg-worker-labels). Unset disables"
+                " filtering."
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}dp-minimum-tokens-scheduler",

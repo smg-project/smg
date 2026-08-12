@@ -495,6 +495,7 @@ struct Router {
     model_aliases: HashMap<String, String>,
     worker_startup_delay: u64,
     worker_ports_annotation: String,
+    worker_filter_header: Option<String>,
 }
 
 impl Router {
@@ -833,6 +834,7 @@ impl Router {
             .maybe_redis(redis_config)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
+            .worker_filter_header(self.worker_filter_header.clone())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .enable_wasm(self.enable_wasm)
@@ -989,6 +991,7 @@ impl Router {
         model_aliases = HashMap::new(),
         worker_startup_delay = 0,
         worker_ports_annotation = String::from("smg.ai/worker-ports"),
+        worker_filter_header = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1118,6 +1121,7 @@ impl Router {
         model_aliases: HashMap<String, String>,
         worker_startup_delay: u64,
         worker_ports_annotation: String,
+        worker_filter_header: Option<String>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1261,6 +1265,7 @@ impl Router {
             model_aliases,
             worker_startup_delay,
             worker_ports_annotation,
+            worker_filter_header,
         })
     }
 
