@@ -1073,10 +1073,73 @@ class TestPrefixHashArgs:
 
 
 class TestRouterArgsFieldOrder:
-    """New RouterArgs fields must be appended after the positional-reserve
-    marker (worker_startup_delay), never inserted mid-list: dataclasses
-    generate a positional __init__, so a mid-list insertion silently rebinds
-    every later positional argument."""
+    """RouterArgs generates a positional __init__, so field order is a public
+    contract: a mid-list insertion silently rebinds every later positional
+    argument. New fields must be APPENDED (after the reserve marker at
+    worker_startup_delay). The full-sequence snapshot below fails on any
+    reorder or insertion — when adding a field, append it both to the
+    dataclass tail and to the end of this list."""
+
+    EXPECTED_FIELD_SEQUENCE = [
+        "worker_urls", "host", "port", "health_check_port", "pd_disaggregation",
+        "epd_disaggregation", "encode_urls", "prefill_urls", "decode_urls",
+        "policy", "encode_policy", "prefill_policy", "decode_policy",
+        "worker_startup_timeout_secs", "worker_startup_check_interval",
+        "load_monitor_interval", "cache_threshold", "balance_abs_threshold",
+        "balance_rel_threshold", "balance_token_usage_threshold",
+        "overload_token_usage_threshold", "eviction_interval_secs",
+        "max_tree_size", "block_size", "least_load_kv_pressure_weight",
+        "least_load_default_throughput", "least_load_mean_prefill_tokens",
+        "max_idle_secs", "assignment_mode", "max_payload_size",
+        "bucket_adjust_interval_secs", "dp_aware", "multimodal_tensor_transport",
+        "multimodal_shm_min_bytes", "routing_key_override",
+        "dp_minimum_tokens_scheduler", "enable_igw", "api_key", "log_dir",
+        "log_level", "log_json", "service_discovery", "selector",
+        "service_discovery_port", "service_discovery_namespace",
+        "encode_selector", "prefill_selector", "decode_selector",
+        "router_selector", "bootstrap_port_annotation",
+        "worker_ports_annotation", "model_id_from", "prometheus_port",
+        "prometheus_host", "prometheus_duration_buckets", "request_id_headers",
+        "storage_context_headers", "request_timeout_secs",
+        "shutdown_grace_period_secs", "max_concurrent_requests", "queue_size",
+        "queue_timeout_secs", "rate_limit_tokens_per_second",
+        "cors_allowed_origins", "retry_max_retries", "retry_initial_backoff_ms",
+        "retry_max_backoff_ms", "retry_backoff_multiplier",
+        "retry_jitter_factor", "disable_retries", "health_failure_threshold",
+        "health_success_threshold", "health_check_timeout_secs",
+        "health_check_interval_secs", "health_check_endpoint",
+        "disable_health_check", "remove_unhealthy_workers",
+        "cb_failure_threshold", "cb_success_threshold",
+        "cb_timeout_duration_secs", "cb_window_duration_secs",
+        "disable_circuit_breaker", "model_path", "tokenizer_path",
+        "chat_template", "disable_tokenizer_autoload",
+        "tokenizer_cache_enable_l0", "tokenizer_cache_l0_max_entries",
+        "tokenizer_cache_enable_l1", "tokenizer_cache_l1_max_memory",
+        "reasoning_parser", "tool_call_parser", "mcp_config_path", "backend",
+        "enable_wasm", "storage_hook_wasm_path", "history_backend",
+        "oracle_wallet_path", "oracle_tns_alias", "oracle_connect_descriptor",
+        "oracle_username", "oracle_password", "oracle_external_auth",
+        "oracle_pool_min", "oracle_pool_max", "oracle_pool_timeout_secs",
+        "postgres_db_url", "postgres_pool_max", "redis_url", "redis_pool_max",
+        "redis_retention_days", "schema_config", "client_cert_path",
+        "client_key_path", "ca_cert_paths", "server_cert_path",
+        "server_key_path", "enable_trace", "otlp_traces_endpoint",
+        "control_plane_api_keys", "control_plane_audit_enabled", "jwt_issuer",
+        "jwt_audience", "jwt_jwks_uri", "jwt_role_mapping", "enable_mesh",
+        "mesh_server_name", "mesh_host", "mesh_advertise_host", "mesh_port",
+        "mesh_peer_urls", "model_aliases", "worker_startup_delay",
+        "overlap_decay", "selection_temperature",
+    ]
+
+    def test_complete_field_sequence_is_frozen(self):
+        import dataclasses
+
+        names = [f.name for f in dataclasses.fields(RouterArgs)]
+        assert names == self.EXPECTED_FIELD_SEQUENCE, (
+            "RouterArgs field order changed. Positional callers bind by "
+            "position: fields may only be APPENDED at the tail (and to "
+            "EXPECTED_FIELD_SEQUENCE), never inserted or reordered."
+        )
 
     def test_new_fields_appended_after_positional_reserve(self):
         import dataclasses
@@ -1088,12 +1151,3 @@ class TestRouterArgsFieldOrder:
                 f"{appended} must be appended after worker_startup_delay to "
                 "preserve positional callers"
             )
-
-    def test_pre_existing_positional_bindings_unchanged(self):
-        import dataclasses
-
-        names = [f.name for f in dataclasses.fields(RouterArgs)]
-        # Sentinel ordering that a mid-list insertion would have shifted.
-        assert names.index("overload_token_usage_threshold") + 1 == names.index(
-            "eviction_interval_secs"
-        )
