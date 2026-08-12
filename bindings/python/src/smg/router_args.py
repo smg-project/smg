@@ -61,8 +61,6 @@ class RouterArgs:
     balance_rel_threshold: float = 1.5
     balance_token_usage_threshold: float = 1.0
     overload_token_usage_threshold: float = 1.0
-    overlap_decay: float = 0.0
-    selection_temperature: float = 0.0
     eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
     block_size: int = 16
@@ -212,6 +210,8 @@ class RouterArgs:
     prefix_hash_load_factor: float = 1.25
     prefix_hash_balance_abs_threshold: int = 10
     upstream_http2: bool = False
+    overlap_decay: float = 0.0
+    selection_temperature: float = 0.0
 
     @staticmethod
     def add_cli_args(

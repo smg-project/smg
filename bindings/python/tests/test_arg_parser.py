@@ -1070,3 +1070,30 @@ class TestPrefixHashArgs:
         router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
         assert router_args.prefix_token_count == 8192
         assert router_args.prefix_hash_load_factor == 2.0
+
+
+class TestRouterArgsFieldOrder:
+    """New RouterArgs fields must be appended after the positional-reserve
+    marker (worker_startup_delay), never inserted mid-list: dataclasses
+    generate a positional __init__, so a mid-list insertion silently rebinds
+    every later positional argument."""
+
+    def test_new_fields_appended_after_positional_reserve(self):
+        import dataclasses
+
+        names = [f.name for f in dataclasses.fields(RouterArgs)]
+        marker = names.index("worker_startup_delay")
+        for appended in ("overlap_decay", "selection_temperature"):
+            assert names.index(appended) > marker, (
+                f"{appended} must be appended after worker_startup_delay to "
+                "preserve positional callers"
+            )
+
+    def test_pre_existing_positional_bindings_unchanged(self):
+        import dataclasses
+
+        names = [f.name for f in dataclasses.fields(RouterArgs)]
+        # Sentinel ordering that a mid-list insertion would have shifted.
+        assert names.index("overload_token_usage_threshold") + 1 == names.index(
+            "eviction_interval_secs"
+        )
