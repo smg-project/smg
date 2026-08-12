@@ -2024,6 +2024,26 @@ impl ProtoStream {
             Self::Zmq(stream) => stream.mark_completed(),
         }
     }
+
+    /// Defer the abort-on-drop until the stream yields its first response.
+    ///
+    /// Used for the disaggregated decode leg: aborting a decode request while
+    /// it is still receiving the KV handoff from its prefill peer can tear
+    /// down the transfer mid-write; the first response proves the handoff
+    /// completed, after which the (deferred) abort is safe. No-op for ZMQ
+    /// streams — the ZMQ adapter owns its own lifecycle and the ZMQ lane does
+    /// not serve disaggregated requests.
+    #[must_use]
+    pub fn defer_abort_until_first_item(self) -> Self {
+        match self {
+            Self::Sglang(stream) => Self::Sglang(stream.defer_abort_until_first_item()),
+            Self::Vllm(stream) => Self::Vllm(stream.defer_abort_until_first_item()),
+            Self::Trtllm(stream) => Self::Trtllm(stream.defer_abort_until_first_item()),
+            Self::Mlx(stream) => Self::Mlx(stream.defer_abort_until_first_item()),
+            Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_until_first_item()),
+            Self::Zmq(stream) => Self::Zmq(stream),
+        }
+    }
 }
 
 /// Unified EmbedRequest that works with all backends
