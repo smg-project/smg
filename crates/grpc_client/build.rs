@@ -7,6 +7,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/vllm_engine.proto");
     println!("cargo:rerun-if-changed=proto/trtllm_service.proto");
     println!("cargo:rerun-if-changed=proto/mlx_engine.proto");
+    println!("cargo:rerun-if-changed=proto/vllm_native/inference.proto");
+    println!("cargo:rerun-if-changed=proto/vllm_native/control.proto");
 
     // Pass 1: compile shared message types (no gRPC service generation)
     tonic_prost_build::configure()
@@ -61,6 +63,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/tokenspeed_scheduler.proto",
             ],
             &["proto"],
+        )?;
+
+    // Pass 4: vLLM's first-party gRPC services (vendored from upstream, see
+    // proto/vllm_native/README.md). Compiled separately: the `vllm` package
+    // is unrelated to our own `vllm.grpc.engine` protocol above.
+    tonic_prost_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .protoc_arg("--experimental_allow_proto3_optional")
+        .compile_protos(
+            &[
+                "proto/vllm_native/inference.proto",
+                "proto/vllm_native/control.proto",
+            ],
+            &["proto/vllm_native"],
         )?;
 
     Ok(())
