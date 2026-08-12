@@ -33,6 +33,7 @@ use super::{
     multimodal::MultimodalComponents,
     pipeline::{Endpoint, PipelineDeps, RequestPipeline},
     regular::responses,
+    utils::ParserResolver,
 };
 use crate::{
     app_context::AppContext,
@@ -354,8 +355,11 @@ impl GrpcRouter {
             worker_registry: worker_registry.clone(),
             tool_parser_factory: tool_parser_factory.clone(),
             reasoning_parser_factory: reasoning_parser_factory.clone(),
-            configured_tool_parser: ctx.configured_tool_parser.clone(),
-            configured_reasoning_parser: ctx.configured_reasoning_parser.clone(),
+            parser_resolver: ParserResolver::new(
+                worker_registry.clone(),
+                ctx.configured_tool_parser.clone(),
+                ctx.configured_reasoning_parser.clone(),
+            ),
             multimodal,
         });
 

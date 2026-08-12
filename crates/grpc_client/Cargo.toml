@@ -43,6 +43,8 @@ prost-build = "0.14.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Mock-server harness for the abort-on-drop behavioral tests.
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [lints]
 workspace = true

@@ -51,7 +51,7 @@ use super::{
     config::{BuiltinToolType, McpConfig, McpProxyConfig, McpServerConfig, McpTransport},
     handler::{HandlerRequestContext, RefreshRequest, SmgClientHandler},
     metrics::McpMetrics,
-    pool::{McpConnectionPool, PoolKey},
+    pool::{McpConnectionPool, PoolKey, UrlLookup},
     reconnect::ReconnectionManager,
 };
 use crate::{
@@ -1153,15 +1153,32 @@ impl McpOrchestrator {
             });
         }
 
-        if let Some(client) = self.connection_pool.get_by_url(server_key) {
-            return client.call_tool(request).await.map_err(|e| match e {
-                ServiceError::TransportClosed | ServiceError::TransportSend(_) => {
-                    // Note: Pooled connections trigger Disconnected but
-                    // recovery logic is currently scoped to static servers.
-                    McpError::ServerDisconnected(server_key.to_string())
-                }
-                _ => McpError::ToolExecution(format!("MCP call failed: {e}")),
-            });
+        match self.connection_pool.get_unique_by_url(server_key) {
+            UrlLookup::Found(client) => {
+                return client.call_tool(request).await.map_err(|e| match e {
+                    ServiceError::TransportClosed | ServiceError::TransportSend(_) => {
+                        // Note: Pooled connections trigger Disconnected but
+                        // recovery logic is currently scoped to static servers.
+                        McpError::ServerDisconnected(server_key.to_string())
+                    }
+                    _ => McpError::ToolExecution(format!("MCP call failed: {e}")),
+                });
+            }
+            UrlLookup::Ambiguous => {
+                // Multiple pooled connections share this URL under different
+                // credentials/tenants. Picking one would run the call over
+                // another caller's authenticated connection, so fail closed.
+                warn!(
+                    "Refusing tool execution on '{}': multiple pooled connections share this \
+                     URL with different credentials/tenants; cannot select one safely",
+                    server_key
+                );
+                return Err(McpError::ServerAccessDenied(format!(
+                    "ambiguous MCP connection for '{server_key}': multiple credentials or \
+                     tenants are pooled for this URL"
+                )));
+            }
+            UrlLookup::NotFound => {}
         }
 
         Err(McpError::ServerNotFound(server_key.to_string()))

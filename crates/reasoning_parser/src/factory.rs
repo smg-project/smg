@@ -230,6 +230,10 @@ impl ParserFactory {
         registry.register_pattern("nemotron-nano", "nano_v3");
         registry.register_pattern("nemotron-super", "nano_v3");
         registry.register_pattern("nano-v3", "nano_v3");
+        // Generation-qualified names (Nemotron-3-Super, Nemotron-3.5-Lightning)
+        // contain neither "nemotron-nano" nor "nemotron-super" — the `-3`/`-3.5`
+        // infix breaks the substring — so match the generation prefix directly.
+        registry.register_pattern("nemotron-3", "nano_v3");
 
         // Inkling checkpoints use the model-family name in their ID or config.
         registry.register_pattern("inkling", "inkling");
@@ -393,6 +397,14 @@ mod tests {
 
         let nemotron_nano = factory.create("nemotron-nano-4b");
         assert_eq!(nemotron_nano.model_type(), "nano_v3");
+
+        // Generation-qualified names: the -3/-3.5 infix breaks the
+        // nemotron-nano/nemotron-super substrings, so they match via the
+        // generation prefix instead.
+        let lightning = factory.create("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4");
+        assert_eq!(lightning.model_type(), "nano_v3");
+        let super_3 = factory.create("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8");
+        assert_eq!(super_3.model_type(), "nano_v3");
 
         let nemotron_super = factory.create("NVIDIA-Nemotron/nemotron-super");
         assert_eq!(nemotron_super.model_type(), "nano_v3");

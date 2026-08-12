@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use openai_protocol::chat::ChatCompletionRequest;
 use serde_json::to_value;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
     context::{ComponentRefs, PayloadState, RequestContext, SharedComponents, WorkerSelection},
@@ -26,6 +26,7 @@ use crate::{
         common::{
             header_utils::{apply_provider_headers, extract_auth_header},
             retry::{is_retryable_status, RetryExecutor},
+            sse::SSE_CHANNEL_BUFFER,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error,
@@ -193,26 +194,26 @@ pub(super) async fn route_chat(
 
                 if is_streaming {
                     let stream = resp.bytes_stream();
-                    let (tx, rx) = mpsc::unbounded_channel();
+                    let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
                     #[expect(clippy::disallowed_methods, reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding")]
                     tokio::spawn(async move {
                         let mut s = stream;
                         while let Some(chunk) = s.next().await {
                             match chunk {
                                 Ok(bytes) => {
-                                    if tx.send(Ok(bytes)).is_err() {
+                                    if tx.send(Ok(bytes)).await.is_err() {
                                         break;
                                     }
                                 }
                                 Err(e) => {
-                                    let _ = tx.send(Err(format!("Stream error: {e}")));
+                                    let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                                     break;
                                 }
                             }
                         }
                     });
                     let mut response =
-                        Response::new(Body::from_stream(UnboundedReceiverStream::new(rx)));
+                        Response::new(Body::from_stream(ReceiverStream::new(rx)));
                     *response.status_mut() = status;
                     response
                         .headers_mut()

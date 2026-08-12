@@ -22,7 +22,7 @@ pub(crate) use logprobs::{
 pub(crate) use metrics::{error_type_from_status, route_to_endpoint};
 pub(crate) use parsers::{
     check_reasoning_parser_availability, check_tool_parser_availability, create_reasoning_parser,
-    create_tool_parser, get_tool_parser, reasoning_parser_requires_special_tokens,
+    create_tool_parser, get_tool_parser, reasoning_parser_requires_special_tokens, ParserResolver,
 };
 // `pub` (not `pub(crate)`) so the Go bindings can reuse the gateway's reasoning
 // detection instead of duplicating it.

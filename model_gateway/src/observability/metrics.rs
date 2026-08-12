@@ -38,6 +38,54 @@ pub(crate) fn interner_size() -> usize {
     STRING_INTERNER.len()
 }
 
+/// Sentinel substituted once a bounded interner reaches its cap, so a flood of
+/// client-controlled label values (model IDs, MCP tool names) cannot mint an
+/// unbounded number of interner entries or Prometheus series.
+const BOUNDED_LABEL_SENTINEL: &str = "other";
+
+/// Max distinct client-supplied model labels retained before collapsing to the
+/// sentinel. A gateway fronts far fewer real models than this; the cap only bites
+/// on adversarial or unvalidated input.
+const MAX_MODEL_LABELS: usize = 1024;
+
+/// Max distinct client/model-controlled MCP tool-name labels.
+const MAX_TOOL_LABELS: usize = 1024;
+
+static MODEL_LABELS: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
+static TOOL_LABELS: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
+static BOUNDED_LABEL_SENTINEL_ARC: Lazy<Arc<str>> = Lazy::new(|| Arc::from(BOUNDED_LABEL_SENTINEL));
+
+/// Intern a client-controlled label with a hard cardinality cap.
+///
+/// Distinct values beyond `cap` collapse to a shared sentinel, so untrusted input
+/// (client-supplied model names, model-generated tool names) cannot grow the
+/// interner — or the metric's Prometheus series set — without bound. Unlike an LRU,
+/// admitted values are never evicted and re-admitted, which would keep minting new
+/// series in the recorder even as the map churned.
+fn intern_bounded_label(map: &DashMap<String, Arc<str>>, cap: usize, s: &str) -> Arc<str> {
+    if let Some(entry) = map.get(s) {
+        return Arc::clone(entry.value());
+    }
+    // Best-effort cap; a small concurrent overshoot is harmless.
+    if map.len() >= cap {
+        return Arc::clone(&BOUNDED_LABEL_SENTINEL_ARC);
+    }
+    map.entry(s.to_string())
+        .or_insert_with(|| Arc::from(s))
+        .clone()
+}
+
+/// Intern a client-supplied model label, bounded by [`MAX_MODEL_LABELS`].
+fn intern_model_label(model_id: &str) -> Arc<str> {
+    intern_bounded_label(&MODEL_LABELS, MAX_MODEL_LABELS, model_id)
+}
+
+/// Intern a client/model-controlled MCP tool-name label, bounded by
+/// [`MAX_TOOL_LABELS`].
+fn intern_tool_label(tool_name: &str) -> Arc<str> {
+    intern_bounded_label(&TOOL_LABELS, MAX_TOOL_LABELS, tool_name)
+}
+
 // =============================================================================
 // STATIC STRING CONSTANTS
 // =============================================================================
@@ -676,7 +724,7 @@ impl Metrics {
         endpoint: &'static str,
         streaming: &'static str,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         counter!(
             "smg_router_requests_total",
             "router_type" => router_type,
@@ -699,7 +747,7 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         histogram!(
             "smg_router_request_duration_seconds",
             "router_type" => router_type,
@@ -721,7 +769,7 @@ impl Metrics {
         endpoint: &'static str,
         error_type: &'static str,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         counter!(
             "smg_router_request_errors_total",
             "router_type" => router_type,
@@ -780,7 +828,7 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         histogram!(
             "smg_router_ttft_seconds",
             "router_type" => router_type,
@@ -799,7 +847,7 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         histogram!(
             "smg_router_tpot_seconds",
             "router_type" => router_type,
@@ -819,7 +867,7 @@ impl Metrics {
         token_type: &'static str,
         count: u64,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         counter!(
             "smg_router_tokens_total",
             "router_type" => router_type,
@@ -840,7 +888,7 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         histogram!(
             "smg_router_generation_duration_seconds",
             "router_type" => router_type,
@@ -868,7 +916,7 @@ impl Metrics {
         } = params;
 
         // Intern model string once - Arc::clone is just a ref count increment
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
 
         // TTFT and TPOT (only if we have a first token time)
         if let Some(ttft_duration) = ttft {
@@ -948,7 +996,7 @@ impl Metrics {
         runtime: &'static str,
         duration: Duration,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         histogram!(
             "smg_pd_prefill_duration_seconds",
             "backend_type" => backend_type,
@@ -966,7 +1014,7 @@ impl Metrics {
         runtime: &'static str,
         duration: Duration,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         histogram!(
             "smg_pd_kv_transfer_duration_seconds",
             "backend_type" => backend_type,
@@ -989,7 +1037,7 @@ impl Metrics {
         runtime: &'static str,
         duration: Duration,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         histogram!(
             "smg_pd_ttft_seconds",
             "backend_type" => backend_type,
@@ -1029,7 +1077,7 @@ impl Metrics {
         model_id: &str,
         size: usize,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         gauge!(
             "smg_worker_pool_size",
             "worker_type" => worker_type,
@@ -1070,7 +1118,7 @@ impl Metrics {
         model_id: &str,
         policy: &'static str,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         counter!(
             "smg_worker_selection_total",
             "worker_type" => worker_type,
@@ -1316,8 +1364,8 @@ impl Metrics {
 
     /// Record MCP tool call
     pub fn record_mcp_tool_call(model_id: &str, tool_name: &str, result: &'static str) {
-        let model = intern_string(model_id);
-        let tool = intern_string(tool_name);
+        let model = intern_model_label(model_id);
+        let tool = intern_tool_label(tool_name);
         counter!(
             "smg_mcp_tool_calls_total",
             "model" => model,
@@ -1329,8 +1377,8 @@ impl Metrics {
 
     /// Record MCP tool execution duration
     pub fn record_mcp_tool_duration(model_id: &str, tool_name: &str, duration: Duration) {
-        let model = intern_string(model_id);
-        let tool = intern_string(tool_name);
+        let model = intern_model_label(model_id);
+        let tool = intern_tool_label(tool_name);
         histogram!(
             "smg_mcp_tool_duration_seconds",
             "model" => model,
@@ -1346,7 +1394,7 @@ impl Metrics {
 
     /// Record MCP tool loop iteration
     pub fn record_mcp_tool_iteration(model_id: &str) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         counter!(
             "smg_mcp_tool_iterations_total",
             "model" => model
@@ -1420,7 +1468,7 @@ impl Metrics {
         response: &openai_protocol::worker::WorkerLoadResponse,
     ) {
         let worker = intern_string(worker_url);
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
 
         for load in &response.loads {
             let dp_rank = intern_string(&load.dp_rank.to_string());
@@ -1535,7 +1583,7 @@ impl Metrics {
     /// `dp_rank`) or a fresh series is created instead of overwriting the live one.
     pub fn remove_engine_load_metrics(worker_url: &str, model_id: &str, dp_size: usize) {
         let worker = intern_string(worker_url);
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
 
         for rank in 0..dp_size.max(1) {
             let dp_rank = intern_string(&rank.to_string());
@@ -1585,6 +1633,31 @@ mod tests {
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 
     use super::*;
+
+    #[test]
+    fn intern_bounded_label_caps_cardinality_with_sentinel() {
+        let map: DashMap<String, Arc<str>> = DashMap::new();
+
+        let a = intern_bounded_label(&map, 2, "m1");
+        let b = intern_bounded_label(&map, 2, "m2");
+        assert_eq!(map.len(), 2);
+
+        // Repeats return the same interned Arc without growing the map.
+        let a2 = intern_bounded_label(&map, 2, "m1");
+        assert!(Arc::ptr_eq(&a, &a2));
+        assert_eq!(map.len(), 2);
+
+        // A distinct value past the cap collapses to the sentinel and does not
+        // grow the map, so no new Prometheus series is minted for it.
+        let c = intern_bounded_label(&map, 2, "m3");
+        assert_eq!(&*c, BOUNDED_LABEL_SENTINEL);
+        assert_eq!(map.len(), 2);
+
+        // Already-admitted values still resolve normally after the cap is hit.
+        let b2 = intern_bounded_label(&map, 2, "m2");
+        assert!(Arc::ptr_eq(&b, &b2));
+        assert_ne!(&*a, BOUNDED_LABEL_SENTINEL);
+    }
 
     /// Run `f` under a thread-local Prometheus recorder and return the
     /// rendered `/metrics` text — the same scrape output the :29000 endpoint

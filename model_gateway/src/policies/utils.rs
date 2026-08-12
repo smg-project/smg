@@ -64,6 +64,18 @@ impl Drop for PeriodicTask {
         self.shutdown_flag.store(true, Ordering::Relaxed);
 
         if let Some(handle) = self.handle.take() {
+            // A task closure that (transitively) owns its own PeriodicTask —
+            // e.g. by holding the last Arc to the struct storing it — would
+            // run this drop on the task's own thread; joining would deadlock
+            // (or error) on self-join. Detach instead: the shutdown flag is
+            // already set, so the thread exits right after this drop returns.
+            if handle.thread().id() == thread::current().id() {
+                debug!(
+                    "{} dropped from its own thread; detaching instead of self-joining",
+                    self.debug_name
+                );
+                return;
+            }
             match handle.join() {
                 Ok(()) => debug!("{} thread shut down cleanly", self.debug_name),
                 Err(_) => debug!("{} thread panicked during shutdown", self.debug_name),

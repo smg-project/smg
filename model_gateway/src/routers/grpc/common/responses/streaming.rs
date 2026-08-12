@@ -16,13 +16,15 @@ use openai_protocol::{
 };
 use serde_json::json;
 use smg_mcp::{self as mcp};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::routers::{
-    common::openai_bridge::{self, descriptor, ResponseFormat},
+    common::{
+        openai_bridge::{self, descriptor, ResponseFormat},
+        sse::{SseReceiver, SseSender},
+    },
     grpc::harmony::responses::ToolResult,
 };
 
@@ -718,9 +720,9 @@ impl ResponseStreamEventEmitter {
     ///
     /// Reasoning items in OpenAI format are simple placeholders emitted between tool iterations.
     /// They don't have streaming content - just wrapper events with empty/null content.
-    pub fn emit_reasoning_item(
+    pub async fn emit_reasoning_item(
         &mut self,
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+        tx: &SseSender,
         reasoning_content: Option<String>,
     ) -> Result<(), String> {
         // Allocate output index and generate ID
@@ -738,11 +740,11 @@ impl ResponseStreamEventEmitter {
 
         // Emit output_item.added
         let added_event = self.emit_output_item_added(output_index, &item);
-        self.send_event(&added_event, tx)?;
+        self.send_event(&added_event, tx).await?;
 
         // Immediately emit output_item.done (no streaming for reasoning)
         let done_event = self.emit_output_item_done(output_index, &item);
-        self.send_event(&done_event, tx)?;
+        self.send_event(&done_event, tx).await?;
 
         // Mark as completed
         self.complete_output_item(output_index);
@@ -751,10 +753,10 @@ impl ResponseStreamEventEmitter {
     }
 
     /// Process a chunk and emit appropriate events
-    pub fn process_chunk(
+    pub async fn process_chunk(
         &mut self,
         chunk: &ChatCompletionStreamResponse,
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+        tx: &SseSender,
     ) -> Result<(), String> {
         // Process content if present
         if let Some(choice) = chunk.choices.first() {
@@ -775,7 +777,7 @@ impl ResponseStreamEventEmitter {
 
                         // Emit output_item.added
                         let event = self.emit_output_item_added(output_index, &item);
-                        self.send_event(&event, tx)?;
+                        self.send_event(&event, tx).await?;
                         self.has_emitted_output_item_added = true;
 
                         // Store for subsequent events
@@ -795,14 +797,14 @@ impl ResponseStreamEventEmitter {
                         if !self.has_emitted_content_part_added {
                             let event =
                                 self.emit_content_part_added(output_index, &item_id, content_index);
-                            self.send_event(&event, tx)?;
+                            self.send_event(&event, tx).await?;
                             self.has_emitted_content_part_added = true;
                         }
 
                         // Emit text delta
                         let event =
                             self.emit_text_delta(content, output_index, &item_id, content_index);
-                        self.send_event(&event, tx)?;
+                        self.send_event(&event, tx).await?;
                     }
                 }
             }
@@ -819,10 +821,10 @@ impl ResponseStreamEventEmitter {
                         // Emit closing events
                         if self.has_emitted_content_part_added {
                             let event = self.emit_text_done(output_index, &item_id, content_index);
-                            self.send_event(&event, tx)?;
+                            self.send_event(&event, tx).await?;
                             let event =
                                 self.emit_content_part_done(output_index, &item_id, content_index);
-                            self.send_event(&event, tx)?;
+                            self.send_event(&event, tx).await?;
                         }
 
                         if self.has_emitted_output_item_added {
@@ -837,7 +839,7 @@ impl ResponseStreamEventEmitter {
                                 }]
                             });
                             let event = self.emit_output_item_done(output_index, &item);
-                            self.send_event(&event, tx)?;
+                            self.send_event(&event, tx).await?;
                         }
 
                         // Mark item as completed
@@ -850,14 +852,10 @@ impl ResponseStreamEventEmitter {
         Ok(())
     }
 
-    #[expect(
-        clippy::unused_self,
-        reason = "method on emitter for API consistency with send_event_best_effort"
-    )]
-    pub fn send_event(
+    pub async fn send_event(
         &self,
         event: &serde_json::Value,
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+        tx: &SseSender,
     ) -> Result<(), String> {
         let event_json =
             serde_json::to_string(event).map_err(|e| format!("Failed to serialize event: {e}"))?;
@@ -871,7 +869,7 @@ impl ResponseStreamEventEmitter {
         // Format as SSE with event: field
         let sse_message = format!("event: {event_type}\ndata: {event_json}\n\n");
 
-        if tx.send(Ok(Bytes::from(sse_message))).is_err() {
+        if tx.send(Ok(Bytes::from(sse_message))).await.is_err() {
             return Err("Client disconnected".to_string());
         }
 
@@ -883,12 +881,8 @@ impl ResponseStreamEventEmitter {
     /// This is a convenience method for streaming scenarios where client
     /// disconnection is expected and should be logged but not fail the operation.
     /// Returns true if sent successfully, false if client disconnected.
-    pub fn send_event_best_effort(
-        &self,
-        event: &serde_json::Value,
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
-    ) -> bool {
-        match self.send_event(event, tx) {
+    pub async fn send_event_best_effort(&self, event: &serde_json::Value, tx: &SseSender) -> bool {
+        match self.send_event(event, tx).await {
             Ok(()) => true,
             Err(e) => {
                 tracing::debug!("Failed to send event (likely client disconnect): {}", e);
@@ -902,12 +896,7 @@ impl ResponseStreamEventEmitter {
     /// Creates and sends an error event with the given error message.
     /// Uses OpenAI's error event format.
     /// Use this for terminal errors that should abort the streaming response.
-    pub fn emit_error(
-        &mut self,
-        error_msg: &str,
-        error_code: Option<&str>,
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
-    ) {
+    pub async fn emit_error(&mut self, error_msg: &str, error_code: Option<&str>, tx: &SseSender) {
         let event = json!({
             "type": "error",
             "code": error_code.unwrap_or("internal_error"),
@@ -919,7 +908,7 @@ impl ResponseStreamEventEmitter {
             Ok(json) => format!("data: {json}\n\n"),
             Err(_) => "data: {\"type\":\"error\",\"code\":\"internal_error\",\"message\":\"serialization failed\",\"param\":null}\n\n".to_string(),
         };
-        let _ = tx.send(Ok(Bytes::from(sse_data)));
+        let _ = tx.send(Ok(Bytes::from(sse_data))).await;
     }
 
     /// Emit the full mcp_list_tools output-item sequence.
@@ -930,11 +919,11 @@ impl ResponseStreamEventEmitter {
     ///
     /// `server_label` is taken as an explicit parameter so callers can iterate
     /// over multiple MCP servers without mutating the emitter's own label.
-    pub fn emit_mcp_list_tools_sequence(
+    pub async fn emit_mcp_list_tools_sequence(
         &mut self,
         server_label: &str,
         tools: &[mcp::ToolEntry],
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+        tx: &SseSender,
     ) -> Result<(), String> {
         let (output_index, item_id) = self.allocate_output_index(OutputItemKind::McpListTools);
 
@@ -955,15 +944,15 @@ impl ResponseStreamEventEmitter {
 
         // Emit output_item.added
         let event = self.emit_output_item_added(output_index, &item_in_progress);
-        self.send_event(&event, tx)?;
+        self.send_event(&event, tx).await?;
 
         // Emit mcp_list_tools.in_progress
         let event = self.emit_mcp_list_tools_in_progress(output_index);
-        self.send_event(&event, tx)?;
+        self.send_event(&event, tx).await?;
 
         // Emit mcp_list_tools.completed
         let event = self.emit_mcp_list_tools_completed(output_index, &tool_items);
-        self.send_event(&event, tx)?;
+        self.send_event(&event, tx).await?;
 
         // Completed item (with tools populated)
         let item_done = json!({
@@ -976,7 +965,7 @@ impl ResponseStreamEventEmitter {
 
         // Emit output_item.done (also stores item data internally)
         let event = self.emit_output_item_done(output_index, &item_done);
-        self.send_event(&event, tx)?;
+        self.send_event(&event, tx).await?;
 
         self.complete_output_item(output_index);
 
@@ -991,10 +980,8 @@ impl ResponseStreamEventEmitter {
     clippy::expect_used,
     reason = "Response::builder with static headers and valid status code is infallible"
 )]
-pub(crate) fn build_sse_response(
-    rx: mpsc::UnboundedReceiver<Result<Bytes, std::io::Error>>,
-) -> Response {
-    let stream = UnboundedReceiverStream::new(rx);
+pub(crate) fn build_sse_response(rx: SseReceiver) -> Response {
+    let stream = ReceiverStream::new(rx);
     Response::builder()
         .status(StatusCode::OK)
         .header(
