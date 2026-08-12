@@ -882,6 +882,8 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         }));
     }
 
@@ -900,6 +902,8 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         };
 
         let mut config = config_with_policy(PolicyConfig::Random);

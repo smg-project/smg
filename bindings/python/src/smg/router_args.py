@@ -61,6 +61,8 @@ class RouterArgs:
     balance_rel_threshold: float = 1.5
     balance_token_usage_threshold: float = 1.0
     overload_token_usage_threshold: float = 1.0
+    overlap_decay: float = 0.0
+    selection_temperature: float = 0.0
     eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
     block_size: int = 16
@@ -488,6 +490,28 @@ class RouterArgs:
                 " exceeds it, shed load off that engine regardless of spread. A safety"
                 " valve for critically-saturated engines, best set high (e.g. 0.9)."
                 " Backend must report token_usage. Defaults to 1.0 (disabled)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}overlap-decay",
+            type=float,
+            default=RouterArgs.overlap_decay,
+            help=(
+                "Cache-aware anti-hotspot decay: divide each candidate's overlap"
+                " score by 1 + overlap_decay * x, where x is the worker's"
+                " waiting-prefill backlog (blocks above the candidate minimum) per"
+                " request block. Requires backend load reporting. Defaults to 0.0"
+                " (disabled)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}selection-temperature",
+            type=float,
+            default=RouterArgs.selection_temperature,
+            help=(
+                "Cache-aware softmax temperature over min-max normalized scores for"
+                " event-driven selection. 0.0 is exact argmax; larger values spread"
+                " picks across candidates. Defaults to 0.0."
             ),
         )
         routing_group.add_argument(

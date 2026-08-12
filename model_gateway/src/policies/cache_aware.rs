@@ -910,6 +910,25 @@ impl TreeHandle for CacheAwarePolicy {
     }
 }
 
+/// One positive-overlap candidate in event-driven scoring: slice index,
+/// (possibly decayed) score, and the in-flight-count tie-break key.
+struct OverlapCandidate {
+    idx: usize,
+    effective_score: f64,
+    load: usize,
+}
+
+/// Pressure-tuning inputs for [`CacheAwarePolicy::score_overlap`]: the two
+/// config knobs plus a waiting-prefill backlog snapshot (worker URL → queued
+/// uncached tokens, clamped non-negative) captured from the load receiver at
+/// selection time. `waiting_prefill_tokens` is `None` when decay is off or no
+/// load receiver is wired; workers absent from the map are never decayed.
+struct OverlapTuning<'a> {
+    overlap_decay: f32,
+    selection_temperature: f32,
+    waiting_prefill_tokens: Option<&'a HashMap<String, i64>>,
+}
+
 impl LoadBalancingPolicy for CacheAwarePolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
         let request_text = info.request_text;
@@ -1049,9 +1068,33 @@ impl CacheAwarePolicy {
             .block_size(model_id)
             .unwrap_or(self.config.block_size);
 
-        if let Some(idx) =
-            Self::score_overlap(workers, tokens, healthy_indices, &indexer, block_size)
-        {
+        // Snapshot the waiting-prefill backlog only when decay is on: the
+        // clone is per-selection, and with decay off the map is never read.
+        let waiting_prefill_tokens = if self.config.overlap_decay > 0.0 {
+            let guard = self.load_rx.read();
+            guard.as_ref().map(|rx| {
+                rx.borrow()
+                    .iter()
+                    .map(|(url, load)| (url.clone(), load.total_waiting_uncached_tokens().max(0)))
+                    .collect::<HashMap<String, i64>>()
+            })
+        } else {
+            None
+        };
+        let tuning = OverlapTuning {
+            overlap_decay: self.config.overlap_decay,
+            selection_temperature: self.config.selection_temperature,
+            waiting_prefill_tokens: waiting_prefill_tokens.as_ref(),
+        };
+
+        if let Some(idx) = Self::score_overlap(
+            workers,
+            tokens,
+            healthy_indices,
+            &indexer,
+            block_size,
+            &tuning,
+        ) {
             return Some(idx);
         }
 
@@ -1070,12 +1113,17 @@ impl CacheAwarePolicy {
     /// Returns `Some(idx)` if at least one worker has cached blocks matching the
     /// request. Returns `None` if the request is too short for a full block or
     /// no workers have matching data.
+    ///
+    /// With default tuning (decay 0, temperature 0) selection is exactly the
+    /// historical behavior: max raw overlap, then lower load, then uniformly
+    /// at random among exact ties.
     fn score_overlap(
         workers: &[Arc<dyn Worker>],
         tokens: &[u32],
         healthy_indices: &[usize],
         indexer: &PositionalIndexer,
         block_size: usize,
+        tuning: &OverlapTuning<'_>,
     ) -> Option<usize> {
         let content_hashes = compute_request_content_hashes(tokens, block_size);
         if content_hashes.is_empty() {
@@ -1087,18 +1135,9 @@ impl CacheAwarePolicy {
             return None;
         }
 
-        // Select worker with best overlap among those that actually match.
-        // Tie-break: lower load, then UNIFORMLY AT RANDOM. The previous final
-        // key (smaller total tree size, then slice order) was a spreading
-        // proxy but deterministic: equal-overlap equal-load workers herd onto
-        // one index until the global tree-size ordering flips. Tree size is a
-        // per-worker aggregate unrelated to this request's placement, and it
-        // tracks event-stream health — an event-lagged worker looks "small"
-        // and attracts the whole tie. Uniform random gives the same spreading
-        // goal memorylessly; the next request's overlap scores restore
-        // affinity to whichever worker actually cached the prefix.
-        let mut best: Option<(u32, usize)> = None;
-        let mut tied: Vec<usize> = Vec::new();
+        // Gather the positive-overlap candidates once; both selection modes
+        // and the decay's fleet-floor computation need the full set.
+        let mut candidates: Vec<OverlapCandidate> = Vec::new();
         for &idx in healthy_indices {
             let Some(score) = indexer
                 .worker_id(workers[idx].url())
@@ -1108,28 +1147,29 @@ impl CacheAwarePolicy {
             else {
                 continue;
             };
-            let load = workers[idx].load();
-            match best {
-                Some((best_score, best_load)) => {
-                    if score > best_score || (score == best_score && load < best_load) {
-                        best = Some((score, load));
-                        tied.clear();
-                        tied.push(idx);
-                    } else if score == best_score && load == best_load {
-                        tied.push(idx);
-                    }
-                }
-                None => {
-                    best = Some((score, load));
-                    tied.push(idx);
-                }
-            }
+            candidates.push(OverlapCandidate {
+                idx,
+                effective_score: f64::from(score),
+                load: workers[idx].load(),
+            });
         }
-        let best_idx = match tied.len() {
-            0 => return None,
-            1 => tied[0],
-            n => tied[rand::rng().random_range(0..n)],
-        };
+        if candidates.is_empty() {
+            return None;
+        }
+
+        Self::apply_overlap_decay(
+            workers,
+            &mut candidates,
+            content_hashes.len(),
+            block_size,
+            tuning,
+        );
+
+        let best_idx = if tuning.selection_temperature > 0.0 {
+            Self::sample_by_temperature(&candidates, tuning.selection_temperature)
+        } else {
+            Self::argmax_with_random_ties(&candidates)
+        }?;
 
         debug!(
             worker = workers[best_idx].url(),
@@ -1142,6 +1182,111 @@ impl CacheAwarePolicy {
         );
         workers[best_idx].increment_processed();
         Some(best_idx)
+    }
+
+    /// Anti-hotspot decay: divide each candidate's overlap score by
+    /// `1 + overlap_decay * x`, where `x` is the candidate's waiting-prefill
+    /// backlog in blocks, in excess of the minimum among candidates WITH load
+    /// data, normalized by the request's own block count ("how many of *this*
+    /// request's prefills is the worker already behind by"). The rational form
+    /// keeps the multiplier in (0, 1] with no clamping: exactly 1 at the
+    /// fleet floor, asymptotic to 0 under extreme backlog. Candidates without
+    /// a load entry are never decayed — missing data must not punish.
+    fn apply_overlap_decay(
+        workers: &[Arc<dyn Worker>],
+        candidates: &mut [OverlapCandidate],
+        request_blocks: usize,
+        block_size: usize,
+        tuning: &OverlapTuning<'_>,
+    ) {
+        let (Some(waiting), true) = (tuning.waiting_prefill_tokens, tuning.overlap_decay > 0.0)
+        else {
+            return;
+        };
+        let backlog_of = |c: &OverlapCandidate| waiting.get(workers[c.idx].url()).copied();
+        let Some(min_backlog) = candidates.iter().filter_map(&backlog_of).min() else {
+            return;
+        };
+        // request_blocks >= 1 (empty-hash requests returned earlier);
+        // block_size > 0 is config-validated.
+        for candidate in candidates.iter_mut() {
+            let Some(backlog) = backlog_of(candidate) else {
+                continue;
+            };
+            let excess_blocks = (backlog - min_backlog) as f64 / block_size as f64;
+            let x = excess_blocks / request_blocks as f64;
+            candidate.effective_score /= 1.0 + f64::from(tuning.overlap_decay) * x;
+        }
+    }
+
+    /// Historical selection: max effective score, then lower load, then
+    /// uniformly at random among exact ties. Tie-break rationale: the old
+    /// final key (smaller total tree size, then slice order) was a spreading
+    /// proxy but deterministic — equal-overlap equal-load workers herd onto
+    /// one index until the global tree-size ordering flips, and tree size
+    /// tracks event-stream health, so an event-lagged worker looked "small"
+    /// and attracted the whole tie. Uniform random gives the same spreading
+    /// goal memorylessly; the next request's overlap scores restore affinity
+    /// to whichever worker actually cached the prefix.
+    fn argmax_with_random_ties(candidates: &[OverlapCandidate]) -> Option<usize> {
+        let mut best: Option<(f64, usize)> = None;
+        let mut tied: Vec<usize> = Vec::new();
+        for candidate in candidates {
+            let key = (candidate.effective_score, candidate.load);
+            match best {
+                Some((best_score, best_load)) => {
+                    if key.0 > best_score || (key.0 == best_score && key.1 < best_load) {
+                        best = Some(key);
+                        tied.clear();
+                        tied.push(candidate.idx);
+                    } else if key.0 == best_score && key.1 == best_load {
+                        tied.push(candidate.idx);
+                    }
+                }
+                None => {
+                    best = Some(key);
+                    tied.push(candidate.idx);
+                }
+            }
+        }
+        match tied.len() {
+            0 => None,
+            1 => Some(tied[0]),
+            n => Some(tied[rand::rng().random_range(0..n)]),
+        }
+    }
+
+    /// Softmax selection over min-max normalized effective scores. The
+    /// normalization makes temperature scale-free: only a candidate's
+    /// relative position within the current score spread matters, so one
+    /// temperature setting behaves the same whether overlaps span 2 blocks
+    /// or 2000. The best candidate's exponent is exactly 0 (overflow-safe);
+    /// a degenerate spread (all equal) is a uniform draw. Inverse-CDF
+    /// sampling with a last-row fallback against floating-point drift.
+    fn sample_by_temperature(candidates: &[OverlapCandidate], temperature: f32) -> Option<usize> {
+        let first = candidates.first()?;
+        let (min, max) = candidates.iter().fold(
+            (first.effective_score, first.effective_score),
+            |(min, max), c| (min.min(c.effective_score), max.max(c.effective_score)),
+        );
+        let range = max - min;
+        if range <= 0.0 {
+            return Some(candidates[rand::rng().random_range(0..candidates.len())].idx);
+        }
+        let weights: Vec<f64> = candidates
+            .iter()
+            .map(|c| (((c.effective_score - min) / range - 1.0) / f64::from(temperature)).exp())
+            .collect();
+        let total: f64 = weights.iter().sum();
+        let draw = rand::rng().random::<f64>() * total;
+        let mut cumulative = 0.0;
+        for (candidate, weight) in candidates.iter().zip(&weights) {
+            cumulative += weight;
+            if cumulative >= draw {
+                return Some(candidate.idx);
+            }
+        }
+        candidates.last().map(|c| c.idx)
     }
 
     /// Select worker using token-based tree (gRPC path)
@@ -1355,6 +1500,16 @@ mod tests {
     use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerStatus};
 
     use super::*;
+
+    /// Neutral tuning: decay and temperature off, no load snapshot — the
+    /// historical selection behavior.
+    fn default_tuning() -> OverlapTuning<'static> {
+        OverlapTuning {
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+            waiting_prefill_tokens: None,
+        }
+    }
     use crate::worker::{BasicWorkerBuilder, WorkerType};
 
     fn no_health_check() -> HealthCheckConfig {
@@ -1439,6 +1594,8 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         });
 
         let worker1 = BasicWorkerBuilder::new("http://w1:8000")
@@ -2121,6 +2278,7 @@ mod tests {
             &[0, 1],
             &indexer,
             4,
+            &default_tuning(),
         );
         assert_eq!(result, Some(0)); // w1
     }
@@ -2168,6 +2326,7 @@ mod tests {
                 &[0, 1],
                 &indexer,
                 4,
+                &default_tuning(),
             )
             .expect("both workers fully match");
             seen[idx] = true;
@@ -2178,6 +2337,209 @@ mod tests {
         assert!(
             seen[0] && seen[1],
             "equal-overlap equal-load tie must spread across workers, saw only one"
+        );
+    }
+
+    /// Two workers with identical cached blocks (the tie-test topology): both
+    /// fully match the request.
+    fn equal_overlap_fixture() -> (Vec<Arc<dyn Worker>>, Arc<PositionalIndexer>) {
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .build(),
+            ),
+        ];
+        let chunks: [&[u32]; 2] = [&[1, 2, 3, 4], &[5, 6, 7, 8]];
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &chunks, 4);
+        let w2 = indexer.intern_worker("http://w2:8000").unwrap();
+        let mut wb2 = WorkerBlockMap::default();
+        let blocks: Vec<StoredBlock> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, tokens)| StoredBlock {
+                seq_hash: SequenceHash(100 + i as u64),
+                content_hash: compute_content_hash(tokens),
+            })
+            .collect();
+        indexer.apply_stored(w2, &blocks, None, &mut wb2).unwrap();
+        (workers, indexer)
+    }
+
+    #[test]
+    fn test_overlap_decay_prefers_less_backlogged_worker() {
+        // Equal overlap, equal load — but w2 carries waiting-prefill backlog.
+        // With decay on, the fleet-floor worker keeps full credit and must
+        // win every draw (previously this tie was a coin flip).
+        let (workers, indexer) = equal_overlap_fixture();
+        let waiting = HashMap::from([
+            ("http://w1:8000".to_string(), 0),
+            ("http://w2:8000".to_string(), 8),
+        ]);
+        let tuning = OverlapTuning {
+            overlap_decay: 4.0,
+            selection_temperature: 0.0,
+            waiting_prefill_tokens: Some(&waiting),
+        };
+        for _ in 0..50 {
+            let idx = CacheAwarePolicy::score_overlap(
+                &workers,
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+                &[0, 1],
+                &indexer,
+                4,
+                &tuning,
+            )
+            .expect("both workers match");
+            assert_eq!(idx, 0, "backlogged worker must lose its credit edge");
+        }
+    }
+
+    #[test]
+    fn test_overlap_decay_missing_load_data_never_decays() {
+        // Only w1 reports load (and holds the floor at zero backlog); w2 has
+        // no entry. Neither may be decayed, so the equal-score tie — and its
+        // random spreading — must survive.
+        let (workers, indexer) = equal_overlap_fixture();
+        let waiting = HashMap::from([("http://w1:8000".to_string(), 0)]);
+        let tuning = OverlapTuning {
+            overlap_decay: 4.0,
+            selection_temperature: 0.0,
+            waiting_prefill_tokens: Some(&waiting),
+        };
+        let mut seen = [false; 2];
+        for _ in 0..200 {
+            let idx = CacheAwarePolicy::score_overlap(
+                &workers,
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+                &[0, 1],
+                &indexer,
+                4,
+                &tuning,
+            )
+            .expect("both workers match");
+            seen[idx] = true;
+            if seen[0] && seen[1] {
+                break;
+            }
+        }
+        assert!(
+            seen[0] && seen[1],
+            "workers without load data must not be decayed (tie must survive)"
+        );
+    }
+
+    /// w1 caches both request blocks (score 2), w2 only the first (score 1).
+    fn unequal_overlap_fixture() -> (Vec<Arc<dyn Worker>>, Arc<PositionalIndexer>) {
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .build(),
+            ),
+        ];
+        let indexer =
+            setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+        let w2 = indexer.intern_worker("http://w2:8000").unwrap();
+        let mut wb2 = WorkerBlockMap::default();
+        let blocks = vec![StoredBlock {
+            seq_hash: SequenceHash(100),
+            content_hash: compute_content_hash(&[1, 2, 3, 4]),
+        }];
+        indexer.apply_stored(w2, &blocks, None, &mut wb2).unwrap();
+        (workers, indexer)
+    }
+
+    #[test]
+    fn test_selection_temperature_spreads_but_favors_better_score() {
+        // At temperature 0 the better scorer wins every draw; at temperature
+        // 1.0 the weaker scorer must be sampled sometimes, while the better
+        // one keeps the majority (p(best) = 1/(1+e^-1) ≈ 0.73).
+        let (workers, indexer) = unequal_overlap_fixture();
+        for _ in 0..50 {
+            let idx = CacheAwarePolicy::score_overlap(
+                &workers,
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+                &[0, 1],
+                &indexer,
+                4,
+                &default_tuning(),
+            )
+            .expect("both workers match");
+            assert_eq!(idx, 0, "temperature 0 must be exact argmax");
+        }
+
+        let tuning = OverlapTuning {
+            overlap_decay: 0.0,
+            selection_temperature: 1.0,
+            waiting_prefill_tokens: None,
+        };
+        let mut counts = [0usize; 2];
+        for _ in 0..300 {
+            let idx = CacheAwarePolicy::score_overlap(
+                &workers,
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+                &[0, 1],
+                &indexer,
+                4,
+                &tuning,
+            )
+            .expect("both workers match");
+            counts[idx] += 1;
+        }
+        assert!(
+            counts[1] > 0,
+            "temperature must spread picks to the weaker scorer"
+        );
+        assert!(
+            counts[0] > counts[1],
+            "better score must keep the majority: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn test_selection_temperature_uniform_on_equal_scores() {
+        // Degenerate spread (all candidates equal): the draw is uniform, so
+        // both workers must appear.
+        let (workers, indexer) = equal_overlap_fixture();
+        let tuning = OverlapTuning {
+            overlap_decay: 0.0,
+            selection_temperature: 0.5,
+            waiting_prefill_tokens: None,
+        };
+        let mut seen = [false; 2];
+        for _ in 0..200 {
+            let idx = CacheAwarePolicy::score_overlap(
+                &workers,
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+                &[0, 1],
+                &indexer,
+                4,
+                &tuning,
+            )
+            .expect("both workers match");
+            seen[idx] = true;
+            if seen[0] && seen[1] {
+                break;
+            }
+        }
+        assert!(
+            seen[0] && seen[1],
+            "equal scores under temperature must draw uniformly"
         );
     }
 
@@ -2202,6 +2564,7 @@ mod tests {
             &[0],
             &indexer,
             4,
+            &default_tuning(),
         );
         assert_eq!(result, None);
     }
@@ -2249,7 +2612,14 @@ mod tests {
             .unwrap();
 
         // Equal overlap → tie-break by load → w2 wins (lower load)
-        let result = CacheAwarePolicy::score_overlap(&workers, &[1, 2, 3, 4], &[0, 1], &indexer, 4);
+        let result = CacheAwarePolicy::score_overlap(
+            &workers,
+            &[1, 2, 3, 4],
+            &[0, 1],
+            &indexer,
+            4,
+            &default_tuning(),
+        );
         assert_eq!(result, Some(1)); // w2 (lower load)
     }
 
@@ -2307,9 +2677,15 @@ mod tests {
         // herded every tie onto w1 until the global size ordering flipped).
         let mut seen = [false; 2];
         for _ in 0..200 {
-            let idx =
-                CacheAwarePolicy::score_overlap(&workers, &[1, 2, 3, 4], &[0, 1], &indexer, 4)
-                    .expect("both workers match");
+            let idx = CacheAwarePolicy::score_overlap(
+                &workers,
+                &[1, 2, 3, 4],
+                &[0, 1],
+                &indexer,
+                4,
+                &default_tuning(),
+            )
+            .expect("both workers match");
             seen[idx] = true;
             if seen[0] && seen[1] {
                 break;
@@ -2333,7 +2709,14 @@ mod tests {
         let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
 
         // Request shorter than block_size → no full blocks → None
-        let result = CacheAwarePolicy::score_overlap(&workers, &[1, 2, 3], &[0], &indexer, 4);
+        let result = CacheAwarePolicy::score_overlap(
+            &workers,
+            &[1, 2, 3],
+            &[0],
+            &indexer,
+            4,
+            &default_tuning(),
+        );
         assert_eq!(result, None);
     }
 
@@ -2401,6 +2784,7 @@ mod tests {
             &[0, 1],
             &indexer,
             4,
+            &default_tuning(),
         );
         assert_eq!(result, Some(0)); // w1 (higher overlap)
     }

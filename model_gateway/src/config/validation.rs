@@ -456,7 +456,25 @@ impl ConfigValidator {
                 block_size,
                 balance_token_usage_threshold,
                 overload_token_usage_threshold,
+                overlap_decay,
+                selection_temperature,
             } => {
+                if !overlap_decay.is_finite() || *overlap_decay < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "overlap_decay".to_string(),
+                        value: overlap_decay.to_string(),
+                        reason: "Must be finite and >= 0.0 (0.0 disables)".to_string(),
+                    });
+                }
+
+                if !selection_temperature.is_finite() || *selection_temperature < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "selection_temperature".to_string(),
+                        value: selection_temperature.to_string(),
+                        reason: "Must be finite and >= 0.0 (0.0 is argmax)".to_string(),
+                    });
+                }
+
                 if *block_size == 0 {
                     return Err(ConfigError::InvalidValue {
                         field: "block_size".to_string(),
@@ -1393,10 +1411,47 @@ mod tests {
                 block_size: 16,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
             },
         );
 
         assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_cache_aware_pressure_knobs() {
+        let make = |overlap_decay: f32, selection_temperature: f32| {
+            RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec![
+                        "http://worker1:8000".to_string(),
+                        "http://worker2:8000".to_string(),
+                    ],
+                },
+                PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                    block_size: 16,
+                    balance_token_usage_threshold: 1.0,
+                    overload_token_usage_threshold: 1.0,
+                    overlap_decay,
+                    selection_temperature,
+                },
+            )
+        };
+
+        // Off (defaults) and positive values are valid.
+        assert!(ConfigValidator::validate(&make(0.0, 0.0)).is_ok());
+        assert!(ConfigValidator::validate(&make(4.0, 0.7)).is_ok());
+        // Negative or non-finite values are rejected for both knobs.
+        assert!(ConfigValidator::validate(&make(-0.1, 0.0)).is_err());
+        assert!(ConfigValidator::validate(&make(0.0, -1.0)).is_err());
+        assert!(ConfigValidator::validate(&make(f32::NAN, 0.0)).is_err());
+        assert!(ConfigValidator::validate(&make(0.0, f32::INFINITY)).is_err());
     }
 
     #[test]
@@ -1415,6 +1470,8 @@ mod tests {
                 block_size: 16,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
             },
         );
 
@@ -1472,6 +1529,8 @@ mod tests {
                 block_size: 16,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
             },
         );
 
@@ -1519,6 +1578,8 @@ mod tests {
                     block_size: 16,
                     balance_token_usage_threshold: 1.0,
                     overload_token_usage_threshold: 1.0,
+                    overlap_decay: 0.0,
+                    selection_temperature: 0.0,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
@@ -1645,6 +1706,8 @@ mod tests {
                     block_size: 16,
                     balance_token_usage_threshold: 1.0,
                     overload_token_usage_threshold: 1.0,
+                    overlap_decay: 0.0,
+                    selection_temperature: 0.0,
                 }),
                 prefill_policy: None,
                 decode_policy: None,

@@ -184,6 +184,13 @@ class Router:
             aware. Default: 1.0001
         eviction_interval_secs: Interval in seconds between cache eviction operations
             in cache-aware routing. Default: 60
+        overlap_decay: Cache-aware anti-hotspot decay: each candidate's overlap score
+            is divided by 1 + overlap_decay * x, where x is the worker's
+            waiting-prefill backlog (blocks above the candidate minimum) per request
+            block. Requires backend load reporting. Default: 0.0 (disabled)
+        selection_temperature: Cache-aware softmax temperature over min-max
+            normalized scores for event-driven selection. 0.0 is exact argmax;
+            larger values spread picks across candidates. Default: 0.0
         max_payload_size: Maximum payload size in bytes. Default: 256MB
         max_tree_size: Maximum total size of each model's approximation tree for
             cache-aware routing (chars for HTTP, tokens for gRPC), shared across

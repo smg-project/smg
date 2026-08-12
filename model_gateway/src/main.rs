@@ -223,6 +223,19 @@ struct CliArgs {
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     overload_token_usage_threshold: f32,
 
+    /// Cache-aware anti-hotspot decay: divide each candidate's overlap score
+    /// by 1 + overlap_decay * x, where x is the worker's waiting-prefill
+    /// backlog (blocks above the candidate minimum) per request block.
+    /// Requires backend load reporting. 0.0 disables.
+    #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
+    overlap_decay: f32,
+
+    /// Cache-aware softmax temperature over min-max normalized scores for
+    /// event-driven selection. 0.0 is exact argmax; larger values spread
+    /// picks across candidates.
+    #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
+    selection_temperature: f32,
+
     /// Interval in seconds between cache eviction operations
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
     eviction_interval: u64,
@@ -1145,6 +1158,8 @@ impl CliArgs {
                 block_size: self.block_size,
                 balance_token_usage_threshold: self.balance_token_usage_threshold,
                 overload_token_usage_threshold: self.overload_token_usage_threshold,
+                overlap_decay: self.overlap_decay,
+                selection_temperature: self.selection_temperature,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,

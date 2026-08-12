@@ -494,6 +494,17 @@ pub enum PolicyConfig {
         /// triggers shedding regardless of spread. `>= 1.0` disables (default).
         #[serde(default = "default_balance_token_usage_threshold")]
         overload_token_usage_threshold: f32,
+        /// Anti-hotspot decay for event-driven overlap credit: each
+        /// candidate's overlap score is divided by `1 + overlap_decay * x`,
+        /// with `x` the worker's waiting-prefill backlog (blocks in excess of
+        /// the candidate minimum) per request block. `0.0` disables (default).
+        #[serde(default = "default_overlap_decay")]
+        overlap_decay: f32,
+        /// Softmax temperature for event-driven selection over min-max
+        /// normalized scores. `0.0` (default) is exact argmax with the
+        /// existing tie-breaks; larger values spread picks across candidates.
+        #[serde(default = "default_selection_temperature")]
+        selection_temperature: f32,
     },
 
     /// Power-of-two choices load balancing policy.
@@ -596,6 +607,14 @@ fn default_block_size() -> usize {
 
 fn default_balance_token_usage_threshold() -> f32 {
     1.0
+}
+
+fn default_overlap_decay() -> f32 {
+    0.0
+}
+
+fn default_selection_temperature() -> f32 {
+    0.0
 }
 
 fn default_prefix_token_count() -> usize {
@@ -1182,6 +1201,8 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -1206,6 +1227,8 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -1231,6 +1254,8 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         };
 
         match cache_aware {
@@ -1247,6 +1272,32 @@ mod tests {
                 assert!((balance_rel_threshold - 2.0).abs() < 0.0001);
                 assert_eq!(eviction_interval_secs, 600);
                 assert_eq!(max_tree_size, 5000);
+            }
+            _ => panic!("Expected CacheAware"),
+        }
+    }
+
+    #[test]
+    fn test_cache_aware_pressure_knobs_default_off_when_absent() {
+        // Config files written before the knobs existed must keep parsing,
+        // with both knobs off (behavior-preserving defaults).
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.5,
+            "balance_abs_threshold": 32,
+            "balance_rel_threshold": 1.1,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1000
+        }"#;
+        let policy: PolicyConfig = serde_json::from_str(json).unwrap();
+        match policy {
+            PolicyConfig::CacheAware {
+                overlap_decay,
+                selection_temperature,
+                ..
+            } => {
+                assert_eq!(overlap_decay, 0.0);
+                assert_eq!(selection_temperature, 0.0);
             }
             _ => panic!("Expected CacheAware"),
         }
@@ -1644,6 +1695,8 @@ mod tests {
                 block_size: 16,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1677,6 +1730,8 @@ mod tests {
                 block_size: 16,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
             }),
             decode_policy: None,
         };
@@ -1736,6 +1791,8 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         };
 
         match pd.get_prefill_policy(&main_policy) {

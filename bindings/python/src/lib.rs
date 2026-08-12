@@ -510,6 +510,8 @@ struct Router {
     /// Appended last: positional constructor compatibility (see the field
     /// ordering rule on this struct's signature).
     zmq_engine_count: Option<usize>,
+    overlap_decay: f32,
+    selection_temperature: f32,
 }
 
 impl Router {
@@ -588,6 +590,8 @@ impl Router {
                     block_size: self.block_size,
                     balance_token_usage_threshold: self.balance_token_usage_threshold,
                     overload_token_usage_threshold: self.overload_token_usage_threshold,
+                    overlap_decay: self.overlap_decay,
+                    selection_temperature: self.selection_temperature,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: self.load_monitor_interval,
@@ -1012,6 +1016,8 @@ impl Router {
         prefix_hash_load_factor = 1.25,
         prefix_hash_balance_abs_threshold = 10,
         upstream_http2 = false,
+        overlap_decay = 0.0,
+        selection_temperature = 0.0,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1146,6 +1152,8 @@ impl Router {
         prefix_hash_load_factor: f64,
         prefix_hash_balance_abs_threshold: usize,
         upstream_http2: bool,
+        overlap_decay: f32,
+        selection_temperature: f32,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1294,6 +1302,8 @@ impl Router {
             worker_startup_delay,
             worker_ports_annotation,
             zmq_engine_count,
+            overlap_decay,
+            selection_temperature,
         })
     }
 

@@ -128,6 +128,21 @@ pub struct CacheAwareConfig {
     /// shedding load off a critically-saturated engine. A safety valve, best set
     /// high (e.g. 0.9). Requires `token_usage`; `>= 1.0` disables it (default).
     pub overload_token_usage_threshold: f32,
+    /// Anti-hotspot decay for event-driven overlap credit. Each candidate's
+    /// overlap score is multiplied by `1 / (1 + overlap_decay * x)`, where `x`
+    /// is the worker's waiting-prefill backlog (backend-reported waiting
+    /// uncached tokens, in blocks, in excess of the minimum among candidates)
+    /// divided by the request's block count. The least-backlogged candidate
+    /// always keeps full credit; workers without load data are never decayed.
+    /// `0.0` disables (default). Requires backend load reporting.
+    pub overlap_decay: f32,
+    /// Randomized selection among event-driven candidates. `0.0` (default) is
+    /// exact argmax with the existing tie-breaks. Above zero, candidates are
+    /// sampled by softmax over min-max-normalized scores divided by this
+    /// temperature — scale-free (only relative position within the current
+    /// score spread matters): small values mostly follow the best candidate,
+    /// large values approach uniform.
+    pub selection_temperature: f32,
 }
 
 impl Default for CacheAwareConfig {
@@ -143,6 +158,10 @@ impl Default for CacheAwareConfig {
             // balance e.g. 0.5 (spread) and/or overload e.g. 0.9 (ceiling).
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            // Both pressure knobs off by default: behavior is bit-identical
+            // to pre-knob selection until explicitly tuned.
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         }
     }
 }
