@@ -19,6 +19,7 @@ use super::{
 };
 use crate::{
     config::types::{PolicyConfig, RoutingKeyOverrideConfig},
+    mesh::adapters::TreeSyncAdapter,
     policies::cache_aware::LoadReceiver,
     routers::common::header_utils::extract_routing_key,
     worker::{KvEventMonitor, Worker},
@@ -53,6 +54,12 @@ pub struct PolicyRegistry {
     /// set, new CacheAwarePolicy instances are injected with it for the KV-usage
     /// imbalance trigger.
     load_rx: Arc<RwLock<Option<LoadReceiver>>>,
+
+    /// Optional mesh outbound bridge. When set, every cache-aware policy
+    /// created here is attached to this adapter so its local tree inserts
+    /// join the next gossip round. Absence means mesh is disabled and
+    /// cache-aware policies stay local.
+    mesh_tree_sync: Arc<RwLock<Option<Arc<TreeSyncAdapter>>>>,
 
     // DP-rank policy: Supports the selection of dp-rank outside the engine.
     dp_rank_policy: Arc<OnceLock<Arc<dyn DPRankLoadPolicy>>>,
@@ -93,6 +100,7 @@ impl PolicyRegistry {
             encode_policy: Arc::new(OnceLock::new()),
             kv_event_monitor: Arc::new(RwLock::new(None)),
             load_rx: Arc::new(RwLock::new(None)),
+            mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
             routing_key_sticky,
         }
@@ -186,6 +194,44 @@ impl PolicyRegistry {
     fn maybe_inject_load_rx(policy: &Arc<dyn LoadBalancingPolicy>, rx: Option<&LoadReceiver>) {
         if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
             cache_aware.set_load_receiver(rx.cloned());
+        }
+    }
+
+    /// Attach the mesh outbound bridge (thread-safe, can be called after
+    /// initialization). Every existing cache-aware policy gets the adapter
+    /// wired in and its `populate_hash_index` flag flipped on (both flip
+    /// atomically inside [`CacheAwarePolicy::set_mesh_tree_sync`]); every
+    /// future cache-aware policy created here inherits both. Pass `None`
+    /// to detach.
+    pub fn set_mesh_tree_sync(&self, adapter: Option<Arc<TreeSyncAdapter>>) {
+        {
+            let mut guard = self.mesh_tree_sync.write();
+            guard.clone_from(&adapter);
+        }
+        Self::maybe_inject_mesh_tree_sync(&self.default_policy, adapter.as_ref());
+        if let Some(p) = self.prefill_policy.get() {
+            Self::maybe_inject_mesh_tree_sync(p, adapter.as_ref());
+        }
+        if let Some(p) = self.decode_policy.get() {
+            Self::maybe_inject_mesh_tree_sync(p, adapter.as_ref());
+        }
+        if let Some(p) = self.encode_policy.get() {
+            Self::maybe_inject_mesh_tree_sync(p, adapter.as_ref());
+        }
+        for entry in self.model_policies.iter() {
+            Self::maybe_inject_mesh_tree_sync(entry.value(), adapter.as_ref());
+        }
+    }
+
+    /// Inject the mesh adapter into a policy if it's cache-aware.
+    /// The setter also flips `populate_hash_index` to match adapter
+    /// presence, so callers do not need to touch that flag directly.
+    fn maybe_inject_mesh_tree_sync(
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        adapter: Option<&Arc<TreeSyncAdapter>>,
+    ) {
+        if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+            cache_aware.set_mesh_tree_sync(adapter.cloned());
         }
     }
 
@@ -315,6 +361,12 @@ impl PolicyRegistry {
                 let guard = self.load_rx.read();
                 if let Some(ref rx) = *guard {
                     cache_aware.set_load_receiver(Some(rx.clone()));
+                }
+            }
+            {
+                let guard = self.mesh_tree_sync.read();
+                if let Some(ref adapter) = *guard {
+                    cache_aware.set_mesh_tree_sync(Some(Arc::clone(adapter)));
                 }
             }
             Arc::new(cache_aware)

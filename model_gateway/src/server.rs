@@ -1089,6 +1089,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             handler.mesh_kv(),
             handler.self_name.clone(),
             app_context.worker_registry.clone(),
+            handler.state.clone(),
+            app_context.policy_registry.clone(),
         )
     });
     if let Some(mesh_server) = mesh_server {

@@ -63,7 +63,7 @@ use super::{
     SelectWorkerInfo,
 };
 use crate::{
-    mesh::adapters::tree_sync::{RepairEntry, TreeRepairPage},
+    mesh::adapters::tree_sync::{RepairEntry, TreeDelta, TreeRepairPage, TreeSyncAdapter},
     worker::{KvEventMonitor, Worker},
 };
 
@@ -121,6 +121,16 @@ pub struct CacheAwarePolicy {
     /// gateway. Off by default; the mesh wiring code flips it on
     /// when it attaches.
     populate_hash_index: AtomicBool,
+    /// Outbound bridge into the mesh `td:` broadcast namespace.
+    /// `Some` after [`Self::set_mesh_tree_sync`] (called by mesh wiring
+    /// at startup); `None` when mesh is disabled, in which case
+    /// `sync_local_insert` is a no-op. The setter also toggles
+    /// [`Self::populate_hash_index`] to match adapter presence so the
+    /// two never drift apart. Note the pairing is best-effort at a
+    /// point-in-time — later eviction of a hash-index entry can leave
+    /// a still-in-flight delta with no local resolution; peers that
+    /// repair against us will simply see the gap the next tick.
+    mesh_tree_sync: RwLock<Option<Arc<TreeSyncAdapter>>>,
 }
 
 /// Per-model inner container for [`CacheAwarePolicy::hash_index`].
@@ -230,18 +240,62 @@ impl CacheAwarePolicy {
             load_rx: RwLock::new(None),
             hash_index,
             populate_hash_index: AtomicBool::new(false),
+            mesh_tree_sync: RwLock::new(None),
         }
     }
 
-    /// Enable request-hot-path `hash_index` population. Called by mesh
-    /// wiring when the policy is attached to a mesh adapter; otherwise
-    /// the index stays empty (its only readers are mesh-only paths).
-    pub fn set_populate_hash_index(&self, enabled: bool) {
+    /// Enable request-hot-path `hash_index` population without attaching
+    /// an adapter. Only exists so unit tests can seed the populate flag
+    /// without the ceremony of wiring in a real [`TreeSyncAdapter`];
+    /// production code goes through [`Self::set_mesh_tree_sync`], which
+    /// flips both fields together.
+    #[cfg(test)]
+    fn set_populate_hash_index(&self, enabled: bool) {
         self.populate_hash_index.store(enabled, Ordering::Relaxed);
     }
 
     fn should_populate_hash_index(&self) -> bool {
         self.populate_hash_index.load(Ordering::Relaxed)
+    }
+
+    /// Test-only view onto the populate flag so integration tests
+    /// outside this file can assert wiring flipped it. Not part of
+    /// the public API.
+    #[cfg(test)]
+    pub fn should_populate_hash_index_for_test(&self) -> bool {
+        self.should_populate_hash_index()
+    }
+
+    /// Attach the mesh outbound bridge and enable hash-index population
+    /// in one atomic step; pass `None` to detach and disable both. The
+    /// pair moves together because the hash-index has no non-mesh
+    /// readers — enabling population without an adapter attached would
+    /// waste memory, and the producer-side `sync_local_insert` calls
+    /// only fire while population is on.
+    ///
+    /// Interior-mutability setter so it composes with policies stored
+    /// behind `Arc<dyn LoadBalancingPolicy>` after construction, matching
+    /// `set_kv_event_monitor` / `set_load_receiver`.
+    pub fn set_mesh_tree_sync(&self, adapter: Option<Arc<TreeSyncAdapter>>) {
+        let populate = adapter.is_some();
+        {
+            let mut guard = self.mesh_tree_sync.write();
+            *guard = adapter;
+        }
+        self.populate_hash_index.store(populate, Ordering::Relaxed);
+    }
+
+    /// Publish one local tree change to the mesh outbound buffer.
+    /// No-op when no adapter is attached — cheap check on the hot path.
+    /// The `Arc` is cloned out before invoking `on_local_insert` so the
+    /// adapter callback never runs under our read lock (avoids a future
+    /// deadlock if the adapter path ever wants to write back into any
+    /// policy state).
+    fn sync_local_insert(&self, model_id: &str, delta: TreeDelta) {
+        let adapter = self.mesh_tree_sync.read().as_ref().map(Arc::clone);
+        if let Some(adapter) = adapter {
+            adapter.on_local_insert(model_id, delta);
+        }
     }
 
     /// Set event-driven KV cache monitor (thread-safe, can be called after construction).
@@ -1048,11 +1102,26 @@ impl CacheAwarePolicy {
                 // returned by match_and_insert_with.
                 if self.should_populate_hash_index() {
                     let matched_prefix: Vec<u32> = tokens[..result.matched_token_count].to_vec();
+                    let node_hash = kv_index::hash_token_path(tokens);
                     self.hash_index
                         .entry(model_id.to_string())
                         .or_default()
                         .token_tree
-                        .insert(kv_index::hash_token_path(tokens), matched_prefix);
+                        .insert(node_hash, matched_prefix);
+                    // Publish only what peers can already resolve:
+                    // the node_hash keys the hash_index entry we
+                    // just wrote, so a receiver that repairs against
+                    // us will land the same worker onto the same
+                    // tree node.
+                    self.sync_local_insert(
+                        model_id,
+                        TreeDelta {
+                            tree_kind: TreeKind::Token,
+                            node_hash,
+                            worker_url: workers[idx].url().to_string(),
+                            epoch: 0,
+                        },
+                    );
                 }
                 workers[idx].increment_processed();
                 return Some(idx);
@@ -1134,6 +1203,15 @@ impl CacheAwarePolicy {
                         .or_default()
                         .string_tree
                         .insert(path_hash, matched_prefix);
+                    self.sync_local_insert(
+                        model_id,
+                        TreeDelta {
+                            tree_kind: TreeKind::String,
+                            node_hash: path_hash,
+                            worker_url: workers[idx].url().to_string(),
+                            epoch: 0,
+                        },
+                    );
                 }
 
                 workers[idx].increment_processed();
