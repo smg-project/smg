@@ -752,7 +752,7 @@ impl ResponseProcessor {
                 };
 
                 content_blocks.push(messages::ContentBlock::ToolUse {
-                    id: tc.id.clone(),
+                    id: utils::message_utils::anthropic_tool_use_id(&tc.id),
                     name: tc.function.name.clone(),
                     input,
                 });

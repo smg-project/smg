@@ -470,11 +470,58 @@ pub(crate) fn get_history_tool_calls_count_messages(request: &CreateMessageReque
         .count()
 }
 
+/// Anthropic-native id for a `tool_use` content block.
+///
+/// The Messages surface should expose `toolu_`-prefixed ids — strict Anthropic
+/// SDKs and ecosystem tooling pattern-match the prefix. Parsed tool calls carry
+/// the standard OpenAI `call_{uuid}` id, so swap the prefix and keep the
+/// suffix: deterministic, so the non-streaming builder and every streaming
+/// `content_block_start` site emit the same id for the same call, and clients
+/// echo it back opaquely just as before.
+///
+/// Any other id shape passes through unchanged — model families whose id
+/// format is load-bearing in the prompt (rendered into history or correlated
+/// verbatim by the reference server) must keep their native shape.
+pub(crate) fn anthropic_tool_use_id(id: &str) -> String {
+    match id.strip_prefix("call_") {
+        Some(suffix) => format!("toolu_{suffix}"),
+        None => id.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use messages::{InputMessage, Role, TextBlock};
 
     use super::*;
+
+    #[test]
+    fn anthropic_tool_use_id_swaps_standard_prefix() {
+        assert_eq!(
+            anthropic_tool_use_id("call_0123456789abcdef01234567"),
+            "toolu_0123456789abcdef01234567"
+        );
+        // Deterministic: same input, same output.
+        assert_eq!(
+            anthropic_tool_use_id("call_0123456789abcdef01234567"),
+            anthropic_tool_use_id("call_0123456789abcdef01234567"),
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_use_id_passes_other_shapes_through() {
+        // Prompt-visible / reference-correlated id formats keep their shape.
+        assert_eq!(anthropic_tool_use_id("Bash_3"), "Bash_3");
+        assert_eq!(
+            anthropic_tool_use_id("functions.get_weather:2"),
+            "functions.get_weather:2"
+        );
+        // Already-native ids are untouched.
+        assert_eq!(
+            anthropic_tool_use_id("toolu_0123456789abcdef01234567"),
+            "toolu_0123456789abcdef01234567"
+        );
+    }
 
     #[test]
     fn test_simple_user_message() {

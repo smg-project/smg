@@ -2160,7 +2160,7 @@ impl StreamingProcessor {
                                     &MessageStreamEvent::ContentBlockStart {
                                         index: current_block_index,
                                         content_block: ContentBlock::ToolUse {
-                                            id: tool_call_id,
+                                            id: message_utils::anthropic_tool_use_id(&tool_call_id),
                                             name: tool_name,
                                             input: Value::Object(serde_json::Map::new()),
                                         },
@@ -2260,7 +2260,9 @@ impl StreamingProcessor {
                                                 &MessageStreamEvent::ContentBlockStart {
                                                     index: current_block_index,
                                                     content_block: ContentBlock::ToolUse {
-                                                        id: tool_call_id,
+                                                        id: message_utils::anthropic_tool_use_id(
+                                                            &tool_call_id,
+                                                        ),
                                                         name: name.clone(),
                                                         input: Value::Object(serde_json::Map::new()),
                                                     },
@@ -2410,7 +2412,7 @@ impl StreamingProcessor {
                             &MessageStreamEvent::ContentBlockStart {
                                 index: current_block_index,
                                 content_block: ContentBlock::ToolUse {
-                                    id: tool_call_id,
+                                    id: message_utils::anthropic_tool_use_id(&tool_call_id),
                                     name: name.clone(),
                                     input: Value::Object(serde_json::Map::new()),
                                 },
