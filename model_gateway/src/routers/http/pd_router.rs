@@ -923,26 +923,31 @@ impl PDRouter {
             ));
         }
 
-        let selected_idx = self
-            .policy_registry
-            .select_worker(
-                policy,
-                &available_workers,
-                &SelectWorkerInfo {
-                    request_text,
-                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
-                    headers,
-                    hash_ring,
-                    leg,
-                },
-            )
-            .ok_or_else(|| {
-                format!(
+        let selected_idx = match self.policy_registry.select_worker(
+            policy,
+            &available_workers,
+            &SelectWorkerInfo {
+                request_text,
+                tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                headers,
+                hash_ring,
+                leg,
+            },
+        ) {
+            crate::policies::SelectionOutcome::Selected(idx) => idx,
+            crate::policies::SelectionOutcome::NotSelected => {
+                return Err(format!(
                     "Policy {} failed to select a {} worker",
                     policy.name(),
                     worker_type
-                )
-            })?;
+                ));
+            }
+            crate::policies::SelectionOutcome::AllFiltered => {
+                return Err(format!(
+                    "All candidate {worker_type} workers were excluded by request worker filters"
+                ));
+            }
+        };
 
         Ok(available_workers[selected_idx].clone())
     }

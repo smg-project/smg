@@ -41,7 +41,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{PolicyRegistry, SelectWorkerInfo},
+    policies::{PolicyRegistry, SelectWorkerInfo, SelectionOutcome},
     routers::{
         common::{
             header_utils,
@@ -121,6 +121,14 @@ impl std::fmt::Debug for Router {
     }
 }
 
+/// Why [`Router::select_worker_for_model`] yielded no worker: the historical
+/// unavailable case (empty pool or policy declined — caller re-queries to
+/// choose 404 vs 503) vs. worker-filter exhaustion (503 `workers_filtered`).
+enum SelectMiss {
+    Unavailable,
+    AllFiltered,
+}
+
 impl Router {
     /// Create a new router with injected policy and client
     #[expect(
@@ -193,12 +201,17 @@ impl Router {
     /// Select worker considering circuit breaker state.
     /// Filters to workers serving the specified model. When model is "unknown"
     /// (generate endpoint without model), considers all HTTP workers.
+    ///
+    /// `Err(SelectMiss::Unavailable)` preserves the historical no-worker
+    /// handling (caller re-queries to pick 404 vs 503);
+    /// `Err(SelectMiss::AllFiltered)` is the worker-filter exhaustion case
+    /// (503 `workers_filtered`).
     fn select_worker_for_model(
         &self,
         model_id: &str,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Result<Arc<dyn Worker>, SelectMiss> {
         // UNKNOWN_MODEL_ID means caller didn't specify a model — find any available worker
         let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
             None
@@ -219,7 +232,7 @@ impl Router {
             .cloned()
             .collect();
         if available.is_empty() {
-            return None;
+            return Err(SelectMiss::Unavailable);
         }
 
         // Get the appropriate policy for this model
@@ -228,7 +241,7 @@ impl Router {
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
-        let idx = self.policy_registry.select_worker(
+        let idx = match self.policy_registry.select_worker(
             &policy,
             &available,
             &SelectWorkerInfo {
@@ -238,7 +251,11 @@ impl Router {
                 hash_ring,
                 leg: crate::policies::WorkerLeg::Single,
             },
-        )?;
+        ) {
+            SelectionOutcome::Selected(idx) => idx,
+            SelectionOutcome::NotSelected => return Err(SelectMiss::Unavailable),
+            SelectionOutcome::AllFiltered => return Err(SelectMiss::AllFiltered),
+        };
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
@@ -248,7 +265,7 @@ impl Router {
             policy.name(),
         );
 
-        Some(available[idx].clone())
+        Ok(available[idx].clone())
     }
 
     /// Select a local, realtime-capable worker for the given model.
@@ -428,8 +445,18 @@ impl Router {
         text: &str,
     ) -> Response {
         let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
-            Some(w) => w,
-            None => {
+            Ok(w) => w,
+            Err(SelectMiss::AllFiltered) => {
+                // Candidates existed but the request's worker filters excluded
+                // them all: unavailability, not model-absence.
+                return error::service_unavailable(
+                    "workers_filtered",
+                    format!(
+                        "All candidate workers for model '{model_id}' were excluded by request worker filters"
+                    ),
+                );
+            }
+            Err(SelectMiss::Unavailable) => {
                 // Distinguish "no workers for this model" from "workers exist but unavailable"
                 let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
                     None
@@ -731,11 +758,19 @@ impl Router {
                 leg: crate::policies::WorkerLeg::Single,
             },
         ) {
-            Some(i) => i,
-            None => {
+            SelectionOutcome::Selected(i) => i,
+            SelectionOutcome::NotSelected => {
                 let resp = error::service_unavailable(
                     "no_available_workers",
                     "Policy returned no eligible worker",
+                );
+                record_pre_send_error(&resp);
+                return resp;
+            }
+            SelectionOutcome::AllFiltered => {
+                let resp = error::service_unavailable(
+                    "workers_filtered",
+                    "All candidate workers were excluded by request worker filters",
                 );
                 record_pre_send_error(&resp);
                 return resp;

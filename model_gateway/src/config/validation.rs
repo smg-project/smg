@@ -92,6 +92,7 @@ impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
+        Self::validate_worker_filter(config)?;
         Self::validate_server_settings(config)?;
         Self::validate_storage_context_headers(config)?;
         Self::validate_tenant_resolution(config)?;
@@ -129,6 +130,22 @@ impl ConfigValidator {
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
 
+        Ok(())
+    }
+
+    /// The worker-filter header must be a valid HTTP header name; an invalid
+    /// name would make the filter silently inert (HeaderMap lookups never
+    /// match), which is worse than failing at startup.
+    fn validate_worker_filter(config: &RouterConfig) -> ConfigResult<()> {
+        if let Some(name) = &config.worker_filter_header {
+            if name.trim().is_empty() || HeaderName::try_from(name.trim()).is_err() {
+                return Err(ConfigError::InvalidValue {
+                    field: "worker_filter_header".to_string(),
+                    value: name.clone(),
+                    reason: "Must be a valid HTTP header name".to_string(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -1396,6 +1413,26 @@ mod tests {
         );
 
         assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_worker_filter_header() {
+        let make = |header: Option<&str>| RouterConfig {
+            worker_filter_header: header.map(str::to_string),
+            ..RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec!["http://worker1:8000".to_string()],
+                },
+                PolicyConfig::Random,
+            )
+        };
+
+        assert!(ConfigValidator::validate(&make(None)).is_ok());
+        assert!(ConfigValidator::validate(&make(Some("x-smg-worker-labels"))).is_ok());
+        // Invalid header names would make the filter silently inert; reject
+        // at startup instead.
+        assert!(ConfigValidator::validate(&make(Some(""))).is_err());
+        assert!(ConfigValidator::validate(&make(Some("bad header name"))).is_err());
     }
 
     #[test]

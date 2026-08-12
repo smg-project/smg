@@ -232,6 +232,12 @@ struct CliArgs {
     #[arg(long, default_value_t = 14400, help_heading = "Routing Policy")]
     max_idle_secs: u64,
 
+    /// Enable the label worker filter: name of the request header carrying
+    /// comma-separated key=value pairs a worker's labels must all match
+    /// (e.g. "x-smg-worker-labels"). Unset disables filtering.
+    #[arg(long, help_heading = "Routing Policy")]
+    worker_filter_header: Option<String>,
+
     /// Assignment mode for manual policy when encountering a new routing key
     #[arg(long, default_value = "random", value_parser = ["random", "min_load", "min_group"], help_heading = "Routing Policy")]
     assignment_mode: String,
@@ -1572,6 +1578,7 @@ impl CliArgs {
                 max_idle_secs: self.max_idle_secs,
                 assignment_mode: Self::parse_assignment_mode(&self.assignment_mode),
             })
+            .worker_filter_header(self.worker_filter_header.clone())
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)

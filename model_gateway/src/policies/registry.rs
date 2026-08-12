@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
     BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig,
-    ManualPolicy, PolicyFactory, SelectWorkerInfo,
+    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerFilter,
 };
 use crate::{
     config::types::{PolicyConfig, RoutingKeyOverrideConfig},
@@ -23,6 +23,34 @@ use crate::{
     routers::common::header_utils::extract_routing_key,
     worker::{KvEventMonitor, Worker},
 };
+
+/// Result of a registry-level worker selection.
+///
+/// Three-way rather than `Option<usize>` so the caller can distinguish the
+/// filter-exhaustion case and map it to 503 unavailability: retrying another
+/// worker just bounces (every candidate failed a hard requirement), a 429
+/// would misreport it as backpressure, and a 404 would deny the model exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionOutcome {
+    /// A worker was selected; the index refers to the caller's slice.
+    Selected(usize),
+    /// Empty candidate set or the policy declined — callers keep their
+    /// pre-existing behavior for this case.
+    NotSelected,
+    /// Candidates existed, but the filter chain removed them all.
+    AllFiltered,
+}
+
+impl SelectionOutcome {
+    /// The selected index, if any. Collapses the miss reasons — use the full
+    /// match where AllFiltered must map to its own error.
+    pub fn selected(self) -> Option<usize> {
+        match self {
+            SelectionOutcome::Selected(idx) => Some(idx),
+            SelectionOutcome::NotSelected | SelectionOutcome::AllFiltered => None,
+        }
+    }
+}
 
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
@@ -61,6 +89,13 @@ pub struct PolicyRegistry {
     /// override is enabled; consulted (instead of the configured policy) for keyed
     /// requests via [`PolicyRegistry::select_worker`].
     routing_key_sticky: Option<Arc<ManualPolicy>>,
+
+    /// Ordered pre-scoring candidate filters, applied in
+    /// [`PolicyRegistry::select_worker`] before the policy (and before the
+    /// routing-key override) on every policy-based selection path. Empty by
+    /// default; injected post-construction like the KV monitor / load
+    /// receiver. See [`crate::policies::WorkerFilter`].
+    worker_filters: Arc<RwLock<Vec<Arc<dyn WorkerFilter>>>>,
 }
 
 impl PolicyRegistry {
@@ -95,14 +130,73 @@ impl PolicyRegistry {
             load_rx: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
             routing_key_sticky,
+            worker_filters: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
-    /// Select a worker, applying the `X-SMG-Routing-Key` sticky override when it is
-    /// enabled, the request carries the header, and the configured policy does not
-    /// already honor the key (`manual` / `consistent_hashing`). Otherwise delegates
-    /// to `policy`. `policy.name()` stays the real policy (for metrics).
+    /// Install the pre-scoring candidate filter chain (thread-safe, callable
+    /// after initialization like [`Self::set_kv_event_monitor`]). Replaces
+    /// any previous chain; an empty vector disables filtering.
+    pub fn set_worker_filters(&self, filters: Vec<Arc<dyn WorkerFilter>>) {
+        *self.worker_filters.write() = filters;
+    }
+
+    /// Select a worker: apply the pre-scoring filter chain, then the
+    /// `X-SMG-Routing-Key` sticky override / configured policy on the
+    /// surviving candidates. The returned index refers to the CALLER's
+    /// `workers` slice, mapped back across any filtering.
+    ///
+    /// Outcome semantics are three-way so callers can tell "the filters
+    /// removed everyone" (unavailability, 503) apart from "no candidates /
+    /// policy declined" (each path keeps its existing behavior for that).
+    /// Note for index-pinning clients: with a filter chain active,
+    /// `X-SMG-Target-Worker` interprets its value against the post-filter
+    /// slice the policy sees.
     pub fn select_worker(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> SelectionOutcome {
+        let filters = self.worker_filters.read();
+        if !filters.is_empty() && !workers.is_empty() {
+            let kept: Vec<usize> = (0..workers.len())
+                .filter(|&idx| {
+                    filters
+                        .iter()
+                        .all(|filter| filter.keep(workers[idx].as_ref(), info))
+                })
+                .collect();
+            if kept.is_empty() {
+                debug!(
+                    candidates = workers.len(),
+                    "Worker filters removed every candidate"
+                );
+                return SelectionOutcome::AllFiltered;
+            }
+            if kept.len() < workers.len() {
+                drop(filters);
+                let filtered: Vec<Arc<dyn Worker>> =
+                    kept.iter().map(|&idx| workers[idx].clone()).collect();
+                return match self.select_with_override(policy, &filtered, info) {
+                    Some(local_idx) => SelectionOutcome::Selected(kept[local_idx]),
+                    None => SelectionOutcome::NotSelected,
+                };
+            }
+            // Nothing filtered: fall through on the original slice, no remap.
+        }
+        drop(filters);
+        match self.select_with_override(policy, workers, info) {
+            Some(idx) => SelectionOutcome::Selected(idx),
+            None => SelectionOutcome::NotSelected,
+        }
+    }
+
+    /// The pre-filter selection core: `X-SMG-Routing-Key` sticky override when
+    /// enabled, the request carries the header, and the configured policy does
+    /// not already honor the key (`manual` / `consistent_hashing`); otherwise
+    /// the policy. `policy.name()` stays the real policy (for metrics).
+    fn select_with_override(
         &self,
         policy: &Arc<dyn LoadBalancingPolicy>,
         workers: &[Arc<dyn Worker>],
@@ -679,9 +773,15 @@ mod tests {
             headers: Some(&headers),
             ..Default::default()
         };
-        let first = reg.select_worker(&policy, &workers, &info).unwrap();
+        let first = reg
+            .select_worker(&policy, &workers, &info)
+            .selected()
+            .unwrap();
         for _ in 0..5 {
-            assert_eq!(reg.select_worker(&policy, &workers, &info), Some(first));
+            assert_eq!(
+                reg.select_worker(&policy, &workers, &info),
+                SelectionOutcome::Selected(first)
+            );
         }
     }
 
@@ -701,8 +801,14 @@ mod tests {
         ];
         let info = SelectWorkerInfo::default(); // no key header
                                                 // RoundRobin alternates -> proves the configured policy is used, not sticky.
-        let a = reg.select_worker(&policy, &workers, &info).unwrap();
-        let b = reg.select_worker(&policy, &workers, &info).unwrap();
+        let a = reg
+            .select_worker(&policy, &workers, &info)
+            .selected()
+            .unwrap();
+        let b = reg
+            .select_worker(&policy, &workers, &info)
+            .selected()
+            .unwrap();
         assert_ne!(a, b);
     }
 
@@ -720,8 +826,141 @@ mod tests {
             ..Default::default()
         };
         // Override off -> the key is ignored, RoundRobin alternates.
-        let a = reg.select_worker(&policy, &workers, &info).unwrap();
-        let b = reg.select_worker(&policy, &workers, &info).unwrap();
+        let a = reg
+            .select_worker(&policy, &workers, &info)
+            .selected()
+            .unwrap();
+        let b = reg
+            .select_worker(&policy, &workers, &info)
+            .selected()
+            .unwrap();
+        assert_ne!(a, b);
+    }
+
+    /// Test filter: rejects workers whose URL is on the list.
+    #[derive(Debug)]
+    struct RejectUrls(Vec<&'static str>);
+
+    impl WorkerFilter for RejectUrls {
+        fn name(&self) -> &'static str {
+            "reject_urls"
+        }
+        fn keep(&self, worker: &dyn Worker, _info: &SelectWorkerInfo) -> bool {
+            !self.0.contains(&worker.url())
+        }
+    }
+
+    #[test]
+    fn filters_narrow_candidates_and_map_indices_back() {
+        let reg = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        reg.set_worker_filters(vec![Arc::new(RejectUrls(vec!["http://w1", "http://w2"]))]);
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+            worker("http://w3", WorkerType::Regular),
+        ];
+        // Only w3 survives; the returned index must refer to the CALLER's
+        // slice (2), not the filtered slice the policy saw (0).
+        for _ in 0..5 {
+            assert_eq!(
+                reg.select_worker(&policy, &workers, &SelectWorkerInfo::default()),
+                SelectionOutcome::Selected(2)
+            );
+        }
+    }
+
+    #[test]
+    fn all_filtered_is_distinct_from_not_selected() {
+        let reg = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        reg.set_worker_filters(vec![Arc::new(RejectUrls(vec!["http://w1"]))]);
+        let policy = reg.get_default_policy();
+
+        // Candidates existed, filters removed them all -> AllFiltered.
+        let workers = vec![worker("http://w1", WorkerType::Regular)];
+        assert_eq!(
+            reg.select_worker(&policy, &workers, &SelectWorkerInfo::default()),
+            SelectionOutcome::AllFiltered
+        );
+
+        // Empty pool (even with filters installed) -> NotSelected: the
+        // caller's historical empty-pool handling must stay reachable.
+        assert_eq!(
+            reg.select_worker(&policy, &[], &SelectWorkerInfo::default()),
+            SelectionOutcome::NotSelected
+        );
+    }
+
+    #[test]
+    fn empty_filter_chain_is_passthrough() {
+        let reg = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        reg.set_worker_filters(Vec::new());
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let a = reg
+            .select_worker(&policy, &workers, &SelectWorkerInfo::default())
+            .selected()
+            .unwrap();
+        let b = reg
+            .select_worker(&policy, &workers, &SelectWorkerInfo::default())
+            .selected()
+            .unwrap();
+        assert_ne!(a, b, "round robin must alternate through the passthrough");
+    }
+
+    #[test]
+    fn label_header_filter_narrows_via_registry() {
+        use std::collections::HashMap;
+
+        let reg = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        reg.set_worker_filters(vec![Arc::new(super::super::LabelHeaderFilter::new(
+            "x-smg-worker-labels",
+        ))]);
+        let policy = reg.get_default_policy();
+
+        let labeled = |url: &str, labels: &[(&str, &str)]| -> Arc<dyn Worker> {
+            let mut map = HashMap::new();
+            for (k, v) in labels {
+                map.insert((*k).to_string(), (*v).to_string());
+            }
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .labels(map)
+                    .build(),
+            )
+        };
+        let workers = vec![
+            labeled("http://w1", &[("tenant", "acme")]),
+            labeled("http://w2", &[("tenant", "globex")]),
+        ];
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-smg-worker-labels", "tenant=globex".parse().unwrap());
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        for _ in 0..5 {
+            assert_eq!(
+                reg.select_worker(&policy, &workers, &info),
+                SelectionOutcome::Selected(1)
+            );
+        }
+
+        // Without the header the filter is inert: both workers reachable.
+        let a = reg
+            .select_worker(&policy, &workers, &SelectWorkerInfo::default())
+            .selected()
+            .unwrap();
+        let b = reg
+            .select_worker(&policy, &workers, &SelectWorkerInfo::default())
+            .selected()
+            .unwrap();
         assert_ne!(a, b);
     }
 

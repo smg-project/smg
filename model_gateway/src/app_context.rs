@@ -552,10 +552,12 @@ impl AppContextBuilder {
 
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(PolicyRegistry::with_override(
+        let registry = PolicyRegistry::with_override(
             config.policy.clone(),
             config.routing_key_override.clone(),
-        )));
+        );
+        registry.set_worker_filters(crate::policies::worker_filters_from_config(config));
+        self.policy_registry = Some(Arc::new(registry));
         self
     }
 

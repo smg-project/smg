@@ -31,6 +31,12 @@ pub struct RouterConfig {
     /// Per-request sticky-routing override (honors `X-SMG-Routing-Key`).
     #[serde(default)]
     pub routing_key_override: RoutingKeyOverrideConfig,
+    /// Enables the label worker filter on every policy-based selection path:
+    /// the named request header carries comma-separated `key=value` pairs,
+    /// and only workers whose spec labels contain ALL pairs are candidates.
+    /// Requests without the header are unaffected. `None` disables filtering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_filter_header: Option<String>,
     pub host: String,
     pub port: u16,
     /// Dedicated port for the isolated Kubernetes liveness/readiness/health
@@ -819,6 +825,7 @@ impl Default for RouterConfig {
             },
             policy: PolicyConfig::Random,
             routing_key_override: RoutingKeyOverrideConfig::default(),
+            worker_filter_header: None,
             host: "0.0.0.0".to_string(),
             port: 3001,
             health_check_port: None,

@@ -12,7 +12,9 @@ use tracing::{error, warn};
 use super::PipelineStage;
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
+    policies::{
+        LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, SelectionOutcome, WorkerLeg,
+    },
     routers::{
         error,
         grpc::{
@@ -96,34 +98,32 @@ impl PipelineStage for WorkerSelectionStage {
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
                 match self.select_single_worker(model_id, text, tokens, headers) {
-                    Some(w) => WorkerSelection::Single { worker: w },
-                    None => {
-                        error!(
-                            function = "WorkerSelectionStage::execute",
-                            mode = "Regular",
-                            model_id = %model_id,
-                            "No available workers for model"
-                        );
-                        return Err(error::model_not_found(model_id));
+                    Ok(w) => WorkerSelection::Single { worker: w },
+                    Err(miss) => {
+                        return Err(selection_miss_response(
+                            miss,
+                            model_id,
+                            "Regular",
+                            "No available workers for model",
+                        ));
                     }
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
                 match self.select_pd_pair(model_id, text, tokens, headers) {
-                    Some((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
+                    Ok((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
                         prefill,
                         decode,
                         runtime_type,
                     },
-                    None => {
-                        error!(
-                            function = "WorkerSelectionStage::execute",
-                            mode = "PrefillDecode",
-                            model_id = %model_id,
-                            "No available PD worker pairs for model"
-                        );
-                        return Err(error::model_not_found(model_id));
+                    Err(miss) => {
+                        return Err(selection_miss_response(
+                            miss,
+                            model_id,
+                            "PrefillDecode",
+                            "No available PD worker pairs for model",
+                        ));
                     }
                 }
             }
@@ -149,7 +149,7 @@ impl PipelineStage for WorkerSelectionStage {
                     headers,
                     &encode_item_hashes,
                 ) {
-                    Some((encode_assignments, prefill, decode, runtime_type)) => {
+                    Ok((encode_assignments, prefill, decode, runtime_type)) => {
                         WorkerSelection::Disaggregated {
                             encode_assignments: if encode_assignments.is_empty() {
                                 None
@@ -161,14 +161,13 @@ impl PipelineStage for WorkerSelectionStage {
                             runtime_type,
                         }
                     }
-                    None => {
-                        error!(
-                            function = "WorkerSelectionStage::execute",
-                            mode = "EncodePrefillDecode",
-                            model_id = %model_id,
-                            "No available encode/prefill/decode worker set for model"
-                        );
-                        return Err(error::model_not_found(model_id));
+                    Err(miss) => {
+                        return Err(selection_miss_response(
+                            miss,
+                            model_id,
+                            "EncodePrefillDecode",
+                            "No available encode/prefill/decode worker set for model",
+                        ));
                     }
                 }
             }
@@ -221,7 +220,7 @@ impl WorkerSelectionStage {
         text: Option<&str>,
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Result<Arc<dyn Worker>, SelectionMiss> {
         // Treat "unknown" model as wildcard (match any worker)
         let model_filter = if model_id == UNKNOWN_MODEL_ID {
             None
@@ -246,7 +245,7 @@ impl WorkerSelectionStage {
             .collect();
 
         if available.is_empty() {
-            return None;
+            return Err(SelectionMiss::NoCandidates);
         }
 
         // Get the appropriate policy for this model
@@ -255,9 +254,9 @@ impl WorkerSelectionStage {
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
-        // Select worker via the registry (applies the routing-key sticky override
-        // when enabled; otherwise delegates to the configured policy).
-        let idx = self.policy_registry.select_worker(
+        // Select worker via the registry (applies the worker filter chain and
+        // the routing-key sticky override; otherwise delegates to the policy).
+        let idx = require_selected(self.policy_registry.select_worker(
             &policy,
             &available,
             &SelectWorkerInfo {
@@ -267,7 +266,7 @@ impl WorkerSelectionStage {
                 hash_ring,
                 leg: WorkerLeg::Single,
             },
-        )?;
+        ))?;
         let selected = available[idx].clone();
 
         // Record worker selection metric
@@ -278,7 +277,7 @@ impl WorkerSelectionStage {
             policy.name(),
         );
 
-        Some(selected)
+        Ok(selected)
     }
 
     fn select_pd_pair(
@@ -287,7 +286,7 @@ impl WorkerSelectionStage {
         text: Option<&str>,
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
-    ) -> Option<PdWorkerPair> {
+    ) -> Result<PdWorkerPair, SelectionMiss> {
         // Treat "unknown" model as wildcard (match any worker)
         let model_filter = if model_id == UNKNOWN_MODEL_ID {
             None
@@ -323,17 +322,20 @@ impl WorkerSelectionStage {
 
         if all_prefill.is_empty() {
             warn!("No available prefill workers");
-            return None;
+            return Err(SelectionMiss::NoCandidates);
         }
 
         if all_decode.is_empty() {
             warn!("No available decode workers");
-            return None;
+            return Err(SelectionMiss::NoCandidates);
         }
 
         // Determine the runtime type from prefill workers.
         // All workers in a PD pair must use the same runtime.
-        let first_runtime = all_prefill.first()?.metadata().spec.runtime_type;
+        let Some(first) = all_prefill.first() else {
+            return Err(SelectionMiss::NoCandidates);
+        };
+        let first_runtime = first.metadata().spec.runtime_type;
 
         // Check for mixed runtimes in both prefill and decode pools
         let prefill_mixed = all_prefill
@@ -367,7 +369,7 @@ impl WorkerSelectionStage {
 
         if available_prefill.is_empty() || available_decode.is_empty() {
             warn!("No available PD pair for runtime {:?}", target_runtime);
-            return None;
+            return Err(SelectionMiss::NoCandidates);
         }
 
         // Independent P/D policies so stateful ones (e.g. round_robin) don't share a counter.
@@ -386,13 +388,17 @@ impl WorkerSelectionStage {
             hash_ring,
             leg: WorkerLeg::Prefill,
         };
-        let prefill_idx =
-            self.policy_registry
-                .select_worker(&prefill_policy, &available_prefill, &info)?;
+        let prefill_idx = require_selected(self.policy_registry.select_worker(
+            &prefill_policy,
+            &available_prefill,
+            &info,
+        ))?;
         info.leg = WorkerLeg::Decode;
-        let decode_idx =
-            self.policy_registry
-                .select_worker(&decode_policy, &available_decode, &info)?;
+        let decode_idx = require_selected(self.policy_registry.select_worker(
+            &decode_policy,
+            &available_decode,
+            &info,
+        ))?;
 
         let model = model_id;
 
@@ -414,7 +420,7 @@ impl WorkerSelectionStage {
             decode_policy.name(),
         );
 
-        Some((
+        Ok((
             available_prefill[prefill_idx].clone(),
             available_decode[decode_idx].clone(),
             target_runtime,
@@ -434,7 +440,7 @@ impl WorkerSelectionStage {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         encode_item_hashes: &[Vec<u8>],
-    ) -> Option<EncodePrefillDecodeWorkerSelection> {
+    ) -> Result<EncodePrefillDecodeWorkerSelection, SelectionMiss> {
         // Treat "unknown" model as wildcard (match any worker)
         let model_filter = if model_id == UNKNOWN_MODEL_ID {
             None
@@ -475,15 +481,15 @@ impl WorkerSelectionStage {
         let needs_encode = !encode_item_hashes.is_empty();
         if needs_encode && all_encode.is_empty() {
             warn!("No available encode workers");
-            return None;
+            return Err(SelectionMiss::NoCandidates);
         }
         if all_prefill.is_empty() {
             warn!("No available prefill workers");
-            return None;
+            return Err(SelectionMiss::NoCandidates);
         }
         if all_decode.is_empty() {
             warn!("No available decode workers");
-            return None;
+            return Err(SelectionMiss::NoCandidates);
         }
 
         // Disaggregated legs must share a runtime. Pick a runtime that has at
@@ -507,7 +513,7 @@ impl WorkerSelectionStage {
             })
         else {
             warn!("No available encode/prefill/decode worker set with a shared runtime");
-            return None;
+            return Err(SelectionMiss::NoCandidates);
         };
 
         let mixed = all_prefill
@@ -547,7 +553,7 @@ impl WorkerSelectionStage {
                 "No available encode/prefill/decode worker set for runtime {:?}",
                 target_runtime
             );
-            return None;
+            return Err(SelectionMiss::NoCandidates);
         }
 
         // Select encode, prefill, and decode via their per-role policies. Encode
@@ -567,19 +573,24 @@ impl WorkerSelectionStage {
             hash_ring: hash_ring.clone(),
             leg: WorkerLeg::Prefill,
         };
-        let prefill_idx =
-            self.policy_registry
-                .select_worker(&prefill_policy, &available_prefill, &info)?;
+        let prefill_idx = require_selected(self.policy_registry.select_worker(
+            &prefill_policy,
+            &available_prefill,
+            &info,
+        ))?;
         info.leg = WorkerLeg::Decode;
-        let decode_idx =
-            self.policy_registry
-                .select_worker(&decode_policy, &available_decode, &info)?;
+        let decode_idx = require_selected(self.policy_registry.select_worker(
+            &decode_policy,
+            &available_decode,
+            &info,
+        ))?;
 
         let encode_assignments = assign_encode_workers(
             &available_encode,
             encode_item_hashes,
             model_id,
-            encode_policy.as_ref(),
+            &encode_policy,
+            &self.policy_registry,
             hash_ring.clone(),
         )?;
 
@@ -603,12 +614,68 @@ impl WorkerSelectionStage {
             decode_policy.name(),
         );
 
-        Some((
+        Ok((
             encode_assignments,
             available_prefill[prefill_idx].clone(),
             available_decode[decode_idx].clone(),
             target_runtime,
         ))
+    }
+}
+
+/// Why a selection helper yielded no workers. Keeps the historical
+/// empty-pool / policy-miss case (mapped to 404 `model_not_found`) distinct
+/// from filter exhaustion, which is unavailability
+/// ([`SelectionOutcome::AllFiltered`] → 503).
+#[derive(Debug, Clone, Copy)]
+enum SelectionMiss {
+    NoCandidates,
+    AllFiltered,
+}
+
+fn require_selected(outcome: SelectionOutcome) -> Result<usize, SelectionMiss> {
+    match outcome {
+        SelectionOutcome::Selected(idx) => Ok(idx),
+        SelectionOutcome::NotSelected => Err(SelectionMiss::NoCandidates),
+        SelectionOutcome::AllFiltered => Err(SelectionMiss::AllFiltered),
+    }
+}
+
+/// Map a selection miss to the client-facing error: the historical 404 for
+/// an empty pool / policy miss (`no_candidates_msg` preserves each mode's
+/// log line), or 503 when the worker filter chain excluded every candidate —
+/// the model exists and the pool is not overloaded, so neither 404 nor 429
+/// would be truthful.
+fn selection_miss_response(
+    miss: SelectionMiss,
+    model_id: &str,
+    mode: &str,
+    no_candidates_msg: &str,
+) -> Response {
+    match miss {
+        SelectionMiss::NoCandidates => {
+            error!(
+                function = "WorkerSelectionStage::execute",
+                mode = mode,
+                model_id = %model_id,
+                "{no_candidates_msg}"
+            );
+            error::model_not_found(model_id)
+        }
+        SelectionMiss::AllFiltered => {
+            error!(
+                function = "WorkerSelectionStage::execute",
+                mode = mode,
+                model_id = %model_id,
+                "All candidate workers were excluded by request worker filters"
+            );
+            error::service_unavailable(
+                "workers_filtered",
+                format!(
+                    "All candidate workers for model '{model_id}' were excluded by request worker filters"
+                ),
+            )
+        }
     }
 }
 
@@ -625,17 +692,23 @@ fn assign_encode_workers(
     encode_workers: &[Arc<dyn Worker>],
     item_hashes: &[Vec<u8>],
     model_id: &str,
-    policy: &dyn LoadBalancingPolicy,
+    policy: &Arc<dyn LoadBalancingPolicy>,
+    policy_registry: &PolicyRegistry,
     hash_ring: Option<Arc<HashRing>>,
-) -> Option<Vec<EncodeWorkerAssignment>> {
+) -> Result<Vec<EncodeWorkerAssignment>, SelectionMiss> {
     if item_hashes.is_empty() {
-        return Some(Vec::new());
+        return Ok(Vec::new());
     }
 
     item_hashes
         .iter()
         .enumerate()
         .map(|(item_index, content_hash)| {
+            // Per-item selection goes through the registry like every other
+            // leg so worker-side filters apply. Note the info carries the
+            // SYNTHETIC per-item routing headers (content-hash affinity), not
+            // the client's — header-driven filters are inert on this leg by
+            // construction.
             let routing_headers = encode_routing_headers(content_hash);
             let info = SelectWorkerInfo {
                 request_text: None,
@@ -644,7 +717,8 @@ fn assign_encode_workers(
                 hash_ring: hash_ring.clone(),
                 leg: WorkerLeg::Single,
             };
-            let worker_idx = policy.select_worker(encode_workers, &info)?;
+            let worker_idx =
+                require_selected(policy_registry.select_worker(policy, encode_workers, &info))?;
             let worker = encode_workers[worker_idx].clone();
             Metrics::record_worker_selection(
                 metrics_labels::WORKER_ENCODE,
@@ -652,7 +726,7 @@ fn assign_encode_workers(
                 model_id,
                 policy.name(),
             );
-            Some(EncodeWorkerAssignment { item_index, worker })
+            Ok(EncodeWorkerAssignment { item_index, worker })
         })
         .collect()
 }

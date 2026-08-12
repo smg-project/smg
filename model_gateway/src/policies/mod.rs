@@ -14,6 +14,7 @@ mod cache_aware;
 mod consistent_hashing;
 mod dp_min_token;
 mod factory;
+mod filter;
 mod least_load;
 mod manual;
 mod passthrough;
@@ -29,6 +30,7 @@ pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
 pub use factory::PolicyFactory;
+pub use filter::{worker_filters_from_config, LabelHeaderFilter, WorkerFilter};
 // Re-export PrefixMatchResult from kv_index for production use
 pub use kv_index::PrefixMatchResult;
 pub use least_load::LeastLoadPolicy;
@@ -37,7 +39,7 @@ pub use passthrough::PassthroughPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
-pub use registry::PolicyRegistry;
+pub use registry::{PolicyRegistry, SelectionOutcome};
 pub use round_robin::RoundRobinPolicy;
 
 /// Core trait for load balancing policies

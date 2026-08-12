@@ -145,6 +145,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Header name enabling the label worker filter (`None` disables).
+    pub fn worker_filter_header(mut self, header: Option<String>) -> Self {
+        self.config.worker_filter_header = header;
+        self
+    }
+
     // ==================== Connection ====================
 
     /// Explicit runtime for startup workers over ZMQ (`None` keeps
