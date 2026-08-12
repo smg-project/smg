@@ -2,13 +2,11 @@
 
 use std::{
     collections::{hash_map::Entry::Vacant, HashMap, HashSet},
-    io,
     sync::Arc,
     time::Instant,
 };
 
 use axum::response::Response;
-use bytes::Bytes;
 use openai_protocol::{
     chat::{
         ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
@@ -21,7 +19,6 @@ use openai_protocol::{
 };
 use serde_json::json;
 use smg_mcp::{McpToolSession, DEFAULT_SERVER_LABEL};
-use tokio::sync::mpsc;
 use tracing::{debug, error};
 
 use super::{
@@ -37,7 +34,7 @@ use crate::{
     routers::{
         common::{
             openai_bridge::{self, descriptor, FormatRegistry, ResponseFormat},
-            sse::SseEncoder,
+            sse::{sse_channel, SseEncoder, SseSender},
         },
         grpc::{
             common::{
@@ -95,17 +92,13 @@ impl HarmonyStreamingProcessor {
     /// Note: Caller should attach load guards to the returned response using
     /// `WorkerLoadGuard::attach_to_response()` for proper RAII lifecycle management.
     #[expect(
-        clippy::unused_self,
-        reason = "takes Arc<Self> for API consistency with other streaming processors"
-    )]
-    #[expect(
         clippy::disallowed_methods,
         reason = "streaming tasks are fire-and-forget by design; client disconnect terminates them"
     )]
     /// `router_stop_strings` is non-empty only when the router must enforce
     /// string `stop` sequences itself (direct-ZMQ backends: the engine sees
     /// token ids only).
-    pub fn process_streaming_chat_response(
+    pub async fn process_streaming_chat_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
         chat_request: Arc<ChatCompletionRequest>,
@@ -114,7 +107,7 @@ impl HarmonyStreamingProcessor {
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Response {
         // Create SSE channel
-        let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
+        let (tx, rx) = sse_channel();
 
         // Spawn background task based on execution mode
         match execution_result {
@@ -132,10 +125,10 @@ impl HarmonyStreamingProcessor {
 
                     if let Err(e) = result {
                         error!("Harmony streaming error: {}", e);
-                        utils::send_error_sse(&tx, &e, "internal_error");
+                        utils::send_error_sse(&tx, &e, "internal_error").await;
                     }
 
-                    let _ = tx.send(Ok(SseEncoder::done()));
+                    let _ = tx.send(Ok(SseEncoder::done())).await;
                 });
             }
             context::ExecutionResult::PrefillDecode {
@@ -158,10 +151,10 @@ impl HarmonyStreamingProcessor {
 
                     if let Err(e) = result {
                         error!("Harmony prefill/decode streaming error: {}", e);
-                        utils::send_error_sse(&tx, &e, "internal_error");
+                        utils::send_error_sse(&tx, &e, "internal_error").await;
                     }
 
-                    let _ = tx.send(Ok(SseEncoder::done()));
+                    let _ = tx.send(Ok(SseEncoder::done())).await;
                 });
             }
             context::ExecutionResult::Embedding { .. } => {
@@ -170,8 +163,9 @@ impl HarmonyStreamingProcessor {
                     &tx,
                     "Embeddings not supported in Harmony streaming",
                     "invalid_request_error",
-                );
-                let _ = tx.send(Ok(SseEncoder::done()));
+                )
+                .await;
+                let _ = tx.send(Ok(SseEncoder::done())).await;
             }
             // Batch results exist only on the completions pipeline.
             context::ExecutionResult::Batch { .. } => {
@@ -180,8 +174,9 @@ impl HarmonyStreamingProcessor {
                     &tx,
                     "Batched results not supported in Harmony streaming",
                     "invalid_request_error",
-                );
-                let _ = tx.send(Ok(SseEncoder::done()));
+                )
+                .await;
+                let _ = tx.send(Ok(SseEncoder::done())).await;
             }
         }
 
@@ -194,7 +189,7 @@ impl HarmonyStreamingProcessor {
         grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
-        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         router_stop_strings: Vec<String>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
@@ -219,7 +214,7 @@ impl HarmonyStreamingProcessor {
         decode_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
-        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         router_stop_strings: Vec<String>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
@@ -266,7 +261,7 @@ impl HarmonyStreamingProcessor {
         mut decode_stream: ProtoStream,
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
-        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         prompt_tokens: &mut HashMap<u32, u32>,
         cached_tokens: &mut HashMap<u32, u32>,
         router_stop_strings: &[String],
@@ -391,7 +386,8 @@ impl HarmonyStreamingProcessor {
                                 tx,
                                 &mut encoder,
                                 chunk_logprobs,
-                            )?;
+                            )
+                            .await?;
 
                             if is_first {
                                 is_firsts.insert(index, false);
@@ -410,7 +406,8 @@ impl HarmonyStreamingProcessor {
                                 original_request,
                                 tx,
                                 &mut encoder,
-                            )?;
+                            )
+                            .await?;
                             router_stopped.insert(index);
                         }
                     }
@@ -464,7 +461,8 @@ impl HarmonyStreamingProcessor {
                                 tx,
                                 &mut encoder,
                                 None,
-                            )?;
+                            )
+                            .await?;
                         }
 
                         Self::emit_final_chunk(
@@ -475,7 +473,8 @@ impl HarmonyStreamingProcessor {
                             original_request,
                             tx,
                             &mut encoder,
-                        )?;
+                        )
+                        .await?;
                     }
                 }
                 ProtoResponseVariant::None => {}
@@ -525,7 +524,8 @@ impl HarmonyStreamingProcessor {
                 original_request,
                 tx,
                 &mut encoder,
-            )?;
+            )
+            .await?;
         }
 
         // Record streaming metrics
@@ -545,13 +545,13 @@ impl HarmonyStreamingProcessor {
 
     /// Emit a chunk delta from Harmony channels
     #[expect(clippy::too_many_arguments)]
-    fn emit_chunk_delta(
+    async fn emit_chunk_delta(
         delta: &HarmonyChannelDelta,
         index: u32,
         is_first: bool,
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
-        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         encoder: &mut SseEncoder,
         logprobs: Option<ChatLogProbs>,
     ) -> Result<(), String> {
@@ -571,6 +571,7 @@ impl HarmonyStreamingProcessor {
                 .map_err(|e| format!("JSON serialization error: {e}"))?;
 
             tx.send(Ok(sse_data))
+                .await
                 .map_err(|_| "Failed to send role chunk".to_string())?;
         }
 
@@ -611,19 +612,20 @@ impl HarmonyStreamingProcessor {
             .map_err(|e| format!("JSON serialization error: {e}"))?;
 
         tx.send(Ok(sse_data))
+            .await
             .map_err(|_| "Failed to send chunk".to_string())?;
 
         Ok(())
     }
 
     /// Emit final chunk with finish_reason
-    fn emit_final_chunk(
+    async fn emit_final_chunk(
         index: u32,
         finish_reason: &str,
         matched_stop: Option<&serde_json::Value>,
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
-        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         encoder: &mut SseEncoder,
     ) -> Result<(), String> {
         let chunk =
@@ -638,19 +640,20 @@ impl HarmonyStreamingProcessor {
             .map_err(|e| format!("JSON serialization error: {e}"))?;
 
         tx.send(Ok(sse_data))
+            .await
             .map_err(|_| "Failed to send final chunk".to_string())?;
 
         Ok(())
     }
 
     /// Emit usage chunk at the end
-    fn emit_usage_chunk(
+    async fn emit_usage_chunk(
         prompt_tokens: u32,
         completion_tokens: u32,
         cached_tokens: u32,
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
-        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         encoder: &mut SseEncoder,
     ) -> Result<(), String> {
         let usage_chunk =
@@ -668,6 +671,7 @@ impl HarmonyStreamingProcessor {
             .map_err(|e| format!("JSON serialization error: {e}"))?;
 
         tx.send(Ok(sse_data))
+            .await
             .map_err(|_| "Failed to send usage chunk".to_string())?;
 
         Ok(())
@@ -684,7 +688,7 @@ impl HarmonyStreamingProcessor {
     pub async fn process_responses_iteration_stream(
         execution_result: context::ExecutionResult,
         emitter: &mut ResponseStreamEventEmitter,
-        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
     ) -> Result<ResponsesIterationResult, String> {
@@ -724,7 +728,7 @@ impl HarmonyStreamingProcessor {
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
         emitter: &mut ResponseStreamEventEmitter,
-        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
     ) -> Result<ResponsesIterationResult, String> {
@@ -758,7 +762,7 @@ impl HarmonyStreamingProcessor {
     async fn process_decode_stream(
         mut decode_stream: ProtoStream,
         emitter: &mut ResponseStreamEventEmitter,
-        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
         prefill_cached_tokens: u32,
@@ -815,6 +819,7 @@ impl HarmonyStreamingProcessor {
                                 // Note: reasoning_content will be provided at finalize
                                 emitter
                                     .emit_reasoning_item(tx, None)
+                                    .await
                                     .map_err(|e| format!("Failed to emit reasoning item: {e}"))?;
 
                                 has_emitted_reasoning = true;
@@ -842,7 +847,7 @@ impl HarmonyStreamingProcessor {
 
                                     // Emit output_item.added
                                     let event = emitter.emit_output_item_added(output_index, &item);
-                                    emitter.send_event_best_effort(&event, tx);
+                                    emitter.send_event_best_effort(&event, tx).await;
                                 }
 
                                 let Some(output_index) = message_output_index else {
@@ -860,7 +865,7 @@ impl HarmonyStreamingProcessor {
                                         item_id,
                                         content_index,
                                     );
-                                    emitter.send_event_best_effort(&event, tx);
+                                    emitter.send_event_best_effort(&event, tx).await;
                                     has_emitted_content_part_added = true;
                                 }
 
@@ -871,7 +876,7 @@ impl HarmonyStreamingProcessor {
                                     item_id,
                                     content_index,
                                 );
-                                emitter.send_event_best_effort(&event, tx);
+                                emitter.send_event_best_effort(&event, tx).await;
 
                                 accumulated_final_text.push_str(final_delta);
                             }
@@ -933,7 +938,7 @@ impl HarmonyStreamingProcessor {
                                 );
 
                                 let event = emitter.emit_output_item_added(output_index, &item);
-                                emitter.send_event_best_effort(&event, tx);
+                                emitter.send_event_best_effort(&event, tx).await;
 
                                 // Emit in_progress event for MCP tools
                                 if let Some(fmt) = response_format {
@@ -942,7 +947,7 @@ impl HarmonyStreamingProcessor {
                                         &item_id,
                                         fmt,
                                     );
-                                    emitter.send_event_best_effort(&event, tx);
+                                    emitter.send_event_best_effort(&event, tx).await;
 
                                     // Emit searching/interpreting event for builtin tools
                                     if let Some(event) = emitter.emit_tool_call_searching(
@@ -950,7 +955,7 @@ impl HarmonyStreamingProcessor {
                                         &item_id,
                                         fmt,
                                     ) {
-                                        emitter.send_event_best_effort(&event, tx);
+                                        emitter.send_event_best_effort(&event, tx).await;
                                     }
                                 }
 
@@ -974,7 +979,7 @@ impl HarmonyStreamingProcessor {
                                             "",
                                         ),
                                     };
-                                    emitter.send_event_best_effort(&event, tx);
+                                    emitter.send_event_best_effort(&event, tx).await;
                                 }
                             } else {
                                 // Continuing tool call: emit arguments delta
@@ -1010,7 +1015,7 @@ impl HarmonyStreamingProcessor {
                                                 args,
                                             ),
                                         };
-                                        emitter.send_event_best_effort(&event, tx);
+                                        emitter.send_event_best_effort(&event, tx).await;
                                     }
                                 }
                             }
@@ -1067,7 +1072,7 @@ impl HarmonyStreamingProcessor {
                                             args_str,
                                         ),
                                     };
-                                    emitter.send_event_best_effort(&event, tx);
+                                    emitter.send_event_best_effort(&event, tx).await;
                                 }
 
                                 // Emit completed event for MCP tools
@@ -1077,7 +1082,7 @@ impl HarmonyStreamingProcessor {
                                         item_id,
                                         fmt,
                                     );
-                                    emitter.send_event_best_effort(&event, tx);
+                                    emitter.send_event_best_effort(&event, tx).await;
                                 }
 
                                 // Determine type string for JSON
@@ -1105,7 +1110,7 @@ impl HarmonyStreamingProcessor {
 
                                 let event = emitter.emit_output_item_done(*output_index, &item);
                                 emitter.complete_output_item(*output_index);
-                                emitter.send_event_best_effort(&event, tx);
+                                emitter.send_event_best_effort(&event, tx).await;
                             }
                         }
                     }
@@ -1118,12 +1123,12 @@ impl HarmonyStreamingProcessor {
 
                         // Emit text_done
                         let event = emitter.emit_text_done(output_index, item_id, content_index);
-                        emitter.send_event_best_effort(&event, tx);
+                        emitter.send_event_best_effort(&event, tx).await;
 
                         // Emit content_part.done
                         let event =
                             emitter.emit_content_part_done(output_index, item_id, content_index);
-                        emitter.send_event_best_effort(&event, tx);
+                        emitter.send_event_best_effort(&event, tx).await;
 
                         // Emit output_item.done
                         let item = json!({
@@ -1140,7 +1145,7 @@ impl HarmonyStreamingProcessor {
                         // Mark as completed before sending (so it's included in final output even if send fails)
                         emitter.complete_output_item(output_index);
 
-                        emitter.send_event_best_effort(&event, tx);
+                        emitter.send_event_best_effort(&event, tx).await;
                     }
                 }
                 ProtoResponseVariant::None => {}
@@ -1204,14 +1209,14 @@ impl HarmonyStreamingProcessor {
                                     args_str,
                                 ),
                             };
-                            emitter.send_event_best_effort(&event, tx);
+                            emitter.send_event_best_effort(&event, tx).await;
                         }
 
                         // Emit completed event for MCP tools
                         if let Some(fmt) = *response_format {
                             let event =
                                 emitter.emit_tool_call_completed(*output_index, item_id, fmt);
-                            emitter.send_event_best_effort(&event, tx);
+                            emitter.send_event_best_effort(&event, tx).await;
                         }
 
                         let type_str = ResponseStreamEventEmitter::type_str_for_format(
@@ -1238,7 +1243,7 @@ impl HarmonyStreamingProcessor {
 
                         let event = emitter.emit_output_item_done(*output_index, &item);
                         emitter.complete_output_item(*output_index);
-                        emitter.send_event_best_effort(&event, tx);
+                        emitter.send_event_best_effort(&event, tx).await;
                     }
                 }
             }

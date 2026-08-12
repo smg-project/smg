@@ -274,6 +274,7 @@ impl RequestExecutionStage {
             }
             Some(RuntimeType::Trtllm)
             | Some(RuntimeType::Mlx)
+            | Some(RuntimeType::Generic)
             | Some(RuntimeType::External)
             | Some(RuntimeType::Unspecified) => {
                 error!(
@@ -536,6 +537,16 @@ impl RequestExecutionStage {
                 format!("Decode worker failed to start: {}", e.message()),
             )
         })?;
+
+        // A client disconnect drops both leg streams, which normally fires an
+        // immediate abort to each worker. The decode leg must not be aborted
+        // while it is still receiving the KV handoff from prefill — tearing
+        // the request down mid-transfer can crash or leak on the engine — so
+        // its abort is deferred until the first decode response (the proof
+        // the handoff completed). The prefill leg keeps the immediate abort:
+        // if prefill is still running there is nothing to hand off yet, and
+        // stopping it promptly frees capacity.
+        let decode_stream = decode_stream.defer_abort_until_first_item();
 
         Ok(ExecutionResult::PrefillDecode {
             prefill: prefill_stream,
@@ -815,6 +826,13 @@ impl RequestExecutionStage {
             runtime,
             kv_window_start.elapsed(),
         );
+
+        // Prefill has completed and its KV blocks are held pending decode's
+        // transfer; aborting decode mid-transfer on a client disconnect can
+        // crash or leak on the engine side. Defer the abort until the first
+        // decode response proves the handoff finished (see the parallel PD
+        // path for the same invariant).
+        let decode_stream = decode_stream.defer_abort_until_first_item();
 
         Ok(ExecutionResult::Single {
             stream: decode_stream,

@@ -38,22 +38,20 @@ use crate::routers::{
 pub(crate) struct ResponseProcessor {
     pub tool_parser_factory: ToolParserFactory,
     pub reasoning_parser_factory: ReasoningParserFactory,
-    pub configured_tool_parser: Option<String>,
-    pub configured_reasoning_parser: Option<String>,
+    /// Per-request parser-name resolution (model-card override → configured).
+    pub parser_resolver: utils::ParserResolver,
 }
 
 impl ResponseProcessor {
     pub fn new(
         tool_parser_factory: ToolParserFactory,
         reasoning_parser_factory: ReasoningParserFactory,
-        configured_tool_parser: Option<String>,
-        configured_reasoning_parser: Option<String>,
+        parser_resolver: utils::ParserResolver,
     ) -> Self {
         Self {
             tool_parser_factory,
             reasoning_parser_factory,
-            configured_tool_parser,
-            configured_reasoning_parser,
+            parser_resolver,
         }
     }
 
@@ -69,6 +67,11 @@ impl ResponseProcessor {
         history_tool_calls_count: usize,
         reasoning_parser_available: bool,
         tool_parser_available: bool,
+        // Resolved once per request by the caller: keeps every choice of one
+        // request on the same parser even if the worker registry changes
+        // between availability check and parsing.
+        reasoning_parser_name: Option<&str>,
+        tool_parser_name: Option<&str>,
     ) -> Result<ChatChoice, String> {
         stop_decoder.reset();
         // Decode tokens
@@ -109,7 +112,7 @@ impl ResponseProcessor {
             // across requests, so avoid serializing on the shared pooled mutex.
             if let Some(mut parser) = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_deref(),
+                reasoning_parser_name,
                 &original_request.model,
             ) {
                 // If the template injected `<think>` in the prefill (thinking toggle
@@ -151,7 +154,7 @@ impl ResponseProcessor {
             let has_structural_tag = self
                 .tool_parser_factory
                 .registry()
-                .has_structural_tag_for_parser(self.configured_tool_parser.as_deref());
+                .has_structural_tag_for_parser(tool_parser_name);
             let used_json_schema = if has_structural_tag {
                 false
             } else {
@@ -175,6 +178,7 @@ impl ResponseProcessor {
                     .parse_tool_calls(
                         &processed_text,
                         &original_request.model,
+                        tool_parser_name,
                         original_request.tools.as_deref().unwrap_or(&[]),
                         history_tool_calls_count,
                     )
@@ -241,6 +245,8 @@ impl ResponseProcessor {
         stop_decoder: &mut StopSequenceDecoder,
         request_logprobs: bool,
     ) -> Result<ChatCompletionResponse, axum::response::Response> {
+        let reasoning_parser_name = self.parser_resolver.reasoning_parser(&chat_request.model);
+        let tool_parser_name = self.parser_resolver.tool_parser(&chat_request.model);
         // Collect all responses from the execution result
         let all_responses =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
@@ -251,7 +257,7 @@ impl ResponseProcessor {
         let reasoning_parser_available = chat_request.separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_deref(),
+                reasoning_parser_name.as_deref(),
                 &chat_request.model,
             );
 
@@ -264,7 +270,7 @@ impl ResponseProcessor {
             && chat_request.tools.is_some()
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
-                self.configured_tool_parser.as_deref(),
+                tool_parser_name.as_deref(),
                 &chat_request.model,
             );
 
@@ -296,6 +302,8 @@ impl ResponseProcessor {
                     history_tool_calls_count,
                     reasoning_parser_available,
                     tool_parser_available,
+                    reasoning_parser_name.as_deref(),
+                    tool_parser_name.as_deref(),
                 )
                 .await
             {
@@ -328,15 +336,14 @@ impl ResponseProcessor {
         &self,
         processed_text: &str,
         model: &str,
+        // Resolved once per request by the caller (see process_single_choice).
+        tool_parser_name: Option<&str>,
         tools: &[Tool],
         history_tool_calls_count: usize,
     ) -> (Option<Vec<ToolCall>>, String) {
         // Get pooled parser for this model
-        let pooled_parser = utils::get_tool_parser(
-            &self.tool_parser_factory,
-            self.configured_tool_parser.as_deref(),
-            model,
-        );
+        let pooled_parser =
+            utils::get_tool_parser(&self.tool_parser_factory, tool_parser_name, model);
 
         // Try parsing directly (parser will handle detection internally). Pass the
         // tool schemas so schema-aware parsers coerce argument types by their
@@ -502,6 +509,10 @@ impl ResponseProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<Message, axum::response::Response> {
+        let reasoning_parser_name = self
+            .parser_resolver
+            .reasoning_parser(&messages_request.model);
+        let tool_parser_name = self.parser_resolver.tool_parser(&messages_request.model);
         // Collect all responses (no logprobs for Messages API)
         let all_responses = response_collection::collect_responses(execution_result, false).await?;
 
@@ -537,7 +548,7 @@ impl ResponseProcessor {
         // or when the selected parser needs structural special tokens (e.g. Inkling).
         let reasoning_requires_special_tokens = utils::reasoning_parser_requires_special_tokens(
             &self.reasoning_parser_factory,
-            self.configured_reasoning_parser.as_deref(),
+            reasoning_parser_name.as_deref(),
             &messages_request.model,
         );
         let separate_reasoning = reasoning_requires_special_tokens
@@ -551,7 +562,7 @@ impl ResponseProcessor {
         let reasoning_parser_available = separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_deref(),
+                reasoning_parser_name.as_deref(),
                 &messages_request.model,
             );
 
@@ -564,7 +575,7 @@ impl ResponseProcessor {
             && messages_request.tools.is_some()
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
-                self.configured_tool_parser.as_deref(),
+                tool_parser_name.as_deref(),
                 &messages_request.model,
             );
 
@@ -624,7 +635,7 @@ impl ResponseProcessor {
             // across requests, so avoid serializing on the shared pooled mutex.
             if let Some(mut parser) = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_deref(),
+                reasoning_parser_name.as_deref(),
                 &messages_request.model,
             ) {
                 // If thinking is effectively ON and template has a toggle, start in reasoning mode.
@@ -664,7 +675,7 @@ impl ResponseProcessor {
             let has_structural_tag = self
                 .tool_parser_factory
                 .registry()
-                .has_structural_tag_for_parser(self.configured_tool_parser.as_deref());
+                .has_structural_tag_for_parser(tool_parser_name.as_deref());
             let used_json_schema = !has_structural_tag
                 && matches!(
                     &messages_request.tool_choice,
@@ -694,6 +705,7 @@ impl ResponseProcessor {
                     .parse_tool_calls(
                         &processed_text,
                         &messages_request.model,
+                        tool_parser_name.as_deref(),
                         &chat_tools,
                         utils::message_utils::get_history_tool_calls_count_messages(
                             &messages_request,
@@ -740,7 +752,7 @@ impl ResponseProcessor {
                 };
 
                 content_blocks.push(messages::ContentBlock::ToolUse {
-                    id: tc.id.clone(),
+                    id: utils::message_utils::anthropic_tool_use_id(&tc.id),
                     name: tc.function.name.clone(),
                     input,
                 });

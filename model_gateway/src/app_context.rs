@@ -669,18 +669,48 @@ impl AppContextBuilder {
 
     /// Create KV event monitor for event-driven cache-aware routing.
     ///
-    /// The monitor is created when the default policy is cache_aware, regardless
-    /// of connection mode. The monitor itself is cheap (empty DashMaps) and stays
-    /// dormant until workers are added. The UpdatePoliciesStep gates subscriptions
-    /// on `cache_aware && gRPC`, so HTTP workers are never subscribed.
+    /// The monitor is created when ANY serving policy is cache_aware — the
+    /// global default or a PD/EPD role override (a non-cache-aware global with
+    /// a cache-aware decode policy still needs event-driven indexers) —
+    /// regardless of connection mode. The monitor itself is cheap (empty
+    /// DashMaps) and stays dormant until workers are added. The
+    /// UpdatePoliciesStep gates subscriptions on `cache_aware && gRPC`, so
+    /// HTTP workers are never subscribed.
     fn with_kv_event_monitor(mut self, config: &RouterConfig) -> Self {
-        use crate::config::types::PolicyConfig;
+        use crate::config::types::{PolicyConfig, RoutingMode};
 
-        let is_cache_aware = matches!(config.policy, PolicyConfig::CacheAware { .. });
+        let role_is_cache_aware =
+            |policy: &Option<PolicyConfig>| matches!(policy, Some(PolicyConfig::CacheAware { .. }));
+        let is_cache_aware = matches!(config.policy, PolicyConfig::CacheAware { .. })
+            || match &config.mode {
+                RoutingMode::PrefillDecode {
+                    prefill_policy,
+                    decode_policy,
+                    ..
+                } => role_is_cache_aware(prefill_policy) || role_is_cache_aware(decode_policy),
+                RoutingMode::EncodePrefillDecode {
+                    encode_policy,
+                    prefill_policy,
+                    decode_policy,
+                    ..
+                } => {
+                    role_is_cache_aware(encode_policy)
+                        || role_is_cache_aware(prefill_policy)
+                        || role_is_cache_aware(decode_policy)
+                }
+                _ => false,
+            };
 
         if is_cache_aware {
             let monitor = Arc::new(KvEventMonitor::new(None));
             debug!("Created KV event monitor for event-driven cache-aware routing");
+
+            // Optional indexer bounding: prune entries by last-touch TTL and/or
+            // capacity ceiling. Both default off (unbounded, prior behavior).
+            monitor.start_prune_task(
+                config.kv_indexer_ttl_secs.unwrap_or(0),
+                config.kv_indexer_max_entries.unwrap_or(0),
+            );
 
             // Inject monitor into PolicyRegistry — propagates to default_policy
             // and any other existing cache-aware policies.
@@ -783,6 +813,53 @@ mod tests {
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
         }));
+    }
+
+    /// A cache-aware PD/EPD role policy needs the monitor even when the
+    /// global policy is not cache-aware.
+    #[test]
+    fn test_cache_aware_role_policy_creates_kv_event_monitor() {
+        use crate::config::types::RoutingMode;
+
+        let cache_aware = PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 30,
+            max_tree_size: 1000,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+        };
+
+        let mut config = config_with_policy(PolicyConfig::Random);
+        config.mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: Some(cache_aware.clone()),
+        };
+        let created = AppContextBuilder::new()
+            .with_policy_registry(&config)
+            .with_kv_event_monitor(&config)
+            .kv_event_monitor
+            .is_some();
+        assert!(created, "cache-aware decode policy must create the monitor");
+
+        // Non-cache-aware role policies still skip it.
+        let mut config = config_with_policy(PolicyConfig::Random);
+        config.mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: Some(PolicyConfig::RoundRobin),
+            decode_policy: None,
+        };
+        let created = AppContextBuilder::new()
+            .with_policy_registry(&config)
+            .with_kv_event_monitor(&config)
+            .kv_event_monitor
+            .is_some();
+        assert!(!created);
     }
 
     #[test]

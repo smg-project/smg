@@ -8,7 +8,7 @@
 //! - Payload transformation for MCP tool interception
 //! - Metadata injection for MCP operations
 
-use std::{collections::HashSet, io};
+use std::collections::HashSet;
 
 use axum::http::HeaderMap;
 use bytes::Bytes;
@@ -18,7 +18,6 @@ use openai_protocol::{
 };
 use serde_json::{json, to_value, Value};
 use smg_mcp::{McpServerBinding, McpToolSession, ToolExecutionInput, ToolExecutionResult};
-use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::tool_handler::FunctionCallInProgress;
@@ -32,6 +31,7 @@ use crate::{
                 self, extract_embedded_openai_responses, mcp_response_item_id, FormatRegistry,
                 ResponseFormat, ResponseTransformer,
             },
+            sse::SseSender,
         },
         error,
         openai::responses::utils,
@@ -171,7 +171,7 @@ pub(crate) async fn execute_streaming_tool_calls(
     pending_calls: Vec<FunctionCallInProgress>,
     session: &McpToolSession<'_>,
     format_registry: &FormatRegistry,
-    tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    tx: &SseSender,
     state: &mut ToolLoopState,
     sequence_number: &mut u64,
     model_id: &str,
@@ -228,7 +228,9 @@ pub(crate) async fn execute_streaming_tool_calls(
                     &mcp_call_item,
                     response_format,
                     sequence_number,
-                ) {
+                )
+                .await
+                {
                     return false;
                 }
                 state.record_call(
@@ -243,7 +245,7 @@ pub(crate) async fn execute_streaming_tool_calls(
             }
         };
 
-        if !send_tool_call_intermediate_event(tx, &call, response_format, sequence_number) {
+        if !send_tool_call_intermediate_event(tx, &call, response_format, sequence_number).await {
             return false;
         }
 
@@ -303,7 +305,9 @@ pub(crate) async fn execute_streaming_tool_calls(
             &mcp_call_item,
             response_format,
             sequence_number,
-        ) {
+        )
+        .await
+        {
             return false;
         }
 
@@ -442,8 +446,8 @@ pub(crate) fn build_resume_payload(
 
 /// Send mcp_list_tools events to client at the start of streaming
 /// Returns false if client disconnected
-pub(crate) fn send_mcp_list_tools_events(
-    tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+pub(crate) async fn send_mcp_list_tools_events(
+    tx: &SseSender,
     session: &McpToolSession<'_>,
     server_label: &str,
     output_index: usize,
@@ -475,7 +479,7 @@ pub(crate) fn send_mcp_list_tools_events(
         OutputItemEvent::ADDED,
         event1_payload
     );
-    if tx.send(Ok(Bytes::from(event1))).is_err() {
+    if tx.send(Ok(Bytes::from(event1))).await.is_err() {
         return false; // Client disconnected
     }
 
@@ -492,7 +496,7 @@ pub(crate) fn send_mcp_list_tools_events(
         McpEvent::LIST_TOOLS_IN_PROGRESS,
         event2_payload
     );
-    if tx.send(Ok(Bytes::from(event2))).is_err() {
+    if tx.send(Ok(Bytes::from(event2))).await.is_err() {
         return false;
     }
 
@@ -509,7 +513,7 @@ pub(crate) fn send_mcp_list_tools_events(
         McpEvent::LIST_TOOLS_COMPLETED,
         event3_payload
     );
-    if tx.send(Ok(Bytes::from(event3))).is_err() {
+    if tx.send(Ok(Bytes::from(event3))).await.is_err() {
         return false;
     }
 
@@ -526,13 +530,13 @@ pub(crate) fn send_mcp_list_tools_events(
         OutputItemEvent::DONE,
         event4_payload
     );
-    tx.send(Ok(Bytes::from(event4))).is_ok()
+    tx.send(Ok(Bytes::from(event4))).await.is_ok()
 }
 
 /// Send intermediate event during tool execution (searching/interpreting).
 /// Returns false if client disconnected.
-fn send_tool_call_intermediate_event(
-    tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+async fn send_tool_call_intermediate_event(
+    tx: &SseSender,
     call: &FunctionCallInProgress,
     response_format: ResponseFormat,
     sequence_number: &mut u64,
@@ -555,15 +559,15 @@ fn send_tool_call_intermediate_event(
     *sequence_number += 1;
 
     let event = format!("event: {event_type}\ndata: {event_payload}\n\n");
-    tx.send(Ok(Bytes::from(event))).is_ok()
+    tx.send(Ok(Bytes::from(event))).await.is_ok()
 }
 
 /// Send tool call completion events after tool execution.
 /// Handles mcp_call, web_search_call, code_interpreter_call, file_search_call,
 /// and image_generation_call items.
 /// Returns false if client disconnected.
-fn send_tool_call_completion_events(
-    tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+async fn send_tool_call_completion_events(
+    tx: &SseSender,
     call: &FunctionCallInProgress,
     tool_call_item: &Value,
     response_format: ResponseFormat,
@@ -593,7 +597,7 @@ fn send_tool_call_completion_events(
     *sequence_number += 1;
 
     let completed_event = format!("event: {completed_event_type}\ndata: {completed_payload}\n\n");
-    if tx.send(Ok(Bytes::from(completed_event))).is_err() {
+    if tx.send(Ok(Bytes::from(completed_event))).await.is_err() {
         return false;
     }
 
@@ -611,7 +615,7 @@ fn send_tool_call_completion_events(
         OutputItemEvent::DONE,
         done_payload
     );
-    tx.send(Ok(Bytes::from(done_event))).is_ok()
+    tx.send(Ok(Bytes::from(done_event))).await.is_ok()
 }
 
 fn stable_streaming_tool_item_id(
@@ -1644,9 +1648,7 @@ mod tests {
     // L1054-L1072).
     // ========================================================================
 
-    fn drain_channel(
-        rx: &mut mpsc::UnboundedReceiver<Result<bytes::Bytes, std::io::Error>>,
-    ) -> Vec<String> {
+    fn drain_channel(rx: &mut mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>) -> Vec<String> {
         let mut events = Vec::new();
         while let Ok(chunk) = rx.try_recv() {
             let bytes = chunk.expect("no io errors in unit-test channel");
@@ -1667,8 +1669,8 @@ mod tests {
         block.to_string()
     }
 
-    #[test]
-    fn image_generation_completion_events_fire_before_output_item_done() {
+    #[tokio::test]
+    async fn image_generation_completion_events_fire_before_output_item_done() {
         // Gap B lock test: after the tool executes, the completion
         // emitter must push `response.image_generation_call.completed`
         // onto the wire BEFORE `response.output_item.done`. If a future
@@ -1690,7 +1692,7 @@ mod tests {
             "result": "BASE64",
         });
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
         let mut sequence_number: u64 = 0;
 
         let ok = super::send_tool_call_completion_events(
@@ -1699,7 +1701,8 @@ mod tests {
             &tool_call_item,
             ResponseFormat::ImageGenerationCall,
             &mut sequence_number,
-        );
+        )
+        .await;
         assert!(ok, "send_tool_call_completion_events should not disconnect");
         drop(tx);
 
@@ -1725,8 +1728,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn web_search_completion_events_fire_before_output_item_done() {
+    #[tokio::test]
+    async fn web_search_completion_events_fire_before_output_item_done() {
         // Same ordering contract for the pre-existing web_search_call path,
         // so the invariant applies uniformly across every hosted-tool
         // ResponseFormat we emit.
@@ -1747,7 +1750,7 @@ mod tests {
             "action": {"type": "search"}
         });
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
         let mut sequence_number: u64 = 0;
 
         let ok = super::send_tool_call_completion_events(
@@ -1756,7 +1759,8 @@ mod tests {
             &tool_call_item,
             ResponseFormat::WebSearchCall,
             &mut sequence_number,
-        );
+        )
+        .await;
         assert!(ok);
         drop(tx);
 
@@ -1777,8 +1781,8 @@ mod tests {
         assert!(completed_idx < done_idx);
     }
 
-    #[test]
-    fn code_interpreter_completion_events_fire_before_output_item_done() {
+    #[tokio::test]
+    async fn code_interpreter_completion_events_fire_before_output_item_done() {
         // The suppression gate in `tool_handler.rs` drops the upstream
         // umbrella `output_item.done` for every tool-call item type. This
         // test locks the downstream half of the contract for
@@ -1803,7 +1807,7 @@ mod tests {
             "code": "print('hi')",
         });
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
         let mut sequence_number: u64 = 0;
 
         let ok = super::send_tool_call_completion_events(
@@ -1812,7 +1816,8 @@ mod tests {
             &tool_call_item,
             ResponseFormat::CodeInterpreterCall,
             &mut sequence_number,
-        );
+        )
+        .await;
         assert!(ok);
         drop(tx);
 
@@ -1849,8 +1854,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn file_search_completion_events_fire_before_output_item_done() {
+    #[tokio::test]
+    async fn file_search_completion_events_fire_before_output_item_done() {
         // Lock the ordering contract for the hosted `file_search_call`
         // format so the gate's suppression covers every tool-call item
         // type listed in `TOOL_CALL_ITEM_TYPES`.
@@ -1871,7 +1876,7 @@ mod tests {
             "queries": ["needle"],
         });
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
         let mut sequence_number: u64 = 0;
 
         let ok = super::send_tool_call_completion_events(
@@ -1880,7 +1885,8 @@ mod tests {
             &tool_call_item,
             ResponseFormat::FileSearchCall,
             &mut sequence_number,
-        );
+        )
+        .await;
         assert!(ok);
         drop(tx);
 

@@ -3,11 +3,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::response::Response;
-use bytes::Bytes;
 use openai_protocol::responses::ResponsesRequest;
 use serde_json::json;
 use smg_mcp::{McpServerBinding, McpToolSession};
-use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -22,7 +20,10 @@ use crate::{
     middleware::TenantRequestMeta,
     observability::metrics::Metrics,
     routers::{
-        common::mcp_utils::DEFAULT_MAX_ITERATIONS,
+        common::{
+            mcp_utils::DEFAULT_MAX_ITERATIONS,
+            sse::{sse_channel, SseSender},
+        },
         grpc::{
             common::responses::{
                 build_sse_response, ensure_mcp_connection, persist_response_if_needed,
@@ -65,7 +66,7 @@ pub(crate) async fn serve_harmony_responses_stream(
     };
 
     // Create SSE channel
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = sse_channel();
 
     // Create response event emitter
     let response_id = format!("resp_{}", Uuid::now_v7());
@@ -88,11 +89,11 @@ pub(crate) async fn serve_harmony_responses_stream(
 
         // Emit initial response.created and response.in_progress events
         let event = emitter.emit_created();
-        if emitter.send_event(&event, &tx).is_err() {
+        if emitter.send_event(&event, &tx).await.is_err() {
             return;
         }
         let event = emitter.emit_in_progress();
-        if emitter.send_event(&event, &tx).is_err() {
+        if emitter.send_event(&event, &tx).await.is_err() {
             return;
         }
 
@@ -139,7 +140,7 @@ async fn execute_mcp_tool_loop_streaming(
     tenant_request_meta: TenantRequestMeta,
     mcp_servers: Vec<McpServerBinding>,
     emitter: &mut ResponseStreamEventEmitter,
-    tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    tx: &SseSender,
 ) {
     let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
 
@@ -185,6 +186,7 @@ async fn execute_mcp_tool_loop_streaming(
 
         if emitter
             .emit_mcp_list_tools_sequence(&binding.label, &tools_for_server, tx)
+            .await
             .is_err()
         {
             return;
@@ -206,11 +208,13 @@ async fn execute_mcp_tool_loop_streaming(
 
         // Safety check: prevent infinite loops
         if iteration_count > DEFAULT_MAX_ITERATIONS {
-            emitter.emit_error(
-                &format!("Maximum tool iterations ({DEFAULT_MAX_ITERATIONS}) exceeded"),
-                Some("max_iterations_exceeded"),
-                tx,
-            );
+            emitter
+                .emit_error(
+                    &format!("Maximum tool iterations ({DEFAULT_MAX_ITERATIONS}) exceeded"),
+                    Some("max_iterations_exceeded"),
+                    tx,
+                )
+                .await;
             return;
         }
 
@@ -231,11 +235,13 @@ async fn execute_mcp_tool_loop_streaming(
         {
             Ok(result) => result,
             Err(err_response) => {
-                emitter.emit_error(
-                    &format!("Pipeline execution failed: {err_response:?}"),
-                    Some("pipeline_error"),
-                    tx,
-                );
+                emitter
+                    .emit_error(
+                        &format!("Pipeline execution failed: {err_response:?}"),
+                        Some("pipeline_error"),
+                        tx,
+                    )
+                    .await;
                 return;
             }
         };
@@ -252,7 +258,9 @@ async fn execute_mcp_tool_loop_streaming(
         {
             Ok(result) => result,
             Err(err_msg) => {
-                emitter.emit_error(&err_msg, Some("processing_error"), tx);
+                emitter
+                    .emit_error(&err_msg, Some("processing_error"), tx)
+                    .await;
                 return;
             }
         };
@@ -311,7 +319,7 @@ async fn execute_mcp_tool_loop_streaming(
                         "incomplete_details": incomplete_details,
                     });
                     let event = emitter.emit_completed(Some(&usage_json));
-                    emitter.send_event_best_effort(&event, tx);
+                    emitter.send_event_best_effort(&event, tx).await;
                     return;
                 }
 
@@ -336,11 +344,13 @@ async fn execute_mcp_tool_loop_streaming(
                     {
                         Ok(results) => results,
                         Err(err_response) => {
-                            emitter.emit_error(
-                                &format!("MCP tool execution failed: {err_response:?}"),
-                                Some("mcp_tool_error"),
-                                tx,
-                            );
+                            emitter
+                                .emit_error(
+                                    &format!("MCP tool execution failed: {err_response:?}"),
+                                    Some("mcp_tool_error"),
+                                    tx,
+                                )
+                                .await;
                             return;
                         }
                     }
@@ -365,7 +375,7 @@ async fn execute_mcp_tool_loop_streaming(
                         "total_tokens": usage.total_tokens,
                     });
                     let event = emitter.emit_completed(Some(&usage_json));
-                    emitter.send_event_best_effort(&event, tx);
+                    emitter.send_event_best_effort(&event, tx).await;
                     return;
                 }
 
@@ -418,7 +428,7 @@ async fn execute_mcp_tool_loop_streaming(
                     }
                 }
                 let event = emitter.emit_completed(Some(&usage_json));
-                emitter.send_event_best_effort(&event, tx);
+                emitter.send_event_best_effort(&event, tx).await;
                 return;
             }
         }
@@ -435,7 +445,7 @@ async fn execute_without_mcp_streaming(
     original_request: &ResponsesRequest,
     tenant_request_meta: TenantRequestMeta,
     emitter: &mut ResponseStreamEventEmitter,
-    tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    tx: &SseSender,
 ) {
     debug!("No MCP tools - executing single iteration");
 
@@ -447,11 +457,13 @@ async fn execute_without_mcp_streaming(
     {
         Ok(result) => result,
         Err(err_response) => {
-            emitter.emit_error(
-                &format!("Pipeline execution failed: {err_response:?}"),
-                Some("pipeline_error"),
-                tx,
-            );
+            emitter
+                .emit_error(
+                    &format!("Pipeline execution failed: {err_response:?}"),
+                    Some("pipeline_error"),
+                    tx,
+                )
+                .await;
             return;
         }
     };
@@ -468,7 +480,9 @@ async fn execute_without_mcp_streaming(
     {
         Ok(result) => result,
         Err(err_msg) => {
-            emitter.emit_error(&err_msg, Some("processing_error"), tx);
+            emitter
+                .emit_error(&err_msg, Some("processing_error"), tx)
+                .await;
             return;
         }
     };
@@ -506,5 +520,5 @@ async fn execute_without_mcp_streaming(
         }
     }
     let event = emitter.emit_completed(Some(&usage_json));
-    emitter.send_event_best_effort(&event, tx);
+    emitter.send_event_best_effort(&event, tx).await;
 }

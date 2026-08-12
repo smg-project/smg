@@ -29,6 +29,7 @@ use super::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
         ProtoRequest, ProtoStream,
     },
+    utils::ParserResolver,
 };
 use crate::{
     middleware::TenantRequestMeta,
@@ -144,10 +145,9 @@ pub(crate) struct SharedComponents {
     pub worker_registry: Arc<WorkerRegistry>,
     pub tool_parser_factory: ToolParserFactory,
     pub reasoning_parser_factory: ReasoningParserFactory,
-    /// Configured tool parser name (from CLI `--tool-call-parser`)
-    pub configured_tool_parser: Option<String>,
-    /// Configured reasoning parser name (from CLI `--reasoning-parser`)
-    pub configured_reasoning_parser: Option<String>,
+    /// Per-request parser-name resolution (model-card override → configured
+    /// CLI `--tool-call-parser`/`--reasoning-parser` names).
+    pub parser_resolver: ParserResolver,
     /// Multimodal processing components (initialized at router creation)
     pub multimodal: Option<Arc<MultimodalComponents>>,
 }

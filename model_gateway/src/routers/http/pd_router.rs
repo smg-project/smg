@@ -21,7 +21,7 @@ use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -37,7 +37,7 @@ use crate::{
         common::{
             header_utils,
             retry::{is_retryable_status, RetryExecutor},
-            sse::SseEncoder,
+            sse::{SseEncoder, SSE_CHANNEL_BUFFER},
         },
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
@@ -964,7 +964,7 @@ impl PDRouter {
     ) -> Response {
         use crate::worker::AttachedBody;
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
 
         #[expect(
             clippy::disallowed_methods,
@@ -997,7 +997,7 @@ impl PDRouter {
                             chunk
                         };
 
-                        if tx.send(Ok(result)).is_err() {
+                        if tx.send(Ok(result)).await.is_err() {
                             break;
                         }
 
@@ -1009,14 +1009,14 @@ impl PDRouter {
                         if let Some(ref url) = decode_url {
                             error!("Stream error from decode server {}: {}", url, e);
                         }
-                        let _ = tx.send(Err(format!("Stream error: {e}")));
+                        let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                         break;
                     }
                 }
             }
         });
 
-        let stream = UnboundedReceiverStream::new(rx);
+        let stream = ReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
         let mut response = Response::new(body);
@@ -1856,8 +1856,8 @@ mod tests {
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        let stream = UnboundedReceiverStream::new(rx);
+        let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
+        let stream = ReceiverStream::new(rx);
 
         {
             let guards = vec![
@@ -1882,7 +1882,7 @@ mod tests {
             assert_eq!(prefill_ref.load(), 1);
             assert_eq!(decode_ref.load(), 1);
 
-            tx.send(Bytes::from("test data")).unwrap();
+            tx.send(Bytes::from("test data")).await.unwrap();
 
             sleep(Duration::from_millis(10)).await;
 

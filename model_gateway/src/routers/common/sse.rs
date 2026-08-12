@@ -24,7 +24,7 @@ use http::{
 };
 use serde::Serialize;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 
 // ============================================================================
 // SseEncoder
@@ -434,18 +434,42 @@ fn parse_frame(frame: &str) -> Option<SseFrame<'_>> {
 }
 
 // ============================================================================
+// Bounded SSE body channel
+// ============================================================================
+
+/// Buffer size for SSE / streaming HTTP response-body channels.
+///
+/// Mirrors `STREAM_RELAY_BUFFER` in [`crate::routers::http::router`] (the
+/// transcription relay). The channel is deliberately **bounded**: when a client
+/// reads the response slowly, [`SseSender::send`](tokio::sync::mpsc::Sender::send)
+/// awaits once the buffer fills, propagating backpressure to the backend read
+/// loop instead of buffering the entire response in RAM. An unbounded channel
+/// would let a slow/stalled client drive the gateway into OOM (slowloris).
+pub(crate) const SSE_CHANNEL_BUFFER: usize = 32;
+
+/// Sender half of a bounded SSE body channel (see [`SSE_CHANNEL_BUFFER`]).
+/// `send` is async: it awaits when the buffer is full, applying backpressure.
+pub(crate) type SseSender = mpsc::Sender<Result<Bytes, std::io::Error>>;
+
+/// Receiver half of a bounded SSE body channel, consumed by [`build_sse_response`].
+pub(crate) type SseReceiver = mpsc::Receiver<Result<Bytes, std::io::Error>>;
+
+/// Create a bounded SSE body channel (see [`SSE_CHANNEL_BUFFER`]).
+pub(crate) fn sse_channel() -> (SseSender, SseReceiver) {
+    mpsc::channel(SSE_CHANNEL_BUFFER)
+}
+
+// ============================================================================
 // Build SSE Response
 // ============================================================================
 
-/// Build an HTTP response with SSE headers and streaming body from an unbounded receiver.
+/// Build an HTTP response with SSE headers and streaming body from a bounded receiver.
 #[expect(
     clippy::expect_used,
     reason = "Response::builder with static headers and valid status code is infallible"
 )]
-pub fn build_sse_response(
-    rx: mpsc::UnboundedReceiver<Result<Bytes, std::io::Error>>,
-) -> axum::response::Response {
-    let stream = UnboundedReceiverStream::new(rx);
+pub fn build_sse_response(rx: SseReceiver) -> axum::response::Response {
+    let stream = ReceiverStream::new(rx);
     axum::response::Response::builder()
         .status(StatusCode::OK)
         .header(

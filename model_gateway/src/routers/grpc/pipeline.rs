@@ -46,6 +46,7 @@ use super::{
         },
         streaming,
     },
+    utils,
     utils::error_type_from_status,
 };
 use crate::{
@@ -138,17 +139,20 @@ impl PipelineDeps {
         processor::ResponseProcessor,
         Arc<streaming::StreamingProcessor>,
     ) {
+        let parser_resolver = utils::ParserResolver::new(
+            self.worker_registry.clone(),
+            self.configured_tool_parser.clone(),
+            self.configured_reasoning_parser.clone(),
+        );
         let processor = processor::ResponseProcessor::new(
             self.tool_parser_factory.clone(),
             self.reasoning_parser_factory.clone(),
-            self.configured_tool_parser.clone(),
-            self.configured_reasoning_parser.clone(),
+            parser_resolver.clone(),
         );
         let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
             self.tool_parser_factory.clone(),
             self.reasoning_parser_factory.clone(),
-            self.configured_tool_parser.clone(),
-            self.configured_reasoning_parser.clone(),
+            parser_resolver,
             backend,
         ));
         (processor, streaming_processor)
@@ -165,14 +169,12 @@ impl PipelineDeps {
         let processor = processor::ResponseProcessor::new(
             ToolParserFactory::default(),
             ReasoningParserFactory::default(),
-            None,
-            None,
+            utils::ParserResolver::disabled(),
         );
         let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
             ToolParserFactory::default(),
             ReasoningParserFactory::default(),
-            None,
-            None,
+            utils::ParserResolver::disabled(),
             backend,
         ));
         (processor, streaming_processor)
@@ -1570,8 +1572,7 @@ mod alias_pipeline_tests {
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
-            configured_tool_parser: None,
-            configured_reasoning_parser: None,
+            parser_resolver: utils::ParserResolver::disabled(),
             multimodal: None,
         });
         let request: GenerateRequest = serde_json::from_value(json!({
@@ -1644,8 +1645,7 @@ mod rate_limit_reserve_tests {
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
-            configured_tool_parser: None,
-            configured_reasoning_parser: None,
+            parser_resolver: utils::ParserResolver::disabled(),
             multimodal: None,
         })
     }

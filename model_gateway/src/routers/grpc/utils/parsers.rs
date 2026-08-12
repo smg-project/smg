@@ -1,16 +1,113 @@
 //! Reasoning and tool parser helpers.
 
+use std::sync::Arc;
+
 use llm_tokenizer::{
     chat_template::{ThinkingKeyName, ThinkingToggle},
     traits::Tokenizer,
 };
-use openai_protocol::chat::thinking_from_reasoning_effort;
+use openai_protocol::{chat::thinking_from_reasoning_effort, model_card::ModelCard};
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ReasoningParser};
 use serde_json::Value;
 use tool_parser::{
     ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
 };
 use tracing::warn;
+
+use crate::worker::WorkerRegistry;
+
+/// Per-request parser-name resolution.
+///
+/// Precedence: the model's `ModelCard` override (`tool_parser` /
+/// `reasoning_parser`, populated from worker labels or an explicit
+/// `WorkerSpec` card) → the process-wide configured name
+/// (`--tool-call-parser` / `--reasoning-parser`) → `None`, which lets the
+/// factory helpers fall back to their name-based auto-detection, unchanged.
+///
+/// Lookups borrow straight from worker metadata (no card clones); only the
+/// resolved name is cloned.
+#[derive(Clone)]
+pub(crate) struct ParserResolver {
+    /// `None` disables card lookups (parser-free endpoints, tests).
+    worker_registry: Option<Arc<WorkerRegistry>>,
+    configured_tool_parser: Option<String>,
+    configured_reasoning_parser: Option<String>,
+}
+
+impl ParserResolver {
+    pub(crate) fn new(
+        worker_registry: Arc<WorkerRegistry>,
+        configured_tool_parser: Option<String>,
+        configured_reasoning_parser: Option<String>,
+    ) -> Self {
+        Self {
+            worker_registry: Some(worker_registry),
+            configured_tool_parser,
+            configured_reasoning_parser,
+        }
+    }
+
+    /// Resolver that never consults model cards and carries no configured
+    /// names — preserves the parser-free endpoints' behavior.
+    pub(crate) fn disabled() -> Self {
+        Self {
+            worker_registry: None,
+            configured_tool_parser: None,
+            configured_reasoning_parser: None,
+        }
+    }
+
+    /// Effective tool-parser name for `model`, if any.
+    pub(crate) fn tool_parser(&self, model: &str) -> Option<String> {
+        self.card_parser(model, |card| card.tool_parser.as_ref())
+            .or_else(|| self.configured_tool_parser.clone())
+    }
+
+    /// Effective reasoning-parser name for `model`, if any.
+    pub(crate) fn reasoning_parser(&self, model: &str) -> Option<String> {
+        self.card_parser(model, |card| card.reasoning_parser.as_ref())
+            .or_else(|| self.configured_reasoning_parser.clone())
+    }
+
+    fn card_parser(
+        &self,
+        model: &str,
+        pick: impl Fn(&ModelCard) -> Option<&String>,
+    ) -> Option<String> {
+        let registry = self.worker_registry.as_ref()?;
+        // Cards built by the label pipeline agree across workers of one model;
+        // if they don't (mixed labels, e.g. mid rolling-upgrade), pick the
+        // lexicographically smallest so resolution is deterministic rather
+        // than registry-iteration-order dependent. Registration logs a
+        // warning for the conflict; here it's debug (per-request hot path).
+        let mut chosen: Option<String> = None;
+        let mut conflict = false;
+        for worker in registry.get_by_model(model).iter() {
+            let Some(name) = worker.metadata().spec.models.find(model).and_then(&pick) else {
+                continue;
+            };
+            match &chosen {
+                None => chosen = Some(name.clone()),
+                Some(existing) if existing != name => {
+                    conflict = true;
+                    if name < existing {
+                        chosen = Some(name.clone());
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        if conflict {
+            tracing::debug!(
+                model,
+                chosen = chosen.as_deref(),
+                "Workers for this model declare conflicting parser overrides; \
+                 using the lexicographically smallest"
+            );
+        }
+        chosen
+    }
+}
 
 /// Determine if thinking is effectively ON based on the template's thinking
 /// toggle and the user's request.
@@ -352,5 +449,88 @@ mod tests {
             Some("qwen3"),
             "served-model"
         ));
+    }
+}
+
+#[cfg(test)]
+mod parser_resolver_tests {
+    use super::*;
+    use crate::worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType};
+
+    fn registry_with_card(card: ModelCard) -> Arc<WorkerRegistry> {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = BasicWorkerBuilder::new("http://w1:8000")
+            .model(card)
+            .worker_type(WorkerType::Regular)
+            .build();
+        registry.register(Arc::new(worker));
+        registry
+    }
+
+    #[test]
+    fn card_override_wins_over_configured() {
+        let registry = registry_with_card(
+            ModelCard::new("m")
+                .with_tool_parser("json")
+                .with_reasoning_parser("basic"),
+        );
+        let resolver = ParserResolver::new(
+            registry,
+            Some("mistral".to_string()),
+            Some("deepseek_r1".to_string()),
+        );
+        assert_eq!(resolver.tool_parser("m").as_deref(), Some("json"));
+        assert_eq!(resolver.reasoning_parser("m").as_deref(), Some("basic"));
+    }
+
+    #[test]
+    fn falls_back_to_configured_without_card_override() {
+        let registry = registry_with_card(ModelCard::new("m"));
+        let resolver = ParserResolver::new(
+            registry,
+            Some("mistral".to_string()),
+            Some("deepseek_r1".to_string()),
+        );
+        assert_eq!(resolver.tool_parser("m").as_deref(), Some("mistral"));
+        assert_eq!(
+            resolver.reasoning_parser("m").as_deref(),
+            Some("deepseek_r1")
+        );
+        // Unknown model: no card, same configured fallback.
+        assert_eq!(resolver.tool_parser("other").as_deref(), Some("mistral"));
+    }
+
+    #[test]
+    fn no_override_and_no_configured_resolves_none() {
+        let registry = registry_with_card(ModelCard::new("m"));
+        let resolver = ParserResolver::new(registry, None, None);
+        assert_eq!(resolver.tool_parser("m"), None);
+        assert_eq!(resolver.reasoning_parser("m"), None);
+    }
+
+    #[test]
+    fn disabled_resolver_never_resolves() {
+        let resolver = ParserResolver::disabled();
+        assert_eq!(resolver.tool_parser("m"), None);
+        assert_eq!(resolver.reasoning_parser("m"), None);
+    }
+
+    #[test]
+    fn conflicting_overrides_resolve_deterministically() {
+        // Two same-model workers with different overrides: resolution must
+        // not depend on registration/iteration order — the lexicographically
+        // smallest name wins either way.
+        for (first, second) in [("zebra", "alpha"), ("alpha", "zebra")] {
+            let registry = Arc::new(WorkerRegistry::new());
+            for (i, name) in [first, second].iter().enumerate() {
+                let worker = BasicWorkerBuilder::new(format!("http://w{i}:8000"))
+                    .model(ModelCard::new("m").with_tool_parser(*name))
+                    .worker_type(WorkerType::Regular)
+                    .build();
+                registry.register(Arc::new(worker));
+            }
+            let resolver = ParserResolver::new(registry, None, None);
+            assert_eq!(resolver.tool_parser("m").as_deref(), Some("alpha"));
+        }
     }
 }

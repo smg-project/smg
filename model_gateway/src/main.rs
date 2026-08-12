@@ -323,6 +323,19 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
     engine_metrics: bool,
 
+    /// TTL in seconds for event-driven cache-aware indexer entries: entries
+    /// neither stored nor read by a query within this window are pruned.
+    /// Bounds index growth when a backend stops emitting removal events.
+    /// Unset or 0 disables the TTL pass.
+    #[arg(long, help_heading = "Routing Policy")]
+    kv_indexer_ttl_secs: Option<u64>,
+
+    /// Capacity ceiling per model for the event-driven cache-aware indexer;
+    /// beyond it, oldest-touched entries are pruned down to 90% of the
+    /// ceiling. Unset or 0 disables the ceiling.
+    #[arg(long, help_heading = "Routing Policy")]
+    kv_indexer_max_entries: Option<usize>,
+
     /// Multimodal tensor transport mode: `inline` (default), `shm` (same-host
     /// /dev/shm), or `auto` (shm only when the worker shares /dev/shm). A
     /// per-worker `WorkerSpec.multimodal_tensor_transport` overrides this.
@@ -1479,6 +1492,8 @@ impl CliArgs {
             .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
+            .kv_indexer_max_entries(self.kv_indexer_max_entries)
             .engine_metrics(self.engine_metrics)
             .multimodal_tensor_transport(self.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
@@ -1798,6 +1813,25 @@ mod tests {
             .chain(args.iter().map(|s| (*s).to_string()))
             .collect();
         Cli::parse_from(argv).router_args
+    }
+
+    /// The indexer prune flags are router-only settings and must flow into
+    /// `RouterConfig` (unset by default so the indexer stays unbounded).
+    #[test]
+    fn kv_indexer_prune_flags_flow_into_router_config() {
+        let cli = cli_args_from(&[
+            "--kv-indexer-ttl-secs",
+            "600",
+            "--kv-indexer-max-entries",
+            "500000",
+        ]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.kv_indexer_ttl_secs, Some(600));
+        assert_eq!(router_config.kv_indexer_max_entries, Some(500_000));
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.kv_indexer_ttl_secs, None);
+        assert_eq!(defaults.kv_indexer_max_entries, None);
     }
 
     /// `--health-check-port` must flow into BOTH conversion paths

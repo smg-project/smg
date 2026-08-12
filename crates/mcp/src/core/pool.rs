@@ -103,6 +103,47 @@ impl CachedConnection {
     }
 }
 
+/// Outcome of a URL-scoped pooled-connection lookup on the tool-execution path.
+///
+/// Execution must never reuse a connection authenticated for a different caller.
+/// When a single URL is pooled under more than one [`PoolKey`] — i.e. the same
+/// server reached with different credentials or tenants — the lookup returns
+/// [`UrlLookup::Ambiguous`] so the caller fails closed instead of resolving to an
+/// arbitrary entry.
+pub(crate) enum UrlLookup {
+    Found(Arc<McpClient>),
+    NotFound,
+    Ambiguous,
+}
+
+/// How many pooled keys share a given URL (credential/tenant-agnostic).
+#[derive(Debug, PartialEq, Eq)]
+enum UrlMatch {
+    None,
+    Unique,
+    Ambiguous,
+}
+
+/// Classify how many pooled keys match `url`. Two or more matches means the URL
+/// is reachable under different credentials/tenants and therefore cannot be
+/// resolved to a single connection safely.
+fn classify_url_match<'a>(keys: impl Iterator<Item = &'a PoolKey>, url: &str) -> UrlMatch {
+    let mut count = 0usize;
+    for key in keys {
+        if key.url == url {
+            count += 1;
+            if count > 1 {
+                return UrlMatch::Ambiguous;
+            }
+        }
+    }
+    if count == 0 {
+        UrlMatch::None
+    } else {
+        UrlMatch::Unique
+    }
+}
+
 /// Thread-safe LRU connection pool for dynamic MCP servers.
 pub struct McpConnectionPool {
     connections: Arc<Mutex<LruCache<PoolKey, CachedConnection>>>,
@@ -227,17 +268,26 @@ impl McpConnectionPool {
         self.connections.lock().contains(key)
     }
 
-    /// Look up a connection by URL only (backward compatibility).
+    /// Look up a connection by URL, failing closed when the URL is ambiguous.
     ///
-    /// **O(n)** — performs a linear scan of all pooled connections under the
-    /// lock. Callers on hot paths should prefer [`get()`](Self::get) with a
-    /// full [`PoolKey`] for O(1) lookup.
-    pub fn get_by_url(&self, url: &str) -> Option<Arc<McpClient>> {
-        self.connections
-            .lock()
-            .iter()
-            .find(|(key, _)| key.url == url)
-            .map(|(_, cached)| Arc::clone(&cached.client))
+    /// The tool-execution path holds only the server URL, not the full
+    /// [`PoolKey`]. If exactly one pooled connection matches the URL it is
+    /// returned; if several do (same server, different credentials or tenants)
+    /// the result is [`UrlLookup::Ambiguous`] so the caller never reuses another
+    /// caller's authenticated connection. Callers that hold the full key should
+    /// prefer [`get()`](Self::get) for an O(1), unambiguous lookup.
+    ///
+    /// **O(n)** — linear scan under the lock (n ≤ `max_connections`).
+    pub(crate) fn get_unique_by_url(&self, url: &str) -> UrlLookup {
+        let connections = self.connections.lock();
+        match classify_url_match(connections.iter().map(|(key, _)| key), url) {
+            UrlMatch::None => UrlLookup::NotFound,
+            UrlMatch::Ambiguous => UrlLookup::Ambiguous,
+            UrlMatch::Unique => match connections.iter().find(|(key, _)| key.url == url) {
+                Some((_, cached)) => UrlLookup::Found(Arc::clone(&cached.client)),
+                None => UrlLookup::NotFound,
+            },
+        }
     }
 }
 
@@ -449,6 +499,45 @@ mod tests {
             stored_proxy.no_proxy.as_ref().unwrap(),
             "localhost,127.0.0.1"
         );
+    }
+
+    #[test]
+    fn classify_url_match_distinguishes_none_unique_and_ambiguous() {
+        let url = "http://localhost:3000";
+        let other = PoolKey::new("http://other:9000", 1, None);
+        let a = PoolKey::new(url, 111, None);
+        // Same URL, different auth hash (two callers with different tokens).
+        let b_diff_auth = PoolKey::new(url, 222, None);
+        // Same URL and auth, different tenant.
+        let a_diff_tenant = PoolKey::new(url, 111, Some("tenant-2".to_string()));
+
+        assert_eq!(
+            classify_url_match([&other].into_iter(), url),
+            UrlMatch::None
+        );
+        assert_eq!(
+            classify_url_match([&other, &a].into_iter(), url),
+            UrlMatch::Unique
+        );
+        // Different credentials on the same URL must never resolve to one entry.
+        assert_eq!(
+            classify_url_match([&a, &b_diff_auth].into_iter(), url),
+            UrlMatch::Ambiguous
+        );
+        // Different tenants on the same URL are equally ambiguous.
+        assert_eq!(
+            classify_url_match([&a, &a_diff_tenant].into_iter(), url),
+            UrlMatch::Ambiguous
+        );
+    }
+
+    #[test]
+    fn get_unique_by_url_on_empty_pool_is_not_found() {
+        let pool = McpConnectionPool::new();
+        assert!(matches!(
+            pool.get_unique_by_url("http://localhost:3000"),
+            UrlLookup::NotFound
+        ));
     }
 
     #[test]

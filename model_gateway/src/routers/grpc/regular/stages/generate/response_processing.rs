@@ -101,13 +101,17 @@ impl GenerateResponseProcessingStage {
                 .and_then(RateLimitCell::take_for_streaming_handoff);
 
             // Streaming: Use StreamingProcessor and return SSE response
-            let response = self.streaming_processor.clone().process_streaming_generate(
-                execution_result,
-                ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
-                dispatch,
-                tokenizer,
-                reservation.clone(),
-            );
+            let response = self
+                .streaming_processor
+                .clone()
+                .process_streaming_generate(
+                    execution_result,
+                    ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
+                    dispatch,
+                    tokenizer,
+                    reservation.clone(),
+                )
+                .await;
 
             // Attach load guards (and the reservation's disconnect/error
             // safety net) to the response body for proper RAII lifecycle.

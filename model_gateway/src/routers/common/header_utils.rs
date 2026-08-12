@@ -238,6 +238,42 @@ pub fn extract_auth_header(
         .or_else(|| worker_api_key.and_then(|k| HeaderValue::from_str(&format!("Bearer {k}")).ok()))
 }
 
+/// Apply the effective `Authorization` header plus every other forwardable
+/// request header to an outbound reqwest builder, without ever emitting a
+/// duplicate `Authorization`.
+///
+/// `reqwest::RequestBuilder::header` appends rather than replaces, so setting the
+/// worker API key and *then* forwarding the caller's `Authorization` separately
+/// sends two `Authorization` headers (worker-key-first) and inverts the
+/// passthrough precedence documented on [`extract_auth_header`]. Callers that
+/// proxy a request to a worker should use this instead of doing both: it resolves
+/// the single correct value (user header wins, worker key is the fallback) and
+/// forwards every other allow-listed header.
+pub fn apply_forwarded_request_headers(
+    mut builder: reqwest::RequestBuilder,
+    headers: Option<&HeaderMap>,
+    worker_api_key: Option<&String>,
+) -> reqwest::RequestBuilder {
+    if let Some(auth) = extract_auth_header(headers, worker_api_key) {
+        builder = builder.header(http::header::AUTHORIZATION, auth);
+    }
+
+    if let Some(headers) = headers {
+        for (name, value) in headers {
+            // Authorization is applied above with the correct precedence; never
+            // forward it again or reqwest appends a second header.
+            if name.as_str().eq_ignore_ascii_case("authorization") {
+                continue;
+            }
+            if should_forward_request_header(name.as_str()) {
+                builder = builder.header(name, value);
+            }
+        }
+    }
+
+    builder
+}
+
 /// Extract the subset of request headers that SMG is allowed to preserve for
 /// internal execution paths such as MCP tool calls.
 pub fn extract_forwardable_request_headers(headers: Option<&HeaderMap>) -> HashMap<String, String> {
@@ -286,6 +322,63 @@ pub fn should_forward_request_header(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_forwarded_request_headers_user_auth_wins_without_duplicate() {
+        let client = reqwest::Client::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer user-token"),
+        );
+        headers.insert("x-request-id", HeaderValue::from_static("abc"));
+        headers.insert("x-not-allowlisted", HeaderValue::from_static("nope"));
+        let worker_key = "worker-key".to_string();
+
+        let req = apply_forwarded_request_headers(
+            client.get("http://example.invalid/"),
+            Some(&headers),
+            Some(&worker_key),
+        )
+        .build()
+        .unwrap();
+
+        let auths: Vec<_> = req
+            .headers()
+            .get_all(http::header::AUTHORIZATION)
+            .iter()
+            .collect();
+        assert_eq!(auths.len(), 1, "exactly one Authorization header");
+        assert_eq!(auths[0].to_str().unwrap(), "Bearer user-token");
+        assert!(req.headers().get("x-request-id").is_some());
+        assert!(
+            req.headers().get("x-not-allowlisted").is_none(),
+            "non-allowlisted headers must not be forwarded"
+        );
+    }
+
+    #[test]
+    fn apply_forwarded_request_headers_falls_back_to_worker_key() {
+        let client = reqwest::Client::new();
+        let headers = HeaderMap::new(); // caller sent no Authorization
+        let worker_key = "worker-key".to_string();
+
+        let req = apply_forwarded_request_headers(
+            client.get("http://example.invalid/"),
+            Some(&headers),
+            Some(&worker_key),
+        )
+        .build()
+        .unwrap();
+
+        let auths: Vec<_> = req
+            .headers()
+            .get_all(http::header::AUTHORIZATION)
+            .iter()
+            .collect();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].to_str().unwrap(), "Bearer worker-key");
+    }
 
     #[test]
     fn test_extract_header_value_returns_value() {

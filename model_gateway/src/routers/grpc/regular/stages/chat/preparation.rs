@@ -239,7 +239,10 @@ impl ChatPreparationStage {
                 .tool_parser_factory
                 .registry()
                 .generate_tool_constraint(
-                    ctx.components.configured_tool_parser.as_deref(),
+                    ctx.components
+                        .parser_resolver
+                        .tool_parser(&request.model)
+                        .as_deref(),
                     tools,
                     tool_choice,
                 )
@@ -257,7 +260,10 @@ impl ChatPreparationStage {
         let preserve_reasoning_special_tokens = request.separate_reasoning
             && utils::reasoning_parser_requires_special_tokens(
                 &ctx.components.reasoning_parser_factory,
-                ctx.components.configured_reasoning_parser.as_deref(),
+                ctx.components
+                    .parser_resolver
+                    .reasoning_parser(&request.model)
+                    .as_deref(),
                 &request.model,
             );
 

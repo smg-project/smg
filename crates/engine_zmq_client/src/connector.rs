@@ -152,6 +152,14 @@ impl<P: EngineProtocol> ClientInner<P> {
     }
 
     /// Send an encoded request frame to one engine over the shared input socket.
+    ///
+    /// The send is bounded by [`ENGINE_SEND_TIMEOUT`]: a healthy engine drains its
+    /// input continuously, so a send that cannot complete in that window means the
+    /// engine's event loop is wedged. Because the timeout cancels the send
+    /// mid-frame (leaving the shared socket unusable), the timeout is fatal — it
+    /// fails every in-flight request and closes the client so health checks evict
+    /// this worker, instead of the untimed send freezing the dispatcher (starving
+    /// the death watchdog) and every concurrent submit behind the shared lock.
     async fn send_to_engine(
         &self,
         engine_id: &EngineId,
@@ -160,14 +168,26 @@ impl<P: EngineProtocol> ClientInner<P> {
         aux_frames: Vec<Bytes>,
     ) -> Result<()> {
         let mut input_send = self.input_send.lock().await;
-        send_message(
+        let send = send_message(
             &mut input_send,
             engine_id,
             request_type,
             payload.into(),
             aux_frames,
-        )
-        .await
+        );
+        match tokio::time::timeout(ENGINE_SEND_TIMEOUT, send).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                warn!(
+                    timeout = ?ENGINE_SEND_TIMEOUT,
+                    "engine input send timed out; treating engine as dead"
+                );
+                self.registry
+                    .lock()
+                    .fail_all(Arc::new(Error::EngineCoreDead));
+                Err(Error::EngineCoreDead)
+            }
+        }
     }
 
     /// Tell every rank but `exclude_index` to start `wave`. Does nothing for a
@@ -401,6 +421,13 @@ impl<P: EngineProtocol> Drop for Client<P> {
 /// PUSH peer vanishes — so silence is the only available death signal. Generous
 /// so a slow first token never trips it, while still bounding an otherwise
 /// infinite hang.
+/// Maximum time to wait for a single request frame to be accepted by an engine's
+/// input socket before treating the engine as wedged. A healthy engine drains its
+/// input continuously; a send that blocks this long means its event loop is stuck.
+/// Bounds an otherwise unbounded await under the shared input lock (see
+/// [`ClientInner::send_to_engine`]).
+const ENGINE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
 const ENGINE_SILENCE_DEATH_TIMEOUT: Duration = Duration::from_secs(300);
 
 async fn run_dispatcher<P: EngineProtocol>(
@@ -442,6 +469,11 @@ async fn run_dispatcher<P: EngineProtocol>(
                     inner.registry.lock().remove_all([&request_id]);
                     if let Err(error) = inner.abort(&engine_id, &request_id).await {
                         warn!(%error, %request_id, "failed to send abort");
+                        if matches!(error, Error::EngineCoreDead | Error::Transport(_)) {
+                            // The engine is dead — send_to_engine already failed all
+                            // in-flight requests; stop dispatching.
+                            return;
+                        }
                     }
                 }
             }
