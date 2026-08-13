@@ -158,23 +158,12 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         }
 
         // A grouped ZMQ worker (`dp_size: N` on the spec) awaits N engines on
-        // one socket set. TokenSpeed's msgpack wire carries no DP-rank routing
-        // yet, so fail its groups at registration for the same reason as the
-        // runtime check above.
+        // one socket set. Both ZMQ runtimes route per rank: vLLM by in-request
+        // DP rank, TokenSpeed by per-rank socket identity with the producing
+        // rank named on each output batch.
         let zmq_engine_group = config
             .dp_size
             .filter(|&n| n > 1 && *connection_mode == ConnectionMode::Zmq);
-        if zmq_engine_group.is_some() && runtime_type == RuntimeType::TokenSpeed {
-            return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("create_worker"),
-                message: format!(
-                    "ZMQ worker {} configures dp_size={} but the TokenSpeed wire \
-                     does not support DP>1 yet; only vllm engine groups are supported",
-                    config.url,
-                    config.dp_size.unwrap_or_default()
-                ),
-            });
-        }
 
         // Normalize URL
         let url = normalize_url(&config.url, *connection_mode);

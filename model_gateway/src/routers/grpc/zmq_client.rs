@@ -394,17 +394,6 @@ impl ZmqEngineClient {
         runtime: RuntimeType,
         timeout: Duration,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // Single-engine scope for TokenSpeed: its wire carries no DP-rank routing
-        // yet (`data_parallel_rank` is always `None`), so more than one engine
-        // would silently send all traffic to engine 0. Reject it loudly until
-        // DP>1 lands. The engine count is known here (the handshake awaits it).
-        if matches!(runtime, RuntimeType::TokenSpeed) && engine_count > 1 {
-            return Err(format!(
-                "TokenSpeed ZMQ backend supports a single engine only (got \
-                 engine_count={engine_count}); DP>1 is not yet supported"
-            )
-            .into());
-        }
         // No silent fallback: any other runtime has no ZMQ engine adapter.
         // Reject before the handshake — no such engine ever dials in, so the
         // handshake would just block for the full timeout.
