@@ -1033,3 +1033,40 @@ class TestParseRouterArgs:
 
         # SystemExit with code 0 indicates help was displayed
         assert exc_info.value.code == 0
+
+
+class TestPrefixHashArgs:
+    """The prefix_hash knobs parse, default, and honor the router prefix."""
+
+    def test_defaults(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        namespace = parser.parse_args([])
+        router_args = RouterArgs.from_cli_args(namespace)
+        assert router_args.prefix_token_count == 256
+        assert router_args.prefix_hash_load_factor == 1.25
+
+    def test_flags(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        namespace = parser.parse_args(
+            ["--prefix-token-count", "4096", "--prefix-hash-load-factor", "1.5"]
+        )
+        router_args = RouterArgs.from_cli_args(namespace)
+        assert router_args.prefix_token_count == 4096
+        assert router_args.prefix_hash_load_factor == 1.5
+
+    def test_router_prefix_flags(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(
+            [
+                "--router-prefix-token-count",
+                "8192",
+                "--router-prefix-hash-load-factor",
+                "2.0",
+            ]
+        )
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+        assert router_args.prefix_token_count == 8192
+        assert router_args.prefix_hash_load_factor == 2.0

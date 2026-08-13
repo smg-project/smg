@@ -206,6 +206,8 @@ class RouterArgs:
     worker_startup_delay: int = 0
     # DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped)
     zmq_engine_count: int | None = None
+    prefix_token_count: int = 256
+    prefix_hash_load_factor: float = 1.25
 
     @staticmethod
     def add_cli_args(
@@ -386,6 +388,18 @@ class RouterArgs:
             type=float,
             default=RouterArgs.cache_threshold,
             help="Cache threshold (0.0-1.0) for cache-aware routing",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefix-token-count",
+            type=int,
+            default=RouterArgs.prefix_token_count,
+            help="Number of prefix tokens hashed by the prefix_hash policy",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefix-hash-load-factor",
+            type=float,
+            default=RouterArgs.prefix_hash_load_factor,
+            help="Load factor above which prefix_hash walks the ring (multiple of average load)",
         )
         routing_group.add_argument(
             f"--{prefix}least-load-kv-pressure-weight",

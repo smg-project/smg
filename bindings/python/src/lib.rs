@@ -395,6 +395,8 @@ struct Router {
     block_size: usize,
     balance_token_usage_threshold: f32,
     overload_token_usage_threshold: f32,
+    prefix_token_count: usize,
+    prefix_hash_load_factor: f64,
     least_load_kv_pressure_weight: f64,
     least_load_default_throughput: f64,
     least_load_mean_prefill_tokens: u32,
@@ -606,8 +608,8 @@ impl Router {
                 },
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
-                    prefix_token_count: 256,
-                    load_factor: 1.25,
+                    prefix_token_count: self.prefix_token_count,
+                    load_factor: self.prefix_hash_load_factor,
                 },
             })
         };
@@ -1002,6 +1004,8 @@ impl Router {
         worker_startup_delay = 0,
         worker_ports_annotation = String::from("smg.ai/worker-ports"),
         zmq_engine_count = None,
+        prefix_token_count = 256,
+        prefix_hash_load_factor = 1.25,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1132,6 +1136,8 @@ impl Router {
         worker_startup_delay: u64,
         worker_ports_annotation: String,
         zmq_engine_count: Option<usize>,
+        prefix_token_count: usize,
+        prefix_hash_load_factor: f64,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1171,6 +1177,8 @@ impl Router {
             block_size,
             balance_token_usage_threshold,
             overload_token_usage_threshold,
+            prefix_token_count,
+            prefix_hash_load_factor,
             least_load_kv_pressure_weight,
             least_load_default_throughput,
             least_load_mean_prefill_tokens,
