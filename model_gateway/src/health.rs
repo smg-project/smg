@@ -65,6 +65,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     config::{RouterConfig, RoutingMode},
+    middleware::ProbeResponse,
     observability::inflight_tracker::InFlightRequestTracker,
     worker::{event::WorkerEvent, ConnectionMode, WorkerRegistry, WorkerType},
 };
@@ -220,41 +221,47 @@ impl ProbeState {
     /// during shutdown (liveness intentionally stays OK — see module docs).
     pub fn readiness_response(&self) -> Response {
         if self.inflight_tracker.is_draining() {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "status": "not ready",
-                    "reason": "draining"
-                })),
-            )
-                .into_response();
+            return mark_probe(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "status": "not ready",
+                        "reason": "draining"
+                    })),
+                )
+                    .into_response(),
+            );
         }
 
         let snapshot = self.readiness.load();
         if snapshot.workers_ready && snapshot.tokenizers_ready {
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "status": "ready",
-                    "healthy_workers": snapshot.healthy_workers,
-                    "total_workers": snapshot.total_workers
-                })),
+            mark_probe(
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "ready",
+                        "healthy_workers": snapshot.healthy_workers,
+                        "total_workers": snapshot.total_workers
+                    })),
+                )
+                    .into_response(),
             )
-                .into_response()
         } else {
             let reason = if snapshot.workers_ready {
                 "tokenizer not yet registered"
             } else {
                 "insufficient healthy workers"
             };
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "status": "not ready",
-                    "reason": reason
-                })),
+            mark_probe(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "status": "not ready",
+                        "reason": reason
+                    })),
+                )
+                    .into_response(),
             )
-                .into_response()
         }
     }
 }
@@ -263,7 +270,15 @@ impl ProbeState {
 /// deliberately stays OK while draining: the process is healthy, it is
 /// just not accepting new work.
 pub fn liveness_response() -> Response {
-    (StatusCode::OK, "OK").into_response()
+    mark_probe((StatusCode::OK, "OK").into_response())
+}
+
+/// Attach the [`ProbeResponse`] logging marker: probe statuses (503 "not
+/// ready" included) are expected states polled on a tight interval, and the
+/// HTTP logging layer demotes marked responses to DEBUG.
+fn mark_probe(mut response: Response) -> Response {
+    response.extensions_mut().insert(ProbeResponse);
+    response
 }
 
 /// Spawn the readiness maintainer: recomputes the snapshot on every
@@ -742,6 +757,32 @@ mod tests {
             StatusCode::OK,
             "liveness must stay OK while draining"
         );
+    }
+
+    /// Every probe response — ready and not-ready alike — must carry the
+    /// [`ProbeResponse`] marker, or the HTTP logging layer floods ERROR with
+    /// expected not-ready 503s on every poll (two lines per 2s in the e2e
+    /// gateway logs before this marker existed).
+    #[tokio::test]
+    async fn probe_responses_carry_the_logging_marker() {
+        let inflight_tracker = InFlightRequestTracker::new();
+        let state = ProbeState::new(inflight_tracker.clone());
+
+        // Not ready (initial snapshot), ready is irrelevant to the marker:
+        // check the 503 path, the liveness 200 path, and the draining path.
+        let not_ready = state.readiness_response();
+        assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(not_ready.extensions().get::<ProbeResponse>().is_some());
+
+        assert!(liveness_response()
+            .extensions()
+            .get::<ProbeResponse>()
+            .is_some());
+
+        inflight_tracker.begin_drain();
+        let draining = state.readiness_response();
+        assert_eq!(draining.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(draining.extensions().get::<ProbeResponse>().is_some());
     }
 
     async fn get_probe(router: &Router, path: &str) -> (StatusCode, String) {
