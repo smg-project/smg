@@ -35,6 +35,7 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     WorkerType,
     get_connection_mode_override,
     get_runtime,
+    get_zmq_engine_count,
     is_mlx,
     is_sglang,
     is_trtllm,
@@ -113,6 +114,7 @@ __all__ = [
     # Runtime helpers
     "get_runtime",
     "get_connection_mode_override",
+    "get_zmq_engine_count",
     "is_vllm",
     "is_sglang",
     "is_trtllm",
