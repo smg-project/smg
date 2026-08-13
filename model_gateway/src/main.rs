@@ -245,7 +245,8 @@ struct CliArgs {
     #[arg(long, default_value = "random", value_parser = ["random", "min_load", "min_group"], help_heading = "Routing Policy")]
     assignment_mode: String,
 
-    /// Number of prefix tokens to use for prefix_hash policy
+    /// Number of prefix tokens to use for prefix_hash policy, or four times
+    /// as many characters of the prompt when the request is untokenized
     #[arg(long, default_value_t = 256, help_heading = "Routing Policy")]
     prefix_token_count: usize,
 

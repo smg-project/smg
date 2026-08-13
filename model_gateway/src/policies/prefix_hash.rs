@@ -6,8 +6,9 @@
 //!
 //! ## Algorithm
 //!
-//! 1. Extract first N tokens from the request (configurable prefix length)
-//! 2. Hash the token sequence using xxhash for fast, stable hashing
+//! 1. Extract first N tokens from the request (configurable prefix length),
+//!    or the equivalent span of routing text when the request is untokenized
+//! 2. Hash the prefix using xxhash for fast, stable hashing
 //! 3. Use consistent hash ring to find the target worker
 //! 4. If worker is overloaded (load > avg * load_factor), find least loaded
 //! 5. Return least loaded worker that passes load check, or initial if all overloaded
@@ -37,7 +38,8 @@ use crate::{observability::metrics::Metrics, worker::Worker};
 /// Configuration for the PrefixHash load balancing policy
 #[derive(Debug, Clone)]
 pub struct PrefixHashConfig {
-    /// Number of prefix tokens to use for hashing.
+    /// Number of prefix tokens to use for hashing, or `CHARS_PER_TOKEN` times
+    /// as many characters when the request carries no tokens.
     /// Longer prefixes = more precise routing but less grouping.
     /// Shorter prefixes = more requests grouped together.
     /// Default: 256 tokens (~1 paragraph of text)
@@ -63,7 +65,7 @@ impl Default for PrefixHashConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Branch {
     NoHealthyWorkers,
-    NoTokens,
+    NoRoutingKey,
     RingHit,
     LoadBalanceWalk,
     FallbackLeastLoad,
@@ -74,13 +76,18 @@ impl Branch {
     const fn as_str(self) -> &'static str {
         match self {
             Self::NoHealthyWorkers => "no_healthy_workers",
-            Self::NoTokens => "no_tokens",
+            Self::NoRoutingKey => "no_routing_key",
             Self::RingHit => "ring_hit",
             Self::LoadBalanceWalk => "load_balance_walk",
             Self::FallbackLeastLoad => "fallback_least_load",
         }
     }
 }
+
+/// Characters of routing text treated as one token's worth of prefix. Four is
+/// the usual rule of thumb for English text, so an untokenized request hashes
+/// roughly the same span of the prompt as `prefix_token_count` would cover.
+const CHARS_PER_TOKEN: usize = 4;
 
 /// Prefix Hash load balancing policy
 ///
@@ -110,6 +117,36 @@ impl PrefixHashPolicy {
 
         let bytes: &[u8] = bytemuck::cast_slice(prefix);
         xxhash_rust::xxh3::xxh3_64(bytes)
+    }
+
+    /// Compute hash of the leading text of an untokenized request
+    ///
+    /// Only pre-tokenized requests carry token IDs; chat, completions and
+    /// text-form generate requests reach the policy with routing text alone,
+    /// and hashing it keeps them on a stable worker instead of leaving them
+    /// unroutable.
+    #[inline]
+    fn compute_text_prefix_hash(&self, text: &str) -> u64 {
+        let budget = self
+            .config
+            .prefix_token_count
+            .saturating_mul(CHARS_PER_TOKEN);
+        let end = text
+            .char_indices()
+            .nth(budget)
+            .map_or(text.len(), |(offset, _)| offset);
+
+        xxhash_rust::xxh3::xxh3_64(&text.as_bytes()[..end])
+    }
+
+    /// Index of the least loaded healthy worker
+    fn least_loaded_healthy(workers: &[Arc<dyn Worker>]) -> Option<usize> {
+        workers
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.is_healthy())
+            .min_by_key(|(_, w)| w.load())
+            .map(|(idx, _)| idx)
     }
 
     /// Check if a worker's load is acceptable
@@ -190,12 +227,10 @@ impl PrefixHashPolicy {
         }
 
         // Fallback: no ring or ring lookup failed, use least loaded worker
-        let least_loaded = healthy_workers
-            .iter()
-            .min_by_key(|(_, w)| w.load())
-            .map(|(idx, _)| *idx);
-
-        (least_loaded, Branch::FallbackLeastLoad)
+        (
+            Self::least_loaded_healthy(workers),
+            Branch::FallbackLeastLoad,
+        )
     }
 
     fn select_worker_impl(
@@ -207,14 +242,14 @@ impl PrefixHashPolicy {
             return (None, Branch::NoHealthyWorkers);
         }
 
-        // Get tokens from SelectWorkerInfo
-        let tokens = match info.tokens {
-            Some(t) if !t.is_empty() => t,
-            _ => return (None, Branch::NoTokens),
+        // Pre-tokenized requests hash their token prefix, the rest hash the
+        // equivalent span of routing text.
+        let prefix_hash = match (info.tokens, info.request_text) {
+            (Some(tokens), _) if !tokens.is_empty() => self.compute_prefix_hash(tokens),
+            (_, Some(text)) if !text.is_empty() => self.compute_text_prefix_hash(text),
+            // Nothing to hash: stay serviceable by falling back to load.
+            _ => return (Self::least_loaded_healthy(workers), Branch::NoRoutingKey),
         };
-
-        // Compute prefix hash
-        let prefix_hash = self.compute_prefix_hash(tokens);
 
         // Find worker using ring with load balancing
         self.find_worker_with_load_balance(workers, info, prefix_hash)
@@ -242,7 +277,7 @@ mod tests {
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, HashRing, WorkerType};
+    use crate::worker::{BasicWorkerBuilder, HashRing, WorkerLoadGuard, WorkerType};
 
     fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
         urls.iter()
@@ -342,33 +377,133 @@ mod tests {
     }
 
     #[test]
-    fn test_no_tokens_returns_none() {
+    fn test_untokenized_request_routes_consistently() {
         let policy = PrefixHashPolicy::with_defaults();
-        let workers = create_workers(&["http://w1:8000"]);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
-        // Empty tokens
+        // Chat and completions requests reach the policy with text only.
+        let info = SelectWorkerInfo {
+            tokens: None,
+            request_text: Some("summarize the quarterly earnings report"),
+            hash_ring: Some(ring),
+            ..Default::default()
+        };
+
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        assert!(first_result.is_some(), "text alone must be routable");
+        assert_eq!(branch, Branch::RingHit);
+
+        for _ in 0..10 {
+            let (result, _) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(result, first_result);
+        }
+    }
+
+    #[test]
+    fn test_shared_text_prefix_routes_same() {
+        let policy = PrefixHashPolicy::new(PrefixHashConfig {
+            prefix_token_count: 2, // 8 characters of text
+            ..Default::default()
+        });
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+
+        let info1 = SelectWorkerInfo {
+            request_text: Some("system: you are a helpful assistant"),
+            hash_ring: Some(ring.clone()),
+            ..Default::default()
+        };
+        let info2 = SelectWorkerInfo {
+            request_text: Some("system: you are a terse assistant"),
+            hash_ring: Some(ring),
+            ..Default::default()
+        };
+
+        let (result1, _) = policy.select_worker_impl(&workers, &info1);
+        let (result2, _) = policy.select_worker_impl(&workers, &info2);
+
+        assert_eq!(
+            result1, result2,
+            "text past the prefix budget must not change the worker"
+        );
+    }
+
+    #[test]
+    fn test_text_prefix_budget_respects_char_boundaries() {
+        let policy = PrefixHashPolicy::new(PrefixHashConfig {
+            prefix_token_count: 1, // 4 characters, mid-way through the emoji run
+            ..Default::default()
+        });
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+
+        let info = SelectWorkerInfo {
+            request_text: Some("🌊🌊🌊🌊🌊🌊 tide report"),
+            hash_ring: Some(ring),
+            ..Default::default()
+        };
+
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert!(result.is_some());
+        assert_eq!(branch, Branch::RingHit);
+    }
+
+    #[test]
+    fn test_tokens_take_priority_over_text() {
+        let policy = PrefixHashPolicy::with_defaults();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+
+        let tokens: Vec<u32> = vec![7, 8, 9];
+        let tokens_only = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(ring.clone()),
+            ..Default::default()
+        };
+        let tokens_and_text = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            request_text: Some("text that must not influence the ring key"),
+            hash_ring: Some(ring),
+            ..Default::default()
+        };
+
+        let (result1, _) = policy.select_worker_impl(&workers, &tokens_only);
+        let (result2, _) = policy.select_worker_impl(&workers, &tokens_and_text);
+
+        assert_eq!(result1, result2);
+    }
+
+    #[test]
+    fn test_no_routing_key_falls_back_to_load() {
+        let policy = PrefixHashPolicy::with_defaults();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+        let _busy = WorkerLoadGuard::new(workers[0].clone(), None);
+
+        // Empty tokens, empty text
         let tokens: Vec<u32> = vec![];
         let info = SelectWorkerInfo {
             tokens: Some(&tokens),
+            request_text: Some(""),
             hash_ring: Some(ring.clone()),
             ..Default::default()
         };
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
-        assert_eq!(result, None);
-        assert_eq!(branch, Branch::NoTokens);
+        assert_eq!(result, Some(1), "a keyless request still has to be served");
+        assert_eq!(branch, Branch::NoRoutingKey);
 
-        // No tokens field
-        let info_no_tokens = SelectWorkerInfo {
+        // Neither field set
+        let info_empty = SelectWorkerInfo {
             tokens: None,
             hash_ring: Some(ring),
             ..Default::default()
         };
 
-        let (result2, branch2) = policy.select_worker_impl(&workers, &info_no_tokens);
-        assert_eq!(result2, None);
-        assert_eq!(branch2, Branch::NoTokens);
+        let (result2, branch2) = policy.select_worker_impl(&workers, &info_empty);
+        assert_eq!(result2, Some(1));
+        assert_eq!(branch2, Branch::NoRoutingKey);
     }
 
     #[test]

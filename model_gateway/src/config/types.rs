@@ -559,7 +559,8 @@ pub enum PolicyConfig {
     /// - O(log n) lookup instead of O(prefix_len) radix tree traversal
     #[serde(rename = "prefix_hash")]
     PrefixHash {
-        /// Number of prefix tokens to hash (default: 256)
+        /// Number of prefix tokens to hash, or four times as many characters
+        /// of the prompt when the request is untokenized (default: 256)
         #[serde(default = "default_prefix_token_count")]
         prefix_token_count: usize,
         /// Load factor threshold - walk ring if load > avg * factor (default: 1.25)

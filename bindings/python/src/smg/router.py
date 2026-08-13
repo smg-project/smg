@@ -166,8 +166,9 @@ class Router:
             cached worker if the match rate exceeds threshold, otherwise routes to the
             worker with the smallest tree. Default: 0.5
         prefix_token_count: Number of prefix tokens hashed by the prefix_hash
-            policy. Size it past any shared system prompt so distinct
-            conversations hash apart. Default: 256
+            policy, or four times as many characters of the prompt when the
+            request is untokenized. Size it past any shared system prompt so
+            distinct conversations hash apart. Default: 256
         prefix_hash_load_factor: Load factor above which the prefix_hash policy
             walks the ring instead of using the hashed worker (multiple of the
             average load). Default: 1.25

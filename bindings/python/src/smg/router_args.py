@@ -393,7 +393,10 @@ class RouterArgs:
             f"--{prefix}prefix-token-count",
             type=int,
             default=RouterArgs.prefix_token_count,
-            help="Number of prefix tokens hashed by the prefix_hash policy",
+            help=(
+                "Number of prefix tokens hashed by the prefix_hash policy "
+                "(untokenized requests hash four times as many characters)"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}prefix-hash-load-factor",
