@@ -2145,7 +2145,7 @@ mod tests {
                 cached_tokens: vec![0],
                 output_token_logprobs_val: vec![vec![-0.5]],
                 output_token_logprobs_idx: vec![vec![10]],
-                engine_index: 0,
+                ..Default::default()
             };
             let done = BatchTokenIDOutSlim {
                 rids: vec!["r1".into()],
@@ -2156,7 +2156,7 @@ mod tests {
                 cached_tokens: vec![0],
                 output_token_logprobs_val: vec![vec![-1.25]],
                 output_token_logprobs_idx: vec![vec![11]],
-                engine_index: 0,
+                ..Default::default()
             };
             output
                 .send_frames(vec![bytes::Bytes::from(encode_msgpack(&chunk).unwrap())])
@@ -2810,7 +2810,7 @@ mod tests {
                 cached_tokens: vec![0, 0],
                 output_token_logprobs_val: vec![vec![], vec![]],
                 output_token_logprobs_idx: vec![vec![], vec![]],
-                engine_index: 0,
+                ..Default::default()
             };
             output
                 .send_frames(vec![bytes::Bytes::from(encode_msgpack(&done).unwrap())])

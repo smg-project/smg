@@ -31,7 +31,7 @@ use crate::{
             output::{BatchTokenIDOutSlim, TokenSpeedOutput},
             request::{TokenSpeedRequestType, TokenizedGenerateReqInput},
         },
-        EngineBatch, EngineProtocol,
+        EngineBatch, EngineLoad, EngineProtocol,
     },
 };
 
@@ -142,6 +142,14 @@ impl EngineProtocol for TokenSpeedProtocol {
         let payload = frames.first().map(AsRef::as_ref).unwrap_or_default();
         let batch: BatchTokenIDOutSlim = decode_msgpack(payload)?;
         let engine_index = batch.engine_index;
+        // `kv_total_pages == 0` marks a pre-piggyback sender (or a snapshot
+        // the engine could not take): report no load rather than fabricating
+        // an empty-scheduler signal that least-loaded selection would trust.
+        let load = (batch.kv_total_pages > 0).then(|| EngineLoad {
+            num_running: batch.num_running,
+            num_waiting: batch.num_waiting,
+            kv_cache_usage: batch.kv_active_pages as f64 / batch.kv_total_pages as f64,
+        });
         let outputs = batch.into_outputs()?;
         let finished_request_ids = outputs
             .iter()
@@ -152,9 +160,7 @@ impl EngineProtocol for TokenSpeedProtocol {
             engine_index,
             outputs,
             finished_request_ids,
-            // The slim batch piggybacks no scheduler load, so DP selection
-            // scores TokenSpeed ranks on the gateway's own in-flight counts.
-            load: None,
+            load,
             wave: None,
         })
     }
@@ -175,6 +181,10 @@ mod tests {
             output_token_logprobs_val: vec![vec![], vec![]],
             output_token_logprobs_idx: vec![vec![], vec![]],
             engine_index: 1,
+            num_running: 2,
+            num_waiting: 5,
+            kv_active_pages: 100,
+            kv_total_pages: 400,
         }
     }
 
@@ -184,10 +194,31 @@ mod tests {
         let decoded = TokenSpeedProtocol::decode_batch(&frames).unwrap();
         assert_eq!(decoded.outputs.len(), 2);
         assert_eq!(decoded.finished_request_ids, vec!["b".to_string()]);
-        assert!(decoded.load.is_none());
         // The batch names its producing DP rank; the connector routes in-flight
         // release and scoring by it.
         assert_eq!(decoded.engine_index, 1);
+        // The piggybacked snapshot surfaces as the engine-neutral load signal.
+        assert_eq!(
+            decoded.load,
+            Some(EngineLoad {
+                num_running: 2,
+                num_waiting: 5,
+                kv_cache_usage: 0.25,
+            })
+        );
+    }
+
+    #[test]
+    fn decode_batch_reports_no_load_without_a_snapshot() {
+        // kv_total_pages == 0 marks a pre-piggyback sender (or a snapshot the
+        // engine could not take): no load, not a fabricated empty scheduler.
+        let batch = BatchTokenIDOutSlim {
+            kv_total_pages: 0,
+            ..slim_batch()
+        };
+        let frames = vec![Bytes::from(encode_msgpack(&batch).unwrap())];
+        let decoded = TokenSpeedProtocol::decode_batch(&frames).unwrap();
+        assert!(decoded.load.is_none());
     }
 
     #[test]

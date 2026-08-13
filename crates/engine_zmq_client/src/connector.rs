@@ -227,6 +227,15 @@ impl<P: EngineProtocol> ClientInner<P> {
 
     /// Retire in-flight request ids from a rank. Idempotent: an id already
     /// retired by a racing path is simply absent.
+    ///
+    /// When the retirement empties the rank, its stored queue counts are
+    /// zeroed too: engines only report load on output batches (there is no
+    /// heartbeat), and the last batch a rank ever sends is sampled before its
+    /// final request's finish is committed — so an idle rank's last snapshot
+    /// permanently shows that request still resident. This client routed
+    /// every request, so an empty in-flight set is ground truth that the
+    /// rank's queue is empty; the KV term is left as reported (cache pages
+    /// outlive requests).
     fn release<'a>(&self, engine_index: u32, request_ids: impl IntoIterator<Item = &'a String>) {
         let mut inflight = self.inflight.lock();
         let Some(ids) = inflight.get_mut(&engine_index) else {
@@ -234,6 +243,12 @@ impl<P: EngineProtocol> ClientInner<P> {
         };
         for request_id in request_ids {
             ids.remove(request_id);
+        }
+        if ids.is_empty() {
+            if let Some(load) = self.load.lock().get_mut(&engine_index) {
+                load.num_running = 0;
+                load.num_waiting = 0;
+            }
         }
     }
 
@@ -895,12 +910,15 @@ mod tests {
             .unwrap();
         engine.recv_request().await.unwrap();
 
+        // Stats ride a mid-stream chunk: the request is still in flight, so
+        // the snapshot is current and must be stored verbatim. (A terminal
+        // batch's snapshot predates its own finish; once the rank empties,
+        // the queue counts are zeroed — covered separately.)
         let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
             outputs: vec![EngineCoreOutput {
                 request_id: "r".into(),
                 new_token_ids: vec![7],
-                finish_reason: Some(EngineCoreFinishReason::Stop),
                 ..Default::default()
             }],
             scheduler_stats: Some(Box::new(SchedulerStats {
@@ -908,7 +926,6 @@ mod tests {
                 num_waiting_reqs: 5,
                 ..Default::default()
             })),
-            finished_requests: Some(std::collections::BTreeSet::from(["r".to_string()])),
             ..Default::default()
         });
         engine
@@ -916,8 +933,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Drain the stream so the batch is processed.
-        while stream.next().await.is_some() {}
+        let chunk = stream.next().await.expect("mid-stream chunk").unwrap();
+        assert!(!chunk.finished());
         let load = client.engine_load(0).expect("load recorded");
         assert_eq!(load.num_running, 3);
         assert_eq!(load.num_waiting, 5);
@@ -927,8 +944,10 @@ mod tests {
     async fn unpinned_requests_prefer_the_least_loaded_engine() {
         let (client, mut engines, _ns) = connect_ranks(2, false).await;
 
-        // Make engine 0 report load via a pinned warm-up request; engine 1
-        // never reports and therefore scores zero.
+        // Make engine 0 report load via a pinned warm-up request that stays
+        // in flight (a finished-and-emptied rank has its queue counts zeroed,
+        // because a terminal batch's snapshot predates its own finish);
+        // engine 1 never reports and therefore scores zero.
         let mut stream = client.submit(request_for("warm", 0)).await.unwrap();
         engines[0].recv_request().await.unwrap();
         let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
@@ -936,7 +955,6 @@ mod tests {
             outputs: vec![EngineCoreOutput {
                 request_id: "warm".into(),
                 new_token_ids: vec![7],
-                finish_reason: Some(EngineCoreFinishReason::Stop),
                 ..Default::default()
             }],
             scheduler_stats: Some(Box::new(SchedulerStats {
@@ -944,14 +962,14 @@ mod tests {
                 num_waiting_reqs: 5,
                 ..Default::default()
             })),
-            finished_requests: Some(std::collections::BTreeSet::from(["warm".to_string()])),
             ..Default::default()
         });
         engines[0]
             .send_output(vec![Bytes::from(encode_msgpack(&outputs).unwrap())])
             .await
             .unwrap();
-        while stream.next().await.is_some() {}
+        let chunk = stream.next().await.expect("warm chunk").unwrap();
+        assert!(!chunk.finished());
         assert!(client.engine_load(0).is_some(), "warm-up load recorded");
 
         // An unpinned request must now land on the idle engine 1, not
@@ -1087,6 +1105,66 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn an_emptied_rank_sheds_its_stale_queue_counts() {
+        // Engines report load only on output batches, and a terminal batch's
+        // snapshot is sampled before its own finish commits — so the last
+        // thing an idle rank ever says is "still busy". The client routed
+        // every request: once a rank's in-flight set empties, its stored
+        // queue counts must be zeroed or the rank is shunned forever.
+        let (client, mut engines, _ns) = connect_ranks(2, false).await;
+
+        // Rank 0 runs one request to completion; its terminal batch carries
+        // the stale pre-commit snapshot (3 running, 5 waiting).
+        let mut stream = client.submit(request_for("last", 0)).await.unwrap();
+        engines[0].recv_request().await.unwrap();
+        let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            outputs: vec![EngineCoreOutput {
+                request_id: "last".into(),
+                new_token_ids: vec![7],
+                finish_reason: Some(EngineCoreFinishReason::Stop),
+                ..Default::default()
+            }],
+            scheduler_stats: Some(Box::new(SchedulerStats {
+                num_running_reqs: 3,
+                num_waiting_reqs: 5,
+                ..Default::default()
+            })),
+            finished_requests: Some(std::collections::BTreeSet::from(["last".to_string()])),
+            ..Default::default()
+        });
+        engines[0]
+            .send_output(vec![Bytes::from(encode_msgpack(&outputs).unwrap())])
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+        let load = client.engine_load(0).expect("snapshot stored");
+        assert_eq!((load.num_running, load.num_waiting), (0, 0));
+
+        // Rank 1 holds one live request. The next unpinned request must go to
+        // the genuinely idle rank 0 — trusting the stale snapshot would send
+        // it behind rank 1's real work.
+        let _held = client.submit(request_for("held", 1)).await.unwrap();
+        engines[1].recv().await.unwrap();
+        let _next = client
+            .submit(EngineCoreRequest {
+                request_id: "next".into(),
+                prompt_token_ids: Some(vec![1, 2, 3]),
+                ..EngineCoreRequest::default()
+            })
+            .await
+            .unwrap();
+        match tokio::time::timeout(TIMEOUT, engines[0].recv())
+            .await
+            .expect("request should route to the emptied rank")
+            .unwrap()
+        {
+            EngineInbound::Add(request) => assert_eq!(request.request_id, "next"),
+            other => panic!("expected Add on engine 0, got {other:?}"),
+        }
+    }
+
     /// The `EngineId` of one connected rank, by index.
     fn engines_id(client: &EngineCoreClient, engine_index: u32) -> EngineId {
         client
@@ -1208,7 +1286,7 @@ mod tests {
             cached_tokens: vec![0],
             output_token_logprobs_val: vec![vec![]],
             output_token_logprobs_idx: vec![vec![]],
-            engine_index: 0,
+            ..Default::default()
         };
         let done = BatchTokenIDOutSlim {
             rids: vec!["ts-1".into()],
@@ -1219,7 +1297,7 @@ mod tests {
             cached_tokens: vec![0],
             output_token_logprobs_val: vec![vec![]],
             output_token_logprobs_idx: vec![vec![]],
-            engine_index: 0,
+            ..Default::default()
         };
         engine
             .send_output(vec![Bytes::from(encode_msgpack(&chunk).unwrap())])
