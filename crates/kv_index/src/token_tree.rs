@@ -273,7 +273,10 @@ impl Node {
     /// # Arguments
     /// * `tenant` - The tenant to touch
     /// * `track_lfu` - If true, increment hit_count for LFU policy (only needed when eviction_policy == LFU)
-    fn touch_tenant(&self, tenant: &TenantId, track_lfu: bool) {
+    /// Returns true when this call newly attached the tenant to the node —
+    /// the atomic winner under concurrency, so token accounting tied to it is
+    /// exact.
+    fn touch_tenant(&self, tenant: &TenantId, track_lfu: bool) -> bool {
         let ts = next_timestamp();
 
         // Conditionally increment hit count (only for LFU policy to reduce contention)
@@ -283,12 +286,16 @@ impl Node {
 
         // Fast path: try to update existing entry without Arc clone
         // DashMap supports Borrow<str> lookups, avoiding allocation
-        if let Some(mut entry) = self.tenant_last_access_time.get_mut(tenant.as_ref()) {
-            *entry = ts;
-        } else {
-            // Slow path: insert new entry (requires Arc clone)
-            self.tenant_last_access_time.insert(Arc::clone(tenant), ts);
-        }
+        let newly_attached =
+            if let Some(mut entry) = self.tenant_last_access_time.get_mut(tenant.as_ref()) {
+                *entry = ts;
+                false
+            } else {
+                // Slow path: insert new entry (requires Arc clone)
+                self.tenant_last_access_time
+                    .insert(Arc::clone(tenant), ts)
+                    .is_none()
+            };
 
         // Probabilistic cache update (1/16 chance) to reduce write contention
         if ts & 0xF == 0 {
@@ -296,6 +303,8 @@ impl Node {
                 *guard = Some(Arc::clone(tenant));
             }
         }
+
+        newly_attached
     }
 }
 
@@ -439,7 +448,11 @@ impl TokenTree {
         // This allows the entry guard to be dropped before we update current
         enum InsertStep {
             Done(usize),
-            Continue { next: NodeRef, advance: usize },
+            Continue {
+                next: NodeRef,
+                advance: usize,
+                counted: usize,
+            },
         }
 
         while remaining.len() >= PAGE_SIZE {
@@ -474,12 +487,16 @@ impl TokenTree {
                         drop(child_tokens);
                         InsertStep::Done(0)
                     } else if common_len == child_len {
-                        // Full match with child - continue traversal
+                        // Full match with child - continue traversal. Count
+                        // the tokens only on first attach (atomic via
+                        // touch_tenant), or repeat traffic inflates
+                        // `tenant_token_count`.
                         drop(child_tokens);
-                        child.touch_tenant(&tenant_id, track_lfu);
+                        let newly_attached = child.touch_tenant(&tenant_id, track_lfu);
                         InsertStep::Continue {
                             next: child,
                             advance: common_len,
+                            counted: if newly_attached { common_len } else { 0 },
                         }
                     } else if common_len >= remaining.len() {
                         // Input is prefix of child - split child at page boundary
@@ -600,8 +617,12 @@ impl TokenTree {
                     tokens_added += added;
                     break;
                 }
-                InsertStep::Continue { next, advance } => {
-                    tokens_added += advance;
+                InsertStep::Continue {
+                    next,
+                    advance,
+                    counted,
+                } => {
+                    tokens_added += counted;
                     remaining = &remaining[advance..];
                     current = next;
                 }
@@ -800,7 +821,11 @@ impl TokenTree {
         // dropped before we advance `current` (same pattern as `insert_tokens`).
         enum Step {
             Done(usize),
-            Continue { next: NodeRef, advance: usize },
+            Continue {
+                next: NodeRef,
+                advance: usize,
+                counted: usize,
+            },
         }
 
         while remaining.len() >= PAGE_SIZE {
@@ -865,10 +890,11 @@ impl TokenTree {
                         // ALSO touched twice (match then insert), so we keep both
                         // touches to preserve LFU hit_count / timestamp behavior
                         // byte-for-byte.
-                        child.touch_tenant(&tenant_id, track_lfu);
+                        let newly_attached = child.touch_tenant(&tenant_id, track_lfu);
                         Step::Continue {
                             next: child,
                             advance: common_len,
+                            counted: if newly_attached { common_len } else { 0 },
                         }
                     } else if common_len >= remaining.len() {
                         // Input is a prefix of the child -> split child at the
@@ -1000,8 +1026,12 @@ impl TokenTree {
                     tokens_added += added;
                     break;
                 }
-                Step::Continue { next, advance } => {
-                    tokens_added += advance;
+                Step::Continue {
+                    next,
+                    advance,
+                    counted,
+                } => {
+                    tokens_added += counted;
                     remaining = &remaining[advance..];
                     current = next;
                 }
@@ -1184,8 +1214,11 @@ impl TokenTree {
         // `insert_tokens` touches the inserting tenant on each full-match node
         // and counts its `advance` tokens.
         for (node, advance) in &path {
-            node.touch_tenant(&tenant_id, track_lfu);
-            tokens_added += *advance;
+            // Count only newly-attached edges (atomic via touch_tenant): the
+            // selected tenant usually already owns the matched prefix.
+            if node.touch_tenant(&tenant_id, track_lfu) {
+                tokens_added += *advance;
+            }
         }
 
         // Splice only the unmatched suffix at the fall-off node (`current`),
@@ -2261,10 +2294,49 @@ mod tests {
 
         let counts = tree.get_tenant_token_counts();
 
-        assert!(counts.contains_key("tenant1"));
-        assert!(counts.contains_key("tenant2"));
-        assert!(*counts.get("tenant1").unwrap() >= PAGE_SIZE);
-        assert!(*counts.get("tenant2").unwrap() >= PAGE_SIZE);
+        // tokens2 shares tokens1's full 2-page prefix: tenant1 owns exactly
+        // 3 pages, not 2 + 3.
+        assert_eq!(*counts.get("tenant1").unwrap(), 3 * PAGE_SIZE);
+        assert_eq!(*counts.get("tenant2").unwrap(), PAGE_SIZE);
+    }
+
+    #[test]
+    fn repeat_insert_does_not_inflate_tenant_count() {
+        let tree = TokenTree::new();
+        let tokens = make_tokens(1, 3);
+
+        tree.insert_tokens(&tokens, "tenant1");
+        tree.insert_tokens(&tokens, "tenant1");
+        tree.insert_tokens(&tokens, "tenant1");
+
+        let counts = tree.get_tenant_token_counts();
+        assert_eq!(*counts.get("tenant1").unwrap(), 3 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn match_and_insert_with_repeat_keeps_count_stable() {
+        let tree = TokenTree::new();
+        let tokens = make_tokens(1, 3);
+
+        for _ in 0..3 {
+            tree.match_and_insert_with(&tokens, |_| Some("tenant1"));
+        }
+
+        let counts = tree.get_tenant_token_counts();
+        assert_eq!(*counts.get("tenant1").unwrap(), 3 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn match_and_insert_repeat_keeps_count_stable() {
+        let tree = TokenTree::new();
+        let tokens = make_tokens(1, 3);
+
+        tree.match_and_insert(&tokens, "tenant1");
+        tree.match_and_insert(&tokens, "tenant1");
+        tree.match_and_insert(&tokens, "tenant1");
+
+        let counts = tree.get_tenant_token_counts();
+        assert_eq!(*counts.get("tenant1").unwrap(), 3 * PAGE_SIZE);
     }
 
     #[test]
@@ -3279,13 +3351,14 @@ mod tests {
     /// `tenant_token_count` or loses routes under concurrent node splits
     /// (the review concern).
     ///
-    /// Invariant under test (exact, concurrency-independent): every insert
-    /// adds `align_to_page(input_len)` to its tenant's count, no matter how
-    /// nodes are split mid-flight — the per-node `advance`s are frozen at match
-    /// time, and the suffix splice re-walks from the fall-off node. If a
-    /// concurrent split inflated the count (the "Major" review claim), the
-    /// exact-equality assert below would fail. There is no background eviction
-    /// in a bare `TokenTree`, so the count is pure-cumulative here.
+    /// Invariant under test (exact, concurrency-independent): a tenant's
+    /// count equals the tokens it owns — `align_to_page(input_len)` counted
+    /// once on first attach, never again on repeats — no matter how nodes are
+    /// split mid-flight or how calls interleave (first-attach is atomic in
+    /// `touch_tenant`, per-node `advance`s are frozen at match time, and the
+    /// suffix splice re-walks from the fall-off node). Inflation from repeat
+    /// traffic or concurrent splits fails the exact-equality assert below.
+    /// There is no background eviction in a bare `TokenTree`.
     ///
     /// Both variants run concurrently (inline + replay) on overlapping, nested,
     /// diverging prefixes chosen to force splits.
@@ -3343,10 +3416,14 @@ mod tests {
             }
         }
 
-        // DEFINITIVE: exact, concurrency-independent count.
+        // DEFINITIVE: exact, concurrency-independent count. Repeat traffic
+        // must not inflate ownership: each tenant owns its full path exactly
+        // once regardless of iteration count or interleaving (first-attach is
+        // atomic in touch_tenant).
         let counts = tree.get_tenant_token_counts();
         for j in 0..N_PREFIXES {
-            let expected = total[j] * lens[j];
+            assert!(total[j] > 0);
+            let expected = lens[j];
             let actual = counts.get(&tenants[j]).copied().unwrap_or(0);
             assert_eq!(
                 actual, expected,
