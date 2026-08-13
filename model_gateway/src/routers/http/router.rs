@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use openai_protocol::{
     chat::ChatCompletionRequest,
@@ -851,7 +852,7 @@ impl Router {
             // is slow, the upstream relay awaits on `send` rather than piling
             // chunks in memory.
             const STREAM_RELAY_BUFFER: usize = 32;
-            let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, String>>(STREAM_RELAY_BUFFER);
+            let (tx, rx) = mpsc::channel::<Result<Bytes, String>>(STREAM_RELAY_BUFFER);
             // Attribute worker-level and router-level outcomes to the actual
             // stream completion from inside the relay task: a mid-stream error
             // after a 2xx header, or a non-streaming 5xx header returned under
