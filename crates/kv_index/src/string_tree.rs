@@ -264,6 +264,32 @@ struct Node {
     last_tenant: RwLock<Option<TenantId>>,
 }
 
+impl Node {
+    /// Attach `tenant` with `timestamp` unless already present. Returns true
+    /// when this call newly attached the tenant — the atomic winner under
+    /// concurrency, so char accounting tied to it is exact.
+    fn attach_tenant_if_absent(&self, tenant: &TenantId, timestamp: u64) -> bool {
+        match self.tenant_last_access_time.entry(Arc::clone(tenant)) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(entry) => {
+                entry.insert(timestamp);
+                true
+            }
+        }
+    }
+}
+
+/// True when `node`'s parent pointer currently designates `parent`. A split
+/// re-parents a node inside the same `text` write section that truncates it,
+/// so walkers check this under their `text` read guard to reject a child
+/// re-probed through a stale edge mid-split.
+fn node_parent_is(node: &NodeRef, parent: &NodeRef) -> bool {
+    node.parent
+        .read()
+        .as_ref()
+        .is_some_and(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(parent)))
+}
+
 #[derive(Debug)]
 pub struct Tree {
     root: NodeRef,
@@ -480,38 +506,50 @@ impl Tree {
                         // Drop read lock before creating new node
                         drop(matched_node_text);
 
-                        let new_node = Arc::new(Node {
-                            text: RwLock::new(matched_text),
-                            children: new_children_map(),
-                            parent: RwLock::new(Some(Arc::downgrade(&prev))),
-                            tenant_last_access_time: matched_node.tenant_last_access_time.clone(),
-                            last_tenant: RwLock::new(matched_node.last_tenant.read().clone()),
-                        });
-
                         let Some(first_new_char) = contracted_text.first_char() else {
                             // split_at_char with shared_count < char_count guarantees non-empty suffix
                             return;
                         };
+
+                        // Truncate to the suffix, clone the tenant map, and
+                        // re-parent under the new prefix node in one `text`
+                        // write section: lock-free walkers read the text and
+                        // validate the parent pointer under a `text` read
+                        // guard, so they observe the pre-split node or the
+                        // post-split one — never a truncated text still
+                        // reachable through the stale edge (which would
+                        // silently shift their depth on self-similar content).
+                        // Replayers likewise credit the live char count under
+                        // the read guard, so the clone inherits exactly the
+                        // tenants credited for the pre-split span.
+                        let mut matched_node_text_write = matched_node.text.write();
+                        let tenant_map = matched_node.tenant_last_access_time.clone();
+                        let last_tenant = matched_node.last_tenant.read().clone();
+                        let new_node = Arc::new(Node {
+                            text: RwLock::new(matched_text),
+                            children: new_children_map(),
+                            parent: RwLock::new(Some(Arc::downgrade(&prev))),
+                            tenant_last_access_time: tenant_map,
+                            last_tenant: RwLock::new(last_tenant),
+                        });
+                        *matched_node.parent.write() = Some(Arc::downgrade(&new_node));
+                        *matched_node_text_write = contracted_text;
+                        drop(matched_node_text_write);
+
                         new_node
                             .children
                             .insert(first_new_char, Arc::clone(&matched_node));
 
-                        entry.insert(Arc::clone(&new_node));
-
-                        *matched_node.text.write() = contracted_text;
-                        *matched_node.parent.write() = Some(Arc::downgrade(&new_node));
-
-                        // Attach tenant to the new split node (intermediate - no timestamp update)
-                        // The cloned DashMap already has the tenant; just ensure char count is correct
-                        if !new_node
-                            .tenant_last_access_time
-                            .contains_key(tenant_id.as_ref())
-                        {
+                        // Attach before publication (intermediate - no timestamp
+                        // update): the node is unreachable, so the return is
+                        // authoritative and the prefix is credited exactly once
+                        // even against a concurrent same-tenant replay that
+                        // raced the clone above.
+                        if new_node.attach_tenant_if_absent(&tenant_id, 0) {
                             self.add_tenant_chars(&tenant_id, matched_text_count);
-                            new_node
-                                .tenant_last_access_time
-                                .insert(Arc::clone(&tenant_id), 0);
                         }
+
+                        entry.insert(Arc::clone(&new_node));
 
                         InsertStep::Continue {
                             next_prev: new_node,
@@ -521,15 +559,11 @@ impl Tree {
                         // Full match - move to next node (intermediate - no timestamp update)
                         drop(matched_node_text);
 
-                        // Ensure tenant exists at this intermediate node
-                        if !matched_node
-                            .tenant_last_access_time
-                            .contains_key(tenant_id.as_ref())
-                        {
+                        // Ensure tenant exists at this intermediate node,
+                        // counting only on first attach (atomic) so a
+                        // concurrent same-tenant attach can't double-credit.
+                        if matched_node.attach_tenant_if_absent(&tenant_id, 0) {
                             self.add_tenant_chars(&tenant_id, matched_node_text_count);
-                            matched_node
-                                .tenant_last_access_time
-                                .insert(Arc::clone(&tenant_id), 0);
                         }
 
                         InsertStep::Continue {
@@ -572,6 +606,17 @@ impl Tree {
 
             if let Some(matched_node) = child_node {
                 let matched_text_guard = matched_node.text.read();
+                // Stale-edge check: a split re-parents the child inside the
+                // same `text` write section that truncates it, so a parent no
+                // longer equal to `prev` means this text may start deeper than
+                // this edge (on self-similar content the suffix would still
+                // compare equal and silently shift the walk). Re-probe the
+                // edge until the split publishes.
+                if !node_parent_is(&matched_node, &prev) {
+                    drop(matched_text_guard);
+                    std::hint::spin_loop();
+                    continue;
+                }
                 let matched_node_text_count = matched_text_guard.char_count();
 
                 // Use slice-based comparison - no allocation
@@ -714,9 +759,9 @@ impl Tree {
         // The node match resolves its tenant on (its final `curr`): the deepest
         // full-match node, the partial child, or the root if nothing matched.
         let mut match_curr = Arc::clone(&self.root);
-        // (node, char_count) for each full-match edge, in order.
+        // Every full-match node we descended through, in order.
         // Pre-allocated; most matched paths are well under this depth.
-        let mut path: Vec<(NodeRef, usize)> = Vec::with_capacity(16);
+        let mut path: Vec<NodeRef> = Vec::with_capacity(16);
 
         while let Some(first_char) = remaining.chars().next() {
             let child_node = current.children.get(&first_char).map(|e| e.value().clone());
@@ -727,6 +772,12 @@ impl Tree {
             };
 
             let matched_text_guard = matched_node.text.read();
+            // Stale-edge check (see `match_prefix_with_counts`).
+            if !node_parent_is(&matched_node, &current) {
+                drop(matched_text_guard);
+                std::hint::spin_loop();
+                continue;
+            }
             let matched_node_text_count = matched_text_guard.char_count();
             let shared_count = shared_prefix_count(remaining, matched_text_guard.as_str());
             drop(matched_text_guard);
@@ -734,7 +785,7 @@ impl Tree {
             if shared_count == matched_node_text_count {
                 // Full match -> continue. Record for ancestor re-attach.
                 matched_chars += shared_count;
-                path.push((Arc::clone(&matched_node), matched_node_text_count));
+                path.push(Arc::clone(&matched_node));
                 remaining = advance_by_chars(remaining, shared_count);
                 current = Arc::clone(&matched_node);
                 match_curr = matched_node;
@@ -778,14 +829,16 @@ impl Tree {
 
         // Re-attach the inserting tenant to every full-match ancestor node, the
         // epoch-0 intermediate attach `insert_text` performs while descending.
-        for (node, char_count) in &path {
-            if !node
-                .tenant_last_access_time
-                .contains_key(tenant_id.as_ref())
-            {
-                self.add_tenant_chars(&tenant_id, *char_count);
-                node.tenant_last_access_time
-                    .insert(Arc::clone(&tenant_id), 0);
+        for node in &path {
+            // Credit the live char count under the `text` read guard: a
+            // concurrent split truncates the node and clones its tenant map in
+            // one `text` write section, so this ordering decides both what the
+            // tenant now owns and whether the clone inherits it. The
+            // match-time count would over-credit a node truncated since.
+            // Count only on first attach (atomic).
+            let text_guard = node.text.read();
+            if node.attach_tenant_if_absent(&tenant_id, 0) {
+                self.add_tenant_chars(&tenant_id, text_guard.char_count());
             }
         }
 
@@ -878,6 +931,12 @@ impl Tree {
                 }
 
                 let matched_text_guard = matched_node.text.read();
+                // Stale-edge check (see `match_prefix_with_counts`).
+                if !node_parent_is(&matched_node, &prev) {
+                    drop(matched_text_guard);
+                    std::hint::spin_loop();
+                    continue;
+                }
                 let matched_node_text_count = matched_text_guard.char_count();
 
                 // Use slice-based comparison - no allocation
@@ -1726,9 +1785,14 @@ impl Tree {
                         }
                     }
 
-                    // Push local child down as child of split node
-                    *local_child.text.write() = local_remainder_text;
+                    // Push local child down as child of split node. Re-parent
+                    // inside the same `text` write section as the truncation
+                    // so walkers validating the parent under a `text` read
+                    // guard never see the truncated edge as top-level.
+                    let mut local_child_text_write = local_child.text.write();
                     *local_child.parent.write() = Some(Arc::downgrade(&split_node));
+                    *local_child_text_write = local_remainder_text;
+                    drop(local_child_text_write);
                     split_node
                         .children
                         .insert(local_remainder_first, Arc::clone(&local_child));
@@ -3441,5 +3505,75 @@ mod tests {
         tree.clear();
         assert_consistent(&tree);
         assert_eq!(tree.total_char_size(), 0);
+    }
+
+    #[test]
+    fn test_concurrent_match_and_insert_count_and_route_integrity() {
+        const N_PREFIXES: usize = 8;
+        const N_THREADS: usize = 8;
+        const ITERS: usize = 3000;
+        const HEAD_STEP: usize = 8;
+        const TAIL_LEN: usize = 5;
+
+        // Nested shared head "aaa…" (a shorter prefix matching inside a longer
+        // node forces a split) + a disjoint divergent tail per tenant.
+        let prefixes: Vec<String> = (0..N_PREFIXES)
+            .map(|j| {
+                let mut s = "a".repeat(HEAD_STEP * (j + 1));
+                let tail = char::from(b'b' + j as u8);
+                s.extend(std::iter::repeat_n(tail, TAIL_LEN));
+                s
+            })
+            .collect();
+        let tenants: Vec<String> = (0..N_PREFIXES).map(|j| format!("t{j}")).collect();
+        let lens: Vec<usize> = prefixes.iter().map(|p| p.chars().count()).collect();
+
+        let tree = Arc::new(Tree::new());
+        let prefixes = Arc::new(prefixes);
+        let tenants = Arc::new(tenants);
+
+        let handles: Vec<_> = (0..N_THREADS)
+            .map(|t| {
+                let tree = Arc::clone(&tree);
+                let prefixes = Arc::clone(&prefixes);
+                let tenants = Arc::clone(&tenants);
+                thread::spawn(move || {
+                    for i in 0..ITERS {
+                        let j = (t + i) % N_PREFIXES;
+                        if t % 2 == 0 {
+                            let tn = tenants[j].as_str();
+                            tree.match_and_insert_with(&prefixes[j], |_| Some(tn));
+                        } else {
+                            tree.match_and_insert(&prefixes[j], tenants[j].as_str());
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker panicked (deadlock/corruption)");
+        }
+
+        // Exact, concurrency-independent count: each tenant owns its full path
+        // exactly once regardless of iteration count or interleaving
+        // (first-attach is atomic, split-vs-replay ordered by the text lock).
+        let counts = tree.get_tenant_char_count();
+        for j in 0..N_PREFIXES {
+            let actual = counts.get(&tenants[j]).copied().unwrap_or(0);
+            assert_eq!(
+                actual, lens[j],
+                "tenant {} char count diverged under concurrency: expected {}, got {actual}",
+                tenants[j], lens[j]
+            );
+        }
+
+        // Route integrity: every prefix is still fully cached at the end.
+        for j in 0..N_PREFIXES {
+            let r = tree.match_prefix_with_counts(&prefixes[j]);
+            assert_eq!(
+                r.matched_char_count, lens[j],
+                "prefix {j} not fully cached after concurrent stress (route loss)"
+            );
+        }
     }
 }

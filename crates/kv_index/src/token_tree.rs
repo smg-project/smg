@@ -508,26 +508,32 @@ impl TokenTree {
                         let common_len = align_to_page(remaining.len());
                         let prefix_tokens: Vec<TokenId> = child_tokens[..common_len].to_vec();
                         let suffix_page_key = make_page_key(&child_tokens[common_len..]);
-
-                        // Check if tenant already owned the child (tokens already counted)
-                        let tenant_already_owned = child
-                            .tenant_last_access_time
-                            .contains_key(tenant_id.as_ref());
                         drop(child_tokens);
 
-                        // Modify original child to hold only suffix tokens
+                        // Truncate the child to its suffix, clone its tenant
+                        // map, and re-parent it under the intermediate in one
+                        // `tokens` write section: lock-free walkers read the
+                        // length and validate the parent pointer under a
+                        // `tokens` read guard, so they observe the pre-split
+                        // node or the post-split one — never a truncated text
+                        // still reachable through the stale edge (which would
+                        // silently shift their depth on self-similar content).
+                        // Replayers likewise credit the live length under the
+                        // read guard, so the clone inherits exactly the
+                        // tenants credited for the pre-split span.
                         let mut child_tokens_write = child.tokens.write();
+                        let tenant_map = child.tenant_last_access_time.clone();
+                        let last_tenant = child.last_tenant.read().clone();
                         let suffix_tokens: Vec<TokenId> = child_tokens_write[common_len..].to_vec();
                         *child_tokens_write = suffix_tokens;
-                        drop(child_tokens_write);
 
-                        // Create intermediate node with prefix - clone tenant map (O(1))
+                        // Create intermediate node with prefix
                         // Intermediate inherits metadata from child (represents same prefix)
                         let intermediate_node = Arc::new(Node {
                             tokens: ParkingLotRwLock::new(prefix_tokens),
                             children: new_children_map(),
-                            tenant_last_access_time: child.tenant_last_access_time.clone(),
-                            last_tenant: ParkingLotRwLock::new(child.last_tenant.read().clone()),
+                            tenant_last_access_time: tenant_map,
+                            last_tenant: ParkingLotRwLock::new(last_tenant),
                             parent: ParkingLotRwLock::new(Arc::downgrade(&current)),
                             page_key: ParkingLotRwLock::new(Some(page_key)),
                             hit_count: AtomicU64::new(child.hit_count.load(Ordering::Relaxed)),
@@ -535,20 +541,25 @@ impl TokenTree {
                             priority: AtomicI32::new(child.priority.load(Ordering::Relaxed)),
                         });
 
-                        // Add original child (now suffix) as child of intermediate
                         // Update child's parent to point to intermediate
                         child.set_parent(&intermediate_node, suffix_page_key);
+                        drop(child_tokens_write);
+
+                        // Add original child (now suffix) as child of intermediate
                         intermediate_node
                             .children
                             .insert(suffix_page_key, Arc::clone(&child));
 
+                        // Attach before publication: the node is unreachable, so
+                        // the return is authoritative and the prefix is credited
+                        // exactly once even against a concurrent same-tenant
+                        // replay that raced the clone above.
+                        let newly_attached = intermediate_node.touch_tenant(&tenant_id, track_lfu);
+
                         // Replace entry with intermediate node
-                        entry.insert(intermediate_node.clone());
+                        entry.insert(intermediate_node);
 
-                        intermediate_node.touch_tenant(&tenant_id, track_lfu);
-
-                        // Only count new tokens if tenant didn't already own this path
-                        let new_tokens = if tenant_already_owned { 0 } else { common_len };
+                        let new_tokens = if newly_attached { common_len } else { 0 };
                         InsertStep::Done(new_tokens)
                     } else {
                         // Partial match - need to split and add new branch at page boundary
@@ -556,26 +567,24 @@ impl TokenTree {
                         // keep original child as one suffix, create new node for other suffix
                         let prefix_tokens: Vec<TokenId> = child_tokens[..common_len].to_vec();
                         let child_suffix_page_key = make_page_key(&child_tokens[common_len..]);
-
-                        // Check if tenant already owned the child (common prefix already counted)
-                        let tenant_already_owned = child
-                            .tenant_last_access_time
-                            .contains_key(tenant_id.as_ref());
                         drop(child_tokens);
 
-                        // Modify original child to hold only its suffix tokens
+                        // Truncate + tenant-map clone + re-parent in one
+                        // `tokens` write section (see the prefix-split arm
+                        // above).
                         let mut child_tokens_write = child.tokens.write();
+                        let tenant_map = child.tenant_last_access_time.clone();
+                        let last_tenant = child.last_tenant.read().clone();
                         let child_suffix: Vec<TokenId> = child_tokens_write[common_len..].to_vec();
                         *child_tokens_write = child_suffix;
-                        drop(child_tokens_write);
 
-                        // Create intermediate node with common prefix - clone tenant map (O(1))
+                        // Create intermediate node with common prefix
                         // Intermediate inherits metadata from child (represents same prefix)
                         let intermediate_node = Arc::new(Node {
                             tokens: ParkingLotRwLock::new(prefix_tokens),
                             children: new_children_map(),
-                            tenant_last_access_time: child.tenant_last_access_time.clone(),
-                            last_tenant: ParkingLotRwLock::new(child.last_tenant.read().clone()),
+                            tenant_last_access_time: tenant_map,
+                            last_tenant: ParkingLotRwLock::new(last_tenant),
                             parent: ParkingLotRwLock::new(Arc::downgrade(&current)),
                             page_key: ParkingLotRwLock::new(Some(page_key)),
                             hit_count: AtomicU64::new(child.hit_count.load(Ordering::Relaxed)),
@@ -583,9 +592,11 @@ impl TokenTree {
                             priority: AtomicI32::new(child.priority.load(Ordering::Relaxed)),
                         });
 
-                        // Add original child (now suffix) as child of intermediate
                         // Update child's parent to point to intermediate
                         child.set_parent(&intermediate_node, child_suffix_page_key);
+                        drop(child_tokens_write);
+
+                        // Add original child (now suffix) as child of intermediate
                         intermediate_node
                             .children
                             .insert(child_suffix_page_key, Arc::clone(&child));
@@ -603,13 +614,13 @@ impl TokenTree {
                             0
                         };
 
+                        // Attach before publication (see the prefix-split arm).
+                        let newly_attached = intermediate_node.touch_tenant(&tenant_id, track_lfu);
+
                         // Replace entry with intermediate node
-                        entry.insert(intermediate_node.clone());
+                        entry.insert(intermediate_node);
 
-                        intermediate_node.touch_tenant(&tenant_id, track_lfu);
-
-                        // Count: new branch tokens + common prefix only if tenant is new
-                        let common_tokens = if tenant_already_owned { 0 } else { common_len };
+                        let common_tokens = if newly_attached { common_len } else { 0 };
                         InsertStep::Done(new_branch_tokens + common_tokens)
                     }
                 }
@@ -669,6 +680,7 @@ impl TokenTree {
 
         enum MatchStep {
             Done,
+            Retry,
             Continue {
                 next: NodeRef,
                 advance: usize,
@@ -686,11 +698,22 @@ impl TokenTree {
 
             let step = match current.children.get(&page_key) {
                 None => MatchStep::Done,
-                Some(child_ref) => {
+                Some(child_ref) => 'probe: {
                     let child = Arc::clone(child_ref.value());
                     drop(child_ref);
 
                     let child_tokens = child.tokens.read();
+                    // Stale-edge check: a split re-parents the child inside
+                    // the same `tokens` write section that truncates it, so a
+                    // parent no longer equal to `current` means this text may
+                    // start deeper than this edge (on self-similar content the
+                    // suffix would still compare equal and silently shift the
+                    // walk). Re-probe the edge until the split publishes.
+                    if !std::ptr::eq(child.parent.read().as_ptr(), Arc::as_ptr(&current)) {
+                        drop(child_tokens);
+                        std::hint::spin_loop();
+                        break 'probe MatchStep::Retry;
+                    }
 
                     // Count matching tokens
                     let match_len = remaining
@@ -739,6 +762,7 @@ impl TokenTree {
 
             match step {
                 MatchStep::Done => break,
+                MatchStep::Retry => continue,
                 MatchStep::PartialMatch { matched, tenant } => {
                     matched_tokens += matched;
                     if let Some(t) = tenant {
@@ -921,22 +945,22 @@ impl TokenTree {
                         let common_len = align_to_page(remaining.len());
                         let prefix_tokens: Vec<TokenId> = child_tokens[..common_len].to_vec();
                         let suffix_page_key = make_page_key(&child_tokens[common_len..]);
-
-                        let tenant_already_owned = child
-                            .tenant_last_access_time
-                            .contains_key(tenant_id.as_ref());
                         drop(child_tokens);
 
+                        // Truncate + tenant-map clone + re-parent in one
+                        // `tokens` write section (see `insert_from`'s
+                        // prefix-split arm).
                         let mut child_tokens_write = child.tokens.write();
+                        let tenant_map = child.tenant_last_access_time.clone();
+                        let last_tenant = child.last_tenant.read().clone();
                         let suffix_tokens: Vec<TokenId> = child_tokens_write[common_len..].to_vec();
                         *child_tokens_write = suffix_tokens;
-                        drop(child_tokens_write);
 
                         let intermediate_node = Arc::new(Node {
                             tokens: ParkingLotRwLock::new(prefix_tokens),
                             children: new_children_map(),
-                            tenant_last_access_time: child.tenant_last_access_time.clone(),
-                            last_tenant: ParkingLotRwLock::new(child.last_tenant.read().clone()),
+                            tenant_last_access_time: tenant_map,
+                            last_tenant: ParkingLotRwLock::new(last_tenant),
                             parent: ParkingLotRwLock::new(Arc::downgrade(&current)),
                             page_key: ParkingLotRwLock::new(Some(page_key)),
                             hit_count: AtomicU64::new(child.hit_count.load(Ordering::Relaxed)),
@@ -945,15 +969,18 @@ impl TokenTree {
                         });
 
                         child.set_parent(&intermediate_node, suffix_page_key);
+                        drop(child_tokens_write);
+
                         intermediate_node
                             .children
                             .insert(suffix_page_key, Arc::clone(&child));
 
-                        entry.insert(intermediate_node.clone());
+                        // Attach before publication (see `insert_from`).
+                        let newly_attached = intermediate_node.touch_tenant(&tenant_id, track_lfu);
 
-                        intermediate_node.touch_tenant(&tenant_id, track_lfu);
+                        entry.insert(intermediate_node);
 
-                        let new_tokens = if tenant_already_owned { 0 } else { common_len };
+                        let new_tokens = if newly_attached { common_len } else { 0 };
                         Step::Done(new_tokens)
                     } else {
                         // Partial match -> split and add a new branch at the page
@@ -974,22 +1001,22 @@ impl TokenTree {
 
                         let prefix_tokens: Vec<TokenId> = child_tokens[..common_len].to_vec();
                         let child_suffix_page_key = make_page_key(&child_tokens[common_len..]);
-
-                        let tenant_already_owned = child
-                            .tenant_last_access_time
-                            .contains_key(tenant_id.as_ref());
                         drop(child_tokens);
 
+                        // Truncate + tenant-map clone + re-parent in one
+                        // `tokens` write section (see `insert_from`'s
+                        // prefix-split arm).
                         let mut child_tokens_write = child.tokens.write();
+                        let tenant_map = child.tenant_last_access_time.clone();
+                        let last_tenant = child.last_tenant.read().clone();
                         let child_suffix: Vec<TokenId> = child_tokens_write[common_len..].to_vec();
                         *child_tokens_write = child_suffix;
-                        drop(child_tokens_write);
 
                         let intermediate_node = Arc::new(Node {
                             tokens: ParkingLotRwLock::new(prefix_tokens),
                             children: new_children_map(),
-                            tenant_last_access_time: child.tenant_last_access_time.clone(),
-                            last_tenant: ParkingLotRwLock::new(child.last_tenant.read().clone()),
+                            tenant_last_access_time: tenant_map,
+                            last_tenant: ParkingLotRwLock::new(last_tenant),
                             parent: ParkingLotRwLock::new(Arc::downgrade(&current)),
                             page_key: ParkingLotRwLock::new(Some(page_key)),
                             hit_count: AtomicU64::new(child.hit_count.load(Ordering::Relaxed)),
@@ -998,6 +1025,8 @@ impl TokenTree {
                         });
 
                         child.set_parent(&intermediate_node, child_suffix_page_key);
+                        drop(child_tokens_write);
+
                         intermediate_node
                             .children
                             .insert(child_suffix_page_key, Arc::clone(&child));
@@ -1014,11 +1043,12 @@ impl TokenTree {
                             0
                         };
 
-                        entry.insert(intermediate_node.clone());
+                        // Attach before publication (see `insert_from`).
+                        let newly_attached = intermediate_node.touch_tenant(&tenant_id, track_lfu);
 
-                        intermediate_node.touch_tenant(&tenant_id, track_lfu);
+                        entry.insert(intermediate_node);
 
-                        let common_tokens = if tenant_already_owned { 0 } else { common_len };
+                        let common_tokens = if newly_attached { common_len } else { 0 };
                         Step::Done(new_branch_tokens + common_tokens)
                     }
                 }
@@ -1099,15 +1129,16 @@ impl TokenTree {
         let mut last_tenant: Option<TenantId> = None;
         let mut remaining = tokens;
         let mut current = Arc::clone(&self.root);
-        // (node, advance) for each edge we descended through, in order.
+        // Every full-match node we descended through, in order.
         // Pre-allocated; most matched paths are well under this depth.
-        let mut path: Vec<(NodeRef, usize)> = Vec::with_capacity(16);
+        let mut path: Vec<NodeRef> = Vec::with_capacity(16);
         // Once match would stop (all-evicted node / partial), freeze the match
         // result but keep descending for insert (insert's reach is a superset).
         let mut match_frozen = false;
 
         enum MatchStep {
             Stop,
+            Retry,
             Continue { next: NodeRef, advance: usize },
         }
 
@@ -1116,11 +1147,17 @@ impl TokenTree {
 
             let step = match current.children.get(&page_key) {
                 None => MatchStep::Stop,
-                Some(child_ref) => {
+                Some(child_ref) => 'probe: {
                     let child = Arc::clone(child_ref.value());
                     drop(child_ref);
 
                     let child_tokens = child.tokens.read();
+                    // Stale-edge check (see `match_prefix_with_counts`).
+                    if !std::ptr::eq(child.parent.read().as_ptr(), Arc::as_ptr(&current)) {
+                        drop(child_tokens);
+                        std::hint::spin_loop();
+                        break 'probe MatchStep::Retry;
+                    }
                     let match_len = remaining
                         .iter()
                         .zip(child_tokens.iter())
@@ -1174,8 +1211,9 @@ impl TokenTree {
 
             match step {
                 MatchStep::Stop => break,
+                MatchStep::Retry => continue,
                 MatchStep::Continue { next, advance } => {
-                    path.push((Arc::clone(&next), advance));
+                    path.push(Arc::clone(&next));
                     remaining = &remaining[advance..];
                     current = next;
                 }
@@ -1210,12 +1248,17 @@ impl TokenTree {
 
         // Replay insert's per-node work on every edge the match descended:
         // `insert_tokens` touches the inserting tenant on each full-match node
-        // and counts its `advance` tokens.
-        for (node, advance) in &path {
-            // Count only newly-attached edges (atomic via touch_tenant): the
-            // selected tenant usually already owns the matched prefix.
+        // and counts its tokens.
+        for node in &path {
+            // Credit the live length under the `tokens` read guard: a
+            // concurrent split truncates the node and clones its tenant map in
+            // one `tokens` write section, so this ordering decides both what
+            // the tenant now owns and whether the clone inherits it. The
+            // match-time length would over-credit a node truncated since.
+            // Count only newly-attached edges (atomic via touch_tenant).
+            let node_tokens = node.tokens.read();
             if node.touch_tenant(&tenant_id, track_lfu) {
-                tokens_added += *advance;
+                tokens_added += node_tokens.len();
             }
         }
 
