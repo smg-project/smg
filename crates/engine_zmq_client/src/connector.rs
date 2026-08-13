@@ -1208,6 +1208,7 @@ mod tests {
             cached_tokens: vec![0],
             output_token_logprobs_val: vec![vec![]],
             output_token_logprobs_idx: vec![vec![]],
+            engine_index: 0,
         };
         let done = BatchTokenIDOutSlim {
             rids: vec!["ts-1".into()],
@@ -1218,6 +1219,7 @@ mod tests {
             cached_tokens: vec![0],
             output_token_logprobs_val: vec![vec![]],
             output_token_logprobs_idx: vec![vec![]],
+            engine_index: 0,
         };
         engine
             .send_output(vec![Bytes::from(encode_msgpack(&chunk).unwrap())])

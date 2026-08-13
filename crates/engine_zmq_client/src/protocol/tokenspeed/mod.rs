@@ -99,8 +99,10 @@ impl EngineProtocol for TokenSpeedProtocol {
     }
 
     fn data_parallel_rank(_request: &Self::Request) -> Option<u32> {
-        // The TokenSpeed generate request carries no DP-rank field, so requests
-        // route to the sole engine (single-engine ZMQ). DP fan-out is future work.
+        // The TokenSpeed generate request carries no DP-rank field and needs
+        // none: rank routing is purely by ZMQ identity — the connector selects
+        // a rank and sends on that rank's socket identity. `None` means "never
+        // pinned", so every request goes through least-loaded selection.
         None
     }
 
@@ -139,6 +141,7 @@ impl EngineProtocol for TokenSpeedProtocol {
         }
         let payload = frames.first().map(AsRef::as_ref).unwrap_or_default();
         let batch: BatchTokenIDOutSlim = decode_msgpack(payload)?;
+        let engine_index = batch.engine_index;
         let outputs = batch.into_outputs()?;
         let finished_request_ids = outputs
             .iter()
@@ -146,11 +149,11 @@ impl EngineProtocol for TokenSpeedProtocol {
             .map(|output| output.request_id.clone())
             .collect();
         Ok(EngineBatch {
-            // Single-engine ZMQ: TokenSpeed batches carry no engine index and
-            // no piggybacked scheduler load.
-            engine_index: 0,
+            engine_index,
             outputs,
             finished_request_ids,
+            // The slim batch piggybacks no scheduler load, so DP selection
+            // scores TokenSpeed ranks on the gateway's own in-flight counts.
             load: None,
             wave: None,
         })
@@ -171,6 +174,7 @@ mod tests {
             cached_tokens: vec![0, 0],
             output_token_logprobs_val: vec![vec![], vec![]],
             output_token_logprobs_idx: vec![vec![], vec![]],
+            engine_index: 1,
         }
     }
 
@@ -181,6 +185,9 @@ mod tests {
         assert_eq!(decoded.outputs.len(), 2);
         assert_eq!(decoded.finished_request_ids, vec!["b".to_string()]);
         assert!(decoded.load.is_none());
+        // The batch names its producing DP rank; the connector routes in-flight
+        // release and scoring by it.
+        assert_eq!(decoded.engine_index, 1);
     }
 
     #[test]
