@@ -258,6 +258,20 @@ impl CacheAwarePolicy {
         self.populate_hash_index.load(Ordering::Relaxed)
     }
 
+    /// Test-only view of the effective config so registry tests can
+    /// assert operator tunables propagated.
+    #[cfg(test)]
+    pub(crate) fn config_for_test(&self) -> &CacheAwareConfig {
+        &self.config
+    }
+
+    /// Test-only: whether a KV event monitor is attached, so registry
+    /// tests can assert injection at publication.
+    #[cfg(test)]
+    pub(crate) fn kv_event_monitor_is_set_for_test(&self) -> bool {
+        self.kv_monitor.read().is_some()
+    }
+
     /// Test-only view onto the populate flag so integration tests
     /// outside this file can assert wiring flipped it. Not part of
     /// the public API.

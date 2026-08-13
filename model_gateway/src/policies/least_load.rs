@@ -134,6 +134,17 @@ impl LeastLoadPolicy {
         }
     }
 
+    /// Test-only view of the tunables so registry tests can assert
+    /// operator values propagated.
+    #[cfg(test)]
+    pub(crate) fn params_for_test(&self) -> (f64, u32, f64) {
+        (
+            self.kv_pressure_weight,
+            self.mean_prefill_tokens,
+            self.default_throughput,
+        )
+    }
+
     /// Expected-wait score for a worker (lower is better).
     ///
     /// `inflight` maps worker URL -> token-work dispatched since its last poll.
