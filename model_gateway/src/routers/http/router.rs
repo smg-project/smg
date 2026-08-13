@@ -197,6 +197,7 @@ impl Router {
         &self,
         model_id: &str,
         text: Option<&str>,
+        tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
         // UNKNOWN_MODEL_ID means caller didn't specify a model — find any available worker
@@ -233,7 +234,7 @@ impl Router {
             &available,
             &SelectWorkerInfo {
                 request_text: text,
-                tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                tokens,
                 headers,
                 hash_ring,
                 leg: crate::policies::WorkerLeg::Single,
@@ -323,7 +324,14 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
-        let text = typed_req.extract_text_for_routing();
+        // Pre-tokenized requests route on the token tree; the decimal-string
+        // rendering is only materialized when there are no tokens.
+        let routing_tokens: Option<Vec<u32>> = typed_req
+            .routing_tokens()
+            .map(|ids| ids.iter().map(|&id| id as u32).collect());
+        let text = routing_tokens
+            .is_none()
+            .then(|| typed_req.extract_text_for_routing());
         // Resolve once, here, so every registry, policy and metrics lookup
         // below is keyed by the canonical model ID. Only `get_by_model`
         // understands aliases; retry configs, hash rings and policies do not,
@@ -361,7 +369,8 @@ impl Router {
                         model_id,
                         canonical_model.as_deref(),
                         is_stream,
-                        &text,
+                        text.as_deref(),
+                        routing_tokens.as_deref(),
                     )
                     .await;
 
@@ -425,9 +434,10 @@ impl Router {
         model_id: &str,
         canonical_model: Option<&str>,
         is_stream: bool,
-        text: &str,
+        text: Option<&str>,
+        tokens: Option<&[u32]>,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
+        let worker = match self.select_worker_for_model(model_id, text, tokens, headers) {
             Some(w) => w,
             None => {
                 // Distinguish "no workers for this model" from "workers exist but unavailable"

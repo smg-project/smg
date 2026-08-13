@@ -182,9 +182,12 @@ impl LoadBalancingPolicy for BucketPolicy {
             return None;
         }
 
-        let char_count = match info.request_text {
-            None => 0,
-            Some(text) => text.chars().count(),
+        // Request-size signal: token count for pre-tokenized requests, else
+        // chars. Boundaries adapt to whichever unit the traffic carries.
+        let char_count = match (info.tokens, info.request_text) {
+            (Some(tokens), _) => tokens.len(),
+            (None, Some(text)) => text.chars().count(),
+            (None, None) => 0,
         };
 
         // Determine the model for this set of workers (router pre-filters by model)

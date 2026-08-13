@@ -62,6 +62,7 @@ struct PDRequestContext<'a> {
     is_stream: bool,
     return_logprob: bool,
     request_text: Option<String>,
+    routing_tokens: Option<Vec<u32>>,
     model_id: &'a str,
     headers: Option<HeaderMap>,
 }
@@ -329,6 +330,7 @@ impl PDRouter {
                         let (prefill, decode) = match self
                             .select_pd_pair(
                                 context.request_text.as_deref(),
+                                context.routing_tokens.as_deref(),
                                 context.model_id,
                                 context.headers.as_ref(),
                             )
@@ -376,8 +378,12 @@ impl PDRouter {
 
                         let dp_rank_policy_opt = self.policy_registry.get_dp_rank_policy();
                         if let Some(dp_rank_policy) = dp_rank_policy_opt.as_ref() {
-                            let estimated_cost: isize = match context.request_text.as_ref() {
-                                Some(text) => {
+                            let estimated_cost: isize = match (
+                                context.routing_tokens.as_deref(),
+                                context.request_text.as_ref(),
+                            ) {
+                                (Some(tokens), _) => (tokens.len() as isize).max(1),
+                                (None, Some(text)) => {
                                     // Calculate token count using a simple heuristic
                                     // In a real implementation, we would use the tokenizer
                                     // For now, use a simple words-to-tokens ratio
@@ -386,7 +392,7 @@ impl PDRouter {
                                     let token_count = (word_count as f64 * 1.3).ceil() as isize;
                                     token_count.max(1)
                                 }
-                                None => 1, // Use at least 1 to avoid no-op
+                                (None, None) => 1, // Use at least 1 to avoid no-op
                             };
                             let policy_prefill_rank =
                                 dp_rank_policy.select_dp_rank(prefill.as_ref(), estimated_cost);
@@ -808,6 +814,7 @@ impl PDRouter {
     async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
+        tokens: Option<&[u32]>,
         model_id: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
@@ -857,6 +864,7 @@ impl PDRouter {
             &prefill_workers,
             &prefill_policy,
             request_text,
+            tokens,
             headers,
             hash_ring.clone(),
             "prefill",
@@ -867,6 +875,7 @@ impl PDRouter {
             &decode_workers,
             &decode_policy,
             request_text,
+            tokens,
             headers,
             hash_ring,
             "decode",
@@ -900,6 +909,7 @@ impl PDRouter {
         workers: &[Arc<dyn Worker>],
         policy: &Arc<dyn LoadBalancingPolicy>,
         request_text: Option<&str>,
+        tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         hash_ring: Option<Arc<HashRing>>,
         worker_type: &str,
@@ -930,7 +940,7 @@ impl PDRouter {
                 &available_workers,
                 &SelectWorkerInfo {
                     request_text,
-                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                    tokens,
                     headers,
                     hash_ring,
                     leg,
@@ -1321,7 +1331,10 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, UNKNOWN_MODEL_ID, None).await {
+        let (prefill, decode) = match self
+            .select_pd_pair(None, None, UNKNOWN_MODEL_ID, None)
+            .await
+        {
             Ok(pair) => pair,
             Err(e) => {
                 return error::service_unavailable(
@@ -1419,10 +1432,13 @@ impl RouterTrait for PDRouter {
         let is_stream = body.stream;
         let return_logprob = body.return_logprob.unwrap_or(false);
 
-        let request_text = if self.policies_need_request_text() {
-            body.text.as_deref().map(|s| s.to_string())
+        let (request_text, routing_tokens) = if self.policies_need_request_text() {
+            match body.routing_tokens() {
+                Some(ids) => (None, Some(ids.iter().map(|&id| id as u32).collect())),
+                None => (body.text.as_deref().map(|s| s.to_string()), None),
+            }
         } else {
-            None
+            (None, None)
         };
 
         let batch_size = Self::get_generate_batch_size(body);
@@ -1433,6 +1449,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            routing_tokens,
             model_id,
             headers: headers.cloned(),
         };
@@ -1465,6 +1482,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            routing_tokens: None,
             model_id,
             headers: headers.cloned(),
         };
@@ -1500,6 +1518,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            routing_tokens: None,
             model_id,
             headers: headers.cloned(),
         };
@@ -1527,6 +1546,7 @@ impl RouterTrait for PDRouter {
             is_stream: false,
             return_logprob: false,
             request_text: req_text,
+            routing_tokens: None,
             model_id,
             headers: headers.cloned(),
         };
@@ -1698,7 +1718,9 @@ mod tests {
             .worker_registry
             .register_or_replace(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, UNKNOWN_MODEL_ID, None).await;
+        let result = router
+            .select_pd_pair(None, None, UNKNOWN_MODEL_ID, None)
+            .await;
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -1723,14 +1745,14 @@ mod tests {
         }
 
         let (prefill, decode) = router
-            .select_pd_pair(None, "GLM-5.2-Coding", None)
+            .select_pd_pair(None, None, "GLM-5.2-Coding", None)
             .await
             .expect("alias should select a PD pair");
         assert_eq!(prefill.url(), "http://prefill");
         assert_eq!(decode.url(), "http://decode");
 
         assert!(router
-            .select_pd_pair(None, "GLM-5.2-Unknown", None)
+            .select_pd_pair(None, None, "GLM-5.2-Unknown", None)
             .await
             .is_err());
     }
@@ -1739,7 +1761,9 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, UNKNOWN_MODEL_ID, None).await;
+        let result = router
+            .select_pd_pair(None, None, UNKNOWN_MODEL_ID, None)
+            .await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
@@ -1798,6 +1822,7 @@ mod tests {
             is_stream: true,
             return_logprob: false,
             request_text: None,
+            routing_tokens: None,
             model_id: UNKNOWN_MODEL_ID,
             headers: None,
         };

@@ -235,6 +235,14 @@ impl GenerationRequest for GenerateRequest {
         // No text input found
         String::new()
     }
+
+    fn routing_tokens(&self) -> Option<&[i32]> {
+        // Mirrors extract_text_for_routing priority: explicit text wins.
+        match (&self.text, &self.input_ids) {
+            (None, Some(InputIds::Single(ids))) => Some(ids),
+            _ => None,
+        }
+    }
 }
 
 // ============================================================================
@@ -304,4 +312,39 @@ pub enum GenerateFinishReason {
 pub enum GenerateFinishType {
     Length,
     Stop,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req() -> GenerateRequest {
+        serde_json::from_value(serde_json::json!({"model": "m"})).expect("minimal request")
+    }
+
+    #[test]
+    fn routing_tokens_from_single_input_ids() {
+        let mut r = req();
+        r.input_ids = Some(InputIds::Single(vec![1, 2, 3]));
+        assert_eq!(r.routing_tokens(), Some(&[1, 2, 3][..]));
+    }
+
+    #[test]
+    fn routing_tokens_text_takes_priority() {
+        let mut r = req();
+        r.text = Some("hello".to_string());
+        r.input_ids = Some(InputIds::Single(vec![1, 2, 3]));
+        assert_eq!(r.routing_tokens(), None);
+        assert_eq!(r.extract_text_for_routing(), "hello");
+    }
+
+    #[test]
+    fn routing_tokens_none_for_batch_and_empty() {
+        let mut r = req();
+        r.input_ids = Some(InputIds::Batch(vec![vec![1], vec![2]]));
+        assert_eq!(r.routing_tokens(), None);
+
+        let r = req();
+        assert_eq!(r.routing_tokens(), None);
+    }
 }
