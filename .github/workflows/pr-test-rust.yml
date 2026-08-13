@@ -605,10 +605,12 @@ jobs:
           - engine: vllm
             timeout: 46
           # The TokenSpeed ZMQ lane restarts the engine per model group, and
-          # DP doubles model load + warmup; needs the same headroom as its
-          # 1-gpu lane.
+          # DP doubles model load + warmup. The ~22-minute TokenSpeed source
+          # build eats the front of the budget, and at 50 the first dp run was
+          # killed mid-suite while progressing (28 minutes of test time); 60
+          # leaves the tests the same ~40 minutes the test_timeout allows.
           - engine: tokenspeed
-            timeout: 50
+            timeout: 60
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
