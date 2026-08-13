@@ -268,6 +268,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upstream_forged_error_codes_do_not_grow_interner() {
+        use axum::{
+            extract::Path,
+            http::HeaderValue,
+            response::{IntoResponse, Response},
+        };
+
+        use crate::{
+            observability::inflight_tracker::InFlightRequestTracker,
+            routers::error::HEADER_X_SMG_ERROR_CODE,
+        };
+
+        // Simulates a backend minting a fresh X-SMG-Error-Code per response
+        // (rebuilt responses preserve upstream headers). Only gateway-set
+        // codes may become metric labels, so the interner must stay flat.
+        let app = Router::new()
+            .route(
+                "/echo/{id}",
+                get(|Path(id): Path<String>| async move {
+                    let mut response: Response = "ok".into_response();
+                    response.headers_mut().insert(
+                        HEADER_X_SMG_ERROR_CODE,
+                        HeaderValue::from_str(&format!("evil-{id}")).unwrap(),
+                    );
+                    response
+                }),
+            )
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()));
+
+        let send = |uri: String| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert!(response.status().is_success());
+            }
+        };
+
+        send("/echo/warmup".to_owned()).await;
+        let size_before = interner_size();
+
+        const ITERS: usize = 1000;
+        for i in 0..ITERS {
+            send(format!("/echo/{i}")).await;
+        }
+
+        let growth = interner_size().saturating_sub(size_before);
+        assert!(
+            growth < 100,
+            "interner grew by {growth} for {ITERS} distinct upstream error codes"
+        );
+    }
+
+    #[tokio::test]
     async fn distinct_ids_on_matched_route_do_not_grow_interner() {
         // Drive the real `HttpMetricsLayer`. Every request matches the dynamic
         // route `/v1/responses/{response_id}`, so each distinct id must record

@@ -1684,6 +1684,7 @@ async fn audio_transcriptions_handler(
 // Minimal rerank handler returning mock results; router shapes final response
 #[expect(
     clippy::unwrap_used,
+    clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
 async fn rerank_handler(
@@ -1714,9 +1715,17 @@ async fn rerank_handler(
     let mut mock_results = Vec::new();
     for (i, doc) in documents.iter().enumerate() {
         let score = 0.95 - (i as f32 * 0.1); // Decreasing scores
+
+        // "PAD:<n>" documents are echoed back as n-byte strings so tests can
+        // make the worker return a body far larger than the request.
+        let doc = doc.as_str().unwrap_or("");
+        let doc = match doc.strip_prefix("PAD:") {
+            Some(n) => "x".repeat(n.parse().expect("PAD size must be a usize")),
+            None => doc.to_string(),
+        };
         let result = serde_json::json!({
             "score": score,
-            "document": doc.as_str().unwrap_or(""),
+            "document": doc,
             "index": i,
             "meta_info": {
                 "confidence": if score > 0.9 { "high" } else { "medium" }

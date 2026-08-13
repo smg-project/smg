@@ -7,8 +7,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use bytes::Bytes;
-use futures_util::{stream, StreamExt};
+use bytes::{Bytes, BytesMut};
+use futures_util::{stream, Stream, StreamExt};
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
@@ -31,7 +31,7 @@ use reqwest::{
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     app_context::AppContext,
@@ -71,6 +71,8 @@ pub struct Router {
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
     retry_config: RetryConfig,
+    /// Cap on buffered worker response bodies, mirroring the ingress limit.
+    max_payload_size: usize,
     realtime_registry: Arc<RealtimeRegistry>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
@@ -134,6 +136,7 @@ impl Router {
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
+            max_payload_size: ctx.router_config.max_payload_size,
             realtime_registry: ctx.realtime_registry.clone(),
             webrtc_bind_addr: ctx.webrtc_bind_addr,
             webrtc_stun_server: ctx.webrtc_stun_server.clone(),
@@ -1004,6 +1007,36 @@ impl Router {
         response
     }
 
+    /// Buffer a worker response body, capped at `limit` bytes; a larger body
+    /// is a misbehaving worker and yields a 502 before memory balloons.
+    async fn read_worker_body_capped<S, E>(mut stream: S, limit: usize) -> Result<Bytes, Response>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        let mut body = BytesMut::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    return Err(error::internal_error(
+                        "read_response_body_failed",
+                        format!("Failed to get response body: {e}"),
+                    ));
+                }
+            };
+            if body.len().saturating_add(chunk.len()) > limit {
+                warn!(limit, "Worker response exceeded the body limit");
+                return Err(error::bad_gateway(
+                    "upstream_response_too_large",
+                    format!("Response from worker exceeded {limit} bytes"),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body.freeze())
+    }
+
     // Send typed request directly without conversion.
     //
     // `canonical_model` is set only when the client addressed the model by an
@@ -1129,17 +1162,21 @@ impl Router {
             // For non-streaming requests, preserve headers
             let response_headers = header_utils::preserve_response_headers(res.headers());
 
-            let response = match res.bytes().await {
+            // Cap the buffered read at the ingress payload limit; this is the
+            // point where an upstream body is first pulled into memory.
+            let response = match Self::read_worker_body_capped(
+                res.bytes_stream(),
+                self.max_payload_size,
+            )
+            .await
+            {
                 Ok(body) => {
                     let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
                     response
                 }
-                Err(e) => {
-                    let error_msg = format!("Failed to get response body: {e}");
-                    error::internal_error("read_response_body_failed", error_msg)
-                }
+                Err(error_response) => error_response,
             };
 
             // load_guard dropped here automatically after response body is read
@@ -1154,14 +1191,49 @@ impl Router {
     /// has to be canonicalized here. `canonical_model` is set only when the
     /// client addressed the model by an alias; reporting the alias would make
     /// this route disagree with every other one about which model ran.
+    ///
+    /// The worker body read is capped at `max_body_bytes`; a larger body is a
+    /// misbehaving worker and yields a 502.
     async fn build_rerank_response(
         req: &RerankRequest,
         canonical_model: Option<&str>,
         response: Response,
-    ) -> anyhow::Result<Response> {
+        max_body_bytes: usize,
+    ) -> Response {
         let (_, response_body) = response.into_parts();
-        let body_bytes = to_bytes(response_body, usize::MAX).await?;
-        let rerank_results = serde_json::from_slice::<Vec<RerankResult>>(&body_bytes)?;
+        let body_bytes = match to_bytes(response_body, max_body_bytes).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                if e.source()
+                    .and_then(|s| s.downcast_ref::<http_body_util::LengthLimitError>())
+                    .is_some()
+                {
+                    warn!(
+                        limit = max_body_bytes,
+                        "Rerank worker response exceeded the body limit"
+                    );
+                    return error::bad_gateway(
+                        "upstream_response_too_large",
+                        format!("Rerank response from worker exceeded {max_body_bytes} bytes"),
+                    );
+                }
+                error!("Failed to read rerank worker response: {e}");
+                return error::internal_error(
+                    "rerank_response_build_failed",
+                    "Failed to build rerank response",
+                );
+            }
+        };
+        let rerank_results = match serde_json::from_slice::<Vec<RerankResult>>(&body_bytes) {
+            Ok(results) => results,
+            Err(e) => {
+                error!("Failed to build rerank response: {e}");
+                return error::internal_error(
+                    "rerank_response_build_failed",
+                    "Failed to build rerank response",
+                );
+            }
+        };
         let model = canonical_model.map_or_else(|| req.model.clone(), ToOwned::to_owned);
         let mut rerank_response = RerankResponse::new(rerank_results, model, req.rid.clone());
         // Sorting is handled by Python worker (serving_rerank.py)
@@ -1171,7 +1243,7 @@ impl Router {
         if !req.return_documents {
             rerank_response.drop_documents();
         }
-        Ok(Json(rerank_response).into_response())
+        Json(rerank_response).into_response()
     }
 }
 
@@ -1415,16 +1487,13 @@ impl RouterTrait for Router {
             .route_typed_request(headers, body, "/v1/rerank", model_id)
             .await;
         if response.status().is_success() {
-            match Self::build_rerank_response(body, canonical_model.as_deref(), response).await {
-                Ok(rerank_response) => rerank_response,
-                Err(e) => {
-                    error!("Failed to build rerank response: {}", e);
-                    return error::internal_error(
-                        "rerank_response_build_failed",
-                        "Failed to build rerank response",
-                    );
-                }
-            }
+            Self::build_rerank_response(
+                body,
+                canonical_model.as_deref(),
+                response,
+                self.max_payload_size,
+            )
+            .await
         } else {
             response
         }
@@ -1593,6 +1662,7 @@ mod tests {
             policy_registry,
             client: Client::new(),
             retry_config: RetryConfig::default(),
+            max_payload_size: 536_870_912,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
@@ -1638,5 +1708,113 @@ mod tests {
 
         let worker = router.worker_registry.get_by_url(&url).unwrap();
         assert!(worker.is_healthy());
+    }
+
+    fn rerank_request() -> RerankRequest {
+        RerankRequest {
+            query: "q".to_string(),
+            documents: vec!["d1".to_string(), "d2".to_string()],
+            model: "test-model".to_string(),
+            top_k: Some(1),
+            return_documents: false,
+            rid: None,
+            user: None,
+        }
+    }
+
+    fn rerank_worker_body() -> Vec<u8> {
+        serde_json::to_vec(&vec![
+            RerankResult {
+                score: 0.9,
+                document: Some("d1".to_string()),
+                index: 0,
+                meta_info: None,
+            },
+            RerankResult {
+                score: 0.5,
+                document: Some("d2".to_string()),
+                index: 1,
+                meta_info: None,
+            },
+        ])
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn build_rerank_response_accepts_body_at_limit() {
+        let req = rerank_request();
+        let body = rerank_worker_body();
+        let limit = body.len();
+        let upstream = Response::new(Body::from(body));
+
+        let response = Router::build_rerank_response(&req, None, upstream, limit).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rerank: RerankResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(rerank.model, "test-model");
+        assert_eq!(rerank.results.len(), 1);
+        assert_eq!(rerank.results[0].document, None);
+    }
+
+    #[tokio::test]
+    async fn build_rerank_response_caps_oversized_body_with_502() {
+        let req = rerank_request();
+        let body = rerank_worker_body();
+        let limit = body.len() - 1;
+        let upstream = Response::new(Body::from(body));
+
+        let response = Router::build_rerank_response(&req, None, upstream, limit).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "upstream_response_too_large"
+        );
+    }
+
+    fn body_chunks(chunks: &[&'static [u8]]) -> Vec<Result<Bytes, String>> {
+        chunks.iter().map(|c| Ok(Bytes::from_static(c))).collect()
+    }
+
+    #[tokio::test]
+    async fn read_worker_body_capped_accepts_body_at_limit() {
+        let chunks = body_chunks(&[b"abc", b"def", b"gh"]);
+
+        let body = Router::read_worker_body_capped(stream::iter(chunks), 8)
+            .await
+            .unwrap();
+
+        assert_eq!(body.as_ref(), b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn read_worker_body_capped_rejects_oversized_body_with_502() {
+        let chunks = body_chunks(&[b"abc", b"def", b"gh"]);
+
+        let response = Router::read_worker_body_capped(stream::iter(chunks), 7)
+            .await
+            .unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "upstream_response_too_large"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_worker_body_capped_maps_read_failure_to_500() {
+        let chunks = vec![Ok(Bytes::from_static(b"abc")), Err("boom".to_string())];
+
+        let response = Router::read_worker_body_capped(stream::iter(chunks), 8)
+            .await
+            .unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "read_response_body_failed"
+        );
     }
 }

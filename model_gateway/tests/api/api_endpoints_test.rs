@@ -1903,6 +1903,92 @@ mod rerank_tests {
     }
 
     #[tokio::test]
+    async fn test_rerank_oversized_worker_body_returns_502() {
+        // Upstream rerank reads are capped at max_payload_size; the mock
+        // worker inflates its response via "PAD:<n>" documents, which echo
+        // back as n-byte strings.
+        let mut config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3002)
+            .max_payload_size(16 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![MockWorkerConfig {
+                port: 18112,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            }],
+        )
+        .await;
+
+        let app = ctx.create_app();
+
+        // Worker response (~64KB document) exceeds the 16KB cap.
+        let payload = json!({
+            "query": "test query",
+            "documents": ["PAD:65536"],
+            "model": "mock-model",
+            "return_documents": true
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            resp.headers().get("x-smg-error-code").unwrap(),
+            "upstream_response_too_large"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["error"]["code"], "upstream_response_too_large");
+
+        // A worker response under the cap is rebuilt normally.
+        let payload = json!({
+            "query": "test query",
+            "documents": ["PAD:1024"],
+            "model": "mock-model",
+            "return_documents": true
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["results"].as_array().unwrap().len(), 1);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn test_v1_rerank_compatibility() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18110,
