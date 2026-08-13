@@ -374,6 +374,14 @@ impl ParserFactory {
         registry.map_model("Qwen3.5*", "qwen_xml");
         registry.map_model("qwen3.5*", "qwen_xml");
         registry.map_model("qwen/qwen3.5*", "qwen_xml");
+        registry.map_model("Qwen/Qwen3.6*", "qwen_xml");
+        registry.map_model("Qwen3.6*", "qwen_xml");
+        registry.map_model("qwen3.6*", "qwen_xml");
+        registry.map_model("qwen/qwen3.6*", "qwen_xml");
+        registry.map_model("Qwen/Qwen3.8*", "qwen_xml");
+        registry.map_model("Qwen3.8*", "qwen_xml");
+        registry.map_model("qwen3.8*", "qwen_xml");
+        registry.map_model("qwen/qwen3.8*", "qwen_xml");
         registry.map_model("Qwen/Qwen3-Coder*", "qwen_xml");
         registry.map_model("Qwen3-Coder*", "qwen_xml");
         registry.map_model("qwen3-coder*", "qwen_xml");

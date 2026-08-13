@@ -319,6 +319,18 @@ mod tests {
     }
 
     #[test]
+    fn test_factory_routes_dotted_qwen3_generations_to_qwen3() {
+        let factory = ParserFactory::new();
+        // The dotted generations keep <think> reasoning; the qwen3 substring
+        // pattern must keep matching their ids.
+        assert_eq!(
+            factory.create("Qwen/Qwen3.8-2.4T-A95B").model_type(),
+            "qwen3"
+        );
+        assert_eq!(factory.create("Qwen/Qwen3.6-35B-A3B").model_type(), "qwen3");
+    }
+
+    #[test]
     fn test_factory_creates_kimi() {
         let factory = ParserFactory::new();
         let parser = factory.create("kimi-chat");
