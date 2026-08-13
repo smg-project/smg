@@ -254,6 +254,11 @@ struct CliArgs {
     #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     prefix_hash_load_factor: f64,
 
+    /// Absolute load difference over average a worker must also exceed before
+    /// the prefix_hash policy treats it as overloaded
+    #[arg(long, default_value_t = 10, help_heading = "Routing Policy")]
+    prefix_hash_balance_abs_threshold: usize,
+
     /// KV-pressure weight (seconds) for the least_load policy
     #[arg(long, default_value_t = 0.15, help_heading = "Routing Policy")]
     least_load_kv_pressure_weight: f64,
@@ -1152,6 +1157,7 @@ impl CliArgs {
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.prefix_token_count,
                 load_factor: self.prefix_hash_load_factor,
+                balance_abs_threshold: self.prefix_hash_balance_abs_threshold,
             },
             "consistent_hashing" => PolicyConfig::ConsistentHashing,
             "manual" => PolicyConfig::Manual {

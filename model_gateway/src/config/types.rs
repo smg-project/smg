@@ -566,6 +566,10 @@ pub enum PolicyConfig {
         /// Load factor threshold - walk ring if load > avg * factor (default: 1.25)
         #[serde(default = "default_load_factor")]
         load_factor: f64,
+        /// Absolute load difference over average a worker must also exceed
+        /// before it counts as overloaded (default: 10)
+        #[serde(default = "default_prefix_hash_balance_abs_threshold")]
+        balance_abs_threshold: usize,
     },
 }
 
@@ -583,6 +587,10 @@ fn default_prefix_token_count() -> usize {
 
 fn default_load_factor() -> f64 {
     1.25
+}
+
+fn default_prefix_hash_balance_abs_threshold() -> usize {
+    10
 }
 
 fn default_manual_eviction_interval_secs() -> u64 {

@@ -122,6 +122,7 @@ impl TestRouterConfig {
                 .policy(PolicyConfig::PrefixHash {
                     prefix_token_count,
                     load_factor: 1.25,
+                    balance_abs_threshold: 10,
                 })
                 .host(defaults::HOST)
                 .port(port)

@@ -593,6 +593,7 @@ impl ConfigValidator {
             PolicyConfig::PrefixHash {
                 prefix_token_count,
                 load_factor,
+                balance_abs_threshold: _,
             } => {
                 if *prefix_token_count == 0 {
                     return Err(ConfigError::InvalidValue {

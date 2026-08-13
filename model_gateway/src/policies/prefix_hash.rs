@@ -10,7 +10,8 @@
 //!    or the equivalent span of routing text when the request is untokenized
 //! 2. Hash the prefix using xxhash for fast, stable hashing
 //! 3. Use consistent hash ring to find the target worker
-//! 4. If worker is overloaded (load > avg * load_factor), find least loaded
+//! 4. If worker is overloaded (load above both the relative and absolute
+//!    margins over average), find least loaded
 //! 5. Return least loaded worker that passes load check, or initial if all overloaded
 //!
 //! ## Complexity
@@ -50,6 +51,14 @@ pub struct PrefixHashConfig {
     /// walk clockwise to the next worker.
     /// Default: 1.25 (125% of average load)
     pub load_factor: f64,
+
+    /// Absolute load difference threshold for the overload check.
+    /// A worker only counts as overloaded once its load exceeds the average
+    /// by this many requests as well as by `load_factor`. Without it the
+    /// check is purely relative, so its false-positive rate grows as each
+    /// router replica observes a smaller share of a worker's true load.
+    /// Default: 10 requests
+    pub balance_abs_threshold: usize,
 }
 
 impl Default for PrefixHashConfig {
@@ -57,6 +66,7 @@ impl Default for PrefixHashConfig {
         Self {
             prefix_token_count: 256,
             load_factor: 1.25,
+            balance_abs_threshold: 10,
         }
     }
 }
@@ -150,6 +160,9 @@ impl PrefixHashPolicy {
     }
 
     /// Check if a worker's load is acceptable
+    ///
+    /// Overload requires clearing both the relative and the absolute margin,
+    /// mirroring the imbalance test cache_aware uses.
     #[inline]
     fn load_ok(&self, worker_load: usize, total_load: usize, num_workers: usize) -> bool {
         if total_load == 0 || num_workers == 0 {
@@ -158,7 +171,8 @@ impl PrefixHashPolicy {
 
         // Average load per worker (with +1 to simulate incoming request)
         let avg_load = (total_load + 1) as f64 / num_workers as f64;
-        let threshold = avg_load * self.config.load_factor;
+        let threshold = (avg_load * self.config.load_factor)
+            .max(avg_load + self.config.balance_abs_threshold as f64);
 
         (worker_load as f64) <= threshold
     }
@@ -529,16 +543,50 @@ mod tests {
     fn test_load_ok_calculation() {
         let policy = PrefixHashPolicy::new(PrefixHashConfig {
             load_factor: 1.25,
+            balance_abs_threshold: 0,
             ..Default::default()
         });
 
-        // Total load 100, 4 workers -> avg 25, threshold 31.25
-        assert!(policy.load_ok(30, 100, 4)); // 30 <= 31.25
-        assert!(!policy.load_ok(35, 100, 4)); // 35 > 31.25
+        // Total load 100, 4 workers -> avg 25.25, threshold 31.5625
+        assert!(policy.load_ok(30, 100, 4));
+        assert!(!policy.load_ok(35, 100, 4));
 
         // Edge cases
         assert!(policy.load_ok(0, 0, 4)); // No load = OK
         assert!(policy.load_ok(100, 0, 0)); // No workers = OK (shouldn't happen)
+    }
+
+    #[test]
+    fn test_absolute_margin_absorbs_small_count_noise() {
+        let policy = PrefixHashPolicy::new(PrefixHashConfig {
+            load_factor: 1.25,
+            balance_abs_threshold: 10,
+            ..Default::default()
+        });
+
+        // Average 10.25 across 4 workers: the relative margin alone flags 13,
+        // but 13 is within 10 requests of average so it stays acceptable.
+        assert!(policy.load_ok(13, 40, 4));
+        assert!(!policy.load_ok(21, 40, 4));
+    }
+
+    #[test]
+    fn test_relative_margin_still_binds_at_high_load() {
+        let policy = PrefixHashPolicy::new(PrefixHashConfig {
+            load_factor: 1.25,
+            balance_abs_threshold: 10,
+            ..Default::default()
+        });
+
+        // Average 200.25: the relative margin (250.3) now exceeds the absolute
+        // one (210.25), so it is the binding constraint.
+        assert!(policy.load_ok(240, 800, 4));
+        assert!(!policy.load_ok(260, 800, 4));
+    }
+
+    #[test]
+    fn test_absolute_margin_defaults_on() {
+        assert_eq!(PrefixHashConfig::default().balance_abs_threshold, 10);
     }
 
     #[test]

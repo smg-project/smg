@@ -208,6 +208,7 @@ class RouterArgs:
     zmq_engine_count: int | None = None
     prefix_token_count: int = 256
     prefix_hash_load_factor: float = 1.25
+    prefix_hash_balance_abs_threshold: int = 10
 
     @staticmethod
     def add_cli_args(
@@ -403,6 +404,15 @@ class RouterArgs:
             type=float,
             default=RouterArgs.prefix_hash_load_factor,
             help="Load factor above which prefix_hash walks the ring (multiple of average load)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefix-hash-balance-abs-threshold",
+            type=int,
+            default=RouterArgs.prefix_hash_balance_abs_threshold,
+            help=(
+                "Absolute load difference over average a worker must also "
+                "exceed before prefix_hash treats it as overloaded"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}least-load-kv-pressure-weight",

@@ -172,6 +172,10 @@ class Router:
         prefix_hash_load_factor: Load factor above which the prefix_hash policy
             walks the ring instead of using the hashed worker (multiple of the
             average load). Default: 1.25
+        prefix_hash_balance_abs_threshold: Absolute load difference over average
+            a worker must also exceed before prefix_hash treats it as
+            overloaded. Guards the load factor against sampling noise when each
+            router replica sees only a share of a worker's load. Default: 10
         balance_abs_threshold: Load balancing is triggered when (max_load - min_load) >
             abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache
             aware. Default: 32
