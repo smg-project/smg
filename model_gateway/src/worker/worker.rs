@@ -472,8 +472,17 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     ///
     /// When the worker has a `dp_rank`, injects `data_parallel_rank`
     /// into the request body. Otherwise returns the request unchanged.
+    ///
+    /// Any override that edits the body must also override
+    /// [`Worker::mutates_request`] to return `true`.
     fn prepare_request(&self, req: serde_json::Value) -> WorkerResult<serde_json::Value> {
         self.metadata().prepare_request(req)
+    }
+
+    /// Whether [`Worker::prepare_request`] rewrites the body. The HTTP proxy
+    /// path skips the `serde_json::Value` round-trip when this is `false`.
+    fn mutates_request(&self) -> bool {
+        self.metadata().mutates_request()
     }
 
     /// Get the model ID this worker serves.
@@ -793,6 +802,11 @@ impl WorkerMetadata {
         } else {
             Ok(req)
         }
+    }
+
+    /// True when [`Self::prepare_request`] would modify the request.
+    pub fn mutates_request(&self) -> bool {
+        self.spec.dp_rank.is_some()
     }
 
     // ── Routing priorities / model lookup ───────────────────────────

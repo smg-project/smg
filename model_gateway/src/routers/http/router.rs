@@ -55,7 +55,7 @@ use crate::{
         },
         error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
-        openai::strip_default_sglang_fields,
+        http::request_body::{serialize_request_body, RequestBodyError},
         RouterTrait,
     },
     worker::{AttachedBody, ConnectionMode, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType},
@@ -1005,32 +1005,27 @@ impl Router {
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
 
-        let mut json_val = match serde_json::to_value(typed_req) {
-            Ok(j) => j,
-            Err(e) => {
+        let body = match serialize_request_body(typed_req, canonical_model, worker) {
+            Ok(body) => body,
+            Err(RequestBodyError::Serialize(e)) => {
                 return error::bad_request(
                     "serialization_failed",
-                    format!("Convert into serde_json::Value failed: {e}"),
+                    format!("Failed to serialize request body: {e}"),
                 );
             }
-        };
-
-        if let Some(canonical_model) = canonical_model {
-            super::set_request_model(&mut json_val, canonical_model);
-        }
-
-        let mut json_val = match worker.prepare_request(json_val) {
-            Ok(prepared) => prepared,
-            Err(e) => {
+            Err(RequestBodyError::Prepare(e)) => {
                 return error::bad_request(
                     "request_preparation_failed",
                     format!("Failed to prepare request: {e}"),
                 );
             }
         };
-        strip_default_sglang_fields(&mut json_val);
 
-        let mut request_builder = self.client.post(&endpoint_url).json(&json_val);
+        let mut request_builder = self
+            .client
+            .post(&endpoint_url)
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(body);
 
         request_builder = header_utils::apply_forwarded_request_headers(
             request_builder,
