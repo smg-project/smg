@@ -905,6 +905,8 @@ mod tests {
             block_size: 32,
             balance_token_usage_threshold: 0.5,
             overload_token_usage_threshold: 0.8,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         });
 
         // Hinted policy is a fresh per-model instance, not the shared default.
@@ -971,6 +973,8 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         }));
 
         for round in 0..64 {
