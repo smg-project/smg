@@ -314,6 +314,18 @@ pub(crate) fn init_metrics() {
         "smg_manual_policy_cache_entries",
         "Number of routing entries in manual policy cache"
     );
+    describe_gauge!(
+        "smg_cache_tree_chars",
+        "Cache-aware string tree cached characters by model (summed across tenants)"
+    );
+    describe_gauge!(
+        "smg_cache_tree_tokens",
+        "Cache-aware token tree cached tokens by model (summed across tenants)"
+    );
+    describe_gauge!(
+        "smg_cache_tree_tenants",
+        "Cache-aware tree tenant count by model and tree (string/token)"
+    );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
     describe_gauge!(
@@ -1158,6 +1170,24 @@ impl Metrics {
         gauge!("smg_manual_policy_cache_entries").set(count as f64);
     }
 
+    /// Set cache-aware string-tree cached characters for a model
+    pub fn set_cache_tree_chars(model_id: &str, chars: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_cache_tree_chars", "model" => model).set(chars as f64);
+    }
+
+    /// Set cache-aware token-tree cached tokens for a model
+    pub fn set_cache_tree_tokens(model_id: &str, tokens: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_cache_tree_tokens", "model" => model).set(tokens as f64);
+    }
+
+    /// Set cache-aware tree tenant count for a model and tree kind ("string"/"token")
+    pub fn set_cache_tree_tenants(model_id: &str, tree: &'static str, count: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_cache_tree_tenants", "model" => model, "tree" => tree).set(count as f64);
+    }
+
     /// Record consistent hashing policy execution branch for routing decisions
     pub fn record_worker_consistent_hashing_policy_branch(branch: &'static str) {
         counter!(
@@ -1760,6 +1790,33 @@ mod tests {
             &pd_labels,
             "4",
         );
+    }
+
+    #[test]
+    fn cache_tree_setters_emit_per_model_gauges() {
+        let rendered = render_with_recorder(|| {
+            Metrics::set_cache_tree_chars("m", 120);
+            Metrics::set_cache_tree_tokens("m", 64);
+            Metrics::set_cache_tree_tenants("m", "string", 3);
+            Metrics::set_cache_tree_tenants("m", "token", 2);
+        });
+
+        assert_metric(&rendered, "smg_cache_tree_chars", &["model=\"m\""], "120");
+        assert_metric(&rendered, "smg_cache_tree_tokens", &["model=\"m\""], "64");
+        // Two tenant series (one per tree kind); series order within the
+        // family is exporter-defined, so match each line independently.
+        for (tree, value) in [("string", "3"), ("token", "2")] {
+            let label = format!("tree=\"{tree}\"");
+            assert!(
+                rendered.lines().any(|l| {
+                    l.starts_with("smg_cache_tree_tenants{")
+                        && l.contains("model=\"m\"")
+                        && l.contains(&label)
+                        && l.ends_with(&format!(" {value}"))
+                }),
+                "smg_cache_tree_tenants {tree} series missing; rendered:\n{rendered}"
+            );
+        }
     }
 
     #[test]

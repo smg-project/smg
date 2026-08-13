@@ -64,6 +64,7 @@ use super::{
 };
 use crate::{
     mesh::adapters::tree_sync::{RepairEntry, TreeDelta, TreeRepairPage, TreeSyncAdapter},
+    observability::metrics::Metrics,
     worker::{KvEventMonitor, Worker},
 };
 
@@ -145,6 +146,20 @@ struct PerModelHashIndex {
     token_tree: DashMap<u64, Vec<u32>>,
 }
 
+/// Total cached characters across tenants and the tenant count for one
+/// model's string tree. O(tenants): sums the tree's maintained counters.
+fn string_tree_totals(tree: &Tree) -> (usize, usize) {
+    let counts = tree.get_tenant_char_count();
+    (counts.values().sum(), counts.len())
+}
+
+/// Total cached tokens across tenants and the tenant count for one
+/// model's token tree. O(tenants): sums the tree's maintained counters.
+fn token_tree_totals(tree: &TokenTree) -> (usize, usize) {
+    let counts = tree.get_tenant_token_counts();
+    (counts.values().sum(), counts.len())
+}
+
 impl CacheAwarePolicy {
     pub fn new() -> Self {
         Self::with_config(CacheAwareConfig::default())
@@ -167,10 +182,16 @@ impl CacheAwarePolicy {
                 "Eviction",
                 move || {
                     // Evict string trees (HTTP)
+                    let mut total_chars: usize = 0;
                     for tree_ref in string_trees_clone.iter() {
                         let model_id = tree_ref.key();
                         let tree = tree_ref.value();
                         tree.evict_tenant_by_size(max_tree_size);
+
+                        let (chars, tenants) = string_tree_totals(tree);
+                        total_chars += chars;
+                        Metrics::set_cache_tree_chars(model_id, chars);
+                        Metrics::set_cache_tree_tenants(model_id, "string", tenants);
 
                         debug!(
                             "String tree eviction completed for model {}, max_size: {}",
@@ -178,10 +199,16 @@ impl CacheAwarePolicy {
                         );
                     }
                     // Evict token trees (gRPC)
+                    let mut total_tokens: usize = 0;
                     for tree_ref in token_trees_clone.iter() {
                         let model_id = tree_ref.key();
                         let tree = tree_ref.value();
                         tree.evict_tenant_by_size(max_tree_size);
+
+                        let (tokens, tenants) = token_tree_totals(tree);
+                        total_tokens += tokens;
+                        Metrics::set_cache_tree_tokens(model_id, tokens);
+                        Metrics::set_cache_tree_tenants(model_id, "token", tenants);
 
                         debug!(
                             "Token tree eviction completed for model {}, max_size: {}",
@@ -214,14 +241,18 @@ impl CacheAwarePolicy {
                         hash_total += per_model.string_tree.len() + per_model.token_tree.len();
                     }
 
-                    // Log tree sizes — model counts + hash-index total.
+                    // Log tree sizes — model counts, aggregate sizes +
+                    // hash-index total, from the per-tenant counters.
                     // DO NOT call tree.snapshot() here — it clones all
                     // edge text (~170 MB) every cycle.
                     tracing::info!(
-                        "Tree memory: string_trees={} models, token_trees={} models, \
+                        "Tree memory: string_trees={} models / {} chars, \
+                         token_trees={} models / {} tokens, \
                          hash_index={} models / {} entries",
                         string_trees_clone.len(),
+                        total_chars,
                         token_trees_clone.len(),
+                        total_tokens,
                         hash_index_clone.len(),
                         hash_total,
                     );
@@ -1423,6 +1454,54 @@ mod tests {
             let idx = policy.select_worker(&workers, &info).unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
+    }
+
+    // ---- tree size aggregation (per-model gauges + eviction-cycle log) ----
+
+    #[test]
+    fn string_tree_totals_sums_tenant_chars() {
+        let tree = Tree::new();
+        assert_eq!(string_tree_totals(&tree), (0, 0));
+
+        // Worker registration (empty insert) registers a zero-char tenant.
+        tree.insert_text("", "http://w1:8000");
+        assert_eq!(string_tree_totals(&tree), (0, 1));
+
+        tree.insert_text("hello", "http://w1:8000");
+        assert_eq!(string_tree_totals(&tree), (5, 1));
+
+        // A shared path counts its chars for every tenant on it.
+        tree.insert_text("hello", "http://w2:8000");
+        assert_eq!(string_tree_totals(&tree), (10, 2));
+
+        // "help!" shares "hel", adds only "p!" for w1.
+        tree.insert_text("help!", "http://w1:8000");
+        assert_eq!(string_tree_totals(&tree), (12, 2));
+    }
+
+    #[test]
+    fn token_tree_totals_sums_tenant_tokens() {
+        let tree = TokenTree::new();
+        assert_eq!(token_tree_totals(&tree), (0, 0));
+
+        // Worker registration (empty insert) aligns to zero pages —
+        // no tenant entry.
+        tree.insert_tokens(&[], "http://w1:8000");
+        assert_eq!(token_tree_totals(&tree), (0, 0));
+
+        let page = tree.page_size();
+        let page_a: Vec<u32> = (0..page as u32).collect();
+        tree.insert_tokens(&page_a, "http://w1:8000");
+        assert_eq!(token_tree_totals(&tree), (page, 1));
+
+        // A shared page counts its tokens for every tenant on it.
+        tree.insert_tokens(&page_a, "http://w2:8000");
+        assert_eq!(token_tree_totals(&tree), (2 * page, 2));
+
+        // A disjoint page adds only for its tenant.
+        let page_b: Vec<u32> = (1000..1000 + page as u32).collect();
+        tree.insert_tokens(&page_b, "http://w1:8000");
+        assert_eq!(token_tree_totals(&tree), (3 * page, 2));
     }
 
     // ---- is_imbalanced: 3-term trigger (overload ∨ KV-spread ∨ count) ----
