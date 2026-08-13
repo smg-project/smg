@@ -360,14 +360,30 @@ class TokenspeedWorkerLauncher(WorkerLauncher):
     def _build_zmq_command(
         self, args: argparse.Namespace, backend_args: list[str], port: int
     ) -> list[str]:
-        """Launch a headless TokenSpeed scheduler that dials SMG's ZMQ handshake.
+        """Launch a headless TokenSpeed scheduler group that dials SMG's ZMQ handshake.
 
         SMG (the router) binds the tcp handshake + ipc data-plane sockets it
-        derives from the ipc:// worker URL; this engine connects in. Each worker
-        is a standalone engine (`--zmq-engine-index 0`); running several is
-        dense data parallelism as N independent ZMQ workers.
+        derives from the ipc:// worker URL; the engines connect in. An
+        engine-level ``--data-parallel-size N`` (after ``--``) launches a
+        grouped worker: N ranks on one socket set, each dialing with its own
+        identity (``--zmq-engine-index`` is the group's base). The default
+        stays one standalone engine per worker.
+
+        Two ports are the launcher's to own, or co-located workers collide:
+
+        - ``--port`` seeds TokenSpeed's whole derived control-plane port
+          cluster (torch.distributed store at ``port + 233``, and neighbors).
+          Left at the engine default, every worker on the host derives the
+          same cluster, and back-to-back engine restarts race the previous
+          process's teardown (EADDRINUSE on the distributed store).
+        - ``--dist-init-addr`` pins that store explicitly. TokenSpeed derives
+          it from ``--port`` at dp==1 but refuses to guess for dp>1; passing
+          the same derivation it would use keeps one port layout for both.
         """
         rpc_port = _zmq_handshake_port(_zmq_ipc_url(port))
+        # Mirrors TokenSpeed's own dp==1 derivation (ZMQ_TCP_PORT_DELTA);
+        # reflected below the u16 ceiling instead of wrapping into low ports.
+        dist_port = port + 233 if port + 233 <= 65535 else port - 233
         cmd = [
             sys.executable,
             "-m",
@@ -376,6 +392,10 @@ class TokenspeedWorkerLauncher(WorkerLauncher):
             "--headless",
             "--model",
             getattr(args, "model", ""),
+            "--port",
+            str(port),
+            "--dist-init-addr",
+            f"127.0.0.1:{dist_port}",
             "--data-parallel-address",
             "127.0.0.1",
             "--data-parallel-rpc-port",
@@ -406,6 +426,8 @@ class TokenspeedWorkerLauncher(WorkerLauncher):
                 [
                     "--model",
                     "--headless",
+                    "--port",
+                    "--dist-init-addr",
                     "--data-parallel-address",
                     "--data-parallel-rpc-port",
                     "--zmq-engine-index",
