@@ -61,6 +61,13 @@ def _backend_arg_int(backend_args: list[str], flag: str, default: int) -> int:
     return default
 
 
+# The band `derive_handshake_port` folds every worker's handshake port into.
+# Other launcher-derived tcp ports must stay out of it: a port in this band can
+# collide with SOME worker's handshake listener for the right ipc path.
+_ZMQ_HANDSHAKE_PORT_BASE = 20000
+_ZMQ_HANDSHAKE_PORT_SPAN = 10000
+
+
 def _zmq_handshake_port(ipc_url: str) -> int:
     """The tcp handshake port SMG derives from an ipc:// URL.
 
@@ -73,7 +80,7 @@ def _zmq_handshake_port(ipc_url: str) -> int:
     for b in path.encode():
         h ^= b
         h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-    return 20000 + (h % 10000)
+    return _ZMQ_HANDSHAKE_PORT_BASE + (h % _ZMQ_HANDSHAKE_PORT_SPAN)
 
 
 def _reject_handshake_port_collisions(ports: list[int]) -> None:
@@ -384,6 +391,17 @@ class TokenspeedWorkerLauncher(WorkerLauncher):
         # Mirrors TokenSpeed's own dp==1 derivation (ZMQ_TCP_PORT_DELTA);
         # reflected below the u16 ceiling instead of wrapping into low ports.
         dist_port = port + 233 if port + 233 <= 65535 else port - 233
+        # Hop over the SMG handshake band: a dist port inside it can land on
+        # a worker's rpc listener (this worker's included — the band is a hash
+        # of the ipc path). The +233 branch enters the band only from below,
+        # so one span-wide hop exits it for good; the -233 branch starts far
+        # above the band.
+        if (
+            _ZMQ_HANDSHAKE_PORT_BASE
+            <= dist_port
+            < _ZMQ_HANDSHAKE_PORT_BASE + _ZMQ_HANDSHAKE_PORT_SPAN
+        ):
+            dist_port += _ZMQ_HANDSHAKE_PORT_SPAN
         cmd = [
             sys.executable,
             "-m",
