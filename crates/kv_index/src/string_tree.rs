@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     hash::{BuildHasherDefault, Hasher},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -950,6 +950,18 @@ impl Tree {
     }
 
     pub fn evict_tenant_by_size(&self, max_size: usize) {
+        // Eviction can only touch tenants over budget; skip the
+        // full-tree walk and heap construction when there are none.
+        let over_budget: HashSet<TenantId> = self
+            .tenant_char_count
+            .iter()
+            .filter(|entry| *entry.value() > max_size)
+            .map(|entry| Arc::clone(entry.key()))
+            .collect();
+        if over_budget.is_empty() {
+            return;
+        }
+
         // Calculate used size and collect leaves
         let mut stack = vec![Arc::clone(&self.root)];
         let mut pq = BinaryHeap::new();
@@ -959,8 +971,11 @@ impl Tree {
                 stack.push(Arc::clone(child.value()));
             }
 
-            // Add leaves to priority queue
+            // Add over-budget tenants' leaves to priority queue
             for tenant in Tree::leaf_of(&curr) {
+                if !over_budget.contains(tenant.as_ref()) {
+                    continue;
+                }
                 if let Some(timestamp) = curr.tenant_last_access_time.get(tenant.as_ref()) {
                     pq.push(Reverse(EvictionEntry {
                         timestamp: *timestamp,
@@ -2785,6 +2800,33 @@ mod tests {
 
         let sizes = tree.get_used_size_per_tenant();
         assert!(sizes.is_empty());
+    }
+
+    #[test]
+    fn test_eviction_no_op_when_under_budget() {
+        let tree = Tree::new();
+
+        tree.insert_text("hello", "tenant1");
+        tree.insert_text("world", "tenant2");
+
+        let sizes_before = tree.get_used_size_per_tenant();
+        let counts_before = get_maintained_counts(&tree);
+
+        // Both tenants under budget: nothing may change.
+        tree.evict_tenant_by_size(100);
+
+        // At budget (count == max_size) is not over budget: still a no-op.
+        tree.evict_tenant_by_size(5);
+
+        assert_eq!(tree.get_used_size_per_tenant(), sizes_before);
+        assert_eq!(get_maintained_counts(&tree), counts_before);
+
+        let (matched, tenant) = tree.prefix_match_legacy("hello");
+        assert_eq!(matched, "hello");
+        assert_eq!(tenant, "tenant1");
+        let (matched, tenant) = tree.prefix_match_legacy("world");
+        assert_eq!(matched, "world");
+        assert_eq!(tenant, "tenant2");
     }
 
     #[test]
