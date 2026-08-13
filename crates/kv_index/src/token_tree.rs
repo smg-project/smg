@@ -1570,9 +1570,42 @@ impl TokenTree {
         self.total_token_count.store(0, Ordering::Relaxed);
     }
 
-    // TODO: Implement efficient remove_tenant with reverse index.
-    // See lib.rs for design options. Current naive O(n) traversal removed.
-    // For now, stale entries are cleaned up by LRU eviction.
+    /// Remove a tenant from every node (including the root), detach nodes
+    /// the removal emptied, and drop the tenant's token-count entry.
+    /// Size-based eviction never fires for a tenant whose count no longer
+    /// grows, so removed workers must be purged eagerly.
+    pub fn remove_tenant_all(&self, tenant_id: &TenantId) {
+        self.root.tenant_last_access_time.remove(tenant_id.as_ref());
+
+        let mut nodes: Vec<NodeRef> = Vec::new();
+        self.collect_tenant_nodes(&self.root, tenant_id, &mut nodes);
+        for node in &nodes {
+            self.remove_tenant_and_cleanup(node, tenant_id);
+        }
+        if let Some((_, count)) = self.tenant_token_count.remove(tenant_id.as_ref()) {
+            self.total_token_count.fetch_sub(count, Ordering::Relaxed);
+        }
+    }
+
+    /// Collect every node owning `tenant_id`. The root is excluded (never
+    /// detached); the caller drops its entry directly.
+    fn collect_tenant_nodes(
+        &self,
+        node: &NodeRef,
+        tenant_id: &TenantId,
+        result: &mut Vec<NodeRef>,
+    ) {
+        if !Arc::ptr_eq(node, &self.root)
+            && node
+                .tenant_last_access_time
+                .contains_key(tenant_id.as_ref())
+        {
+            result.push(Arc::clone(node));
+        }
+        for child in &node.children {
+            self.collect_tenant_nodes(child.value(), tenant_id, result);
+        }
+    }
 
     /// Evict cache entries until the tree-wide token total is at or under
     /// `max_size`. Matches the StringTree API.
@@ -3686,11 +3719,65 @@ mod tests {
         assert_consistent(&tree);
         assert!(tree.total_token_size() <= total / 2);
 
+        // Tenant purge.
+        tree.remove_tenant_all(&Arc::from("tenant2"));
+        assert_consistent(&tree);
+
         // No-op eviction and reset.
         tree.evict_tenant_by_size(usize::MAX);
         assert_consistent(&tree);
         tree.clear();
         assert_consistent(&tree);
         assert_eq!(tree.total_token_size(), 0);
+    }
+
+    #[test]
+    fn test_remove_tenant_all_purges_tenant_and_keeps_others() {
+        let tree = TokenTree::new();
+
+        // Shared first page; a distinct second page per tenant.
+        let mut tokens1 = make_tokens(1, 1);
+        tokens1.extend(make_tokens(100, 1));
+        let mut tokens2 = make_tokens(1, 1);
+        tokens2.extend(make_tokens(200, 1));
+        tree.insert_tokens(&tokens1, "tenant1");
+        tree.insert_tokens(&tokens2, "tenant2");
+
+        tree.remove_tenant_all(&Arc::from("tenant1"));
+
+        // Count entry is gone (not merely zero), root entry included.
+        assert!(!tree.get_tenant_token_counts().contains_key("tenant1"));
+        assert!(!tree.root.tenant_last_access_time.contains_key("tenant1"));
+
+        // tenant1's path only matches the shared page, now owned by tenant2.
+        let r = tree.match_prefix_with_counts(&tokens1);
+        assert_eq!(r.matched_token_count, PAGE_SIZE);
+        assert_eq!(r.tenant.as_ref(), "tenant2");
+
+        // tenant1's sole-owner branch is detached from the shared node.
+        assert_eq!(tree.root.children.len(), 1);
+        let shared = Arc::clone(tree.root.children.iter().next().unwrap().value());
+        assert_eq!(shared.children.len(), 1);
+
+        // tenant2 still matches its full prefix.
+        let r = tree.match_prefix_with_counts(&tokens2);
+        assert_eq!(r.matched_token_count, 2 * PAGE_SIZE);
+        assert_eq!(r.tenant.as_ref(), "tenant2");
+    }
+
+    #[test]
+    fn test_remove_tenant_all_sole_owner_detaches_subtree() {
+        let tree = TokenTree::new();
+        // Chain root -> [page] -> [2 pages], all owned by tenant1 only.
+        tree.insert_tokens(&make_tokens(500, 1), "tenant1");
+        tree.insert_tokens(&make_tokens(500, 3), "tenant1");
+        assert!(!tree.root.children.is_empty());
+
+        tree.remove_tenant_all(&Arc::from("tenant1"));
+
+        assert!(tree.root.children.is_empty());
+        assert!(!tree.get_tenant_token_counts().contains_key("tenant1"));
+        let r = tree.match_prefix_with_counts(&make_tokens(500, 3));
+        assert_eq!(r.matched_token_count, 0);
     }
 }

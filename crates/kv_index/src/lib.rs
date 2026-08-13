@@ -69,7 +69,7 @@ pub trait RadixTree: Send + Sync {
     /// * `max_units` - Maximum units (chars/tokens) to retain for this tenant
     fn evict(&self, tenant: &TenantId, max_units: usize);
 
-    // No `remove_tenant`: stale entries are reclaimed via LRU eviction.
+    // Tenant purge lives on the concrete trees (`remove_tenant_all`), not the trait.
 
     /// Get the current size (in units) for a tenant.
     fn tenant_size(&self, tenant: &TenantId) -> usize;

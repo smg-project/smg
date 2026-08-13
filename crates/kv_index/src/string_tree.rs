@@ -1119,10 +1119,6 @@ impl Tree {
         }
     }
 
-    // TODO: Implement efficient remove_tenant with reverse index.
-    // See lib.rs for design options. Current naive O(n) traversal removed.
-    // For now, stale entries are cleaned up by LRU eviction.
-
     pub fn get_tenant_char_count(&self) -> HashMap<String, usize> {
         self.tenant_char_count
             .iter()
@@ -1168,9 +1164,10 @@ impl Tree {
         self.evict_tenant_entries(tenant, current_count - max_chars);
     }
 
-    /// Remove a tenant from all nodes in the tree, including root.
-    /// Used for mesh eviction propagation — when a remote node reports
-    /// that a worker evicted all its cached prefixes.
+    /// Remove a tenant from all nodes in the tree (including root), detach
+    /// nodes the removal emptied, and drop the tenant's char-count entry.
+    /// Used for mesh eviction propagation and worker removal — size-based
+    /// eviction never fires for a tenant whose count no longer grows.
     pub fn remove_tenant_all(&self, tenant_id: &TenantId) {
         // collect_tenant_nodes skips root (root is never LRU-evicted),
         // but global removal must include it.
@@ -1180,9 +1177,27 @@ impl Tree {
         self.collect_tenant_nodes(&self.root, tenant_id, &mut nodes);
         for (node, _) in &nodes {
             self.remove_tenant_from_node(node, tenant_id);
+            Self::detach_empty_ancestors(node);
         }
         if let Some((_, count)) = self.tenant_char_count.remove(tenant_id) {
             self.total_char_count.fetch_sub(count, Ordering::Relaxed);
+        }
+    }
+
+    /// Detach `node` from its parent when it has no tenants and no children
+    /// (the `evict_tenant_by_size` empty-node rule), walking up so ancestors
+    /// emptied by the detach are removed too. The root (no parent) is never
+    /// detached.
+    fn detach_empty_ancestors(node: &NodeRef) {
+        let mut current = Arc::clone(node);
+        while current.children.is_empty() && current.tenant_last_access_time.is_empty() {
+            let Some(parent) = current.parent.read().as_ref().and_then(Weak::upgrade) else {
+                break;
+            };
+            if let Some(fc) = current.text.read().first_char() {
+                parent.children.remove(&fc);
+            }
+            current = parent;
         }
     }
 
@@ -3575,5 +3590,45 @@ mod tests {
                 "prefix {j} not fully cached after concurrent stress (route loss)"
             );
         }
+    }
+
+    #[test]
+    fn test_remove_tenant_all_purges_tenant_and_keeps_others() {
+        let tree = Tree::new();
+        tree.insert_text("hello world", "tenant1");
+        tree.insert_text("hello there", "tenant2");
+
+        tree.remove_tenant_all(&Arc::from("tenant1"));
+
+        // Count entry is gone (not merely zero), root entry included.
+        assert!(!tree.get_tenant_char_count().contains_key("tenant1"));
+        assert!(!tree.root.tenant_last_access_time.contains_key("tenant1"));
+
+        // tenant1's sole-owner branch ("world") is detached from the split node.
+        assert_eq!(tree.root.children.len(), 1);
+        let split = Arc::clone(tree.root.children.iter().next().unwrap().value());
+        assert_eq!(split.text.read().as_str(), "hello ");
+        assert_eq!(split.children.len(), 1);
+
+        // tenant2 still matches its full prefix.
+        let r = tree.match_prefix_with_counts("hello there");
+        assert_eq!(r.matched_char_count, "hello there".chars().count());
+        assert_eq!(r.tenant.as_ref(), "tenant2");
+    }
+
+    #[test]
+    fn test_remove_tenant_all_sole_owner_detaches_subtree() {
+        let tree = Tree::new();
+        // Chain root -> "solo" -> " prefix chain", owned by tenant1 only.
+        tree.insert_text("solo", "tenant1");
+        tree.insert_text("solo prefix chain", "tenant1");
+        assert!(!tree.root.children.is_empty());
+
+        tree.remove_tenant_all(&Arc::from("tenant1"));
+
+        assert!(tree.root.children.is_empty());
+        assert!(!tree.get_tenant_char_count().contains_key("tenant1"));
+        let r = tree.match_prefix_with_counts("solo prefix chain");
+        assert_eq!(r.matched_char_count, 0);
     }
 }

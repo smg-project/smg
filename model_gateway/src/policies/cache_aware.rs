@@ -51,7 +51,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use kv_index::{compute_request_content_hashes, PositionalIndexer, TokenTree, Tree};
+use kv_index::{compute_request_content_hashes, PositionalIndexer, TenantId, TokenTree, Tree};
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
 use rand::RngExt;
@@ -545,28 +545,21 @@ impl CacheAwarePolicy {
     }
 
     /// Remove a worker from the trees
-    ///
-    /// Note: Currently a no-op. Stale entries are cleaned up by LRU eviction.
-    /// Worker registry removes workers first, so routing will skip them anyway.
-    /// TODO: Implement efficient remove_tenant in kv_index with reverse index.
-    #[expect(
-        clippy::unused_self,
-        reason = "no-op stub; will use self once remove_tenant is implemented"
-    )]
-    pub fn remove_worker(&self, _worker: &dyn Worker) {
-        // No-op: rely on LRU eviction to clean up stale entries
+    pub fn remove_worker(&self, worker: &dyn Worker) {
+        self.remove_worker_by_url(worker.url());
     }
 
-    /// Remove a worker by URL (removes from all model trees for backward compatibility)
-    ///
-    /// Note: Currently a no-op. Stale entries are cleaned up by LRU eviction.
-    /// TODO: Implement efficient remove_tenant in kv_index with reverse index.
-    #[expect(
-        clippy::unused_self,
-        reason = "no-op stub; will use self once remove_tenant is implemented"
-    )]
-    pub fn remove_worker_by_url(&self, _url: &str) {
-        // No-op: rely on LRU eviction to clean up stale entries
+    /// Remove a worker by URL, purging its tenant from every model's string
+    /// and token tree. A removed worker's tenant count never grows again, so
+    /// size-based eviction alone would retain its subtree forever.
+    pub fn remove_worker_by_url(&self, url: &str) {
+        let tenant: TenantId = Arc::from(url);
+        for tree_ref in self.string_trees.iter() {
+            tree_ref.value().remove_tenant_all(&tenant);
+        }
+        for tree_ref in self.token_trees.iter() {
+            tree_ref.value().remove_tenant_all(&tenant);
+        }
     }
 
     /// Run cache eviction to prevent unbounded growth
@@ -1728,6 +1721,80 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn test_remove_worker_purges_tree_tenants() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .build(),
+            ),
+        ];
+        policy.init_workers(&workers);
+
+        // Distinct cold inputs spread across both workers (min-load
+        // tie-breaks by processed count), populating both trees.
+        for text in ["purge me please", "keep me around"] {
+            policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some(text),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        let tokens_a: Vec<u32> = (0..32).collect();
+        let tokens_b: Vec<u32> = (1000..1032).collect();
+        for tokens in [&tokens_a, &tokens_b] {
+            policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(tokens),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        let model_key = normalize_model_key(workers[0].model_id()).to_string();
+        let string_tree = Arc::clone(policy.string_trees.get(&model_key).unwrap().value());
+        let token_tree = Arc::clone(policy.token_trees.get(&model_key).unwrap().value());
+
+        let char_counts = string_tree.get_tenant_char_count();
+        let token_counts = token_tree.get_tenant_token_counts();
+        for url in ["http://w1:8000", "http://w2:8000"] {
+            assert!(char_counts.contains_key(url), "precondition: {url} routed");
+            assert!(token_counts.contains_key(url), "precondition: {url} routed");
+        }
+
+        policy.remove_worker(workers[0].as_ref());
+
+        let char_counts = string_tree.get_tenant_char_count();
+        assert!(!char_counts.contains_key("http://w1:8000"));
+        assert!(char_counts.contains_key("http://w2:8000"));
+        let token_counts = token_tree.get_tenant_token_counts();
+        assert!(!token_counts.contains_key("http://w1:8000"));
+        assert!(token_counts.contains_key("http://w2:8000"));
+
+        policy.remove_worker_by_url("http://w2:8000");
+        assert!(string_tree.get_tenant_char_count().is_empty());
+        assert!(token_tree.get_tenant_token_counts().is_empty());
     }
 
     #[test]
