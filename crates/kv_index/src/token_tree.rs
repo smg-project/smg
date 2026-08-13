@@ -16,7 +16,7 @@ use std::{
     collections::HashMap,
     hash::{BuildHasherDefault, Hasher},
     sync::{
-        atomic::{AtomicI32, AtomicU64, Ordering},
+        atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering},
         Arc, Weak,
     },
 };
@@ -313,6 +313,9 @@ pub struct TokenTree {
     root: NodeRef,
     /// Track total tokens per tenant for eviction decisions
     tenant_token_count: DashMap<TenantId, usize>,
+    /// Tree-wide token total (sum of `tenant_token_count`); the budget
+    /// checked by `evict_tenant_by_size`
+    total_token_count: AtomicUsize,
     /// Eviction policy (should match the backend worker's policy)
     eviction_policy: EvictionPolicy,
     /// Page size for token grouping (should match the backend worker's page size)
@@ -323,6 +326,10 @@ impl std::fmt::Debug for TokenTree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenTree")
             .field("tenant_count", &self.tenant_token_count.len())
+            .field(
+                "total_tokens",
+                &self.total_token_count.load(Ordering::Relaxed),
+            )
             .field("eviction_policy", &self.eviction_policy)
             .field("page_size", &self.page_size)
             .finish_non_exhaustive()
@@ -366,6 +373,7 @@ impl TokenTree {
         Self {
             root: Arc::new(Node::new_root()),
             tenant_token_count: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
+            total_token_count: AtomicUsize::new(0),
             eviction_policy: policy,
             page_size,
         }
@@ -417,13 +425,8 @@ impl TokenTree {
             track_lfu,
         );
 
-        // Update tenant token count
-        if tokens_added > 0 {
-            self.tenant_token_count
-                .entry(tenant_id)
-                .and_modify(|c| *c += tokens_added)
-                .or_insert(tokens_added);
-        }
+        // Update tenant token count and tree-wide total
+        self.add_tenant_tokens(tenant_id, tokens_added);
     }
 
     /// Insert `remaining` for `tenant_id` starting the descent at `current`
@@ -1039,12 +1042,7 @@ impl TokenTree {
         }
 
         // Fold insert's token count in once (insert-side bookkeeping).
-        if tokens_added > 0 {
-            self.tenant_token_count
-                .entry(tenant_id)
-                .and_modify(|c| *c += tokens_added)
-                .or_insert(tokens_added);
-        }
+        self.add_tenant_tokens(tenant_id, tokens_added);
 
         PrefixMatchResult {
             tenant: last_tenant.unwrap_or_else(|| intern_tenant("empty")),
@@ -1233,12 +1231,7 @@ impl TokenTree {
                 Self::insert_from(current, remaining, Arc::clone(&tenant_id), track_lfu);
         }
 
-        if tokens_added > 0 {
-            self.tenant_token_count
-                .entry(tenant_id)
-                .and_modify(|c| *c += tokens_added)
-                .or_insert(tokens_added);
-        }
+        self.add_tenant_tokens(tenant_id, tokens_added);
 
         result
     }
@@ -1353,9 +1346,7 @@ impl TokenTree {
             }
         }
 
-        if let Some(mut count) = self.tenant_token_count.get_mut(tenant.as_ref()) {
-            *count = count.saturating_sub(evicted);
-        }
+        self.sub_tenant_tokens(tenant, evicted);
 
         debug!(
             tenant = %tenant.as_ref(),
@@ -1497,33 +1488,141 @@ impl TokenTree {
             .unwrap_or(0)
     }
 
-    /// Clear the tree to empty state.
+    /// Tree-wide token total (sum of per-tenant counts).
+    pub fn total_token_size(&self) -> usize {
+        self.total_token_count.load(Ordering::Relaxed)
+    }
+
+    /// Fold `tokens` into a tenant's count and the tree-wide total.
+    fn add_tenant_tokens(&self, tenant_id: TenantId, tokens: usize) {
+        if tokens == 0 {
+            return;
+        }
+        self.tenant_token_count
+            .entry(tenant_id)
+            .and_modify(|c| *c += tokens)
+            .or_insert(tokens);
+        self.total_token_count.fetch_add(tokens, Ordering::Relaxed);
+    }
+
+    /// Subtract evicted `tokens` from a tenant's count and the tree-wide
+    /// total, clamped to the tenant's current count so the two stay in sync.
+    fn sub_tenant_tokens(&self, tenant: &TenantId, tokens: usize) {
+        if tokens == 0 {
+            return;
+        }
+        if let Some(mut count) = self.tenant_token_count.get_mut(tenant.as_ref()) {
+            let removed = tokens.min(*count);
+            *count -= removed;
+            self.total_token_count.fetch_sub(removed, Ordering::Relaxed);
+        }
+    }
+
+    /// Clear the tree to empty state. Not synchronized with concurrent
+    /// mutation: callers must quiesce writers first.
     pub fn clear(&self) {
         self.root.children.clear();
         self.root.tenant_last_access_time.clear();
         self.tenant_token_count.clear();
+        self.total_token_count.store(0, Ordering::Relaxed);
     }
 
     // TODO: Implement efficient remove_tenant with reverse index.
     // See lib.rs for design options. Current naive O(n) traversal removed.
     // For now, stale entries are cleaned up by LRU eviction.
 
-    /// Evict cache entries by total token count to reduce memory usage.
-    /// Convenience method matching the StringTree API.
+    /// Evict cache entries until the tree-wide token total is at or under
+    /// `max_size`. Matches the StringTree API.
     ///
-    /// For each tenant, reduces their token usage to `max_size` if they exceed it.
+    /// The budget is shared across all tenants of this tree: eviction triggers
+    /// on the tree-wide total (no single tenant has to exceed anything) and
+    /// removes leaves in policy order across tenants — least recently used
+    /// first under LRU — using the same leaf-first machinery as
+    /// [`Self::evict_tenant`].
     pub fn evict_tenant_by_size(&self, max_size: usize) {
-        // Collect tenants that exceed the max size
-        let tenants_to_evict: Vec<TenantId> = self
-            .tenant_token_count
-            .iter()
-            .filter(|entry| *entry.value() > max_size)
-            .map(|entry| Arc::clone(entry.key()))
-            .collect();
+        use std::{cmp::Reverse, collections::BinaryHeap};
 
-        // Evict each tenant
-        for tenant_id in tenants_to_evict {
-            self.evict_tenant(&tenant_id, max_size);
+        let initial_total = self.total_token_size();
+        if initial_total <= max_size {
+            return;
+        }
+
+        let mut leaves: Vec<(NodeRef, TenantId, u64)> = Vec::new();
+        self.collect_all_tenant_leaves(&self.root, &mut leaves);
+
+        // Min-heap by eviction priority (policy-dependent), across all tenants
+        let mut heap: BinaryHeap<Reverse<((i64, u64), usize)>> = BinaryHeap::new();
+        let mut leaf_data: Vec<(NodeRef, TenantId)> = Vec::with_capacity(leaves.len());
+
+        for (node, tenant, ts) in leaves.drain(..) {
+            let priority = self.compute_eviction_priority(&node, ts);
+            let idx = leaf_data.len();
+            leaf_data.push((node, tenant));
+            heap.push(Reverse((priority, idx)));
+        }
+
+        while self.total_token_size() > max_size {
+            let Some(Reverse((_, idx))) = heap.pop() else {
+                break;
+            };
+
+            let (node, tenant) = {
+                let (node, tenant) = &leaf_data[idx];
+                (Arc::clone(node), Arc::clone(tenant))
+            };
+            // Verify this node is still a leaf for this tenant: a concurrent
+            // insert may have attached the tenant to a descendant.
+            if !self.is_tenant_leaf(&node, &tenant) {
+                continue;
+            }
+            let (node_tokens, parent_became_leaf) = self.remove_tenant_and_cleanup(&node, &tenant);
+            if node_tokens > 0 {
+                self.sub_tenant_tokens(&tenant, node_tokens);
+
+                // Incremental leaf promotion (matching SGLang's approach)
+                if let Some((parent_node, parent_ts)) = parent_became_leaf {
+                    let priority = self.compute_eviction_priority(&parent_node, parent_ts);
+                    let new_idx = leaf_data.len();
+                    leaf_data.push((parent_node, tenant));
+                    heap.push(Reverse((priority, new_idx)));
+                }
+            }
+        }
+
+        debug!(
+            evicted = initial_total.saturating_sub(self.total_token_size()),
+            remaining = self.total_token_size(),
+            max_size = max_size,
+            policy = ?self.eviction_policy,
+            "Evicted tokens to tree-wide budget (leaf-first)"
+        );
+    }
+
+    /// Collect `(node, tenant, ts)` for every tenant-leaf of every tenant.
+    fn collect_all_tenant_leaves(
+        &self,
+        node: &NodeRef,
+        result: &mut Vec<(NodeRef, TenantId, u64)>,
+    ) {
+        for child_entry in &node.children {
+            self.collect_all_tenant_leaves(child_entry.value(), result);
+        }
+
+        // Root is never eligible for eviction
+        if Arc::ptr_eq(node, &self.root) {
+            return;
+        }
+        for entry in &node.tenant_last_access_time {
+            let tenant = entry.key();
+            let any_child_has_tenant = node.children.iter().any(|child| {
+                child
+                    .value()
+                    .tenant_last_access_time
+                    .contains_key(tenant.as_ref())
+            });
+            if !any_child_has_tenant {
+                result.push((Arc::clone(node), Arc::clone(tenant), *entry.value()));
+            }
         }
     }
 
@@ -2279,6 +2378,10 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+
+        // Tree-wide total stays in sync with per-tenant counts.
+        let sum: usize = tree.get_tenant_token_counts().values().sum();
+        assert_eq!(tree.total_token_size(), sum);
     }
 
     #[test]
@@ -3440,5 +3543,111 @@ mod tests {
                 "prefix {j} not fully cached after concurrent stress (route loss)"
             );
         }
+    }
+
+    #[test]
+    fn test_evict_by_size_shared_budget_lru_tenants() {
+        let tree = TokenTree::new();
+
+        // 8 tenants, 2 pages each: every tenant is far below the budget on
+        // its own, but the tree-wide total is double the budget.
+        for t in 0..8u32 {
+            let tokens = make_tokens(t * 100_000 + 1, 2);
+            tree.insert_tokens(&tokens, &format!("tenant{t}"));
+        }
+        assert_eq!(tree.total_token_size(), 8 * 2 * PAGE_SIZE);
+
+        let max_size = 4 * 2 * PAGE_SIZE;
+        tree.evict_tenant_by_size(max_size);
+
+        assert!(tree.total_token_size() <= max_size);
+        // Least-recently-used tenants are evicted first.
+        for t in 0..4u32 {
+            let tokens = make_tokens(t * 100_000 + 1, 2);
+            let result = tree.match_prefix_with_counts(&tokens);
+            assert_eq!(
+                result.matched_token_count, 0,
+                "tenant{t} (LRU) should be evicted"
+            );
+            let tenant: TenantId = Arc::from(format!("tenant{t}"));
+            assert_eq!(tree.tenant_token_size(&tenant), 0);
+        }
+        for t in 4..8u32 {
+            let tokens = make_tokens(t * 100_000 + 1, 2);
+            let result = tree.match_prefix_with_counts(&tokens);
+            assert_eq!(
+                result.matched_token_count,
+                2 * PAGE_SIZE,
+                "tenant{t} should survive"
+            );
+        }
+    }
+
+    #[test]
+    fn test_evict_by_size_under_budget_is_noop() {
+        let tree = TokenTree::new();
+        for t in 0..4u32 {
+            let tokens = make_tokens(t * 100_000 + 1, 2);
+            tree.insert_tokens(&tokens, &format!("tenant{t}"));
+        }
+        let counts_before = tree.get_tenant_token_counts();
+        assert_eq!(tree.total_token_size(), 4 * 2 * PAGE_SIZE);
+
+        // At and above the budget: nothing may change.
+        tree.evict_tenant_by_size(4 * 2 * PAGE_SIZE);
+        tree.evict_tenant_by_size(usize::MAX);
+
+        assert_eq!(tree.get_tenant_token_counts(), counts_before);
+        assert_eq!(tree.total_token_size(), 4 * 2 * PAGE_SIZE);
+        for t in 0..4u32 {
+            let tokens = make_tokens(t * 100_000 + 1, 2);
+            assert_eq!(
+                tree.match_prefix_with_counts(&tokens).matched_token_count,
+                2 * PAGE_SIZE
+            );
+        }
+    }
+
+    #[test]
+    fn test_total_count_consistent_with_tenant_sum() {
+        fn assert_consistent(tree: &TokenTree) {
+            let sum: usize = tree.get_tenant_token_counts().values().sum();
+            assert_eq!(
+                tree.total_token_size(),
+                sum,
+                "total must equal per-tenant sum"
+            );
+        }
+
+        let tree = TokenTree::new();
+        assert_consistent(&tree);
+
+        // All insert paths, including a re-insert and a skipped insert.
+        for t in 0..6u32 {
+            let tokens = make_tokens(t * 100_000 + 1, 3);
+            tree.insert_tokens(&tokens, &format!("tenant{t}"));
+        }
+        tree.insert_tokens(&make_tokens(1, 3), "tenant0");
+        tree.match_and_insert(&make_tokens(600_001, 2), "tenant1");
+        tree.match_and_insert_with(&make_tokens(700_001, 2), |_| Some("tenant2"));
+        tree.match_and_insert_with(&make_tokens(800_001, 2), |_| None);
+        assert_consistent(&tree);
+
+        // Per-tenant eviction.
+        tree.evict_tenant(&Arc::from("tenant0"), PAGE_SIZE);
+        assert_consistent(&tree);
+
+        // Global eviction.
+        let total = tree.total_token_size();
+        tree.evict_tenant_by_size(total / 2);
+        assert_consistent(&tree);
+        assert!(tree.total_token_size() <= total / 2);
+
+        // No-op eviction and reset.
+        tree.evict_tenant_by_size(usize::MAX);
+        assert_consistent(&tree);
+        tree.clear();
+        assert_consistent(&tree);
+        assert_eq!(tree.total_token_size(), 0);
     }
 }

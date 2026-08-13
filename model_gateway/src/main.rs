@@ -227,7 +227,9 @@ struct CliArgs {
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
     eviction_interval: u64,
 
-    /// Maximum size of the approximation tree for cache-aware routing
+    /// Maximum total size of each model's approximation tree for cache-aware
+    /// routing (chars for HTTP, tokens for gRPC), shared across all workers;
+    /// eviction keeps every tree at or under this bound
     #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
 

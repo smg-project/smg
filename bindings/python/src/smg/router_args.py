@@ -468,7 +468,10 @@ class RouterArgs:
             f"--{prefix}max-tree-size",
             type=int,
             default=RouterArgs.max_tree_size,
-            help="Maximum size of the approximation tree for cache-aware routing",
+            help="Maximum total size of each model's approximation tree for "
+            "cache-aware routing (chars for HTTP, tokens for gRPC), shared "
+            "across all workers; eviction keeps every tree at or under this "
+            "bound",
         )
         routing_group.add_argument(
             f"--{prefix}block-size",

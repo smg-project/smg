@@ -174,8 +174,10 @@ class Router:
         eviction_interval_secs: Interval in seconds between cache eviction operations
             in cache-aware routing. Default: 60
         max_payload_size: Maximum payload size in bytes. Default: 256MB
-        max_tree_size: Maximum size of the approximation tree for cache-aware routing.
-            Default: 2^24
+        max_tree_size: Maximum total size of each model's approximation tree for
+            cache-aware routing (chars for HTTP, tokens for gRPC), shared across
+            all workers; eviction keeps every tree at or under this bound.
+            Default: 2^26
         dp_aware: Enable data parallelism aware schedule. Default: False
         dp_minimum_tokens_scheduler: Enable minimum tokens scheduler for data parallel group. Default: False
         enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When

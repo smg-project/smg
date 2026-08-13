@@ -1,9 +1,9 @@
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashMap},
     hash::{BuildHasherDefault, Hasher},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Weak,
     },
 };
@@ -268,7 +268,10 @@ struct Node {
 pub struct Tree {
     root: NodeRef,
     /// Per-tenant character count for size tracking. Using TenantId for consistency.
-    pub tenant_char_count: DashMap<TenantId, usize>,
+    tenant_char_count: DashMap<TenantId, usize>,
+    /// Tree-wide char total (sum of `tenant_char_count`); the budget
+    /// checked by `evict_tenant_by_size`
+    total_char_count: AtomicUsize,
 }
 
 // For the heap
@@ -387,6 +390,7 @@ impl Tree {
                 last_tenant: RwLock::new(None),
             }),
             tenant_char_count: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
+            total_char_count: AtomicUsize::new(0),
         }
     }
 
@@ -448,10 +452,7 @@ impl Tree {
                     });
 
                     // Attach tenant to the new leaf node with timestamp
-                    self.tenant_char_count
-                        .entry(Arc::clone(&tenant_id))
-                        .and_modify(|count| *count += remaining_char_count)
-                        .or_insert(remaining_char_count);
+                    self.add_tenant_chars(&tenant_id, remaining_char_count);
                     new_node
                         .tenant_last_access_time
                         .insert(Arc::clone(&tenant_id), epoch);
@@ -506,10 +507,7 @@ impl Tree {
                             .tenant_last_access_time
                             .contains_key(tenant_id.as_ref())
                         {
-                            self.tenant_char_count
-                                .entry(Arc::clone(&tenant_id))
-                                .and_modify(|count| *count += matched_text_count)
-                                .or_insert(matched_text_count);
+                            self.add_tenant_chars(&tenant_id, matched_text_count);
                             new_node
                                 .tenant_last_access_time
                                 .insert(Arc::clone(&tenant_id), 0);
@@ -528,10 +526,7 @@ impl Tree {
                             .tenant_last_access_time
                             .contains_key(tenant_id.as_ref())
                         {
-                            self.tenant_char_count
-                                .entry(Arc::clone(&tenant_id))
-                                .and_modify(|count| *count += matched_node_text_count)
-                                .or_insert(matched_node_text_count);
+                            self.add_tenant_chars(&tenant_id, matched_node_text_count);
                             matched_node
                                 .tenant_last_access_time
                                 .insert(Arc::clone(&tenant_id), 0);
@@ -788,10 +783,7 @@ impl Tree {
                 .tenant_last_access_time
                 .contains_key(tenant_id.as_ref())
             {
-                self.tenant_char_count
-                    .entry(Arc::clone(&tenant_id))
-                    .and_modify(|count| *count += *char_count)
-                    .or_insert(*char_count);
+                self.add_tenant_chars(&tenant_id, *char_count);
                 node.tenant_last_access_time
                     .insert(Arc::clone(&tenant_id), 0);
             }
@@ -949,20 +941,18 @@ impl Tree {
             .collect()
     }
 
+    /// Evict cache entries until the tree-wide char total is at or under
+    /// `max_size`.
+    ///
+    /// The budget is shared across all tenants of this tree: eviction triggers
+    /// on the tree-wide total (no single tenant has to exceed anything) and
+    /// removes leaves in LRU order across tenants, least recently used first.
     pub fn evict_tenant_by_size(&self, max_size: usize) {
-        // Eviction can only touch tenants over budget; skip the
-        // full-tree walk and heap construction when there are none.
-        let over_budget: HashSet<TenantId> = self
-            .tenant_char_count
-            .iter()
-            .filter(|entry| *entry.value() > max_size)
-            .map(|entry| Arc::clone(entry.key()))
-            .collect();
-        if over_budget.is_empty() {
+        if self.total_char_size() <= max_size {
             return;
         }
 
-        // Calculate used size and collect leaves
+        // Collect leaves across all tenants
         let mut stack = vec![Arc::clone(&self.root)];
         let mut pq = BinaryHeap::new();
 
@@ -971,11 +961,13 @@ impl Tree {
                 stack.push(Arc::clone(child.value()));
             }
 
-            // Add over-budget tenants' leaves to priority queue
+            // Root is never eligible for eviction
+            if Arc::ptr_eq(&curr, &self.root) {
+                continue;
+            }
+
+            // Add leaves to priority queue
             for tenant in Tree::leaf_of(&curr) {
-                if !over_budget.contains(tenant.as_ref()) {
-                    continue;
-                }
                 if let Some(timestamp) = curr.tenant_last_access_time.get(tenant.as_ref()) {
                     pq.push(Reverse(EvictionEntry {
                         timestamp: *timestamp,
@@ -991,14 +983,16 @@ impl Tree {
             debug!("Tenant: {}, Size: {}", entry.key(), entry.value());
         }
 
-        // Process eviction
-        while let Some(Reverse(entry)) = pq.pop() {
+        // Process eviction until the tree-wide total obeys the budget
+        while self.total_char_size() > max_size {
+            let Some(Reverse(entry)) = pq.pop() else {
+                break;
+            };
             let EvictionEntry { tenant, node, .. } = entry;
 
-            if let Some(used_size) = self.tenant_char_count.get(tenant.as_ref()) {
-                if *used_size <= max_size {
-                    continue;
-                }
+            // Root is never eligible for eviction (re-enters via promotion)
+            if Arc::ptr_eq(&node, &self.root) {
+                continue;
             }
 
             // Verify this node is still a leaf for this tenant (may have changed)
@@ -1016,11 +1010,7 @@ impl Tree {
 
             // Decrement when removing tenant from node
             let node_len = node.text.read().char_count();
-            self.tenant_char_count
-                .entry(Arc::clone(&tenant))
-                .and_modify(|count| {
-                    *count = count.saturating_sub(node_len);
-                });
+            self.sub_tenant_chars(&tenant, node_len);
 
             // Remove tenant from node
             node.tenant_last_access_time.remove(tenant.as_ref());
@@ -1132,7 +1122,9 @@ impl Tree {
         for (node, _) in &nodes {
             self.remove_tenant_from_node(node, tenant_id);
         }
-        self.tenant_char_count.remove(tenant_id);
+        if let Some((_, count)) = self.tenant_char_count.remove(tenant_id) {
+            self.total_char_count.fetch_sub(count, Ordering::Relaxed);
+        }
     }
 
     /// Evict a specific number of chars for a tenant using LRU ordering.
@@ -1161,10 +1153,8 @@ impl Tree {
             }
         }
 
-        // Update tenant char count
-        self.tenant_char_count
-            .entry(tenant_id.clone())
-            .and_modify(|count| *count = count.saturating_sub(evicted));
+        // Update tenant char count and tree-wide total
+        self.sub_tenant_chars(tenant_id, evicted);
     }
 
     fn collect_tenant_nodes(
@@ -1198,7 +1188,38 @@ impl Tree {
         self.tenant_char_count.get(tenant).map(|v| *v).unwrap_or(0)
     }
 
-    /// Clear the tree to empty state.
+    /// Tree-wide char total (sum of per-tenant counts).
+    pub fn total_char_size(&self) -> usize {
+        self.total_char_count.load(Ordering::Relaxed)
+    }
+
+    /// Fold `chars` into a tenant's count and the tree-wide total.
+    fn add_tenant_chars(&self, tenant_id: &TenantId, chars: usize) {
+        if chars == 0 {
+            return;
+        }
+        self.tenant_char_count
+            .entry(Arc::clone(tenant_id))
+            .and_modify(|count| *count += chars)
+            .or_insert(chars);
+        self.total_char_count.fetch_add(chars, Ordering::Relaxed);
+    }
+
+    /// Subtract evicted `chars` from a tenant's count and the tree-wide
+    /// total, clamped to the tenant's current count so the two stay in sync.
+    fn sub_tenant_chars(&self, tenant_id: &TenantId, chars: usize) {
+        if chars == 0 {
+            return;
+        }
+        if let Some(mut count) = self.tenant_char_count.get_mut(tenant_id.as_ref()) {
+            let removed = chars.min(*count);
+            *count -= removed;
+            self.total_char_count.fetch_sub(removed, Ordering::Relaxed);
+        }
+    }
+
+    /// Clear the tree to empty state. Not synchronized with concurrent
+    /// mutation: callers must quiesce writers first.
     pub fn clear(&self) {
         // Clear root's children
         self.root.children.clear();
@@ -1206,6 +1227,7 @@ impl Tree {
         self.root.tenant_last_access_time.clear();
         // Clear tenant char counts
         self.tenant_char_count.clear();
+        self.total_char_count.store(0, Ordering::Relaxed);
         // Reset root text
         *self.root.text.write() = NodeText::new(String::new());
     }
@@ -1454,20 +1476,15 @@ impl Tree {
         }
 
         let mut idx = 0;
-        Self::restore_node(
-            &tree.root,
-            &snapshot.nodes,
-            &mut idx,
-            &tree.tenant_char_count,
-        );
+        tree.restore_node(&tree.root, &snapshot.nodes, &mut idx);
         tree
     }
 
     fn restore_node(
+        &self,
         target: &NodeRef,
         nodes: &[crate::snapshot::SnapshotNode],
         idx: &mut usize,
-        tenant_counts: &DashMap<TenantId, usize>,
     ) {
         if *idx >= nodes.len() {
             return;
@@ -1480,6 +1497,7 @@ impl Tree {
         *target.text.write() = NodeText::new(snap_node.edge.clone());
 
         // Set tenants
+        let edge_chars = snap_node.edge.chars().count();
         for (tenant_str, epoch) in &snap_node.tenants {
             let tenant_id = intern_tenant(tenant_str);
             target
@@ -1487,11 +1505,7 @@ impl Tree {
                 .insert(Arc::clone(&tenant_id), *epoch);
 
             // Track char counts
-            let edge_chars = snap_node.edge.chars().count();
-            tenant_counts
-                .entry(tenant_id)
-                .and_modify(|c| *c += edge_chars)
-                .or_insert(edge_chars);
+            self.add_tenant_chars(&tenant_id, edge_chars);
         }
 
         // Restore children
@@ -1525,7 +1539,7 @@ impl Tree {
                 last_tenant: RwLock::new(None),
             });
 
-            Self::restore_node(&child_node, nodes, idx, tenant_counts);
+            self.restore_node(&child_node, nodes, idx);
             target.children.insert(first_char, child_node);
         }
     }
@@ -1552,10 +1566,10 @@ impl Tree {
     /// (remote wins on newer epoch) and reconciles children using the
     /// three-case edge comparison.
     pub fn merge_tree(&self, remote: &Tree) {
-        Self::merge_nodes(&self.root, &remote.root, &self.tenant_char_count);
+        self.merge_nodes(&self.root, &remote.root);
     }
 
-    fn merge_nodes(local: &NodeRef, remote: &NodeRef, tenant_counts: &DashMap<TenantId, usize>) {
+    fn merge_nodes(&self, local: &NodeRef, remote: &NodeRef) {
         // Merge tenants at this node
         for entry in &remote.tenant_last_access_time {
             let tenant_id = Arc::clone(entry.key());
@@ -1578,10 +1592,7 @@ impl Tree {
 
                 if is_new {
                     let edge_chars = local.text.read().char_count();
-                    tenant_counts
-                        .entry(tenant_id)
-                        .and_modify(|c| *c += edge_chars)
-                        .or_insert(edge_chars);
+                    self.add_tenant_chars(&tenant_id, edge_chars);
                 }
             }
         }
@@ -1601,7 +1612,7 @@ impl Tree {
 
                 if shared == local_edge.chars().count() && shared == remote_edge.chars().count() {
                     // Case 1: exact match — recurse
-                    Self::merge_nodes(&local_child, &remote_child, tenant_counts);
+                    self.merge_nodes(&local_child, &remote_child);
                 } else if shared == local_edge.chars().count() {
                     // Case 2: local edge is a prefix of remote edge.
                     // Descend into local child. The remote child's edge
@@ -1626,10 +1637,7 @@ impl Tree {
                                 .insert(Arc::clone(&tid), epoch);
                             if is_new {
                                 let edge_chars = local_edge.chars().count();
-                                tenant_counts
-                                    .entry(tid)
-                                    .and_modify(|c| *c += edge_chars)
-                                    .or_insert(edge_chars);
+                                self.add_tenant_chars(&tid, edge_chars);
                             }
                         }
                     }
@@ -1659,11 +1667,11 @@ impl Tree {
                     if let Some(deeper_local) = local_child.children.get(&rem_first) {
                         let deeper_local = deeper_local.value().clone();
                         // Recurse: merge trimmed remote into the deeper local child
-                        Self::merge_nodes(&deeper_local, &trimmed_remote, tenant_counts);
+                        self.merge_nodes(&deeper_local, &trimmed_remote);
                     } else {
                         // No local child at this position — graft remote subtree
                         *trimmed_remote.parent.write() = Some(Arc::downgrade(&local_child));
-                        Self::accumulate_tenant_counts(&trimmed_remote, tenant_counts);
+                        self.accumulate_tenant_counts(&trimmed_remote);
                         local_child.children.insert(rem_first, trimmed_remote);
                     }
                 } else {
@@ -1713,10 +1721,7 @@ impl Tree {
                                 .tenant_last_access_time
                                 .insert(Arc::clone(&tid), epoch);
                             if is_new {
-                                tenant_counts
-                                    .entry(tid)
-                                    .and_modify(|c| *c += split_chars)
-                                    .or_insert(split_chars);
+                                self.add_tenant_chars(&tid, split_chars);
                             }
                         }
                     }
@@ -1747,7 +1752,7 @@ impl Tree {
                                 .children
                                 .insert(*child_entry.key(), child_clone);
                         }
-                        Self::accumulate_tenant_counts(&remote_subtree, tenant_counts);
+                        self.accumulate_tenant_counts(&remote_subtree);
                         split_node.children.insert(rem_first, remote_subtree);
                     }
 
@@ -1757,7 +1762,7 @@ impl Tree {
             } else {
                 // No local child at this char — copy entire remote subtree
                 let cloned = Self::clone_subtree(&remote_child, Some(local));
-                Self::accumulate_tenant_counts(&cloned, tenant_counts);
+                self.accumulate_tenant_counts(&cloned);
                 local.children.insert(rc, cloned);
             }
         }
@@ -1767,17 +1772,13 @@ impl Tree {
     /// tree-level `tenant_char_count` map.  Called after grafting a
     /// remote subtree into the local tree so that size tracking and
     /// eviction remain correct.
-    fn accumulate_tenant_counts(node: &NodeRef, tenant_counts: &DashMap<TenantId, usize>) {
+    fn accumulate_tenant_counts(&self, node: &NodeRef) {
         let edge_chars = node.text.read().char_count();
         for entry in &node.tenant_last_access_time {
-            let tid = Arc::clone(entry.key());
-            tenant_counts
-                .entry(tid)
-                .and_modify(|c| *c += edge_chars)
-                .or_insert(edge_chars);
+            self.add_tenant_chars(entry.key(), edge_chars);
         }
         for child_entry in &node.children {
-            Self::accumulate_tenant_counts(child_entry.value(), tenant_counts);
+            self.accumulate_tenant_counts(child_entry.value());
         }
     }
 
@@ -2263,13 +2264,14 @@ mod tests {
         assert_eq!(sizes_before.get("tenant1").unwrap(), &5); // "hello" = 5
         assert_eq!(sizes_before.get("tenant2").unwrap(), &10); // "hello" + "world" = 10
 
-        // Evict - should remove "hello" from tenant2 as it's the oldest
+        // Evict: the tree-wide total (15) exceeds max_size, so LRU leaves go
+        // first - tenant1's "hello" (oldest), then tenant2's "hello"
         tree.evict_tenant_by_size(max_size);
 
         tree.pretty_print();
 
         let sizes_after = tree.get_used_size_per_tenant();
-        assert_eq!(sizes_after.get("tenant1").unwrap(), &5); // Should be unchanged
+        assert_eq!(*sizes_after.get("tenant1").unwrap_or(&0), 0); // Oldest, evicted
         assert_eq!(sizes_after.get("tenant2").unwrap(), &5); // Only "world" remains
 
         let (matched, tenant) = tree.prefix_match_legacy("world");
@@ -2281,7 +2283,7 @@ mod tests {
     fn test_advanced_eviction() {
         let tree = Tree::new();
 
-        // Set limits for each tenant
+        // Tree-wide budget
         let max_size: usize = 100;
 
         // Define prefixes
@@ -2300,14 +2302,13 @@ mod tests {
         // Perform eviction
         tree.evict_tenant_by_size(max_size);
 
-        // Check sizes after eviction
+        // Check sizes after eviction: the tree-wide total obeys the budget
         let sizes_after = tree.get_used_size_per_tenant();
-        for (tenant, &size) in &sizes_after {
-            assert!(
-                size <= max_size,
-                "Tenant {tenant} exceeds size limit. Current size: {size}, Limit: {max_size}"
-            );
-        }
+        let total_after: usize = sizes_after.values().sum();
+        assert!(
+            total_after <= max_size,
+            "Tree total exceeds budget. Total: {total_after}, Limit: {max_size}"
+        );
     }
 
     #[test]
@@ -2318,7 +2319,7 @@ mod tests {
         let mut handles = vec![];
         let test_duration = Duration::from_secs(10);
         let start_time = Instant::now();
-        let max_size = 100; // Single max size for all tenants
+        let max_size = 100; // Tree-wide budget
 
         // Spawn eviction thread
         {
@@ -2373,16 +2374,15 @@ mod tests {
         // final eviction
         tree.evict_tenant_by_size(max_size);
 
-        // Final size check
+        // Final size check: the tree-wide total obeys the budget
         let final_sizes = tree.get_used_size_per_tenant();
         println!("Final sizes after test completion: {final_sizes:?}");
 
-        for &size in final_sizes.values() {
-            assert!(
-                size <= max_size,
-                "Tenant exceeds size limit. Final size: {size}, Limit: {max_size}"
-            );
-        }
+        let final_total: usize = final_sizes.values().sum();
+        assert!(
+            final_total <= max_size,
+            "Tree total exceeds budget. Final total: {final_total}, Limit: {max_size}"
+        );
     }
 
     #[test]
@@ -2800,33 +2800,6 @@ mod tests {
 
         let sizes = tree.get_used_size_per_tenant();
         assert!(sizes.is_empty());
-    }
-
-    #[test]
-    fn test_eviction_no_op_when_under_budget() {
-        let tree = Tree::new();
-
-        tree.insert_text("hello", "tenant1");
-        tree.insert_text("world", "tenant2");
-
-        let sizes_before = tree.get_used_size_per_tenant();
-        let counts_before = get_maintained_counts(&tree);
-
-        // Both tenants under budget: nothing may change.
-        tree.evict_tenant_by_size(100);
-
-        // At budget (count == max_size) is not over budget: still a no-op.
-        tree.evict_tenant_by_size(5);
-
-        assert_eq!(tree.get_used_size_per_tenant(), sizes_before);
-        assert_eq!(get_maintained_counts(&tree), counts_before);
-
-        let (matched, tenant) = tree.prefix_match_legacy("hello");
-        assert_eq!(matched, "hello");
-        assert_eq!(tenant, "tenant1");
-        let (matched, tenant) = tree.prefix_match_legacy("world");
-        assert_eq!(matched, "world");
-        assert_eq!(tenant, "tenant2");
     }
 
     #[test]
@@ -3359,5 +3332,114 @@ mod tests {
             before,
             "None selection must not insert"
         );
+    }
+
+    #[test]
+    fn test_evict_by_size_shared_budget_lru_tenants() {
+        let tree = Tree::new();
+
+        // 8 tenants, 10 chars each: every tenant is under the budget on its
+        // own, but the tree-wide total is double the budget.
+        for t in 0..8 {
+            tree.insert_text(&format!("{t}aaaaaaaaa"), &format!("tenant{t}"));
+        }
+        assert_eq!(tree.total_char_size(), 80);
+
+        tree.evict_tenant_by_size(40);
+
+        assert!(tree.total_char_size() <= 40);
+        // Least-recently-used tenants are evicted first.
+        let sizes = tree.get_used_size_per_tenant();
+        for t in 0..4 {
+            assert_eq!(
+                *sizes.get(&format!("tenant{t}")).unwrap_or(&0),
+                0,
+                "tenant{t} (LRU) should be evicted"
+            );
+        }
+        for t in 4..8 {
+            assert_eq!(
+                *sizes.get(&format!("tenant{t}")).unwrap(),
+                10,
+                "tenant{t} should survive"
+            );
+        }
+    }
+
+    #[test]
+    fn test_evict_by_size_under_budget_is_noop() {
+        let tree = Tree::new();
+        for t in 0..4 {
+            tree.insert_text(&format!("{t}aaaaaaaaa"), &format!("tenant{t}"));
+        }
+        let counts_before = tree.get_tenant_char_count();
+        assert_eq!(tree.total_char_size(), 40);
+
+        // At and above the budget: nothing may change.
+        tree.evict_tenant_by_size(40);
+        tree.evict_tenant_by_size(usize::MAX);
+
+        assert_eq!(tree.get_tenant_char_count(), counts_before);
+        assert_eq!(tree.total_char_size(), 40);
+        assert_eq!(tree.get_used_size_per_tenant(), counts_before);
+        for t in 0..4 {
+            let text = format!("{t}aaaaaaaaa");
+            let (matched, tenant) = tree.prefix_match_legacy(&text);
+            assert_eq!(matched, text);
+            assert_eq!(tenant, format!("tenant{t}"));
+        }
+    }
+
+    #[test]
+    fn test_total_count_consistent_with_tenant_sum() {
+        fn assert_consistent(tree: &Tree) {
+            let sum: usize = tree.get_tenant_char_count().values().sum();
+            assert_eq!(
+                tree.total_char_size(),
+                sum,
+                "total must equal per-tenant sum"
+            );
+        }
+
+        let tree = Tree::new();
+        assert_consistent(&tree);
+
+        // All insert paths, including a re-insert and a skipped insert.
+        tree.insert_text("apple", "tenant1");
+        tree.insert_text("application", "tenant2");
+        tree.insert_text("apple", "tenant1");
+        tree.match_and_insert("banana", "tenant3");
+        tree.match_and_insert_with("bandana", |_| Some("tenant1"));
+        tree.match_and_insert_with("cucumber", |_| None);
+        assert_consistent(&tree);
+
+        // Per-tenant eviction.
+        tree.evict_by_tenant(&Arc::from("tenant1"), 3);
+        assert_consistent(&tree);
+
+        // Global eviction.
+        tree.evict_tenant_by_size(8);
+        assert_consistent(&tree);
+        assert!(tree.total_char_size() <= 8);
+
+        // Tenant purge.
+        tree.remove_tenant_all(&Arc::from("tenant2"));
+        assert_consistent(&tree);
+
+        // Snapshot restore and merge maintain the invariant too.
+        let restored = Tree::from_snapshot(&tree.snapshot());
+        assert_consistent(&restored);
+
+        let other = Tree::new();
+        other.insert_text("delta", "tenant9");
+        tree.merge_tree(&other);
+        assert_consistent(&tree);
+
+        // No-op eviction and reset.
+        tree.evict_tenant_by_size(usize::MAX);
+        assert_consistent(&tree);
+        tree.clear();
+        assert_consistent(&tree);
+        assert_eq!(tree.total_char_size(), 0);
     }
 }

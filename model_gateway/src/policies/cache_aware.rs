@@ -37,7 +37,8 @@
     balance_abs_threshold:   Absolute load diff threshold for imbalance detection
     balance_rel_threshold:   Relative load ratio threshold for imbalance detection
     eviction_interval_secs:  Interval between LRU eviction cycles
-    max_tree_size:           Max nodes per approximate tree before eviction
+    max_tree_size:           Max total size (chars/tokens) of each model's approximate tree,
+                             shared across all workers; enforced by eviction
     block_size:              Backend KV cache block size for event-driven routing
 */
 
