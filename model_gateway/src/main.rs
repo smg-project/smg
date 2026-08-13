@@ -1,6 +1,13 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+
+// Jemalloc as the global allocator: glibc malloc retains freed pages badly
+// under the gateway's allocation churn. Prefixed symbols only — vendored C
+// libraries keep their own malloc.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use openai_protocol::worker::TransportMode;
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{

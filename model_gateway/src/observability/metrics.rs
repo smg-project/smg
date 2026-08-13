@@ -183,6 +183,9 @@ impl Default for PrometheusConfig {
 pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 
 pub(crate) fn init_metrics() {
+    #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+    allocator_stats::describe();
+
     // Layer 1: HTTP metrics
     describe_counter!(
         "smg_http_requests_total",
@@ -507,7 +510,78 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
         )
         .expect("failed to set event loop delay buckets")
         .install_recorder()
+        .inspect(|_| {
+            #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+            allocator_stats::start_reporting();
+        })
         .expect("failed to install Prometheus recorder")
+}
+
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+pub(crate) mod allocator_stats {
+    use metrics::{describe_gauge, gauge};
+
+    pub(crate) fn describe() {
+        describe_gauge!(
+            "smg_allocator_allocated_bytes",
+            "Bytes in live allocations (jemalloc stats.allocated)"
+        );
+        describe_gauge!(
+            "smg_allocator_active_bytes",
+            "Bytes in active pages (jemalloc stats.active)"
+        );
+        describe_gauge!(
+            "smg_allocator_resident_bytes",
+            "Bytes resident per the allocator (jemalloc stats.resident)"
+        );
+        describe_gauge!(
+            "smg_allocator_metadata_bytes",
+            "Allocator metadata bytes (jemalloc stats.metadata)"
+        );
+    }
+
+    fn record() {
+        use tikv_jemalloc_ctl::{epoch, stats};
+        if epoch::advance().is_err() {
+            return;
+        }
+        if let Ok(v) = stats::allocated::read() {
+            gauge!("smg_allocator_allocated_bytes").set(v as f64);
+        }
+        if let Ok(v) = stats::active::read() {
+            gauge!("smg_allocator_active_bytes").set(v as f64);
+        }
+        if let Ok(v) = stats::resident::read() {
+            gauge!("smg_allocator_resident_bytes").set(v as f64);
+        }
+        if let Ok(v) = stats::metadata::read() {
+            gauge!("smg_allocator_metadata_bytes").set(v as f64);
+        }
+    }
+
+    /// Gauges are truthful when jemalloc is the global allocator, which every
+    /// shipped artifact declares.
+    pub(crate) fn start_reporting() {
+        record();
+        // Plain thread: metrics must not depend on a runtime being alive.
+        let _ = std::thread::Builder::new()
+            .name("smg-allocator-stats".into())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                record();
+            });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn jemalloc_stats_readable() {
+            use tikv_jemalloc_ctl::{epoch, stats};
+            epoch::advance().expect("epoch advance");
+            stats::allocated::read().expect("stats.allocated readable");
+            stats::resident::read().expect("stats.resident readable");
+        }
+    }
 }
 
 /// Label constants for consistent metric labeling

@@ -46,3 +46,6 @@ strip = true
 
 [lints]
 workspace = true
+
+[target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dependencies]
+tikv-jemallocator = { workspace = true }

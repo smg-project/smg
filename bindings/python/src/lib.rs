@@ -2,6 +2,13 @@ use std::collections::HashMap;
 
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
+
+// Jemalloc for all Rust-side allocations in the extension. Prefixed symbols
+// leave CPython's allocators untouched; disable_initial_exec_tls is required
+// for a dlopen'd cdylib.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use smg::*;
 use smg_auth as auth;
 
