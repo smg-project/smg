@@ -1039,12 +1039,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // port conflicts or bad addresses.
     if let Some(prometheus_config) = &config.prometheus_config {
         let handle = metrics::start_prometheus(prometheus_config.clone());
-        let _server_handle = metrics_server::start_metrics_server(
+        let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
             handle,
             prometheus_config.host.clone(),
             prometheus_config.port,
         )
-        .await;
+        .await?;
         // Tokio runtime self-observability (event-loop canary + sampler).
         // `startup` runs on the main runtime, so the observer lands on —
         // and therefore measures — the runtime that serves requests.

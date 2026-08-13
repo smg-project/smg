@@ -430,7 +430,7 @@ struct CliArgs {
     log_json: bool,
 
     // ==================== Prometheus Metrics ====================
-    /// Port to expose Prometheus metrics
+    /// Port to expose Prometheus metrics; 0 binds an OS-assigned ephemeral port
     #[arg(long, default_value_t = 29000, help_heading = "Prometheus Metrics")]
     prometheus_port: u16,
 

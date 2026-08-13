@@ -734,7 +734,10 @@ class RouterArgs:
             f"--{prefix}prometheus-port",
             type=int,
             default=29000,
-            help="Port to expose Prometheus metrics (default: 29000).",
+            help=(
+                "Port to expose Prometheus metrics (default: 29000)."
+                " 0 binds an OS-assigned ephemeral port, logged at startup."
+            ),
         )
         prometheus_group.add_argument(
             f"--{prefix}prometheus-host",
