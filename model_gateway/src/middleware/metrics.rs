@@ -17,6 +17,7 @@ use axum::{
     extract::{MatchedPath, Request},
     response::Response,
 };
+use http_body::Body as _;
 use tower::{Layer, Service};
 
 use crate::{
@@ -106,11 +107,7 @@ where
             // immediately and keep generating from a detached task, and the
             // guard is what `wait_for_drain()` and the age histogram observe.
             let (parts, body) = response.into_parts();
-            let body = Body::new(TrackedBody {
-                inner: body,
-                guard: Some(guard),
-                tracker: in_flight_request_tracker,
-            });
+            let body = Body::new(TrackedBody::new(body, guard, in_flight_request_tracker));
             Ok(Response::from_parts(parts, body))
         })
     }
@@ -130,8 +127,24 @@ struct TrackedBody {
 }
 
 impl TrackedBody {
+    fn new(inner: Body, guard: InFlightGuard, tracker: Arc<InFlightRequestTracker>) -> Self {
+        let mut body = Self {
+            inner,
+            guard: Some(guard),
+            tracker,
+        };
+        // An already-complete body (e.g. an empty unary response) may never be
+        // polled at all; do not retain the guard past construction for it.
+        if body.inner.is_end_stream() {
+            body.release();
+        }
+        body
+    }
+
     fn release(&mut self) {
-        if self.guard.take().is_some() {
+        if let Some(guard) = self.guard.take() {
+            // Drop before reading len() so the gauge reflects the decrement.
+            drop(guard);
             Metrics::set_http_connections_active(self.tracker.len());
         }
     }
@@ -147,11 +160,15 @@ impl http_body::Body for TrackedBody {
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
         let poll = Pin::new(&mut this.inner).poll_frame(cx);
-        // Release eagerly at end-of-stream/error rather than waiting for the
-        // wrapper's own drop, so a response object kept alive after its body
-        // finished does not count as in flight.
-        if matches!(&poll, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
-            this.release();
+        // Release as soon as the end of the stream is knowable: at the
+        // trailing None, on error, or right after a successful final frame
+        // when the inner body reports end-of-stream - per the http_body
+        // contract, consumers may stop polling at that point and never ask
+        // for the None. Drop still covers client disconnect.
+        match &poll {
+            Poll::Ready(None) | Poll::Ready(Some(Err(_))) => this.release(),
+            Poll::Ready(Some(Ok(_))) if this.inner.is_end_stream() => this.release(),
+            _ => {}
         }
         poll
     }
@@ -364,6 +381,59 @@ mod tests {
         // stream is still open — the guard must release immediately.
         drop(response);
         assert_eq!(tracker.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn already_complete_body_releases_at_wrap() {
+        use crate::observability::inflight_tracker::InFlightRequestTracker;
+
+        let tracker = InFlightRequestTracker::new();
+        let app = Router::new()
+            .route("/empty", get(|| async { Response::new(Body::empty()) }))
+            .layer(HttpMetricsLayer::new(tracker.clone()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/empty")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // An empty body is end-of-stream at wrap time; a consumer may never
+        // poll it, so the guard must already be gone.
+        assert_eq!(tracker.len(), 0);
+        drop(response);
+    }
+
+    #[tokio::test]
+    async fn final_frame_releases_without_trailing_poll() {
+        use http_body_util::BodyExt;
+
+        use crate::observability::inflight_tracker::InFlightRequestTracker;
+
+        let tracker = InFlightRequestTracker::new();
+        let app = Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .layer(HttpMetricsLayer::new(tracker.clone()));
+
+        let response = app
+            .oneshot(Request::builder().uri("/ok").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+
+        // A sized body is not end-of-stream before its data frame...
+        assert_eq!(tracker.len(), 1);
+
+        // ...but after the final successful frame the http_body contract lets
+        // the consumer stop polling: release must not wait for the None.
+        let frame = body.frame().await.expect("one frame").expect("frame ok");
+        assert!(frame.is_data());
+        assert_eq!(tracker.len(), 0);
+        drop(body);
     }
 
     #[tokio::test]
