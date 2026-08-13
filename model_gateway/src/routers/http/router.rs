@@ -468,11 +468,7 @@ impl Router {
             }
         };
 
-        let policy = self.policy_registry.get_policy_or_default(model_id);
-
-        let load_guard = ["cache_aware", "manual"]
-            .contains(&policy.name())
-            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+        let load_guard = WorkerLoadGuard::new(worker.clone(), headers);
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -763,9 +759,7 @@ impl Router {
         );
         let worker = available[idx].clone();
 
-        let load_guard = ["cache_aware", "manual"]
-            .contains(&policy.name())
-            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+        let load_guard = WorkerLoadGuard::new(worker.clone(), headers);
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -949,9 +943,7 @@ impl Router {
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
-            if let Some(guard) = load_guard {
-                response = AttachedBody::wrap_response(response, guard);
-            }
+            response = AttachedBody::wrap_response(response, load_guard);
             response
         } else {
             let response_headers = header_utils::preserve_response_headers(res.headers());
@@ -1054,7 +1046,7 @@ impl Router {
         canonical_model: Option<&str>,
         worker: &dyn Worker,
         is_stream: bool,
-        load_guard: Option<WorkerLoadGuard>,
+        load_guard: WorkerLoadGuard,
     ) -> Response {
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
@@ -1154,9 +1146,7 @@ impl Router {
 
             // Attach load guard to response body for proper RAII lifecycle
             // Guard is dropped when response body is consumed or client disconnects
-            if let Some(guard) = load_guard {
-                response = AttachedBody::wrap_response(response, guard);
-            }
+            response = AttachedBody::wrap_response(response, load_guard);
             response
         } else {
             // For non-streaming requests, preserve headers
