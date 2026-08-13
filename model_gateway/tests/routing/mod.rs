@@ -11,6 +11,7 @@ pub mod pd_routing_test;
 pub mod policy_registry_integration;
 pub mod power_of_two_test;
 pub mod service_discovery_test;
+pub mod stream_relay_disconnect_test;
 pub mod test_openai_routing;
 pub mod test_pd_routing;
 pub mod worker_management_test;

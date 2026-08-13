@@ -870,16 +870,29 @@ impl Router {
             tokio::spawn(async move {
                 let mut stream = stream;
                 let mut stream_failed = false;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).await.is_err() {
+                let mut client_disconnected = false;
+                loop {
+                    tokio::select! {
+                        chunk = stream.next() => match chunk {
+                            Some(Ok(bytes)) => {
+                                if tx.send(Ok(bytes)).await.is_err() {
+                                    client_disconnected = true;
+                                    break;
+                                }
+                            }
+                            Some(Err(e)) => {
+                                stream_failed = true;
+                                let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                                 break;
                             }
-                        }
-                        Err(e) => {
-                            stream_failed = true;
-                            let _ = tx.send(Err(format!("Stream error: {e}"))).await;
+                            None => break,
+                        },
+                        // Client gone with no chunk in flight (long prefill,
+                        // stalled upstream): break so the reqwest stream drops,
+                        // closing the upstream connection and letting the
+                        // engine abort generation.
+                        () = tx.closed() => {
+                            client_disconnected = true;
                             break;
                         }
                     }
@@ -899,6 +912,13 @@ impl Router {
                         metrics_labels::CONNECTION_HTTP,
                         error_type_from_status(effective_status),
                     );
+                }
+                // A client disconnect gets no terminal router metric: it is
+                // neither a completed request (duration) nor a router or
+                // worker failure (error). Worker-level attribution above
+                // still applies — the header status is a worker fact.
+                if client_disconnected {
+                    return;
                 }
                 if effective_status.is_success() {
                     Metrics::record_router_duration(
@@ -1073,17 +1093,25 @@ impl Router {
             )]
             tokio::spawn(async move {
                 let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).await.is_err() {
+                loop {
+                    tokio::select! {
+                        chunk = stream.next() => match chunk {
+                            Some(Ok(bytes)) => {
+                                if tx.send(Ok(bytes)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(Err(e)) => {
+                                let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                                 break;
                             }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {e}"))).await;
-                            break;
-                        }
+                            None => break,
+                        },
+                        // Client gone with no chunk in flight (long prefill,
+                        // stalled upstream): break so the reqwest stream drops,
+                        // closing the upstream connection and letting the
+                        // engine abort generation.
+                        () = tx.closed() => break,
                     }
                 }
             });
