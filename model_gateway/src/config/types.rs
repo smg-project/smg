@@ -555,7 +555,7 @@ pub enum PolicyConfig {
     /// A lightweight alternative to cache_aware radix tree.
     /// Routes requests based on prefix token hash for cache locality.
     /// - Uses consistent hash ring with bounded load balancing
-    /// - Walks ring if worker is overloaded (load > avg * load_factor)
+    /// - Diverts to the least loaded worker when the hashed one is overloaded
     /// - O(log n) lookup instead of O(prefix_len) radix tree traversal
     #[serde(rename = "prefix_hash")]
     PrefixHash {
@@ -563,7 +563,8 @@ pub enum PolicyConfig {
         /// of the prompt when the request is untokenized (default: 256)
         #[serde(default = "default_prefix_token_count")]
         prefix_token_count: usize,
-        /// Load factor threshold - walk ring if load > avg * factor (default: 1.25)
+        /// Relative load threshold - a worker is overloaded when its load
+        /// exceeds both avg * factor and the absolute margin (default: 1.25)
         #[serde(default = "default_load_factor")]
         load_factor: f64,
         /// Absolute load difference over average a worker must also exceed

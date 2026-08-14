@@ -46,9 +46,10 @@ pub struct PrefixHashConfig {
     /// Default: 256 tokens (~1 paragraph of text)
     pub prefix_token_count: usize,
 
-    /// Load factor threshold for walking the ring.
-    /// If a worker's load > (total_load / num_workers) * load_factor,
-    /// walk clockwise to the next worker.
+    /// Relative load threshold for the overload check.
+    /// A worker counts as overloaded once its load exceeds the average by
+    /// this multiple as well as by `balance_abs_threshold`, at which point
+    /// the request goes to the least loaded worker that is not overloaded.
     /// Default: 1.25 (125% of average load)
     pub load_factor: f64,
 
