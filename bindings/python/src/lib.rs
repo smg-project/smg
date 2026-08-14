@@ -589,10 +589,10 @@ impl Router {
                     overload_token_usage_threshold: self.overload_token_usage_threshold,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 5,
+                    load_check_interval_secs: self.load_monitor_interval,
                 },
                 PolicyType::LeastLoad => ConfigPolicyConfig::LeastLoad {
-                    load_check_interval_secs: 5,
+                    load_check_interval_secs: self.load_monitor_interval,
                     kv_pressure_weight: self.least_load_kv_pressure_weight,
                     mean_prefill_tokens: self.least_load_mean_prefill_tokens,
                     default_throughput: self.least_load_default_throughput,

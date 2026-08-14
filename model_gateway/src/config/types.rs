@@ -490,6 +490,12 @@ pub enum PolicyConfig {
         overload_token_usage_threshold: f32,
     },
 
+    /// Power-of-two choices load balancing policy.
+    /// Randomly selects two workers and routes to the one with lower load.
+    /// TODO: Implement per-policy load monitoring intervals.
+    /// Currently, load_check_interval_secs is populated from RouterConfig.load_monitor_interval_secs,
+    /// but WorkerMonitor does not yet use per-policy intervals. This field is reserved for
+    /// future support of different polling cadences per policy.
     #[serde(rename = "power_of_two")]
     PowerOfTwo { load_check_interval_secs: u64 },
 
@@ -499,6 +505,10 @@ pub enum PolicyConfig {
     /// from the load monitor with in-flight correction. See `policies/least_load.rs`.
     #[serde(rename = "least_load")]
     LeastLoad {
+        /// TODO: Implement per-policy load monitoring intervals.
+        /// Currently, load_check_interval_secs is populated from RouterConfig.load_monitor_interval_secs,
+        /// but WorkerMonitor does not yet use per-policy intervals. This field is reserved for
+        /// future support of different polling cadences per policy.
         #[serde(default = "default_least_load_interval")]
         load_check_interval_secs: u64,
         /// KV-pressure weight `λ_t` (seconds): the time-cost of KV contention,
