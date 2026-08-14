@@ -81,6 +81,10 @@ jobs:
         if: matrix.os == 'windows'
         run: choco install protoc -y
 
+      - name: Pin jemalloc page size for cross-built aarch64 wheels
+        if: matrix.platform == 'linux' && matrix.target == 'aarch64' && matrix.manylinux == '2_28'
+        run: echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> "$GITHUB_ENV"
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -89,7 +93,7 @@ jobs:
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist --features vendored-openssl --interpreter ${{ matrix.interpreter || '3.9 3.10 3.11 3.12 3.13 3.14' }}
           rust-toolchain: stable
-          docker-options: -e CI -e CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc -e CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+          docker-options: -e CI -e JEMALLOC_SYS_WITH_LG_PAGE -e CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc -e CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
           before-script-linux: |
             # Install build dependencies (perl/make for vendored OpenSSL, protoc for gRPC)
             if command -v yum &> /dev/null; then

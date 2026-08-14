@@ -13,14 +13,16 @@ use std::{
 };
 
 use axum::{
+    body::{Body, Bytes},
     extract::{MatchedPath, Request},
     response::Response,
 };
+use http_body::Body as _;
 use tower::{Layer, Service};
 
 use crate::{
     observability::{
-        inflight_tracker::InFlightRequestTracker,
+        inflight_tracker::{InFlightGuard, InFlightRequestTracker},
         metrics::{method_to_static_str, Metrics},
     },
     routers::error::extract_error_code_from_response,
@@ -82,13 +84,15 @@ where
             let guard = in_flight_request_tracker.track();
             Metrics::set_http_connections_active(in_flight_request_tracker.len());
 
-            // Capture result before dropping guard to ensure decrement happens on error too
-            let result = inner.call(req).await;
-
-            drop(guard);
-            Metrics::set_http_connections_active(in_flight_request_tracker.len());
-
-            let response = result?;
+            let response = match inner.call(req).await {
+                Ok(response) => response,
+                Err(e) => {
+                    // Decrement on error too.
+                    drop(guard);
+                    Metrics::set_http_connections_active(in_flight_request_tracker.len());
+                    return Err(e);
+                }
+            };
 
             let duration = start.elapsed();
             Metrics::record_http_response(
@@ -98,8 +102,89 @@ where
             );
             Metrics::record_http_duration(method, &path, duration);
 
-            Ok(response)
+            // Hold the in-flight guard for the response BODY's lifetime, not
+            // the handler's: streaming handlers return their response
+            // immediately and keep generating from a detached task, and the
+            // guard is what `wait_for_drain()` and the age histogram observe.
+            let (parts, body) = response.into_parts();
+            let body = Body::new(TrackedBody::new(body, guard, in_flight_request_tracker));
+            Ok(Response::from_parts(parts, body))
         })
+    }
+}
+
+/// Response-body wrapper that carries the in-flight guard until the body
+/// completes or is dropped.
+///
+/// Unary bodies release at write-out (same point a handler-scoped guard would
+/// observe, modulo the final write); streaming bodies release at stream
+/// completion or client disconnect — which is what makes SSE generations
+/// visible to graceful drain and stuck-request detection.
+struct TrackedBody {
+    inner: Body,
+    guard: Option<InFlightGuard>,
+    tracker: Arc<InFlightRequestTracker>,
+}
+
+impl TrackedBody {
+    fn new(inner: Body, guard: InFlightGuard, tracker: Arc<InFlightRequestTracker>) -> Self {
+        let mut body = Self {
+            inner,
+            guard: Some(guard),
+            tracker,
+        };
+        // An already-complete body (e.g. an empty unary response) may never be
+        // polled at all; do not retain the guard past construction for it.
+        if body.inner.is_end_stream() {
+            body.release();
+        }
+        body
+    }
+
+    fn release(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            // Drop before reading len() so the gauge reflects the decrement.
+            drop(guard);
+            Metrics::set_http_connections_active(self.tracker.len());
+        }
+    }
+}
+
+impl http_body::Body for TrackedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_frame(cx);
+        // Release as soon as the end of the stream is knowable: at the
+        // trailing None, on error, or right after a successful final frame
+        // when the inner body reports end-of-stream - per the http_body
+        // contract, consumers may stop polling at that point and never ask
+        // for the None. Drop still covers client disconnect.
+        match &poll {
+            Poll::Ready(None) | Poll::Ready(Some(Err(_))) => this.release(),
+            Poll::Ready(Some(Ok(_))) if this.inner.is_end_stream() => this.release(),
+            _ => {}
+        }
+        poll
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for TrackedBody {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -114,9 +199,13 @@ pub(super) fn matched_path_label(extensions: &http::Extensions) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        convert::Infallible,
+        sync::{Arc, Mutex},
+    };
 
     use axum::{body::Body, http::Request, routing::get, Router};
+    use tokio::sync::mpsc;
     use tower::{ServiceBuilder, ServiceExt};
 
     use super::*;
@@ -179,9 +268,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn distinct_ids_on_matched_route_do_not_grow_interner() {
-        use crate::observability::inflight_tracker::InFlightRequestTracker;
+    async fn upstream_forged_error_codes_do_not_grow_interner() {
+        use axum::{
+            extract::Path,
+            http::HeaderValue,
+            response::{IntoResponse, Response},
+        };
 
+        use crate::{
+            observability::inflight_tracker::InFlightRequestTracker,
+            routers::error::HEADER_X_SMG_ERROR_CODE,
+        };
+
+        // Simulates a backend minting a fresh X-SMG-Error-Code per response
+        // (rebuilt responses preserve upstream headers). Only gateway-set
+        // codes may become metric labels, so the interner must stay flat.
+        let app = Router::new()
+            .route(
+                "/echo/{id}",
+                get(|Path(id): Path<String>| async move {
+                    let mut response: Response = "ok".into_response();
+                    response.headers_mut().insert(
+                        HEADER_X_SMG_ERROR_CODE,
+                        HeaderValue::from_str(&format!("evil-{id}")).unwrap(),
+                    );
+                    response
+                }),
+            )
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()));
+
+        let send = |uri: String| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert!(response.status().is_success());
+            }
+        };
+
+        send("/echo/warmup".to_owned()).await;
+        let size_before = interner_size();
+
+        const ITERS: usize = 1000;
+        for i in 0..ITERS {
+            send(format!("/echo/{i}")).await;
+        }
+
+        let growth = interner_size().saturating_sub(size_before);
+        assert!(
+            growth < 100,
+            "interner grew by {growth} for {ITERS} distinct upstream error codes"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_ids_on_matched_route_do_not_grow_interner() {
         // Drive the real `HttpMetricsLayer`. Every request matches the dynamic
         // route `/v1/responses/{response_id}`, so each distinct id must record
         // the bounded template label and leave the never-evicted interner flat.
@@ -216,5 +359,154 @@ mod tests {
             growth < 100,
             "interner grew by {growth} for {ITERS} distinct request ids"
         );
+    }
+
+    /// Build a router whose `/stream` handler hands out the given body once,
+    /// wrapped by the real metrics layer over `tracker`.
+    fn stream_app(tracker: Arc<InFlightRequestTracker>, body: Body) -> Router {
+        let slot = Arc::new(Mutex::new(Some(body)));
+        Router::new()
+            .route(
+                "/stream",
+                get(move || {
+                    let body = slot.lock().unwrap().take().expect("handler called once");
+                    async move { Response::new(body) }
+                }),
+            )
+            .layer(HttpMetricsLayer::new(tracker))
+    }
+
+    #[tokio::test]
+    async fn streaming_body_holds_inflight_until_completion() {
+        use http_body_util::BodyExt;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let tracker = InFlightRequestTracker::new();
+        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
+        let app = stream_app(tracker.clone(), Body::from_stream(ReceiverStream::new(rx)));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // The handler has returned but the body is still open: the request
+        // must still count as in flight (this is exactly what a detached SSE
+        // producer looks like to the middleware).
+        assert_eq!(tracker.len(), 1);
+
+        tx.send(Ok(Bytes::from_static(b"chunk"))).await.unwrap();
+        drop(tx); // end of stream
+
+        let collected = response.into_body().collect().await.unwrap();
+        assert_eq!(collected.to_bytes(), Bytes::from_static(b"chunk"));
+        assert_eq!(tracker.len(), 0);
+        assert!(
+            tracker
+                .wait_for_drain(std::time::Duration::from_secs(1))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_streaming_body_releases_inflight() {
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let tracker = InFlightRequestTracker::new();
+        // Keep the sender alive: the stream never ends on its own.
+        let (_tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(1);
+        let app = stream_app(tracker.clone(), Body::from_stream(ReceiverStream::new(rx)));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tracker.len(), 1);
+
+        // Client disconnect: the response (and its body) is dropped while the
+        // stream is still open — the guard must release immediately.
+        drop(response);
+        assert_eq!(tracker.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn already_complete_body_releases_at_wrap() {
+        use crate::observability::inflight_tracker::InFlightRequestTracker;
+
+        let tracker = InFlightRequestTracker::new();
+        let app = Router::new()
+            .route("/empty", get(|| async { Response::new(Body::empty()) }))
+            .layer(HttpMetricsLayer::new(tracker.clone()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/empty")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // An empty body is end-of-stream at wrap time; a consumer may never
+        // poll it, so the guard must already be gone.
+        assert_eq!(tracker.len(), 0);
+        drop(response);
+    }
+
+    #[tokio::test]
+    async fn final_frame_releases_without_trailing_poll() {
+        use http_body_util::BodyExt;
+
+        use crate::observability::inflight_tracker::InFlightRequestTracker;
+
+        let tracker = InFlightRequestTracker::new();
+        let app = Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .layer(HttpMetricsLayer::new(tracker.clone()));
+
+        let response = app
+            .oneshot(Request::builder().uri("/ok").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+
+        // A sized body is not end-of-stream before its data frame...
+        assert_eq!(tracker.len(), 1);
+
+        // ...but after the final successful frame the http_body contract lets
+        // the consumer stop polling: release must not wait for the None.
+        let frame = body.frame().await.expect("one frame").expect("frame ok");
+        assert!(frame.is_data());
+        assert_eq!(tracker.len(), 0);
+        drop(body);
+    }
+
+    #[tokio::test]
+    async fn unary_response_releases_inflight_after_body() {
+        use http_body_util::BodyExt;
+
+        let tracker = InFlightRequestTracker::new();
+        let app = Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .layer(HttpMetricsLayer::new(tracker.clone()));
+
+        let response = app
+            .oneshot(Request::builder().uri("/ok").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let _ = response.into_body().collect().await.unwrap();
+        assert_eq!(tracker.len(), 0);
+        assert!(tracker.is_empty());
     }
 }

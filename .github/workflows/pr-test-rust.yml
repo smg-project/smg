@@ -582,6 +582,50 @@ jobs:
       connection_mode: zmq
     secrets: inherit
 
+  e2e-2gpu-chat-zmq-dp:
+    name: e2e-2gpu-chat-zmq-dp (${{ matrix.engine }})
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && (needs.detect-changes.outputs.common == 'true'
+                  || needs.detect-changes.outputs.chat-completions == 'true')))
+    # The 1-GPU ZMQ suite with grouped workers: each ZMQ worker launches two
+    # DP engines on one socket set (tp=1 models, one GPU per engine), so the
+    # gateway's handshake, the connector's least-loaded selection, and
+    # per-rank output attribution all run against a real dp=2 group. The wave
+    # protocol is vLLM-only (TokenSpeed ranks run independently).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: vllm
+            timeout: 46
+          # The TokenSpeed ZMQ lane restarts the engine per model group, and
+          # DP doubles model load + warmup. The ~22-minute TokenSpeed source
+          # build eats the front of the budget, and at 50 the first dp run was
+          # killed mid-suite while progressing (28 minutes of test time); 60
+          # leaves the tests the same ~40 minutes the test_timeout allows.
+          - engine: tokenspeed
+            timeout: 60
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: ${{ matrix.engine }}
+      # Tier selects the TEST SET (and model downloads): this lane runs the
+      # tier-1 chat suite; the second GPU serves the second engine of the
+      # group, not 2-GPU-marked tests.
+      gpu_tier: "1"
+      runner: 2-gpu-h100
+      timeout: ${{ matrix.timeout }}
+      test_timeout: 40
+      test_dirs: e2e_test/chat_completions
+      connection_mode: zmq
+      zmq_engine_count: "2"
+    secrets: inherit
+
   e2e-1gpu-completions:
     name: e2e-1gpu-completions (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]

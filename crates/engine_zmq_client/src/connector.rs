@@ -2,14 +2,22 @@
 // [`ConnectedTransport`]. Adapted from the Apache-2.0 reference
 // `vllm-engine-core-client` (vllm-project/vllm) client, scoped to SMG's needs:
 //
-// - No client-side DP load balancing. SMG routing picks the rank and stamps
-//   `data_parallel_rank`; the connector consumes the piggybacked per-rank
-//   `scheduler_stats` as the load signal.
+// - DP load balancing for unpinned requests: the connector picks the
+//   least-loaded engine from the piggybacked per-rank `scheduler_stats`
+//   (mirroring vLLM's frontend DP client). An SMG-stamped
+//   `data_parallel_rank` remains authoritative.
 // - No DP coordinator process: for a lockstep engine group the connector plays
 //   the wake role itself, over the input socket each rank already listens on.
 // - No utility RPC (deferred).
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use bytes::Bytes;
 use futures::Stream;
@@ -101,53 +109,153 @@ impl<O: EngineOutput> RequestRegistry<O> {
     }
 }
 
-/// Per-group wave bookkeeping (see [`WaveEvent`] for what a wave is), mirroring
-/// the state vLLM's DP coordinator keeps: which wave the group is on, and
-/// whether it is stepping.
-#[derive(Default)]
-struct WaveState {
-    current: u32,
-    running: bool,
-}
-
 struct ClientInner<P: EngineProtocol> {
     /// Shared input ROUTER send half (serialized across concurrent submits).
     input_send: tokio::sync::Mutex<RouterSendHalf>,
     engines: Vec<ConnectedEngine>,
     registry: Mutex<RequestRegistry<P::Output>>,
     /// Latest per-rank load, keyed by engine index. SMG's DP load signal.
+    /// Reported values only — `select_engine` never mutates this map; its
+    /// reservations live in `inflight`.
     load: Mutex<HashMap<u32, EngineLoad>>,
-    /// Wave state for a lockstep engine group; `None` when the ranks step
-    /// independently (dense DP, DP=1) and so never pause together.
-    wave: Option<Mutex<WaveState>>,
+    /// This client's own unfinished request ids, per rank: a floor under the
+    /// (possibly stale) reported load, so routing never trusts a snapshot that
+    /// says an engine we just loaded is idle. Keyed by id rather than counted,
+    /// because a request has several racing ways to finish — the explicit
+    /// [`Client::abort`], a dropped stream's auto-abort, and the engine's own
+    /// terminal output or finished-id report — and only the first of them may
+    /// count. Identity makes every release idempotent; counters would let one
+    /// request retire several slots and leave the rank looking emptier than it
+    /// is.
+    inflight: Mutex<HashMap<u32, HashSet<String>>>,
+    /// Rotates the selection scan start so all-zero ties (cold start, fresh
+    /// stats) don't systematically favor the first engine.
+    scan_start: AtomicUsize,
+    /// Wave clock for a lockstep engine group (see [`WaveEvent`] for what a
+    /// wave is), mirroring the `current_wave` vLLM's DP coordinator keeps.
+    /// `None` when the ranks step independently (dense DP, DP=1) and so never
+    /// pause together.
+    wave: Option<Mutex<u64>>,
     /// Auto-abort channel fed by dropped streams.
     abort_tx: mpsc::UnboundedSender<(EngineId, String)>,
 }
 
 impl<P: EngineProtocol> ClientInner<P> {
     /// Pick the engine for a request: by `data_parallel_rank` if set, else the
-    /// sole engine. SMG routing is authoritative for rank selection. The rank is
-    /// matched against the engine's ZMQ index (Python `EngineCoreProc`'s 2-byte
+    /// least-loaded engine. An SMG-pinned rank is authoritative; it is matched
+    /// against the engine's ZMQ index (Python `EngineCoreProc`'s 2-byte
     /// identity), which is version-independent — unlike the `data_parallel_rank`
     /// field, which not every vLLM version sends in `EngineCoreReadyResponse`.
-    fn select_engine(&self, data_parallel_rank: Option<u32>) -> Result<EngineId> {
+    ///
+    /// Unpinned requests use vLLM's own frontend DP scoring
+    /// (`DPLBAsyncMPClient.get_core_engine_for_request`), single-client form:
+    /// an engine's score is the greater of this client's exact in-flight count
+    /// and the reported `waiting + running` (the floor survives stale
+    /// snapshots), plus a KV-pressure penalty — a queue on a KV-bound engine
+    /// drains slowly, so `waiting` is scaled up as `kv_cache_usage` passes
+    /// 50%. The scan start rotates so all-zero ties don't always resolve to
+    /// the first engine.
+    ///
+    /// Selection RESERVES the choice: `request_id` is recorded as in flight
+    /// here, under the same lock the scores were read with, so a burst between
+    /// load reports spreads across ranks instead of dogpiling one snapshot.
+    /// Reported load is never mutated — reservations live only in `inflight`,
+    /// and every failed submit path must release its reservation via
+    /// [`Self::release`]. (vLLM additionally bumps its report cache because
+    /// multiple client processes share its engines; this connector is the
+    /// sole client of its group, so the in-flight floor already covers it.)
+    fn select_engine(&self, data_parallel_rank: Option<u32>, request_id: &str) -> Result<EngineId> {
         match data_parallel_rank {
-            Some(rank) => self
-                .engines
-                .iter()
-                .find(|engine| engine.engine_id.engine_index() == Some(rank))
-                .map(|engine| engine.engine_id.clone())
-                .ok_or(Error::InvalidDataParallelRank {
-                    rank,
-                    num_engines: self.engines.len() as u32,
-                }),
-            None => self
-                .engines
-                .first()
-                .map(|engine| engine.engine_id.clone())
-                .ok_or(Error::ClientClosed {
-                    message: "no engines connected".to_string(),
-                }),
+            Some(rank) => {
+                let engine_id = self
+                    .engines
+                    .iter()
+                    .find(|engine| engine.engine_id.engine_index() == Some(rank))
+                    .map(|engine| engine.engine_id.clone())
+                    .ok_or(Error::InvalidDataParallelRank {
+                        rank,
+                        num_engines: self.engines.len() as u32,
+                    })?;
+                self.inflight
+                    .lock()
+                    .entry(rank)
+                    .or_default()
+                    .insert(request_id.to_string());
+                Ok(engine_id)
+            }
+            None => {
+                if self.engines.is_empty() {
+                    return Err(Error::ClientClosed {
+                        message: "no engines connected".to_string(),
+                    });
+                }
+                let load = self.load.lock();
+                let mut inflight = self.inflight.lock();
+                let count = self.engines.len();
+                let start = self.scan_start.fetch_add(1, Ordering::Relaxed) % count;
+                let mut best: Option<(f64, usize)> = None;
+                for offset in 0..count {
+                    let position = (start + offset) % count;
+                    let index = self.engines[position].engine_id.engine_index();
+                    let reported = index
+                        .and_then(|i| load.get(&i))
+                        .copied()
+                        .unwrap_or_default();
+                    let own = index.and_then(|i| inflight.get(&i)).map_or(0, HashSet::len) as u64;
+                    let mut score = own.max(reported.num_waiting + reported.num_running) as f64;
+                    if reported.num_waiting > 0 {
+                        score += reported.num_waiting as f64
+                            * 6.0
+                            * (reported.kv_cache_usage - 0.5).max(0.0);
+                    }
+                    if best.is_none_or(|(best_score, _)| score < best_score) {
+                        best = Some((score, position));
+                    }
+                }
+                let (_, position) = best.unwrap_or((0.0, 0));
+                let engine = &self.engines[position];
+                if let Some(index) = engine.engine_id.engine_index() {
+                    inflight
+                        .entry(index)
+                        .or_default()
+                        .insert(request_id.to_string());
+                }
+                Ok(engine.engine_id.clone())
+            }
+        }
+    }
+
+    /// Retire in-flight request ids from a rank. Idempotent: an id already
+    /// retired by a racing path is simply absent.
+    ///
+    /// When the retirement empties the rank, its stored queue counts are
+    /// zeroed too: engines only report load on output batches (there is no
+    /// heartbeat), and the last batch a rank ever sends is sampled before its
+    /// final request's finish is committed — so an idle rank's last snapshot
+    /// permanently shows that request still resident. This client routed
+    /// every request, so an empty in-flight set is ground truth that the
+    /// rank's queue is empty; the KV term is left as reported (cache pages
+    /// outlive requests).
+    fn release<'a>(&self, engine_index: u32, request_ids: impl IntoIterator<Item = &'a String>) {
+        let mut inflight = self.inflight.lock();
+        let Some(ids) = inflight.get_mut(&engine_index) else {
+            return;
+        };
+        for request_id in request_ids {
+            ids.remove(request_id);
+        }
+        if ids.is_empty() {
+            if let Some(load) = self.load.lock().get_mut(&engine_index) {
+                load.num_running = 0;
+                load.num_waiting = 0;
+            }
+        }
+    }
+
+    /// Retire one request from the rank named by `engine_id`, if it has one.
+    fn release_one(&self, engine_id: &EngineId, request_id: &String) {
+        if let Some(index) = engine_id.engine_index() {
+            self.release(index, [request_id]);
         }
     }
 
@@ -190,16 +298,18 @@ impl<P: EngineProtocol> ClientInner<P> {
         }
     }
 
-    /// Tell every rank but `exclude_index` to start `wave`. Does nothing for a
-    /// protocol without a wave protocol.
-    async fn broadcast_start_wave(&self, wave: u32, exclude_index: u32) -> Result<()> {
-        let Some((frame, payload)) = P::encode_start_wave(wave, exclude_index)? else {
+    /// Tell every rank to start `wave`. Does nothing for a protocol without a
+    /// wave protocol.
+    ///
+    /// No rank is excluded, not even the one already holding the request: a
+    /// rank that skips an update keeps a lower `current_wave` than its peers,
+    /// and the group's wave numbers must stay identical for
+    /// [`Self::wake_group`]'s ordering argument to hold.
+    async fn broadcast_start_wave(&self, wave: u64) -> Result<()> {
+        let Some((frame, payload)) = P::encode_start_wave(wave)? else {
             return Ok(());
         };
         for engine in &self.engines {
-            if engine.engine_id.engine_index() == Some(exclude_index) {
-                continue;
-            }
             self.send_to_engine(
                 &engine.engine_id,
                 frame.clone(),
@@ -215,55 +325,64 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// progress: its peers must be stepping too, because every rank joins the
     /// same all-reduce. Upstream vLLM has a DP coordinator process broadcast the
     /// restart; SMG owns rank selection, so it sends the same signal over the
-    /// input socket each rank already listens on. A no-op for independent ranks
-    /// and for a group that is already running.
-    async fn wake_group(&self, holder_index: u32) -> Result<()> {
+    /// input socket each rank already listens on. A no-op for independent
+    /// ranks.
+    ///
+    /// The wake is UNCONDITIONAL for a lockstep group. Gating it on the
+    /// tracked `running` flag raced the drain: between the ranks agreeing to
+    /// park and this client processing their `wave_complete`, a submit would
+    /// see a stale "running" state, skip the wake, and — without a
+    /// coordinator, a parked engine does not self-wake on ADD — strand the
+    /// request until the silence watchdog killed the group.
+    ///
+    /// The wave number is a logical clock this client owns, bumped on every
+    /// wake, and an engine only obeys a wave at or above its own. Bumping is
+    /// what makes the wake reliable across that same drain window: the ranks
+    /// increment `current_wave` themselves as they park, so re-sending the
+    /// number we last knew about would land *below* theirs and be dropped on
+    /// the floor — a lost wake, whose peers then never join the holder's
+    /// all-reduce, hanging the group until vLLM's own RPC timeout kills the
+    /// engine. Bumping keeps us ahead: every rank sits at the last number we
+    /// broadcast plus at most one self-increment (a second needs another wave,
+    /// which needs another wake), so `last + 1` is never stale.
+    async fn wake_group(&self) -> Result<()> {
         let Some(state) = self.wave.as_ref() else {
             return Ok(());
         };
         let wave = {
-            let mut state = state.lock();
-            if state.running {
-                return Ok(());
-            }
-            state.running = true;
-            state.current
+            let mut current = state.lock();
+            *current = current.saturating_add(1);
+            *current
         };
-        if let Err(error) = self.broadcast_start_wave(wave, holder_index).await {
-            // The group is still asleep, so let the next submit try again.
-            state.lock().running = false;
-            return Err(error);
-        }
-        Ok(())
+        self.broadcast_start_wave(wave).await
     }
 
-    /// Fold a wave notification from an engine into the group's state.
+    /// Fold a wave notification from an engine into the group's clock.
     async fn observe_wave(&self, event: WaveEvent, engine_index: u32) {
         let Some(state) = self.wave.as_ref() else {
-            warn!(?event, "wave notification from independent ranks; ignoring");
+            warn!(
+                ?event,
+                engine_index, "wave notification from independent ranks; ignoring"
+            );
             return;
         };
         match event {
-            // The group drained the wave and parked itself; the engines have
-            // already moved on to the next one. The next submit wakes them.
+            // The group drained the wave and parked itself, incrementing its
+            // own `current_wave` on the way out; track that so the next wake
+            // names a wave the ranks will still accept.
             WaveEvent::Complete(wave) => {
-                let mut state = state.lock();
-                if wave >= state.current {
-                    state.current = wave.saturating_add(1);
-                    state.running = false;
-                }
+                let mut current = state.lock();
+                *current = (*current).max(wave.saturating_add(1));
             }
             // A rank took a request for an already-drained wave and is asking
             // for the rest of the group to catch up.
             WaveEvent::Start(wave) => {
                 {
-                    let mut state = state.lock();
-                    state.current = state.current.max(wave);
-                    state.running = true;
+                    let mut current = state.lock();
+                    *current = (*current).max(wave);
                 }
-                if let Err(error) = self.broadcast_start_wave(wave, engine_index).await {
+                if let Err(error) = self.wake_group().await {
                     warn!(%error, wave, "failed to start the requested wave");
-                    state.lock().running = false;
                 }
             }
         }
@@ -309,7 +428,9 @@ impl<P: EngineProtocol> Client<P> {
             engines,
             registry: Mutex::new(RequestRegistry::default()),
             load: Mutex::new(HashMap::new()),
-            wave: lockstep.then(|| Mutex::new(WaveState::default())),
+            inflight: Mutex::new(HashMap::new()),
+            scan_start: AtomicUsize::new(0),
+            wave: lockstep.then(|| Mutex::new(0)),
             abort_tx,
         });
 
@@ -355,12 +476,34 @@ impl<P: EngineProtocol> Client<P> {
     /// Dropping the returned stream before it finishes aborts the request.
     pub async fn submit(&self, request: P::Request) -> Result<RequestStream<P>> {
         P::validate(&request)?;
-        let engine_id = self.inner.select_engine(P::data_parallel_rank(&request))?;
-
         let request_id = P::request_id(&request).to_string();
+        // Register before selecting: registration is the admission gate (it
+        // rejects a duplicate id), and in-flight slots are held by id, so a
+        // reservation taken before that gate could collide with the live
+        // request's own slot and release it on rollback.
         let receiver = self.inner.registry.lock().register(request_id.clone())?;
 
-        let (payload, aux_frames) = P::encode_add(&request)?;
+        // Selection reserves the engine's in-flight slot; every failure path
+        // from here to a successful hand-off must release it.
+        let engine_id = match self
+            .inner
+            .select_engine(P::data_parallel_rank(&request), &request_id)
+        {
+            Ok(engine_id) => engine_id,
+            Err(error) => {
+                self.inner.registry.lock().remove_all([&request_id]);
+                return Err(error);
+            }
+        };
+
+        let (payload, aux_frames) = match P::encode_add(&request) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.inner.registry.lock().remove_all([&request_id]);
+                self.inner.release_one(&engine_id, &request_id);
+                return Err(error);
+            }
+        };
         if let Err(error) = self
             .inner
             .send_to_engine(&engine_id, P::add_frame(), payload, aux_frames)
@@ -368,20 +511,18 @@ impl<P: EngineProtocol> Client<P> {
         {
             // Roll back the registry entry so a failed send doesn't leak it.
             self.inner.registry.lock().remove_all([&request_id]);
+            self.inner.release_one(&engine_id, &request_id);
             return Err(error);
         }
 
         // The rank now holds the request; its peers must be awake for it to
         // step. Waking after the send keeps the group parked (and so unable to
         // report another drained wave) for the whole window.
-        if let Err(error) = self
-            .inner
-            .wake_group(engine_id.engine_index().unwrap_or(u32::MAX))
-            .await
-        {
+        if let Err(error) = self.inner.wake_group().await {
             // The request can never make progress with its peers asleep, so
             // take it back rather than leaving it stranded on the engine.
             self.inner.registry.lock().remove_all([&request_id]);
+            self.inner.release_one(&engine_id, &request_id);
             let _ = self.inner.abort(&engine_id, &request_id).await;
             return Err(error);
         }
@@ -397,11 +538,10 @@ impl<P: EngineProtocol> Client<P> {
 
     /// Explicitly abort an in-flight request.
     pub async fn abort(&self, engine_id: &EngineId, request_id: &str) -> Result<()> {
-        self.inner
-            .registry
-            .lock()
-            .remove_all([&request_id.to_string()]);
-        self.inner.abort(engine_id, request_id).await
+        let request_id = request_id.to_string();
+        self.inner.registry.lock().remove_all([&request_id]);
+        self.inner.release_one(engine_id, &request_id);
+        self.inner.abort(engine_id, &request_id).await
     }
 }
 
@@ -413,8 +553,6 @@ impl<P: EngineProtocol> Drop for Client<P> {
     }
 }
 
-/// Route decoded outputs to per-request streams and forward auto-abort requests
-/// to their engines. Runs until the output channel closes or the engine dies.
 /// If the engine emits no output for this long while requests are in flight, the
 /// dispatcher treats it as dead. A hard engine death (SIGKILL/OOM) sends no
 /// `ENGINE_CORE_DEAD` sentinel, and a bound PULL socket never errors when its
@@ -430,6 +568,8 @@ const ENGINE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 const ENGINE_SILENCE_DEATH_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Route decoded outputs to per-request streams and forward auto-abort requests
+/// to their engines. Runs until the output channel closes or the engine dies.
 async fn run_dispatcher<P: EngineProtocol>(
     mut out_rx: mpsc::Receiver<Result<EngineBatch<P::Output>>>,
     mut abort_rx: mpsc::UnboundedReceiver<(EngineId, String)>,
@@ -446,16 +586,29 @@ async fn run_dispatcher<P: EngineProtocol>(
                         if let Some(event) = batch.wave {
                             inner.observe_wave(event, batch.engine_index).await;
                         }
+                        // Unique finished ids: a terminal output and the
+                        // out-of-band finished list may name the same request.
+                        let mut finished: HashSet<String> = batch
+                            .finished_request_ids
+                            .iter()
+                            .cloned()
+                            .collect();
                         let mut registry = inner.registry.lock();
                         for output in batch.outputs {
+                            if output.finished() {
+                                finished.insert(output.request_id().to_string());
+                            }
                             registry.route(output);
                         }
                         registry.remove_all(&batch.finished_request_ids);
+                        drop(registry);
+                        inner.release(batch.engine_index, &finished);
                     }
                     Some(Err(error)) => {
                         if matches!(error, Error::EngineCoreDead | Error::Transport(_)) {
                             warn!(%error, "engine transport failed; failing all in-flight requests");
                             inner.registry.lock().fail_all(Arc::new(error));
+                            inner.inflight.lock().clear();
                             return;
                         }
                         // A per-message decode error is non-fatal; keep going.
@@ -467,6 +620,7 @@ async fn run_dispatcher<P: EngineProtocol>(
             abort = abort_rx.recv() => {
                 if let Some((engine_id, request_id)) = abort {
                     inner.registry.lock().remove_all([&request_id]);
+                    inner.release_one(&engine_id, &request_id);
                     if let Err(error) = inner.abort(&engine_id, &request_id).await {
                         warn!(%error, %request_id, "failed to send abort");
                         if matches!(error, Error::EngineCoreDead | Error::Transport(_)) {
@@ -483,6 +637,7 @@ async fn run_dispatcher<P: EngineProtocol>(
             () = tokio::time::sleep(ENGINE_SILENCE_DEATH_TIMEOUT) => {
                 let mut registry = inner.registry.lock();
                 if !registry.requests.is_empty() {
+                    inner.inflight.lock().clear();
                     warn!(
                         "no engine output for {ENGINE_SILENCE_DEATH_TIMEOUT:?} with in-flight \
                          requests; treating engine as dead"
@@ -500,6 +655,7 @@ async fn run_dispatcher<P: EngineProtocol>(
         .fail_all(Arc::new(Error::ClientClosed {
             message: "engine output stream ended".to_string(),
         }));
+    inner.inflight.lock().clear();
 }
 
 /// Stream of outputs for one submitted request. Dropping it before the terminal
@@ -754,10 +910,218 @@ mod tests {
             .unwrap();
         engine.recv_request().await.unwrap();
 
+        // Stats ride a mid-stream chunk: the request is still in flight, so
+        // the snapshot is current and must be stored verbatim. (A terminal
+        // batch's snapshot predates its own finish; once the rank empties,
+        // the queue counts are zeroed — covered separately.)
         let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
             outputs: vec![EngineCoreOutput {
                 request_id: "r".into(),
+                new_token_ids: vec![7],
+                ..Default::default()
+            }],
+            scheduler_stats: Some(Box::new(SchedulerStats {
+                num_running_reqs: 3,
+                num_waiting_reqs: 5,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        engine
+            .send_output(vec![Bytes::from(encode_msgpack(&outputs).unwrap())])
+            .await
+            .unwrap();
+
+        let chunk = stream.next().await.expect("mid-stream chunk").unwrap();
+        assert!(!chunk.finished());
+        let load = client.engine_load(0).expect("load recorded");
+        assert_eq!(load.num_running, 3);
+        assert_eq!(load.num_waiting, 5);
+    }
+
+    #[tokio::test]
+    async fn unpinned_requests_prefer_the_least_loaded_engine() {
+        let (client, mut engines, _ns) = connect_ranks(2, false).await;
+
+        // Make engine 0 report load via a pinned warm-up request that stays
+        // in flight (a finished-and-emptied rank has its queue counts zeroed,
+        // because a terminal batch's snapshot predates its own finish);
+        // engine 1 never reports and therefore scores zero.
+        let mut stream = client.submit(request_for("warm", 0)).await.unwrap();
+        engines[0].recv_request().await.unwrap();
+        let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            outputs: vec![EngineCoreOutput {
+                request_id: "warm".into(),
+                new_token_ids: vec![7],
+                ..Default::default()
+            }],
+            scheduler_stats: Some(Box::new(SchedulerStats {
+                num_running_reqs: 3,
+                num_waiting_reqs: 5,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        engines[0]
+            .send_output(vec![Bytes::from(encode_msgpack(&outputs).unwrap())])
+            .await
+            .unwrap();
+        let chunk = stream.next().await.expect("warm chunk").unwrap();
+        assert!(!chunk.finished());
+        assert!(client.engine_load(0).is_some(), "warm-up load recorded");
+
+        // An unpinned request must now land on the idle engine 1, not
+        // engines.first().
+        let _stream = client
+            .submit(EngineCoreRequest {
+                request_id: "cold".into(),
+                prompt_token_ids: Some(vec![1, 2, 3]),
+                ..EngineCoreRequest::default()
+            })
+            .await
+            .unwrap();
+        let inbound = tokio::time::timeout(TIMEOUT, engines[1].recv())
+            .await
+            .expect("unpinned request should route to the least-loaded engine")
+            .unwrap();
+        match inbound {
+            EngineInbound::Add(request) => assert_eq!(request.request_id, "cold"),
+            other => panic!("expected Add on engine 1, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cold_burst_spreads_across_engines() {
+        // No engine has reported load yet: the in-flight floor plus the
+        // rotating scan start must spread a burst instead of dogpiling the
+        // first engine (which is what a pure snapshot-min would do).
+        let (client, mut engines, _ns) = connect_ranks(2, false).await;
+        let unpinned = |id: &str| EngineCoreRequest {
+            request_id: id.into(),
+            prompt_token_ids: Some(vec![1, 2, 3]),
+            ..EngineCoreRequest::default()
+        };
+        let _first = client.submit(unpinned("burst-0")).await.unwrap();
+        let _second = client.submit(unpinned("burst-1")).await.unwrap();
+
+        for engine in &mut engines {
+            let inbound = tokio::time::timeout(TIMEOUT, engine.recv())
+                .await
+                .expect("each engine should receive exactly one of the burst")
+                .unwrap();
+            match inbound {
+                EngineInbound::Add(request) => {
+                    assert!(request.request_id.starts_with("burst-"));
+                }
+                other => panic!("expected Add, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_submit_releases_its_reservation() {
+        // A rejected submit (duplicate request id) must release the in-flight
+        // reservation selection took, or the failed attempt permanently
+        // penalizes that engine's score.
+        let (client, mut engines, _ns) = connect_ranks(2, false).await;
+        let unpinned = |id: &str| EngineCoreRequest {
+            request_id: id.into(),
+            prompt_token_ids: Some(vec![1, 2, 3]),
+            ..EngineCoreRequest::default()
+        };
+        let _held = client.submit(unpinned("dup")).await.unwrap();
+        engines[0].recv().await.unwrap();
+        // Second submit with the same id fails at registration; its
+        // reservation must roll back, leaving the counts (1, 0).
+        assert!(client.submit(unpinned("dup")).await.is_err());
+
+        // With counts (1, 0) the next request must land on engine 1. If the
+        // failed attempt leaked its reservation the counts would read (1, 1)
+        // and rotation could send this to engine 0.
+        let _next = client.submit(unpinned("after")).await.unwrap();
+        match tokio::time::timeout(TIMEOUT, engines[1].recv())
+            .await
+            .expect("request should route to the unloaded engine")
+            .unwrap()
+        {
+            EngineInbound::Add(request) => assert_eq!(request.request_id, "after"),
+            other => panic!("expected Add on engine 1, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn retiring_one_request_twice_frees_only_its_own_slot() {
+        // A request has several racing ways to finish: the explicit abort API,
+        // the dropped stream's auto-abort, and the engine's own finished
+        // report. Counting each one would retire slots the request never held
+        // and leave the rank looking emptier than it is; slots are keyed by
+        // request id so only the first retirement lands.
+        let (client, mut engines, _ns) = connect_ranks(2, false).await;
+        let pinned = |id: &str| EngineCoreRequest {
+            request_id: id.into(),
+            prompt_token_ids: Some(vec![1, 2, 3]),
+            data_parallel_rank: Some(0),
+            ..EngineCoreRequest::default()
+        };
+        let doomed = client.submit(pinned("doomed")).await.unwrap();
+        let _held = client.submit(pinned("held")).await.unwrap();
+        engines[0].recv().await.unwrap();
+        engines[0].recv().await.unwrap();
+
+        // Abort retires "doomed"; dropping its unfinished stream sends the
+        // auto-abort for the same id behind it.
+        client
+            .abort(&engines_id(&client, 0), "doomed")
+            .await
+            .unwrap();
+        drop(doomed);
+        for _ in 0..2 {
+            tokio::time::timeout(TIMEOUT, engines[0].recv())
+                .await
+                .expect("both aborts should reach the engine")
+                .unwrap();
+        }
+
+        // Engine 0 still holds "held". An unpinned request must therefore go
+        // to the idle engine 1 — it would go to 0 if the second retirement had
+        // freed "held"'s slot too.
+        let _next = client
+            .submit(EngineCoreRequest {
+                request_id: "next".into(),
+                prompt_token_ids: Some(vec![1, 2, 3]),
+                ..EngineCoreRequest::default()
+            })
+            .await
+            .unwrap();
+        match tokio::time::timeout(TIMEOUT, engines[1].recv())
+            .await
+            .expect("request should route to the idle engine")
+            .unwrap()
+        {
+            EngineInbound::Add(request) => assert_eq!(request.request_id, "next"),
+            other => panic!("expected Add on engine 1, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_emptied_rank_sheds_its_stale_queue_counts() {
+        // Engines report load only on output batches, and a terminal batch's
+        // snapshot is sampled before its own finish commits — so the last
+        // thing an idle rank ever says is "still busy". The client routed
+        // every request: once a rank's in-flight set empties, its stored
+        // queue counts must be zeroed or the rank is shunned forever.
+        let (client, mut engines, _ns) = connect_ranks(2, false).await;
+
+        // Rank 0 runs one request to completion; its terminal batch carries
+        // the stale pre-commit snapshot (3 running, 5 waiting).
+        let mut stream = client.submit(request_for("last", 0)).await.unwrap();
+        engines[0].recv_request().await.unwrap();
+        let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            outputs: vec![EngineCoreOutput {
+                request_id: "last".into(),
                 new_token_ids: vec![7],
                 finish_reason: Some(EngineCoreFinishReason::Stop),
                 ..Default::default()
@@ -767,19 +1131,49 @@ mod tests {
                 num_waiting_reqs: 5,
                 ..Default::default()
             })),
-            finished_requests: Some(std::collections::BTreeSet::from(["r".to_string()])),
+            finished_requests: Some(std::collections::BTreeSet::from(["last".to_string()])),
             ..Default::default()
         });
-        engine
+        engines[0]
             .send_output(vec![Bytes::from(encode_msgpack(&outputs).unwrap())])
             .await
             .unwrap();
-
-        // Drain the stream so the batch is processed.
         while stream.next().await.is_some() {}
-        let load = client.engine_load(0).expect("load recorded");
-        assert_eq!(load.num_running, 3);
-        assert_eq!(load.num_waiting, 5);
+        let load = client.engine_load(0).expect("snapshot stored");
+        assert_eq!((load.num_running, load.num_waiting), (0, 0));
+
+        // Rank 1 holds one live request. The next unpinned request must go to
+        // the genuinely idle rank 0 — trusting the stale snapshot would send
+        // it behind rank 1's real work.
+        let _held = client.submit(request_for("held", 1)).await.unwrap();
+        engines[1].recv().await.unwrap();
+        let _next = client
+            .submit(EngineCoreRequest {
+                request_id: "next".into(),
+                prompt_token_ids: Some(vec![1, 2, 3]),
+                ..EngineCoreRequest::default()
+            })
+            .await
+            .unwrap();
+        match tokio::time::timeout(TIMEOUT, engines[0].recv())
+            .await
+            .expect("request should route to the emptied rank")
+            .unwrap()
+        {
+            EngineInbound::Add(request) => assert_eq!(request.request_id, "next"),
+            other => panic!("expected Add on engine 0, got {other:?}"),
+        }
+    }
+
+    /// The `EngineId` of one connected rank, by index.
+    fn engines_id(client: &EngineCoreClient, engine_index: u32) -> EngineId {
+        client
+            .engines()
+            .iter()
+            .find(|engine| engine.engine_id.engine_index() == Some(engine_index))
+            .expect("connected rank")
+            .engine_id
+            .clone()
     }
 
     #[tokio::test]
@@ -892,6 +1286,7 @@ mod tests {
             cached_tokens: vec![0],
             output_token_logprobs_val: vec![vec![]],
             output_token_logprobs_idx: vec![vec![]],
+            ..Default::default()
         };
         let done = BatchTokenIDOutSlim {
             rids: vec!["ts-1".into()],
@@ -902,6 +1297,7 @@ mod tests {
             cached_tokens: vec![0],
             output_token_logprobs_val: vec![vec![]],
             output_token_logprobs_idx: vec![vec![]],
+            ..Default::default()
         };
         engine
             .send_output(vec![Bytes::from(encode_msgpack(&chunk).unwrap())])
@@ -924,7 +1320,8 @@ mod tests {
     }
 
     /// A lockstep group is paused when the client connects, so the first submit
-    /// must wake every rank except the one taking the request.
+    /// must wake every rank — including the one taking the request, so the
+    /// whole group shares one wave number.
     #[tokio::test]
     async fn first_submit_wakes_the_paused_lockstep_group() {
         let (client, mut engines, _ns) = connect_ranks(2, true).await;
@@ -935,55 +1332,81 @@ mod tests {
             EngineInbound::Add(request) => assert_eq!(request.request_id, "req-1"),
             other => panic!("rank 1 expected the Add, got {other:?}"),
         }
-        assert!(matches!(
-            engines[0].recv().await.unwrap(),
-            EngineInbound::StartDpWave {
-                wave: 0,
-                exclude_engine_index: 1,
-            }
-        ));
+        assert_eq!(next_wake(&mut engines[0]).await, 1);
+        assert_eq!(next_wake(&mut engines[1]).await, 1);
     }
 
-    /// While the group runs, submits carry no wake; once it reports the wave
-    /// drained, the next submit wakes it again on the following wave.
+    /// Every submit to a lockstep group wakes it with a FRESH wave number,
+    /// even submits that race the group's drain.
+    ///
+    /// This is the load-bearing property. The ranks bump their own
+    /// `current_wave` as they park, and an engine drops any wave below its
+    /// own, so a wake that reuses the last number the client saw is silently
+    /// discarded — the holder's peers stay parked, never join its all-reduce,
+    /// and vLLM kills the engine on its own RPC timeout. The client's clock is
+    /// therefore monotonic and independent of when the `wave_complete`
+    /// notifications arrive.
     #[tokio::test]
-    async fn a_drained_wave_re_arms_the_wake() {
+    async fn every_wake_names_a_wave_the_ranks_will_accept() {
         let (client, mut engines, _ns) = connect_ranks(2, true).await;
 
         let _first = client.submit(request_for("req-1", 1)).await.unwrap();
-        assert!(matches!(
-            engines[0].recv().await.unwrap(),
-            EngineInbound::StartDpWave { wave: 0, .. }
-        ));
+        let first = next_wake(&mut engines[0]).await;
+        assert_eq!(next_wake(&mut engines[1]).await, first);
 
-        // Running group: the second submit only sends the Add.
+        // The group drains the wave and parks, moving on to `first + 1` — but
+        // the client has not heard about it yet. Its next wake must still
+        // outrank the engines' self-increment.
         let _second = client.submit(request_for("req-2", 0)).await.unwrap();
-        match engines[0].recv().await.unwrap() {
-            EngineInbound::Add(request) => assert_eq!(request.request_id, "req-2"),
-            other => panic!("expected the Add with no wake, got {other:?}"),
-        }
+        let second = next_wake(&mut engines[0]).await;
+        assert!(
+            second > first,
+            "wake {second} does not outrank the parked ranks at {}",
+            first + 1
+        );
+        assert_eq!(next_wake(&mut engines[1]).await, second);
 
-        // The group drains wave 0 and parks itself.
+        // A rank can also report a wave AHEAD of the client's clock — it kept
+        // its `current_wave` across a gateway restart, say. Folding that in is
+        // the other half of the same invariant: the next wake must clear the
+        // highest wave any rank is known to hold.
+        let ahead = second + 5;
         engines[0]
-            .send_output(wave_control(0, DpControlMessage::WaveComplete(0)))
+            .send_output(wave_control(0, DpControlMessage::WaveComplete(ahead)))
             .await
             .unwrap();
-        // The notification travels through the dispatcher, so wait for it to
-        // land before submitting against the parked group.
         tokio::time::timeout(TIMEOUT, async {
-            while client.inner.wave.as_ref().unwrap().lock().running {
+            while *client.inner.wave.as_ref().unwrap().lock() <= ahead {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("the drained wave never parked the group");
+        .expect("the reported wave never reached the clock");
 
         let _third = client.submit(request_for("req-3", 1)).await.unwrap();
-        match engines[0].recv().await.unwrap() {
-            // The engines moved on to wave 1 as they paused, so that is the
-            // wave the wake must name.
-            EngineInbound::StartDpWave { wave, .. } => assert_eq!(wave, 1),
-            other => panic!("expected a wake for the next wave, got {other:?}"),
+        let third = next_wake(&mut engines[0]).await;
+        assert!(
+            third > ahead,
+            "wake {third} does not clear the rank already on {ahead}"
+        );
+    }
+
+    /// Read one engine's inbound queue up to its next wake, returning the wave
+    /// it names.
+    async fn next_wake(engine: &mut MockEngine) -> u64 {
+        loop {
+            match engine.recv().await.unwrap() {
+                EngineInbound::StartDpWave {
+                    wave,
+                    exclude_engine_index,
+                } => {
+                    // No rank is excluded: the whole group shares one wave.
+                    assert_eq!(exclude_engine_index, u32::MAX);
+                    return wave;
+                }
+                EngineInbound::Add(_) => continue,
+                other => panic!("expected a wake or an Add, got {other:?}"),
+            }
         }
     }
 

@@ -19,17 +19,25 @@ impl PolicyFactory {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::Passthrough => Arc::new(PassthroughPolicy::new()),
-            PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
+            PolicyConfig::PowerOfTwo { .. } => {
+                // TODO: Pass load_check_interval_secs to WorkerMonitor for per-policy polling intervals.
+                // Currently, WorkerMonitor uses RouterConfig.load_monitor_interval_secs globally.
+                Arc::new(PowerOfTwoPolicy::new())
+            }
             PolicyConfig::LeastLoad {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
                 ..
-            } => Arc::new(LeastLoadPolicy::with_params(
-                *kv_pressure_weight,
-                *mean_prefill_tokens,
-                *default_throughput,
-            )),
+            } => {
+                // TODO: Pass load_check_interval_secs to WorkerMonitor for per-policy polling intervals.
+                // Currently, WorkerMonitor uses RouterConfig.load_monitor_interval_secs globally.
+                Arc::new(LeastLoadPolicy::with_params(
+                    *kv_pressure_weight,
+                    *mean_prefill_tokens,
+                    *default_throughput,
+                ))
+            }
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold,
@@ -80,10 +88,12 @@ impl PolicyFactory {
             PolicyConfig::PrefixHash {
                 prefix_token_count,
                 load_factor,
+                balance_abs_threshold,
             } => {
                 let config = PrefixHashConfig {
                     prefix_token_count: *prefix_token_count,
                     load_factor: *load_factor,
+                    balance_abs_threshold: *balance_abs_threshold,
                 };
                 Arc::new(PrefixHashPolicy::new(config))
             }
@@ -162,6 +172,7 @@ mod tests {
         let policy = PolicyFactory::create_from_config(&PolicyConfig::PrefixHash {
             prefix_token_count: 100,
             load_factor: 0.8,
+            balance_abs_threshold: 10,
         });
         assert_eq!(policy.name(), "prefix_hash");
     }

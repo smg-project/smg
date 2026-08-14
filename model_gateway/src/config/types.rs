@@ -27,6 +27,12 @@ pub struct RouterConfig {
     /// this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_worker_runtime_type: Option<RuntimeType>,
+    /// DP engines per startup ZMQ worker: each `--worker-urls` ZMQ worker
+    /// becomes a grouped worker whose handshake awaits this many engines on
+    /// one socket set (`dp_size` on the worker spec, no rank). `None`/1 keeps
+    /// today's one-engine workers; HTTP/gRPC workers ignore this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zmq_engine_count: Option<usize>,
     pub policy: PolicyConfig,
     /// Per-request sticky-routing override (honors `X-SMG-Routing-Key`).
     #[serde(default)]
@@ -54,6 +60,18 @@ pub struct RouterConfig {
     pub worker_startup_check_interval_secs: u64,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// TTL in seconds for entries in the event-driven cache-aware positional
+    /// indexer: entries neither stored to nor read by a query within this
+    /// window are evicted by a periodic background prune. Bounds index growth
+    /// when a backend stops emitting removal events (crash, stream downgrade).
+    /// `None`/`0` disables the TTL pass (default, preserving unbounded growth).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_indexer_ttl_secs: Option<u64>,
+    /// Capacity ceiling per model for the positional indexer, enforced by the
+    /// same periodic prune: beyond it, oldest-touched entries are evicted down
+    /// to 90% of the ceiling. `None`/`0` disables the ceiling (default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_indexer_max_entries: Option<usize>,
     /// Re-export engine `GetLoads` signals as `smg_engine_*` gauges, polling
     /// even when no load-aware routing policy is active. Decouples engine
     /// observability from routing.
@@ -472,6 +490,12 @@ pub enum PolicyConfig {
         overload_token_usage_threshold: f32,
     },
 
+    /// Power-of-two choices load balancing policy.
+    /// Randomly selects two workers and routes to the one with lower load.
+    /// TODO: Implement per-policy load monitoring intervals.
+    /// Currently, load_check_interval_secs is populated from RouterConfig.load_monitor_interval_secs,
+    /// but WorkerMonitor does not yet use per-policy intervals. This field is reserved for
+    /// future support of different polling cadences per policy.
     #[serde(rename = "power_of_two")]
     PowerOfTwo { load_check_interval_secs: u64 },
 
@@ -481,6 +505,10 @@ pub enum PolicyConfig {
     /// from the load monitor with in-flight correction. See `policies/least_load.rs`.
     #[serde(rename = "least_load")]
     LeastLoad {
+        /// TODO: Implement per-policy load monitoring intervals.
+        /// Currently, load_check_interval_secs is populated from RouterConfig.load_monitor_interval_secs,
+        /// but WorkerMonitor does not yet use per-policy intervals. This field is reserved for
+        /// future support of different polling cadences per policy.
         #[serde(default = "default_least_load_interval")]
         load_check_interval_secs: u64,
         /// KV-pressure weight `λ_t` (seconds): the time-cost of KV contention,
@@ -537,16 +565,22 @@ pub enum PolicyConfig {
     /// A lightweight alternative to cache_aware radix tree.
     /// Routes requests based on prefix token hash for cache locality.
     /// - Uses consistent hash ring with bounded load balancing
-    /// - Walks ring if worker is overloaded (load > avg * load_factor)
+    /// - Diverts to the least loaded worker when the hashed one is overloaded
     /// - O(log n) lookup instead of O(prefix_len) radix tree traversal
     #[serde(rename = "prefix_hash")]
     PrefixHash {
-        /// Number of prefix tokens to hash (default: 256)
+        /// Number of prefix tokens to hash, or four times as many characters
+        /// of the prompt when the request is untokenized (default: 256)
         #[serde(default = "default_prefix_token_count")]
         prefix_token_count: usize,
-        /// Load factor threshold - walk ring if load > avg * factor (default: 1.25)
+        /// Relative load threshold - a worker is overloaded when its load
+        /// exceeds both avg * factor and the absolute margin (default: 1.25)
         #[serde(default = "default_load_factor")]
         load_factor: f64,
+        /// Absolute load difference over average a worker must also exceed
+        /// before it counts as overloaded (default: 10)
+        #[serde(default = "default_prefix_hash_balance_abs_threshold")]
+        balance_abs_threshold: usize,
     },
 }
 
@@ -564,6 +598,10 @@ fn default_prefix_token_count() -> usize {
 
 fn default_load_factor() -> f64 {
     1.25
+}
+
+fn default_prefix_hash_balance_abs_threshold() -> usize {
+    10
 }
 
 fn default_manual_eviction_interval_secs() -> u64 {
@@ -817,6 +855,8 @@ impl Default for RouterConfig {
             worker_startup_delay_secs: 0,
             worker_startup_check_interval_secs: 30,
             load_monitor_interval_secs: 10,
+            kv_indexer_ttl_secs: None,
+            kv_indexer_max_entries: None,
             engine_metrics: false,
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,
@@ -852,6 +892,7 @@ impl Default for RouterConfig {
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
             startup_worker_runtime_type: None,
+            zmq_engine_count: None,
             model_path: None,
             tokenizer_path: None,
             chat_template: None,

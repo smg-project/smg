@@ -165,6 +165,17 @@ class Router:
         cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to
             cached worker if the match rate exceeds threshold, otherwise routes to the
             worker with the smallest tree. Default: 0.5
+        prefix_token_count: Number of prefix tokens hashed by the prefix_hash
+            policy, or four times as many characters of the prompt when the
+            request is untokenized. Size it past any shared system prompt so
+            distinct conversations hash apart. Default: 256
+        prefix_hash_load_factor: Load factor above which the prefix_hash policy
+            walks the ring instead of using the hashed worker (multiple of the
+            average load). Default: 1.25
+        prefix_hash_balance_abs_threshold: Absolute load difference over average
+            a worker must also exceed before prefix_hash treats it as
+            overloaded. Guards the load factor against sampling noise when each
+            router replica sees only a share of a worker's load. Default: 10
         balance_abs_threshold: Load balancing is triggered when (max_load - min_load) >
             abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache
             aware. Default: 32
@@ -174,8 +185,10 @@ class Router:
         eviction_interval_secs: Interval in seconds between cache eviction operations
             in cache-aware routing. Default: 60
         max_payload_size: Maximum payload size in bytes. Default: 256MB
-        max_tree_size: Maximum size of the approximation tree for cache-aware routing.
-            Default: 2^24
+        max_tree_size: Maximum total size of each model's approximation tree for
+            cache-aware routing (chars for HTTP, tokens for gRPC), shared across
+            all workers; eviction keeps every tree at or under this bound.
+            Default: 2^26
         dp_aware: Enable data parallelism aware schedule. Default: False
         dp_minimum_tokens_scheduler: Enable minimum tokens scheduler for data parallel group. Default: False
         enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When

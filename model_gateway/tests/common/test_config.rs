@@ -114,6 +114,28 @@ impl TestRouterConfig {
         )
     }
 
+    /// Create a prefix-hash config
+    pub fn prefix_hash(port: u16, prefix_token_count: usize) -> RouterConfig {
+        apply_test_defaults(
+            RouterConfig::builder()
+                .regular_mode(vec![])
+                .policy(PolicyConfig::PrefixHash {
+                    prefix_token_count,
+                    load_factor: 1.25,
+                    balance_abs_threshold: 10,
+                })
+                .host(defaults::HOST)
+                .port(port)
+                .max_payload_size(defaults::MAX_PAYLOAD_SIZE)
+                .request_timeout_secs(defaults::REQUEST_TIMEOUT_SECS)
+                .worker_startup_timeout_secs(defaults::WORKER_STARTUP_TIMEOUT_SECS)
+                .worker_startup_check_interval_secs(defaults::WORKER_STARTUP_CHECK_INTERVAL_SECS)
+                .max_concurrent_requests(defaults::MAX_CONCURRENT_REQUESTS)
+                .queue_timeout_secs(defaults::QUEUE_TIMEOUT_SECS)
+                .build_unchecked(),
+        )
+    }
+
     /// Create a manual routing config (for sticky routing tests)
     pub fn manual(port: u16) -> RouterConfig {
         Self::manual_with_mode(port, ManualAssignmentMode::Random)

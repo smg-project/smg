@@ -183,6 +183,9 @@ impl Default for PrometheusConfig {
 pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 
 pub(crate) fn init_metrics() {
+    #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+    allocator_stats::describe();
+
     // Layer 1: HTTP metrics
     describe_counter!(
         "smg_http_requests_total",
@@ -313,6 +316,18 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_manual_policy_cache_entries",
         "Number of routing entries in manual policy cache"
+    );
+    describe_gauge!(
+        "smg_cache_tree_chars",
+        "Cache-aware string tree cached characters by model (summed across tenants)"
+    );
+    describe_gauge!(
+        "smg_cache_tree_tokens",
+        "Cache-aware token tree cached tokens by model (summed across tenants)"
+    );
+    describe_gauge!(
+        "smg_cache_tree_tenants",
+        "Cache-aware tree tenant count by model and tree (string/token)"
     );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
@@ -507,7 +522,78 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
         )
         .expect("failed to set event loop delay buckets")
         .install_recorder()
+        .inspect(|_| {
+            #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+            allocator_stats::start_reporting();
+        })
         .expect("failed to install Prometheus recorder")
+}
+
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+pub(crate) mod allocator_stats {
+    use metrics::{describe_gauge, gauge};
+
+    pub(crate) fn describe() {
+        describe_gauge!(
+            "smg_allocator_allocated_bytes",
+            "Bytes in live allocations (jemalloc stats.allocated)"
+        );
+        describe_gauge!(
+            "smg_allocator_active_bytes",
+            "Bytes in active pages (jemalloc stats.active)"
+        );
+        describe_gauge!(
+            "smg_allocator_resident_bytes",
+            "Bytes resident per the allocator (jemalloc stats.resident)"
+        );
+        describe_gauge!(
+            "smg_allocator_metadata_bytes",
+            "Allocator metadata bytes (jemalloc stats.metadata)"
+        );
+    }
+
+    fn record() {
+        use tikv_jemalloc_ctl::{epoch, stats};
+        if epoch::advance().is_err() {
+            return;
+        }
+        if let Ok(v) = stats::allocated::read() {
+            gauge!("smg_allocator_allocated_bytes").set(v as f64);
+        }
+        if let Ok(v) = stats::active::read() {
+            gauge!("smg_allocator_active_bytes").set(v as f64);
+        }
+        if let Ok(v) = stats::resident::read() {
+            gauge!("smg_allocator_resident_bytes").set(v as f64);
+        }
+        if let Ok(v) = stats::metadata::read() {
+            gauge!("smg_allocator_metadata_bytes").set(v as f64);
+        }
+    }
+
+    /// Gauges are truthful when jemalloc is the global allocator, which every
+    /// shipped artifact declares.
+    pub(crate) fn start_reporting() {
+        record();
+        // Plain thread: metrics must not depend on a runtime being alive.
+        let _ = std::thread::Builder::new()
+            .name("smg-allocator-stats".into())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                record();
+            });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn jemalloc_stats_readable() {
+            use tikv_jemalloc_ctl::{epoch, stats};
+            epoch::advance().expect("epoch advance");
+            stats::allocated::read().expect("stats.allocated readable");
+            stats::resident::read().expect("stats.resident readable");
+        }
+    }
 }
 
 /// Label constants for consistent metric labeling
@@ -1158,6 +1244,24 @@ impl Metrics {
         gauge!("smg_manual_policy_cache_entries").set(count as f64);
     }
 
+    /// Set cache-aware string-tree cached characters for a model
+    pub fn set_cache_tree_chars(model_id: &str, chars: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_cache_tree_chars", "model" => model).set(chars as f64);
+    }
+
+    /// Set cache-aware token-tree cached tokens for a model
+    pub fn set_cache_tree_tokens(model_id: &str, tokens: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_cache_tree_tokens", "model" => model).set(tokens as f64);
+    }
+
+    /// Set cache-aware tree tenant count for a model and tree kind ("string"/"token")
+    pub fn set_cache_tree_tenants(model_id: &str, tree: &'static str, count: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_cache_tree_tenants", "model" => model, "tree" => tree).set(count as f64);
+    }
+
     /// Record consistent hashing policy execution branch for routing decisions
     pub fn record_worker_consistent_hashing_policy_branch(branch: &'static str) {
         counter!(
@@ -1760,6 +1864,33 @@ mod tests {
             &pd_labels,
             "4",
         );
+    }
+
+    #[test]
+    fn cache_tree_setters_emit_per_model_gauges() {
+        let rendered = render_with_recorder(|| {
+            Metrics::set_cache_tree_chars("m", 120);
+            Metrics::set_cache_tree_tokens("m", 64);
+            Metrics::set_cache_tree_tenants("m", "string", 3);
+            Metrics::set_cache_tree_tenants("m", "token", 2);
+        });
+
+        assert_metric(&rendered, "smg_cache_tree_chars", &["model=\"m\""], "120");
+        assert_metric(&rendered, "smg_cache_tree_tokens", &["model=\"m\""], "64");
+        // Two tenant series (one per tree kind); series order within the
+        // family is exporter-defined, so match each line independently.
+        for (tree, value) in [("string", "3"), ("token", "2")] {
+            let label = format!("tree=\"{tree}\"");
+            assert!(
+                rendered.lines().any(|l| {
+                    l.starts_with("smg_cache_tree_tenants{")
+                        && l.contains("model=\"m\"")
+                        && l.contains(&label)
+                        && l.ends_with(&format!(" {value}"))
+                }),
+                "smg_cache_tree_tenants {tree} series missing; rendered:\n{rendered}"
+            );
+        }
     }
 
     #[test]

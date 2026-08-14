@@ -37,7 +37,8 @@
     balance_abs_threshold:   Absolute load diff threshold for imbalance detection
     balance_rel_threshold:   Relative load ratio threshold for imbalance detection
     eviction_interval_secs:  Interval between LRU eviction cycles
-    max_tree_size:           Max nodes per approximate tree before eviction
+    max_tree_size:           Max total size (chars/tokens) of each model's approximate tree,
+                             shared across all workers; enforced by eviction
     block_size:              Backend KV cache block size for event-driven routing
 */
 
@@ -50,7 +51,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use kv_index::{compute_request_content_hashes, PositionalIndexer, TokenTree, Tree};
+use kv_index::{compute_request_content_hashes, PositionalIndexer, TenantId, TokenTree, Tree};
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
 use rand::RngExt;
@@ -63,7 +64,8 @@ use super::{
     SelectWorkerInfo,
 };
 use crate::{
-    mesh::adapters::tree_sync::{RepairEntry, TreeRepairPage},
+    mesh::adapters::tree_sync::{RepairEntry, TreeDelta, TreeRepairPage, TreeSyncAdapter},
+    observability::metrics::Metrics,
     worker::{KvEventMonitor, Worker},
 };
 
@@ -121,6 +123,16 @@ pub struct CacheAwarePolicy {
     /// gateway. Off by default; the mesh wiring code flips it on
     /// when it attaches.
     populate_hash_index: AtomicBool,
+    /// Outbound bridge into the mesh `td:` broadcast namespace.
+    /// `Some` after [`Self::set_mesh_tree_sync`] (called by mesh wiring
+    /// at startup); `None` when mesh is disabled, in which case
+    /// `sync_local_insert` is a no-op. The setter also toggles
+    /// [`Self::populate_hash_index`] to match adapter presence so the
+    /// two never drift apart. Note the pairing is best-effort at a
+    /// point-in-time — later eviction of a hash-index entry can leave
+    /// a still-in-flight delta with no local resolution; peers that
+    /// repair against us will simply see the gap the next tick.
+    mesh_tree_sync: RwLock<Option<Arc<TreeSyncAdapter>>>,
 }
 
 /// Per-model inner container for [`CacheAwarePolicy::hash_index`].
@@ -133,6 +145,20 @@ struct PerModelHashIndex {
     string_tree: DashMap<u64, String>,
     /// token-path hash → tokens (reconstructs the token-tree node).
     token_tree: DashMap<u64, Vec<u32>>,
+}
+
+/// Total cached characters across tenants and the tenant count for one
+/// model's string tree. O(tenants): sums the tree's maintained counters.
+fn string_tree_totals(tree: &Tree) -> (usize, usize) {
+    let counts = tree.get_tenant_char_count();
+    (counts.values().sum(), counts.len())
+}
+
+/// Total cached tokens across tenants and the tenant count for one
+/// model's token tree. O(tenants): sums the tree's maintained counters.
+fn token_tree_totals(tree: &TokenTree) -> (usize, usize) {
+    let counts = tree.get_tenant_token_counts();
+    (counts.values().sum(), counts.len())
 }
 
 impl CacheAwarePolicy {
@@ -157,10 +183,16 @@ impl CacheAwarePolicy {
                 "Eviction",
                 move || {
                     // Evict string trees (HTTP)
+                    let mut total_chars: usize = 0;
                     for tree_ref in string_trees_clone.iter() {
                         let model_id = tree_ref.key();
                         let tree = tree_ref.value();
                         tree.evict_tenant_by_size(max_tree_size);
+
+                        let (chars, tenants) = string_tree_totals(tree);
+                        total_chars += chars;
+                        Metrics::set_cache_tree_chars(model_id, chars);
+                        Metrics::set_cache_tree_tenants(model_id, "string", tenants);
 
                         debug!(
                             "String tree eviction completed for model {}, max_size: {}",
@@ -168,10 +200,16 @@ impl CacheAwarePolicy {
                         );
                     }
                     // Evict token trees (gRPC)
+                    let mut total_tokens: usize = 0;
                     for tree_ref in token_trees_clone.iter() {
                         let model_id = tree_ref.key();
                         let tree = tree_ref.value();
                         tree.evict_tenant_by_size(max_tree_size);
+
+                        let (tokens, tenants) = token_tree_totals(tree);
+                        total_tokens += tokens;
+                        Metrics::set_cache_tree_tokens(model_id, tokens);
+                        Metrics::set_cache_tree_tenants(model_id, "token", tenants);
 
                         debug!(
                             "Token tree eviction completed for model {}, max_size: {}",
@@ -204,14 +242,18 @@ impl CacheAwarePolicy {
                         hash_total += per_model.string_tree.len() + per_model.token_tree.len();
                     }
 
-                    // Log tree sizes — model counts + hash-index total.
+                    // Log tree sizes — model counts, aggregate sizes +
+                    // hash-index total, from the per-tenant counters.
                     // DO NOT call tree.snapshot() here — it clones all
                     // edge text (~170 MB) every cycle.
                     tracing::info!(
-                        "Tree memory: string_trees={} models, token_trees={} models, \
+                        "Tree memory: string_trees={} models / {} chars, \
+                         token_trees={} models / {} tokens, \
                          hash_index={} models / {} entries",
                         string_trees_clone.len(),
+                        total_chars,
                         token_trees_clone.len(),
+                        total_tokens,
                         hash_index_clone.len(),
                         hash_total,
                     );
@@ -230,18 +272,122 @@ impl CacheAwarePolicy {
             load_rx: RwLock::new(None),
             hash_index,
             populate_hash_index: AtomicBool::new(false),
+            mesh_tree_sync: RwLock::new(None),
         }
     }
 
-    /// Enable request-hot-path `hash_index` population. Called by mesh
-    /// wiring when the policy is attached to a mesh adapter; otherwise
-    /// the index stays empty (its only readers are mesh-only paths).
-    pub fn set_populate_hash_index(&self, enabled: bool) {
+    /// Enable request-hot-path `hash_index` population without attaching
+    /// an adapter. Only exists so unit tests can seed the populate flag
+    /// without the ceremony of wiring in a real [`TreeSyncAdapter`];
+    /// production code goes through [`Self::set_mesh_tree_sync`], which
+    /// flips both fields together.
+    #[cfg(test)]
+    fn set_populate_hash_index(&self, enabled: bool) {
         self.populate_hash_index.store(enabled, Ordering::Relaxed);
     }
 
     fn should_populate_hash_index(&self) -> bool {
         self.populate_hash_index.load(Ordering::Relaxed)
+    }
+
+    /// Test-only view of the effective config so registry tests can
+    /// assert operator tunables propagated.
+    #[cfg(test)]
+    pub(crate) fn config_for_test(&self) -> &CacheAwareConfig {
+        &self.config
+    }
+
+    /// Test-only: whether a KV event monitor is attached, so registry
+    /// tests can assert injection at publication.
+    #[cfg(test)]
+    pub(crate) fn kv_event_monitor_is_set_for_test(&self) -> bool {
+        self.kv_monitor.read().is_some()
+    }
+
+    /// Test-only view onto the populate flag so integration tests
+    /// outside this file can assert wiring flipped it. Not part of
+    /// the public API.
+    #[cfg(test)]
+    pub fn should_populate_hash_index_for_test(&self) -> bool {
+        self.should_populate_hash_index()
+    }
+
+    /// Test-only: flip populate on without going through the mesh
+    /// wiring path. Used by bridge tests that need to seed
+    /// `hash_index` directly.
+    #[cfg(test)]
+    pub fn set_populate_hash_index_for_test_true(&self) {
+        self.set_populate_hash_index(true);
+    }
+
+    /// Test-only: seed a single hash-index entry so bridge tests
+    /// can exercise the inbound resolution path without driving a
+    /// full request through `select_worker`. `matched` is the
+    /// matched-prefix shape the populate site would normally store
+    /// (full text for string / full token vec for token) — for a
+    /// unit test that only asserts the lookup succeeded, any
+    /// non-empty value works because the underlying tree seeds
+    /// itself in `apply_known_remote_insert`.
+    #[cfg(test)]
+    pub fn seed_hash_index_for_test(
+        &self,
+        model_id: &str,
+        tree_kind: TreeKind,
+        node_hash: u64,
+        matched: &str,
+    ) {
+        let entry = self.hash_index.entry(model_id.to_string()).or_default();
+        match tree_kind {
+            TreeKind::String => {
+                entry.string_tree.insert(node_hash, matched.to_string());
+                // Ensure the string_tree map has a matching tree so
+                // apply_known_remote_insert doesn't hit the
+                // populate-site invariant warning.
+                self.string_trees
+                    .entry(model_id.to_string())
+                    .or_insert_with(|| Arc::new(Tree::new()));
+            }
+            TreeKind::Token => {
+                entry
+                    .token_tree
+                    .insert(node_hash, matched.bytes().map(u32::from).collect());
+                self.token_trees
+                    .entry(model_id.to_string())
+                    .or_insert_with(|| Arc::new(TokenTree::new()));
+            }
+        }
+    }
+
+    /// Attach the mesh outbound bridge and enable hash-index population
+    /// in one atomic step; pass `None` to detach and disable both. The
+    /// pair moves together because the hash-index has no non-mesh
+    /// readers — enabling population without an adapter attached would
+    /// waste memory, and the producer-side `sync_local_insert` calls
+    /// only fire while population is on.
+    ///
+    /// Interior-mutability setter so it composes with policies stored
+    /// behind `Arc<dyn LoadBalancingPolicy>` after construction, matching
+    /// `set_kv_event_monitor` / `set_load_receiver`.
+    pub fn set_mesh_tree_sync(&self, adapter: Option<Arc<TreeSyncAdapter>>) {
+        let populate = adapter.is_some();
+        let mut guard = self.mesh_tree_sync.write();
+        *guard = adapter;
+        // Store under the guard so no observer can see the pair
+        // split (adapter attached ↔ populate flag on).
+        self.populate_hash_index.store(populate, Ordering::Relaxed);
+    }
+
+    /// Publish one local tree change to the mesh outbound buffer.
+    /// No-op when no adapter is attached — cheap check on the hot path.
+    /// The `Arc` is cloned out before invoking `on_local_insert` so the
+    /// adapter callback never runs under our read lock (avoids a future
+    /// deadlock if the adapter path ever wants to write back into any
+    /// policy state).
+    fn sync_local_insert(&self, model_id: &str, delta: TreeDelta) {
+        let adapter = self.mesh_tree_sync.read().as_ref().map(Arc::clone);
+        if let Some(adapter) = adapter {
+            adapter.on_local_insert(model_id, delta);
+        }
     }
 
     /// Set event-driven KV cache monitor (thread-safe, can be called after construction).
@@ -399,28 +545,21 @@ impl CacheAwarePolicy {
     }
 
     /// Remove a worker from the trees
-    ///
-    /// Note: Currently a no-op. Stale entries are cleaned up by LRU eviction.
-    /// Worker registry removes workers first, so routing will skip them anyway.
-    /// TODO: Implement efficient remove_tenant in kv_index with reverse index.
-    #[expect(
-        clippy::unused_self,
-        reason = "no-op stub; will use self once remove_tenant is implemented"
-    )]
-    pub fn remove_worker(&self, _worker: &dyn Worker) {
-        // No-op: rely on LRU eviction to clean up stale entries
+    pub fn remove_worker(&self, worker: &dyn Worker) {
+        self.remove_worker_by_url(worker.url());
     }
 
-    /// Remove a worker by URL (removes from all model trees for backward compatibility)
-    ///
-    /// Note: Currently a no-op. Stale entries are cleaned up by LRU eviction.
-    /// TODO: Implement efficient remove_tenant in kv_index with reverse index.
-    #[expect(
-        clippy::unused_self,
-        reason = "no-op stub; will use self once remove_tenant is implemented"
-    )]
-    pub fn remove_worker_by_url(&self, _url: &str) {
-        // No-op: rely on LRU eviction to clean up stale entries
+    /// Remove a worker by URL, purging its tenant from every model's string
+    /// and token tree. A removed worker's tenant count never grows again, so
+    /// size-based eviction alone would retain its subtree forever.
+    pub fn remove_worker_by_url(&self, url: &str) {
+        let tenant: TenantId = Arc::from(url);
+        for tree_ref in self.string_trees.iter() {
+            tree_ref.value().remove_tenant_all(&tenant);
+        }
+        for tree_ref in self.token_trees.iter() {
+            tree_ref.value().remove_tenant_all(&tenant);
+        }
     }
 
     /// Run cache eviction to prevent unbounded growth
@@ -943,31 +1082,48 @@ impl CacheAwarePolicy {
         }
 
         // Select worker with best overlap among those that actually match.
-        // Tie-break: lower load, then smaller tree size.
-        let best_idx = healthy_indices
-            .iter()
-            .copied()
-            .filter(|&idx| {
-                indexer
-                    .worker_id(workers[idx].url())
-                    .and_then(|id| overlap.scores.get(&id))
-                    .copied()
-                    .unwrap_or(0)
-                    > 0
-            })
-            .max_by_key(|&idx| {
-                let wid = indexer.worker_id(workers[idx].url());
-                let score = wid
-                    .and_then(|id| overlap.scores.get(&id))
-                    .copied()
-                    .unwrap_or(0);
-                let load = workers[idx].load();
-                let tree_size = wid
-                    .and_then(|id| overlap.tree_sizes.get(&id))
-                    .copied()
-                    .unwrap_or(0);
-                (score, std::cmp::Reverse(load), std::cmp::Reverse(tree_size))
-            })?;
+        // Tie-break: lower load, then UNIFORMLY AT RANDOM. The previous final
+        // key (smaller total tree size, then slice order) was a spreading
+        // proxy but deterministic: equal-overlap equal-load workers herd onto
+        // one index until the global tree-size ordering flips. Tree size is a
+        // per-worker aggregate unrelated to this request's placement, and it
+        // tracks event-stream health — an event-lagged worker looks "small"
+        // and attracts the whole tie. Uniform random gives the same spreading
+        // goal memorylessly; the next request's overlap scores restore
+        // affinity to whichever worker actually cached the prefix.
+        let mut best: Option<(u32, usize)> = None;
+        let mut tied: Vec<usize> = Vec::new();
+        for &idx in healthy_indices {
+            let Some(score) = indexer
+                .worker_id(workers[idx].url())
+                .and_then(|id| overlap.scores.get(&id))
+                .copied()
+                .filter(|&s| s > 0)
+            else {
+                continue;
+            };
+            let load = workers[idx].load();
+            match best {
+                Some((best_score, best_load)) => {
+                    if score > best_score || (score == best_score && load < best_load) {
+                        best = Some((score, load));
+                        tied.clear();
+                        tied.push(idx);
+                    } else if score == best_score && load == best_load {
+                        tied.push(idx);
+                    }
+                }
+                None => {
+                    best = Some((score, load));
+                    tied.push(idx);
+                }
+            }
+        }
+        let best_idx = match tied.len() {
+            0 => return None,
+            1 => tied[0],
+            n => tied[rand::rng().random_range(0..n)],
+        };
 
         debug!(
             worker = workers[best_idx].url(),
@@ -1048,11 +1204,28 @@ impl CacheAwarePolicy {
                 // returned by match_and_insert_with.
                 if self.should_populate_hash_index() {
                     let matched_prefix: Vec<u32> = tokens[..result.matched_token_count].to_vec();
+                    let node_hash = kv_index::hash_token_path(tokens);
                     self.hash_index
                         .entry(model_id.to_string())
                         .or_default()
                         .token_tree
-                        .insert(kv_index::hash_token_path(tokens), matched_prefix);
+                        .insert(node_hash, matched_prefix);
+                    // Publish only what peers can already resolve:
+                    // the node_hash keys the hash_index entry we
+                    // just wrote, so a receiver that repairs against
+                    // us will land the same worker onto the same
+                    // tree node. `epoch: 0` — the field is a reserved
+                    // slot the current receiver does not consult
+                    // (see `TreeDelta::epoch`).
+                    self.sync_local_insert(
+                        model_id,
+                        TreeDelta {
+                            tree_kind: TreeKind::Token,
+                            node_hash,
+                            worker_url: workers[idx].url().to_string(),
+                            epoch: 0,
+                        },
+                    );
                 }
                 workers[idx].increment_processed();
                 return Some(idx);
@@ -1134,6 +1307,15 @@ impl CacheAwarePolicy {
                         .or_default()
                         .string_tree
                         .insert(path_hash, matched_prefix);
+                    self.sync_local_insert(
+                        model_id,
+                        TreeDelta {
+                            tree_kind: TreeKind::String,
+                            node_hash: path_hash,
+                            worker_url: workers[idx].url().to_string(),
+                            epoch: 0,
+                        },
+                    );
                 }
 
                 workers[idx].increment_processed();
@@ -1280,6 +1462,54 @@ mod tests {
             let idx = policy.select_worker(&workers, &info).unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
+    }
+
+    // ---- tree size aggregation (per-model gauges + eviction-cycle log) ----
+
+    #[test]
+    fn string_tree_totals_sums_tenant_chars() {
+        let tree = Tree::new();
+        assert_eq!(string_tree_totals(&tree), (0, 0));
+
+        // Worker registration (empty insert) registers a zero-char tenant.
+        tree.insert_text("", "http://w1:8000");
+        assert_eq!(string_tree_totals(&tree), (0, 1));
+
+        tree.insert_text("hello", "http://w1:8000");
+        assert_eq!(string_tree_totals(&tree), (5, 1));
+
+        // A shared path counts its chars for every tenant on it.
+        tree.insert_text("hello", "http://w2:8000");
+        assert_eq!(string_tree_totals(&tree), (10, 2));
+
+        // "help!" shares "hel", adds only "p!" for w1.
+        tree.insert_text("help!", "http://w1:8000");
+        assert_eq!(string_tree_totals(&tree), (12, 2));
+    }
+
+    #[test]
+    fn token_tree_totals_sums_tenant_tokens() {
+        let tree = TokenTree::new();
+        assert_eq!(token_tree_totals(&tree), (0, 0));
+
+        // Worker registration (empty insert) aligns to zero pages —
+        // no tenant entry.
+        tree.insert_tokens(&[], "http://w1:8000");
+        assert_eq!(token_tree_totals(&tree), (0, 0));
+
+        let page = tree.page_size();
+        let page_a: Vec<u32> = (0..page as u32).collect();
+        tree.insert_tokens(&page_a, "http://w1:8000");
+        assert_eq!(token_tree_totals(&tree), (page, 1));
+
+        // A shared page counts its tokens for every tenant on it.
+        tree.insert_tokens(&page_a, "http://w2:8000");
+        assert_eq!(token_tree_totals(&tree), (2 * page, 2));
+
+        // A disjoint page adds only for its tenant.
+        let page_b: Vec<u32> = (1000..1000 + page as u32).collect();
+        tree.insert_tokens(&page_b, "http://w1:8000");
+        assert_eq!(token_tree_totals(&tree), (3 * page, 2));
     }
 
     // ---- is_imbalanced: 3-term trigger (overload ∨ KV-spread ∨ count) ----
@@ -1491,6 +1721,80 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn test_remove_worker_purges_tree_tenants() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .build(),
+            ),
+        ];
+        policy.init_workers(&workers);
+
+        // Distinct cold inputs spread across both workers (min-load
+        // tie-breaks by processed count), populating both trees.
+        for text in ["purge me please", "keep me around"] {
+            policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some(text),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        let tokens_a: Vec<u32> = (0..32).collect();
+        let tokens_b: Vec<u32> = (1000..1032).collect();
+        for tokens in [&tokens_a, &tokens_b] {
+            policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(tokens),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        let model_key = normalize_model_key(workers[0].model_id()).to_string();
+        let string_tree = Arc::clone(policy.string_trees.get(&model_key).unwrap().value());
+        let token_tree = Arc::clone(policy.token_trees.get(&model_key).unwrap().value());
+
+        let char_counts = string_tree.get_tenant_char_count();
+        let token_counts = token_tree.get_tenant_token_counts();
+        for url in ["http://w1:8000", "http://w2:8000"] {
+            assert!(char_counts.contains_key(url), "precondition: {url} routed");
+            assert!(token_counts.contains_key(url), "precondition: {url} routed");
+        }
+
+        policy.remove_worker(workers[0].as_ref());
+
+        let char_counts = string_tree.get_tenant_char_count();
+        assert!(!char_counts.contains_key("http://w1:8000"));
+        assert!(char_counts.contains_key("http://w2:8000"));
+        let token_counts = token_tree.get_tenant_token_counts();
+        assert!(!token_counts.contains_key("http://w1:8000"));
+        assert!(token_counts.contains_key("http://w2:8000"));
+
+        policy.remove_worker_by_url("http://w2:8000");
+        assert!(string_tree.get_tenant_char_count().is_empty());
+        assert!(token_tree.get_tenant_token_counts().is_empty());
     }
 
     #[test]
@@ -1816,6 +2120,62 @@ mod tests {
     }
 
     #[test]
+    fn test_score_overlap_random_tie_break_spreads_equal_workers() {
+        // Two workers with identical cached blocks and equal load: the pick
+        // must not be deterministic (equal candidates herded onto one worker
+        // before), so across many draws both must be selected.
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .build(),
+            ),
+        ];
+
+        let chunks: [&[u32]; 2] = [&[1, 2, 3, 4], &[5, 6, 7, 8]];
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &chunks, 4);
+        // Same content cached on w2 under distinct backend seq hashes.
+        let w2 = indexer.intern_worker("http://w2:8000").unwrap();
+        let mut wb2 = WorkerBlockMap::default();
+        let blocks: Vec<StoredBlock> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, tokens)| StoredBlock {
+                seq_hash: SequenceHash(100 + i as u64),
+                content_hash: compute_content_hash(tokens),
+            })
+            .collect();
+        indexer.apply_stored(w2, &blocks, None, &mut wb2).unwrap();
+
+        let mut seen = [false; 2];
+        for _ in 0..200 {
+            let idx = CacheAwarePolicy::score_overlap(
+                &workers,
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+                &[0, 1],
+                &indexer,
+                4,
+            )
+            .expect("both workers fully match");
+            seen[idx] = true;
+            if seen[0] && seen[1] {
+                break;
+            }
+        }
+        assert!(
+            seen[0] && seen[1],
+            "equal-overlap equal-load tie must spread across workers, saw only one"
+        );
+    }
+
+    #[test]
     fn test_score_overlap_no_match_returns_none() {
         let policy = CacheAwarePolicy::with_config(test_config());
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
@@ -1888,7 +2248,7 @@ mod tests {
     }
 
     #[test]
-    fn test_score_overlap_tree_size_tiebreak() {
+    fn test_score_overlap_tree_size_not_a_tiebreak() {
         let policy = CacheAwarePolicy::with_config(test_config());
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -1935,9 +2295,24 @@ mod tests {
             .apply_stored(w2_id, &extra, Some(SequenceHash(1)), &mut wb2)
             .unwrap();
 
-        // Equal overlap, equal load → tie-break by tree size → w1 wins (smaller)
-        let result = CacheAwarePolicy::score_overlap(&workers, &[1, 2, 3, 4], &[0, 1], &indexer, 4);
-        assert_eq!(result, Some(0)); // w1 (smaller tree)
+        // Equal overlap, equal load, different tree sizes: tree size is no
+        // longer a tie-break key — the pick is uniform over the tie, so both
+        // workers must appear across draws (the old smaller-tree preference
+        // herded every tie onto w1 until the global size ordering flipped).
+        let mut seen = [false; 2];
+        for _ in 0..200 {
+            let idx =
+                CacheAwarePolicy::score_overlap(&workers, &[1, 2, 3, 4], &[0, 1], &indexer, 4)
+                    .expect("both workers match");
+            seen[idx] = true;
+            if seen[0] && seen[1] {
+                break;
+            }
+        }
+        assert!(
+            seen[0] && seen[1],
+            "tie must spread over both workers regardless of tree size, saw {seen:?}"
+        );
     }
 
     #[test]

@@ -204,6 +204,11 @@ class RouterArgs:
     # Append new fields here to preserve positional callers.
     model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
     worker_startup_delay: int = 0
+    # DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped)
+    zmq_engine_count: int | None = None
+    prefix_token_count: int = 256
+    prefix_hash_load_factor: float = 1.25
+    prefix_hash_balance_abs_threshold: int = 10
 
     @staticmethod
     def add_cli_args(
@@ -386,6 +391,30 @@ class RouterArgs:
             help="Cache threshold (0.0-1.0) for cache-aware routing",
         )
         routing_group.add_argument(
+            f"--{prefix}prefix-token-count",
+            type=int,
+            default=RouterArgs.prefix_token_count,
+            help=(
+                "Number of prefix tokens hashed by the prefix_hash policy "
+                "(untokenized requests hash four times as many characters)"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefix-hash-load-factor",
+            type=float,
+            default=RouterArgs.prefix_hash_load_factor,
+            help="Load factor above which prefix_hash walks the ring (multiple of average load)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefix-hash-balance-abs-threshold",
+            type=int,
+            default=RouterArgs.prefix_hash_balance_abs_threshold,
+            help=(
+                "Absolute load difference over average a worker must also "
+                "exceed before prefix_hash treats it as overloaded"
+            ),
+        )
+        routing_group.add_argument(
             f"--{prefix}least-load-kv-pressure-weight",
             type=float,
             default=RouterArgs.least_load_kv_pressure_weight,
@@ -466,7 +495,10 @@ class RouterArgs:
             f"--{prefix}max-tree-size",
             type=int,
             default=RouterArgs.max_tree_size,
-            help="Maximum size of the approximation tree for cache-aware routing",
+            help="Maximum total size of each model's approximation tree for "
+            "cache-aware routing (chars for HTTP, tokens for gRPC), shared "
+            "across all workers; eviction keeps every tree at or under this "
+            "bound",
         )
         routing_group.add_argument(
             f"--{prefix}block-size",
@@ -715,7 +747,10 @@ class RouterArgs:
             f"--{prefix}prometheus-port",
             type=int,
             default=29000,
-            help="Port to expose Prometheus metrics (default: 29000).",
+            help=(
+                "Port to expose Prometheus metrics (default: 29000)."
+                " 0 binds an OS-assigned ephemeral port, logged at startup."
+            ),
         )
         prometheus_group.add_argument(
             f"--{prefix}prometheus-host",
@@ -1010,6 +1045,16 @@ class RouterArgs:
             help=(
                 "Backend runtime to use (default: sglang). For ZMQ workers, vllm/"
                 "tokenspeed also pin the wire protocol (it cannot be auto-detected)"
+            ),
+        )
+        backend_group.add_argument(
+            f"--{prefix}zmq-engine-count",
+            type=int,
+            default=RouterArgs.zmq_engine_count,
+            help=(
+                "DP engines per startup ZMQ worker: each ipc:// worker becomes a "
+                "grouped worker whose handshake awaits this many engines on one "
+                "socket set (vLLM only; default: 1)"
             ),
         )
         backend_group.add_argument(

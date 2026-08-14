@@ -17,6 +17,6 @@ pub use openai::OpenAIProvider;
 pub use provider_trait::Provider;
 pub use registry::ProviderRegistry;
 pub use sglang::SGLangProvider;
-pub(crate) use types::strip_default_sglang_fields;
 pub use types::ProviderError;
+pub(crate) use types::{is_stripped_sglang_default, strip_default_sglang_fields, SGLANG_FIELDS};
 pub use xai::XAIProvider;

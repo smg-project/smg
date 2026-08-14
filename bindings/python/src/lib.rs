@@ -2,6 +2,13 @@ use std::collections::HashMap;
 
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
+
+// Jemalloc for all Rust-side allocations in the extension. Prefixed symbols
+// leave CPython's allocators untouched; disable_initial_exec_tls is required
+// for a dlopen'd cdylib.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use smg::*;
 use smg_auth as auth;
 
@@ -388,6 +395,9 @@ struct Router {
     block_size: usize,
     balance_token_usage_threshold: f32,
     overload_token_usage_threshold: f32,
+    prefix_token_count: usize,
+    prefix_hash_load_factor: f64,
+    prefix_hash_balance_abs_threshold: usize,
     least_load_kv_pressure_weight: f64,
     least_load_default_throughput: f64,
     least_load_mean_prefill_tokens: u32,
@@ -495,6 +505,10 @@ struct Router {
     model_aliases: HashMap<String, String>,
     worker_startup_delay: u64,
     worker_ports_annotation: String,
+    /// DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped).
+    /// Appended last: positional constructor compatibility (see the field
+    /// ordering rule on this struct's signature).
+    zmq_engine_count: Option<usize>,
 }
 
 impl Router {
@@ -575,10 +589,10 @@ impl Router {
                     overload_token_usage_threshold: self.overload_token_usage_threshold,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 5,
+                    load_check_interval_secs: self.load_monitor_interval,
                 },
                 PolicyType::LeastLoad => ConfigPolicyConfig::LeastLoad {
-                    load_check_interval_secs: 5,
+                    load_check_interval_secs: self.load_monitor_interval,
                     kv_pressure_weight: self.least_load_kv_pressure_weight,
                     mean_prefill_tokens: self.least_load_mean_prefill_tokens,
                     default_throughput: self.least_load_default_throughput,
@@ -595,8 +609,9 @@ impl Router {
                 },
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
-                    prefix_token_count: 256,
-                    load_factor: 1.25,
+                    prefix_token_count: self.prefix_token_count,
+                    load_factor: self.prefix_hash_load_factor,
+                    balance_abs_threshold: self.prefix_hash_balance_abs_threshold,
                 },
             })
         };
@@ -769,6 +784,7 @@ impl Router {
             .health_check_port(self.health_check_port)
             .connection_mode(self.connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
+            .zmq_engine_count(self.zmq_engine_count)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
@@ -989,6 +1005,10 @@ impl Router {
         model_aliases = HashMap::new(),
         worker_startup_delay = 0,
         worker_ports_annotation = String::from("smg.ai/worker-ports"),
+        zmq_engine_count = None,
+        prefix_token_count = 256,
+        prefix_hash_load_factor = 1.25,
+        prefix_hash_balance_abs_threshold = 10,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1118,6 +1138,10 @@ impl Router {
         model_aliases: HashMap<String, String>,
         worker_startup_delay: u64,
         worker_ports_annotation: String,
+        zmq_engine_count: Option<usize>,
+        prefix_token_count: usize,
+        prefix_hash_load_factor: f64,
+        prefix_hash_balance_abs_threshold: usize,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1157,6 +1181,9 @@ impl Router {
             block_size,
             balance_token_usage_threshold,
             overload_token_usage_threshold,
+            prefix_token_count,
+            prefix_hash_load_factor,
+            prefix_hash_balance_abs_threshold,
             least_load_kv_pressure_weight,
             least_load_default_throughput,
             least_load_mean_prefill_tokens,
@@ -1261,6 +1288,7 @@ impl Router {
             model_aliases,
             worker_startup_delay,
             worker_ports_annotation,
+            zmq_engine_count,
         })
     }
 

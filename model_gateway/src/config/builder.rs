@@ -154,6 +154,13 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// DP engines per startup ZMQ worker (grouped worker; see
+    /// `RouterConfig::zmq_engine_count`).
+    pub fn zmq_engine_count(mut self, count: Option<usize>) -> Self {
+        self.config.zmq_engine_count = count;
+        self
+    }
+
     pub fn connection_mode(mut self, mode: ConnectionMode) -> Self {
         self.config.connection_mode = mode;
         self
@@ -218,6 +225,16 @@ impl RouterConfigBuilder {
 
     pub fn load_monitor_interval_secs(mut self, interval: u64) -> Self {
         self.config.load_monitor_interval_secs = interval;
+        self
+    }
+
+    pub fn kv_indexer_ttl_secs(mut self, ttl: Option<u64>) -> Self {
+        self.config.kv_indexer_ttl_secs = ttl;
+        self
+    }
+
+    pub fn kv_indexer_max_entries(mut self, max: Option<usize>) -> Self {
+        self.config.kv_indexer_max_entries = max;
         self
     }
 

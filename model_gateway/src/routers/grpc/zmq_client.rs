@@ -305,16 +305,19 @@ async fn unlink_stale_socket(address: &str) -> Result<(), String> {
     }
 }
 
-/// Bind the SMG-side ZMQ sockets and complete the handshake with the engine:
-/// the single connect path for a worker's `ipc://` URL, shared by the lazy
-/// client accessor and the background handshake driver. `model_id` is the
-/// config-resolved served model (EngineCore reports none). Errors are plain
-/// reasons; the worker layer wraps them in its own error type.
+/// Bind the SMG-side ZMQ sockets and complete the handshake with the
+/// engine(s): the single connect path for a worker's `ipc://` URL, shared by
+/// the lazy client accessor and the background handshake driver. `model_id` is
+/// the config-resolved served model (EngineCore reports none). `engine_count`
+/// is the number of DP engines that will dial this worker's sockets (1 for an
+/// ungrouped worker). Errors are plain reasons; the worker layer wraps them in
+/// its own error type.
 pub(crate) async fn connect_for_worker(
     base_url: &str,
     model_id: String,
     runtime: RuntimeType,
     handshake_override: Option<&str>,
+    engine_count: usize,
 ) -> Result<ZmqEngineClient, String> {
     let (handshake, input, output) = zmq_socket_addresses(base_url, handshake_override)?;
     ensure_ipc_socket_dir(base_url).await?;
@@ -339,12 +342,14 @@ pub(crate) async fn connect_for_worker(
         );
         EosTokenIds::default()
     };
-    tracing::info!("Binding ZMQ client for worker {base_url} (handshake={handshake})");
+    tracing::info!(
+        "Binding ZMQ client for worker {base_url} (handshake={handshake}, engines={engine_count})"
+    );
     ZmqEngineClient::connect(
         &handshake,
         &input,
         &output,
-        1,
+        engine_count,
         model_id,
         eos,
         runtime,
@@ -389,17 +394,6 @@ impl ZmqEngineClient {
         runtime: RuntimeType,
         timeout: Duration,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // Single-engine scope for TokenSpeed: its wire carries no DP-rank routing
-        // yet (`data_parallel_rank` is always `None`), so more than one engine
-        // would silently send all traffic to engine 0. Reject it loudly until
-        // DP>1 lands. The engine count is known here (the handshake awaits it).
-        if matches!(runtime, RuntimeType::TokenSpeed) && engine_count > 1 {
-            return Err(format!(
-                "TokenSpeed ZMQ backend supports a single engine only (got \
-                 engine_count={engine_count}); DP>1 is not yet supported"
-            )
-            .into());
-        }
         // No silent fallback: any other runtime has no ZMQ engine adapter.
         // Reject before the handshake — no such engine ever dials in, so the
         // handshake would just block for the full timeout.
@@ -2151,6 +2145,7 @@ mod tests {
                 cached_tokens: vec![0],
                 output_token_logprobs_val: vec![vec![-0.5]],
                 output_token_logprobs_idx: vec![vec![10]],
+                ..Default::default()
             };
             let done = BatchTokenIDOutSlim {
                 rids: vec!["r1".into()],
@@ -2161,6 +2156,7 @@ mod tests {
                 cached_tokens: vec![0],
                 output_token_logprobs_val: vec![vec![-1.25]],
                 output_token_logprobs_idx: vec![vec![11]],
+                ..Default::default()
             };
             output
                 .send_frames(vec![bytes::Bytes::from(encode_msgpack(&chunk).unwrap())])
@@ -2814,6 +2810,7 @@ mod tests {
                 cached_tokens: vec![0, 0],
                 output_token_logprobs_val: vec![vec![], vec![]],
                 output_token_logprobs_idx: vec![vec![], vec![]],
+                ..Default::default()
             };
             output
                 .send_frames(vec![bytes::Bytes::from(encode_msgpack(&done).unwrap())])

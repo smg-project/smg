@@ -92,6 +92,30 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             &app_context.router_config.model_aliases,
         );
 
+        // A parser override naming an unknown parser would silently ship
+        // unparsed output at serve time — fail registration loudly instead
+        // (mirrors the fail-fast AppContext applies to the global CLI names).
+        validate_parser_overrides(
+            &model_card,
+            &config.url,
+            app_context.tool_parser_factory.as_ref(),
+            app_context.reasoning_parser_factory.as_ref(),
+        )
+        .map_err(|message| WorkflowError::StepFailed {
+            step_id: StepId::new("create_worker"),
+            message,
+        })?;
+
+        // Mixed overrides across same-model workers are a misconfiguration
+        // (except transiently during rolling upgrades): resolution picks one
+        // deterministically, but only one family parses correctly. Warn, don't
+        // fail — failing would block rolling upgrades that change the parser.
+        warn_on_conflicting_parser_overrides(
+            &model_card,
+            &config.url,
+            &app_context.worker_registry,
+        );
+
         let runtime_type = match context.data.detected_runtime_type.as_deref() {
             Some(s) => s.parse::<RuntimeType>().unwrap_or(config.runtime_type),
             None => config.runtime_type,
@@ -132,6 +156,14 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 ),
             });
         }
+
+        // A grouped ZMQ worker (`dp_size: N` on the spec) awaits N engines on
+        // one socket set. Both ZMQ runtimes route per rank: vLLM by in-request
+        // DP rank, TokenSpeed by per-rank socket identity with the producing
+        // rank named on each output batch.
+        let zmq_engine_group = config
+            .dp_size
+            .filter(|&n| n > 1 && *connection_mode == ConnectionMode::Zmq);
 
         // Normalize URL
         let url = normalize_url(&config.url, *connection_mode);
@@ -216,6 +248,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 if let Some(ref address) = config.zmq_handshake_address {
                     builder = builder.zmq_handshake_address(address.clone());
                 }
+                if let Some(group_size) = zmq_engine_group {
+                    builder = builder.zmq_engine_group(group_size);
+                }
                 // ZMQ promotion is event-driven: the worker signals the manager
                 // the instant its handshake completes, so wire the registry's
                 // connect signal. Other transports promote via polling.
@@ -261,6 +296,75 @@ fn resolve_model_id<'a>(config: &'a WorkerSpec, labels: &'a HashMap<String, Stri
         .or_else(|| labels.get("model_id").map(String::as_str))
         .or_else(|| labels.get("model_path").map(String::as_str))
         .unwrap_or(UNKNOWN_MODEL_ID)
+}
+
+/// Warn when a new worker's parser overrides disagree with an already
+/// registered worker serving the same model. Resolution stays deterministic
+/// (lexicographically smallest name wins), but only one format parses
+/// correctly — operators should see the conflict at deploy time.
+fn warn_on_conflicting_parser_overrides(
+    card: &ModelCard,
+    worker_url: &str,
+    registry: &crate::worker::WorkerRegistry,
+) {
+    for existing in registry.get_by_model(&card.id).iter() {
+        let Some(existing_card) = existing.metadata().spec.models.find(&card.id) else {
+            continue;
+        };
+        for (kind, new_name, existing_name) in [
+            ("tool_parser", &card.tool_parser, &existing_card.tool_parser),
+            (
+                "reasoning_parser",
+                &card.reasoning_parser,
+                &existing_card.reasoning_parser,
+            ),
+        ] {
+            if let (Some(new_name), Some(existing_name)) = (new_name, existing_name) {
+                if new_name != existing_name {
+                    tracing::warn!(
+                        model = %card.id,
+                        new_worker = worker_url,
+                        existing_worker = existing.url(),
+                        %kind,
+                        new = %new_name,
+                        existing = %existing_name,
+                        "Workers for one model declare conflicting parser \
+                         overrides; the lexicographically smallest name wins \
+                         at request time"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Reject parser-override names the registries don't know. Skipped when a
+/// factory is absent (parsers unused in that configuration).
+fn validate_parser_overrides(
+    card: &ModelCard,
+    worker_url: &str,
+    tool_parser_factory: Option<&tool_parser::ParserFactory>,
+    reasoning_parser_factory: Option<&reasoning_parser::ParserFactory>,
+) -> Result<(), String> {
+    if let (Some(name), Some(factory)) = (card.tool_parser.as_deref(), tool_parser_factory) {
+        if !factory.registry().has_parser(name) {
+            return Err(format!(
+                "worker {} declares unknown tool_parser '{}' for model '{}'",
+                worker_url, name, card.id
+            ));
+        }
+    }
+    if let (Some(name), Some(factory)) =
+        (card.reasoning_parser.as_deref(), reasoning_parser_factory)
+    {
+        if !factory.registry().has_parser(name) {
+            return Err(format!(
+                "worker {} declares unknown reasoning_parser '{}' for model '{}'",
+                worker_url, name, card.id
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn build_model_card(
@@ -324,6 +428,21 @@ fn build_model_card(
     if card.tokenizer_path.is_none() {
         card.tokenizer_path = labels
             .get("tokenizer_path")
+            .filter(|s| !s.is_empty())
+            .cloned();
+    }
+
+    // Per-model parser overrides: `tool_parser` / `reasoning_parser` labels
+    // (from backend metadata or WorkerSpec.labels) pin the parser for this
+    // model, overriding the process-wide `--tool-call-parser` /
+    // `--reasoning-parser` names on the gRPC serving path. An explicit card
+    // keeps its own values (same precedence as tokenizer_path above).
+    if card.tool_parser.is_none() {
+        card.tool_parser = labels.get("tool_parser").filter(|s| !s.is_empty()).cloned();
+    }
+    if card.reasoning_parser.is_none() {
+        card.reasoning_parser = labels
+            .get("reasoning_parser")
             .filter(|s| !s.is_empty())
             .cloned();
     }
@@ -417,10 +536,12 @@ fn normalize_url(url: &str, connection_mode: ConnectionMode) -> String {
 
 /// Reject a data-parallel worker the ZMQ path cannot serve.
 ///
-/// A ZMQ worker binds a single EngineCore connection (engine_count=1); DP>1
-/// needs the coordinator + wave protocol (not yet implemented), so fail loudly
-/// rather than silently under-connecting. Only ZMQ with `dp_size > 1` is
-/// rejected; gRPC/HTTP data parallelism and single-engine ZMQ are fine.
+/// dp-aware expansion creates one rank-pinned worker per DP rank, but each
+/// ZMQ worker owns its own socket bind — N expanded workers would fight over
+/// the same ipc paths. ZMQ DP runs as a *grouped* worker instead (`dp_size: N`
+/// on the worker spec: one worker, one socket set, N engines dialing in), so
+/// reject the expansion loudly and point at the grouped form. gRPC/HTTP
+/// expansion and single-engine ZMQ are fine.
 fn validate_zmq_dp(
     connection_mode: ConnectionMode,
     dp_size: usize,
@@ -430,8 +551,8 @@ fn validate_zmq_dp(
         return Err(WorkflowError::StepFailed {
             step_id: StepId::new("create_worker"),
             message: format!(
-                "ZMQ worker {url} cannot run data-parallel (dp_size={dp_size}); \
-                 DP>1 over ZMQ is not yet supported"
+                "ZMQ worker {url} cannot be dp-aware expanded (dp_size={dp_size}); \
+                 configure a grouped ZMQ worker (`dp_size` on the worker spec) instead"
             ),
         });
     }
@@ -607,5 +728,77 @@ mod tests {
         );
         assert!(card.aliases.contains(&"glm-5.2".to_string()));
         assert_eq!(card.aliases.len(), 2);
+    }
+
+    #[test]
+    fn parser_override_labels_flow_into_card() {
+        let spec = WorkerSpec::new("http://worker:8080");
+        let labels = HashMap::from([
+            ("tool_parser".to_string(), "json".to_string()),
+            ("reasoning_parser".to_string(), "basic".to_string()),
+            ("model_type".to_string(), "llama".to_string()),
+        ]);
+
+        let card = build_model_card("m", &spec, &labels, &HashMap::new());
+        assert_eq!(card.tool_parser.as_deref(), Some("json"));
+        assert_eq!(card.reasoning_parser.as_deref(), Some("basic"));
+
+        // Empty label values are treated as unset.
+        let labels = HashMap::from([("tool_parser".to_string(), String::new())]);
+        let card = build_model_card("m", &spec, &labels, &HashMap::new());
+        assert_eq!(card.tool_parser, None);
+    }
+
+    #[test]
+    fn explicit_card_parser_wins_over_labels() {
+        // A user-provided WorkerSpec card keeps its parser fields; labels
+        // only fill gaps (same precedence as tokenizer_path).
+        let mut spec = WorkerSpec::new("http://worker:8080");
+        spec.models = openai_protocol::worker::WorkerModels::Single(Box::new(
+            ModelCard::new("m").with_tool_parser("pythonic"),
+        ));
+        let labels = HashMap::from([
+            ("tool_parser".to_string(), "json".to_string()),
+            ("reasoning_parser".to_string(), "basic".to_string()),
+        ]);
+
+        let card = build_model_card("m", &spec, &labels, &HashMap::new());
+        assert_eq!(card.tool_parser.as_deref(), Some("pythonic"));
+        // The explicit card left reasoning unset — the label fills it.
+        assert_eq!(card.reasoning_parser.as_deref(), Some("basic"));
+    }
+
+    #[test]
+    fn unknown_parser_override_fails_validation() {
+        let tool_factory = tool_parser::ParserFactory::default();
+        let reasoning_factory = reasoning_parser::ParserFactory::default();
+
+        // No overrides → nothing to validate.
+        let card = ModelCard::new("m");
+        assert!(validate_parser_overrides(
+            &card,
+            "http://w:1",
+            Some(&tool_factory),
+            Some(&reasoning_factory)
+        )
+        .is_ok());
+
+        // Known tool parser passes; unknown names fail loudly.
+        let card = ModelCard::new("m").with_tool_parser("json");
+        assert!(validate_parser_overrides(&card, "http://w:1", Some(&tool_factory), None).is_ok());
+
+        let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
+        let err = validate_parser_overrides(&card, "http://w:1", Some(&tool_factory), None)
+            .expect_err("unknown tool parser must fail registration");
+        assert!(err.contains("definitely-not-a-parser"), "{err}");
+
+        let card = ModelCard::new("m").with_reasoning_parser("definitely-not-a-parser");
+        let err = validate_parser_overrides(&card, "http://w:1", None, Some(&reasoning_factory))
+            .expect_err("unknown reasoning parser must fail registration");
+        assert!(err.contains("definitely-not-a-parser"), "{err}");
+
+        // Absent factories skip validation (parsers unused in that config).
+        let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
+        assert!(validate_parser_overrides(&card, "http://w:1", None, None).is_ok());
     }
 }

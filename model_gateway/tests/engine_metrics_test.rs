@@ -16,19 +16,17 @@ use smg::observability::{
 
 #[tokio::test]
 async fn engine_pd_gauge_appears_on_metrics_endpoint() {
-    // Reserve a free port, then start the metrics server on it. The recorder is
-    // global and may only be installed once per process; `start_prometheus`
-    // does that install and hands back the handle the server renders.
-    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
-
+    // The recorder is global and may only be installed once per process;
+    // `start_prometheus` does that install and hands back the handle the
+    // server renders. Port 0 binds an ephemeral port with no reservation race.
     let handle = start_prometheus(PrometheusConfig {
-        port,
+        port: 0,
         host: "127.0.0.1".to_string(),
         duration_buckets: None,
     });
-    let _server = start_metrics_server(handle, "127.0.0.1".to_string(), port).await;
+    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
+        .await
+        .expect("metrics server binds an ephemeral port");
 
     let response = WorkerLoadResponse {
         timestamp: "t".to_string(),
@@ -46,7 +44,7 @@ async fn engine_pd_gauge_appears_on_metrics_endpoint() {
     };
     Metrics::record_engine_load("grpc://prefill-0:30000", "test-model", &response);
 
-    let body = reqwest::get(format!("http://127.0.0.1:{port}/metrics"))
+    let body = reqwest::get(format!("http://{addr}/metrics"))
         .await
         .expect("metrics endpoint reachable")
         .text()

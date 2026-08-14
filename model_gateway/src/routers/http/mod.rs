@@ -2,6 +2,7 @@
 
 pub mod pd_router;
 pub mod pd_types;
+pub(crate) mod request_body;
 pub mod router;
 
 use serde_json::Value;

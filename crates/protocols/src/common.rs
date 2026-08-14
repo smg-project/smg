@@ -46,6 +46,13 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
+
+    /// Token IDs for routing when the request is already tokenized.
+    /// Some(_) routes on the token radix tree instead of the decimal-string
+    /// rendering of the same IDs.
+    fn routing_tokens(&self) -> Option<&[i32]> {
+        None
+    }
 }
 
 // ============================================================================

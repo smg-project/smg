@@ -19,6 +19,7 @@ use super::{
 };
 use crate::{
     config::types::{PolicyConfig, RoutingKeyOverrideConfig},
+    mesh::adapters::TreeSyncAdapter,
     policies::cache_aware::LoadReceiver,
     routers::common::header_utils::extract_routing_key,
     worker::{KvEventMonitor, Worker},
@@ -35,6 +36,11 @@ pub struct PolicyRegistry {
 
     /// Default policy instance (cached, immutable after creation)
     default_policy: Arc<dyn LoadBalancingPolicy>,
+
+    /// Operator config the default policy was built from; hinted per-model
+    /// policies of the same type are built from it so they inherit the
+    /// operator's tunables.
+    default_policy_config: PolicyConfig,
 
     /// Prefill policy for PD mode (set once at startup, lock-free reads via OnceLock)
     prefill_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
@@ -53,6 +59,12 @@ pub struct PolicyRegistry {
     /// set, new CacheAwarePolicy instances are injected with it for the KV-usage
     /// imbalance trigger.
     load_rx: Arc<RwLock<Option<LoadReceiver>>>,
+
+    /// Optional mesh outbound bridge. When set, every cache-aware policy
+    /// created here is attached to this adapter so its local tree inserts
+    /// join the next gossip round. Absence means mesh is disabled and
+    /// cache-aware policies stay local.
+    mesh_tree_sync: Arc<RwLock<Option<Arc<TreeSyncAdapter>>>>,
 
     // DP-rank policy: Supports the selection of dp-rank outside the engine.
     dp_rank_policy: Arc<OnceLock<Arc<dyn DPRankLoadPolicy>>>,
@@ -88,11 +100,13 @@ impl PolicyRegistry {
             model_policies: Arc::new(DashMap::new()),
             model_worker_counts: Arc::new(DashMap::new()),
             default_policy,
+            default_policy_config,
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
             encode_policy: Arc::new(OnceLock::new()),
             kv_event_monitor: Arc::new(RwLock::new(None)),
             load_rx: Arc::new(RwLock::new(None)),
+            mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
             routing_key_sticky,
         }
@@ -189,6 +203,44 @@ impl PolicyRegistry {
         }
     }
 
+    /// Attach the mesh outbound bridge (thread-safe, can be called after
+    /// initialization). Every existing cache-aware policy gets the adapter
+    /// wired in and its `populate_hash_index` flag flipped on (both flip
+    /// atomically inside [`CacheAwarePolicy::set_mesh_tree_sync`]); every
+    /// future cache-aware policy created here inherits both. Pass `None`
+    /// to detach.
+    pub fn set_mesh_tree_sync(&self, adapter: Option<Arc<TreeSyncAdapter>>) {
+        {
+            let mut guard = self.mesh_tree_sync.write();
+            guard.clone_from(&adapter);
+        }
+        Self::maybe_inject_mesh_tree_sync(&self.default_policy, adapter.as_ref());
+        if let Some(p) = self.prefill_policy.get() {
+            Self::maybe_inject_mesh_tree_sync(p, adapter.as_ref());
+        }
+        if let Some(p) = self.decode_policy.get() {
+            Self::maybe_inject_mesh_tree_sync(p, adapter.as_ref());
+        }
+        if let Some(p) = self.encode_policy.get() {
+            Self::maybe_inject_mesh_tree_sync(p, adapter.as_ref());
+        }
+        for entry in self.model_policies.iter() {
+            Self::maybe_inject_mesh_tree_sync(entry.value(), adapter.as_ref());
+        }
+    }
+
+    /// Inject the mesh adapter into a policy if it's cache-aware.
+    /// The setter also flips `populate_hash_index` to match adapter
+    /// presence, so callers do not need to touch that flag directly.
+    fn maybe_inject_mesh_tree_sync(
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        adapter: Option<&Arc<TreeSyncAdapter>>,
+    ) {
+        if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+            cache_aware.set_mesh_tree_sync(adapter.cloned());
+        }
+    }
+
     /// Called when a worker is added
     /// Returns the policy that should be used for this worker's model
     pub fn on_worker_added(
@@ -224,9 +276,20 @@ impl PolicyRegistry {
             model_id
         );
 
-        // Store policy for this model (DashMap handles concurrent inserts)
-        self.model_policies
-            .insert(model_id.to_string(), Arc::clone(&policy));
+        // Inject and publish under the integration guards so a concurrent
+        // setter cannot fall between them: it either wrote before the reads
+        // here, or its propagation scan runs after the insert and finds
+        // this policy.
+        {
+            let monitor = self.kv_event_monitor.read();
+            let load_rx = self.load_rx.read();
+            let mesh = self.mesh_tree_sync.read();
+            Self::maybe_inject_monitor(&policy, monitor.as_ref());
+            Self::maybe_inject_load_rx(&policy, load_rx.as_ref());
+            Self::maybe_inject_mesh_tree_sync(&policy, mesh.as_ref());
+            self.model_policies
+                .insert(model_id.to_string(), Arc::clone(&policy));
+        }
 
         policy
     }
@@ -284,6 +347,44 @@ impl PolicyRegistry {
             .unwrap_or_else(|| self.get_default_policy())
     }
 
+    /// Every distinct policy this registry might dispatch requests
+    /// through for `model_id`, ordered from most-specific to least
+    /// (per-model → default → PD/EPD legs). Deduplicated by `Arc`
+    /// pointer identity so a policy that appears in multiple slots
+    /// (e.g. the same `CacheAwarePolicy` as both default and prefill
+    /// leg) is returned once.
+    ///
+    /// The tree-sync bridge uses this to reach every `CacheAwarePolicy`
+    /// that could have produced a delta for `model_id` — reaching
+    /// only `model_policies` misses PD-leg and default-fallback
+    /// deployments, and inbound deltas never resolve.
+    pub(crate) fn policies_for_model(&self, model_id: &str) -> Vec<Arc<dyn LoadBalancingPolicy>> {
+        let mut out: Vec<Arc<dyn LoadBalancingPolicy>> = Vec::new();
+        let mut push = |candidate: Arc<dyn LoadBalancingPolicy>| {
+            let ptr = Arc::as_ptr(&candidate) as *const ();
+            if !out
+                .iter()
+                .any(|existing| Arc::as_ptr(existing) as *const () == ptr)
+            {
+                out.push(candidate);
+            }
+        };
+        if let Some(policy) = self.get_policy(model_id) {
+            push(policy);
+        }
+        push(Arc::clone(&self.default_policy));
+        if let Some(p) = self.prefill_policy.get() {
+            push(Arc::clone(p));
+        }
+        if let Some(p) = self.decode_policy.get() {
+            push(Arc::clone(p));
+        }
+        if let Some(p) = self.encode_policy.get() {
+            push(Arc::clone(p));
+        }
+        out
+    }
+
     /// Determine policy for a new model
     fn determine_policy_for_model(
         &self,
@@ -301,29 +402,27 @@ impl PolicyRegistry {
         Arc::clone(&self.default_policy)
     }
 
-    /// Create a policy from a type string (delegates to PolicyFactory)
+    /// Create a policy from a type string. A hint naming the operator's
+    /// default policy type is built from that config so it inherits the
+    /// operator's tunables; other types are built with their defaults.
+    /// Integration injection happens at publication in
+    /// [`Self::on_worker_added`].
     fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
-        if policy_type == "cache_aware" {
-            let cache_aware = CacheAwarePolicy::new();
-            {
-                let guard = self.kv_event_monitor.read();
-                if let Some(ref monitor) = *guard {
-                    cache_aware.set_kv_event_monitor(Some(Arc::clone(monitor)));
-                }
-            }
-            {
-                let guard = self.load_rx.read();
-                if let Some(ref rx) = *guard {
-                    cache_aware.set_load_receiver(Some(rx.clone()));
-                }
-            }
-            Arc::new(cache_aware)
+        if Self::hint_matches_config(policy_type, self.default_policy_config.name()) {
+            Self::create_policy_from_config(&self.default_policy_config)
+        } else if let Some(policy) = PolicyFactory::create_by_name(policy_type) {
+            policy
         } else {
-            PolicyFactory::create_by_name(policy_type).unwrap_or_else(|| {
-                warn!("Unknown policy type '{}', using default", policy_type);
-                Arc::clone(&self.default_policy)
-            })
+            warn!("Unknown policy type '{}', using default", policy_type);
+            Arc::clone(&self.default_policy)
         }
+    }
+
+    /// Whether a policy hint names `config_name`, accepting the same
+    /// underscore-stripped aliases as [`PolicyFactory::create_by_name`].
+    fn hint_matches_config(policy_type: &str, config_name: &str) -> bool {
+        let hint = policy_type.to_lowercase();
+        hint == config_name || hint == config_name.replace('_', "")
     }
 
     /// Create a policy from a PolicyConfig (delegates to PolicyFactory)
@@ -613,7 +712,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        policies::{CacheAwareConfig, SelectWorkerInfo},
+        policies::{CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
         worker::{BasicWorkerBuilder, Worker, WorkerType},
     };
 
@@ -793,6 +892,139 @@ mod tests {
         // Get default directly
         let default = registry.get_default_policy();
         assert_eq!(default.name(), "round_robin");
+    }
+
+    #[test]
+    fn hinted_policy_inherits_operator_cache_aware_config() {
+        let registry = PolicyRegistry::new(PolicyConfig::CacheAware {
+            cache_threshold: 0.9,
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 2.5,
+            eviction_interval_secs: 0,
+            max_tree_size: 4096,
+            block_size: 32,
+            balance_token_usage_threshold: 0.5,
+            overload_token_usage_threshold: 0.8,
+        });
+
+        // Hinted policy is a fresh per-model instance, not the shared default.
+        let policy = registry.on_worker_added("llama-3", Some("cache_aware"));
+        assert!(!Arc::ptr_eq(&policy, &registry.get_default_policy()));
+
+        let config = policy
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .unwrap()
+            .config_for_test();
+        assert_eq!(config.cache_threshold, 0.9);
+        assert_eq!(config.balance_abs_threshold, 64);
+        assert_eq!(config.balance_rel_threshold, 2.5);
+        assert_eq!(config.eviction_interval_secs, 0);
+        assert_eq!(config.max_tree_size, 4096);
+        assert_eq!(config.block_size, 32);
+        assert_eq!(config.balance_token_usage_threshold, 0.5);
+        assert_eq!(config.overload_token_usage_threshold, 0.8);
+
+        // Aliases accepted by create_by_name inherit too.
+        let alias = registry.on_worker_added("llama-4", Some("CacheAware"));
+        let alias_config = alias
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .unwrap()
+            .config_for_test();
+        assert_eq!(alias_config.max_tree_size, 4096);
+    }
+
+    #[test]
+    fn hinted_policy_inherits_operator_least_load_config() {
+        let registry = PolicyRegistry::new(PolicyConfig::LeastLoad {
+            load_check_interval_secs: 10,
+            kv_pressure_weight: 0.4,
+            mean_prefill_tokens: 2048,
+            default_throughput: 555.0,
+        });
+
+        let policy = registry.on_worker_added("llama-3", Some("least_load"));
+        assert!(!Arc::ptr_eq(&policy, &registry.get_default_policy()));
+        let least_load = policy.as_any().downcast_ref::<LeastLoadPolicy>().unwrap();
+        assert_eq!(least_load.params_for_test(), (0.4, 2048, 555.0));
+    }
+
+    /// An integration setter racing policy publication must never be
+    /// missed: publication injects and inserts under the integration
+    /// guards, so the setter either wrote first (its value is injected)
+    /// or its propagation scan runs after the insert.
+    #[test]
+    fn hinted_policy_publication_races_integration_setter() {
+        use std::sync::Barrier;
+
+        use crate::worker::KvEventMonitor;
+
+        const ADDERS: usize = 4;
+
+        let registry = Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 0,
+            max_tree_size: 128,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+        }));
+
+        for round in 0..64 {
+            let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+            let barrier = Arc::new(Barrier::new(ADDERS + 1));
+            let handles: Vec<_> = (0..ADDERS)
+                .map(|k| {
+                    let registry = Arc::clone(&registry);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        registry
+                            .on_worker_added(&format!("model-{round}-{k}"), Some("cache_aware"));
+                    })
+                })
+                .collect();
+            barrier.wait();
+            registry.set_kv_event_monitor(Some(monitor));
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            for entry in registry.model_policies.iter() {
+                let cache_aware = entry
+                    .value()
+                    .as_any()
+                    .downcast_ref::<CacheAwarePolicy>()
+                    .unwrap();
+                assert!(
+                    cache_aware.kv_event_monitor_is_set_for_test(),
+                    "policy for {} missed the concurrently-set monitor",
+                    entry.key()
+                );
+            }
+            registry.set_kv_event_monitor(None);
+            registry.clear();
+        }
+    }
+
+    #[test]
+    fn hinted_policy_without_operator_config_uses_type_defaults() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let policy = registry.on_worker_added("llama-3", Some("cache_aware"));
+        let config = policy
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .unwrap()
+            .config_for_test();
+        let defaults = CacheAwareConfig::default();
+        assert_eq!(config.cache_threshold, defaults.cache_threshold);
+        assert_eq!(config.max_tree_size, defaults.max_tree_size);
+        assert_eq!(
+            config.eviction_interval_secs,
+            defaults.eviction_interval_secs
+        );
     }
 
     #[test]

@@ -552,9 +552,17 @@ async fn stop_profile(
 }
 
 async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    WorkerManager::get_all_worker_loads(&state.context.worker_registry, &state.context.client)
-        .await
-        .into_response()
+    WorkerManager::get_all_worker_loads(
+        &state.context.worker_registry,
+        &state.context.client,
+        state
+            .context
+            .worker_monitor
+            .as_ref()
+            .map(|monitor| monitor.native_loads_absent()),
+    )
+    .await
+    .into_response()
 }
 
 async fn create_worker(
@@ -1039,12 +1047,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // port conflicts or bad addresses.
     if let Some(prometheus_config) = &config.prometheus_config {
         let handle = metrics::start_prometheus(prometheus_config.clone());
-        let _server_handle = metrics_server::start_metrics_server(
+        let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
             handle,
             prometheus_config.host.clone(),
             prometheus_config.port,
         )
-        .await;
+        .await?;
         // Tokio runtime self-observability (event-loop canary + sampler).
         // `startup` runs on the main runtime, so the observer lands on —
         // and therefore measures — the runtime that serves requests.
@@ -1089,6 +1097,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             handler.mesh_kv(),
             handler.self_name.clone(),
             app_context.worker_registry.clone(),
+            handler.state.clone(),
+            app_context.policy_registry.clone(),
         )
     });
     if let Some(mesh_server) = mesh_server {

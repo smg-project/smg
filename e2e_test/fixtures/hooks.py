@@ -14,7 +14,13 @@ from __future__ import annotations
 import os
 
 import pytest
-from infra import ConnectionMode, cleanup_pool, get_connection_mode_override, get_runtime
+from infra import (
+    ConnectionMode,
+    cleanup_pool,
+    get_connection_mode_override,
+    get_runtime,
+    get_zmq_engine_count,
+)
 
 from .markers import resolve_class_marker
 
@@ -193,6 +199,27 @@ def _filter_zmq_items(items: list[pytest.Item]) -> tuple[list[pytest.Item], list
     return kept, deselected
 
 
+# Models whose TokenSpeed forward crashes on the 0-token idle batch a DP rank
+# runs to stay in the group's collectives (flashinfer silu_and_mul cannot
+# launch over an empty grid). Fixed upstream by
+# https://github.com/lightseekorg/tokenspeed/pull/1077; delete this skip when
+# the tokenspeed pin advances past it.
+_TOKENSPEED_DP_BROKEN_MODELS = frozenset({"Qwen/Qwen3-4B-Instruct-2507"})
+
+
+def _filter_tokenspeed_dp_items(
+    items: list[pytest.Item],
+) -> tuple[list[pytest.Item], list[pytest.Item]]:
+    """Split items into (kept, deselected) for a grouped TokenSpeed ZMQ lane."""
+    kept: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        marker = resolve_class_marker(item, "model")
+        model = str(marker.args[0]) if marker is not None and marker.args else ""
+        (deselected if model in _TOKENSPEED_DP_BROKEN_MODELS else kept).append(item)
+    return kept, deselected
+
+
 def pytest_collection_modifyitems(
     config: pytest.Config,
     items: list[pytest.Item],
@@ -240,6 +267,14 @@ def pytest_collection_modifyitems(
         if deselected:
             config.hook.pytest_deselected(items=deselected)
             items[:] = kept
+
+        # Grouped TokenSpeed lane: drop the models the pinned engine cannot
+        # run under DP (see _TOKENSPEED_DP_BROKEN_MODELS).
+        if get_runtime() == "tokenspeed" and get_zmq_engine_count() > 1:
+            kept, deselected = _filter_tokenspeed_dp_items(items)
+            if deselected:
+                config.hook.pytest_deselected(items=deselected)
+                items[:] = kept
 
     items.sort(key=_pool_sort_key)
 

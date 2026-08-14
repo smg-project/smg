@@ -12,7 +12,12 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from .constants import DEFAULT_HOST, DEFAULT_ROUTER_TIMEOUT, ENV_SHOW_ROUTER_LOGS
+from .constants import (
+    DEFAULT_HOST,
+    DEFAULT_ROUTER_TIMEOUT,
+    ENV_SHOW_ROUTER_LOGS,
+    get_zmq_engine_count,
+)
 from .process_utils import (
     get_open_port,
     kill_process_tree,
@@ -235,6 +240,11 @@ class Gateway:
             # cannot probe the backend from the ipc:// URL — pin it explicitly.
             if backend is not None:
                 mode_args += ["--backend", backend]
+            # Grouped ZMQ lane: the handshake must await every engine the
+            # worker launched (see get_zmq_engine_count).
+            engine_count = get_zmq_engine_count()
+            if engine_count > 1:
+                mode_args += ["--zmq-engine-count", str(engine_count)]
             self._launch(
                 mode_args=mode_args,
                 timeout=timeout,

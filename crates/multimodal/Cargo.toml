@@ -24,8 +24,8 @@ opencv-video = ["dep:opencv"]
 # zune-jpeg 0.5.15's compile (its no-op log macros stop expanding to
 # expressions), and zune-jpeg rides in via `image`. Without this pin any
 # fresh resolve — every CI run — fails. Drop once a fixed zune-jpeg ships.
-zune-core = "=0.5.1"
-base64 = "0.22"
+zune-core = "=0.5.3"
+base64 = "0.23"
 hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "rustls-tls"] }
 bytes = { version = "1.12.0", features = ["serde"] }
 fast_image_resize = { version = "6.0.0", features = ["image"] }

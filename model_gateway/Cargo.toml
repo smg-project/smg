@@ -94,7 +94,7 @@ rayon = "1.12"
 rustix = { version = "1", features = ["fs", "process"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.7", features = ["trace", "compression-gzip", "cors", "timeout", "limit", "request-id", "util"] }
-serde_json = { version = "1.0", default-features = false, features = ["std", "preserve_order"] }
+serde_json = { version = "1.0", default-features = false, features = ["std", "preserve_order", "raw_value"] }
 bytes = "1.12.0"
 http-body = "1.0"
 http-body-util = "0.1"
@@ -126,7 +126,7 @@ arc-swap = "1.9.1"
 bitflags.workspace = true
 once_cell = "1.21.4"
 sha2 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 image = { version = "0.25.10", default-features = false }
 tokio-tungstenite = { workspace = true }
 webpki-roots = { workspace = true }
@@ -154,7 +154,7 @@ metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 http-body-util = "0.1"
 portpicker = "0.1"
 lazy_static = "1.5"
-wasm-encoder = "0.254"
+wasm-encoder = "0.255"
 npyz = { version = "0.9", features = ["npz"] }
 opentelemetry-proto = { version = "0.32", features = ["gen-tonic"] }
 serial_test = "3.5"
@@ -235,3 +235,7 @@ path = "benches/scheduler_load.rs"
 
 [lints]
 workspace = true
+
+[target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dependencies]
+tikv-jemallocator = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }

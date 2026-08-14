@@ -97,7 +97,7 @@ pub enum EngineInbound {
     /// A lockstep-group wake (`EngineCoreRequestType::StartDpWave`): start this
     /// wave unless this engine is the excluded one.
     StartDpWave {
-        wave: u32,
+        wave: u64,
         exclude_engine_index: u32,
     },
     /// Any other request type byte (Utility), unhandled here.

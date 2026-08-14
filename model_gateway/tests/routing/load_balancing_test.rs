@@ -370,3 +370,80 @@ mod worker_response_delay_tests {
         ctx.shutdown().await;
     }
 }
+
+#[cfg(test)]
+mod inflight_load_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use super::*;
+    use crate::common::mock_worker::{set_scheduler_controls, HoldGate, SchedulerControls};
+
+    /// The in-flight counter is a worker property, not a policy's private
+    /// state: `least_load`, `power_of_two` and `prefix_hash` all rank workers
+    /// by `Worker::load()`, and the mesh and `running_requests` metrics report
+    /// it. So the router has to hold a guard for every request, whichever
+    /// policy picked the worker — here `random`, which never reads it.
+    #[expect(clippy::disallowed_methods, reason = "test infrastructure")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_inflight_load_tracked_for_load_agnostic_policy() {
+        const WORKER_PORT: u16 = 19410;
+
+        let gate = HoldGate::new();
+        set_scheduler_controls(
+            WORKER_PORT,
+            SchedulerControls {
+                max_running_requests: None,
+                hold_gate: Some(Arc::clone(&gate)),
+            },
+        );
+
+        let config = TestRouterConfig::random(3140);
+        let ctx = AppTestContext::new_with_config(
+            config,
+            TestWorkerConfig::healthy_workers(WORKER_PORT, 1),
+        )
+        .await;
+        let app = ctx.create_app();
+
+        let worker = ctx
+            .app_context
+            .worker_registry
+            .get_all()
+            .into_iter()
+            .next()
+            .expect("the mock worker is registered");
+        assert_eq!(worker.load(), 0, "no requests in flight yet");
+
+        let payload = json!({ "text": "held request", "stream": false });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let held = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+
+        tokio::time::timeout(Duration::from_secs(8), gate.wait_for_arrivals(1))
+            .await
+            .expect("request never reached the worker");
+        assert_eq!(
+            worker.load(),
+            1,
+            "a request parked at the worker must be counted as in flight"
+        );
+
+        gate.release();
+        let resp = tokio::time::timeout(Duration::from_secs(8), held)
+            .await
+            .expect("held request did not complete in time")
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            worker.load(),
+            0,
+            "the guard must release the slot once the request finishes"
+        );
+
+        ctx.shutdown().await;
+    }
+}

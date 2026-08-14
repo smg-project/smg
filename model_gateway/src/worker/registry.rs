@@ -326,6 +326,10 @@ impl WorkerRegistry {
     /// this registry except [`Self::get_by_model`]. A caller holding a
     /// client-supplied name resolves it with [`Self::resolve_model_alias`]
     /// once at request entry and passes the canonical ID from there on.
+    ///
+    /// [`UNKNOWN_MODEL_ID`] returns the wildcard ring spanning every worker,
+    /// matching the candidate set a request that names no model is routed
+    /// against.
     pub fn get_hash_ring(&self, model_id: &str) -> Option<Arc<HashRing>> {
         self.hash_rings.get(model_id).map(|r| Arc::clone(&r))
     }
@@ -1430,12 +1434,59 @@ impl WorkerRegistry {
 
     /// Rebuild the hash ring for a model based on current workers in the model index.
     fn rebuild_hash_ring(&self, model_id: &str) {
-        if let Some(workers) = self.model_index.get(model_id) {
-            let ring = HashRing::new(workers.value().iter().map(|w| w.url()));
-            self.hash_rings.insert(model_id.to_string(), Arc::new(ring));
-        } else {
-            // No workers for this model, remove the ring
-            self.hash_rings.remove(model_id);
+        let ring = self
+            .model_index
+            .get(model_id)
+            .map(|workers| Arc::new(HashRing::new(workers.value().iter().map(|w| w.url()))));
+
+        match ring {
+            Some(ring) => {
+                self.hash_rings.insert(model_id.to_string(), ring);
+            }
+            None => {
+                // No workers for this model, remove the ring
+                self.hash_rings.remove(model_id);
+            }
+        }
+
+        self.rebuild_wildcard_hash_ring();
+    }
+
+    /// Rebuild the ring stored under [`UNKNOWN_MODEL_ID`], which requests that
+    /// name no model are routed against. Those requests may land on any worker,
+    /// so the ring spans every model's workers, deduplicated by URL.
+    fn rebuild_wildcard_hash_ring(&self) {
+        let model_ids: Vec<String> = self
+            .model_index
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        match model_ids.as_slice() {
+            [] => {
+                self.hash_rings.remove(UNKNOWN_MODEL_ID);
+            }
+            // A single model already covers every worker, so share its ring
+            // instead of hashing the same URLs a second time.
+            [only] => {
+                let ring = self.hash_rings.get(only).map(|ring| Arc::clone(&ring));
+                match ring {
+                    Some(ring) => {
+                        self.hash_rings.insert(UNKNOWN_MODEL_ID.to_string(), ring);
+                    }
+                    None => {
+                        self.hash_rings.remove(UNKNOWN_MODEL_ID);
+                    }
+                }
+            }
+            _ => {
+                let mut urls: HashSet<String> = HashSet::new();
+                for entry in self.model_index.iter() {
+                    urls.extend(entry.value().iter().map(|w| w.url().to_string()));
+                }
+                self.hash_rings
+                    .insert(UNKNOWN_MODEL_ID.to_string(), Arc::new(HashRing::new(urls)));
+            }
         }
     }
 
@@ -3310,5 +3361,118 @@ mod tests {
             }
             other => panic!("Expected Removed event, got: {other:?}"),
         }
+    }
+
+    fn worker_serving(url: &str, model_ids: &[&str]) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .models(
+                    model_ids
+                        .iter()
+                        .map(|id| ModelCard::new(*id))
+                        .collect::<Vec<_>>(),
+                )
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    #[test]
+    fn test_wildcard_hash_ring_matches_the_only_model() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(worker_serving("http://w1:8080", &["llama-3"]))
+            .unwrap();
+        registry
+            .register(worker_serving("http://w2:8080", &["llama-3"]))
+            .unwrap();
+
+        let wildcard = registry
+            .get_hash_ring(UNKNOWN_MODEL_ID)
+            .expect("requests naming no model need a ring");
+        let model_ring = registry.get_hash_ring("llama-3").expect("per-model ring");
+
+        assert_eq!(wildcard.worker_count(), 2);
+        for key in ["alpha", "beta", "gamma"] {
+            assert_eq!(
+                wildcard.find_healthy_url(key, |_| true),
+                model_ring.find_healthy_url(key, |_| true),
+                "wildcard and single-model rings must agree on {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wildcard_hash_ring_unions_models() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(worker_serving("http://w1:8080", &["llama-3"]))
+            .unwrap();
+        registry
+            .register(worker_serving("http://w2:8080", &["gpt-4"]))
+            .unwrap();
+
+        let wildcard = registry.get_hash_ring(UNKNOWN_MODEL_ID).expect("ring");
+        assert_eq!(wildcard.worker_count(), 2);
+        assert_eq!(
+            wildcard.find_healthy_url("key", |url| url == "http://w1:8080"),
+            Some("http://w1:8080")
+        );
+        assert_eq!(
+            wildcard.find_healthy_url("key", |url| url == "http://w2:8080"),
+            Some("http://w2:8080")
+        );
+
+        // Per-model rings stay scoped to their own workers.
+        assert_eq!(
+            registry
+                .get_hash_ring("llama-3")
+                .expect("ring")
+                .worker_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_wildcard_hash_ring_weights_multi_model_worker_once() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(worker_serving("http://w1:8080", &["llama-3", "gpt-4"]))
+            .unwrap();
+        registry
+            .register(worker_serving("http://w2:8080", &["gpt-4"]))
+            .unwrap();
+
+        let wildcard = registry.get_hash_ring(UNKNOWN_MODEL_ID).expect("ring");
+        assert_eq!(
+            wildcard.worker_count(),
+            2,
+            "a worker serving two models must not take a double share of the ring"
+        );
+    }
+
+    #[test]
+    fn test_wildcard_hash_ring_follows_removals() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(worker_serving("http://w1:8080", &["llama-3"]))
+            .unwrap();
+        registry
+            .register(worker_serving("http://w2:8080", &["gpt-4"]))
+            .unwrap();
+
+        registry.remove_by_url("http://w2:8080");
+        let wildcard = registry.get_hash_ring(UNKNOWN_MODEL_ID).expect("ring");
+        assert_eq!(wildcard.worker_count(), 1);
+        assert_eq!(
+            wildcard.find_healthy_url("key", |_| true),
+            Some("http://w1:8080")
+        );
+
+        registry.remove_by_url("http://w1:8080");
+        assert!(
+            registry.get_hash_ring(UNKNOWN_MODEL_ID).is_none(),
+            "an empty registry has no ring to route against"
+        );
     }
 }

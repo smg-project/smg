@@ -1,6 +1,13 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+
+// Jemalloc as the global allocator: glibc malloc retains freed pages badly
+// under the gateway's allocation churn. Prefixed symbols only — vendored C
+// libraries keep their own malloc.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use openai_protocol::worker::TransportMode;
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
@@ -220,7 +227,9 @@ struct CliArgs {
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
     eviction_interval: u64,
 
-    /// Maximum size of the approximation tree for cache-aware routing
+    /// Maximum total size of each model's approximation tree for cache-aware
+    /// routing (chars for HTTP, tokens for gRPC), shared across all workers;
+    /// eviction keeps every tree at or under this bound
     #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
 
@@ -236,13 +245,19 @@ struct CliArgs {
     #[arg(long, default_value = "random", value_parser = ["random", "min_load", "min_group"], help_heading = "Routing Policy")]
     assignment_mode: String,
 
-    /// Number of prefix tokens to use for prefix_hash policy
+    /// Number of prefix tokens to use for prefix_hash policy, or four times
+    /// as many characters of the prompt when the request is untokenized
     #[arg(long, default_value_t = 256, help_heading = "Routing Policy")]
     prefix_token_count: usize,
 
     /// Load factor threshold for prefix_hash policy
     #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     prefix_hash_load_factor: f64,
+
+    /// Absolute load difference over average a worker must also exceed before
+    /// the prefix_hash policy treats it as overloaded
+    #[arg(long, default_value_t = 10, help_heading = "Routing Policy")]
+    prefix_hash_balance_abs_threshold: usize,
 
     /// KV-pressure weight (seconds) for the least_load policy
     #[arg(long, default_value_t = 0.15, help_heading = "Routing Policy")]
@@ -314,6 +329,11 @@ struct CliArgs {
     #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
     worker_startup_check_interval: u64,
 
+    /// DP engines per startup ZMQ worker: each ipc:// worker becomes a grouped
+    /// worker whose handshake awaits this many engines on one socket set.
+    #[arg(long, help_heading = "Worker Configuration")]
+    zmq_engine_count: Option<usize>,
+
     /// Interval in seconds between load monitor checks for PowerOfTwo routing
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
@@ -322,6 +342,19 @@ struct CliArgs {
     /// gauges, polling even without a load-aware routing policy.
     #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
     engine_metrics: bool,
+
+    /// TTL in seconds for event-driven cache-aware indexer entries: entries
+    /// neither stored nor read by a query within this window are pruned.
+    /// Bounds index growth when a backend stops emitting removal events.
+    /// Unset or 0 disables the TTL pass.
+    #[arg(long, help_heading = "Routing Policy")]
+    kv_indexer_ttl_secs: Option<u64>,
+
+    /// Capacity ceiling per model for the event-driven cache-aware indexer;
+    /// beyond it, oldest-touched entries are pruned down to 90% of the
+    /// ceiling. Unset or 0 disables the ceiling.
+    #[arg(long, help_heading = "Routing Policy")]
+    kv_indexer_max_entries: Option<usize>,
 
     /// Multimodal tensor transport mode: `inline` (default), `shm` (same-host
     /// /dev/shm), or `auto` (shm only when the worker shares /dev/shm). A
@@ -403,7 +436,7 @@ struct CliArgs {
     log_json: bool,
 
     // ==================== Prometheus Metrics ====================
-    /// Port to expose Prometheus metrics
+    /// Port to expose Prometheus metrics; 0 binds an OS-assigned ephemeral port
     #[arg(long, default_value_t = 29000, help_heading = "Prometheus Metrics")]
     prometheus_port: u16,
 
@@ -1124,6 +1157,7 @@ impl CliArgs {
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.prefix_token_count,
                 load_factor: self.prefix_hash_load_factor,
+                balance_abs_threshold: self.prefix_hash_balance_abs_threshold,
             },
             "consistent_hashing" => PolicyConfig::ConsistentHashing,
             "manual" => PolicyConfig::Manual {
@@ -1469,6 +1503,7 @@ impl CliArgs {
             .policy(policy)
             .connection_mode(connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
+            .zmq_engine_count(self.zmq_engine_count)
             .host(&self.host)
             .port(self.port)
             .health_check_port(self.health_check_port)
@@ -1479,6 +1514,8 @@ impl CliArgs {
             .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
+            .kv_indexer_max_entries(self.kv_indexer_max_entries)
             .engine_metrics(self.engine_metrics)
             .multimodal_tensor_transport(self.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
@@ -1798,6 +1835,25 @@ mod tests {
             .chain(args.iter().map(|s| (*s).to_string()))
             .collect();
         Cli::parse_from(argv).router_args
+    }
+
+    /// The indexer prune flags are router-only settings and must flow into
+    /// `RouterConfig` (unset by default so the indexer stays unbounded).
+    #[test]
+    fn kv_indexer_prune_flags_flow_into_router_config() {
+        let cli = cli_args_from(&[
+            "--kv-indexer-ttl-secs",
+            "600",
+            "--kv-indexer-max-entries",
+            "500000",
+        ]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.kv_indexer_ttl_secs, Some(600));
+        assert_eq!(router_config.kv_indexer_max_entries, Some(500_000));
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.kv_indexer_ttl_secs, None);
+        assert_eq!(defaults.kv_indexer_max_entries, None);
     }
 
     /// `--health-check-port` must flow into BOTH conversion paths
