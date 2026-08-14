@@ -33,9 +33,10 @@ pub const DEFAULT_THROUGHPUT: f64 = 2000.0;
 /// ```
 ///
 /// - `queued_tokens` — the backend's waiting-queue token-work
-///   (`num_waiting_uncached_tokens`). Token-work, not request count, is what
-///   sets the wait under size-skewed traffic: a long prompt is far more work
-///   than a short one, regardless of how many requests are queued.
+///   (`num_waiting_uncached_tokens`, or `waiting_reqs · p̄` when the backend
+///   reports a queue depth but no token count for it). Token-work, not request
+///   count, is what sets the wait under size-skewed traffic: a long prompt is
+///   far more work than a short one, regardless of how many requests are queued.
 /// - `inflight_tokens` — token-work this router has dispatched to the worker
 ///   since its last load poll. Polls are stale between intervals; without this
 ///   correction, plain argmin sends a whole interval's arrivals to one worker
@@ -48,8 +49,11 @@ pub const DEFAULT_THROUGHPUT: f64 = 2000.0;
 ///
 /// Both terms are in seconds, so they add directly. Missing signals degrade
 /// gracefully and stay in time units:
-/// - no queued-token report (backend doesn't expose waiting-queue tokens):
-///   `queued_tokens = 0`, leaving in-flight-corrected drain time plus the barrier;
+/// - no queued-token report (backend exposes a queue depth but not its token
+///   count, as Prometheus-gauge backends do): the queue is estimated at
+///   `waiting_reqs · p̄`, keeping the queue visible in time units rather than
+///   scoring a backlogged worker as idle. Only a backend reporting neither
+///   scores `queued_tokens = 0`;
 /// - zero/absent throughput (backend reports no generation rate): falls back to
 ///   the configured `default_throughput`, so the work term stays in seconds and
 ///   the KV barrier stays relevant;
@@ -165,7 +169,7 @@ impl LeastLoadPolicy {
         match loads.and_then(|m| m.get(url)) {
             Some(load) => {
                 let inflight_tokens = inflight.get(url).copied().unwrap_or(0) as f64;
-                let queued_tokens = load.total_waiting_uncached_tokens() as f64;
+                let queued_tokens = self.queued_tokens(load);
                 let live_throughput = load.total_gen_throughput();
                 let throughput = if live_throughput > 0.0 {
                     live_throughput
@@ -186,6 +190,23 @@ impl LeastLoadPolicy {
             // loads): join-shortest-queue on live in-flight.
             None => worker.load() as f64,
         }
+    }
+
+    /// Waiting-queue token-work for a worker.
+    ///
+    /// Prefers the backend's own `num_waiting_uncached_tokens`. Backends that
+    /// report a queue depth but no token count for it — anything scored from
+    /// Prometheus gauges, which have no waiting-token equivalent — would
+    /// otherwise be read as having an empty queue, and the policy would go
+    /// blind to the very imbalance it exists to correct. Estimate their queue
+    /// from the same mean prefill the in-flight term uses, so a queued request
+    /// and a just-dispatched one weigh the same.
+    fn queued_tokens(&self, load: &WorkerLoadResponse) -> f64 {
+        let reported = load.total_waiting_uncached_tokens();
+        if reported > 0 {
+            return reported as f64;
+        }
+        load.total_waiting_reqs().max(0) as f64 * self.mean_prefill_tokens as f64
     }
 
     /// Token-work the request being routed adds to the chosen worker's
@@ -365,6 +386,19 @@ mod tests {
         }
     }
 
+    /// One DP rank reporting a queue depth with no token count for it — the
+    /// shape produced by any backend scored from Prometheus gauges, which have
+    /// no waiting-token equivalent.
+    fn make_load_reqs_only(
+        num_waiting_reqs: i32,
+        token_usage: f64,
+        gen_throughput: f64,
+    ) -> WorkerLoadResponse {
+        let mut load = make_load(0, token_usage, gen_throughput);
+        load.loads[0].num_waiting_reqs = num_waiting_reqs;
+        load
+    }
+
     fn mk(url: &str) -> Arc<dyn Worker> {
         Arc::new(
             BasicWorkerBuilder::new(url)
@@ -430,6 +464,74 @@ mod tests {
         loads.insert("http://b:8000".to_string(), make_load(1000, 0.2, 100.0));
         policy.update_loads(&loads);
         // a: 8000/100 = 80s ; b: 1000/100 = 10s -> pick b.
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn queue_depth_without_token_count_still_ranks_workers() {
+        // Both backends report a queue but no token count for it. Reading the
+        // absent count as an empty queue scores them identically, so the pick
+        // is a coin flip and a badly backlogged worker keeps drawing traffic.
+        let policy = LeastLoadPolicy::new(); // p̄ = 1024
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let mut loads = HashMap::new();
+        loads.insert(
+            "http://a:8000".to_string(),
+            make_load_reqs_only(64, 0.2, 100.0),
+        );
+        loads.insert(
+            "http://b:8000".to_string(),
+            make_load_reqs_only(6, 0.2, 100.0),
+        );
+        policy.update_loads(&loads);
+        // a: 64*1024/100 ≈ 655s ; b: 6*1024/100 ≈ 61s -> b, on every draw
+        // (20 is well short of the in-flight credit crossover).
+        for _ in 0..20 {
+            assert_eq!(
+                policy.select_worker(&workers, &SelectWorkerInfo::default()),
+                Some(1)
+            );
+        }
+    }
+
+    #[test]
+    fn reported_queue_tokens_win_over_the_estimate() {
+        // A backend reporting both must be scored on the real token count:
+        // 200 queued short requests are less work than one long one.
+        let policy = LeastLoadPolicy::new();
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let mut a = make_load(500, 0.2, 100.0);
+        a.loads[0].num_waiting_reqs = 200;
+        let mut loads = HashMap::new();
+        loads.insert("http://a:8000".to_string(), a);
+        loads.insert("http://b:8000".to_string(), make_load(8000, 0.2, 100.0));
+        policy.update_loads(&loads);
+        // a: its reported 500/100 = 5s, not 200*1024 ; b: 8000/100 = 80s -> a.
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn empty_queue_is_not_penalized() {
+        // Neither backend has a queue; the estimate must not manufacture one,
+        // leaving the KV barrier to decide.
+        let policy = LeastLoadPolicy::with_kv_pressure_weight(2.0);
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let mut loads = HashMap::new();
+        loads.insert(
+            "http://a:8000".to_string(),
+            make_load_reqs_only(0, 0.9, 100.0),
+        );
+        loads.insert(
+            "http://b:8000".to_string(),
+            make_load_reqs_only(0, 0.1, 100.0),
+        );
+        policy.update_loads(&loads);
         assert_eq!(
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
             Some(1)
