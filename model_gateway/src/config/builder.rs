@@ -473,6 +473,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn upstream_http2(mut self, enable: bool) -> Self {
+        self.config.upstream_http2 = enable;
+        self
+    }
+
     // ==================== WASM ====================
 
     pub fn enable_wasm(mut self, enable: bool) -> Self {

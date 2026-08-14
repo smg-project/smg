@@ -334,6 +334,12 @@ struct CliArgs {
     #[arg(long, help_heading = "Worker Configuration")]
     zmq_engine_count: Option<usize>,
 
+    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext),
+    /// multiplexing every request to a worker over one connection. Requires
+    /// every HTTP worker to serve HTTP/2 without an upgrade handshake.
+    #[arg(long, default_value_t = false, help_heading = "Worker Configuration")]
+    upstream_http2: bool,
+
     /// Interval in seconds between load monitor checks for PowerOfTwo routing
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
@@ -1595,6 +1601,7 @@ impl CliArgs {
                 assignment_mode: Self::parse_assignment_mode(&self.assignment_mode),
             })
             .retries(!self.disable_retries)
+            .upstream_http2(self.upstream_http2)
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())

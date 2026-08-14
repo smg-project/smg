@@ -209,6 +209,7 @@ class RouterArgs:
     prefix_token_count: int = 256
     prefix_hash_load_factor: float = 1.25
     prefix_hash_balance_abs_threshold: int = 10
+    upstream_http2: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -327,6 +328,16 @@ class RouterArgs:
             help=(
                 "List of worker URLs. Supports IPv4 and IPv6 addresses"
                 " (use brackets for IPv6, e.g., http://[::1]:8000 http://192.168.1.1:8000)"
+            ),
+        )
+        worker_group.add_argument(
+            f"--{prefix}upstream-http2",
+            action="store_true",
+            help=(
+                "Speak HTTP/2 to workers via prior knowledge (h2c on cleartext),"
+                " multiplexing every request to a worker over one connection."
+                " Requires every HTTP worker to serve HTTP/2 without an upgrade"
+                " handshake."
             ),
         )
         worker_group.add_argument(

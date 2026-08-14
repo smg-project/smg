@@ -406,6 +406,7 @@ struct Router {
     max_payload_size: usize,
     dp_aware: bool,
     dp_minimum_tokens_scheduler: bool,
+    upstream_http2: bool,
     api_key: Option<String>,
     log_dir: Option<String>,
     log_level: Option<String>,
@@ -853,6 +854,7 @@ impl Router {
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .enable_wasm(self.enable_wasm)
             .dp_aware(self.dp_aware)
+            .upstream_http2(self.upstream_http2)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .routing_key_override(config::RoutingKeyOverrideConfig {
@@ -1009,6 +1011,7 @@ impl Router {
         prefix_token_count = 256,
         prefix_hash_load_factor = 1.25,
         prefix_hash_balance_abs_threshold = 10,
+        upstream_http2 = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1142,6 +1145,7 @@ impl Router {
         prefix_token_count: usize,
         prefix_hash_load_factor: f64,
         prefix_hash_balance_abs_threshold: usize,
+        upstream_http2: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1192,6 +1196,7 @@ impl Router {
             max_payload_size,
             dp_aware,
             dp_minimum_tokens_scheduler,
+            upstream_http2,
             api_key,
             log_dir,
             log_level,

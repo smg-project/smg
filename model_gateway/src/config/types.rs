@@ -195,6 +195,12 @@ pub struct RouterConfig {
     /// PEM format, loaded from ca_cert_paths during config creation
     #[serde(default)]
     pub ca_certificates: Vec<Vec<u8>>,
+    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext),
+    /// multiplexing every request to a worker over one connection instead of
+    /// one TCP connection per in-flight request. Requires every HTTP worker
+    /// to serve HTTP/2 without an upgrade handshake.
+    #[serde(default)]
+    pub upstream_http2: bool,
     /// Loaded from mcp_config_path during config creation
     #[serde(skip)]
     pub mcp_config: Option<smg_mcp::McpConfig>,
@@ -907,6 +913,7 @@ impl Default for RouterConfig {
             tokenizer_cache: TokenizerCacheConfig::default(),
             client_identity: None,
             ca_certificates: vec![],
+            upstream_http2: false,
             mcp_config: None,
             enable_wasm: false,
             storage_hook_wasm_path: None,

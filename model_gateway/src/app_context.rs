@@ -464,6 +464,22 @@ impl AppContextBuilder {
             .tcp_nodelay(true)
             .tcp_keepalive(Some(Duration::from_secs(30)));
 
+        if config.upstream_http2 {
+            // Multiplex everything to a worker over one HTTP/2 connection.
+            // The default 64KB flow-control windows would let concurrent token
+            // streams throttle each other, so start large and let the adaptive
+            // window take over; h2 PING keepalives replace idle-connection
+            // churn and detect dead peers under long-lived streams.
+            client_builder = client_builder
+                .http2_prior_knowledge()
+                .http2_initial_stream_window_size(2 * 1024 * 1024)
+                .http2_initial_connection_window_size(16 * 1024 * 1024)
+                .http2_adaptive_window(true)
+                .http2_keep_alive_interval(Duration::from_secs(30))
+                .http2_keep_alive_timeout(Duration::from_secs(20))
+                .http2_keep_alive_while_idle(true);
+        }
+
         // Force rustls backend when TLS is configured
         if has_tls_config {
             client_builder = client_builder.use_rustls_tls();
@@ -753,6 +769,60 @@ impl Default for AppContextBuilder {
 mod tests {
     use super::*;
     use crate::config::types::PolicyConfig;
+
+    /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
+    /// h2c on the same listener, mirroring a dual-protocol engine.
+    async fn spawn_echo_server() -> String {
+        let app = axum::Router::new().route("/probe", axum::routing::get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind echo server");
+        let addr = listener.local_addr().expect("echo server address");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("echo serve");
+        });
+        format!("http://{addr}/probe")
+    }
+
+    fn built_client(upstream_http2: bool) -> Client {
+        let config = RouterConfig {
+            upstream_http2,
+            ..RouterConfig::default()
+        };
+        AppContextBuilder::new()
+            .with_client(&config, 5)
+            .expect("client builds")
+            .client
+            .expect("client set")
+    }
+
+    #[tokio::test]
+    async fn upstream_http2_client_speaks_h2c_prior_knowledge() {
+        let url = spawn_echo_server().await;
+        let resp = built_client(true)
+            .get(&url)
+            .send()
+            .await
+            .expect("h2c request");
+        assert_eq!(resp.version(), http::Version::HTTP_2);
+        assert_eq!(resp.text().await.expect("body"), "ok");
+    }
+
+    #[tokio::test]
+    async fn default_client_stays_http1() {
+        let url = spawn_echo_server().await;
+        let resp = built_client(false)
+            .get(&url)
+            .send()
+            .await
+            .expect("h1 request");
+        assert_eq!(resp.version(), http::Version::HTTP_11);
+        assert_eq!(resp.text().await.expect("body"), "ok");
+    }
 
     #[tokio::test]
     async fn explicit_zero_rate_limit_disables_refill() {
