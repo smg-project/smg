@@ -11,6 +11,7 @@ use std::{
 };
 
 use axum::response::{IntoResponse, Response};
+use dashmap::DashSet;
 use futures::{
     future,
     stream::{self, FuturesUnordered, StreamExt},
@@ -1047,6 +1048,7 @@ impl WorkerManager {
     pub async fn get_all_worker_loads(
         worker_registry: &WorkerRegistry,
         client: &reqwest::Client,
+        native_loads_absent: Option<&DashSet<String>>,
     ) -> WorkerLoadsResult {
         let workers = worker_registry.get_all();
         let total_workers = workers.len();
@@ -1067,7 +1069,8 @@ impl WorkerManager {
                 async move {
                     let details = match connection_mode {
                         ConnectionMode::Http => {
-                            WorkerMonitor::fetch_http_load(&client, &worker).await
+                            WorkerMonitor::fetch_http_load(&client, &worker, native_loads_absent)
+                                .await
                         }
                         ConnectionMode::Grpc | ConnectionMode::Zmq => {
                             WorkerMonitor::fetch_backend_load(&worker).await
