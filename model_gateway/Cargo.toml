@@ -15,9 +15,11 @@ readme = "../README.md"
 categories = ["web-programming", "network-programming"]
 
 [features]
-default = ["grpc-client"]
+default = ["grpc-client", "jemalloc-stats"]
 grpc-client = []
 grpc-server = []
+jemalloc-stats = ["tikv-jemallocator/stats", "dep:tikv-jemalloc-ctl"]
+jemalloc-profiling = ["tikv-jemallocator/profiling"]
 opencv-video = ["llm-multimodal/opencv-video"]
 mm-rdma = ["smg-mm-rdma/nixl"]
 # Client-injection seam for this crate's own K8s discovery integration tests
@@ -238,4 +240,4 @@ workspace = true
 
 [target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = { workspace = true }
-tikv-jemalloc-ctl = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true, optional = true, features = ["stats"] }

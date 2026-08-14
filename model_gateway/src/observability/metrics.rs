@@ -182,8 +182,28 @@ impl Default for PrometheusConfig {
 /// `PrometheusBuilder::upkeep_timeout()` in `start_prometheus`.
 pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 
+/// Marks jemalloc as the final artifact's Rust global allocator.
+///
+/// Call this before [`start_prometheus`] only from a binary or extension that
+/// declares `tikv_jemallocator::Jemalloc` with `#[global_allocator]`. Keeping
+/// this registration at the artifact boundary prevents `smg` rlib consumers
+/// that use the system allocator from publishing statistics for an unused
+/// linked jemalloc instance.
+pub fn register_jemalloc_as_global_allocator() {
+    #[cfg(all(
+        feature = "jemalloc-stats",
+        not(target_env = "msvc"),
+        not(target_env = "musl")
+    ))]
+    allocator_stats::register_global_allocator();
+}
+
 pub(crate) fn init_metrics() {
-    #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+    #[cfg(all(
+        feature = "jemalloc-stats",
+        not(target_env = "msvc"),
+        not(target_env = "musl")
+    ))]
     allocator_stats::describe();
 
     // Layer 1: HTTP metrics
@@ -523,32 +543,55 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
         .expect("failed to set event loop delay buckets")
         .install_recorder()
         .inspect(|_| {
-            #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+            #[cfg(all(
+                feature = "jemalloc-stats",
+                not(target_env = "msvc"),
+                not(target_env = "musl")
+            ))]
             allocator_stats::start_reporting();
         })
         .expect("failed to install Prometheus recorder")
 }
 
-#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[cfg(all(
+    feature = "jemalloc-stats",
+    not(target_env = "msvc"),
+    not(target_env = "musl")
+))]
 pub(crate) mod allocator_stats {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use metrics::{describe_gauge, gauge};
 
+    static JEMALLOC_IS_GLOBAL: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn register_global_allocator() {
+        JEMALLOC_IS_GLOBAL.store(true, Ordering::Release);
+    }
+
+    fn is_global_allocator() -> bool {
+        JEMALLOC_IS_GLOBAL.load(Ordering::Acquire)
+    }
+
     pub(crate) fn describe() {
+        if !is_global_allocator() {
+            return;
+        }
         describe_gauge!(
             "smg_allocator_allocated_bytes",
-            "Bytes in live allocations (jemalloc stats.allocated)"
+            "Bytes in live Rust allocations managed by SMG's jemalloc instance"
         );
         describe_gauge!(
             "smg_allocator_active_bytes",
-            "Bytes in active pages (jemalloc stats.active)"
+            "Bytes in active pages for SMG's Rust jemalloc heap"
         );
         describe_gauge!(
             "smg_allocator_resident_bytes",
-            "Bytes resident per the allocator (jemalloc stats.resident)"
+            "Upper bound on resident bytes for SMG's Rust jemalloc heap"
         );
         describe_gauge!(
             "smg_allocator_metadata_bytes",
-            "Allocator metadata bytes (jemalloc stats.metadata)"
+            "Metadata bytes for SMG's Rust jemalloc instance"
         );
     }
 
@@ -571,9 +614,12 @@ pub(crate) mod allocator_stats {
         }
     }
 
-    /// Gauges are truthful when jemalloc is the global allocator, which every
-    /// shipped artifact declares.
+    /// Registration at the final-artifact boundary keeps these gauges tied to
+    /// Rust's actual global allocator.
     pub(crate) fn start_reporting() {
+        if !is_global_allocator() {
+            return;
+        }
         record();
         // Plain thread: metrics must not depend on a runtime being alive.
         let _ = std::thread::Builder::new()
@@ -587,11 +633,13 @@ pub(crate) mod allocator_stats {
     #[cfg(test)]
     mod tests {
         #[test]
-        fn jemalloc_stats_readable() {
+        fn jemalloc_stats_interface_readable() {
             use tikv_jemalloc_ctl::{epoch, stats};
             epoch::advance().expect("epoch advance");
             stats::allocated::read().expect("stats.allocated readable");
+            stats::active::read().expect("stats.active readable");
             stats::resident::read().expect("stats.resident readable");
+            stats::metadata::read().expect("stats.metadata readable");
         }
     }
 }

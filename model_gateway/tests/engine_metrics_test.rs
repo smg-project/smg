@@ -66,4 +66,8 @@ async fn engine_pd_gauge_appears_on_metrics_endpoint() {
             .any(|l| l.starts_with("smg_engine_running_requests{")),
         "core engine sample missing from /metrics:\n{body}"
     );
+    assert!(
+        !body.contains("smg_allocator_"),
+        "an rlib consumer that did not register jemalloc exposed allocator gauges:\n{body}"
+    );
 }

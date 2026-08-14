@@ -19,7 +19,7 @@ use smg::{
         TokenizerCacheConfig, TraceConfig,
     },
     observability::{
-        metrics::PrometheusConfig,
+        metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
         otel_trace::{is_otel_enabled, shutdown_otel},
     },
     server::{self, ServerConfig},
@@ -1712,6 +1712,8 @@ impl CliArgs {
     reason = "pre-logger startup output and version display"
 )]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    register_jemalloc_as_global_allocator();
+
     // Check for version flags before parsing other args to avoid errors
     let args: Vec<String> = std::env::args().collect();
     for arg in &args {

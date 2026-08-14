@@ -1471,6 +1471,8 @@ fn get_available_reasoning_parsers() -> Vec<String> {
 
 #[pymodule]
 fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    observability::metrics::register_jemalloc_as_global_allocator();
+
     m.add_class::<PolicyType>()?;
     m.add_class::<BackendType>()?;
     m.add_class::<HistoryBackendType>()?;

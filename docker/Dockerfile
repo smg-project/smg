@@ -165,12 +165,20 @@ RUN uv pip install maturin \
 
 ######################### ROUTER IMAGE #########################
 FROM base AS router-image
+ARG TARGETARCH
 
 # Copy the built package from the build image
 COPY --from=build-image /opt/smg/bindings/python/dist/*.whl dist/
 
-# Build the package and install
-RUN uv pip install --force-reinstall dist/*.whl
+# Install the package and verify arm64's allocator configuration. BuildKit
+# supplies TARGETARCH separately for each platform in a multi-arch build.
+RUN uv pip install --force-reinstall dist/*.whl \
+    && if [ "${TARGETARCH}" = "arm64" ]; then \
+         jemalloc_stats="$(_RJEM_MALLOC_CONF=stats_print:true python3 -c 'from smg import smg_rs' 2>&1)" \
+         && printf '%s\n' "${jemalloc_stats}" | grep -F "Page size: 65536"; \
+       else \
+         python3 -c 'from smg import smg_rs'; \
+       fi
 
 # Clean up unnecessary files to reduce the image size
 RUN rm -rf /root/.cache dist/ \

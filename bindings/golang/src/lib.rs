@@ -77,6 +77,20 @@ mod tokenizer;
 mod tool_parser;
 mod utils;
 
+#[cfg(all(test, not(target_env = "msvc"), not(target_env = "musl")))]
+mod allocator_tests {
+    #[test]
+    fn rust_allocations_use_global_jemalloc() {
+        let allocated =
+            tikv_jemalloc_ctl::thread::allocatedp::read().expect("thread allocation counter");
+        let before = allocated.get();
+        let allocation = std::hint::black_box(vec![0_u8; 1024 * 1024]);
+        let after = allocated.get();
+        assert!(after > before, "Rust allocation bypassed jemalloc");
+        std::hint::black_box(&allocation);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
