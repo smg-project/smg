@@ -237,12 +237,13 @@ impl GenerationRequest for GenerateRequest {
     }
 
     fn routing_tokens(&self) -> Option<&[i32]> {
-        // Mirrors extract_text_for_routing priority: explicit text wins.
-        match (&self.text, &self.input_ids) {
-            (None, Some(InputIds::Single(ids))) => Some(ids),
+        // Token ids win over text: they key routing on what the backend KV
+        // cache keys on. Empty ids fall back to text.
+        match &self.input_ids {
+            Some(InputIds::Single(ids)) if !ids.is_empty() => Some(ids),
             // A batch is dispatched to a single worker; the first sequence is
             // the best available affinity signal.
-            (None, Some(InputIds::Batch(seqs))) => seqs
+            Some(InputIds::Batch(seqs)) => seqs
                 .first()
                 .map(Vec::as_slice)
                 .filter(|ids| !ids.is_empty()),
@@ -336,10 +337,21 @@ mod tests {
     }
 
     #[test]
-    fn routing_tokens_text_takes_priority() {
+    fn routing_tokens_prefer_input_ids_over_text() {
         let mut r = req();
         r.text = Some("hello".to_string());
         r.input_ids = Some(InputIds::Single(vec![1, 2, 3]));
+        assert_eq!(r.routing_tokens(), Some(&[1, 2, 3][..]));
+
+        r.input_ids = Some(InputIds::Batch(vec![vec![4, 5], vec![6]]));
+        assert_eq!(r.routing_tokens(), Some(&[4, 5][..]));
+    }
+
+    #[test]
+    fn routing_tokens_none_for_empty_input_ids_with_text() {
+        let mut r = req();
+        r.text = Some("hello".to_string());
+        r.input_ids = Some(InputIds::Single(vec![]));
         assert_eq!(r.routing_tokens(), None);
         assert_eq!(r.extract_text_for_routing(), "hello");
     }
