@@ -240,6 +240,12 @@ impl GenerationRequest for GenerateRequest {
         // Mirrors extract_text_for_routing priority: explicit text wins.
         match (&self.text, &self.input_ids) {
             (None, Some(InputIds::Single(ids))) => Some(ids),
+            // A batch is dispatched to a single worker; the first sequence is
+            // the best available affinity signal.
+            (None, Some(InputIds::Batch(seqs))) => seqs
+                .first()
+                .map(Vec::as_slice)
+                .filter(|ids| !ids.is_empty()),
             _ => None,
         }
     }
@@ -339,9 +345,20 @@ mod tests {
     }
 
     #[test]
-    fn routing_tokens_none_for_batch_and_empty() {
+    fn routing_tokens_from_batch_first_sequence() {
         let mut r = req();
-        r.input_ids = Some(InputIds::Batch(vec![vec![1], vec![2]]));
+        r.input_ids = Some(InputIds::Batch(vec![vec![1, 2], vec![3, 4]]));
+        assert_eq!(r.routing_tokens(), Some(&[1, 2][..]));
+    }
+
+    #[test]
+    fn routing_tokens_none_for_empty_inputs() {
+        let mut r = req();
+        r.input_ids = Some(InputIds::Batch(vec![]));
+        assert_eq!(r.routing_tokens(), None);
+
+        let mut r = req();
+        r.input_ids = Some(InputIds::Batch(vec![vec![], vec![1]]));
         assert_eq!(r.routing_tokens(), None);
 
         let r = req();
