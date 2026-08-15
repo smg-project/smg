@@ -286,6 +286,12 @@ impl CacheAwarePolicy {
         self.populate_hash_index.store(enabled, Ordering::Relaxed);
     }
 
+    /// Token tree sized to the backend's KV page (`block_size`): affinity
+    /// below one backend page is unusable by the engine.
+    fn new_token_tree(&self) -> TokenTree {
+        TokenTree::with_config(self.config.block_size.max(1), Default::default())
+    }
+
     fn should_populate_hash_index(&self) -> bool {
         self.populate_hash_index.load(Ordering::Relaxed)
     }
@@ -353,7 +359,7 @@ impl CacheAwarePolicy {
                     .insert(node_hash, matched.bytes().map(u32::from).collect());
                 self.token_trees
                     .entry(model_id.to_string())
-                    .or_insert_with(|| Arc::new(TokenTree::new()));
+                    .or_insert_with(|| Arc::new(self.new_token_tree()));
             }
         }
     }
@@ -501,7 +507,7 @@ impl CacheAwarePolicy {
             let token_tree = self
                 .token_trees
                 .entry(tree_key)
-                .or_insert_with(|| Arc::new(TokenTree::new()));
+                .or_insert_with(|| Arc::new(self.new_token_tree()));
 
             for worker in model_workers {
                 string_tree.insert_text("", worker.url());
@@ -523,7 +529,7 @@ impl CacheAwarePolicy {
         let token_tree = self
             .token_trees
             .entry(tree_key)
-            .or_insert_with(|| Arc::new(TokenTree::new()));
+            .or_insert_with(|| Arc::new(self.new_token_tree()));
         token_tree.insert_tokens(&[], worker.url());
     }
 
@@ -540,7 +546,7 @@ impl CacheAwarePolicy {
         let token_tree = self
             .token_trees
             .entry(model_id_string)
-            .or_insert_with(|| Arc::new(TokenTree::new()));
+            .or_insert_with(|| Arc::new(self.new_token_tree()));
         token_tree.insert_tokens(&[], url);
     }
 
@@ -873,7 +879,7 @@ impl TreeHandle for CacheAwarePolicy {
                 let tree = self
                     .token_trees
                     .entry(model_id.to_string())
-                    .or_insert_with(|| Arc::new(TokenTree::new()))
+                    .or_insert_with(|| Arc::new(self.new_token_tree()))
                     .clone();
                 for entry in &page.entries {
                     match entry {
@@ -2710,8 +2716,9 @@ mod tests {
         // Empty indexer → has_event_indexer returns false → falls through to token tree
         assert!(!policy.has_event_indexer("unknown"));
 
-        // Tokens must be >= PAGE_SIZE (16) to populate the tree; shorter
-        // sequences are uncacheable and fall through to min-load.
+        // Tokens must fill at least one tree page (the policy's block_size)
+        // to populate the tree; shorter sequences are uncacheable and fall
+        // through to min-load.
         let tokens: Vec<u32> = (1..=16).collect();
 
         // First request populates the token tree for the selected worker.

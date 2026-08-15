@@ -35,17 +35,15 @@ use super::{
 pub type TokenId = u32;
 
 /// Default page size for token grouping (matches SGLang's default radix cache page size).
-/// SGLang supports: 1, 16, 32, 64, 128 depending on attention backend.
-///
-/// Note: This is a compile-time constant used for the `TokenPageKey` type.
-/// The `TokenTree::with_config()` constructor accepts page_size as a parameter,
-/// but currently only page_size=16 is supported. Future versions may support
-/// other sizes via const generics or dynamic key types.
+/// Configure per tree via `TokenTree::with_config` to match the backend's
+/// KV page size; affinity below one backend page is unusable by the engine.
 pub const PAGE_SIZE: usize = 16;
 
-/// A page of tokens used as the children map key.
-/// Fixed-size array enables efficient hashing and comparison.
-pub type TokenPageKey = [TokenId; PAGE_SIZE];
+/// Children map key: a 64-bit digest of a node edge's first page.
+/// A digest (not the tokens) keeps the key size independent of page size;
+/// collisions are caught by the token comparison every walk already does,
+/// and the insert path treats them as a non-match.
+pub type TokenPageKey = u64;
 
 type NodeRef = Arc<Node>;
 
@@ -77,18 +75,21 @@ pub enum EvictionPolicy {
 /// Align token count to page boundary (truncate to nearest page).
 /// Matches SGLang's: `page_aligned_len = len(key) // page_size * page_size`
 #[inline]
-fn align_to_page(len: usize) -> usize {
-    (len / PAGE_SIZE) * PAGE_SIZE
+fn align_to_page(len: usize, page_size: usize) -> usize {
+    (len / page_size) * page_size
 }
 
-/// Extract page key from token slice (first PAGE_SIZE tokens).
-/// Panics if tokens.len() < PAGE_SIZE.
+/// Digest of the first `page_size` tokens (FxHash-style multiplication mixing).
 #[inline]
-fn make_page_key(tokens: &[TokenId]) -> TokenPageKey {
-    debug_assert!(tokens.len() >= PAGE_SIZE);
-    let mut key = [0u32; PAGE_SIZE];
-    key.copy_from_slice(&tokens[..PAGE_SIZE]);
-    key
+fn page_key_of(tokens: &[TokenId], page_size: usize) -> TokenPageKey {
+    debug_assert!(tokens.len() >= page_size);
+    let mut acc = 0u64;
+    for &tok in &tokens[..page_size] {
+        acc = acc
+            .wrapping_add(tok as u64)
+            .wrapping_mul(0x517cc1b727220a95);
+    }
+    acc
 }
 
 /// A fast hasher for token page keys.
@@ -102,19 +103,22 @@ impl Hasher for TokenPageHasher {
         self.0
     }
 
+    // Keys are u64 digests and hash via `write_u64`; fold any other input
+    // through the same mix so the hasher stays total.
     #[inline(always)]
     fn write(&mut self, bytes: &[u8]) {
-        // Process 4 bytes at a time (each token is u32)
-        for chunk in bytes.chunks(4) {
-            if chunk.len() == 4 {
-                let val = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                // FxHash-style mixing: multiply by golden ratio prime
-                self.0 = self
-                    .0
-                    .wrapping_add(val as u64)
-                    .wrapping_mul(0x517cc1b727220a95);
-            }
+        for &b in bytes {
+            self.0 = self
+                .0
+                .wrapping_add(b as u64)
+                .wrapping_mul(0x517cc1b727220a95);
         }
+    }
+
+    // The key is already a mixed digest (`page_key_of`); pass it through.
+    #[inline(always)]
+    fn write_u64(&mut self, key: u64) {
+        self.0 = key;
     }
 }
 
@@ -365,11 +369,7 @@ impl TokenTree {
     /// # Panics
     /// Panics if `page_size` != 16 (compile-time limitation, future versions may support other sizes).
     pub fn with_config(page_size: usize, policy: EvictionPolicy) -> Self {
-        assert_eq!(
-            page_size, PAGE_SIZE,
-            "TokenTree currently only supports page_size={PAGE_SIZE} (compile-time limitation). \
-             Got page_size={page_size}. Future versions may support configurable page sizes."
-        );
+        assert!(page_size >= 1, "page_size must be at least 1");
         Self {
             root: Arc::new(Node::new_root()),
             tenant_token_count: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
@@ -394,8 +394,9 @@ impl TokenTree {
     /// **Page-aligned**: Input is aligned to PAGE_SIZE boundary.
     /// Sequences shorter than PAGE_SIZE are skipped (no cache benefit).
     pub fn insert_tokens(&self, tokens: &[TokenId], tenant: &str) {
+        let page_size = self.page_size;
         // Align to page boundary (truncate to nearest page)
-        let aligned_len = align_to_page(tokens.len());
+        let aligned_len = align_to_page(tokens.len(), page_size);
         if aligned_len == 0 {
             // Sequence too short for cache benefit (matches SGLang behavior)
             return;
@@ -423,6 +424,7 @@ impl TokenTree {
             tokens,
             Arc::clone(&tenant_id),
             track_lfu,
+            page_size,
         );
 
         // Update tenant token count and tree-wide total
@@ -444,6 +446,7 @@ impl TokenTree {
         mut remaining: &[TokenId],
         tenant_id: TenantId,
         track_lfu: bool,
+        page_size: usize,
     ) -> usize {
         let mut tokens_added = 0usize;
 
@@ -458,9 +461,9 @@ impl TokenTree {
             },
         }
 
-        while remaining.len() >= PAGE_SIZE {
+        while remaining.len() >= page_size {
             // Use first PAGE_SIZE tokens as key for children lookup
-            let page_key = make_page_key(remaining);
+            let page_key = page_key_of(remaining, page_size);
 
             let step = match current.children.entry(page_key) {
                 Entry::Vacant(entry) => {
@@ -483,7 +486,7 @@ impl TokenTree {
                         .take_while(|(a, b)| a == b)
                         .count();
                     // Align common length to page boundary
-                    let common_len = align_to_page(common_len);
+                    let common_len = align_to_page(common_len, page_size);
 
                     if common_len == 0 {
                         // No page-aligned match despite same page key (shouldn't happen)
@@ -505,9 +508,9 @@ impl TokenTree {
                         // Input is prefix of child - split child at page boundary
                         // Strategy: Create NEW intermediate node with prefix tokens,
                         // keep original child as suffix (preserving its children/tenants)
-                        let common_len = align_to_page(remaining.len());
+                        let common_len = align_to_page(remaining.len(), page_size);
                         let prefix_tokens: Vec<TokenId> = child_tokens[..common_len].to_vec();
-                        let suffix_page_key = make_page_key(&child_tokens[common_len..]);
+                        let suffix_page_key = page_key_of(&child_tokens[common_len..], page_size);
                         drop(child_tokens);
 
                         // Truncate the child to its suffix, clone its tenant
@@ -566,7 +569,8 @@ impl TokenTree {
                         // Strategy: Create NEW intermediate node with common prefix,
                         // keep original child as one suffix, create new node for other suffix
                         let prefix_tokens: Vec<TokenId> = child_tokens[..common_len].to_vec();
-                        let child_suffix_page_key = make_page_key(&child_tokens[common_len..]);
+                        let child_suffix_page_key =
+                            page_key_of(&child_tokens[common_len..], page_size);
                         drop(child_tokens);
 
                         // Truncate + tenant-map clone + re-parent in one
@@ -603,9 +607,9 @@ impl TokenTree {
 
                         // Create new node for the remaining input suffix
                         let new_remaining = &remaining[common_len..];
-                        let new_branch_tokens = if new_remaining.len() >= PAGE_SIZE {
+                        let new_branch_tokens = if new_remaining.len() >= page_size {
                             let new_node = Arc::new(Node::new(new_remaining.to_vec()));
-                            let new_page_key = make_page_key(new_remaining);
+                            let new_page_key = page_key_of(new_remaining, page_size);
                             new_node.set_parent(&intermediate_node, new_page_key);
                             new_node.touch_tenant(&tenant_id, track_lfu);
                             intermediate_node.children.insert(new_page_key, new_node);
@@ -653,10 +657,11 @@ impl TokenTree {
     /// **Page-aligned**: Input is aligned to PAGE_SIZE boundary before lookup.
     /// Sequences shorter than PAGE_SIZE return 0 matched tokens.
     pub fn match_prefix_with_counts(&self, tokens: &[TokenId]) -> PrefixMatchResult {
+        let page_size = self.page_size;
         let input_token_count = tokens.len();
 
         // Align to page boundary (truncate to nearest page)
-        let aligned_len = align_to_page(tokens.len());
+        let aligned_len = align_to_page(tokens.len(), page_size);
         if aligned_len == 0 {
             // Sequence too short for cache lookup (matches SGLang behavior)
             return PrefixMatchResult {
@@ -692,9 +697,9 @@ impl TokenTree {
             },
         }
 
-        while remaining.len() >= PAGE_SIZE {
+        while remaining.len() >= page_size {
             // Use first PAGE_SIZE tokens as key for children lookup
-            let page_key = make_page_key(remaining);
+            let page_key = page_key_of(remaining, page_size);
 
             let step = match current.children.get(&page_key) {
                 None => MatchStep::Done,
@@ -722,7 +727,7 @@ impl TokenTree {
                         .take_while(|(a, b)| a == b)
                         .count();
                     // Align match length to page boundary
-                    let match_len = align_to_page(match_len);
+                    let match_len = align_to_page(match_len, page_size);
 
                     if match_len == 0 {
                         MatchStep::Done
@@ -800,11 +805,12 @@ impl TokenTree {
     /// condition before insert mutates deeper nodes, so the routed tenant and
     /// matched count are resolved against the pre-insert tree.
     pub fn match_and_insert(&self, tokens: &[TokenId], tenant: &str) -> PrefixMatchResult {
+        let page_size = self.page_size;
         let input_token_count = tokens.len();
 
         // Align to page boundary (truncate to nearest page). Mirrors both
         // `match_prefix_with_counts` and `insert_tokens`.
-        let aligned_len = align_to_page(tokens.len());
+        let aligned_len = align_to_page(tokens.len(), page_size);
         if aligned_len == 0 {
             // Too short to cache: `insert_tokens` is a no-op and
             // `match_prefix_with_counts` returns 0 matched tokens with any
@@ -855,8 +861,8 @@ impl TokenTree {
             },
         }
 
-        while remaining.len() >= PAGE_SIZE {
-            let page_key = make_page_key(remaining);
+        while remaining.len() >= page_size {
+            let page_key = page_key_of(remaining, page_size);
 
             let step = match current.children.entry(page_key) {
                 Entry::Vacant(entry) => {
@@ -878,7 +884,7 @@ impl TokenTree {
                         .zip(child_tokens.iter())
                         .take_while(|(a, b)| a == b)
                         .count();
-                    let common_len = align_to_page(common_len);
+                    let common_len = align_to_page(common_len, page_size);
 
                     if common_len == 0 {
                         // Same page key but no aligned match (shouldn't happen).
@@ -942,9 +948,9 @@ impl TokenTree {
                             }
                         }
 
-                        let common_len = align_to_page(remaining.len());
+                        let common_len = align_to_page(remaining.len(), page_size);
                         let prefix_tokens: Vec<TokenId> = child_tokens[..common_len].to_vec();
-                        let suffix_page_key = make_page_key(&child_tokens[common_len..]);
+                        let suffix_page_key = page_key_of(&child_tokens[common_len..], page_size);
                         drop(child_tokens);
 
                         // Truncate + tenant-map clone + re-parent in one
@@ -1000,7 +1006,8 @@ impl TokenTree {
                         }
 
                         let prefix_tokens: Vec<TokenId> = child_tokens[..common_len].to_vec();
-                        let child_suffix_page_key = make_page_key(&child_tokens[common_len..]);
+                        let child_suffix_page_key =
+                            page_key_of(&child_tokens[common_len..], page_size);
                         drop(child_tokens);
 
                         // Truncate + tenant-map clone + re-parent in one
@@ -1032,9 +1039,9 @@ impl TokenTree {
                             .insert(child_suffix_page_key, Arc::clone(&child));
 
                         let new_remaining = &remaining[common_len..];
-                        let new_branch_tokens = if new_remaining.len() >= PAGE_SIZE {
+                        let new_branch_tokens = if new_remaining.len() >= page_size {
                             let new_node = Arc::new(Node::new(new_remaining.to_vec()));
-                            let new_page_key = make_page_key(new_remaining);
+                            let new_page_key = page_key_of(new_remaining, page_size);
                             new_node.set_parent(&intermediate_node, new_page_key);
                             new_node.touch_tenant(&tenant_id, track_lfu);
                             intermediate_node.children.insert(new_page_key, new_node);
@@ -1098,9 +1105,10 @@ impl TokenTree {
     where
         F: FnOnce(&PrefixMatchResult) -> Option<&'t str>,
     {
+        let page_size = self.page_size;
         let input_token_count = tokens.len();
 
-        let aligned_len = align_to_page(tokens.len());
+        let aligned_len = align_to_page(tokens.len(), page_size);
         if aligned_len == 0 {
             // Too short to cache: `insert_tokens` is a no-op regardless of the
             // selected tenant, so just resolve + return the match result. We
@@ -1142,8 +1150,8 @@ impl TokenTree {
             Continue { next: NodeRef, advance: usize },
         }
 
-        while remaining.len() >= PAGE_SIZE {
-            let page_key = make_page_key(remaining);
+        while remaining.len() >= page_size {
+            let page_key = page_key_of(remaining, page_size);
 
             let step = match current.children.get(&page_key) {
                 None => MatchStep::Stop,
@@ -1163,7 +1171,7 @@ impl TokenTree {
                         .zip(child_tokens.iter())
                         .take_while(|(a, b)| a == b)
                         .count();
-                    let match_len = align_to_page(match_len);
+                    let match_len = align_to_page(match_len, page_size);
 
                     if match_len == 0 {
                         drop(child_tokens);
@@ -1269,9 +1277,14 @@ impl TokenTree {
         // concurrent split race, full-match-continue — cases identically to a
         // standalone `insert_tokens`. The matched prefix above `current` was
         // already re-attached by the loop above and is never re-walked.
-        if remaining.len() >= PAGE_SIZE {
-            tokens_added +=
-                Self::insert_from(current, remaining, Arc::clone(&tenant_id), track_lfu);
+        if remaining.len() >= page_size {
+            tokens_added += Self::insert_from(
+                current,
+                remaining,
+                Arc::clone(&tenant_id),
+                track_lfu,
+                page_size,
+            );
         }
 
         self.add_tenant_tokens(tenant_id, tokens_added);
@@ -3362,10 +3375,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "TokenTree currently only supports page_size=16")]
+    #[should_panic(expected = "page_size must be at least 1")]
     fn test_tree_with_config_invalid_page_size() {
-        // Test that invalid page_size panics
-        let _tree = TokenTree::with_config(32, EvictionPolicy::Lru);
+        let _tree = TokenTree::with_config(0, EvictionPolicy::Lru);
     }
 
     #[test]
@@ -3557,7 +3569,10 @@ mod tests {
             })
             .collect();
         let tenants: Vec<String> = (0..N_PREFIXES).map(|j| format!("t{j}")).collect();
-        let lens: Vec<usize> = prefixes.iter().map(|p| align_to_page(p.len())).collect();
+        let lens: Vec<usize> = prefixes
+            .iter()
+            .map(|p| align_to_page(p.len(), PAGE_SIZE))
+            .collect();
 
         let tree = Arc::new(TokenTree::new());
         let prefixes = Arc::new(prefixes);
@@ -3779,5 +3794,67 @@ mod tests {
         assert!(!tree.get_tenant_token_counts().contains_key("tenant1"));
         let r = tree.match_prefix_with_counts(&make_tokens(500, 3));
         assert_eq!(r.matched_token_count, 0);
+    }
+
+    /// One full round at a non-default page size: page alignment, sub-page
+    /// skip, split at a page boundary, and prefix subsumption across
+    /// different-length inserts.
+    fn roundtrip_at_page_size(page: usize) {
+        let tree = TokenTree::with_config(page, EvictionPolicy::default());
+        let seq: Vec<TokenId> = (0..(3 * page) as u32).collect();
+
+        // Sub-page: uncacheable.
+        tree.insert_tokens(&seq[..page - 1], "w1");
+        assert_eq!(tree.match_prefix_with_counts(&seq).matched_token_count, 0);
+
+        // Three pages under w1; a two-page prefix must subsume.
+        tree.insert_tokens(&seq, "w1");
+        let full = tree.match_prefix_with_counts(&seq);
+        assert_eq!(full.matched_token_count, 3 * page);
+        assert_eq!(full.tenant.as_ref(), "w1");
+        assert_eq!(
+            tree.match_prefix_with_counts(&seq[..2 * page])
+                .matched_token_count,
+            2 * page
+        );
+
+        // Diverge after page 1 under w2: forces a split at a page boundary.
+        let mut fork: Vec<TokenId> = seq[..page].to_vec();
+        fork.extend((0..(2 * page) as u32).map(|i| 900_000 + i));
+        tree.insert_tokens(&fork, "w2");
+        let forked = tree.match_prefix_with_counts(&fork);
+        assert_eq!(forked.matched_token_count, 3 * page);
+        assert_eq!(forked.tenant.as_ref(), "w2");
+        // Shared first page still matches; unaligned tails truncate.
+        let mut partial: Vec<TokenId> = seq[..page].to_vec();
+        partial.extend([1_000_001, 1_000_002]);
+        assert_eq!(
+            tree.match_prefix_with_counts(&partial).matched_token_count,
+            page
+        );
+    }
+
+    #[test]
+    fn configurable_page_size_roundtrip() {
+        for page in [1, 3, 16, 512, 4096] {
+            roundtrip_at_page_size(page);
+        }
+    }
+
+    #[test]
+    fn per_tree_page_size_is_independent() {
+        let coarse = TokenTree::with_config(512, EvictionPolicy::default());
+        let seq: Vec<TokenId> = (0..600).collect();
+        coarse.insert_tokens(&seq, "w1");
+        // 600 tokens = one 512 page; the 88-token tail is uncacheable.
+        assert_eq!(
+            coarse.match_prefix_with_counts(&seq).matched_token_count,
+            512
+        );
+
+        let fine = TokenTree::new();
+        fine.insert_tokens(&seq, "w1");
+        // Default 16: aligned to 592.
+        assert_eq!(fine.match_prefix_with_counts(&seq).matched_token_count, 592);
     }
 }
