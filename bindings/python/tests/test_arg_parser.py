@@ -1215,6 +1215,10 @@ class TestRouterArgsFieldOrder:
         "model_aliases",
         "worker_startup_delay",
         "zmq_engine_count",
+        "prefix_token_count",
+        "prefix_hash_load_factor",
+        "prefix_hash_balance_abs_threshold",
+        "upstream_http2",
         "overlap_decay",
         "selection_temperature",
     ]
