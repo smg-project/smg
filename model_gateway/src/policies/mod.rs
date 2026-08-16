@@ -106,7 +106,16 @@ pub trait DPRankLoadPolicy: Send + Sync + Debug {
 #[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
     pub cache_threshold: f32,
+    /// Absolute load margin for the per-request candidate gate: the selected
+    /// worker spills to least-loaded when its load exceeds the healthy-fleet
+    /// mean by this many requests AND by `balance_rel_threshold`. Requiring
+    /// both keeps the gate quiet on steady-state variance at low means
+    /// (absolute) without going blind to a deep queue at high means
+    /// (relative).
     pub balance_abs_threshold: usize,
+    /// Relative load margin (multiple of the healthy-fleet mean) for the
+    /// per-request candidate gate; fires only together with
+    /// `balance_abs_threshold`.
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,

@@ -201,11 +201,14 @@ struct CliArgs {
     #[arg(long, default_value_t = 0.3, help_heading = "Routing Policy")]
     cache_threshold: f32,
 
-    /// Absolute threshold for load balancing trigger
+    /// Absolute load margin for the balancing check. For cache-aware routing
+    /// the selected worker spills to least-loaded when its load exceeds the
+    /// healthy-fleet mean by this many requests AND by balance_rel_threshold.
     #[arg(long, default_value_t = 64, help_heading = "Routing Policy")]
     balance_abs_threshold: usize,
 
-    /// Relative threshold for load balancing trigger
+    /// Relative load margin for the balancing check (multiple of the
+    /// healthy-fleet mean); fires only together with balance_abs_threshold.
     #[arg(long, default_value_t = 1.5, help_heading = "Routing Policy")]
     balance_rel_threshold: f32,
 

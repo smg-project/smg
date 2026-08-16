@@ -27,7 +27,7 @@ use parking_lot::RwLock as ParkingLotRwLock;
 use tracing::debug;
 
 use super::{
-    common::{MatchResult, TenantId},
+    common::{MatchResult, TenantId, MATCHED_TENANTS_CAP},
     RadixTree,
 };
 
@@ -145,6 +145,11 @@ pub struct PrefixMatchResult {
     pub matched_token_count: usize,
     /// Total number of tokens in the input
     pub input_token_count: usize,
+    /// Tenants holding the deepest matched node (capped at
+    /// [`MATCHED_TENANTS_CAP`]): every one of them has the matched prefix,
+    /// so a router can pressure-select among them instead of being bound to
+    /// the single cached `tenant`. Empty when nothing matched.
+    pub matched_tenants: Vec<TenantId>,
 }
 
 impl MatchResult for PrefixMatchResult {
@@ -270,6 +275,15 @@ impl Node {
             .iter()
             .next()
             .map(|entry| Arc::clone(entry.key()))
+    }
+
+    /// Up to [`MATCHED_TENANTS_CAP`] tenants of this node, in map order.
+    fn matched_tenants(&self) -> Vec<TenantId> {
+        self.tenant_last_access_time
+            .iter()
+            .take(MATCHED_TENANTS_CAP)
+            .map(|entry| Arc::clone(entry.key()))
+            .collect()
     }
 
     /// Update tenant access and cache (with probabilistic update to reduce contention).
@@ -671,12 +685,14 @@ impl TokenTree {
                     .unwrap_or_else(|| intern_tenant("empty")),
                 matched_token_count: 0,
                 input_token_count,
+                matched_tenants: Vec::new(),
             };
         }
         let tokens = &tokens[..aligned_len];
 
         let mut matched_tokens = 0;
         let mut last_tenant: Option<TenantId> = None;
+        let mut last_match_node: Option<NodeRef> = None;
         let mut remaining = tokens;
         let mut current = Arc::clone(&self.root);
 
@@ -694,6 +710,7 @@ impl TokenTree {
             PartialMatch {
                 matched: usize,
                 tenant: Option<TenantId>,
+                node: NodeRef,
             },
         }
 
@@ -747,9 +764,11 @@ impl TokenTree {
 
                             if match_len < child_tokens.len() {
                                 // Partial match within node (at page boundary)
+                                drop(child_tokens);
                                 MatchStep::PartialMatch {
                                     matched: match_len,
                                     tenant,
+                                    node: child,
                                 }
                             } else {
                                 // Full match - continue
@@ -768,10 +787,15 @@ impl TokenTree {
             match step {
                 MatchStep::Done => break,
                 MatchStep::Retry => continue,
-                MatchStep::PartialMatch { matched, tenant } => {
+                MatchStep::PartialMatch {
+                    matched,
+                    tenant,
+                    node,
+                } => {
                     matched_tokens += matched;
                     if let Some(t) = tenant {
                         last_tenant = Some(t);
+                        last_match_node = Some(node);
                     }
                     break;
                 }
@@ -783,6 +807,7 @@ impl TokenTree {
                     matched_tokens += advance;
                     if let Some(t) = tenant {
                         last_tenant = Some(t);
+                        last_match_node = Some(Arc::clone(&next));
                     }
                     remaining = &remaining[advance..];
                     current = next;
@@ -794,6 +819,9 @@ impl TokenTree {
             tenant: last_tenant.unwrap_or_else(|| intern_tenant("empty")),
             matched_token_count: matched_tokens,
             input_token_count,
+            matched_tenants: last_match_node
+                .map(|node| node.matched_tenants())
+                .unwrap_or_default(),
         }
     }
 
@@ -822,6 +850,7 @@ impl TokenTree {
                     .unwrap_or_else(|| intern_tenant("empty")),
                 matched_token_count: 0,
                 input_token_count,
+                matched_tenants: Vec::new(),
             };
         }
         let tokens = &tokens[..aligned_len];
@@ -841,9 +870,13 @@ impl TokenTree {
         let mut current = Arc::clone(&self.root);
         let mut tokens_added = 0usize;
 
-        // Match-result accumulators.
+        // Match-result accumulators. The tenant set is snapshotted at each
+        // match site (pre-insert node state): the insert side touches the
+        // node right after, and a post-walk read would see the inserting
+        // tenant that match-then-insert could not have.
         let mut matched_tokens = 0usize;
         let mut last_tenant: Option<TenantId> = None;
+        let mut matched_tenants: Vec<TenantId> = Vec::new();
         // Once the match descent would have stopped (empty node or partial
         // match), stop updating the match result; insert keeps descending.
         let mut match_frozen = false;
@@ -910,6 +943,7 @@ impl TokenTree {
                                 }
                                 Some(t_match) => {
                                     matched_tokens += common_len;
+                                    matched_tenants = child.matched_tenants();
                                     child.touch_tenant(&t_match, track_lfu);
                                     last_tenant = Some(t_match);
                                 }
@@ -942,6 +976,7 @@ impl TokenTree {
                                 None => match_frozen = true,
                                 Some(t_match) => {
                                     matched_tokens += common_len;
+                                    matched_tenants = child.matched_tenants();
                                     child.touch_tenant(&t_match, track_lfu);
                                     last_tenant = Some(t_match);
                                 }
@@ -999,6 +1034,7 @@ impl TokenTree {
                                 None => match_frozen = true,
                                 Some(t_match) => {
                                     matched_tokens += common_len;
+                                    matched_tenants = child.matched_tenants();
                                     child.touch_tenant(&t_match, track_lfu);
                                     last_tenant = Some(t_match);
                                 }
@@ -1085,6 +1121,7 @@ impl TokenTree {
             tenant: last_tenant.unwrap_or_else(|| intern_tenant("empty")),
             matched_token_count: matched_tokens,
             input_token_count,
+            matched_tenants,
         }
     }
 
@@ -1121,6 +1158,7 @@ impl TokenTree {
                     .unwrap_or_else(|| intern_tenant("empty")),
                 matched_token_count: 0,
                 input_token_count,
+                matched_tenants: Vec::new(),
             };
             let _ = select(&result);
             return result;
@@ -1135,6 +1173,7 @@ impl TokenTree {
         // remaining slice for the splice.
         let mut matched_tokens = 0usize;
         let mut last_tenant: Option<TenantId> = None;
+        let mut last_match_node: Option<NodeRef> = None;
         let mut remaining = tokens;
         let mut current = Arc::clone(&self.root);
         // Every full-match node we descended through, in order.
@@ -1183,6 +1222,7 @@ impl TokenTree {
                                 child.touch_tenant(&t, track_lfu);
                                 matched_tokens += match_len;
                                 last_tenant = Some(t);
+                                last_match_node = Some(Arc::clone(&child));
                             }
                             // (If the node is all-evicted, match records nothing
                             // and simply stops — same as match_prefix_with_counts.)
@@ -1206,6 +1246,7 @@ impl TokenTree {
                                     child.touch_tenant(&t, track_lfu);
                                     matched_tokens += match_len;
                                     last_tenant = Some(t);
+                                    last_match_node = Some(Arc::clone(&child));
                                 }
                             }
                         }
@@ -1233,6 +1274,9 @@ impl TokenTree {
             tenant: last_tenant.unwrap_or_else(|| intern_tenant("empty")),
             matched_token_count: matched_tokens,
             input_token_count,
+            matched_tenants: last_match_node
+                .map(|node| node.matched_tenants())
+                .unwrap_or_default(),
         };
         let Some(tenant) = select(&result) else {
             // No insert (router selected no worker).
@@ -1970,6 +2014,68 @@ mod tests {
         let result = tree.match_prefix_with_counts(&[]);
         assert_eq!(result.matched_token_count, 0);
         assert_eq!(result.input_token_count, 0);
+    }
+
+    #[test]
+    fn test_matched_tenants_all_holders_of_deepest_node() {
+        let tree = TokenTree::new();
+        let tokens = make_tokens(1, 2);
+        tree.insert_tokens(&tokens, "tenant1");
+        tree.insert_tokens(&tokens, "tenant2");
+        // tenant3 holds only the first page — not the deepest matched node.
+        tree.insert_tokens(&make_tokens(1, 1), "tenant3");
+
+        let result = tree.match_prefix_with_counts(&tokens);
+        assert_eq!(result.matched_token_count, 32);
+        let mut tenants: Vec<&str> = result.matched_tenants.iter().map(AsRef::as_ref).collect();
+        tenants.sort_unstable();
+        assert_eq!(tenants, ["tenant1", "tenant2"]);
+    }
+
+    #[test]
+    fn test_matched_tenants_empty_on_no_match() {
+        let tree = TokenTree::new();
+        tree.insert_tokens(&make_tokens(1, 1), "tenant1");
+
+        let result = tree.match_prefix_with_counts(&make_tokens(1000, 1));
+        assert_eq!(result.matched_token_count, 0);
+        assert!(result.matched_tenants.is_empty());
+    }
+
+    #[test]
+    fn test_matched_tenants_capped() {
+        let tree = TokenTree::new();
+        let tokens = make_tokens(1, 1);
+        for i in 0..(MATCHED_TENANTS_CAP + 4) {
+            tree.insert_tokens(&tokens, &format!("tenant{i}"));
+        }
+
+        let result = tree.match_prefix_with_counts(&tokens);
+        assert_eq!(result.matched_token_count, PAGE_SIZE);
+        assert_eq!(result.matched_tenants.len(), MATCHED_TENANTS_CAP);
+    }
+
+    #[test]
+    fn test_match_and_insert_with_populates_matched_tenants() {
+        let tree = TokenTree::new();
+        let tokens = make_tokens(1, 2);
+        tree.insert_tokens(&tokens, "tenant1");
+        tree.insert_tokens(&tokens, "tenant2");
+
+        let result = tree.match_and_insert_with(&tokens, |result| {
+            let mut tenants: Vec<&str> = result.matched_tenants.iter().map(AsRef::as_ref).collect();
+            tenants.sort_unstable();
+            assert_eq!(tenants, ["tenant1", "tenant2"]);
+            Some("tenant3")
+        });
+        assert_eq!(result.matched_token_count, 32);
+
+        // The insert made tenant3 a holder of the same path.
+        let result = tree.match_prefix_with_counts(&tokens);
+        assert!(result
+            .matched_tenants
+            .iter()
+            .any(|tenant| tenant.as_ref() == "tenant3"));
     }
 
     #[test]
@@ -3457,6 +3563,18 @@ mod tests {
                 r_pair.tenant.as_ref(),
                 r_fused.tenant.as_ref(),
                 "matched tenant mismatch"
+            );
+            // Compare as sets: tenant-map iteration order is unstable.
+            let sorted = |result: &PrefixMatchResult| {
+                let mut tenants: Vec<&str> =
+                    result.matched_tenants.iter().map(AsRef::as_ref).collect();
+                tenants.sort_unstable();
+                tenants.into_iter().map(String::from).collect::<Vec<_>>()
+            };
+            assert_eq!(
+                sorted(&r_pair),
+                sorted(&r_fused),
+                "matched_tenants mismatch for tenant {tenant}"
             );
         }
         assert_eq!(

@@ -480,7 +480,14 @@ pub enum PolicyConfig {
     #[serde(rename = "cache_aware")]
     CacheAware {
         cache_threshold: f32,
+        /// Absolute load margin for the per-request candidate gate: the
+        /// selected worker spills to least-loaded when its load exceeds the
+        /// healthy-fleet mean by this many requests AND by
+        /// `balance_rel_threshold`.
         balance_abs_threshold: usize,
+        /// Relative load margin (multiple of the healthy-fleet mean) for the
+        /// per-request candidate gate; fires only together with
+        /// `balance_abs_threshold`.
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,

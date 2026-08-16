@@ -14,7 +14,7 @@ use parking_lot::RwLock;
 use tracing::debug;
 
 use super::{
-    common::{MatchResult, TenantId},
+    common::{MatchResult, TenantId, MATCHED_TENANTS_CAP},
     RadixTree,
 };
 
@@ -51,6 +51,11 @@ pub struct PrefixMatchResult {
     pub matched_char_count: usize,
     /// Total number of characters in the input text
     pub input_char_count: usize,
+    /// Tenants holding the deepest matched node (capped at
+    /// [`MATCHED_TENANTS_CAP`]): every one of them has the matched prefix,
+    /// so a router can pressure-select among them instead of being bound to
+    /// the single cached `tenant`. Empty when nothing matched.
+    pub matched_tenants: Vec<TenantId>,
 }
 
 impl MatchResult for PrefixMatchResult {
@@ -265,6 +270,15 @@ struct Node {
 }
 
 impl Node {
+    /// Up to [`MATCHED_TENANTS_CAP`] tenants of this node, in map order.
+    fn matched_tenants(&self) -> Vec<TenantId> {
+        self.tenant_last_access_time
+            .iter()
+            .take(MATCHED_TENANTS_CAP)
+            .map(|entry| Arc::clone(entry.key()))
+            .collect()
+    }
+
     /// Attach `tenant` with `timestamp` unless already present. Returns true
     /// when this call newly attached the tenant — the atomic winner under
     /// concurrency, so char accounting tied to it is exact.
@@ -694,6 +708,11 @@ impl Tree {
             tenant,
             matched_char_count: matched_chars,
             input_char_count,
+            matched_tenants: if matched_chars > 0 {
+                curr.matched_tenants()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -897,6 +916,11 @@ impl Tree {
             tenant: Arc::clone(tenant),
             matched_char_count: matched_chars,
             input_char_count,
+            matched_tenants: if matched_chars > 0 {
+                match_node.matched_tenants()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -1936,6 +1960,64 @@ mod tests {
             .iter()
             .map(|entry| (entry.key().to_string(), *entry.value()))
             .collect()
+    }
+
+    #[test]
+    fn test_matched_tenants_all_holders_of_deepest_node() {
+        let tree = Tree::new();
+        tree.insert_text("hello world", "tenant1");
+        tree.insert_text("hello world", "tenant2");
+        // tenant3 holds only a shallower prefix.
+        tree.insert_text("hello", "tenant3");
+
+        let result = tree.match_prefix_with_counts("hello world");
+        assert_eq!(result.matched_char_count, 11);
+        let mut tenants: Vec<&str> = result.matched_tenants.iter().map(AsRef::as_ref).collect();
+        tenants.sort_unstable();
+        assert_eq!(tenants, ["tenant1", "tenant2"]);
+    }
+
+    #[test]
+    fn test_matched_tenants_empty_on_no_match() {
+        let tree = Tree::new();
+        tree.insert_text("hello", "tenant1");
+
+        let result = tree.match_prefix_with_counts("zzz");
+        assert_eq!(result.matched_char_count, 0);
+        assert!(result.matched_tenants.is_empty());
+    }
+
+    #[test]
+    fn test_matched_tenants_capped() {
+        let tree = Tree::new();
+        for i in 0..(MATCHED_TENANTS_CAP + 4) {
+            tree.insert_text("hello world", &format!("tenant{i}"));
+        }
+
+        let result = tree.match_prefix_with_counts("hello world");
+        assert_eq!(result.matched_char_count, 11);
+        assert_eq!(result.matched_tenants.len(), MATCHED_TENANTS_CAP);
+    }
+
+    #[test]
+    fn test_match_and_insert_with_populates_matched_tenants() {
+        let tree = Tree::new();
+        tree.insert_text("hello world", "tenant1");
+        tree.insert_text("hello world", "tenant2");
+
+        let result = tree.match_and_insert_with("hello world", |result| {
+            let mut tenants: Vec<&str> = result.matched_tenants.iter().map(AsRef::as_ref).collect();
+            tenants.sort_unstable();
+            assert_eq!(tenants, ["tenant1", "tenant2"]);
+            Some("tenant3")
+        });
+        assert_eq!(result.matched_char_count, 11);
+
+        let result = tree.match_prefix_with_counts("hello world");
+        assert!(result
+            .matched_tenants
+            .iter()
+            .any(|tenant| tenant.as_ref() == "tenant3"));
     }
 
     #[test]

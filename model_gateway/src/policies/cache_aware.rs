@@ -409,12 +409,11 @@ impl CacheAwarePolicy {
         *self.load_rx.write() = rx;
     }
 
-    /// True when the pool is imbalanced enough to abandon cache affinity.
+    /// True when backend KV pressure demands abandoning cache affinity.
     ///
-    /// Three independent triggers, OR'd together. The two KV-based triggers
-    /// require a backend `token_usage` snapshot and are disabled at their `1.0`
-    /// default (utilization and spread are both `<= 1.0`, so `> 1.0` never
-    /// fires):
+    /// Two triggers, OR'd together, both requiring a backend `token_usage`
+    /// snapshot and disabled at their `1.0` default (utilization and spread
+    /// are both `<= 1.0`, so `> 1.0` never fires):
     ///
     /// - **overload** (`overload_token_usage_threshold`): the hottest engine's
     ///   KV utilization exceeds the ceiling — a critically-saturated engine,
@@ -424,21 +423,14 @@ impl CacheAwarePolicy {
     ///   exists to spill toward. This is the true balance signal for long-context
     ///   workloads, and — unlike request counts, which each gateway sees only
     ///   locally — it is invariant to the number of gateway replicas.
-    /// - **count spread**: request-count dispersion (abs AND rel) over healthy
-    ///   workers. Always evaluated, so high-count / low-KV imbalance is still
-    ///   caught when KV looks even.
-    /// Whether to abandon cache affinity for shortest-queue because the pool is
-    /// imbalanced — by backend KV usage (overload ceiling or hot-vs-cool spread)
-    /// or by request-count spread. `min_load`/`max_load` are the request-count
-    /// bounds over the healthy workers, which `select_worker` gathers in its
-    /// single worker pass (tests use the `imbalanced` helper to fold them).
-    fn is_imbalanced(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        healthy_indices: &[usize],
-        min_load: usize,
-        max_load: usize,
-    ) -> bool {
+    ///
+    /// Request-count dispersion is deliberately NOT a trigger here: a global
+    /// spread check is either noise-triggered (small thresholds fire on
+    /// steady-state variance and disable affinity outright) or blind (large
+    /// thresholds admit a single deep queue sitting under them). Count
+    /// pressure is instead applied per request, to the selected candidate,
+    /// in [`Self::gate_selected_candidate`].
+    fn is_kv_imbalanced(&self, workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> bool {
         // KV-based triggers — need a load snapshot; both default 1.0 = disabled.
         if let Some((min_usage, max_usage)) =
             self.backend_token_usage_bounds(workers, healthy_indices)
@@ -452,10 +444,7 @@ impl CacheAwarePolicy {
                 return true;
             }
         }
-
-        // Count spread (abs AND rel) over healthy workers.
-        max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
-            && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold)
+        false
     }
 
     /// Min and max backend KV-cache utilization (0.0–1.0) across healthy workers
@@ -937,11 +926,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // Single O(workers) gather: read each worker once via routing_state()
         // (status + load + processed under one ArcSwap guard), replacing the
         // former separate passes whose per-worker guard traffic dominated routing
-        // CPU at scale. Collects healthy indices, load min/max, and the min-load
-        // index; cache-hit tenant lookup is a hash-free scan over healthy_indices.
+        // CPU at scale. Collects healthy indices, the load sum (for the
+        // per-request pressure gate), and the min-load index.
         let mut healthy_indices: Vec<usize> = Vec::with_capacity(workers.len());
-        let mut min_load = usize::MAX;
-        let mut max_load = 0usize;
+        let mut load_sum = 0usize;
         // Min-load worker, (load, processed_requests, idx) tie-break (#1714);
         // `processed` rides the same guard as `load`, so it is free here.
         let mut min_key: Option<(usize, usize, usize)> = None;
@@ -950,8 +938,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             let state = worker.routing_state();
             if state.healthy && state.can_execute {
                 healthy_indices.push(idx);
-                min_load = min_load.min(state.load);
-                max_load = max_load.max(state.load);
+                load_sum += state.load;
                 let key = (state.load, state.processed, idx);
                 match min_key {
                     Some(best) if key >= best => {}
@@ -966,16 +953,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         if healthy_indices.is_empty() {
             return None;
         }
-        let min_load = if min_load == usize::MAX { 0 } else { min_load };
+        let avg_load = load_sum as f64 / healthy_indices.len() as f64;
 
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
         let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
 
-        // Abandon cache affinity for shortest-queue when the pool is imbalanced —
-        // by request count (using the loads already gathered above), or (for
-        // long-context workloads) by backend KV usage.
-        if self.is_imbalanced(workers, &healthy_indices, min_load, max_load) {
+        // Abandon cache affinity fleet-wide only under backend KV pressure;
+        // request-count pressure is applied per request to the selected
+        // candidate inside each affinity path.
+        if self.is_kv_imbalanced(workers, &healthy_indices) {
             return self.select_worker_min_load(workers, info, min_load_idx, model_id);
         }
 
@@ -990,6 +977,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     tokens,
                     &healthy_indices,
                     min_load_idx,
+                    avg_load,
                     model_id,
                 )
             } else {
@@ -998,12 +986,20 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     tokens,
                     &healthy_indices,
                     min_load_idx,
+                    avg_load,
                     model_id,
                 )
             }
         } else {
             let text = request_text.unwrap_or("");
-            self.select_worker_with_text(workers, text, &healthy_indices, min_load_idx, model_id)
+            self.select_worker_with_text(
+                workers,
+                text,
+                &healthy_indices,
+                min_load_idx,
+                avg_load,
+                model_id,
+            )
         }
     }
 
@@ -1046,6 +1042,100 @@ impl CacheAwarePolicy {
             .is_some_and(|indexer| indexer.current_size() > 0)
     }
 
+    /// Waiting-prefill backlog snapshot (worker URL → queued uncached tokens),
+    /// or `None` when decay is off or no load receiver is wired. The clone is
+    /// per-selection; with decay off the map is never read.
+    fn waiting_prefill_snapshot(&self) -> Option<HashMap<String, i64>> {
+        if self.config.overlap_decay <= 0.0 {
+            return None;
+        }
+        let guard = self.load_rx.read();
+        guard.as_ref().map(|rx| {
+            rx.borrow()
+                .iter()
+                .map(|(url, load)| (url.clone(), load.total_waiting_uncached_tokens().max(0)))
+                .collect::<HashMap<String, i64>>()
+        })
+    }
+
+    /// Per-request count-pressure gate on the selected candidate: over
+    /// `balance_rel_threshold` times the healthy-fleet mean load AND
+    /// `balance_abs_threshold` requests above it, the request spills to the
+    /// least-loaded worker instead. Affinity paths insert for the spill
+    /// target, so a prefix whose home saturates gains an additional tenant —
+    /// hot prefixes replicate instead of queueing behind one engine. Both
+    /// margins must clear so the gate neither fires on steady-state variance
+    /// (relative alone would, at low means) nor stays blind to a deep queue
+    /// (absolute alone would, at high means).
+    fn gate_selected_candidate(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        selected: usize,
+        avg_load: f64,
+        min_load_idx: Option<usize>,
+    ) -> Option<usize> {
+        let load = workers[selected].load() as f64;
+        if load > avg_load * f64::from(self.config.balance_rel_threshold)
+            && load > avg_load + self.config.balance_abs_threshold as f64
+        {
+            return min_load_idx.or(Some(selected));
+        }
+        Some(selected)
+    }
+
+    /// Pressure-select among the tenants holding the matched prefix.
+    ///
+    /// Every matched tenant serves the same prefix, so raw overlap cannot
+    /// discriminate; the waiting-prefill decay and the load tie-break do.
+    /// With default tuning this reduces to the least-loaded holding tenant
+    /// (uniform among ties). Returns `None` when no matched tenant is
+    /// healthy, preserving the caller's no-insert fallback.
+    fn select_matched_candidate(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        matched_tenants: &[TenantId],
+        request_units: usize,
+        avg_load: f64,
+        min_load_idx: Option<usize>,
+    ) -> Option<usize> {
+        let mut candidates: Vec<OverlapCandidate> = Vec::new();
+        for &idx in healthy_indices {
+            let url = workers[idx].url();
+            if matched_tenants.iter().any(|tenant| tenant.as_ref() == url) {
+                candidates.push(OverlapCandidate {
+                    idx,
+                    effective_score: 1.0,
+                    load: workers[idx].load(),
+                });
+            }
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let waiting = self.waiting_prefill_snapshot();
+        let tuning = OverlapTuning {
+            overlap_decay: self.config.overlap_decay,
+            selection_temperature: self.config.selection_temperature,
+            waiting_prefill_tokens: waiting.as_ref(),
+        };
+        let request_blocks = (request_units / self.config.block_size).max(1);
+        Self::apply_overlap_decay(
+            workers,
+            &mut candidates,
+            request_blocks,
+            self.config.block_size,
+            &tuning,
+        );
+        let selected = if tuning.selection_temperature > 0.0 {
+            Self::sample_by_temperature(&candidates, tuning.selection_temperature)
+        } else {
+            Self::argmax_with_random_ties(&candidates)
+        }?;
+        self.gate_selected_candidate(workers, selected, avg_load, min_load_idx)
+    }
+
     /// Event-driven routing: PositionalIndexer overlap scoring (Type 1).
     ///
     /// Self-contained — when overlap is found, selects the worker with the best
@@ -1057,6 +1147,7 @@ impl CacheAwarePolicy {
         tokens: &[u32],
         healthy_indices: &[usize],
         min_load_idx: Option<usize>,
+        avg_load: f64,
         model_id: &str,
     ) -> Option<usize> {
         let guard = self.kv_monitor.read();
@@ -1068,19 +1159,7 @@ impl CacheAwarePolicy {
             .block_size(model_id)
             .unwrap_or(self.config.block_size);
 
-        // Snapshot the waiting-prefill backlog only when decay is on: the
-        // clone is per-selection, and with decay off the map is never read.
-        let waiting_prefill_tokens = if self.config.overlap_decay > 0.0 {
-            let guard = self.load_rx.read();
-            guard.as_ref().map(|rx| {
-                rx.borrow()
-                    .iter()
-                    .map(|(url, load)| (url.clone(), load.total_waiting_uncached_tokens().max(0)))
-                    .collect::<HashMap<String, i64>>()
-            })
-        } else {
-            None
-        };
+        let waiting_prefill_tokens = self.waiting_prefill_snapshot();
         let tuning = OverlapTuning {
             overlap_decay: self.config.overlap_decay,
             selection_temperature: self.config.selection_temperature,
@@ -1095,7 +1174,7 @@ impl CacheAwarePolicy {
             block_size,
             &tuning,
         ) {
-            return Some(idx);
+            return self.gate_selected_candidate(workers, idx, avg_load, min_load_idx);
         }
 
         // No cache overlap — min-load fallback (min-load index gathered upstream)
@@ -1296,6 +1375,7 @@ impl CacheAwarePolicy {
         tokens: &[u32],
         healthy_indices: &[usize],
         min_load_idx: Option<usize>,
+        avg_load: f64,
         model_id: &str,
     ) -> Option<usize> {
         let tree = self
@@ -1324,14 +1404,20 @@ impl CacheAwarePolicy {
                 };
 
                 selected_idx = if match_rate > self.config.cache_threshold {
-                    // Cache hit: scan healthy_indices for the tenant (hash-free;
-                    // url() is cheap). "Healthy" excludes circuit-broken workers, so
-                    // a CB-tripped tenant falls through to min-load (intended).
-                    let tenant_url: &str = &result.tenant;
-                    healthy_indices
-                        .iter()
-                        .copied()
-                        .find(|&idx| workers[idx].url() == tenant_url)
+                    // Cache hit: pressure-select among the tenants holding the
+                    // matched prefix. "Healthy" excludes circuit-broken workers,
+                    // so a fully CB-tripped tenant set falls through to
+                    // first-healthy without inserting (intended). A gated
+                    // selection lands on min-load, and the insert below makes
+                    // the spill target a new tenant of this prefix.
+                    self.select_matched_candidate(
+                        workers,
+                        healthy_indices,
+                        &result.matched_tenants,
+                        tokens.len(),
+                        avg_load,
+                        min_load_idx,
+                    )
                 } else {
                     min_load_idx
                 };
@@ -1403,6 +1489,7 @@ impl CacheAwarePolicy {
         text: &str,
         healthy_indices: &[usize],
         min_load_idx: Option<usize>,
+        avg_load: f64,
         model_id: &str,
     ) -> Option<usize> {
         let tree = self
@@ -1424,14 +1511,20 @@ impl CacheAwarePolicy {
                 };
 
                 selected_idx = if match_rate > self.config.cache_threshold {
-                    // Cache hit: scan healthy_indices for the tenant (hash-free;
-                    // url() is cheap). "Healthy" excludes circuit-broken workers, so
-                    // a CB-tripped tenant falls through to min-load (intended).
-                    let tenant_url: &str = &result.tenant;
-                    healthy_indices
-                        .iter()
-                        .copied()
-                        .find(|&idx| workers[idx].url() == tenant_url)
+                    // Cache hit: pressure-select among the tenants holding the
+                    // matched prefix. "Healthy" excludes circuit-broken workers,
+                    // so a fully CB-tripped tenant set falls through to
+                    // first-healthy without inserting (intended). A gated
+                    // selection lands on min-load, and the insert below makes
+                    // the spill target a new tenant of this prefix.
+                    self.select_matched_candidate(
+                        workers,
+                        healthy_indices,
+                        &result.matched_tenants,
+                        text.chars().count(),
+                        avg_load,
+                        min_load_idx,
+                    )
                 } else {
                     min_load_idx
                 };
@@ -1675,7 +1768,7 @@ mod tests {
         assert_eq!(token_tree_totals(&tree), (3 * page, 2));
     }
 
-    // ---- is_imbalanced: 3-term trigger (overload ∨ KV-spread ∨ count) ----
+    // ---- is_kv_imbalanced: KV triggers (overload ∨ KV-spread) ----
 
     /// Single-DP load snapshot reporting the given KV utilization (0.0–1.0).
     fn kv_load(token_usage: f64) -> WorkerLoadResponse {
@@ -1735,23 +1828,12 @@ mod tests {
         (0..workers.len()).collect()
     }
 
-    /// Run the imbalance check the way `select_worker` does: fold the request-count
-    /// bounds over the healthy workers (production gathers them in one pass), then
-    /// call `is_imbalanced`.
     fn imbalanced(policy: &CacheAwarePolicy, workers: &[Arc<dyn Worker>]) -> bool {
-        let healthy = all_healthy(workers);
-        let (min_load, max_load) = healthy
-            .iter()
-            .fold((usize::MAX, 0usize), |(min, max), &idx| {
-                let load = workers[idx].load();
-                (min.min(load), max.max(load))
-            });
-        let min_load = if min_load == usize::MAX { 0 } else { min_load };
-        policy.is_imbalanced(workers, &healthy, min_load, max_load)
+        policy.is_kv_imbalanced(workers, &all_healthy(workers))
     }
 
     #[test]
-    fn is_imbalanced_uniform_high_kv_does_not_fire() {
+    fn is_kv_imbalanced_uniform_high_kv_does_not_fire() {
         // All engines equally saturated: high utilization, zero spread.
         let policy = CacheAwarePolicy::with_config(kv_only_config(0.3, 0.95));
         let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
@@ -1764,7 +1846,7 @@ mod tests {
     }
 
     #[test]
-    fn is_imbalanced_one_hot_rest_idle_fires_via_spread() {
+    fn is_kv_imbalanced_one_hot_rest_idle_fires_via_spread() {
         // Same hottest engine (0.9) as the uniform case, but neighbors are idle.
         let policy = CacheAwarePolicy::with_config(kv_only_config(0.3, 0.95));
         let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
@@ -1777,7 +1859,7 @@ mod tests {
     }
 
     #[test]
-    fn is_imbalanced_overload_ceiling_fires_below_spread() {
+    fn is_kv_imbalanced_overload_ceiling_fires_below_spread() {
         // Critically hot engine, but the spread is under the balance threshold.
         let policy = CacheAwarePolicy::with_config(kv_only_config(0.3, 0.95));
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
@@ -1790,8 +1872,9 @@ mod tests {
     }
 
     #[test]
-    fn is_imbalanced_high_count_low_kv_caught_by_count() {
-        // KV is even, so both KV triggers stay quiet — count must still catch it.
+    fn is_kv_imbalanced_ignores_request_count_spread() {
+        // Count dispersion alone never abandons affinity fleet-wide; count
+        // pressure is applied per request by the candidate gate instead.
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             balance_abs_threshold: 5,
             balance_rel_threshold: 2.0,
@@ -1805,15 +1888,14 @@ mod tests {
         for _ in 0..20 {
             workers[0].increment_load();
         }
-        // KV spread 0.0, max 0.3 → KV quiet; count 20 vs 0 → fire.
         assert!(
-            imbalanced(&policy, &workers),
-            "count spread must still trigger when KV utilization looks even"
+            !imbalanced(&policy, &workers),
+            "count spread alone must not disable cache affinity fleet-wide"
         );
     }
 
     #[test]
-    fn is_imbalanced_kv_disabled_by_default_ignores_snapshot() {
+    fn is_kv_imbalanced_kv_disabled_by_default_ignores_snapshot() {
         // Default config: both KV thresholds 1.0 (disabled).
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             eviction_interval_secs: 0,
@@ -1827,6 +1909,174 @@ mod tests {
             !imbalanced(&policy, &workers),
             "default thresholds (1.0) must ignore KV usage entirely"
         );
+    }
+
+    // ---- per-request candidate gate + matched-tenant selection ----
+
+    /// Route once so `model_key`-scoped trees exist, then seed the token tree
+    /// with the given tenants for `tokens`.
+    fn seed_token_tenants(
+        policy: &CacheAwarePolicy,
+        workers: &[Arc<dyn Worker>],
+        tokens: &[u32],
+        tenant_urls: &[&str],
+    ) -> Arc<TokenTree> {
+        policy.init_workers(workers);
+        let model_key = normalize_model_key(workers[0].model_id()).to_string();
+        let tree = Arc::clone(policy.token_trees.get(&model_key).unwrap().value());
+        for url in tenant_urls {
+            tree.insert_tokens(tokens, url);
+        }
+        tree
+    }
+
+    #[test]
+    fn cache_hit_prefers_least_loaded_matched_tenant() {
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let tokens: Vec<u32> = (0..32).collect();
+        seed_token_tenants(
+            &policy,
+            &workers,
+            &tokens,
+            &["http://w1:8000", "http://w2:8000"],
+        );
+        for _ in 0..5 {
+            workers[0].increment_load();
+        }
+
+        // w2 and w3 are equally idle, but only w1/w2 hold the prefix: the
+        // selection must stay within the matched tenants and take the less
+        // loaded one.
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "least-loaded matched tenant, not any idle worker");
+    }
+
+    #[test]
+    fn gated_hot_tenant_spills_to_min_load_and_replicates() {
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let tokens: Vec<u32> = (0..32).collect();
+        let tree = seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
+        // avg = 50; w1 clears both margins (100 > 50 * 1.1 and 100 > 50 + 32).
+        for _ in 0..100 {
+            workers[0].increment_load();
+        }
+
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "gated selection must spill to the min-load worker");
+
+        // The spill inserted for w2, so the prefix now has a second tenant.
+        let result = tree.match_prefix_with_counts(&tokens);
+        assert!(
+            result
+                .matched_tenants
+                .iter()
+                .any(|tenant| tenant.as_ref() == "http://w2:8000"),
+            "spill target must become a tenant of the hot prefix"
+        );
+    }
+
+    #[test]
+    fn count_spread_elsewhere_keeps_cache_affinity() {
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let tokens: Vec<u32> = (0..32).collect();
+        seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
+        // Fleet-wide count spread (50 vs 0) that formerly disabled affinity
+        // outright — but the loaded worker is not the request's tenant.
+        for _ in 0..50 {
+            workers[1].increment_load();
+        }
+
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            idx, 0,
+            "a deep queue on another worker must not break this request's affinity"
+        );
+    }
+
+    #[test]
+    fn candidate_gate_requires_both_margins() {
+        // w1 load 10 vs avg 5: over the relative margin (10 > 5 * 1.1) but
+        // under the absolute one (10 < 5 + 32) — affinity holds.
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let tokens: Vec<u32> = (0..32).collect();
+        seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
+        for _ in 0..10 {
+            workers[0].increment_load();
+        }
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        assert_eq!(policy.select_worker(&workers, &info).unwrap(), 0);
+
+        // Same loads with a small absolute margin (10 > 5 + 2): spill.
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            balance_abs_threshold: 2,
+            ..test_config()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
+        for _ in 0..10 {
+            workers[0].increment_load();
+        }
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        assert_eq!(policy.select_worker(&workers, &info).unwrap(), 1);
+    }
+
+    #[test]
+    fn kv_pressure_still_forces_min_load() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            block_size: 4,
+            ..kv_only_config(0.3, 0.95)
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let tokens: Vec<u32> = (0..32).collect();
+        seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
+        workers[0].increment_load();
+        // KV spread 0.8 > 0.3: shed fleet-wide despite the w1 cache hit.
+        let _tx = inject_kv(&policy, &workers, &[0.9, 0.1]);
+
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "KV pressure must still override cache affinity");
     }
 
     #[test]
@@ -2867,6 +3117,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx, 1); // w2 (min load), NOT token tree result
+    }
+
+    #[test]
+    fn test_event_driven_gated_hot_winner_spills_to_min_load() {
+        let policy = CacheAwarePolicy::with_config(test_config());
+
+        let w1 = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build();
+        let w2 = BasicWorkerBuilder::new("http://w2:8000")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build();
+        // avg = 50; w1 clears both gate margins (100 > 50 * 1.1, 100 > 50 + 32).
+        for _ in 0..100 {
+            w1.increment_load();
+        }
+
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(w1), Arc::new(w2)];
+        policy.init_workers(&workers);
+
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        policy.set_kv_event_monitor(Some(monitor));
+
+        // w1 wins the overlap score but is over both load margins: spill.
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&[1, 2, 3, 4]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "gated overlap winner must spill to min load");
     }
 
     #[test]
