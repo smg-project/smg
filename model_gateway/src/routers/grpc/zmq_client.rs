@@ -306,8 +306,8 @@ async fn unlink_stale_socket(address: &str) -> Result<(), String> {
 }
 
 /// Bind the SMG-side ZMQ sockets and complete the handshake with the
-/// engine(s): the single connect path for a worker's `ipc://` URL, shared by
-/// the lazy client accessor and the background handshake driver. `model_id` is
+/// engine(s): the single connect path for a worker's `ipc://` URL, driven only
+/// by the worker's background handshake driver. `model_id` is
 /// the config-resolved served model (EngineCore reports none). `engine_count`
 /// is the number of DP engines that will dial this worker's sockets (1 for an
 /// ungrouped worker). Errors are plain reasons; the worker layer wraps them in

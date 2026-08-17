@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use axum::body::Body;
 // Re-export protocol types as the canonical types for the gateway
@@ -21,6 +21,7 @@ use openai_protocol::{
 use smg_grpc_client::common_proto;
 use tokio::{
     sync::{mpsc, OnceCell},
+    task::AbortHandle,
     time,
 };
 
@@ -553,6 +554,15 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     async fn reset_grpc_client(&self) -> WorkerResult<()> {
         Ok(())
     }
+
+    /// Release background work owned by this worker instance.
+    ///
+    /// Called by the registry when the worker leaves it (removal) or is
+    /// superseded by a replacement. `BasicWorker` aborts the detached ZMQ
+    /// handshake driver: it holds the handshake and data-plane socket binds
+    /// until it lands, so an orphaned driver would keep them for up to the
+    /// connect timeout and collide with a same-URL re-registration.
+    fn abort_background_tasks(&self) {}
     async fn grpc_health_check(&self) -> WorkerResult<bool>;
     /// Liveness check for a ZMQ worker. Unlike gRPC there is no health RPC on
     /// the raw wire: liveness is local (handshake completed and the engine has
@@ -1032,6 +1042,10 @@ pub struct BasicWorker {
     /// never cancels a long (model-load) handshake. Self-clears on failure to
     /// allow a retry. Unused for HTTP/gRPC.
     pub zmq_connect_started: Arc<AtomicBool>,
+    /// Abort handle for that driver, so removing or replacing the worker
+    /// releases the sockets the in-flight handshake has bound instead of
+    /// leaving them held until it times out. `None` until a driver is spawned.
+    pub zmq_connect_abort: Arc<ArcSwapOption<AbortHandle>>,
     /// Wakes the manager the instant the ZMQ handshake completes so it can
     /// promote the worker without waiting for the next health poll. Set only
     /// for ZMQ workers built through the registration path; `None` elsewhere
@@ -1055,6 +1069,7 @@ impl Clone for BasicWorker {
             circuit_breaker: ArcSwap::from(self.circuit_breaker.load_full()),
             backend_client: Arc::clone(&self.backend_client),
             zmq_connect_started: Arc::clone(&self.zmq_connect_started),
+            zmq_connect_abort: Arc::clone(&self.zmq_connect_abort),
             connect_signal_tx: self.connect_signal_tx.clone(),
             models_override: Arc::clone(&self.models_override),
             http_client: self.http_client.clone(),
@@ -1084,6 +1099,70 @@ impl BasicWorker {
 
     fn shared_runtime(&self) -> Arc<WorkerRuntime> {
         self.runtime.load_full()
+    }
+
+    /// Start the one-shot background ZMQ handshake driver for `cell` unless one
+    /// is already in flight.
+    ///
+    /// The handshake is never driven inline: it can take as long as a model
+    /// load, so any caller awaiting it (request pipeline, load monitor, health
+    /// probe) would block far past its own deadline. Callers peek the cell and
+    /// report unavailable until the driver lands.
+    fn spawn_zmq_connect_driver(&self, cell: &Arc<OnceCell<Arc<BackendClient>>>) {
+        if self.zmq_connect_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let cell = Arc::clone(cell);
+        let started = Arc::clone(&self.zmq_connect_started);
+        let base_url = self.metadata.base_url().to_string();
+        let model_id = self.metadata.model_id().to_string();
+        let url = self.metadata.spec.url.clone();
+        let runtime = self.metadata.spec.runtime_type;
+        let handshake_override = self.metadata.spec.zmq_handshake_address.clone();
+        let engine_count = self.metadata.zmq_engine_count();
+        // Capture the readiness signal and the revision at hand-off. The
+        // manager only promotes if this revision still matches, so a
+        // same-URL replacement racing the handshake is discarded.
+        let signal_tx = self.connect_signal_tx.clone();
+        let revision = self.revision();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "detached one-shot handshake driver; the OnceCell dedupes with the request path and the guard self-clears on failure to allow a retry"
+        )]
+        // Detached: only the AbortHandle is kept, so the task keeps running
+        // until it completes or the worker leaves the registry.
+        let handle = tokio::spawn(async move {
+            match cell
+                .get_or_try_init(|| {
+                    connect_zmq_backend(
+                        base_url,
+                        model_id,
+                        runtime,
+                        handshake_override,
+                        engine_count,
+                    )
+                })
+                .await
+            {
+                Ok(_) => {
+                    // Handshake landed: wake the manager to promote now
+                    // rather than on the next poll. A dropped signal (no
+                    // manager, or receiver gone) is harmless — polling
+                    // still promotes on the success threshold.
+                    if let Some(tx) = &signal_tx {
+                        let _ = tx.send(WorkerConnected { url, revision });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "ZMQ backend handshake failed for {url}: {e}; will retry on the next health probe"
+                    );
+                    started.store(false, Ordering::SeqCst);
+                }
+            }
+        });
+        self.zmq_connect_abort
+            .store(Some(Arc::new(handle.abort_handle())));
     }
 
     fn install_shared_state_from_basic(&self, other: &BasicWorker) {
@@ -1344,28 +1423,21 @@ impl Worker for BasicWorker {
             }
             ConnectionMode::Zmq => {
                 // SMG binds the handshake + data-plane sockets; the
-                // operator-launched engine dials them. The first acquisition
-                // completes the handshake (a liveness signal in itself). The
-                // model id comes from config — EngineCore reports none on the
-                // wire (see create_worker).
-                let base_url = self.metadata.base_url().to_string();
-                let model_id = self.metadata.model_id().to_string();
-                let runtime = self.metadata.spec.runtime_type;
-                let handshake_override = self.metadata.spec.zmq_handshake_address.clone();
-                let engine_count = self.metadata.zmq_engine_count();
+                // operator-launched engine dials them. Peek only: the handshake
+                // is owned by the background driver (it can outlast any
+                // caller's deadline — see spawn_zmq_connect_driver), so fail
+                // fast instead of blocking a request or a load poll behind it.
+                // Kicking the driver off here also covers workers whose health
+                // checks are disabled, where no probe ever runs.
                 let cell = self.backend_client.load_full();
-                let client = cell
-                    .get_or_try_init(|| {
-                        connect_zmq_backend(
-                            base_url,
-                            model_id,
-                            runtime,
-                            handshake_override,
-                            engine_count,
-                        )
-                    })
-                    .await?;
-                Ok(Some(Arc::clone(client)))
+                if let Some(client) = cell.get() {
+                    return Ok(Some(Arc::clone(client)));
+                }
+                self.spawn_zmq_connect_driver(&cell);
+                Err(WorkerError::ConnectionFailed {
+                    url: self.metadata.spec.url.clone(),
+                    reason: "ZMQ backend handshake has not completed yet".to_string(),
+                })
             }
         }
     }
@@ -1446,56 +1518,17 @@ impl Worker for BasicWorker {
             self.zmq_connect_started.store(false, Ordering::SeqCst);
             return Ok(false);
         }
-        if !self.zmq_connect_started.swap(true, Ordering::SeqCst) {
-            let started = Arc::clone(&self.zmq_connect_started);
-            let base_url = self.metadata.base_url().to_string();
-            let model_id = self.metadata.model_id().to_string();
-            let url = self.metadata.spec.url.clone();
-            let runtime = self.metadata.spec.runtime_type;
-            let handshake_override = self.metadata.spec.zmq_handshake_address.clone();
-            let engine_count = self.metadata.zmq_engine_count();
-            // Capture the readiness signal and the revision at hand-off. The
-            // manager only promotes if this revision still matches, so a
-            // same-URL replacement racing the handshake is discarded.
-            let signal_tx = self.connect_signal_tx.clone();
-            let revision = self.revision();
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "detached one-shot handshake driver; the OnceCell dedupes with the request path and the guard self-clears on failure to allow a retry"
-            )]
-            // Detached: dropping the handle at scope end leaves the task running.
-            let _handle = tokio::spawn(async move {
-                match cell
-                    .get_or_try_init(|| {
-                        connect_zmq_backend(
-                            base_url,
-                            model_id,
-                            runtime,
-                            handshake_override,
-                            engine_count,
-                        )
-                    })
-                    .await
-                {
-                    Ok(_) => {
-                        // Handshake landed: wake the manager to promote now
-                        // rather than on the next poll. A dropped signal (no
-                        // manager, or receiver gone) is harmless — polling
-                        // still promotes on the success threshold.
-                        if let Some(tx) = &signal_tx {
-                            let _ = tx.send(WorkerConnected { url, revision });
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "ZMQ backend handshake failed for {url}: {e}; will retry on the next health probe"
-                        );
-                        started.store(false, Ordering::SeqCst);
-                    }
-                }
-            });
-        }
+        self.spawn_zmq_connect_driver(&cell);
         Ok(false)
+    }
+
+    fn abort_background_tasks(&self) {
+        if let Some(handle) = self.zmq_connect_abort.swap(None) {
+            handle.abort();
+            // The bound sockets are released with the cancelled future; reset
+            // the guard so any instance still sharing this state can retry.
+            self.zmq_connect_started.store(false, Ordering::SeqCst);
+        }
     }
 
     async fn http_health_check(&self) -> WorkerResult<bool> {
@@ -2698,6 +2731,112 @@ mod tests {
         assert!(
             !worker.zmq_connect_started.load(Ordering::SeqCst),
             "handshake guard must reset to allow a reconnect"
+        );
+    }
+
+    /// Build a ZMQ worker whose sockets no engine will ever dial, plus the
+    /// data-plane socket path its handshake driver binds.
+    fn unattended_zmq_worker(dir: &std::path::Path) -> (BasicWorker, std::path::PathBuf) {
+        let worker = BasicWorkerBuilder::new(format!("ipc://{}", dir.join("ts0.ipc").display()))
+            .connection_mode(ConnectionMode::Zmq)
+            .health_config(no_health_check())
+            .build();
+        (worker, dir.join("ts0.ipc-in.sock"))
+    }
+
+    /// Poll `cond` until it holds, up to five seconds.
+    async fn wait_for(cond: impl Fn() -> bool) -> bool {
+        time::timeout(Duration::from_secs(5), async {
+            while !cond() {
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// The ZMQ handshake can run as long as a model load, so acquisition on a
+    /// request or load-monitor path must hand it to the background driver and
+    /// fail fast instead of awaiting it inline.
+    #[tokio::test]
+    async fn zmq_get_backend_client_hands_the_handshake_to_the_background_driver() {
+        let base = tempfile::tempdir().unwrap();
+        let (worker, input_socket) = unattended_zmq_worker(base.path());
+
+        let acquired = time::timeout(Duration::from_secs(5), worker.get_backend_client())
+            .await
+            .expect("acquisition must not await the handshake");
+        assert!(
+            matches!(acquired, Err(WorkerError::ConnectionFailed { .. })),
+            "acquisition must report the backend as not connected yet"
+        );
+        assert!(
+            worker.backend_client.load().get().is_none(),
+            "no client can be cached before the handshake lands"
+        );
+
+        let handle = worker
+            .zmq_connect_abort
+            .load_full()
+            .expect("acquisition must start the background handshake driver");
+        assert!(
+            wait_for(|| input_socket.exists()).await,
+            "driver never bound the data-plane sockets"
+        );
+        assert!(
+            !handle.is_finished(),
+            "driver must still be waiting for the engine"
+        );
+
+        // A second acquisition rides the in-flight driver instead of spawning
+        // another one (which would rebind the same sockets).
+        assert!(worker.get_backend_client().await.is_err());
+        assert!(Arc::ptr_eq(
+            &handle,
+            &worker
+                .zmq_connect_abort
+                .load_full()
+                .expect("driver still recorded")
+        ));
+
+        worker.abort_background_tasks();
+    }
+
+    /// The driver holds the ipc data-plane and TCP handshake binds until it
+    /// lands, so worker removal/replacement must abort it — otherwise a
+    /// same-URL re-registration collides with an orphan for up to the connect
+    /// timeout.
+    #[tokio::test]
+    async fn abort_background_tasks_cancels_the_zmq_handshake_driver() {
+        let base = tempfile::tempdir().unwrap();
+        let (worker, input_socket) = unattended_zmq_worker(base.path());
+
+        assert!(
+            !worker.zmq_health_check().await.unwrap(),
+            "worker is not ready until the handshake lands"
+        );
+        let handle = worker
+            .zmq_connect_abort
+            .load_full()
+            .expect("probe must start the background handshake driver");
+        assert!(
+            wait_for(|| input_socket.exists()).await,
+            "driver never bound the data-plane sockets"
+        );
+
+        worker.abort_background_tasks();
+
+        assert!(
+            wait_for(|| handle.is_finished()).await,
+            "abort must cancel the in-flight handshake"
+        );
+        assert!(
+            worker.zmq_connect_abort.load_full().is_none(),
+            "the aborted driver must not stay recorded"
+        );
+        assert!(
+            !worker.zmq_connect_started.load(Ordering::SeqCst),
+            "handshake guard must reset so a later probe can retry"
         );
     }
 }

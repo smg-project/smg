@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use openai_protocol::{
     model_card::ModelCard,
     worker::{HealthCheckConfig, WorkerModels, WorkerSpec, WorkerStatus},
@@ -335,6 +335,7 @@ impl BasicWorkerBuilder {
             metadata,
             backend_client,
             zmq_connect_started: Arc::new(AtomicBool::new(false)),
+            zmq_connect_abort: Arc::new(ArcSwapOption::empty()),
             connect_signal_tx: self.connect_signal_tx,
             models_override: Arc::new(ArcSwap::from_pointee(WorkerModels::Wildcard)),
             http_client,

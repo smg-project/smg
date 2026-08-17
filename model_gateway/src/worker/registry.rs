@@ -905,6 +905,11 @@ impl WorkerRegistry {
         // Overwrite worker object atomically
         self.workers.insert(worker_id.clone(), new_worker.clone());
 
+        // The replacement carries its own backend-client slot, so the old
+        // instance's ZMQ handshake driver can now only hold its socket binds
+        // against the new worker's connect.
+        old_worker.abort_background_tasks();
+
         // Diff model indexes: remove stale, add new
         for removed_model in old_models.difference(&new_models) {
             self.remove_worker_from_model_index(removed_model, old_worker.url());
@@ -1199,6 +1204,11 @@ impl WorkerRegistry {
                 worker.set_status(WorkerStatus::NotReady);
             }
             Metrics::remove_worker_metrics(worker.url());
+
+            // Release background work owned by this instance — notably the ZMQ
+            // handshake driver, whose bound sockets would otherwise block a
+            // re-registration at the same URL until it times out.
+            worker.abort_background_tasks();
 
             // Mesh tombstoning rides the `Removed` event below: the
             // outbound sync loop deletes `worker:{id}` for local workers.
@@ -3473,6 +3483,72 @@ mod tests {
         assert!(
             registry.get_hash_ring(UNKNOWN_MODEL_ID).is_none(),
             "an empty registry has no ring to route against"
+        );
+    }
+
+    /// A ZMQ worker whose handshake driver is in flight, holding the socket
+    /// binds derived from `dir`.
+    async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<crate::worker::BasicWorker> {
+        let worker = Arc::new(
+            BasicWorkerBuilder::new(format!("ipc://{}", dir.join("ts0.ipc").display()))
+                .connection_mode(ConnectionMode::Zmq)
+                .health_config(no_health_check())
+                .build(),
+        );
+        assert!(
+            !worker.zmq_health_check().await.unwrap(),
+            "worker is not ready until the handshake lands"
+        );
+        assert!(
+            worker.zmq_connect_abort.load_full().is_some(),
+            "probe must start the background handshake driver"
+        );
+        worker
+    }
+
+    /// A removed worker's ZMQ handshake driver must not outlive its registry
+    /// entry: it holds the worker's socket binds until it lands, which would
+    /// fail a re-registration at the same URL.
+    #[tokio::test]
+    async fn remove_aborts_the_zmq_handshake_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = WorkerRegistry::new();
+        let worker = connecting_zmq_worker(dir.path()).await;
+
+        let id = registry
+            .register(worker.clone() as Arc<dyn Worker>)
+            .unwrap();
+        registry.remove(&id).expect("worker removed");
+
+        assert!(
+            worker.zmq_connect_abort.load_full().is_none(),
+            "removal must abort the in-flight handshake driver"
+        );
+    }
+
+    /// Same for a replacement: it brings its own backend-client slot, so the
+    /// old instance's driver could only collide with the new worker's connect.
+    #[tokio::test]
+    async fn replace_aborts_the_replaced_workers_zmq_handshake_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = WorkerRegistry::new();
+        let worker = connecting_zmq_worker(dir.path()).await;
+        let url = worker.url().to_string();
+
+        let id = registry
+            .register(worker.clone() as Arc<dyn Worker>)
+            .unwrap();
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .connection_mode(ConnectionMode::Zmq)
+                .health_config(no_health_check())
+                .build(),
+        );
+        assert!(registry.replace(&id, replacement));
+
+        assert!(
+            worker.zmq_connect_abort.load_full().is_none(),
+            "replacement must abort the replaced worker's handshake driver"
         );
     }
 }
