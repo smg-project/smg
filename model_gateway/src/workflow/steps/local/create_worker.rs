@@ -546,22 +546,28 @@ fn normalize_url(url: &str, connection_mode: ConnectionMode) -> String {
 /// `EngineCoreRequest` nor the TokenSpeed `TokenizedGenerateReqInput` has a
 /// field for the bootstrap info PD injects, so a ZMQ prefill/decode leg would
 /// silently drop it and degrade to a decode-side recompute or a stalled KV
-/// wait. Reject at registration so the ZMQ lane never serves disaggregated
-/// requests.
+/// wait. Encode fares no better: encode dispatch is a gRPC encoder RPC a
+/// direct-ZMQ worker has no path for. `Regular` is therefore the only role the
+/// ZMQ lane serves, and every disaggregated leg is rejected at registration —
+/// matching the gRPC-only PD/EPD selection folds, which would otherwise leave
+/// such a worker registered but never selected.
 fn validate_zmq_worker_type(
     connection_mode: ConnectionMode,
     worker_type: WorkerType,
     url: &str,
 ) -> Result<(), WorkflowError> {
     if connection_mode == ConnectionMode::Zmq
-        && matches!(worker_type, WorkerType::Prefill | WorkerType::Decode)
+        && matches!(
+            worker_type,
+            WorkerType::Prefill | WorkerType::Decode | WorkerType::Encode
+        )
     {
         return Err(WorkflowError::StepFailed {
             step_id: StepId::new("create_worker"),
             message: format!(
                 "ZMQ worker {url} cannot serve worker type {worker_type}: the direct-ZMQ \
-                 backend carries no KV-transfer metadata, so prefill/decode disaggregation \
-                 requires a gRPC worker"
+                 backend carries no KV-transfer metadata and has no encode path, so \
+                 encode/prefill/decode disaggregation requires a gRPC worker"
             ),
         });
     }
@@ -717,13 +723,13 @@ mod tests {
 
     #[test]
     fn zmq_disaggregated_legs_are_rejected_as_a_create_worker_failure() {
-        for worker_type in [WorkerType::Prefill, WorkerType::Decode] {
+        for worker_type in [WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode] {
             let err = validate_zmq_worker_type(
                 ConnectionMode::Zmq,
                 worker_type,
                 "ipc:///tmp/smg-zmq/ts0.ipc",
             )
-            .expect_err("ZMQ prefill/decode must be rejected");
+            .expect_err("ZMQ encode/prefill/decode must be rejected");
             match err {
                 WorkflowError::StepFailed { step_id, message } => {
                     assert_eq!(step_id, StepId::new("create_worker"));
@@ -736,8 +742,8 @@ mod tests {
             }
         }
 
-        // Regular and encode workers over ZMQ, and any worker type over the
-        // other transports, stay accepted.
+        // Regular is the one role the ZMQ lane serves; every worker type over
+        // the other transports stays accepted.
         validate_zmq_worker_type(
             ConnectionMode::Zmq,
             WorkerType::Regular,
