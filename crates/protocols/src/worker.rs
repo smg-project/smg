@@ -1062,8 +1062,11 @@ pub struct ResilienceUpdate {
     pub disable_circuit_breaker: Option<bool>,
 
     // ── Retryable status codes ──
-    /// Custom retryable HTTP status codes.
-    /// When set, replaces the default set (408, 429, 500, 502, 503, 504).
+    /// HTTP status codes this worker counts as circuit-breaker failures.
+    /// When set, replaces the default set (408, 429, 500, 502, 503, 504)
+    /// verbatim - entries are not merged in. This does not gate retries:
+    /// whether a response is retried is a router-global rule, independent of
+    /// this set, so narrowing it cannot make a status non-retryable.
     pub retryable_status_codes: Option<Vec<u16>>,
     /// Capacity-pushback HTTP status codes: still retryable on another
     /// worker, but never counted as circuit-breaker failures (backpressure

@@ -101,7 +101,16 @@ pub fn resolve_resilience(
         .map(|d| !d)
         .unwrap_or(base_cb_enabled);
 
-    // Resolve retryable status codes
+    // Both sets replace their defaults wholesale, and the capacity set is
+    // deliberately not unioned into the retryable one. Retryability is not
+    // decided here: every retry path goes through
+    // `routers::common::retry::is_retryable_status`, a router-global rule that
+    // always covers 429, so a partial override here cannot make capacity
+    // pushback non-retryable. `retryable_status_codes` has exactly one
+    // consumer - circuit-breaker failure classification in
+    // `Worker::record_outcome` - and that check is unreachable for capacity
+    // codes, which return early just above it. Merging the sets would add no
+    // behaviour and would break the documented replace-the-default contract.
     let retryable_status_codes = overrides
         .retryable_status_codes
         .as_ref()
@@ -127,7 +136,10 @@ pub fn resolve_resilience(
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
+
     use super::*;
+    use crate::routers::common::retry::is_retryable_status;
 
     #[test]
     fn test_default_resilience() {
@@ -264,5 +276,32 @@ mod tests {
         assert!(resolved.capacity_status_codes.contains(&503));
         assert!(!resolved.capacity_status_codes.contains(&429));
         assert_eq!(resolved.capacity_status_codes.len(), 1);
+    }
+
+    #[test]
+    fn partial_retryable_override_leaves_capacity_pushback_retryable() {
+        // Pins why the capacity set is not merged into the retryable set: a
+        // per-worker retryable override that drops 429 cannot make pushback
+        // non-retryable, because the retry gate is router-global.
+        let overrides = ResilienceUpdate {
+            retryable_status_codes: Some(vec![500, 502]),
+            ..Default::default()
+        };
+        let (resolved, _cb) = resolve_resilience(
+            &RetryConfig::default(),
+            &CircuitBreakerConfig::default(),
+            true,
+            true,
+            &overrides,
+        );
+
+        // The override replaces the default set verbatim - 429 is not merged in.
+        assert!(!resolved.retryable_status_codes.contains(&429));
+        // Yet 429 is still retried, because retryability never consults this set.
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        // And it still records no circuit-breaker sample, because
+        // `record_outcome` returns on the capacity set before it ever reads
+        // `retryable_status_codes`.
+        assert!(resolved.capacity_status_codes.contains(&429));
     }
 }
