@@ -3,7 +3,7 @@
 //! Tests for header propagation through the router to workers.
 
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
@@ -302,6 +302,44 @@ mod header_forwarding_tests {
             "x-request-id should take priority"
         );
 
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_worker_id_is_stable_for_streaming_and_non_streaming_responses() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 19406,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+        let mut worker_ids = Vec::new();
+
+        for stream in [false, true] {
+            let payload = json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": stream
+            });
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let worker_id = resp.headers()["x-smg-worker-id"].to_str().unwrap();
+            uuid::Uuid::parse_str(worker_id).expect("worker ID should be an opaque UUID");
+            worker_ids.push(worker_id.to_string());
+            to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        }
+
+        assert_eq!(worker_ids[0], worker_ids[1]);
         ctx.shutdown().await;
     }
 }

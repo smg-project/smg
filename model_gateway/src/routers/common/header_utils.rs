@@ -10,6 +10,7 @@ use http::header::HeaderName;
 static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-worker");
 static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
 static HEADER_MCP: HeaderName = HeaderName::from_static("x-smg-mcp");
+pub(crate) static HEADER_WORKER_ID: HeaderName = HeaderName::from_static("x-smg-worker-id");
 
 fn extract_header_value<'a>(headers: Option<&'a HeaderMap>, name: &HeaderName) -> Option<&'a str> {
     headers
@@ -64,6 +65,16 @@ pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
     }
 
     headers
+}
+
+/// Stamp a response with the opaque ID of the worker that served it.
+///
+/// Call this after [`preserve_response_headers`] so the gateway's value wins
+/// over any value supplied by an upstream worker.
+pub(crate) fn insert_worker_id(headers: &mut HeaderMap, worker_id: &str) {
+    if let Ok(value) = HeaderValue::from_str(worker_id) {
+        headers.insert(HEADER_WORKER_ID.clone(), value);
+    }
 }
 
 /// Determine if a header should be forwarded without allocating (case-insensitive)
