@@ -1425,4 +1425,72 @@ mod tests {
             other => panic!("independent rank expected only its Add, got {other:?}"),
         }
     }
+
+    /// A rank that took a request for an already-drained wave asks the client
+    /// to start the next one (vLLM `start_wave`). Without a DP coordinator
+    /// nobody else answers that request, so the client must broadcast the wake
+    /// itself — to EVERY rank, at a wave the asking rank will still accept.
+    #[tokio::test]
+    async fn a_ranks_start_wave_request_wakes_the_whole_group() {
+        let (_client, mut engines, _ns) = connect_ranks(2, true).await;
+
+        // The rank is ahead of the client's clock (it self-incremented on its
+        // way out of the last wave), which is exactly the stale-wake trap.
+        let requested = 7;
+        engines[0]
+            .send_output(wave_control(0, DpControlMessage::StartWave(requested)))
+            .await
+            .unwrap();
+
+        assert!(next_wake(&mut engines[0]).await >= requested);
+        assert!(next_wake(&mut engines[1]).await >= requested);
+    }
+
+    /// A drain notification is bookkeeping, not a wake: `wave_complete` folds
+    /// into the clock but must NOT restart the group, or the ranks would never
+    /// stay parked and an idle group would spin.
+    #[tokio::test]
+    async fn wave_complete_updates_the_clock_without_waking() {
+        let (client, mut engines, _ns) = connect_ranks(2, true).await;
+
+        engines[0]
+            .send_output(wave_control(0, DpControlMessage::WaveComplete(3)))
+            .await
+            .unwrap();
+        tokio::time::timeout(TIMEOUT, async {
+            while *client.inner.wave.as_ref().unwrap().lock() <= 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the drained wave never reached the clock");
+
+        // The next submit is the first thing that may wake the group, and it
+        // must clear the wave the ranks parked on.
+        let _stream = client.submit(request_for("req-1", 1)).await.unwrap();
+        assert!(next_wake(&mut engines[0]).await > 3);
+    }
+
+    /// Independent ranks keep no wave clock, so a stray wave notification (a
+    /// mislabeled engine, say) must be ignored rather than panic or start
+    /// waking ranks that never park.
+    #[tokio::test]
+    async fn wave_notifications_from_independent_ranks_are_ignored() {
+        let (client, mut engines, _ns) = connect_ranks(2, false).await;
+
+        engines[0]
+            .send_output(wave_control(0, DpControlMessage::StartWave(2)))
+            .await
+            .unwrap();
+
+        let _stream = client.submit(request_for("req-1", 0)).await.unwrap();
+        match engines[0].recv().await.unwrap() {
+            EngineInbound::Add(request) => assert_eq!(request.request_id, "req-1"),
+            other => panic!("independent rank expected only its Add, got {other:?}"),
+        }
+        assert!(
+            client.inner.wave.is_none(),
+            "no clock for independent ranks"
+        );
+    }
 }

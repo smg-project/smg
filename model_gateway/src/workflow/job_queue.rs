@@ -565,26 +565,7 @@ impl JobQueue {
                     spec.worker_type = proto_worker_type;
                     spec.api_key.clone_from(&api_key);
                     spec.bootstrap_port = bootstrap_port;
-                    // ZMQ startup workers carry the runtime pinned by
-                    // `--backend` (the shared handshake cannot be probed for a
-                    // wire protocol); `None` — HTTP/gRPC or no `--backend` —
-                    // keeps auto-detection in detect_backend.
-                    if let Some(runtime) = router_config.startup_worker_runtime_type {
-                        spec.runtime_type = runtime;
-                    }
-                    // Grouped ZMQ worker: the handshake awaits this many DP
-                    // engines on one socket set. Only ZMQ URLs — dp_size on an
-                    // HTTP/gRPC startup worker would misread as dp-awareness.
-                    if let Some(count) = router_config.zmq_engine_count.filter(|&n| n > 1) {
-                        if ConnectionMode::from_url(&spec.url) == Some(ConnectionMode::Zmq) {
-                            spec.dp_size = Some(count);
-                        }
-                    }
-                    // Health config is resolved at worker build time from router
-                    // defaults + per-worker overrides (spec.health). No need to
-                    // set spec.health here since these workers have no overrides.
-                    spec.max_connection_attempts =
-                        router_config.health_check.success_threshold.max(1) * 10;
+                    apply_startup_worker_config(&mut spec, router_config);
                     let config = spec;
 
                     let job = Job::AddWorker {
@@ -766,6 +747,31 @@ impl JobQueue {
     }
 }
 
+/// Stamp the router-config-derived fields onto a startup worker's spec: the
+/// pinned runtime, the grouped-ZMQ engine count, and the connection budget.
+/// Identity fields (url, worker type, api key, bootstrap port) are the
+/// caller's.
+fn apply_startup_worker_config(spec: &mut WorkerSpec, router_config: &RouterConfig) {
+    // ZMQ startup workers carry the runtime pinned by `--backend` (the shared
+    // handshake cannot be probed for a wire protocol); `None` — HTTP/gRPC or no
+    // `--backend` — keeps auto-detection in detect_backend.
+    if let Some(runtime) = router_config.startup_worker_runtime_type {
+        spec.runtime_type = runtime;
+    }
+    // Grouped ZMQ worker: the handshake awaits this many DP engines on one
+    // socket set. Only ZMQ URLs — dp_size on an HTTP/gRPC startup worker would
+    // misread as dp-awareness.
+    if let Some(count) = router_config.zmq_engine_count.filter(|&n| n > 1) {
+        if ConnectionMode::from_url(&spec.url) == Some(ConnectionMode::Zmq) {
+            spec.dp_size = Some(count);
+        }
+    }
+    // Health config is resolved at worker build time from router defaults +
+    // per-worker overrides (spec.health). No need to set spec.health here since
+    // these workers have no overrides.
+    spec.max_connection_attempts = router_config.health_check.success_threshold.max(1) * 10;
+}
+
 /// Submit AddWorker jobs for external provider endpoints (OpenAI/Anthropic/Gemini).
 async fn submit_external_worker_jobs(
     worker_urls: &[String],
@@ -821,4 +827,85 @@ fn build_external_worker_config(
     // set spec.health here since these workers have no overrides.
     spec.max_connection_attempts = router_config.health_check.success_threshold.max(1) * 10;
     spec
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec_for(url: &str, router_config: &RouterConfig) -> WorkerSpec {
+        let mut spec = WorkerSpec::new(url);
+        apply_startup_worker_config(&mut spec, router_config);
+        spec
+    }
+
+    /// A grouped-ZMQ fleet stamps `dp_size` only on the `ipc://` workers:
+    /// `dp_size` on an HTTP/gRPC worker means rank-aware DP routing, a
+    /// different topology entirely.
+    #[test]
+    fn engine_count_only_reaches_zmq_workers_in_a_mixed_fleet() {
+        let config = RouterConfig {
+            zmq_engine_count: Some(4),
+            ..RouterConfig::default()
+        };
+
+        assert_eq!(spec_for("ipc:///tmp/smg/engine", &config).dp_size, Some(4));
+        assert_eq!(spec_for("grpc://127.0.0.1:30000", &config).dp_size, None);
+        assert_eq!(spec_for("http://127.0.0.1:8000", &config).dp_size, None);
+    }
+
+    /// One engine is an ungrouped worker, not a group of one: the ZMQ client
+    /// awaits a single engine by default, and `Some(1)` must not turn the
+    /// worker into a dp-aware one.
+    #[test]
+    fn a_single_engine_leaves_dp_size_unset() {
+        let mut config = RouterConfig {
+            zmq_engine_count: Some(1),
+            ..RouterConfig::default()
+        };
+        assert_eq!(spec_for("ipc:///tmp/smg/engine", &config).dp_size, None);
+
+        config.zmq_engine_count = None;
+        assert_eq!(spec_for("ipc:///tmp/smg/engine", &config).dp_size, None);
+    }
+
+    /// `--backend` pins the ZMQ wire protocol (the handshake can't be probed);
+    /// without it the spec keeps its default so `detect_backend` can probe.
+    #[test]
+    fn startup_runtime_is_pinned_only_when_configured() {
+        let default_runtime = WorkerSpec::new("ipc:///tmp/smg/engine").runtime_type;
+
+        let mut config = RouterConfig {
+            startup_worker_runtime_type: Some(RuntimeType::Vllm),
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            spec_for("ipc:///tmp/smg/engine", &config).runtime_type,
+            RuntimeType::Vllm
+        );
+
+        config.startup_worker_runtime_type = None;
+        assert_eq!(
+            spec_for("ipc:///tmp/smg/engine", &config).runtime_type,
+            default_runtime
+        );
+    }
+
+    /// The connection budget scales with the health-check success threshold,
+    /// and a zero threshold must not collapse it to zero attempts.
+    #[test]
+    fn connection_attempts_scale_with_the_success_threshold_floor() {
+        let mut config = RouterConfig::default();
+        config.health_check.success_threshold = 0;
+        assert_eq!(
+            spec_for("http://127.0.0.1:8000", &config).max_connection_attempts,
+            10
+        );
+
+        config.health_check.success_threshold = 3;
+        assert_eq!(
+            spec_for("http://127.0.0.1:8000", &config).max_connection_attempts,
+            30
+        );
+    }
 }
