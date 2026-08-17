@@ -126,8 +126,7 @@ fn is_false(v: &bool) -> bool {
 /// fields is present. This client exposes [`StructuredOutputsParams`] as an
 /// enum-backed domain type instead, while using this private wire type for
 /// ser/de.
-#[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 struct WireStructuredOutputsParams {
     json: Option<Value>,
@@ -135,9 +134,7 @@ struct WireStructuredOutputsParams {
     choice: Option<Vec<String>>,
     grammar: Option<String>,
     json_object: Option<bool>,
-    #[serde(skip_serializing_if = "is_false")]
     disable_any_whitespace: bool,
-    #[serde(skip_serializing_if = "is_false")]
     disable_additional_properties: bool,
     whitespace_pattern: Option<String>,
     structural_tag: Option<String>,
@@ -146,6 +143,26 @@ struct WireStructuredOutputsParams {
         rename = "_backend",
         deserialize_with = "serde_with::rust::deserialize_ignore_any"
     )]
+    backend: StructuredOutputBackend,
+}
+
+/// Borrowed send-side view of [`WireStructuredOutputsParams`]; keeps the wire
+/// shape without cloning the constraint (JSON schemas can be large).
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Serialize)]
+struct WireStructuredOutputsParamsRef<'a> {
+    json: Option<&'a Value>,
+    regex: Option<&'a str>,
+    choice: Option<&'a [String]>,
+    grammar: Option<&'a str>,
+    json_object: Option<bool>,
+    #[serde(skip_serializing_if = "is_false")]
+    disable_any_whitespace: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    disable_additional_properties: bool,
+    whitespace_pattern: Option<&'a str>,
+    structural_tag: Option<&'a str>,
+    #[serde(rename = "_backend")]
     backend: StructuredOutputBackend,
 }
 
@@ -206,24 +223,29 @@ impl TryFrom<WireStructuredOutputsParams> for StructuredOutputsParams {
     }
 }
 
-impl From<StructuredOutputsParams> for WireStructuredOutputsParams {
-    fn from(params: StructuredOutputsParams) -> Self {
+impl<'a> From<&'a StructuredOutputsParams> for WireStructuredOutputsParamsRef<'a> {
+    fn from(params: &'a StructuredOutputsParams) -> Self {
         let mut raw = Self {
+            json: None,
+            regex: None,
+            choice: None,
+            grammar: None,
+            json_object: None,
             disable_any_whitespace: params.options.disable_any_whitespace,
             disable_additional_properties: params.options.disable_additional_properties,
-            whitespace_pattern: params.options.whitespace_pattern,
+            whitespace_pattern: params.options.whitespace_pattern.as_deref(),
+            structural_tag: None,
             backend: params.backend,
-            ..Self::default()
         };
 
-        match params.constraint {
+        match &params.constraint {
             StructuredOutputConstraint::Json(json) => raw.json = Some(json),
-            StructuredOutputConstraint::Regex(regex) => raw.regex = Some(regex),
-            StructuredOutputConstraint::Choice(choice) => raw.choice = Some(choice),
-            StructuredOutputConstraint::Grammar(grammar) => raw.grammar = Some(grammar),
+            StructuredOutputConstraint::Regex(regex) => raw.regex = Some(regex.as_str()),
+            StructuredOutputConstraint::Choice(choice) => raw.choice = Some(choice.as_slice()),
+            StructuredOutputConstraint::Grammar(grammar) => raw.grammar = Some(grammar.as_str()),
             StructuredOutputConstraint::JsonObject => raw.json_object = Some(true),
             StructuredOutputConstraint::StructuralTag(structural_tag) => {
-                raw.structural_tag = Some(structural_tag);
+                raw.structural_tag = Some(structural_tag.as_str());
             }
         }
 
@@ -236,7 +258,7 @@ impl Serialize for StructuredOutputsParams {
     where
         S: Serializer,
     {
-        WireStructuredOutputsParams::from(self.clone()).serialize(serializer)
+        WireStructuredOutputsParamsRef::from(self).serialize(serializer)
     }
 }
 
@@ -280,6 +302,23 @@ mod tests {
         let value = serde_json::to_value(params).unwrap();
         assert_eq!(value["_backend"], "xgrammar");
         assert_eq!(value["structural_tag"], r#"{"format":{}}"#);
+    }
+
+    #[test]
+    fn structured_outputs_json_roundtrips_through_wire_shape() {
+        let mut params = StructuredOutputsParams::json(serde_json::json!({"type": "object"}));
+        params.options.disable_any_whitespace = true;
+        params.options.whitespace_pattern = Some(" ".to_string());
+
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value["json"], serde_json::json!({"type": "object"}));
+        assert_eq!(value["disable_any_whitespace"], true);
+        assert_eq!(value["whitespace_pattern"], " ");
+        assert!(value.get("disable_additional_properties").is_none());
+        assert_eq!(
+            serde_json::from_value::<StructuredOutputsParams>(value).unwrap(),
+            params
+        );
     }
 
     #[test]

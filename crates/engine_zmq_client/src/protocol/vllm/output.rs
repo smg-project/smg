@@ -6,7 +6,8 @@
 
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use bytes::Bytes;
+use serde::{Deserialize, Serialize, Serializer};
 use serde_default::DefaultFromSerde;
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
@@ -15,7 +16,7 @@ use crate::{
     codec::{decode_msgpack, OpaqueValue},
     error::{Error, Result},
     protocol::vllm::{
-        logprobs::MaybeWireLogprobs,
+        logprobs::{Logprobs, WireLogprobs},
         stats::{PrefillStats, SchedulerStats},
     },
 };
@@ -63,38 +64,30 @@ pub struct EngineCoreEvent {
 
 /// Engine-core output for a single request. Mirrors Python `EngineCoreOutput`
 /// (`array_like` — field order is the wire contract).
-#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple, DefaultFromSerde)]
+///
+/// Logprobs are resolved out of their wire form (aux frames, raw views) by
+/// [`decode_engine_core_outputs`], so this type only ever carries decoded
+/// [`Logprobs`].
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct EngineCoreOutput {
     pub request_id: String,
     pub new_token_ids: Vec<u32>,
     /// Decoded sample logprobs for the newly generated positions.
-    #[serde(default)]
-    pub new_logprobs: Option<MaybeWireLogprobs>,
+    pub new_logprobs: Option<Logprobs>,
     /// Decoded prompt logprobs for the scored prompt positions.
-    #[serde(default)]
-    pub new_prompt_logprobs_tensors: Option<MaybeWireLogprobs>,
-    #[serde(default)]
+    pub new_prompt_logprobs_tensors: Option<Logprobs>,
     pub pooling_output: Option<OpaqueValue>,
-    #[serde(default)]
     pub finish_reason: Option<EngineCoreFinishReason>,
-    #[serde(default)]
     pub stop_reason: Option<StopReason>,
-    #[serde(default)]
     pub events: Option<Vec<EngineCoreEvent>>,
-    #[serde(default)]
     pub kv_transfer_params: Option<serde_json::Value>,
-    #[serde(default)]
     pub ec_transfer_params: Option<serde_json::Value>,
-    #[serde(default)]
     pub trace_headers: Option<OpaqueValue>,
     /// Breakdown of the scheduled prefill computation, set on the first output
     /// of a newly scheduled prefill and elided for subsequent decode outputs.
-    #[serde(default)]
     pub prefill_stats: Option<PrefillStats>,
-    #[serde(default)]
     pub routed_experts: Option<OpaqueValue>,
     /// Number of NaNs seen in logits. Values above zero indicate corruption.
-    #[serde(default)]
     pub num_nans_in_logits: u32,
 }
 
@@ -103,35 +96,136 @@ impl EngineCoreOutput {
     pub fn finished(&self) -> bool {
         self.finish_reason.is_some()
     }
+}
 
-    /// Resolve wire-format logprobs in-place using the aux frames.
-    fn resolve_in_place<Frame>(&mut self, frames: &[Frame]) -> Result<()>
+impl Serialize for EngineCoreOutput {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
-        Frame: AsRef<[u8]>,
+        S: Serializer,
     {
-        self.new_logprobs = self
-            .new_logprobs
-            .take()
-            .map(|value| value.resolve(frames, "new_logprobs"))
-            .transpose()?;
-        self.new_prompt_logprobs_tensors = self
-            .new_prompt_logprobs_tensors
-            .take()
-            .map(|value| value.resolve(frames, "new_prompt_logprobs_tensors"))
-            .transpose()?;
-        Ok(())
+        let new_logprobs = wire_logprobs(self.new_logprobs.as_ref())?;
+        let new_prompt_logprobs_tensors = wire_logprobs(self.new_prompt_logprobs_tensors.as_ref())?;
+        WireEngineCoreOutputRef {
+            request_id: &self.request_id,
+            new_token_ids: &self.new_token_ids,
+            new_logprobs: new_logprobs.as_ref(),
+            new_prompt_logprobs_tensors: new_prompt_logprobs_tensors.as_ref(),
+            pooling_output: self.pooling_output.as_ref(),
+            finish_reason: self.finish_reason,
+            stop_reason: self.stop_reason.as_ref(),
+            events: self.events.as_deref(),
+            kv_transfer_params: self.kv_transfer_params.as_ref(),
+            ec_transfer_params: self.ec_transfer_params.as_ref(),
+            trace_headers: self.trace_headers.as_ref(),
+            prefill_stats: self.prefill_stats.as_ref(),
+            routed_experts: self.routed_experts.as_ref(),
+            num_nans_in_logits: self.num_nans_in_logits,
+        }
+        .serialize(serializer)
     }
+}
+
+/// Encode decoded logprobs back into their wire arrays (send path only: the
+/// mock engine and tests).
+fn wire_logprobs<E: serde::ser::Error>(
+    logprobs: Option<&Logprobs>,
+) -> std::result::Result<Option<WireLogprobs>, E> {
+    logprobs
+        .map(WireLogprobs::from_direct)
+        .transpose()
+        .map_err(serde::ser::Error::custom)
+}
+
+/// Raw Python/msgpack per-request output. Logprobs arrive here in wire form
+/// (inline raw views or aux-frame indices) and are resolved before the public
+/// [`EngineCoreOutput`] is built.
+#[derive(Debug, Clone, PartialEq, Deserialize_tuple, DefaultFromSerde)]
+struct WireEngineCoreOutput {
+    request_id: String,
+    new_token_ids: Vec<u32>,
+    #[serde(default)]
+    new_logprobs: Option<Box<WireLogprobs>>,
+    #[serde(default)]
+    new_prompt_logprobs_tensors: Option<Box<WireLogprobs>>,
+    #[serde(default)]
+    pooling_output: Option<OpaqueValue>,
+    #[serde(default)]
+    finish_reason: Option<EngineCoreFinishReason>,
+    #[serde(default)]
+    stop_reason: Option<StopReason>,
+    #[serde(default)]
+    events: Option<Vec<EngineCoreEvent>>,
+    #[serde(default)]
+    kv_transfer_params: Option<serde_json::Value>,
+    #[serde(default)]
+    ec_transfer_params: Option<serde_json::Value>,
+    #[serde(default)]
+    trace_headers: Option<OpaqueValue>,
+    #[serde(default)]
+    prefill_stats: Option<PrefillStats>,
+    #[serde(default)]
+    routed_experts: Option<OpaqueValue>,
+    #[serde(default)]
+    num_nans_in_logits: u32,
+}
+
+impl WireEngineCoreOutput {
+    /// Resolve the wire-format logprobs using the aux frames.
+    fn resolve(self, frames: &[Bytes]) -> Result<EngineCoreOutput> {
+        Ok(EngineCoreOutput {
+            request_id: self.request_id,
+            new_token_ids: self.new_token_ids,
+            new_logprobs: self
+                .new_logprobs
+                .map(|value| value.resolve(frames, "new_logprobs"))
+                .transpose()?,
+            new_prompt_logprobs_tensors: self
+                .new_prompt_logprobs_tensors
+                .map(|value| value.resolve(frames, "new_prompt_logprobs_tensors"))
+                .transpose()?,
+            pooling_output: self.pooling_output,
+            finish_reason: self.finish_reason,
+            stop_reason: self.stop_reason,
+            events: self.events,
+            kv_transfer_params: self.kv_transfer_params,
+            ec_transfer_params: self.ec_transfer_params,
+            trace_headers: self.trace_headers,
+            prefill_stats: self.prefill_stats,
+            routed_experts: self.routed_experts,
+            num_nans_in_logits: self.num_nans_in_logits,
+        })
+    }
+}
+
+/// Borrowed send-side view of [`WireEngineCoreOutput`]; keeps the wire field
+/// order without cloning the output being encoded.
+#[derive(Serialize_tuple)]
+struct WireEngineCoreOutputRef<'a> {
+    request_id: &'a str,
+    new_token_ids: &'a [u32],
+    new_logprobs: Option<&'a WireLogprobs>,
+    new_prompt_logprobs_tensors: Option<&'a WireLogprobs>,
+    pooling_output: Option<&'a OpaqueValue>,
+    finish_reason: Option<EngineCoreFinishReason>,
+    stop_reason: Option<&'a StopReason>,
+    events: Option<&'a [EngineCoreEvent]>,
+    kv_transfer_params: Option<&'a serde_json::Value>,
+    ec_transfer_params: Option<&'a serde_json::Value>,
+    trace_headers: Option<&'a OpaqueValue>,
+    prefill_stats: Option<&'a PrefillStats>,
+    routed_experts: Option<&'a OpaqueValue>,
+    num_nans_in_logits: u32,
 }
 
 /// Raw Python/msgpack engine-core output envelope. Mirrors Python
 /// `EngineCoreOutputs` (`array_like`).
-#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple, DefaultFromSerde)]
+#[derive(Debug, Clone, PartialEq, Deserialize_tuple, DefaultFromSerde)]
 struct WireEngineCoreOutputs {
     #[serde(default)]
     engine_index: u32,
     /// Outputs grouped for this client in the current engine tick.
     #[serde(default)]
-    outputs: Vec<EngineCoreOutput>,
+    outputs: Vec<WireEngineCoreOutput>,
     #[serde(default)]
     scheduler_stats: Option<Box<SchedulerStats>>,
     #[serde(default)]
@@ -209,19 +303,6 @@ impl EngineCoreOutputs {
             _ => None,
         }
     }
-
-    /// Resolve wire-format fields in-place using the aux frames.
-    fn resolve_in_place<Frame>(&mut self, frames: &[Frame]) -> Result<()>
-    where
-        Frame: AsRef<[u8]>,
-    {
-        if let Self::RequestBatch(batch) = self {
-            for output in &mut batch.outputs {
-                output.resolve_in_place(frames)?;
-            }
-        }
-        Ok(())
-    }
 }
 
 impl From<RequestBatchOutputs> for EngineCoreOutputs {
@@ -242,11 +323,11 @@ impl From<DpControlOutput> for EngineCoreOutputs {
     }
 }
 
-/// Classify the raw wire message into the semantic Rust enum.
-impl TryFrom<WireEngineCoreOutputs> for EngineCoreOutputs {
-    type Error = Error;
-
-    fn try_from(value: WireEngineCoreOutputs) -> Result<Self> {
+impl WireEngineCoreOutputs {
+    /// Classify into the semantic enum, resolving per-request wire logprobs
+    /// against the aux `frames`.
+    fn into_semantic(self, frames: &[Bytes]) -> Result<EngineCoreOutputs> {
+        let value = self;
         let has_request_payload = !value.outputs.is_empty()
             || value.scheduler_stats.is_some()
             || value.finished_requests.is_some();
@@ -259,7 +340,11 @@ impl TryFrom<WireEngineCoreOutputs> for EngineCoreOutputs {
         ) {
             (true, None, None, None) => Ok(RequestBatchOutputs {
                 engine_index: value.engine_index,
-                outputs: value.outputs,
+                outputs: value
+                    .outputs
+                    .into_iter()
+                    .map(|output| output.resolve(frames))
+                    .collect::<Result<Vec<_>>>()?,
                 scheduler_stats: value.scheduler_stats,
                 timestamp: value.timestamp,
                 finished_requests: value.finished_requests,
@@ -291,22 +376,46 @@ impl TryFrom<WireEngineCoreOutputs> for EngineCoreOutputs {
     }
 }
 
-impl From<EngineCoreOutputs> for WireEngineCoreOutputs {
-    fn from(value: EngineCoreOutputs) -> Self {
+/// Borrowed send-side view of [`WireEngineCoreOutputs`]; keeps the wire field
+/// order without cloning the batch being encoded.
+#[derive(Serialize_tuple)]
+struct WireEngineCoreOutputsRef<'a> {
+    engine_index: u32,
+    outputs: &'a [EngineCoreOutput],
+    scheduler_stats: Option<&'a SchedulerStats>,
+    timestamp: f64,
+    utility_output: Option<&'a OpaqueValue>,
+    finished_requests: Option<&'a BTreeSet<String>>,
+    wave_complete: Option<u64>,
+    start_wave: Option<u64>,
+}
+
+impl<'a> From<&'a EngineCoreOutputs> for WireEngineCoreOutputsRef<'a> {
+    fn from(value: &'a EngineCoreOutputs) -> Self {
+        let empty = Self {
+            engine_index: 0,
+            outputs: &[],
+            scheduler_stats: None,
+            timestamp: 0.0,
+            utility_output: None,
+            finished_requests: None,
+            wave_complete: None,
+            start_wave: None,
+        };
         match value {
             EngineCoreOutputs::RequestBatch(batch) => Self {
                 engine_index: batch.engine_index,
-                outputs: batch.outputs,
-                scheduler_stats: batch.scheduler_stats,
+                outputs: &batch.outputs,
+                scheduler_stats: batch.scheduler_stats.as_deref(),
                 timestamp: batch.timestamp,
-                finished_requests: batch.finished_requests,
-                ..Default::default()
+                finished_requests: batch.finished_requests.as_ref(),
+                ..empty
             },
             EngineCoreOutputs::Utility(utility) => Self {
                 engine_index: utility.engine_index,
                 timestamp: utility.timestamp,
-                utility_output: utility.output,
-                ..Default::default()
+                utility_output: utility.output.as_ref(),
+                ..empty
             },
             EngineCoreOutputs::DpControl(control) => {
                 let (wave_complete, start_wave) = match control.control {
@@ -318,7 +427,7 @@ impl From<EngineCoreOutputs> for WireEngineCoreOutputs {
                     timestamp: control.timestamp,
                     wave_complete,
                     start_wave,
-                    ..Default::default()
+                    ..empty
                 }
             }
         }
@@ -330,78 +439,154 @@ impl Serialize for EngineCoreOutputs {
     where
         S: Serializer,
     {
-        WireEngineCoreOutputs::from(self.clone()).serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for EngineCoreOutputs {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        WireEngineCoreOutputs::deserialize(deserializer)?
-            .try_into()
-            .map_err(serde::de::Error::custom)
+        WireEngineCoreOutputsRef::from(self).serialize(serializer)
     }
 }
 
 /// Decode one ordinary or multipart engine-core output message into the typed
 /// public protocol shape. Frame 0 is the primary msgpack; `frames[1..]` are the
 /// ordered aux tensor frames.
-pub fn decode_engine_core_outputs<Frame>(frames: &[Frame]) -> Result<EngineCoreOutputs>
-where
-    Frame: AsRef<[u8]>,
-{
+pub fn decode_engine_core_outputs(frames: &[Bytes]) -> Result<EngineCoreOutputs> {
     let first_frame = frames.first().ok_or_else(|| Error::ExtValueDecode {
         message: "missing output frame".to_string(),
     })?;
 
-    let mut outputs: EngineCoreOutputs = decode_msgpack(first_frame.as_ref())?;
-    outputs.resolve_in_place(frames)?;
-    Ok(outputs)
+    decode_msgpack::<WireEngineCoreOutputs>(first_frame)?.into_semantic(frames)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{decode_msgpack, encode_msgpack};
+    use crate::{
+        codec::{
+            encode_msgpack,
+            tensor::{WireArrayData, WireNdArray},
+        },
+        protocol::vllm::logprobs::{PositionLogprobs, TokenLogprob},
+    };
+
+    fn batch(outputs: Vec<EngineCoreOutput>) -> EngineCoreOutputs {
+        EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            outputs,
+            finished_requests: Some(BTreeSet::from(["req-1".to_string()])),
+            ..Default::default()
+        })
+    }
+
+    fn encoded_frame(outputs: &EngineCoreOutputs) -> Vec<Bytes> {
+        vec![Bytes::from(encode_msgpack(outputs).unwrap())]
+    }
 
     #[test]
     fn engine_core_outputs_roundtrip_finished_fields() {
-        let outputs = WireEngineCoreOutputs {
-            outputs: vec![EngineCoreOutput {
+        let outputs = batch(vec![EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![42],
+            finish_reason: Some(EngineCoreFinishReason::Length),
+            stop_reason: Some(StopReason::Text("stop".to_string())),
+            ..Default::default()
+        }]);
+
+        let decoded = decode_engine_core_outputs(&encoded_frame(&outputs)).unwrap();
+
+        assert_eq!(decoded, outputs);
+    }
+
+    #[test]
+    fn engine_core_outputs_roundtrip_logprobs() {
+        let logprobs = Logprobs {
+            positions: vec![PositionLogprobs {
+                entries: vec![
+                    TokenLogprob {
+                        token_id: 5,
+                        logprob: -0.25,
+                        rank: 3,
+                    },
+                    TokenLogprob {
+                        token_id: 6,
+                        logprob: -1.5,
+                        rank: 1,
+                    },
+                ],
+            }],
+        };
+        let outputs = batch(vec![EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![5],
+            new_logprobs: Some(logprobs.clone()),
+            ..Default::default()
+        }]);
+
+        let decoded = decode_engine_core_outputs(&encoded_frame(&outputs)).unwrap();
+
+        assert_eq!(
+            decoded.as_request_batch().unwrap().outputs[0].new_logprobs,
+            Some(logprobs)
+        );
+    }
+
+    #[test]
+    fn decode_resolves_logprobs_from_aux_frames() {
+        // Aux frames carry the three logprob arrays; frame 0 is the primary.
+        let token_ids = Bytes::from(
+            [7_i64, 8]
+                .into_iter()
+                .flat_map(i64::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        let logprobs = Bytes::from(
+            [-0.5_f32, -2.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        let ranks = Bytes::from(2_i64.to_le_bytes().to_vec());
+        let aux = |index| WireNdArray {
+            dtype: "<i8".to_string(),
+            shape: vec![1, 2],
+            data: WireArrayData::AuxIndex(index),
+        };
+        let wire = WireEngineCoreOutputs {
+            outputs: vec![WireEngineCoreOutput {
                 request_id: "req-1".to_string(),
-                new_token_ids: vec![42],
-                finish_reason: Some(EngineCoreFinishReason::Length),
-                stop_reason: Some(StopReason::Text("stop".to_string())),
+                new_token_ids: vec![7],
+                new_logprobs: Some(Box::new(WireLogprobs {
+                    logprob_token_ids: aux(1),
+                    logprobs: WireNdArray {
+                        dtype: "<f4".to_string(),
+                        shape: vec![1, 2],
+                        data: WireArrayData::AuxIndex(2),
+                    },
+                    token_ranks: WireNdArray {
+                        dtype: "<i8".to_string(),
+                        shape: vec![1],
+                        data: WireArrayData::AuxIndex(3),
+                    },
+                    cu_num_generated_tokens: None,
+                })),
                 ..Default::default()
             }],
-            finished_requests: Some(BTreeSet::from(["req-1".to_string()])),
             ..Default::default()
         };
 
-        let encoded = encode_msgpack(&outputs).unwrap();
-        let decoded: WireEngineCoreOutputs = decode_msgpack(&encoded).unwrap();
+        let frames = vec![Bytes::new(), token_ids, logprobs, ranks];
+        let decoded = wire.into_semantic(&frames).unwrap();
 
-        assert_eq!(decoded.outputs.len(), 1);
-        assert_eq!(
-            decoded.outputs[0].finish_reason,
-            Some(EngineCoreFinishReason::Length)
-        );
-        assert_eq!(
-            decoded.outputs[0].stop_reason,
-            Some(StopReason::Text("stop".to_string()))
-        );
-        assert_eq!(
-            decoded.finished_requests,
-            Some(BTreeSet::from(["req-1".to_string()]))
-        );
+        let entries = &decoded.as_request_batch().unwrap().outputs[0]
+            .new_logprobs
+            .as_ref()
+            .unwrap()
+            .positions[0]
+            .entries;
+        assert_eq!(entries[0].token_id, 7);
+        assert_eq!(entries[0].rank, 2);
+        assert_eq!(entries[1].logprob, -2.0);
     }
 
     #[test]
     fn classify_request_batch() {
         let wire = WireEngineCoreOutputs {
-            outputs: vec![EngineCoreOutput {
+            outputs: vec![WireEngineCoreOutput {
                 request_id: "req-1".to_string(),
                 new_token_ids: vec![7],
                 ..Default::default()
@@ -409,7 +594,7 @@ mod tests {
             finished_requests: Some(BTreeSet::from(["req-1".to_string()])),
             ..Default::default()
         };
-        let classified = EngineCoreOutputs::try_from(wire).unwrap();
+        let classified = wire.into_semantic(&[]).unwrap();
         let batch = classified.as_request_batch().expect("request batch");
         assert_eq!(batch.outputs[0].new_token_ids, vec![7]);
         assert_eq!(
@@ -424,7 +609,7 @@ mod tests {
             utility_output: Some(rmpv::Value::from(42u32)),
             ..Default::default()
         };
-        let classified = EngineCoreOutputs::try_from(wire).unwrap();
+        let classified = wire.into_semantic(&[]).unwrap();
         assert!(matches!(classified, EngineCoreOutputs::Utility(_)));
     }
 
@@ -434,7 +619,7 @@ mod tests {
             start_wave: Some(3),
             ..Default::default()
         };
-        let classified = EngineCoreOutputs::try_from(wire).unwrap();
+        let classified = wire.into_semantic(&[]).unwrap();
         assert_eq!(
             classified,
             EngineCoreOutputs::DpControl(DpControlOutput {
@@ -448,7 +633,7 @@ mod tests {
     #[test]
     fn classify_rejects_mixed_shape() {
         let wire = WireEngineCoreOutputs {
-            outputs: vec![EngineCoreOutput {
+            outputs: vec![WireEngineCoreOutput {
                 request_id: "req-1".to_string(),
                 new_token_ids: vec![7],
                 ..Default::default()
@@ -456,22 +641,18 @@ mod tests {
             utility_output: Some(rmpv::Value::from(1u32)),
             ..Default::default()
         };
-        let error = EngineCoreOutputs::try_from(wire).unwrap_err();
+        let error = wire.into_semantic(&[]).unwrap_err();
         assert!(error.to_string().contains("invalid wire shape"), "{error}");
     }
 
     #[test]
     fn decode_engine_core_outputs_from_single_frame() {
-        let wire = WireEngineCoreOutputs {
-            outputs: vec![EngineCoreOutput {
-                request_id: "req-1".to_string(),
-                new_token_ids: vec![1, 2, 3],
-                ..Default::default()
-            }],
+        let outputs = batch(vec![EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![1, 2, 3],
             ..Default::default()
-        };
-        let bytes = encode_msgpack(&wire).unwrap();
-        let decoded = decode_engine_core_outputs(&[bytes]).unwrap();
+        }]);
+        let decoded = decode_engine_core_outputs(&encoded_frame(&outputs)).unwrap();
         assert_eq!(
             decoded.as_request_batch().unwrap().outputs[0].new_token_ids,
             vec![1, 2, 3]

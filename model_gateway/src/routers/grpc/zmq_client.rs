@@ -843,12 +843,7 @@ impl VllmGenerateStream {
         let mut tick_logprobs_val = Vec::new();
         let mut tick_logprobs_idx = Vec::new();
         let mut tick_top_logprobs = Vec::new();
-        if let Some(logprobs) = &output.new_logprobs {
-            let decoded = logprobs.as_direct().ok_or_else(|| {
-                // The protocol layer resolves wire logprobs during decode, so
-                // an unresolved payload here is a protocol bug — fail loudly.
-                tonic::Status::internal("unresolved wire logprobs in engine output")
-            })?;
+        if let Some(decoded) = &output.new_logprobs {
             for position in &decoded.positions {
                 let Some(sampled) = position.entries.first() else {
                     continue;
@@ -880,10 +875,7 @@ impl VllmGenerateStream {
         // them incrementally); entry 0 per position is the actual prompt
         // token. The API contract reports the first prompt token with a null
         // logprob, so seed it once before the first scored position.
-        if let Some(prompt_logprobs) = &output.new_prompt_logprobs_tensors {
-            let decoded = prompt_logprobs.as_direct().ok_or_else(|| {
-                tonic::Status::internal("unresolved wire prompt logprobs in engine output")
-            })?;
+        if let Some(decoded) = &output.new_prompt_logprobs_tensors {
             if state.prompt_logprobs.is_empty() && !decoded.positions.is_empty() {
                 if let Some(first) = self.first_prompt_token {
                     state
@@ -1459,7 +1451,7 @@ mod tests {
     use engine_zmq_client::{
         mock_engine::{connect_to_frontend, default_ready_response, EngineInbound},
         protocol::vllm::{
-            logprobs::{Logprobs, MaybeWireLogprobs, PositionLogprobs, TokenLogprob},
+            logprobs::{Logprobs, PositionLogprobs, TokenLogprob},
             output::{EngineCoreOutputs, RequestBatchOutputs},
         },
         EngineId,
@@ -1625,16 +1617,14 @@ mod tests {
         finish: Option<EngineCoreFinishReason>,
     ) -> EngineCoreOutputs {
         let finished = finish.map(|_| BTreeSet::from([request_id.to_string()]));
-        let new_logprobs = logprob.map(|lp| {
-            MaybeWireLogprobs::Direct(Logprobs {
-                positions: vec![PositionLogprobs {
-                    entries: vec![TokenLogprob {
-                        token_id: token,
-                        logprob: lp,
-                        rank: 1,
-                    }],
+        let new_logprobs = logprob.map(|lp| Logprobs {
+            positions: vec![PositionLogprobs {
+                entries: vec![TokenLogprob {
+                    token_id: token,
+                    logprob: lp,
+                    rank: 1,
                 }],
-            })
+            }],
         });
         EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
@@ -1826,9 +1816,9 @@ mod tests {
             outputs: vec![EngineCoreOutput {
                 request_id: "r1".to_string(),
                 new_token_ids: vec![10],
-                new_logprobs: Some(MaybeWireLogprobs::Direct(Logprobs {
+                new_logprobs: Some(Logprobs {
                     positions: vec![position],
-                })),
+                }),
                 finish_reason: Some(EngineCoreFinishReason::Length),
                 ..Default::default()
             }],
@@ -1940,7 +1930,7 @@ mod tests {
 
         // Prompt position for input token 2 (the engine scores every prompt
         // token but the first), with one ranked candidate behind it.
-        let prompt_tensors = MaybeWireLogprobs::Direct(Logprobs {
+        let prompt_tensors = Logprobs {
             positions: vec![PositionLogprobs {
                 entries: vec![
                     TokenLogprob {
@@ -1955,7 +1945,7 @@ mod tests {
                     },
                 ],
             }],
-        });
+        };
         let prefill = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
             outputs: vec![EngineCoreOutput {
