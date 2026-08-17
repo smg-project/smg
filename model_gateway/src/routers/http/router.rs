@@ -1319,10 +1319,28 @@ pub(crate) async fn send_with_stale_conn_retry(
         Err(e) if is_pre_response_transport_error(&e) => match retry {
             Some(retry) => {
                 Metrics::record_upstream_send_retry(metrics_labels::ROUTER_HTTP);
+                warn!("DEBUG retrying pre-response transport error err={e:?}");
                 retry.send().await
             }
-            None => Err(e),
+            None => {
+                warn!("DEBUG no-retry: builder not clonable err={e:?}");
+                Err(e)
+            }
         },
+        Err(e) => {
+            warn!(
+                "DEBUG no-retry: classifier rejected err={e:?} status={:?} timeout={} connect={} request={} body={} decode={} builder={} redirect={}",
+                e.status(),
+                e.is_timeout(),
+                e.is_connect(),
+                e.is_request(),
+                e.is_body(),
+                e.is_decode(),
+                e.is_builder(),
+                e.is_redirect()
+            );
+            Err(e)
+        }
         other => other,
     }
 }
