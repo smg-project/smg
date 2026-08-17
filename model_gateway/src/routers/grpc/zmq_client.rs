@@ -65,6 +65,16 @@ enum ZmqBackend {
     TokenSpeed(Arc<TokenSpeedClient>),
 }
 
+/// Per-connection constants of a [`ZmqEngineClient`], fixed at connect time.
+struct ZmqConnectionMeta {
+    /// Model id advertised for metadata (the engine does not report it on the
+    /// wire; it is configured at worker registration).
+    model_id: String,
+    /// EOS ids attached to every vLLM request (the engine can't stop at EOS
+    /// without them).
+    eos: EosTokenIds,
+}
+
 /// The model's EOS stop set, resolved from its local directory. EngineCore
 /// has no tokenizer or model config — stopping at EOS is the frontend's job
 /// (the ids ride each request), and without them generation only ends at
@@ -85,9 +95,9 @@ impl EosTokenIds {
     /// Resolve from `config.json` + `generation_config.json` in a local model
     /// directory: primary = the model config's first id, extras = every other
     /// listed id. Missing files or fields degrade to fewer ids.
-    pub fn from_model_dir(dir: &Path) -> Self {
-        let model_ids = eos_ids_from_file(&dir.join("config.json"));
-        let gen_ids = eos_ids_from_file(&dir.join("generation_config.json"));
+    pub async fn from_model_dir(dir: &Path) -> Self {
+        let model_ids = eos_ids_from_file(&dir.join("config.json")).await;
+        let gen_ids = eos_ids_from_file(&dir.join("generation_config.json")).await;
         let primary = (model_ids.first().or_else(|| gen_ids.first())).copied();
         let mut extra = Vec::new();
         for id in model_ids.into_iter().chain(gen_ids) {
@@ -106,8 +116,8 @@ impl EosTokenIds {
 /// that exists but holds corrupt JSON is worth a `warn!`: it runs once at
 /// connect time, and losing the EOS ids here silently manifests later as
 /// generation running to `max_tokens`.
-fn eos_ids_from_file(path: &Path) -> Vec<u32> {
-    let Ok(text) = std::fs::read_to_string(path) else {
+async fn eos_ids_from_file(path: &Path) -> Vec<u32> {
+    let Ok(text) = tokio::fs::read_to_string(path).await else {
         return Vec::new();
     };
     match serde_json::from_str::<serde_json::Value>(&text) {
@@ -332,8 +342,11 @@ pub(crate) async fn connect_for_worker(
     // config); resolve the EOS ids from the local model dir so every request
     // carries them.
     let model_dir = Path::new(&model_id);
-    let eos = if model_dir.is_dir() {
-        EosTokenIds::from_model_dir(model_dir)
+    let is_model_dir = tokio::fs::metadata(model_dir)
+        .await
+        .is_ok_and(|meta| meta.is_dir());
+    let eos = if is_model_dir {
+        EosTokenIds::from_model_dir(model_dir).await
     } else {
         tracing::warn!(
             "ZMQ worker model id '{model_id}' is not a local model directory; connect-time \
@@ -364,12 +377,9 @@ pub(crate) async fn connect_for_worker(
 #[derive(Clone)]
 pub struct ZmqEngineClient {
     backend: ZmqBackend,
-    /// Model id advertised for metadata (the engine does not report it on the
-    /// wire; it is configured at worker registration).
-    model_id: String,
-    /// EOS ids attached to every vLLM request (the engine can't stop at EOS
-    /// without them).
-    eos: EosTokenIds,
+    /// Connection-constant metadata, shared so cloning the client (once per
+    /// request, via `BackendClient`) stays a pointer bump.
+    meta: Arc<ZmqConnectionMeta>,
 }
 
 impl ZmqEngineClient {
@@ -428,8 +438,7 @@ impl ZmqEngineClient {
         };
         Ok(Self {
             backend,
-            model_id,
-            eos,
+            meta: Arc::new(ZmqConnectionMeta { model_id, eos }),
         })
     }
 
@@ -489,8 +498,9 @@ impl ZmqEngineClient {
                     .ok_or_else(|| tonic::Status::unavailable("no connected ZMQ engine"))?;
                 let mut streams = SelectAll::new();
                 for (index, sub) in fan_out_requests(*req).into_iter().enumerate() {
-                    let request = translate_request(sub, max_model_len, model_dtype, &self.eos)
-                        .map_err(tonic::Status::invalid_argument)?;
+                    let request =
+                        translate_request(sub, max_model_len, model_dtype, &self.meta.eos)
+                            .map_err(tonic::Status::invalid_argument)?;
                     // The engine returns the sampled/prompt token's logprob
                     // plus the requested ranked candidates per position; carry
                     // the counts so the stream can shape both `top_logprobs`
@@ -602,18 +612,18 @@ impl ZmqEngineClient {
             .unwrap_or(0);
         match &self.backend {
             ZmqBackend::Vllm(_) => ModelInfo::Vllm(vllm::GetModelInfoResponse {
-                model_path: self.model_id.clone(),
-                served_model_name: self.model_id.clone(),
-                tokenizer_path: self.model_id.clone(),
+                model_path: self.meta.model_id.clone(),
+                served_model_name: self.meta.model_id.clone(),
+                tokenizer_path: self.meta.model_id.clone(),
                 is_generation: true,
                 max_context_length: u32::try_from(max_context_length).unwrap_or(u32::MAX),
                 ..Default::default()
             }),
             ZmqBackend::TokenSpeed(_) => {
                 ModelInfo::TokenSpeed(Box::new(tokenspeed_proto::GetModelInfoResponse {
-                    model_path: self.model_id.clone(),
-                    served_model_name: self.model_id.clone(),
-                    tokenizer_path: self.model_id.clone(),
+                    model_path: self.meta.model_id.clone(),
+                    served_model_name: self.meta.model_id.clone(),
+                    tokenizer_path: self.meta.model_id.clone(),
                     max_context_length: i32::try_from(max_context_length).unwrap_or(i32::MAX),
                     ..Default::default()
                 }))
@@ -948,30 +958,34 @@ impl VllmGenerateStream {
         if self.state.prompt_logprobs.is_empty() {
             return;
         }
-        let input_logprobs = vllm::InputLogProbs {
-            token_logprobs: self.state.prompt_logprobs.clone(),
-            token_ids: self.state.prompt_token_ids.clone(),
-            top_logprobs: self.state.prompt_top_logprobs.clone(),
+        // Built per attachment site rather than up front: with
+        // `prompt_logprobs` requested this runs on every decode tick, and the
+        // common tick (a later chunk) attaches nothing.
+        let state = &self.state;
+        let build = || vllm::InputLogProbs {
+            token_logprobs: state.prompt_logprobs.clone(),
+            token_ids: state.prompt_token_ids.clone(),
+            top_logprobs: state.prompt_top_logprobs.clone(),
         };
         if let Some(vllm::generate_response::Response::Complete(parked)) = self
             .pending
             .as_mut()
             .and_then(|pending| pending.response.as_mut())
         {
-            parked.input_logprobs = Some(input_logprobs.clone());
+            parked.input_logprobs = Some(build());
         }
         match response.response.as_mut() {
             Some(vllm::generate_response::Response::Chunk(chunk))
                 if !self.input_logprobs_emitted && !chunk.token_ids.is_empty() =>
             {
-                chunk.input_logprobs = Some(input_logprobs);
+                chunk.input_logprobs = Some(build());
                 self.input_logprobs_emitted = true;
             }
             // Later chunks never repeat them (the proto carries them in the
             // first chunk only), and neither do token-less prefill chunks.
             Some(vllm::generate_response::Response::Chunk(_)) => {}
             Some(vllm::generate_response::Response::Complete(complete)) => {
-                complete.input_logprobs = Some(input_logprobs);
+                complete.input_logprobs = Some(build());
             }
             None => {}
         }
@@ -1134,18 +1148,21 @@ fn fan_out_requests(req: vllm::GenerateRequest) -> Vec<vllm::GenerateRequest> {
 
 /// Shared n>1 fan-out scaffolding: clone the request into `n` subs and let
 /// `per_sub` apply the engine-specific rid suffix and sampling tweaks. An
-/// `n <= 1` request passes through untouched.
-fn fan_out_n<R: Clone>(req: R, n: u32, mut per_sub: impl FnMut(&mut R, u32)) -> Vec<R> {
+/// `n <= 1` request passes through untouched. The last sub reuses `req`
+/// itself, so a multimodal payload is copied `n - 1` times, not `n`.
+fn fan_out_n<R: Clone>(mut req: R, n: u32, mut per_sub: impl FnMut(&mut R, u32)) -> Vec<R> {
     if n <= 1 {
         return vec![req];
     }
-    (0..n)
-        .map(|i| {
-            let mut sub = req.clone();
-            per_sub(&mut sub, i);
-            sub
-        })
-        .collect()
+    let mut subs = Vec::with_capacity(n as usize);
+    for i in 0..n - 1 {
+        let mut sub = req.clone();
+        per_sub(&mut sub, i);
+        subs.push(sub);
+    }
+    per_sub(&mut req, n - 1);
+    subs.push(req);
+    subs
 }
 
 /// Split an `n > 1` TokenSpeed proto request into `n` single-sample
@@ -2509,8 +2526,8 @@ mod tests {
         assert_eq!(sp.all_stop_token_ids, BTreeSet::from([5, 7, 9]));
     }
 
-    #[test]
-    fn eos_token_ids_resolve_from_model_dir() {
+    #[tokio::test]
+    async fn eos_token_ids_resolve_from_model_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("config.json"), r#"{"eos_token_id": 5}"#).unwrap();
         std::fs::write(
@@ -2519,14 +2536,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            EosTokenIds::from_model_dir(dir.path()),
+            EosTokenIds::from_model_dir(dir.path()).await,
             EosTokenIds::new(Some(5), vec![7, 9]),
         );
 
         // Missing files degrade to no ids, not an error.
         let empty = tempfile::tempdir().expect("tempdir");
         assert_eq!(
-            EosTokenIds::from_model_dir(empty.path()),
+            EosTokenIds::from_model_dir(empty.path()).await,
             EosTokenIds::default(),
         );
     }

@@ -3,7 +3,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::Duration,
 };
@@ -38,6 +38,57 @@ use crate::{
 
 /// Default HTTP client timeout for worker requests (in seconds)
 pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
+
+/// Per-worker HTTP client with an isolated connection pool, materialized on
+/// first use.
+///
+/// A worker whose connection mode never speaks HTTP (ZMQ: local health check,
+/// admin ops rejected up front) would otherwise pay for a connector and idle
+/// pool it can never use, so the fallback client is built only when a caller
+/// actually asks for it.
+pub struct LazyHttpClient {
+    cell: OnceLock<reqwest::Client>,
+}
+
+impl LazyHttpClient {
+    /// Wrap an already-built client (the registration paths hand one in).
+    pub fn ready(client: reqwest::Client) -> Self {
+        let cell = OnceLock::new();
+        let _ = cell.set(client);
+        Self { cell }
+    }
+
+    /// Defer construction until [`Self::client`] is first called.
+    pub fn deferred() -> Self {
+        Self {
+            cell: OnceLock::new(),
+        }
+    }
+
+    /// Whether the client is still unbuilt (test-only observation of laziness).
+    #[cfg(test)]
+    pub(crate) fn cell_is_empty(&self) -> bool {
+        self.cell.get().is_none()
+    }
+
+    /// The client, building the default one on first use.
+    pub fn client(&self) -> &reqwest::Client {
+        self.cell.get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(DEFAULT_WORKER_HTTP_TIMEOUT_SECS))
+                .pool_max_idle_per_host(8)
+                .build()
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to build the default per-worker HTTP client; \
+                         falling back to reqwest defaults (no request timeout)"
+                    );
+                    reqwest::Client::new()
+                })
+        })
+    }
+}
 
 /// Timeout for worker HTTP `flush_cache` requests. Matches the gRPC
 /// client's local flush deadline.
@@ -1041,8 +1092,9 @@ pub struct BasicWorker {
     /// When not `Wildcard`, overrides metadata.models for routing decisions.
     /// Uses `ArcSwap` for lock-free reads on the hot path (`supports_model`).
     pub models_override: Arc<ArcSwap<WorkerModels>>,
-    /// Per-worker HTTP client with isolated connection pool.
-    pub http_client: reqwest::Client,
+    /// Per-worker HTTP client with isolated connection pool, built on first
+    /// use (see [`LazyHttpClient`]).
+    pub http_client: Arc<LazyHttpClient>,
     /// Resolved resilience config (retry + circuit breaker settings).
     pub resilience: ResolvedResilience,
 }
@@ -1057,7 +1109,7 @@ impl Clone for BasicWorker {
             zmq_connect_started: Arc::clone(&self.zmq_connect_started),
             connect_signal_tx: self.connect_signal_tx.clone(),
             models_override: Arc::clone(&self.models_override),
-            http_client: self.http_client.clone(),
+            http_client: Arc::clone(&self.http_client),
             resilience: self.resilience.clone(),
         }
     }
@@ -1266,7 +1318,7 @@ impl Worker for BasicWorker {
     }
 
     fn http_client(&self) -> &reqwest::Client {
-        &self.http_client
+        self.http_client.client()
     }
 
     fn supports_model(&self, model_id: &str) -> bool {
@@ -1503,7 +1555,7 @@ impl Worker for BasicWorker {
 
         let health_url = format!("{}{}", self.base_url(), self.metadata.health_endpoint);
 
-        let mut req = self.http_client.get(&health_url).timeout(timeout);
+        let mut req = self.http_client.client().get(&health_url).timeout(timeout);
         if let Some(api_key) = &self.metadata.spec.api_key {
             req = req.bearer_auth(api_key);
         }
