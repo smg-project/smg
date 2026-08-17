@@ -355,7 +355,9 @@ async fn run_health_loop(
             () = tokio::time::sleep_until(sleep_until) => {}
             signal = recv_connect_signal(&mut connect_rx) => {
                 match signal {
-                    Some(connected) => apply_connect_signal(&registry, connected),
+                    Some(connected) => {
+                        apply_connect_signal(&registry, connected, &mut next_check, &config);
+                    }
                     // Every sender lives on the registry (Arc), so recv() only
                     // returns None if the registry itself is gone. Drop the
                     // branch so the loop stops polling a dead channel.
@@ -597,7 +599,12 @@ async fn recv_connect_signal(
 /// for its next scheduled poll. Resolves the URL to a live worker id and flips
 /// the status through the revision-checked setter, so a signal that lost a race
 /// with a same-URL replacement — or a worker already removed — is discarded.
-fn apply_connect_signal(registry: &Arc<WorkerRegistry>, connected: WorkerConnected) {
+fn apply_connect_signal(
+    registry: &Arc<WorkerRegistry>,
+    connected: WorkerConnected,
+    next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
+    config: &WorkerManagerConfig,
+) {
     let WorkerConnected { url, revision } = connected;
     let Some(worker_id) = registry.get_id_by_url(&url) else {
         debug!(worker_url = %url, "Connect signal for an unknown worker; ignoring");
@@ -606,6 +613,20 @@ fn apply_connect_signal(registry: &Arc<WorkerRegistry>, connected: WorkerConnect
     match registry.transition_status_if_revision(&worker_id, revision, WorkerStatus::Ready) {
         Some((old, new)) => {
             debug!(worker_url = %url, ?old, ?new, "Promoted worker on connect signal");
+            // A Failed worker was dropped from the schedule; a promoted one is
+            // serving traffic, so it must be probed again — otherwise a later
+            // engine death would leave it Ready with a dead client forever.
+            if let Some(worker) = registry.get(&worker_id) {
+                schedule_worker_at(
+                    next_check,
+                    worker_id,
+                    new,
+                    &worker.metadata().health_config,
+                    config,
+                    tokio::time::Instant::now(),
+                    false,
+                );
+            }
         }
         None => {
             // No transition: already Ready (idempotent), or a stale revision
@@ -1184,6 +1205,13 @@ mod tests {
         )
     }
 
+    fn test_config() -> WorkerManagerConfig {
+        WorkerManagerConfig {
+            default_check_interval_secs: 5,
+            remove_unhealthy: false,
+        }
+    }
+
     fn make_zmq_worker(url: &str) -> Arc<dyn Worker> {
         Arc::new(
             BasicWorkerBuilder::new(url)
@@ -1343,18 +1371,50 @@ mod tests {
         let revision = worker.revision();
         registry.register(worker.clone()).unwrap();
 
+        let mut next_check = HashMap::new();
         apply_connect_signal(
             &registry,
             WorkerConnected {
                 url: "http://w:1".to_string(),
                 revision,
             },
+            &mut next_check,
+            &test_config(),
         );
 
         assert_eq!(
             worker.status(),
             WorkerStatus::Ready,
             "a matching connect signal must promote a Pending worker immediately"
+        );
+    }
+
+    #[test]
+    fn apply_connect_signal_reschedules_a_promoted_worker() {
+        // A worker that hit the Pending cap is dropped from the schedule. A
+        // late handshake promotes it to Ready, so it must re-enter the probe
+        // schedule — otherwise it would serve traffic unmonitored forever.
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = make_worker("http://w:1", 2, 3);
+        worker.set_status(WorkerStatus::Failed);
+        let revision = worker.revision();
+        let worker_id = registry.register(worker.clone()).unwrap();
+
+        let mut next_check = HashMap::new();
+        apply_connect_signal(
+            &registry,
+            WorkerConnected {
+                url: "http://w:1".to_string(),
+                revision,
+            },
+            &mut next_check,
+            &test_config(),
+        );
+
+        assert_eq!(worker.status(), WorkerStatus::Ready);
+        assert!(
+            next_check.contains_key(&worker_id),
+            "a promoted worker must be probed again"
         );
     }
 
@@ -1379,6 +1439,8 @@ mod tests {
                 url: "http://w:1".to_string(),
                 revision: stale_revision,
             },
+            &mut HashMap::new(),
+            &test_config(),
         );
 
         assert_eq!(
@@ -1399,6 +1461,8 @@ mod tests {
                 url: "http://ghost:1".to_string(),
                 revision: 0,
             },
+            &mut HashMap::new(),
+            &test_config(),
         );
     }
 

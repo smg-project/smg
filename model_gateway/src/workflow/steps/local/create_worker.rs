@@ -6,16 +6,17 @@ use async_trait::async_trait;
 use openai_protocol::{
     model_card::ModelCard,
     model_type::ModelType,
-    worker::{WorkerSpec, WorkerType},
+    worker::{HealthCheckConfig, WorkerSpec, WorkerType},
 };
-use tracing::debug;
+use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
+    routers::grpc::zmq_client::zmq_handshake_address,
     worker::{
         circuit_breaker::CircuitBreakerConfig, http_client::build_worker_http_client,
         resilience::resolve_resilience, worker::RuntimeType, BasicWorkerBuilder, ConnectionMode,
-        Worker, UNKNOWN_MODEL_ID,
+        Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
 };
@@ -174,6 +175,17 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         // Normalize URL
         let url = normalize_url(&config.url, *connection_mode);
 
+        validate_zmq_handshake_collision(
+            &app_context.worker_registry,
+            &url,
+            config.zmq_handshake_address.as_deref(),
+            *connection_mode,
+        )
+        .map_err(|message| WorkflowError::StepFailed {
+            step_id: StepId::new("create_worker"),
+            message,
+        })?;
+
         // Build workers — resolve per-worker resilience and HTTP client
         let base_retry = app_context.router_config.effective_retry_config();
         let base_cb_cfg = app_context.router_config.effective_circuit_breaker_config();
@@ -199,7 +211,8 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         })?;
 
         let health_base = app_context.router_config.health_check.to_protocol_config();
-        let health_config = config.health.apply_to(&health_base);
+        let health_config =
+            resolve_zmq_health_config(config.health.apply_to(&health_base), *connection_mode, &url);
         let health_endpoint = &app_context.router_config.health_check.endpoint;
 
         let dp_ranks: Vec<Option<(usize, usize)>> = if app_context.router_config.dp_aware {
@@ -311,7 +324,7 @@ fn resolve_model_id<'a>(config: &'a WorkerSpec, labels: &'a HashMap<String, Stri
 fn warn_on_conflicting_parser_overrides(
     card: &ModelCard,
     worker_url: &str,
-    registry: &crate::worker::WorkerRegistry,
+    registry: &WorkerRegistry,
 ) {
     for existing in registry.get_by_model(&card.id).iter() {
         let Some(existing_card) = existing.metadata().spec.models.find(&card.id) else {
@@ -523,6 +536,74 @@ fn validate_zmq_handshake_override(
     Ok(())
 }
 
+/// Reject a ZMQ worker whose TCP handshake address is already claimed.
+///
+/// The handshake port is a hash of the ipc path, so a collision between two
+/// worker URLs is deterministic and permanent: the second worker's handshake
+/// bind fails on every connect attempt with a bare transport error, hours
+/// after registration. Detect it here, where the fix can be named.
+fn validate_zmq_handshake_collision(
+    registry: &WorkerRegistry,
+    url: &str,
+    handshake_override: Option<&str>,
+    connection_mode: ConnectionMode,
+) -> Result<(), String> {
+    if connection_mode != ConnectionMode::Zmq {
+        return Ok(());
+    }
+    // An unparsable URL fails later with its own message; nothing to compare.
+    let Some(handshake) = zmq_handshake_address(url, handshake_override) else {
+        return Ok(());
+    };
+    for existing in registry.get_all() {
+        let metadata = existing.metadata();
+        // Sockets are bound against the base URL (a dp-expanded worker carries
+        // a `@rank` suffix on `spec.url` but binds the base).
+        let existing_url = metadata.base_url();
+        if *existing.connection_mode() != ConnectionMode::Zmq || existing_url == url {
+            continue;
+        }
+        if zmq_handshake_address(existing_url, metadata.spec.zmq_handshake_address.as_deref())
+            .as_deref()
+            == Some(handshake.as_str())
+        {
+            return Err(format!(
+                "ZMQ worker {url} would bind handshake address {handshake}, already claimed by \
+                 worker {existing_url}: the derived port is a hash of the ipc path, so rename \
+                 this worker's ipc path or set zmq_handshake_address to a free tcp:// address"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Keep health checking on for a ZMQ worker.
+///
+/// The ZMQ probe is not a network call — it peeks a local liveness flag — and
+/// it is the only path that evicts a client whose engine died and rebinds the
+/// sockets for a replacement engine to dial into (ZMQ liveness is latched: a
+/// dead client never recovers in place). With probing off the first handshake
+/// still runs, since a request kicks the background connect driver, but an
+/// engine restart leaves the worker pinned to that dead client until the
+/// gateway restarts. Honor the transport over the flag and say so.
+fn resolve_zmq_health_config(
+    health_config: HealthCheckConfig,
+    connection_mode: ConnectionMode,
+    url: &str,
+) -> HealthCheckConfig {
+    if connection_mode != ConnectionMode::Zmq || !health_config.disable_health_check {
+        return health_config;
+    }
+    warn!(
+        "Ignoring disabled health checks for ZMQ worker {url}: the ZMQ probe is a local liveness \
+         check and the only path that reconnects a restarted engine, so it stays enabled"
+    );
+    HealthCheckConfig {
+        disable_health_check: false,
+        ..health_config
+    }
+}
+
 fn normalize_url(url: &str, connection_mode: ConnectionMode) -> String {
     if url.starts_with("http://")
         || url.starts_with("https://")
@@ -602,7 +683,6 @@ fn validate_zmq_dp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::WorkerRegistry;
 
     #[test]
     fn normalize_url_preserves_existing_schemes() {
@@ -719,6 +799,80 @@ mod tests {
         let card = build_model_card("GLM-5.2", &spec, &HashMap::new(), &aliases);
 
         assert!(card.aliases.is_empty());
+    }
+
+    fn zmq_worker(url: &str, handshake_override: Option<&str>) -> Arc<dyn Worker> {
+        let mut spec = WorkerSpec::new(url);
+        spec.connection_mode = ConnectionMode::Zmq;
+        spec.zmq_handshake_address = handshake_override.map(str::to_string);
+        Arc::new(BasicWorkerBuilder::from_spec(spec).build())
+    }
+
+    #[test]
+    fn zmq_handshake_collision_is_rejected_at_registration() {
+        // Two ipc paths hashing to the same derived port would leave the second
+        // worker's handshake bind failing forever with a bare transport error.
+        let registry = WorkerRegistry::new();
+        let first = "ipc:///tmp/smg-zmq/a.ipc";
+        let handshake = zmq_handshake_address(first, None).expect("derived handshake address");
+        registry.register(zmq_worker(first, None)).unwrap();
+
+        // Same derived address reached through an explicit override.
+        let err = validate_zmq_handshake_collision(
+            &registry,
+            "ipc:///tmp/smg-zmq/b.ipc",
+            Some(&handshake),
+            ConnectionMode::Zmq,
+        )
+        .expect_err("a colliding handshake address must be rejected");
+        assert!(err.contains(&handshake), "message was: {err}");
+        assert!(err.contains(first), "message was: {err}");
+
+        // A distinct path derives a distinct address; re-registering the same
+        // URL (update path) is not a collision with itself.
+        validate_zmq_handshake_collision(
+            &registry,
+            "ipc:///tmp/smg-zmq/b.ipc",
+            None,
+            ConnectionMode::Zmq,
+        )
+        .expect("a distinct ipc path must be accepted");
+        validate_zmq_handshake_collision(&registry, first, None, ConnectionMode::Zmq)
+            .expect("re-registering the same worker URL must be accepted");
+        validate_zmq_handshake_collision(
+            &registry,
+            "grpc://worker:8080",
+            None,
+            ConnectionMode::Grpc,
+        )
+        .expect("non-ZMQ workers are not affected");
+    }
+
+    #[test]
+    fn zmq_workers_keep_health_checks_enabled() {
+        // The ZMQ probe drives the handshake and evicts dead clients, so
+        // disabling it would brick the worker on engine restart.
+        let disabled = HealthCheckConfig {
+            disable_health_check: true,
+            ..Default::default()
+        };
+
+        let resolved = resolve_zmq_health_config(
+            disabled.clone(),
+            ConnectionMode::Zmq,
+            "ipc:///tmp/smg-zmq/a.ipc",
+        );
+        assert!(!resolved.disable_health_check);
+        assert_eq!(
+            resolved.check_interval_secs, disabled.check_interval_secs,
+            "only the disable flag is overridden"
+        );
+
+        assert!(
+            resolve_zmq_health_config(disabled, ConnectionMode::Http, "http://w:1")
+                .disable_health_check,
+            "other transports keep the operator's choice"
+        );
     }
 
     #[test]

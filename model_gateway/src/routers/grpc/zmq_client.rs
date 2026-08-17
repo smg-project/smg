@@ -13,7 +13,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     path::Path,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -85,6 +85,10 @@ struct ZmqConnectionMeta {
     /// EOS ids attached to every vLLM request (the engine can't stop at EOS
     /// without them).
     eos: EosTokenIds,
+    /// Tokenizer-derived EOS ids, adopted once when `eos` came back empty
+    /// (the model id is a repo id, not a local directory). Lives here rather
+    /// than on the client so every clone shares the one adoption.
+    tokenizer_eos: OnceLock<EosTokenIds>,
 }
 
 /// The model's EOS stop set, resolved from its local directory. EngineCore
@@ -102,6 +106,20 @@ pub struct EosTokenIds {
 impl EosTokenIds {
     pub fn new(primary: Option<u32>, extra: Vec<u32>) -> Self {
         Self { primary, extra }
+    }
+
+    /// Build from the tokenizer's merged EOS set (same ordering as
+    /// [`Self::from_model_dir`]: config first, generation config after).
+    fn from_ids(ids: &[u32]) -> Self {
+        let mut ids = ids.iter().copied();
+        Self {
+            primary: ids.next(),
+            extra: ids.collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.primary.is_none() && self.extra.is_empty()
     }
 
     /// Resolve from `config.json` + `generation_config.json` in a local model
@@ -224,6 +242,9 @@ fn derive_handshake_port(path: &str) -> u16 {
 /// band), so setting the override to that value pairs a bare
 /// `ts serve --headless` with a manually registered worker.
 /// Returns `(handshake, input, output)`.
+///
+/// [`zmq_handshake_address`] exposes just the handshake half, for collision
+/// checks at registration time.
 fn zmq_socket_addresses(
     base_url: &str,
     handshake_override: Option<&str>,
@@ -246,6 +267,17 @@ fn zmq_socket_addresses(
     let input = format!("ipc://{path}-in.sock");
     let output = format!("ipc://{path}-out.sock");
     Ok((handshake, input, output))
+}
+
+/// The TCP handshake address a ZMQ worker will bind, or `None` when the URL is
+/// not a usable `ipc://` base (connect reports that with its own error).
+pub(crate) fn zmq_handshake_address(
+    base_url: &str,
+    handshake_override: Option<&str>,
+) -> Option<String> {
+    zmq_socket_addresses(base_url, handshake_override)
+        .ok()
+        .map(|(handshake, _, _)| handshake)
 }
 
 /// Create the parent directory for a worker's `ipc://` sockets. Kept off the
@@ -450,8 +482,38 @@ impl ZmqEngineClient {
         };
         Ok(Self {
             backend,
-            meta: Arc::new(ZmqConnectionMeta { model_id, eos }),
+            meta: Arc::new(ZmqConnectionMeta {
+                model_id,
+                eos,
+                tokenizer_eos: OnceLock::new(),
+            }),
         })
+    }
+
+    /// Adopt the tokenizer's EOS ids when the connect-time model-dir lookup
+    /// found none (the worker's model id is a repo id, not a local path).
+    ///
+    /// Without this the primary EOS id would only ride `stop_token_ids`, and
+    /// an EOS finish would be reported as `matched_stop = <eos id>` — so the
+    /// same model would answer differently depending on whether its files
+    /// happen to be local.
+    pub(crate) fn adopt_tokenizer_eos(&self, tokenizer: Option<&Arc<dyn Tokenizer>>) {
+        if !self.meta.eos.is_empty() || self.meta.tokenizer_eos.get().is_some() {
+            return;
+        }
+        let Some(ids) = tokenizer
+            .map(|t| t.eos_token_ids())
+            .filter(|ids| !ids.is_empty())
+        else {
+            return;
+        };
+        let _ = self.meta.tokenizer_eos.set(EosTokenIds::from_ids(ids));
+    }
+
+    /// The EOS set attached to requests: the connect-time set, or the adopted
+    /// tokenizer set when that one was empty.
+    fn effective_eos(&self) -> &EosTokenIds {
+        self.meta.tokenizer_eos.get().unwrap_or(&self.meta.eos)
     }
 
     /// The wire protocol chosen at connect time.
@@ -519,7 +581,7 @@ impl ZmqEngineClient {
                 let mut streams = SelectAll::new();
                 for (index, sub) in fan_out_requests(*req).into_iter().enumerate() {
                     let request =
-                        translate_request(sub, max_model_len, model_dtype, &self.meta.eos)
+                        translate_request(sub, max_model_len, model_dtype, self.effective_eos())
                             .map_err(tonic::Status::invalid_argument)?;
                     // The engine returns the sampled/prompt token's logprob
                     // plus the requested ranked candidates per position; carry
@@ -1658,6 +1720,54 @@ mod tests {
         let mut req = eos_request(vec![999], false);
         fold_tokenizer_eos_backstop(&mut req, Some(&tokenizer));
         assert_eq!(eos_stop_ids(&req), &[999]);
+    }
+
+    /// A connected client over a throwaway ipc endpoint. The mock engine is
+    /// dropped on return: these tests only inspect request-side EOS state.
+    async fn connected_client(dir: &Path, prefix: &str, eos: EosTokenIds) -> ZmqEngineClient {
+        let ep = |name: &str| format!("ipc://{}", dir.join(format!("{prefix}-{name}")).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "org/repo".to_string(),
+                eos,
+                RuntimeType::Vllm,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        engine.expect("mock engine");
+        client.expect("adapter connect")
+    }
+
+    #[tokio::test]
+    async fn tokenizer_eos_is_adopted_when_the_model_dir_is_not_local() {
+        // MockTokenizer's EOS set is {999}. With no local model dir the
+        // connect-time set is empty, so the primary id must come from the
+        // tokenizer — otherwise EOS rides `stop_token_ids` alone and an EOS
+        // finish is reported as `matched_stop = 999`.
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+
+        let client = connected_client(dir.path(), "empty", EosTokenIds::default()).await;
+        assert_eq!(client.effective_eos(), &EosTokenIds::default());
+        client.adopt_tokenizer_eos(Some(&tokenizer));
+        assert_eq!(client.effective_eos(), &EosTokenIds::new(Some(999), vec![]));
+
+        // A connect-time set resolved from a local model dir wins: adoption is
+        // a backstop, not an override.
+        let resolved = EosTokenIds::new(Some(5), vec![7]);
+        let client = connected_client(dir.path(), "resolved", resolved.clone()).await;
+        client.adopt_tokenizer_eos(Some(&tokenizer));
+        assert_eq!(client.effective_eos(), &resolved);
     }
 
     #[test]

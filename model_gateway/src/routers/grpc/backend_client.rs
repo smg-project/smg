@@ -111,11 +111,19 @@ impl BackendClient {
     ) -> Vec<String> {
         let token_only_wire = self.is_zmq();
         let router_stops = helpers::resolve_string_stops(request, tokenizer, token_only_wire);
-        if token_only_wire {
+        if let Self::Zmq(client) = self {
             // EngineCore has no tokenizer, so stopping at EOS is this
             // frontend's job; TokenSpeed's scheduler stops at EOS itself, and
             // its requests are a different proto variant — the fold's own
             // variant match is the single dispatch point.
+            //
+            // The primary id must also ride the request's `_eos_token_id`, not
+            // just the stop set, or an EOS finish surfaces as a matched_stop
+            // token id. That field is filled from the client's own EOS set, so
+            // hand it the tokenizer's ids for the deployments where the
+            // connect-time model-dir lookup found none (the adopted set is
+            // likewise only read by the vLLM translation).
+            client.adopt_tokenizer_eos(tokenizer);
             fold_tokenizer_eos_backstop(request, tokenizer);
         }
         router_stops

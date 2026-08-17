@@ -632,6 +632,7 @@ impl WorkerRegistry {
         let mut decode_count = 0;
         let mut http_count = 0;
         let mut grpc_count = 0;
+        let mut zmq_count = 0;
         let mut cb_open_count = 0;
         let mut cb_half_open_count = 0;
 
@@ -652,7 +653,8 @@ impl WorkerRegistry {
 
             match worker.connection_mode() {
                 ConnectionMode::Http => http_count += 1,
-                ConnectionMode::Grpc | ConnectionMode::Zmq => grpc_count += 1,
+                ConnectionMode::Grpc => grpc_count += 1,
+                ConnectionMode::Zmq => zmq_count += 1,
             }
 
             match worker.circuit_breaker_state() {
@@ -674,6 +676,7 @@ impl WorkerRegistry {
             decode_workers: decode_count,
             http_workers: http_count,
             grpc_workers: grpc_count,
+            zmq_workers: zmq_count,
             circuit_breaker_open: cb_open_count,
             circuit_breaker_half_open: cb_half_open_count,
         }
@@ -1903,6 +1906,8 @@ pub struct WorkerRegistryStats {
     pub http_workers: usize,
     /// Number of gRPC-connected workers
     pub grpc_workers: usize,
+    /// Number of ZMQ-connected workers (direct-backend transport)
+    pub zmq_workers: usize,
     /// Number of workers with circuit breaker in Open state (not accepting requests)
     pub circuit_breaker_open: usize,
     /// Number of workers with circuit breaker in HalfOpen state (testing recovery)
@@ -2104,6 +2109,34 @@ mod tests {
         assert_eq!(stats.decode_workers, 0);
         assert_eq!(stats.regular_workers, 0);
         assert_eq!(stats.grpc_workers, 1);
+        assert_eq!(stats.zmq_workers, 0);
+    }
+
+    #[test]
+    fn test_stats_counts_zmq_workers_separately_from_grpc() {
+        // ZMQ rides the gRPC request pipeline but is its own transport;
+        // folding it into grpc_workers hid it from observability output.
+        let registry = WorkerRegistry::new();
+
+        for (url, mode) in [
+            ("grpc://worker:8080", ConnectionMode::Grpc),
+            ("ipc:///tmp/smg-zmq/engine.ipc", ConnectionMode::Zmq),
+            ("http://worker:8080", ConnectionMode::Http),
+        ] {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(mode)
+                    .build(),
+            );
+            registry.register(worker).unwrap();
+        }
+
+        let stats = registry.stats();
+        assert_eq!(stats.total_workers, 3);
+        assert_eq!(stats.http_workers, 1);
+        assert_eq!(stats.grpc_workers, 1);
+        assert_eq!(stats.zmq_workers, 1);
     }
 
     #[test]
