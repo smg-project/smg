@@ -1098,6 +1098,31 @@ impl BasicWorker {
         if other_cb.config() == existing_cb.config() {
             self.circuit_breaker.store(other_cb);
         }
+
+        self.adopt_backend_client_from(other);
+    }
+
+    /// Adopt the replaced worker's backend-client cell so a same-URL
+    /// replacement (a metadata-only update, say) keeps talking over the
+    /// connection the old worker already established. Decisive for ZMQ: SMG
+    /// binds the sockets and the engine handshakes only at its own startup, so
+    /// a replacement starting from an empty cell would unbind the live sockets,
+    /// rebind, and wait for a HELLO that never arrives.
+    ///
+    /// `zmq_connect_started` is deliberately left cleared rather than copied:
+    /// the shared cell already dedupes a handshake in flight, and a cleared
+    /// guard lets the replacement retry (and signal under its own revision) if
+    /// that handshake fails.
+    fn adopt_backend_client_from(&self, other: &BasicWorker) {
+        // A transport or runtime change means a different wire protocol, and a
+        // replacement that arrived with its own client keeps it.
+        if self.metadata.spec.connection_mode != other.metadata.spec.connection_mode
+            || self.metadata.spec.runtime_type != other.metadata.spec.runtime_type
+            || self.backend_client.load().get().is_some()
+        {
+            return;
+        }
+        self.backend_client.store(other.backend_client.load_full());
     }
 }
 
@@ -2608,6 +2633,34 @@ mod tests {
         assert!(worker.supports_model("text-embedding-3-small"));
         assert!(!worker.supports_model("non-existent-model"));
         assert!(worker.has_models_discovered());
+    }
+
+    #[test]
+    fn replacement_adopts_the_backend_client_only_on_a_matching_transport() {
+        // The cell object itself is the connection: sharing it is what keeps a
+        // replaced ZMQ worker talking to the engine that already handshook.
+        let build = |mode: ConnectionMode| {
+            BasicWorkerBuilder::new("ipc:///tmp/w.ipc")
+                .connection_mode(mode)
+                .health_config(no_health_check())
+                .build()
+        };
+
+        let old = build(ConnectionMode::Zmq);
+        let new = build(ConnectionMode::Zmq);
+        assert!(new.inherit_shared_state_from(&old));
+        assert!(Arc::ptr_eq(
+            &new.backend_client.load_full(),
+            &old.backend_client.load_full()
+        ));
+
+        // A transport change means a different wire protocol — no adoption.
+        let retyped = build(ConnectionMode::Http);
+        assert!(retyped.inherit_shared_state_from(&old));
+        assert!(!Arc::ptr_eq(
+            &retyped.backend_client.load_full(),
+            &old.backend_client.load_full()
+        ));
     }
 
     /// A ZMQ client whose engine dies must be evicted by the health probe (the
