@@ -834,6 +834,44 @@ impl StreamState {
     }
 }
 
+/// The per-dialect half of a ZMQ generate stream: the wire stream, the parked
+/// terminal `Complete`, and the mapping from one wire output to a vLLM-proto
+/// response. [`poll_mapped`] writes the `Stream` machinery once for every
+/// dialect that implements this.
+trait MappedGenerateStream {
+    /// One tick of engine output on this dialect's wire.
+    type Output;
+    /// The wire stream carrying those ticks.
+    type Inner: Stream<Item = Result<Self::Output, engine_zmq_client::Error>> + Unpin;
+
+    fn inner(&mut self) -> &mut Self::Inner;
+
+    /// Terminal `Complete` held back when the finish tick also carried new
+    /// tokens; yielded before the wire stream is polled again.
+    fn pending(&mut self) -> &mut Option<vllm::GenerateResponse>;
+
+    fn map_output(&mut self, output: Self::Output)
+        -> Result<vllm::GenerateResponse, tonic::Status>;
+}
+
+/// `Stream::poll_next` for any [`MappedGenerateStream`]: drain the parked
+/// `Complete` first, otherwise poll the wire and map the tick.
+fn poll_mapped<S: MappedGenerateStream>(
+    stream: &mut S,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<Option<Result<vllm::GenerateResponse, tonic::Status>>> {
+    use std::task::Poll;
+    if let Some(pending) = stream.pending().take() {
+        return Poll::Ready(Some(Ok(pending)));
+    }
+    match std::pin::Pin::new(stream.inner()).poll_next(cx) {
+        Poll::Ready(Some(Ok(output))) => Poll::Ready(Some(stream.map_output(output))),
+        Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(zmq_status(error)))),
+        Poll::Ready(None) => Poll::Ready(None),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
 /// Streaming generate output for one vLLM EngineCore sub-request, mapping each
 /// `EngineCoreOutput` to a vLLM-proto `GenerateResponse` (chunks until the
 /// terminal output, then a complete), tagged with this sub's choice `index`.
@@ -878,6 +916,61 @@ impl VllmGenerateStream {
             input_logprobs_emitted: false,
             pending: None,
         }
+    }
+
+    /// Attach the accumulated prompt logprobs: once on the first token-bearing
+    /// chunk (the proto puts them in the first chunk only) and on every
+    /// `Complete`, including one parked in `pending`. Prefill precedes the
+    /// first sampled token, so the set is whole by the time a chunk carries
+    /// tokens.
+    fn attach_input_logprobs(&mut self, response: &mut vllm::GenerateResponse) {
+        if self.state.prompt_logprobs.is_empty() {
+            return;
+        }
+        // Built per attachment site rather than up front: with
+        // `prompt_logprobs` requested this runs on every decode tick, and the
+        // common tick (a later chunk) attaches nothing.
+        let state = &self.state;
+        let build = || vllm::InputLogProbs {
+            token_logprobs: state.prompt_logprobs.clone(),
+            token_ids: state.prompt_token_ids.clone(),
+            top_logprobs: state.prompt_top_logprobs.clone(),
+        };
+        if let Some(vllm::generate_response::Response::Complete(parked)) = self
+            .pending
+            .as_mut()
+            .and_then(|pending| pending.response.as_mut())
+        {
+            parked.input_logprobs = Some(build());
+        }
+        match response.response.as_mut() {
+            Some(vllm::generate_response::Response::Chunk(chunk))
+                if !self.input_logprobs_emitted && !chunk.token_ids.is_empty() =>
+            {
+                chunk.input_logprobs = Some(build());
+                self.input_logprobs_emitted = true;
+            }
+            // Later chunks never repeat them (the proto carries them in the
+            // first chunk only), and neither do token-less prefill chunks.
+            Some(vllm::generate_response::Response::Chunk(_)) => {}
+            Some(vllm::generate_response::Response::Complete(complete)) => {
+                complete.input_logprobs = Some(build());
+            }
+            None => {}
+        }
+    }
+}
+
+impl MappedGenerateStream for VllmGenerateStream {
+    type Output = EngineCoreOutput;
+    type Inner = EngineCoreStream;
+
+    fn inner(&mut self) -> &mut Self::Inner {
+        &mut self.inner
+    }
+
+    fn pending(&mut self) -> &mut Option<vllm::GenerateResponse> {
+        &mut self.pending
     }
 
     fn map_output(
@@ -981,48 +1074,6 @@ impl VllmGenerateStream {
         self.attach_input_logprobs(&mut response);
         Ok(response)
     }
-
-    /// Attach the accumulated prompt logprobs: once on the first token-bearing
-    /// chunk (the proto puts them in the first chunk only) and on every
-    /// `Complete`, including one parked in `pending`. Prefill precedes the
-    /// first sampled token, so the set is whole by the time a chunk carries
-    /// tokens.
-    fn attach_input_logprobs(&mut self, response: &mut vllm::GenerateResponse) {
-        if self.state.prompt_logprobs.is_empty() {
-            return;
-        }
-        // Built per attachment site rather than up front: with
-        // `prompt_logprobs` requested this runs on every decode tick, and the
-        // common tick (a later chunk) attaches nothing.
-        let state = &self.state;
-        let build = || vllm::InputLogProbs {
-            token_logprobs: state.prompt_logprobs.clone(),
-            token_ids: state.prompt_token_ids.clone(),
-            top_logprobs: state.prompt_top_logprobs.clone(),
-        };
-        if let Some(vllm::generate_response::Response::Complete(parked)) = self
-            .pending
-            .as_mut()
-            .and_then(|pending| pending.response.as_mut())
-        {
-            parked.input_logprobs = Some(build());
-        }
-        match response.response.as_mut() {
-            Some(vllm::generate_response::Response::Chunk(chunk))
-                if !self.input_logprobs_emitted && !chunk.token_ids.is_empty() =>
-            {
-                chunk.input_logprobs = Some(build());
-                self.input_logprobs_emitted = true;
-            }
-            // Later chunks never repeat them (the proto carries them in the
-            // first chunk only), and neither do token-less prefill chunks.
-            Some(vllm::generate_response::Response::Chunk(_)) => {}
-            Some(vllm::generate_response::Response::Complete(complete)) => {
-                complete.input_logprobs = Some(build());
-            }
-            None => {}
-        }
-    }
 }
 
 impl Stream for VllmGenerateStream {
@@ -1032,17 +1083,7 @@ impl Stream for VllmGenerateStream {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        use std::task::Poll;
-        let this = self.get_mut();
-        if let Some(pending) = this.pending.take() {
-            return Poll::Ready(Some(Ok(pending)));
-        }
-        match std::pin::Pin::new(&mut this.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(output))) => Poll::Ready(Some(this.map_output(output))),
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(zmq_status(error)))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
+        poll_mapped(self.get_mut(), cx)
     }
 }
 
@@ -1069,6 +1110,19 @@ impl TokenSpeedGenerateStream {
             index,
             pending: None,
         }
+    }
+}
+
+impl MappedGenerateStream for TokenSpeedGenerateStream {
+    type Output = TokenSpeedOutput;
+    type Inner = TokenSpeedStream;
+
+    fn inner(&mut self) -> &mut Self::Inner {
+        &mut self.inner
+    }
+
+    fn pending(&mut self) -> &mut Option<vllm::GenerateResponse> {
+        &mut self.pending
     }
 
     fn map_output(
@@ -1137,17 +1191,7 @@ impl Stream for TokenSpeedGenerateStream {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        use std::task::Poll;
-        let this = self.get_mut();
-        if let Some(pending) = this.pending.take() {
-            return Poll::Ready(Some(Ok(pending)));
-        }
-        match std::pin::Pin::new(&mut this.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(output))) => Poll::Ready(Some(this.map_output(output))),
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(zmq_status(error)))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
+        poll_mapped(self.get_mut(), cx)
     }
 }
 

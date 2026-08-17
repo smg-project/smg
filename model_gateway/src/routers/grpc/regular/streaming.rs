@@ -1183,13 +1183,12 @@ impl StreamingProcessor {
                     let accumulated_text = accumulated_texts.entry(index).or_default();
                     accumulated_text.push_str(&chunk_text);
 
-                    // Handle output logprobs based on backend behavior:
-                    // - SGLang sends cumulative logprobs (replace is correct)
-                    // - vLLM sends delta logprobs (need to extend/accumulate)
+                    // Handle output logprobs by the stream's chunk semantics:
+                    // cumulative chunks replace, delta chunks accumulate.
                     if let Some(ref output_logprobs) = chunk.output_logprobs() {
                         let converted = utils::convert_generate_output_logprobs(output_logprobs);
-                        if chunk.is_vllm() {
-                            // vLLM sends delta - extend existing logprobs
+                        if chunk.chunk_semantics().is_delta() {
+                            // Delta - extend existing logprobs
                             if let Some(v) = accumulated_output_logprobs
                                 .entry(index)
                                 .or_insert_with(|| Some(Vec::new()))
@@ -1198,7 +1197,7 @@ impl StreamingProcessor {
                                 v.extend(converted);
                             }
                         } else {
-                            // SGLang sends cumulative - replace
+                            // Cumulative - replace
                             accumulated_output_logprobs.insert(index, Some(converted));
                         }
                     }
