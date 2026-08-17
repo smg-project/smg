@@ -1784,6 +1784,38 @@ impl WorkerRegistry {
             }
         }
 
+        // Decode the spec (and run the transport gate it declares) BEFORE
+        // touching any index: a rejected state must leave no trace, or the
+        // id reservation below would outlive it and a legitimate worker
+        // later arriving at this URL would silently inherit the rejected
+        // publisher's id — breaking tombstone routing for it.
+        let spec = if state.spec.is_empty() {
+            None
+        } else {
+            match serde_json::from_slice::<openai_protocol::worker::WorkerSpec>(&state.spec) {
+                Ok(spec) => {
+                    // Same-host transport declared by the spec rather than by
+                    // the URL scheme — not routable from this node.
+                    if spec.connection_mode == ConnectionMode::Zmq {
+                        tracing::debug!(
+                            url = %state.url,
+                            "Ignoring mesh state for host-local ZMQ worker"
+                        );
+                        return;
+                    }
+                    Some(spec)
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        url = %state.url,
+                        %err,
+                        "undecodable WorkerSpec in mesh state; importing minimal worker"
+                    );
+                    None
+                }
+            }
+        };
+
         // Adopt the publisher's worker id for the import so a later
         // tombstone for `worker:{id}` (which carries no value, only the
         // key) resolves to this worker. A pre-existing reservation for
@@ -1797,40 +1829,14 @@ impl WorkerRegistry {
                 .or_insert_with(|| WorkerId::from_string(state.worker_id.clone()));
         }
 
-        // New worker — build from the full WorkerSpec (JSON) if available,
+        // New worker — build from the full WorkerSpec if it decoded,
         // otherwise fall back to the minimal builder.
-        let minimal = || {
-            super::builder::BasicWorkerBuilder::new(&state.url)
+        let spec_applied = spec.is_some();
+        let worker = match spec {
+            Some(spec) => super::builder::BasicWorkerBuilder::from_spec(spec).build(),
+            None => super::builder::BasicWorkerBuilder::new(&state.url)
                 .model(ModelCard::new(&state.model_id))
-                .build()
-        };
-        let mut spec_applied = false;
-        let worker = if state.spec.is_empty() {
-            minimal()
-        } else {
-            match serde_json::from_slice::<openai_protocol::worker::WorkerSpec>(&state.spec) {
-                Ok(spec) => {
-                    // Same-host transport declared by the spec rather than by
-                    // the URL scheme — not routable from this node.
-                    if spec.connection_mode == ConnectionMode::Zmq {
-                        tracing::debug!(
-                            url = %state.url,
-                            "Ignoring mesh state for host-local ZMQ worker"
-                        );
-                        return;
-                    }
-                    spec_applied = true;
-                    super::builder::BasicWorkerBuilder::from_spec(spec).build()
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        url = %state.url,
-                        %err,
-                        "undecodable WorkerSpec in mesh state; importing minimal worker"
-                    );
-                    minimal()
-                }
-            }
+                .build(),
         };
 
         // An explicitly-unhealthy import must not be routable: the builder
@@ -2181,6 +2187,60 @@ mod tests {
             registry.get_by_url("http://remote:8080").is_none(),
             "a spec-declared ZMQ worker must not be imported from the mesh"
         );
+    }
+
+    #[test]
+    fn rejected_zmq_state_leaves_no_url_to_id_residue() {
+        // Both transport gates run before the id reservation. A leftover
+        // `url_to_id` entry would be invisible to `get_id_by_url` (which
+        // skips ids with no live worker) yet still win the `Entry::Occupied`
+        // arm in `register_inner`, handing the next legitimate worker at
+        // this URL the rejected publisher's id — so a peer tombstone for
+        // that id would delete a worker that never came from the mesh.
+        let registry = WorkerRegistry::new();
+
+        // Rejected by the URL scheme.
+        registry.on_remote_worker_state(&remote_state(
+            "peer-w1",
+            "ipc:///tmp/smg-peer.sock",
+            true,
+            vec![],
+        ));
+        assert!(
+            registry.url_to_id.get("ipc:///tmp/smg-peer.sock").is_none(),
+            "a URL-scheme rejection must not reserve an id"
+        );
+
+        // Rejected by the spec's declared connection mode.
+        let spec: openai_protocol::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+            "url": "http://remote:8080",
+            "connection_mode": "zmq"
+        }))
+        .unwrap();
+        registry.on_remote_worker_state(&remote_state(
+            "peer-w2",
+            "http://remote:8080",
+            true,
+            serde_json::to_vec(&spec).unwrap(),
+        ));
+        assert!(
+            registry.url_to_id.get("http://remote:8080").is_none(),
+            "a spec rejection must not reserve an id"
+        );
+
+        // A legitimate worker later arriving at the same URL gets its own id.
+        let local: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://remote:8080")
+                .model(ModelCard::new("llama-3"))
+                .build(),
+        );
+        let local_id = registry.register(local).expect("registers");
+        assert_ne!(
+            local_id,
+            WorkerId::from_string("peer-w2".to_string()),
+            "a later worker must not inherit the rejected publisher's id"
+        );
+        assert_eq!(registry.get_id_by_url("http://remote:8080"), Some(local_id));
     }
 
     #[test]
