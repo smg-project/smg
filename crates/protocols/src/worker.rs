@@ -1065,6 +1065,11 @@ pub struct ResilienceUpdate {
     /// Custom retryable HTTP status codes.
     /// When set, replaces the default set (408, 429, 500, 502, 503, 504).
     pub retryable_status_codes: Option<Vec<u16>>,
+    /// Capacity-pushback HTTP status codes: still retryable on another
+    /// worker, but never counted as circuit-breaker failures (backpressure
+    /// is a routing signal, not a fault). When set, replaces the default
+    /// set (429).
+    pub capacity_status_codes: Option<Vec<u16>>,
 }
 
 impl ResilienceUpdate {
@@ -1082,6 +1087,7 @@ impl ResilienceUpdate {
             && self.cb_window_secs.is_none()
             && self.disable_circuit_breaker.is_none()
             && self.retryable_status_codes.is_none()
+            && self.capacity_status_codes.is_none()
     }
 }
 

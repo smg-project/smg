@@ -410,10 +410,17 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// pass the status code returned to the client (e.g., 502 for a send
     /// error, 504 for a timeout).
     fn record_outcome(&self, status_code: u16) {
-        let is_failure = self
-            .resilience()
-            .retryable_status_codes
-            .contains(&status_code);
+        let resilience = self.resilience();
+        // Capacity pushback (429 by default) is a routing signal, not a
+        // worker fault: the request is retried elsewhere, but no
+        // circuit-breaker sample is recorded in either direction — opening
+        // the breaker on backpressure would amplify a load spike into
+        // unavailability, and crediting a success would close a half-open
+        // breaker on a request the worker refused.
+        if resilience.capacity_status_codes.contains(&status_code) {
+            return;
+        }
+        let is_failure = resilience.retryable_status_codes.contains(&status_code);
         self.record_circuit_breaker_outcome(!is_failure);
     }
 
@@ -2266,6 +2273,56 @@ mod tests {
         assert!(!worker.is_available());
         assert!(worker.is_healthy());
         assert!(!worker.circuit_breaker_can_execute());
+    }
+
+    #[test]
+    fn test_capacity_pushback_never_trips_circuit_breaker() {
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build();
+
+        // A storm of 429 capacity pushback must not open the breaker...
+        for _ in 0..20 {
+            worker.record_outcome(429);
+        }
+        assert!(worker.is_available());
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+
+        // ...while genuine failures still do.
+        for _ in 0..5 {
+            worker.record_outcome(500);
+        }
+        assert!(!worker.is_available());
+    }
+
+    #[test]
+    fn test_capacity_pushback_does_not_close_half_open_breaker() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 2,
+            success_threshold: 1,
+            timeout_duration: Duration::from_millis(50),
+            window_duration: Duration::from_secs(60),
+        };
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .circuit_breaker_config(config)
+            .health_config(no_health_check())
+            .build();
+
+        worker.record_outcome(500);
+        worker.record_outcome(500);
+        assert!(!worker.is_available());
+        thread::sleep(Duration::from_millis(80));
+        assert!(worker.is_available());
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+
+        // 429 records no sample: the breaker must stay half-open, not close.
+        worker.record_outcome(429);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+
+        worker.record_outcome(200);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
     }
 
     #[test]
