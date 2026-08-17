@@ -409,6 +409,11 @@ impl CacheAwarePolicy {
         *self.load_rx.write() = rx;
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_load_receiver_for_test(&self) -> bool {
+        self.load_rx.read().is_some()
+    }
+
     /// True when backend KV pressure demands abandoning cache affinity.
     ///
     /// Two triggers, OR'd together, both requiring a backend `token_usage`
@@ -1021,6 +1026,14 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
     fn needs_request_text(&self) -> bool {
         true // Cache-aware policy needs request text for cache affinity
+    }
+
+    /// Backend loads feed the KV-usage gate and the waiting-prefill decay;
+    /// both are disabled by default, so only configured policies poll.
+    fn needs_backend_loads(&self) -> bool {
+        self.config.overlap_decay > 0.0
+            || self.config.balance_token_usage_threshold < 1.0
+            || self.config.overload_token_usage_threshold < 1.0
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

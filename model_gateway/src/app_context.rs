@@ -625,19 +625,26 @@ impl AppContextBuilder {
             .client
             .as_ref()
             .ok_or_else(|| "client must be set before load monitor".to_string())?;
-        self.worker_monitor = Some(Arc::new(WorkerMonitor::new(
+        let policy_registry = self
+            .policy_registry
+            .as_ref()
+            .ok_or_else(|| "policy_registry must be set before load monitor".to_string())?
+            .clone();
+        let monitor = Arc::new(WorkerMonitor::new(
             self.worker_registry
                 .as_ref()
                 .ok_or_else(|| "worker_registry must be set before load monitor".to_string())?
                 .clone(),
-            self.policy_registry
-                .as_ref()
-                .ok_or_else(|| "policy_registry must be set before load monitor".to_string())?
-                .clone(),
+            Arc::clone(&policy_registry),
             client.clone(),
             config.load_monitor_interval_secs,
             config.engine_metrics,
-        )));
+        ));
+        // Wire the backend load-snapshot feed into every policy that consumes
+        // it; the monitor itself only polls while some policy reports needing
+        // the data.
+        policy_registry.set_load_receiver(Some(monitor.subscribe()));
+        self.worker_monitor = Some(monitor);
         Ok(self)
     }
 
@@ -739,12 +746,6 @@ impl AppContextBuilder {
             // and any other existing cache-aware policies.
             if let Some(ref registry) = self.policy_registry {
                 registry.set_kv_event_monitor(Some(Arc::clone(&monitor)));
-                // Wire the backend load snapshot so cache-aware policies can use
-                // the KV-usage imbalance trigger. `with_worker_monitor` ran
-                // earlier in the build chain, so this is already set.
-                if let Some(ref worker_monitor) = self.worker_monitor {
-                    registry.set_load_receiver(Some(worker_monitor.subscribe()));
-                }
             }
 
             self.kv_event_monitor = Some(monitor);
@@ -870,6 +871,45 @@ mod tests {
             .with_kv_event_monitor(&config)
             .kv_event_monitor
             .is_some()
+    }
+
+    /// The load-snapshot feed must be wired whenever the worker monitor is
+    /// built — without a KV-event monitor in the chain — so HTTP-only
+    /// cache-aware deployments get waiting-prefill and KV-usage data.
+    #[test]
+    fn worker_monitor_wires_load_receiver_into_policies() {
+        use crate::policies::CacheAwarePolicy;
+
+        let config = config_with_policy(PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 1000,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            overlap_decay: 1.0,
+            selection_temperature: 0.0,
+        });
+        let builder = AppContextBuilder::new()
+            .with_client(&config, 5)
+            .expect("client builds")
+            .with_worker_registry()
+            .with_policy_registry(&config)
+            .with_worker_monitor(&config)
+            .expect("worker monitor builds");
+
+        let policy = builder
+            .policy_registry
+            .as_ref()
+            .expect("policy registry set")
+            .get_default_policy();
+        let cache_aware = policy
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .expect("default policy is cache-aware");
+        assert!(cache_aware.has_load_receiver_for_test());
     }
 
     /// The #1794-relevant guarantee: passthrough never starts the KV-event

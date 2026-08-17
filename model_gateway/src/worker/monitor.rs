@@ -1479,7 +1479,10 @@ mod native_loads_tests {
     use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ConnectionMode, WorkerType};
+    use crate::{
+        config::types::PolicyConfig,
+        worker::{BasicWorkerBuilder, ConnectionMode, WorkerType},
+    };
 
     const VLLM_METRICS: &str = "vllm:num_requests_running{m=\"a\"} 7.0\n\
          vllm:num_requests_waiting{m=\"a\"} 11.0\n\
@@ -1544,6 +1547,76 @@ mod native_loads_tests {
                 })
                 .build(),
         )
+    }
+
+    fn cache_aware_policy_config(overlap_decay: f32) -> PolicyConfig {
+        PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 4096,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            overlap_decay,
+            selection_temperature: 0.0,
+        }
+    }
+
+    fn monitor_with_policy(config: PolicyConfig) -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
+        let registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(config));
+        let monitor = Arc::new(WorkerMonitor::new(
+            registry.clone(),
+            policy_registry,
+            reqwest::Client::new(),
+            1,
+            false,
+        ));
+        (registry, monitor)
+    }
+
+    #[tokio::test]
+    async fn pressure_configured_cache_aware_starts_load_polling() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let (registry, monitor) = monitor_with_policy(cache_aware_policy_config(1.0));
+        let worker = vllm_worker(&stub.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(worker).unwrap();
+        monitor.start_event_loop();
+
+        let mut rx = monitor.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let waiting = rx
+                    .borrow()
+                    .get(&stub.url)
+                    .map(|load| load.total_waiting_uncached_tokens());
+                if let Some(waiting) = waiting {
+                    assert_eq!(waiting, 900);
+                    break;
+                }
+                rx.changed().await.expect("watch sender alive");
+            }
+        })
+        .await
+        .expect("cache_aware with overlap_decay must trigger load polling");
+    }
+
+    #[tokio::test]
+    async fn default_cache_aware_skips_load_polling() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let (registry, monitor) = monitor_with_policy(cache_aware_policy_config(0.0));
+        let worker = vllm_worker(&stub.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(worker).unwrap();
+        monitor.start_event_loop();
+
+        // Covers the immediate first tick plus one full 1s interval.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 0);
+        assert!(monitor.load_rx.borrow().is_empty());
     }
 
     #[tokio::test]
