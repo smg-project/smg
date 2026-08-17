@@ -248,8 +248,10 @@ mod tests {
 
     #[test]
     fn capacity_codes_override_replaces_default() {
+        // The override omits the default 429 so this pins replacement, not
+        // union: a superset override would pass either way.
         let overrides = ResilienceUpdate {
-            capacity_status_codes: Some(vec![429, 503]),
+            capacity_status_codes: Some(vec![503]),
             ..Default::default()
         };
         let (resolved, _cb) = resolve_resilience(
@@ -260,7 +262,7 @@ mod tests {
             &overrides,
         );
         assert!(resolved.capacity_status_codes.contains(&503));
-        assert!(resolved.capacity_status_codes.contains(&429));
-        assert_eq!(resolved.capacity_status_codes.len(), 2);
+        assert!(!resolved.capacity_status_codes.contains(&429));
+        assert_eq!(resolved.capacity_status_codes.len(), 1);
     }
 }
