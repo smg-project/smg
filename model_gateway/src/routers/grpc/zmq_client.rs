@@ -27,6 +27,7 @@ use engine_zmq_client::{
             sampling::SamplingParams as TokenSpeedSamplingParams,
         },
         vllm::{
+            logprobs::TokenLogprob,
             output::{EngineCoreFinishReason, EngineCoreOutput, StopReason},
             request::EngineCoreRequest,
             sampling::EngineCoreSamplingParams,
@@ -689,6 +690,34 @@ fn ranked_candidate_count(requested: Option<i32>) -> usize {
     }
 }
 
+/// Shape one position's wire entries (sampled first, then the engine's ranked
+/// candidates) into `top_logprobs`: the sampled entry leads, then ranked
+/// candidates fill up to `top_k` entries. The engine leaves the sampled token
+/// in its ranked columns, so the ranked entry repeating it is skipped —
+/// otherwise the list would carry it twice and drop the last candidate.
+fn shape_top_logprobs(entries: &[TokenLogprob], top_k: usize) -> vllm::TopLogProbs {
+    let mut top = vllm::TopLogProbs::default();
+    let Some((sampled, ranked)) = entries.split_first() else {
+        return top;
+    };
+    if top_k == 0 {
+        return top;
+    }
+    top.values.push(sampled.logprob);
+    top.token_ids.push(sampled.token_id);
+    for entry in ranked {
+        if top.token_ids.len() >= top_k {
+            break;
+        }
+        if entry.token_id == sampled.token_id {
+            continue;
+        }
+        top.values.push(entry.logprob);
+        top.token_ids.push(entry.token_id);
+    }
+    top
+}
+
 /// Accumulated per-request token counts shared by both stream mappers.
 #[derive(Default)]
 struct StreamState {
@@ -855,15 +884,10 @@ impl VllmGenerateStream {
                 };
                 tick_logprobs_val.push(sampled.logprob);
                 tick_logprobs_idx.push(sampled.token_id);
-                // The entries arrive sampled-first then rank-ordered; take the
+                // The entries arrive sampled-first then rank-ordered; shape the
                 // requested count so one ranked list lands per sampled token.
                 if top_k > 0 {
-                    let mut top = vllm::TopLogProbs::default();
-                    for entry in position.entries.iter().take(top_k) {
-                        top.values.push(entry.logprob);
-                        top.token_ids.push(entry.token_id);
-                    }
-                    tick_top_logprobs.push(top);
+                    tick_top_logprobs.push(shape_top_logprobs(&position.entries, top_k));
                 }
             }
         }
@@ -904,12 +928,10 @@ impl VllmGenerateStream {
                 });
                 state.prompt_token_ids.push(selected.token_id);
                 if self.prompt_top_logprobs > 0 {
-                    let mut top = vllm::TopLogProbs::default();
-                    for entry in position.entries.iter().take(self.prompt_top_logprobs) {
-                        top.values.push(entry.logprob);
-                        top.token_ids.push(entry.token_id);
-                    }
-                    state.prompt_top_logprobs.push(top);
+                    state.prompt_top_logprobs.push(shape_top_logprobs(
+                        &position.entries,
+                        self.prompt_top_logprobs,
+                    ));
                 }
             }
         }
@@ -1769,6 +1791,74 @@ mod tests {
         assert!(stream.next().await.is_none());
 
         engine_task.await.unwrap();
+    }
+
+    /// The sampled token also ranks first — the common case under greedy or
+    /// low-temperature decoding. The engine repeats it in the ranked columns,
+    /// so the shaped list must carry it once and still return `k` candidates.
+    #[test]
+    fn shape_top_logprobs_dedups_sampled_token_at_rank_one() {
+        let entries = vec![
+            TokenLogprob {
+                token_id: 10,
+                logprob: -0.1,
+                rank: 1,
+            },
+            TokenLogprob {
+                token_id: 10,
+                logprob: -0.1,
+                rank: 1,
+            },
+            TokenLogprob {
+                token_id: 20,
+                logprob: -0.3,
+                rank: 2,
+            },
+        ];
+        assert_eq!(
+            shape_top_logprobs(&entries, 2),
+            vllm::TopLogProbs {
+                values: vec![-0.1, -0.3],
+                token_ids: vec![10, 20],
+            }
+        );
+        assert_eq!(
+            shape_top_logprobs(&entries, 1),
+            vllm::TopLogProbs {
+                values: vec![-0.1],
+                token_ids: vec![10],
+            }
+        );
+    }
+
+    /// A sampled token outside the top-k leads the list and the ranked
+    /// candidates follow in order, truncated to the requested count.
+    #[test]
+    fn shape_top_logprobs_keeps_sampled_token_outside_top_k() {
+        let entries = vec![
+            TokenLogprob {
+                token_id: 10,
+                logprob: -0.5,
+                rank: 5,
+            },
+            TokenLogprob {
+                token_id: 20,
+                logprob: -0.1,
+                rank: 1,
+            },
+            TokenLogprob {
+                token_id: 30,
+                logprob: -0.3,
+                rank: 2,
+            },
+        ];
+        assert_eq!(
+            shape_top_logprobs(&entries, 2),
+            vllm::TopLogProbs {
+                values: vec![-0.5, -0.1],
+                token_ids: vec![10, 20],
+            }
+        );
     }
 
     /// With `logprobs=k`, each position's ranked candidates are shaped into
