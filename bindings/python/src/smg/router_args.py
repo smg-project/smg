@@ -212,6 +212,7 @@ class RouterArgs:
     upstream_http2: bool = False
     overlap_decay: float = 0.0
     selection_temperature: float = 0.0
+    upstream_pool_idle_timeout_secs: int = 3
 
     @staticmethod
     def add_cli_args(
@@ -340,6 +341,17 @@ class RouterArgs:
                 " multiplexing every request to a worker over one connection."
                 " Requires every HTTP worker to serve HTTP/2 without an upgrade"
                 " handshake."
+            ),
+        )
+        worker_group.add_argument(
+            f"--{prefix}upstream-pool-idle-timeout-secs",
+            type=int,
+            default=RouterArgs.upstream_pool_idle_timeout_secs,
+            help=(
+                "Idle timeout in seconds for pooled upstream connections. Must"
+                " stay below the backend HTTP server's keep-alive timeout (vLLM"
+                " and SGLang default to 5). 0 keeps idle connections forever."
+                " Defaults to 3."
             ),
         )
         worker_group.add_argument(

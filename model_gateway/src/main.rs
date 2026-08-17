@@ -495,6 +495,13 @@ struct CliArgs {
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     request_timeout_secs: u64,
 
+    /// Idle timeout in seconds for pooled upstream connections. Must stay
+    /// below the backend HTTP server's keep-alive timeout (vLLM and SGLang
+    /// default to 5), or reused connections the server already closed fail
+    /// non-idempotent sends. 0 keeps idle connections forever.
+    #[arg(long, default_value_t = 3, help_heading = "Request Handling")]
+    upstream_pool_idle_timeout_secs: u64,
+
     /// Grace period in seconds to wait for in-flight requests during shutdown
     #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
     shutdown_grace_period_secs: u64,
@@ -1534,6 +1541,7 @@ impl CliArgs {
             .runtime_worker_threads(self.runtime_worker_threads)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
+            .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)

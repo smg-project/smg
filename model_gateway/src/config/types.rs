@@ -51,6 +51,12 @@ pub struct RouterConfig {
     pub runtime_worker_threads: Option<usize>,
     pub max_payload_size: usize,
     pub request_timeout_secs: u64,
+    /// Idle timeout for pooled upstream connections. Must stay below the
+    /// backend HTTP server's keep-alive timeout (vLLM and SGLang default to
+    /// 5s), or the pool hands out connections the server has already closed
+    /// and non-idempotent sends fail. `0` keeps idle connections forever.
+    #[serde(default = "default_upstream_pool_idle_timeout_secs")]
+    pub upstream_pool_idle_timeout_secs: u64,
     pub worker_startup_timeout_secs: u64,
     /// Grace period before the first worker-startup check fires. The engine is
     /// left alone for this long, then polled every
@@ -632,6 +638,10 @@ fn default_load_factor() -> f64 {
     1.25
 }
 
+fn default_upstream_pool_idle_timeout_secs() -> u64 {
+    3
+}
+
 fn default_prefix_hash_balance_abs_threshold() -> usize {
     10
 }
@@ -881,8 +891,9 @@ impl Default for RouterConfig {
             port: 3001,
             health_check_port: None,
             runtime_worker_threads: None,
-            max_payload_size: 536_870_912,     // 512MB
-            request_timeout_secs: 1800,        // 30 minutes
+            max_payload_size: 536_870_912, // 512MB
+            request_timeout_secs: 1800,    // 30 minutes
+            upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_delay_secs: 0,
             worker_startup_check_interval_secs: 30,
@@ -1034,6 +1045,7 @@ mod tests {
         assert_eq!(config.port, 3001);
         assert_eq!(config.max_payload_size, 536_870_912);
         assert_eq!(config.request_timeout_secs, 1800);
+        assert_eq!(config.upstream_pool_idle_timeout_secs, 3);
         assert_eq!(config.worker_startup_timeout_secs, 1800);
         assert_eq!(config.worker_startup_check_interval_secs, 30);
         assert_eq!(config.load_monitor_interval_secs, 10);

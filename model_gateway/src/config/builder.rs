@@ -205,6 +205,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn upstream_pool_idle_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.upstream_pool_idle_timeout_secs = secs;
+        self
+    }
+
     pub fn request_timeout_secs(mut self, timeout: u64) -> Self {
         self.config.request_timeout_secs = timeout;
         self

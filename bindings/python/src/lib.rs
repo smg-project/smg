@@ -512,6 +512,7 @@ struct Router {
     zmq_engine_count: Option<usize>,
     overlap_decay: f32,
     selection_temperature: f32,
+    upstream_pool_idle_timeout_secs: u64,
 }
 
 impl Router {
@@ -859,6 +860,7 @@ impl Router {
             .enable_wasm(self.enable_wasm)
             .dp_aware(self.dp_aware)
             .upstream_http2(self.upstream_http2)
+            .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .routing_key_override(config::RoutingKeyOverrideConfig {
@@ -1018,6 +1020,7 @@ impl Router {
         upstream_http2 = false,
         overlap_decay = 0.0,
         selection_temperature = 0.0,
+        upstream_pool_idle_timeout_secs = 3,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1154,6 +1157,7 @@ impl Router {
         upstream_http2: bool,
         overlap_decay: f32,
         selection_temperature: f32,
+        upstream_pool_idle_timeout_secs: u64,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1304,6 +1308,7 @@ impl Router {
             zmq_engine_count,
             overlap_decay,
             selection_temperature,
+            upstream_pool_idle_timeout_secs,
         })
     }
 

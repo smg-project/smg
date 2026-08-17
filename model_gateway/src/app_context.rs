@@ -456,8 +456,15 @@ impl AppContextBuilder {
         // backend to avoid unnecessary TLS initialization overhead.
         let has_tls_config = config.client_identity.is_some() || !config.ca_certificates.is_empty();
 
+        // Idle pooled connections must expire before the backend server's
+        // keep-alive closes them (vLLM/SGLang default: 5s), or checkout races
+        // the server's FIN and non-idempotent sends fail.
+        let pool_idle_timeout = match config.upstream_pool_idle_timeout_secs {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        };
         let mut client_builder = Client::builder()
-            .pool_idle_timeout(Some(Duration::from_secs(50)))
+            .pool_idle_timeout(pool_idle_timeout)
             .pool_max_idle_per_host(500)
             .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))

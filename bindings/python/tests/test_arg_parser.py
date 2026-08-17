@@ -1221,6 +1221,7 @@ class TestRouterArgsFieldOrder:
         "upstream_http2",
         "overlap_decay",
         "selection_temperature",
+        "upstream_pool_idle_timeout_secs",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1238,7 +1239,11 @@ class TestRouterArgsFieldOrder:
 
         names = [f.name for f in dataclasses.fields(RouterArgs)]
         marker = names.index("worker_startup_delay")
-        for appended in ("overlap_decay", "selection_temperature"):
+        for appended in (
+            "overlap_decay",
+            "selection_temperature",
+            "upstream_pool_idle_timeout_secs",
+        ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "
                 "preserve positional callers"

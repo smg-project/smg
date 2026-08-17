@@ -165,7 +165,7 @@ impl Router {
                     }
                 }
 
-                match request_builder.send().await {
+                match send_with_stale_conn_retry(request_builder).await {
                     Ok(res) => {
                         let status = StatusCode::from_u16(res.status().as_u16())
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -568,7 +568,9 @@ impl Router {
                         request_builder = request_builder.header(name.clone(), value.clone());
                     }
 
-                    request_builder.send().await.map_err(convert_reqwest_error)
+                    send_with_stale_conn_retry(request_builder)
+                        .await
+                        .map_err(convert_reqwest_error)
                 }
             })
             .collect();
@@ -787,7 +789,7 @@ impl Router {
             worker.api_key(),
         );
 
-        let res = match request_builder.send().await {
+        let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
             Err(e) => {
                 error!(
@@ -1079,7 +1081,7 @@ impl Router {
             api_key.as_ref(),
         );
 
-        let res = match request_builder.send().await {
+        let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
             Err(e) => {
                 error!(
@@ -1291,6 +1293,38 @@ fn build_transcription_form(
     }
 
     Ok(form)
+}
+
+/// True for transport failures surfaced without any response: no upstream
+/// status, not a timeout, and not a response-phase (body/decode) or local
+/// (builder/redirect) error. The dominant producer is a pooled connection
+/// the backend closed while idle; the backend never processed the request,
+/// so one resend is safe for any route.
+fn is_pre_response_transport_error(e: &reqwest::Error) -> bool {
+    e.status().is_none()
+        && !e.is_timeout()
+        && !e.is_body()
+        && !e.is_decode()
+        && !e.is_builder()
+        && !e.is_redirect()
+}
+
+/// Send with a single retry on pre-response transport failures. Requests
+/// whose body cannot be cloned (multipart streams) fail through unchanged.
+pub(crate) async fn send_with_stale_conn_retry(
+    builder: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let retry = builder.try_clone();
+    match builder.send().await {
+        Err(e) if is_pre_response_transport_error(&e) => match retry {
+            Some(retry) => {
+                Metrics::record_upstream_send_retry(metrics_labels::ROUTER_HTTP);
+                retry.send().await
+            }
+            None => Err(e),
+        },
+        other => other,
+    }
 }
 
 fn convert_reqwest_error(e: reqwest::Error) -> Response {
@@ -1618,10 +1652,86 @@ impl RouterTrait for Router {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        net::SocketAddr,
+        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    };
+
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
     use crate::{config::types::PolicyConfig, worker::BasicWorkerBuilder};
+
+    /// Accepts `kill_first` connections and closes them before any response
+    /// bytes, then serves a minimal 200 on every later connection. Returns
+    /// (addr, accepted-connection counter).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only server task; lives no longer than the test"
+    )]
+    async fn flaky_upstream(kill_first: usize) -> (SocketAddr, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_clone = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let n = accepted_clone.fetch_add(1, AtomicOrdering::SeqCst);
+                if n < kill_first {
+                    drop(sock);
+                    continue;
+                }
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        (addr, accepted)
+    }
+
+    #[tokio::test]
+    async fn stale_conn_retry_recovers_on_second_connection() {
+        let (addr, accepted) = flaky_upstream(1).await;
+        let client = Client::new();
+        let builder = client.post(format!("http://{addr}/generate")).body("{}");
+
+        let res = send_with_stale_conn_retry(builder).await.unwrap();
+        assert_eq!(res.status().as_u16(), 200);
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_conn_retry_is_bounded_to_one() {
+        let (addr, accepted) = flaky_upstream(usize::MAX).await;
+        let client = Client::new();
+        let builder = client.post(format!("http://{addr}/generate")).body("{}");
+
+        let err = send_with_stale_conn_retry(builder).await.unwrap_err();
+        assert!(is_pre_response_transport_error(&err));
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_conn_retry_skips_unclonable_bodies() {
+        let (addr, accepted) = flaky_upstream(usize::MAX).await;
+        let client = Client::new();
+        let stream_body = reqwest::Body::wrap_stream(stream::once(async {
+            Ok::<_, std::io::Error>(Bytes::from_static(b"{}"))
+        }));
+        let builder = client
+            .post(format!("http://{addr}/generate"))
+            .body(stream_body);
+
+        send_with_stale_conn_retry(builder).await.unwrap_err();
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
+    }
 
     fn no_health_check() -> HealthCheckConfig {
         HealthCheckConfig {

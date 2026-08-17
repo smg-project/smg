@@ -931,6 +931,15 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
+    /// Record a single-shot resend after a pre-response transport failure.
+    pub fn record_upstream_send_retry(router_type: &'static str) {
+        counter!(
+            "smg_router_upstream_send_retries_total",
+            "router_type" => router_type
+        )
+        .increment(1);
+    }
+
     /// Record upstream backend response.
     /// Uses static strings for common status codes and interning for error_code.
     pub fn record_router_upstream_response(
