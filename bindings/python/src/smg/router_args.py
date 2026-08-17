@@ -1101,7 +1101,7 @@ class RouterArgs:
             help=(
                 "DP engines per startup ZMQ worker: each ipc:// worker becomes a "
                 "grouped worker whose handshake awaits this many engines on one "
-                "socket set (vLLM only; default: 1)"
+                "socket set (vLLM and TokenSpeed; default: 1)"
             ),
         )
         backend_group.add_argument(

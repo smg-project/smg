@@ -158,7 +158,7 @@ def get_connection_mode_override() -> "ConnectionMode | None":
 
 
 def get_zmq_engine_count() -> int:
-    """DP engines per ZMQ worker (grouped vLLM launch).
+    """DP engines per ZMQ worker (grouped vLLM/TokenSpeed launch).
 
     Set ``E2E_ZMQ_ENGINE_COUNT`` to run a ZMQ lane with grouped workers: the
     worker launches that many engines on one socket set and the gateway's

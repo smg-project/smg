@@ -164,6 +164,14 @@ fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
         .ok_or_else(|| format!("invalid value '{value}'; expected inline, shm, auto, or rdma"))
 }
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(n) if n >= 1 => Ok(n),
+        Ok(_) => Err(format!("invalid value '{value}'; expected a count >= 1")),
+        Err(err) => Err(format!("invalid value '{value}': {err}")),
+    }
+}
+
 #[derive(Parser, Debug)]
 struct CliArgs {
     // ==================== Worker Configuration ====================
@@ -347,7 +355,7 @@ struct CliArgs {
 
     /// DP engines per startup ZMQ worker: each ipc:// worker becomes a grouped
     /// worker whose handshake awaits this many engines on one socket set.
-    #[arg(long, help_heading = "Worker Configuration")]
+    #[arg(long, value_parser = parse_positive_usize, help_heading = "Worker Configuration")]
     zmq_engine_count: Option<usize>,
 
     /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext),
@@ -1870,6 +1878,26 @@ mod tests {
             .chain(args.iter().map(|s| (*s).to_string()))
             .collect();
         Cli::parse_from(argv).router_args
+    }
+
+    /// A grouped ZMQ handshake needs at least one engine, so `0` (and any
+    /// non-positive value) must be rejected at parse time rather than silently
+    /// degrading to an ungrouped worker.
+    #[test]
+    fn zmq_engine_count_rejects_non_positive() {
+        assert_eq!(
+            cli_args_from(&["--zmq-engine-count", "2"]).zmq_engine_count,
+            Some(2)
+        );
+        assert_eq!(cli_args_from(&[]).zmq_engine_count, None);
+
+        for bad in ["0", "-1"] {
+            let argv = ["smg", "--zmq-engine-count", bad];
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "--zmq-engine-count {bad} should be rejected"
+            );
+        }
     }
 
     /// The indexer prune flags are router-only settings and must flow into

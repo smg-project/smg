@@ -1388,6 +1388,48 @@ class TestServeOrchestrator:
             assert result.backend == backend
             assert result.worker_urls == [_zmq_ipc_url(31000)]
 
+    def test_build_router_args_zmq_engine_count_from_engine_dp(self):
+        """Engine-level --data-parallel-size groups N engines on one socket set
+        for both ZMQ runtimes, so the router must await N engines."""
+        from types import SimpleNamespace
+
+        for backend in ("vllm", "tokenspeed"):
+            args = _make_args(backend=backend, data_parallel_size=1, connection_mode="zmq")
+            orch = ServeOrchestrator(backend, args, ["--data-parallel-size", "2"])
+            orch.workers = [(MagicMock(), 31000)]
+
+            router_args = SimpleNamespace(
+                backend="sglang",
+                zmq_engine_count=None,
+                disable_retries=True,
+                disable_circuit_breaker=True,
+                policy="passthrough",
+            )
+            with patch("smg.serve.RouterArgs.from_cli_args", return_value=router_args):
+                result = orch._build_router_args()
+
+            assert result.zmq_engine_count == 2, backend
+
+    def test_build_router_args_zmq_engine_count_unset_without_engine_dp(self):
+        """An ungrouped ZMQ launch leaves zmq_engine_count alone (defaults to 1)."""
+        from types import SimpleNamespace
+
+        args = _make_args(backend="tokenspeed", data_parallel_size=1, connection_mode="zmq")
+        orch = ServeOrchestrator("tokenspeed", args, [])
+        orch.workers = [(MagicMock(), 31000)]
+
+        router_args = SimpleNamespace(
+            backend="sglang",
+            zmq_engine_count=None,
+            disable_retries=True,
+            disable_circuit_breaker=True,
+            policy="passthrough",
+        )
+        with patch("smg.serve.RouterArgs.from_cli_args", return_value=router_args):
+            result = orch._build_router_args()
+
+        assert result.zmq_engine_count is None
+
     def test_build_router_args_grpc_keeps_router_backend(self):
         """Off the ZMQ path the router backend stays whatever --router-backend
         chose (gRPC/HTTP workers keep runtime auto-detection)."""

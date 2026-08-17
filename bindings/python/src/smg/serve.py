@@ -944,10 +944,11 @@ class ServeOrchestrator:
         # --backend does not reach.)
         if getattr(self.args, "connection_mode", "grpc") == "zmq":
             router_args.backend = self.backend
-            # A grouped vLLM launch (engine-level --data-parallel-size N after
-            # `--`) needs the router to await N engines per worker handshake.
+            # A grouped launch (engine-level --data-parallel-size N after `--`)
+            # puts N engines on one socket set for both ZMQ runtimes, so the
+            # router must await N engines per worker handshake.
             engine_dp = _backend_arg_int(self.backend_args, "--data-parallel-size", 1)
-            if engine_dp > 1 and self.backend == "vllm":
+            if engine_dp > 1:
                 router_args.zmq_engine_count = engine_dp
         # Router-level retries and circuit breaker are redundant when there is a
         # single worker — per-worker resilience already handles failures — so
