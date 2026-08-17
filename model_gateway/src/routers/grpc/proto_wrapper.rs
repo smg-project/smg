@@ -1562,11 +1562,6 @@ impl ProtoGenerateStreamChunk {
         matches!(self, Self::Sglang(_))
     }
 
-    /// Check if this is vLLM
-    pub fn is_vllm(&self) -> bool {
-        matches!(self, Self::Vllm(_))
-    }
-
     /// Check if this is TensorRT-LLM
     pub fn is_trtllm(&self) -> bool {
         matches!(self, Self::Trtllm(_))
@@ -1759,11 +1754,6 @@ impl ProtoGenerateComplete {
     /// Check if this is SGLang
     pub fn is_sglang(&self) -> bool {
         matches!(self, Self::Sglang(_))
-    }
-
-    /// Check if this is vLLM
-    pub fn is_vllm(&self) -> bool {
-        matches!(self, Self::Vllm(_))
     }
 
     /// Check if this is TensorRT-LLM
