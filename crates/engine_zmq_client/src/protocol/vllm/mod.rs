@@ -95,9 +95,10 @@ impl EngineProtocol for VllmProtocol {
 
     fn encode_start_wave(wave: u64) -> Result<Option<(Bytes, Vec<u8>)>> {
         // Python decodes this with the generic msgpack decoder and unpacks it
-        // positionally as `new_wave, exclude_eng_index`. The sentinel matches
-        // no rank, so every rank adopts `wave`.
-        const NO_EXCLUDED_RANK: u32 = u32::MAX;
+        // positionally as `new_wave, exclude_eng_index`. `nil` excludes no
+        // rank — the same encoding vLLM's own DP coordinator emits — so every
+        // rank adopts `wave`.
+        const NO_EXCLUDED_RANK: Option<u32> = None;
         Ok(Some((
             EngineCoreRequestType::StartDpWave.to_frame(),
             encode_msgpack(&(wave, NO_EXCLUDED_RANK))?,
@@ -129,5 +130,23 @@ impl EngineProtocol for VllmProtocol {
             }),
             EngineCoreOutputs::Utility(_) => Ok(EngineBatch::default()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rmpv::Value;
+
+    use super::*;
+    use crate::codec::decode_value;
+
+    #[test]
+    fn start_wave_encodes_a_nil_excluded_rank() {
+        let (frame, payload) = VllmProtocol::encode_start_wave(9).unwrap().unwrap();
+        assert_eq!(frame.as_ref(), b"\x02");
+        assert_eq!(
+            decode_value(&payload).unwrap(),
+            Value::Array(vec![Value::from(9), Value::Nil])
+        );
     }
 }
