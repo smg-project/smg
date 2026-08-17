@@ -8,7 +8,12 @@
 //   `data_parallel_rank` remains authoritative.
 // - No DP coordinator process: for a lockstep engine group the connector plays
 //   the wake role itself, over the input socket each rank already listens on.
-// - No utility RPC (deferred).
+// - No utility RPC. Upstream's `call_utility` and its management wrappers
+//   (LoRA add/remove, prefix-cache reset, sleep/wake, profiling, weight
+//   updates) are out of scope: none of them is wired through SMG's ZMQ router
+//   path, so utility outputs decode to an empty batch the dispatcher ignores.
+//   Re-porting them means restoring upstream's call-id registry (u64 sequence
+//   numbers) alongside the request registry below.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -44,6 +49,14 @@ pub type TokenSpeedClient = Client<TokenSpeedProtocol>;
 /// The per-request output stream for the TokenSpeed connector.
 pub type TokenSpeedStream = RequestStream<TokenSpeedProtocol>;
 
+/// Per-request output channels are unbounded on purpose. The dispatcher fans
+/// one engine tick out to every request in it while holding the registry lock,
+/// so a bounded channel would let one slow consumer stall delivery for every
+/// other request on the transport — and backpressuring further, into the
+/// output PULL socket, would wedge the engine itself. Unboundedness is not
+/// unbounded memory: a request's queue is capped by its own generation
+/// (`max_tokens` outputs), a dropped stream auto-aborts it on the engine, and
+/// the buffer is freed with the stream.
 type OutputSender<O> = mpsc::UnboundedSender<Result<O>>;
 type OutputReceiver<O> = mpsc::UnboundedReceiver<Result<O>>;
 
@@ -80,16 +93,35 @@ impl<O: EngineOutput> RequestRegistry<O> {
     }
 
     /// Deliver one output to its request stream; drop the entry when terminal.
+    ///
+    /// The lookup key stays borrowed from the output, so the hot path — a
+    /// non-terminal token batch — never allocates one.
     fn route(&mut self, output: O) {
-        let request_id = output.request_id().to_string();
-        let Some(sender) = self.requests.get(&request_id) else {
-            trace!(%request_id, "output for unknown/finished request; dropping");
+        if output.finished() {
+            // Terminal: retire the entry before handing the output over, while
+            // its request id is still borrowable.
+            match self.requests.remove(output.request_id()) {
+                Some(sender) => {
+                    let _ = sender.send(Ok(output));
+                }
+                None => trace!(
+                    request_id = output.request_id(),
+                    "output for unknown/finished request; dropping"
+                ),
+            }
+            return;
+        }
+        let Some(sender) = self.requests.get(output.request_id()) else {
+            trace!(
+                request_id = output.request_id(),
+                "output for unknown/finished request; dropping"
+            );
             return;
         };
-        let finished = output.finished();
-        if sender.send(Ok(output)).is_err() || finished {
-            // Receiver gone (stream dropped) or request finished — stop tracking.
-            self.requests.remove(&request_id);
+        // A failed send hands the output back, so the receiver-gone (stream
+        // dropped) path retires the entry without an owned key either.
+        if let Err(mpsc::error::SendError(Ok(undelivered))) = sender.send(Ok(output)) {
+            self.requests.remove(undelivered.request_id());
         }
     }
 
@@ -472,7 +504,8 @@ impl<P: EngineProtocol> Client<P> {
     }
 
     /// Submit a request and return a stream of its outputs. The request is
-    /// routed by `data_parallel_rank` (SMG-pinned) or to the sole engine.
+    /// routed by `data_parallel_rank` (SMG-pinned) or, unpinned, to the
+    /// least-loaded engine (see [`ClientInner::select_engine`]).
     /// Dropping the returned stream before it finishes aborts the request.
     pub async fn submit(&self, request: P::Request) -> Result<RequestStream<P>> {
         P::validate(&request)?;
@@ -553,12 +586,6 @@ impl<P: EngineProtocol> Drop for Client<P> {
     }
 }
 
-/// If the engine emits no output for this long while requests are in flight, the
-/// dispatcher treats it as dead. A hard engine death (SIGKILL/OOM) sends no
-/// `ENGINE_CORE_DEAD` sentinel, and a bound PULL socket never errors when its
-/// PUSH peer vanishes — so silence is the only available death signal. Generous
-/// so a slow first token never trips it, while still bounding an otherwise
-/// infinite hang.
 /// Maximum time to wait for a single request frame to be accepted by an engine's
 /// input socket before treating the engine as wedged. A healthy engine drains its
 /// input continuously; a send that blocks this long means its event loop is stuck.
@@ -566,6 +593,19 @@ impl<P: EngineProtocol> Drop for Client<P> {
 /// [`ClientInner::send_to_engine`]).
 const ENGINE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// If the engine emits no output for this long while requests are in flight, the
+/// dispatcher treats it as dead. A hard engine death (SIGKILL/OOM) sends no
+/// `ENGINE_CORE_DEAD` sentinel, and a bound PULL socket never errors when its
+/// PUSH peer vanishes — so silence is the only available death signal. Generous
+/// so a slow first token never trips it, while still bounding an otherwise
+/// infinite hang.
+///
+/// The window is deliberately fixed rather than derived from context length:
+/// any single request whose first token takes longer than this — a lone
+/// million-token prefill on an otherwise idle transport — is failed as if the
+/// engine had died. Deployments that can prefill for minutes with no other
+/// traffic need this raised (per-worker configuration), not the watchdog
+/// removed: without it a killed engine hangs its requests forever.
 const ENGINE_SILENCE_DEATH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Route decoded outputs to per-request streams and forward auto-abort requests
@@ -588,11 +628,8 @@ async fn run_dispatcher<P: EngineProtocol>(
                         }
                         // Unique finished ids: a terminal output and the
                         // out-of-band finished list may name the same request.
-                        let mut finished: HashSet<String> = batch
-                            .finished_request_ids
-                            .iter()
-                            .cloned()
-                            .collect();
+                        let mut finished: HashSet<String> =
+                            batch.finished_request_ids.into_iter().collect();
                         let mut registry = inner.registry.lock();
                         for output in batch.outputs {
                             if output.finished() {
@@ -600,7 +637,7 @@ async fn run_dispatcher<P: EngineProtocol>(
                             }
                             registry.route(output);
                         }
-                        registry.remove_all(&batch.finished_request_ids);
+                        registry.remove_all(&finished);
                         drop(registry);
                         inner.release(batch.engine_index, &finished);
                     }
@@ -697,9 +734,16 @@ impl<P: EngineProtocol> Stream for RequestStream<P> {
                 self.finished = true;
                 Poll::Ready(Some(Err(error)))
             }
+            // The sender was dropped without a terminal output — the client was
+            // dropped out from under the stream, or the dispatcher stopped
+            // tracking the request. Surface it as an error: a clean end here is
+            // indistinguishable from a completed generation, and a truncated
+            // response must not look complete to the caller.
             Poll::Ready(None) => {
                 self.finished = true;
-                Poll::Ready(None)
+                Poll::Ready(Some(Err(Error::RequestStreamClosed {
+                    request_id: self.request_id.clone(),
+                })))
             }
             Poll::Pending => Poll::Pending,
         }
@@ -755,14 +799,7 @@ mod tests {
             ns.output_endpoint(),
         );
         let (transport, engine) = tokio::join!(
-            connect_handshake(
-                &handshake,
-                1,
-                "127.0.0.1",
-                Some(&input),
-                Some(&output),
-                TIMEOUT
-            ),
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
             connect_to_frontend(
                 &handshake,
                 EngineId::from_engine_index(0),
@@ -799,14 +836,7 @@ mod tests {
             connect_to_frontend(&handshake, EngineId::from_engine_index(rank), ready(rank))
         });
         let (transport, engines) = tokio::join!(
-            connect_handshake(
-                &handshake,
-                engine_count,
-                "127.0.0.1",
-                Some(&input),
-                Some(&output),
-                TIMEOUT
-            ),
+            connect_handshake(&handshake, engine_count, &input, &output, TIMEOUT),
             futures::future::join_all(engines),
         );
         let engines = engines.into_iter().map(Result::unwrap).collect();
@@ -895,6 +925,35 @@ mod tests {
         assert_eq!(second.new_token_ids, vec![11]);
         assert!(second.finished());
         // Terminal output ends the stream.
+        assert!(stream.next().await.is_none());
+    }
+
+    /// A stream that outlives its client is truncated, not complete: it must
+    /// report the truncation rather than end like a finished generation.
+    #[tokio::test]
+    async fn dropping_the_client_errors_live_streams() {
+        let (client, mut engine, _ns) = connect().await;
+        let mut stream = client
+            .submit(EngineCoreRequest {
+                request_id: "orphan".into(),
+                prompt_token_ids: Some(vec![1, 2, 3]),
+                ..EngineCoreRequest::default()
+            })
+            .await
+            .unwrap();
+        engine.recv_request().await.unwrap();
+
+        drop(client);
+
+        let error = stream
+            .next()
+            .await
+            .expect("a terminal error item")
+            .expect_err("truncation is not a clean end of stream");
+        assert!(
+            matches!(&error, Error::RequestStreamClosed { request_id } if request_id == "orphan"),
+            "unexpected error: {error}"
+        );
         assert!(stream.next().await.is_none());
     }
 
@@ -1236,16 +1295,10 @@ mod tests {
             ns.input_endpoint(),
             ns.output_endpoint(),
         );
-        std::mem::forget(ns);
+        // Held for the test duration so the ipc files outlive the client.
+        let _ns = ns;
         let (transport, engine) = tokio::join!(
-            connect_handshake(
-                &handshake,
-                1,
-                "127.0.0.1",
-                Some(&input),
-                Some(&output),
-                TIMEOUT
-            ),
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
             connect_to_frontend(
                 &handshake,
                 EngineId::from_engine_index(0),

@@ -64,7 +64,10 @@ pub struct EngineBatch<O> {
     pub engine_index: u32,
     /// Per-request outputs produced in this tick.
     pub outputs: Vec<O>,
-    /// Request ids the engine reported finished out-of-band.
+    /// Request ids finished in this tick, including ones the connector could
+    /// derive from a terminal output: a protocol without an out-of-band finish
+    /// channel may list them here too. The connector unions both sources, so
+    /// the overlap is harmless.
     pub finished_request_ids: Vec<String>,
     /// Per-rank load signal, when the protocol carries it (`None` otherwise).
     pub load: Option<EngineLoad>,

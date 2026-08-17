@@ -411,9 +411,8 @@ impl ZmqEngineClient {
         let transport = connect_handshake(
             handshake_address,
             engine_count,
-            ZMQ_LOOPBACK_HOST,
-            Some(input_address),
-            Some(output_address),
+            input_address,
+            output_address,
             timeout,
         )
         .await?;

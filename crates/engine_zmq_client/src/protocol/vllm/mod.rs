@@ -9,9 +9,6 @@
 //! features are typed fully. Pooling params and prompt embeds are carried as
 //! [`crate::codec::OpaqueValue`] — they serialize as `nil` on supported paths.
 
-// The startup handshake is engine-neutral (TokenSpeed speaks the same
-// protocol); re-exported here so existing `vllm::handshake` paths keep working.
-pub use crate::protocol::handshake;
 pub mod logprobs;
 pub mod lora;
 pub mod multimodal;
@@ -93,7 +90,7 @@ impl EngineProtocol for VllmProtocol {
     }
 
     fn encode_abort(request_id: &str) -> Result<Vec<u8>> {
-        encode_msgpack(&[request_id.to_string()])
+        encode_msgpack(&[request_id])
     }
 
     fn encode_start_wave(wave: u64) -> Result<Option<(Bytes, Vec<u8>)>> {

@@ -120,7 +120,7 @@ impl EngineProtocol for TokenSpeedProtocol {
         // The abort payload is a positional msgpack array of request-id strings,
         // decoded by the engine's `decode_abort` (a `msgspec.msgpack.Decoder(
         // list[str])`) into abort requests. A single-element array aborts one rid.
-        encode_msgpack(&[request_id.to_string()])
+        encode_msgpack(&[request_id])
     }
 
     fn encode_start_wave(_wave: u64) -> Result<Option<(Bytes, Vec<u8>)>> {
@@ -151,6 +151,9 @@ impl EngineProtocol for TokenSpeedProtocol {
             kv_cache_usage: batch.kv_active_pages as f64 / batch.kv_total_pages as f64,
         });
         let outputs = batch.into_outputs()?;
+        // TokenSpeed has no out-of-band finish channel: every finish is carried
+        // by its own output. Reporting them here anyway keeps the batch shape
+        // self-describing for consumers that only read the finished list.
         let finished_request_ids = outputs
             .iter()
             .filter(|output| output.finish_reason.is_some())

@@ -315,16 +315,9 @@ mod tests {
         )]
         let _engine = tokio::spawn(serve(cfg, handshake.clone(), 0));
 
-        let transport = connect_handshake(
-            &handshake,
-            1,
-            "127.0.0.1",
-            Some(&input),
-            Some(&output),
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("frontend handshake");
+        let transport = connect_handshake(&handshake, 1, &input, &output, Duration::from_secs(10))
+            .await
+            .expect("frontend handshake");
         let client = EngineCoreClient::new(transport);
         assert_eq!(client.engines()[0].ready_response.data_parallel_rank, 0);
 
