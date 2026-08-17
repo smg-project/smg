@@ -4,9 +4,10 @@
 //! stream that publishes every locally-owned worker's state under
 //! `worker:{worker_id}` (and a tombstone on removal). Mesh-imported
 //! workers are filtered out by their registration origin so a peer's
-//! state is never re-published. On broadcast lag the loop re-publishes
-//! all local workers and tombstones any it published that no longer
-//! exist.
+//! state is never re-published, and `Zmq` workers are filtered out as
+//! host-local capacity (their `ipc://` endpoint is unreachable off this
+//! machine). On broadcast lag the loop re-publishes all local workers
+//! and tombstones any it published that no longer exist.
 //!
 //! Inbound: `start` also spawns a task that subscribes to the
 //! namespace, routes each non-tombstone update through
@@ -35,7 +36,9 @@ use smg_mesh::{CrdtNamespace, WorkerState};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use crate::worker::{event::WorkerEvent, registry::WorkerId, Worker, WorkerOrigin, WorkerRegistry};
+use crate::worker::{
+    event::WorkerEvent, registry::WorkerId, ConnectionMode, Worker, WorkerOrigin, WorkerRegistry,
+};
 
 const PREFIX: &str = "worker:";
 
@@ -199,8 +202,8 @@ impl WorkerSyncAdapter {
                 // gone cluster-wide and peers dropped their imports, so
                 // re-assert the authoritative state — otherwise the worker
                 // stays delisted everywhere until its next status change.
-                if self.worker_registry.origin_of(&id) == Some(WorkerOrigin::Local) {
-                    if let Some(worker) = self.worker_registry.get(&id) {
+                if let Some(worker) = self.worker_registry.get(&id) {
+                    if self.is_publishable(&id, &worker) {
                         warn!(
                             worker_id,
                             "re-publishing locally-owned worker after foreign tombstone"
@@ -215,6 +218,16 @@ impl WorkerSyncAdapter {
                 }
             }
         }
+    }
+
+    /// Whether this node should export the worker to the cluster. Only
+    /// locally-owned workers are ours to publish, and a `Zmq` worker is
+    /// host-local by construction — its `ipc://` endpoint names a socket on
+    /// this machine only, so a peer that imported it would route to a path
+    /// that resolves to nothing on its own host.
+    fn is_publishable(&self, worker_id: &WorkerId, worker: &Arc<dyn Worker>) -> bool {
+        self.worker_registry.origin_of(worker_id) == Some(WorkerOrigin::Local)
+            && *worker.connection_mode() != ConnectionMode::Zmq
     }
 
     fn apply_incoming(&self, worker_id: &str, bytes: &[u8]) {
@@ -235,7 +248,7 @@ impl WorkerSyncAdapter {
         loop {
             match events.recv().await {
                 Ok(WorkerEvent::Registered { worker_id, worker }) => {
-                    if self.worker_registry.origin_of(&worker_id) == Some(WorkerOrigin::Local) {
+                    if self.is_publishable(&worker_id, &worker) {
                         self.on_worker_changed(
                             worker_id.as_str(),
                             &worker_state_of(&worker_id, &worker),
@@ -248,18 +261,23 @@ impl WorkerSyncAdapter {
                 // claimed by register_or_replace — starts publishing from its
                 // next mutation.
                 Ok(WorkerEvent::Replaced { worker_id, new, .. }) => {
-                    if self.worker_registry.origin_of(&worker_id) == Some(WorkerOrigin::Local) {
+                    if self.is_publishable(&worker_id, &new) {
                         self.on_worker_changed(
                             worker_id.as_str(),
                             &worker_state_of(&worker_id, &new),
                         );
                         published.insert(worker_id);
+                    } else if published.remove(&worker_id) {
+                        // The replacement is no longer exportable (e.g. the
+                        // endpoint moved to a host-local ZMQ transport):
+                        // withdraw the key peers already imported.
+                        self.on_worker_removed(worker_id.as_str());
                     }
                 }
                 Ok(WorkerEvent::StatusChanged {
                     worker_id, worker, ..
                 }) => {
-                    if self.worker_registry.origin_of(&worker_id) == Some(WorkerOrigin::Local) {
+                    if self.is_publishable(&worker_id, &worker) {
                         self.on_worker_changed(
                             worker_id.as_str(),
                             &worker_state_of(&worker_id, &worker),
@@ -294,7 +312,7 @@ impl WorkerSyncAdapter {
     fn resync_local(&self, published: &mut HashSet<WorkerId>) {
         let mut current = HashSet::new();
         for (id, worker) in self.worker_registry.get_all_with_ids() {
-            if self.worker_registry.origin_of(&id) == Some(WorkerOrigin::Local) {
+            if self.is_publishable(&id, &worker) {
                 let state = worker_state_of(&id, &worker);
                 if !self.store_matches(&id, &state) {
                     self.on_worker_changed(id.as_str(), &state);
@@ -640,6 +658,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbound_never_publishes_local_zmq_worker() {
+        // ZMQ workers are host-local capacity: their `ipc://` endpoint is
+        // meaningless off this machine, so they stay out of the mesh.
+        let mesh = MeshKV::new("node-a".into());
+        let ns = worker_namespace(&mesh);
+        let registry = Arc::new(WorkerRegistry::new());
+        let adapter = WorkerSyncAdapter::new(ns.clone(), registry.clone());
+        adapter.start();
+
+        let zmq: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("ipc:///tmp/smg-local.sock")
+                .model(ModelCard::new("llama-3"))
+                .connection_mode(ConnectionMode::Zmq)
+                .build(),
+        );
+        let zmq_id = registry.register(zmq).unwrap();
+        registry
+            .get(&zmq_id)
+            .unwrap()
+            .set_status(WorkerStatus::Ready);
+
+        // A published HTTP worker is the ordering fence: once its key is in
+        // the store the outbound loop has drained past the ZMQ events.
+        let http_id = registry
+            .register(local_worker("http://local:8080"))
+            .unwrap();
+        assert!(
+            wait_for(|| ns.get(&format!("worker:{}", http_id.as_str())).is_some()).await,
+            "local HTTP registration was not published"
+        );
+        assert!(
+            ns.get(&format!("worker:{}", zmq_id.as_str())).is_none(),
+            "a ZMQ worker must never be published to the mesh"
+        );
+
+        // The resync/lag path takes the same gate.
+        let mut published = HashSet::new();
+        adapter.resync_local(&mut published);
+        assert!(
+            ns.get(&format!("worker:{}", zmq_id.as_str())).is_none(),
+            "resync must not publish a ZMQ worker"
+        );
+        assert!(published.contains(&http_id) && !published.contains(&zmq_id));
+    }
+
+    #[tokio::test]
     async fn outbound_never_republishes_mesh_imported_worker() {
         let mesh = MeshKV::new("node-a".into());
         let ns = worker_namespace(&mesh);
@@ -760,7 +824,7 @@ mod tests {
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://remote:9000")
                 .model(ModelCard::new("llama-3"))
-                .connection_mode(crate::worker::ConnectionMode::Grpc)
+                .connection_mode(ConnectionMode::Grpc)
                 .worker_type(crate::worker::WorkerType::Decode)
                 .build(),
         );
@@ -773,7 +837,7 @@ mod tests {
         let imported = sub_registry.get_by_url("grpc://remote:9000").unwrap();
         assert_eq!(
             *imported.connection_mode(),
-            crate::worker::ConnectionMode::Grpc,
+            ConnectionMode::Grpc,
             "connection mode must survive the spec round trip"
         );
         assert_eq!(

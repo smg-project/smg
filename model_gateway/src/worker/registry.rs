@@ -1734,6 +1734,18 @@ impl WorkerRegistry {
     pub fn on_remote_worker_state(&self, state: &smg_mesh::WorkerState) {
         use openai_protocol::model_card::ModelCard;
 
+        // ZMQ is a same-host transport: its `ipc://` endpoint names a socket
+        // on the publisher's machine, so importing it here would advertise a
+        // route that can never reach the engine. Publishers filter these out;
+        // this guard also covers peers running older builds.
+        if ConnectionMode::from_url(&state.url) == Some(ConnectionMode::Zmq) {
+            tracing::debug!(
+                url = %state.url,
+                "Ignoring mesh state for host-local ZMQ worker"
+            );
+            return;
+        }
+
         // If worker already exists at this URL, update its health
         // status from the mesh state. Don't re-register — the existing
         // worker has full config from its creation workflow.
@@ -1798,6 +1810,15 @@ impl WorkerRegistry {
         } else {
             match serde_json::from_slice::<openai_protocol::worker::WorkerSpec>(&state.spec) {
                 Ok(spec) => {
+                    // Same-host transport declared by the spec rather than by
+                    // the URL scheme — not routable from this node.
+                    if spec.connection_mode == ConnectionMode::Zmq {
+                        tracing::debug!(
+                            url = %state.url,
+                            "Ignoring mesh state for host-local ZMQ worker"
+                        );
+                        return;
+                    }
                     spec_applied = true;
                     super::builder::BasicWorkerBuilder::from_spec(spec).build()
                 }
@@ -2124,6 +2145,41 @@ mod tests {
             registry.get_id_by_url("http://remote:8080"),
             Some(WorkerId::from_string("peer-w1".to_string())),
             "import keys under the publisher's id so its tombstone resolves"
+        );
+    }
+
+    #[test]
+    fn mesh_state_for_zmq_worker_is_never_imported() {
+        // ZMQ is same-host: an `ipc://` endpoint published by a peer names a
+        // socket path on that peer's machine, so importing it would advertise
+        // an unroutable worker.
+        let registry = WorkerRegistry::new();
+        registry.on_remote_worker_state(&remote_state(
+            "peer-w1",
+            "ipc:///tmp/smg-peer.sock",
+            true,
+            vec![],
+        ));
+        assert!(
+            registry.get_by_url("ipc:///tmp/smg-peer.sock").is_none(),
+            "a host-local ZMQ worker must not be imported from the mesh"
+        );
+
+        // Same rejection when the transport is declared only by the spec.
+        let spec: openai_protocol::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+            "url": "http://remote:8080",
+            "connection_mode": "zmq"
+        }))
+        .unwrap();
+        registry.on_remote_worker_state(&remote_state(
+            "peer-w2",
+            "http://remote:8080",
+            true,
+            serde_json::to_vec(&spec).unwrap(),
+        ));
+        assert!(
+            registry.get_by_url("http://remote:8080").is_none(),
+            "a spec-declared ZMQ worker must not be imported from the mesh"
         );
     }
 
