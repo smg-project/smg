@@ -306,7 +306,7 @@ mod header_forwarding_tests {
     }
 
     #[tokio::test]
-    async fn test_worker_id_is_stable_for_streaming_and_non_streaming_responses() {
+    async fn test_routed_worker_id_for_streaming_and_non_streaming_responses() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 19406,
             worker_type: WorkerType::Regular,
@@ -316,7 +316,9 @@ mod header_forwarding_tests {
         }])
         .await;
         let app = ctx.create_app();
-        let mut worker_ids = Vec::new();
+        let worker_url = ctx.app_context.worker_registry.get_all()[0]
+            .url()
+            .to_string();
 
         for stream in [false, true] {
             let payload = json!({
@@ -333,13 +335,12 @@ mod header_forwarding_tests {
 
             let resp = app.clone().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
-            let worker_id = resp.headers()["x-smg-worker-id"].to_str().unwrap();
-            uuid::Uuid::parse_str(worker_id).expect("worker ID should be an opaque UUID");
-            worker_ids.push(worker_id.to_string());
+            assert_eq!(
+                resp.headers()["x-smg-routed-worker-id"],
+                worker_url.as_str()
+            );
             to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         }
-
-        assert_eq!(worker_ids[0], worker_ids[1]);
         ctx.shutdown().await;
     }
 }

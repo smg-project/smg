@@ -845,7 +845,8 @@ impl Router {
             // JSON body (success or 4xx error). Don't relabel non-SSE
             // responses as SSE; leave that judgment to whatever the worker
             // set.
-            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            header_utils::insert_routed_worker_id(&mut response_headers, worker.url());
             let stream = res.bytes_stream();
             // Bounded channel applies backpressure: if the downstream client
             // is slow, the upstream relay awaits on `send` rather than piling
@@ -948,7 +949,8 @@ impl Router {
             response = AttachedBody::wrap_response(response, load_guard);
             response
         } else {
-            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            header_utils::insert_routed_worker_id(&mut response_headers, worker.url());
             match res.bytes().await {
                 Ok(body) => {
                     let mut response = Response::new(Body::from(body));
@@ -1052,9 +1054,6 @@ impl Router {
     ) -> Response {
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
-        // Capture the ID before the request so a concurrent worker removal
-        // cannot make an already-routed response lose its attribution.
-        let worker_id = self.worker_registry.get_id_by_url(worker.url());
 
         let body = match serialize_request_body(typed_req, canonical_model, worker) {
             Ok(body) => body,
@@ -1104,9 +1103,7 @@ impl Router {
         if is_stream {
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            if let Some(worker_id) = worker_id.as_ref() {
-                header_utils::insert_worker_id(&mut response_headers, worker_id.as_str());
-            }
+            header_utils::insert_routed_worker_id(&mut response_headers, worker.url());
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
@@ -1176,9 +1173,7 @@ impl Router {
                 }
                 Err(error_response) => error_response,
             };
-            if let Some(worker_id) = worker_id.as_ref() {
-                header_utils::insert_worker_id(response.headers_mut(), worker_id.as_str());
-            }
+            header_utils::insert_routed_worker_id(response.headers_mut(), worker.url());
 
             // load_guard dropped here automatically after response body is read
             response
@@ -1201,7 +1196,7 @@ impl Router {
         response: Response,
         max_body_bytes: usize,
     ) -> Response {
-        let (response_parts, response_body) = response.into_parts();
+        let (_, response_body) = response.into_parts();
         let body_bytes = match to_bytes(response_body, max_body_bytes).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1244,13 +1239,7 @@ impl Router {
         if !req.return_documents {
             rerank_response.drop_documents();
         }
-        let mut response = Json(rerank_response).into_response();
-        if let Some(worker_id) = response_parts.headers.get(&header_utils::HEADER_WORKER_ID) {
-            response
-                .headers_mut()
-                .insert(header_utils::HEADER_WORKER_ID.clone(), worker_id.clone());
-        }
-        response
+        Json(rerank_response).into_response()
     }
 }
 
@@ -1870,25 +1859,6 @@ mod tests {
         assert_eq!(rerank.model, "test-model");
         assert_eq!(rerank.results.len(), 1);
         assert_eq!(rerank.results[0].document, None);
-    }
-
-    #[tokio::test]
-    async fn build_rerank_response_preserves_worker_id() {
-        let req = rerank_request();
-        let body = rerank_worker_body();
-        let mut upstream = Response::new(Body::from(body.clone()));
-        upstream.headers_mut().insert(
-            header_utils::HEADER_WORKER_ID.clone(),
-            HeaderValue::from_static("0198b7c7-8f80-7000-8000-000000000001"),
-        );
-
-        let response = Router::build_rerank_response(&req, None, upstream, body.len()).await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers()[&header_utils::HEADER_WORKER_ID],
-            "0198b7c7-8f80-7000-8000-000000000001"
-        );
     }
 
     #[tokio::test]

@@ -759,8 +759,9 @@ impl PDRouter {
                 None
             };
 
-            let response_headers =
+            let mut response_headers =
                 header_utils::preserve_response_headers(decode_response.headers());
+            header_utils::insert_routed_worker_id(&mut response_headers, decode.url());
 
             self.create_streaming_response(
                 decode_response.bytes_stream(),
@@ -773,7 +774,7 @@ impl PDRouter {
             )
         } else {
             // Non-streaming response
-            if context.return_logprob {
+            let mut response = if context.return_logprob {
                 self.process_non_streaming_response(
                     decode_response,
                     status,
@@ -798,7 +799,12 @@ impl PDRouter {
                         error::internal_error("read_response_failed", "Failed to read response")
                     }
                 }
-            }
+            };
+
+            // The decode worker is the one that produced the body the client
+            // sees, on both the merged-logprob and passthrough paths.
+            header_utils::insert_routed_worker_id(response.headers_mut(), decode.url());
+            response
         }
     }
 

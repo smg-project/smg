@@ -10,7 +10,7 @@ use http::header::HeaderName;
 static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-worker");
 static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
 static HEADER_MCP: HeaderName = HeaderName::from_static("x-smg-mcp");
-pub(crate) static HEADER_WORKER_ID: HeaderName = HeaderName::from_static("x-smg-worker-id");
+static HEADER_ROUTED_WORKER_ID: HeaderName = HeaderName::from_static("x-smg-routed-worker-id");
 
 fn extract_header_value<'a>(headers: Option<&'a HeaderMap>, name: &HeaderName) -> Option<&'a str> {
     headers
@@ -67,13 +67,18 @@ pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
     headers
 }
 
-/// Stamp a response with the opaque ID of the worker that served it.
+/// Stamp the response with the id of the worker that served the request — the
+/// worker URL as the gateway knows it, including the `@<rank>` suffix for
+/// dp-aware workers.
 ///
-/// Call this after [`preserve_response_headers`] so the gateway's value wins
-/// over any value supplied by an upstream worker.
-pub(crate) fn insert_worker_id(headers: &mut HeaderMap, worker_id: &str) {
-    if let Ok(value) = HeaderValue::from_str(worker_id) {
-        headers.insert(HEADER_WORKER_ID.clone(), value);
+/// Lets a client see which replica answered: which pod to pull logs from, and
+/// whether retries landed somewhere new. Call after
+/// [`preserve_response_headers`] so the gateway's value wins over anything an
+/// upstream set under the same name. Skipped if the URL isn't representable as
+/// a header value.
+pub fn insert_routed_worker_id(headers: &mut HeaderMap, worker_url: &str) {
+    if let Ok(value) = HeaderValue::from_str(worker_url) {
+        headers.insert(HEADER_ROUTED_WORKER_ID.clone(), value);
     }
 }
 
