@@ -54,14 +54,25 @@ use crate::{
 /// binds). Shared with the worker-side socket derivation.
 pub(crate) const ZMQ_LOOPBACK_HOST: &str = "127.0.0.1";
 
-/// The engine protocol a ZMQ backend speaks. Both share the transport and
+/// The engine protocol a ZMQ backend speaks — a closed set: the transport has
+/// an adapter for exactly these two engines. Resolved once at connect time and
+/// exposed by [`ZmqEngineClient::dialect`] so every per-engine dispatch on the
+/// ZMQ lane (request building, multimodal, EOS) matches on the same two
+/// variants with no unreachable arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZmqDialect {
+    /// vLLM EngineCore.
+    Vllm,
+    /// TokenSpeed.
+    TokenSpeed,
+}
+
+/// The connected client for a [`ZmqDialect`]. Both share the transport and
 /// handshake; only the request/output struct shapes and the translation to/from
 /// SMG proto differ.
 #[derive(Clone)]
 enum ZmqBackend {
-    /// vLLM EngineCore.
     Vllm(Arc<EngineCoreClient>),
-    /// TokenSpeed.
     TokenSpeed(Arc<TokenSpeedClient>),
 }
 
@@ -135,8 +146,9 @@ fn eos_ids_from_value(value: Option<&serde_json::Value>) -> Vec<u32> {
 /// model id is a repo id rather than a local path, so the tokenizer's merged
 /// EOS set is folded into `stop_token_ids` here as the always-available
 /// backstop; without it an uncapped request generates to the full context
-/// window. Not needed for TokenSpeed (its scheduler stops at EOS itself) —
-/// the caller gates on runtime.
+/// window. Not needed for TokenSpeed (its scheduler stops at EOS itself), and
+/// a TokenSpeed backend builds a TokenSpeed request variant — so the variant
+/// match below is the single dispatch point for this policy.
 pub(crate) fn fold_tokenizer_eos_backstop(
     request: &mut ProtoGenerateRequest,
     tokenizer: Option<&Arc<dyn Tokenizer>>,
@@ -394,19 +406,22 @@ impl ZmqEngineClient {
         runtime: RuntimeType,
         timeout: Duration,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // No silent fallback: any other runtime has no ZMQ engine adapter.
-        // Reject before the handshake — no such engine ever dials in, so the
-        // handshake would just block for the full timeout.
-        if !matches!(
-            runtime,
-            RuntimeType::Vllm | RuntimeType::TokenSpeed | RuntimeType::Unspecified
-        ) {
-            return Err(format!(
-                "ZMQ direct backend has no engine implementation for runtime \
-                 {runtime}; only vllm and tokenspeed are supported"
-            )
-            .into());
-        }
+        // Resolve the dialect before the handshake: no silent fallback for a
+        // runtime with no ZMQ engine adapter, and no such engine ever dials in,
+        // so the handshake would just block for the full timeout.
+        let dialect = match runtime {
+            // vLLM EngineCore is the default ZMQ wire; an unspecified runtime
+            // maps to it for backward compatibility (see `detect_backend`).
+            RuntimeType::Vllm | RuntimeType::Unspecified => ZmqDialect::Vllm,
+            RuntimeType::TokenSpeed => ZmqDialect::TokenSpeed,
+            other => {
+                return Err(format!(
+                    "ZMQ direct backend has no engine implementation for runtime \
+                     {other}; only vllm and tokenspeed are supported"
+                )
+                .into())
+            }
+        };
 
         let transport = connect_handshake(
             handshake_address,
@@ -417,14 +432,11 @@ impl ZmqEngineClient {
             timeout,
         )
         .await?;
-        let backend = match runtime {
-            RuntimeType::TokenSpeed => {
+        let backend = match dialect {
+            ZmqDialect::Vllm => ZmqBackend::Vllm(Arc::new(EngineCoreClient::new(transport))),
+            ZmqDialect::TokenSpeed => {
                 ZmqBackend::TokenSpeed(Arc::new(TokenSpeedClient::new(transport)))
             }
-            // vLLM EngineCore is the default ZMQ wire; an unspecified runtime maps
-            // to it for backward compatibility (see `detect_backend`). All other
-            // runtimes were rejected before the handshake.
-            _ => ZmqBackend::Vllm(Arc::new(EngineCoreClient::new(transport))),
         };
         Ok(Self {
             backend,
@@ -433,12 +445,20 @@ impl ZmqEngineClient {
         })
     }
 
-    /// The engine runtime behind this connection (the wire protocol chosen at
-    /// connect time).
-    pub fn runtime(&self) -> RuntimeType {
+    /// The wire protocol chosen at connect time.
+    pub fn dialect(&self) -> ZmqDialect {
         match &self.backend {
-            ZmqBackend::Vllm(_) => RuntimeType::Vllm,
-            ZmqBackend::TokenSpeed(_) => RuntimeType::TokenSpeed,
+            ZmqBackend::Vllm(_) => ZmqDialect::Vllm,
+            ZmqBackend::TokenSpeed(_) => ZmqDialect::TokenSpeed,
+        }
+    }
+
+    /// The engine runtime behind this connection, widened to the open
+    /// [`RuntimeType`] for callers that report it alongside gRPC backends.
+    pub fn runtime(&self) -> RuntimeType {
+        match self.dialect() {
+            ZmqDialect::Vllm => RuntimeType::Vllm,
+            ZmqDialect::TokenSpeed => RuntimeType::TokenSpeed,
         }
     }
 
@@ -1616,6 +1636,53 @@ mod tests {
         let mut req = eos_request(vec![7], true);
         fold_tokenizer_eos_backstop(&mut req, Some(&tokenizer));
         assert_eq!(eos_stop_ids(&req), &[7]);
+    }
+
+    /// The variant match is the only gate on the fold: a TokenSpeed request
+    /// (whose scheduler stops at EOS itself) is left untouched.
+    #[test]
+    fn eos_backstop_leaves_tokenspeed_requests_untouched() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let mut req =
+            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
+                sampling_params: Some(tokenspeed_proto::SamplingParams {
+                    stop_token_ids: vec![7],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
+        fold_tokenizer_eos_backstop(&mut req, Some(&tokenizer));
+        let ProtoGenerateRequest::TokenSpeed(req) = req else {
+            panic!("expected TokenSpeed request");
+        };
+        assert_eq!(req.sampling_params.unwrap().stop_token_ids, vec![7]);
+    }
+
+    /// The dialect is resolved before the handshake, so a runtime with no ZMQ
+    /// adapter fails immediately instead of blocking for the connect timeout
+    /// (this test would hang on the generous timeout otherwise).
+    #[tokio::test]
+    async fn connect_rejects_a_runtime_without_a_zmq_adapter_before_the_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let Err(error) = ZmqEngineClient::connect(
+            &ep("hs.sock"),
+            &ep("in.sock"),
+            &ep("out.sock"),
+            1,
+            "m".to_string(),
+            EosTokenIds::default(),
+            RuntimeType::Sglang,
+            ZMQ_CONNECT_TIMEOUT,
+        )
+        .await
+        else {
+            panic!("SGLang has no ZMQ engine adapter");
+        };
+        assert!(
+            error.to_string().contains("no engine implementation"),
+            "{error}"
+        );
     }
 
     fn batch(
