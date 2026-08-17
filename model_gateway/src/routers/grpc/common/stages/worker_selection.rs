@@ -295,11 +295,11 @@ impl WorkerSelectionStage {
             Some(model_id)
         };
 
-        // gRPC + direct-ZMQ workers both ride the gRPC router pipeline.
+        // Filtered to gRPC below: PD legs cannot ride the ZMQ transport.
         let all_workers = self.worker_registry.get_workers_filtered(
             model_filter,
             None,
-            None, // grpc + zmq, filtered below
+            None, // filtered below
             None, // any runtime type
             false,
         );
@@ -308,7 +308,12 @@ impl WorkerSelectionStage {
             all_workers
                 .into_iter()
                 .fold((Vec::new(), Vec::new()), |mut acc, w| {
-                    if w.connection_mode().uses_grpc_pipeline() && w.is_available() {
+                    // Only gRPC legs, not every grpc-pipeline mode: the ZMQ
+                    // wire carries no KV-transfer rendezvous, so a ZMQ leg
+                    // would silently drop the PD bootstrap info. Registration
+                    // rejects such workers; this keeps any that slipped in
+                    // (remote/service-discovery paths) out of PD pairs.
+                    if *w.connection_mode() == ConnectionMode::Grpc && w.is_available() {
                         match w.metadata().spec.worker_type {
                             WorkerType::Prefill => acc.0.push(w),
                             WorkerType::Decode => acc.1.push(w),
@@ -442,11 +447,11 @@ impl WorkerSelectionStage {
             Some(model_id)
         };
 
-        // gRPC + direct-ZMQ workers both ride the gRPC router pipeline.
+        // Filtered to gRPC below: no EPD leg can ride the ZMQ transport.
         let all_workers = self.worker_registry.get_workers_filtered(
             model_filter,
             None,
-            None, // grpc + zmq, filtered below
+            None, // filtered below
             None, // any runtime type
             false,
         );
@@ -454,16 +459,12 @@ impl WorkerSelectionStage {
         let (all_encode, all_prefill, all_decode): (Vec<_>, Vec<_>, Vec<_>) = all_workers
             .into_iter()
             .fold((Vec::new(), Vec::new(), Vec::new()), |mut acc, w| {
-                if w.connection_mode().uses_grpc_pipeline() && w.is_available() {
+                // Only gRPC legs: encode dispatch is a gRPC encoder RPC the
+                // direct-ZMQ worker has no path for, and the ZMQ wire carries
+                // no KV-transfer rendezvous for the prefill/decode legs.
+                if *w.connection_mode() == ConnectionMode::Grpc && w.is_available() {
                     match w.metadata().spec.worker_type {
-                        // Encode dispatch is a gRPC encoder RPC sent to the
-                        // worker's URL; a direct-ZMQ worker has no encode
-                        // path, so only gRPC workers qualify for this pool.
-                        WorkerType::Encode => {
-                            if *w.connection_mode() == ConnectionMode::Grpc {
-                                acc.0.push(w);
-                            }
-                        }
+                        WorkerType::Encode => acc.0.push(w),
                         WorkerType::Prefill => acc.1.push(w),
                         WorkerType::Decode => acc.2.push(w),
                         WorkerType::Regular => {}
@@ -845,5 +846,49 @@ mod tests {
             &prefill_hits,
             &decode_hits,
         );
+    }
+
+    #[test]
+    fn select_pd_pair_ignores_zmq_legs() {
+        // The ZMQ wire carries no KV-transfer rendezvous, so ZMQ prefill/decode
+        // workers must never be paired even if they reach the registry.
+        let model_id = "test-model-zmq";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (port, worker_type) in [(9000, WorkerType::Prefill), (9100, WorkerType::Decode)] {
+            worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("ipc:///tmp/smg-zmq/{port}.ipc"))
+                        .model(ModelCard::new(model_id))
+                        .worker_type(worker_type)
+                        .connection_mode(ConnectionMode::Zmq)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        }
+
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        policy_registry
+            .set_prefill_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        policy_registry
+            .set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::clone(&policy_registry),
+            WorkerSelectionMode::PrefillDecode,
+        );
+
+        assert!(
+            stage.select_pd_pair(model_id, None, None, None).is_none(),
+            "ZMQ-only PD pools must not yield a pair"
+        );
+
+        // Adding gRPC legs makes selection succeed, and it never picks the ZMQ ones.
+        let (prefill_urls, decode_urls) = register_pd_workers(&worker_registry, model_id, 4);
+        let (prefill, decode, _) = stage
+            .select_pd_pair(model_id, None, None, None)
+            .expect("gRPC PD pair should be selected");
+        assert!(prefill_urls.contains(&prefill.url().to_string()));
+        assert!(decode_urls.contains(&decode.url().to_string()));
     }
 }

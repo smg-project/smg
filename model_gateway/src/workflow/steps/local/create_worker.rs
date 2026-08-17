@@ -3,7 +3,11 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use openai_protocol::{model_card::ModelCard, model_type::ModelType, worker::WorkerSpec};
+use openai_protocol::{
+    model_card::ModelCard,
+    model_type::ModelType,
+    worker::{WorkerSpec, WorkerType},
+};
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
@@ -156,6 +160,8 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 ),
             });
         }
+
+        validate_zmq_worker_type(*connection_mode, config.worker_type, &config.url)?;
 
         // A grouped ZMQ worker (`dp_size: N` on the spec) awaits N engines on
         // one socket set. Both ZMQ runtimes route per rank: vLLM by in-request
@@ -534,6 +540,34 @@ fn normalize_url(url: &str, connection_mode: ConnectionMode) -> String {
     }
 }
 
+/// Reject a disaggregated leg the ZMQ path cannot serve.
+///
+/// The ZMQ wire carries no KV-transfer rendezvous: neither the vLLM
+/// `EngineCoreRequest` nor the TokenSpeed `TokenizedGenerateReqInput` has a
+/// field for the bootstrap info PD injects, so a ZMQ prefill/decode leg would
+/// silently drop it and degrade to a decode-side recompute or a stalled KV
+/// wait. Reject at registration so the ZMQ lane never serves disaggregated
+/// requests.
+fn validate_zmq_worker_type(
+    connection_mode: ConnectionMode,
+    worker_type: WorkerType,
+    url: &str,
+) -> Result<(), WorkflowError> {
+    if connection_mode == ConnectionMode::Zmq
+        && matches!(worker_type, WorkerType::Prefill | WorkerType::Decode)
+    {
+        return Err(WorkflowError::StepFailed {
+            step_id: StepId::new("create_worker"),
+            message: format!(
+                "ZMQ worker {url} cannot serve worker type {worker_type}: the direct-ZMQ \
+                 backend carries no KV-transfer metadata, so prefill/decode disaggregation \
+                 requires a gRPC worker"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Reject a data-parallel worker the ZMQ path cannot serve.
 ///
 /// dp-aware expansion creates one rank-pinned worker per DP rank, but each
@@ -679,6 +713,43 @@ mod tests {
         let card = build_model_card("GLM-5.2", &spec, &HashMap::new(), &aliases);
 
         assert!(card.aliases.is_empty());
+    }
+
+    #[test]
+    fn zmq_disaggregated_legs_are_rejected_as_a_create_worker_failure() {
+        for worker_type in [WorkerType::Prefill, WorkerType::Decode] {
+            let err = validate_zmq_worker_type(
+                ConnectionMode::Zmq,
+                worker_type,
+                "ipc:///tmp/smg-zmq/ts0.ipc",
+            )
+            .expect_err("ZMQ prefill/decode must be rejected");
+            match err {
+                WorkflowError::StepFailed { step_id, message } => {
+                    assert_eq!(step_id, StepId::new("create_worker"));
+                    assert!(
+                        message.contains(&worker_type.to_string()),
+                        "message was: {message}"
+                    );
+                }
+                other => panic!("expected StepFailed, got {other:?}"),
+            }
+        }
+
+        // Regular and encode workers over ZMQ, and any worker type over the
+        // other transports, stay accepted.
+        validate_zmq_worker_type(
+            ConnectionMode::Zmq,
+            WorkerType::Regular,
+            "ipc:///tmp/smg-zmq/ts0.ipc",
+        )
+        .expect("ZMQ regular workers are the supported case");
+        for mode in [ConnectionMode::Http, ConnectionMode::Grpc] {
+            for worker_type in [WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode] {
+                validate_zmq_worker_type(mode, worker_type, "grpc://worker:8080")
+                    .expect("non-ZMQ transports serve every worker type");
+            }
+        }
     }
 
     #[test]
