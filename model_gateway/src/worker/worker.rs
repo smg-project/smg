@@ -402,8 +402,11 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Record the outcome of a request based on the HTTP status code.
     ///
-    /// The worker decides whether the status is a CB failure using its
-    /// per-worker `retryable_status_codes` set (default: 408, 429, 5xx).
+    /// Statuses in the per-worker `capacity_status_codes` set (default: 429)
+    /// record nothing at all — neither failure nor success. Any other status
+    /// is a circuit-breaker failure when it appears in `retryable_status_codes`,
+    /// which by default leaves 408, 500, 502, 503 and 504 tripping the breaker.
+    /// 429 is in that set too, but the capacity check returns before it is read.
     /// Callers just pass the status — no need to interpret it.
     ///
     /// For transport/connection errors where no HTTP response is received,
