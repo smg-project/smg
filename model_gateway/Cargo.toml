@@ -156,7 +156,7 @@ metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 http-body-util = "0.1"
 portpicker = "0.1"
 lazy_static = "1.5"
-wasm-encoder = "0.255"
+wasm-encoder = "0.256"
 npyz = { version = "0.9", features = ["npz"] }
 opentelemetry-proto = { version = "0.32", features = ["gen-tonic"] }
 serial_test = "3.5"
