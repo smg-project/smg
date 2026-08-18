@@ -44,7 +44,7 @@ zeromq = { version = "0.6.0", default-features = false, features = ["tokio-runti
 chrono = { version = "0.4" }
 dashmap = "6.2.1"
 tikv-jemallocator = { version = "0.6", default-features = false, features = ["background_threads_runtime_support"] }
-tikv-jemalloc-ctl = { version = "0.6", default-features = false }
+tikv-jemalloc-ctl = { version = "0.7", default-features = false }
 http = "1.4.2"
 lru = "0.18.0"
 num-traits = "0.2"
