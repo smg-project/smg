@@ -547,6 +547,7 @@ impl ConfigValidator {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
+                max_waiting_requests: _,
             } => {
                 if *load_check_interval_secs == 0 {
                     return Err(ConfigError::InvalidValue {
@@ -1726,6 +1727,7 @@ mod tests {
                     kv_pressure_weight: 0.15,
                     mean_prefill_tokens: 1024,
                     default_throughput: 2000.0,
+                    max_waiting_requests: 0,
                 }),
                 prefill_policy: None,
                 decode_policy: None,

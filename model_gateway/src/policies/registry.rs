@@ -980,12 +980,13 @@ mod tests {
             kv_pressure_weight: 0.4,
             mean_prefill_tokens: 2048,
             default_throughput: 555.0,
+            max_waiting_requests: 48,
         });
 
         let policy = registry.on_worker_added("llama-3", Some("least_load"));
         assert!(!Arc::ptr_eq(&policy, &registry.get_default_policy()));
         let least_load = policy.as_any().downcast_ref::<LeastLoadPolicy>().unwrap();
-        assert_eq!(least_load.params_for_test(), (0.4, 2048, 555.0));
+        assert_eq!(least_load.params_for_test(), (0.4, 2048, 555.0, 48));
     }
 
     /// An integration setter racing policy publication must never be

@@ -24,6 +24,13 @@ pub const DEFAULT_MEAN_PREFILL_TOKENS: u32 = 1024;
 /// co-tunes with `kv_pressure_weight`.
 pub const DEFAULT_THROUGHPUT: f64 = 2000.0;
 
+/// Since-poll dispatch tally for one worker.
+#[derive(Clone, Copy, Debug, Default)]
+struct SincePollDispatch {
+    tokens: u64,
+    requests: u64,
+}
+
 /// Least-(token-)work routing — route to the worker with the lowest estimated
 /// time-to-drain plus a convex KV-pressure barrier (argmin, lower is better):
 ///
@@ -82,13 +89,20 @@ pub const DEFAULT_THROUGHPUT: f64 = 2000.0;
 ///   (the HTTP path; ignored when tokens are known, i.e. gRPC).
 /// - `load_check_interval_secs` (default `10`) — worker-load poll period; the
 ///   in-flight correction absorbs staleness between polls.
+/// - `max_waiting_requests` (default `0` = disabled) — per-worker waiting-queue
+///   cap: a worker whose reported waiting requests, plus requests dispatched to
+///   it since its last poll, have reached the cap is skipped. When every
+///   candidate is at the cap the selection returns none, so the request falls
+///   to the router's admission queue instead of deepening a backlog. Set it
+///   below the engine's max batch size.
 #[derive(Debug)]
 pub struct LeastLoadPolicy {
     /// Cached load reports from the worker monitor (keyed by worker URL).
     cached_loads: RwLock<HashMap<String, WorkerLoadResponse>>,
-    /// In-flight token-work dispatched per worker since its last load poll
-    /// (keyed by worker URL); reset when a fresh report arrives.
-    inflight_tokens: RwLock<HashMap<String, u64>>,
+    /// Per-worker dispatch tally since the last load poll (keyed by worker
+    /// URL); reset when a fresh report arrives. Token-work feeds the score's
+    /// in-flight term; the request count feeds the waiting-queue veto.
+    inflight_tokens: RwLock<HashMap<String, SincePollDispatch>>,
     /// KV-pressure weight `λ_t` (seconds).
     kv_pressure_weight: f64,
     /// Mean prefill length (tokens) for estimating in-flight token-work when a
@@ -97,6 +111,8 @@ pub struct LeastLoadPolicy {
     /// Fallback throughput (tokens/s) for the `/throughput` term when a backend
     /// reports no live `gen_throughput`.
     default_throughput: f64,
+    /// Per-worker waiting-queue cap; `0` disables the veto.
+    max_waiting_requests: u32,
 }
 
 impl LeastLoadPolicy {
@@ -105,6 +121,7 @@ impl LeastLoadPolicy {
             DEFAULT_KV_PRESSURE_WEIGHT,
             DEFAULT_MEAN_PREFILL_TOKENS,
             DEFAULT_THROUGHPUT,
+            0,
         )
     }
 
@@ -113,6 +130,7 @@ impl LeastLoadPolicy {
             kv_pressure_weight,
             DEFAULT_MEAN_PREFILL_TOKENS,
             DEFAULT_THROUGHPUT,
+            0,
         )
     }
 
@@ -120,6 +138,7 @@ impl LeastLoadPolicy {
         kv_pressure_weight: f64,
         mean_prefill_tokens: u32,
         default_throughput: f64,
+        max_waiting_requests: u32,
     ) -> Self {
         Self {
             cached_loads: RwLock::new(HashMap::new()),
@@ -135,17 +154,19 @@ impl LeastLoadPolicy {
             } else {
                 DEFAULT_THROUGHPUT
             },
+            max_waiting_requests,
         }
     }
 
     /// Test-only view of the tunables so registry tests can assert
     /// operator values propagated.
     #[cfg(test)]
-    pub(crate) fn params_for_test(&self) -> (f64, u32, f64) {
+    pub(crate) fn params_for_test(&self) -> (f64, u32, f64, u32) {
         (
             self.kv_pressure_weight,
             self.mean_prefill_tokens,
             self.default_throughput,
+            self.max_waiting_requests,
         )
     }
 
@@ -161,14 +182,14 @@ impl LeastLoadPolicy {
         &self,
         worker: &Arc<dyn Worker>,
         loads: Option<&HashMap<String, WorkerLoadResponse>>,
-        inflight: &HashMap<String, u64>,
+        inflight: &HashMap<String, SincePollDispatch>,
         nominal_throughput: f64,
         fleet_has_loads: bool,
     ) -> f64 {
         let url = worker.url();
         match loads.and_then(|m| m.get(url)) {
             Some(load) => {
-                let inflight_tokens = inflight.get(url).copied().unwrap_or(0) as f64;
+                let inflight_tokens = inflight.get(url).copied().unwrap_or_default().tokens as f64;
                 let queued_tokens = self.queued_tokens(load);
                 let live_throughput = load.total_gen_throughput();
                 let throughput = if live_throughput > 0.0 {
@@ -229,10 +250,43 @@ impl LeastLoadPolicy {
         info: &SelectWorkerInfo,
         policy: &'static str,
     ) -> Option<usize> {
-        let (&first, rest) = candidates.split_first()?;
-
         let loads_guard = self.cached_loads.read().ok();
         let loads = loads_guard.as_deref();
+
+        // Waiting-queue veto: drop candidates whose reported queue, plus
+        // requests dispatched since their last poll, has reached the cap.
+        // Workers without a snapshot stay eligible — there is no queue
+        // evidence to veto on, and a dark fleet must keep routing.
+        let capped: Vec<usize>;
+        let candidates = if self.max_waiting_requests == 0 {
+            candidates
+        } else {
+            let cap = self.max_waiting_requests as u64;
+            let inflight_guard = self
+                .inflight_tokens
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            capped = candidates
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    let url = workers[i].url();
+                    match loads.and_then(|m| m.get(url)) {
+                        Some(load) => {
+                            let since_poll = inflight_guard
+                                .get(url)
+                                .copied()
+                                .unwrap_or_default()
+                                .requests;
+                            (load.total_waiting_reqs().max(0) as u64) + since_poll < cap
+                        }
+                        None => true,
+                    }
+                })
+                .collect();
+            &capped
+        };
+        let (&first, rest) = candidates.split_first()?;
 
         // Nominal throughput (mean of positive reports) stands in for a
         // worker missing a fresh snapshot; `fleet_has_loads` distinguishes a
@@ -298,7 +352,9 @@ impl LeastLoadPolicy {
         // In-flight correction: credit the chosen worker with this request's
         // token-work until its next poll refreshes the snapshot.
         let req_tokens = self.request_tokens(info);
-        *inflight.entry(workers[best].url().to_string()).or_insert(0) += req_tokens;
+        let tally = inflight.entry(workers[best].url().to_string()).or_default();
+        tally.tokens += req_tokens;
+        tally.requests += 1;
         drop(inflight);
 
         debug!(
@@ -318,7 +374,8 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
         if healthy.is_empty() {
             return None;
         }
-        if healthy.len() == 1 {
+        // The single-worker shortcut must not bypass the waiting-queue veto.
+        if healthy.len() == 1 && self.max_waiting_requests == 0 {
             return Some(healthy[0]);
         }
         self.select_min_expected_wait(workers, &healthy, info, self.name())
@@ -336,7 +393,7 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
         // since-poll in-flight estimate for the workers it covers.
         if let Ok(mut inflight) = self.inflight_tokens.write() {
             for url in loads.keys() {
-                inflight.insert(url.clone(), 0);
+                inflight.insert(url.clone(), SincePollDispatch::default());
             }
         }
     }
@@ -472,6 +529,129 @@ mod tests {
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn waiting_queue_veto_skips_capped_worker() {
+        // a would win the argmin (655s vs 10,000s) but reports 64 waiting
+        // (>= cap 48); the veto must exclude it before scoring.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 48);
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let mut loads = HashMap::new();
+        loads.insert(
+            "http://a:8000".to_string(),
+            make_load_reqs_only(64, 0.0, 100.0),
+        );
+        loads.insert(
+            "http://b:8000".to_string(),
+            make_load(1_000_000, 0.0, 100.0),
+        );
+        policy.update_loads(&loads);
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn waiting_queue_veto_all_capped_returns_none() {
+        // Every candidate at the cap: selection must fail so the request
+        // falls to the router's admission queue instead of piling on.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 48);
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let mut loads = HashMap::new();
+        loads.insert(
+            "http://a:8000".to_string(),
+            make_load_reqs_only(48, 0.0, 100.0),
+        );
+        loads.insert(
+            "http://b:8000".to_string(),
+            make_load_reqs_only(48, 0.0, 100.0),
+        );
+        policy.update_loads(&loads);
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn waiting_queue_veto_counts_since_poll_dispatches() {
+        // Cap 2: a reports 1 waiting and wins the first pick; the dispatch
+        // counts one since-poll request, lifting a to the cap, so the second
+        // pick must go to b even though b scores far worse.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 2);
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let mut loads = HashMap::new();
+        loads.insert(
+            "http://a:8000".to_string(),
+            make_load_reqs_only(1, 0.0, 100.0),
+        );
+        loads.insert("http://b:8000".to_string(), make_load(400_000, 0.0, 100.0));
+        policy.update_loads(&loads);
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(0)
+        );
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn waiting_queue_veto_ignores_workers_without_snapshots() {
+        // A dark fleet with a cap configured has no queue evidence to veto
+        // on; routing must continue on join-shortest-queue.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 1);
+        let a = mk("http://a:8000");
+        let b = mk("http://b:8000");
+        for _ in 0..5 {
+            a.increment_load();
+        }
+        let workers = vec![a, b];
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn waiting_queue_veto_applies_to_single_worker() {
+        // The one-healthy-worker shortcut must not bypass the veto.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 48);
+        let workers = vec![mk("http://a:8000")];
+        let mut loads = HashMap::new();
+        loads.insert(
+            "http://a:8000".to_string(),
+            make_load_reqs_only(64, 0.0, 100.0),
+        );
+        policy.update_loads(&loads);
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn waiting_queue_cap_zero_disables_veto() {
+        // Cap 0 keeps the historical behavior: arbitrarily deep queues stay
+        // routable.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 100.0, 0);
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let mut loads = HashMap::new();
+        loads.insert(
+            "http://a:8000".to_string(),
+            make_load_reqs_only(1000, 0.0, 100.0),
+        );
+        loads.insert(
+            "http://b:8000".to_string(),
+            make_load_reqs_only(1000, 0.0, 100.0),
+        );
+        policy.update_loads(&loads);
+        assert!(policy
+            .select_worker(&workers, &SelectWorkerInfo::default())
+            .is_some());
     }
 
     #[test]
@@ -716,7 +896,7 @@ mod tests {
             .read()
             .unwrap()
             .values()
-            .any(|&v| v > 0));
+            .any(|v| v.tokens > 0));
 
         // A fresh poll clears the since-poll estimate.
         policy.update_loads(&loads);
@@ -725,7 +905,7 @@ mod tests {
             .read()
             .unwrap()
             .values()
-            .all(|&v| v == 0));
+            .all(|v| v.tokens == 0));
     }
 
     #[test]

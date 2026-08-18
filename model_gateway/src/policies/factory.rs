@@ -28,6 +28,7 @@ impl PolicyFactory {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
+                max_waiting_requests,
                 ..
             } => {
                 // TODO: Pass load_check_interval_secs to WorkerMonitor for per-policy polling intervals.
@@ -36,6 +37,7 @@ impl PolicyFactory {
                     *kv_pressure_weight,
                     *mean_prefill_tokens,
                     *default_throughput,
+                    *max_waiting_requests,
                 ))
             }
             PolicyConfig::CacheAware {

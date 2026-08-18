@@ -297,6 +297,12 @@ struct CliArgs {
     #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
     least_load_mean_prefill_tokens: u32,
 
+    /// Per-worker waiting-queue cap for least_load: skip workers whose reported
+    /// waiting requests (plus dispatches since their last poll) have reached
+    /// this count; 0 disables. Set below the engine's max batch size
+    #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
+    least_load_max_waiting_requests: u32,
+
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
@@ -1187,6 +1193,7 @@ impl CliArgs {
                 kv_pressure_weight: self.least_load_kv_pressure_weight,
                 mean_prefill_tokens: self.least_load_mean_prefill_tokens,
                 default_throughput: self.least_load_default_throughput,
+                max_waiting_requests: self.least_load_max_waiting_requests,
             },
             "bucket" => PolicyConfig::Bucket {
                 balance_abs_threshold: self.balance_abs_threshold,

@@ -513,6 +513,7 @@ struct Router {
     overlap_decay: f32,
     selection_temperature: f32,
     upstream_pool_idle_timeout_secs: u64,
+    least_load_max_waiting_requests: u32,
 }
 
 impl Router {
@@ -602,6 +603,7 @@ impl Router {
                     kv_pressure_weight: self.least_load_kv_pressure_weight,
                     mean_prefill_tokens: self.least_load_mean_prefill_tokens,
                     default_throughput: self.least_load_default_throughput,
+                    max_waiting_requests: self.least_load_max_waiting_requests,
                 },
                 PolicyType::Bucket => ConfigPolicyConfig::Bucket {
                     balance_abs_threshold: self.balance_abs_threshold,
@@ -1021,6 +1023,7 @@ impl Router {
         overlap_decay = 0.0,
         selection_temperature = 0.0,
         upstream_pool_idle_timeout_secs = 3,
+        least_load_max_waiting_requests = 0,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1158,6 +1161,7 @@ impl Router {
         overlap_decay: f32,
         selection_temperature: f32,
         upstream_pool_idle_timeout_secs: u64,
+        least_load_max_waiting_requests: u32,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1309,6 +1313,7 @@ impl Router {
             overlap_decay,
             selection_temperature,
             upstream_pool_idle_timeout_secs,
+            least_load_max_waiting_requests,
         })
     }
 

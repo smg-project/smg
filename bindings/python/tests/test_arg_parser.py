@@ -1222,6 +1222,7 @@ class TestRouterArgsFieldOrder:
         "overlap_decay",
         "selection_temperature",
         "upstream_pool_idle_timeout_secs",
+        "least_load_max_waiting_requests",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1243,6 +1244,7 @@ class TestRouterArgsFieldOrder:
             "overlap_decay",
             "selection_temperature",
             "upstream_pool_idle_timeout_secs",
+            "least_load_max_waiting_requests",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

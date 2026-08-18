@@ -555,6 +555,13 @@ pub enum PolicyConfig {
         /// per-replica generation rate; co-tunes with `kv_pressure_weight`.
         #[serde(default = "default_least_load_throughput")]
         default_throughput: f64,
+        /// Per-worker waiting-queue cap: skip workers whose reported waiting
+        /// requests, plus dispatches since their last poll, have reached this
+        /// count; when every candidate is at the cap, selection fails and the
+        /// request falls to the router's admission queue. `0` disables. Set
+        /// below the engine's max batch size.
+        #[serde(default)]
+        max_waiting_requests: u32,
     },
 
     #[serde(rename = "bucket")]
