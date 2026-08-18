@@ -14,7 +14,7 @@ use axum::http::HeaderMap;
 use bytes::Bytes;
 use openai_protocol::{
     event_types::{is_function_call_type, ItemType, McpEvent, OutputItemEvent},
-    responses::{generate_id, ResponseInput, ResponseTool, ResponsesRequest},
+    responses::{generate_id, McpToolCallError, ResponseInput, ResponseTool, ResponsesRequest},
 };
 use serde_json::{json, to_value, Value};
 use smg_mcp::{McpServerBinding, McpToolSession, ToolExecutionInput, ToolExecutionResult};
@@ -1229,7 +1229,7 @@ fn build_mcp_call_item(
         "status": if success { "completed" } else { "failed" },
         "approval_request_id": Value::Null,
         "arguments": arguments,
-        "error": error,
+        "error": error.map(McpToolCallError::execution),
         "name": tool_name,
         "output": output,
         "server_label": server_label

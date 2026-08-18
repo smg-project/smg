@@ -1909,8 +1909,7 @@ pub enum ResponseInputOutputItem {
     /// Shape mirrors [`ResponseOutputItem::McpCall`] but `approval_request_id`,
     /// `error`, `output`, and `status` are optional on the input side so
     /// replay of an abridged or in-flight call (no output yet) stays
-    /// lossless. Matches OpenAI Python SDK 2.8.1
-    /// `types/responses/response_input_item.py::McpCall`.
+    /// lossless.
     #[serde(rename = "mcp_call")]
     McpCall {
         id: String,
@@ -1919,8 +1918,12 @@ pub enum ResponseInputOutputItem {
         server_label: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         approval_request_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "mcp_call_error_compat",
+            skip_serializing_if = "Option::is_none"
+        )]
+        error: Option<McpToolCallError>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2132,6 +2135,53 @@ pub struct McpToolInfo {
     pub annotations: Option<Value>,
 }
 
+/// Structured `mcp_call.error`: a `type`-tagged union of protocol,
+/// tool-execution, and HTTP failures. OpenAI removed the legacy plain-string
+/// shape from the wire; stored/replayed string errors still deserialize via
+/// [`mcp_call_error_compat`].
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variant names mirror the spec's `*_error` tag set"
+)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+pub enum McpToolCallError {
+    #[serde(rename = "mcp_protocol_error")]
+    ProtocolError { code: i64, message: String },
+    #[serde(rename = "mcp_tool_execution_error")]
+    ToolExecutionError { content: Value },
+    #[serde(rename = "http_error")]
+    HttpError { code: i64, message: String },
+}
+
+impl McpToolCallError {
+    /// Wrap a bare failure message in the tool-execution variant.
+    pub fn execution(message: impl Into<String>) -> Self {
+        Self::ToolExecutionError {
+            content: Value::String(message.into()),
+        }
+    }
+}
+
+/// Accept both the structured union and the legacy plain-string error shape.
+fn mcp_call_error_compat<'de, D>(deserializer: D) -> Result<Option<McpToolCallError>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Compat {
+        Structured(McpToolCallError),
+        Legacy(String),
+    }
+    Ok(
+        Option::<Compat>::deserialize(deserializer)?.map(|error| match error {
+            Compat::Structured(error) => error,
+            Compat::Legacy(message) => McpToolCallError::execution(message),
+        }),
+    )
+}
+
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type")]
@@ -2194,7 +2244,8 @@ pub enum ResponseOutputItem {
         status: String,
         approval_request_id: Option<String>,
         arguments: String,
-        error: Option<String>,
+        #[serde(default, deserialize_with = "mcp_call_error_compat")]
+        error: Option<McpToolCallError>,
         name: String,
         output: String,
         server_label: String,

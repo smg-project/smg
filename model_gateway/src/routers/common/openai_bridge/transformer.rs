@@ -2,8 +2,8 @@
 
 use openai_protocol::responses::{
     CodeInterpreterCallStatus, CodeInterpreterOutput, FileSearchCallStatus, FileSearchResult,
-    ImageGenerationCallStatus, ResponseOutputItem, WebSearchAction, WebSearchCallStatus,
-    WebSearchSource,
+    ImageGenerationCallStatus, McpToolCallError, ResponseOutputItem, WebSearchAction,
+    WebSearchCallStatus, WebSearchSource,
 };
 use tracing::warn;
 
@@ -61,7 +61,7 @@ fn failed_mcp_call(output: &smg_mcp::ToolExecutionOutput) -> ResponseOutputItem 
         status: "failed".to_string(),
         approval_request_id: None,
         arguments: output.arguments_str.clone(),
-        error: Some(err_msg),
+        error: Some(McpToolCallError::execution(err_msg)),
         name: output.tool_name.clone(),
         output: String::new(),
         server_label: output.server_label.clone(),
@@ -1613,7 +1613,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(status, "failed");
-                assert_eq!(error.as_deref(), Some("upstream broke"));
+                assert_eq!(error, Some(McpToolCallError::execution("upstream broke")));
                 assert_eq!(output, "");
                 assert_eq!(arguments, "{\"q\":\"v\"}");
                 assert_eq!(name, "brave_web_search");
@@ -1635,7 +1635,7 @@ mod tests {
         let item = transform_tool_output(&output, ResponseFormat::Passthrough);
         match item {
             ResponseOutputItem::McpCall { error, .. } => {
-                assert_eq!(error.as_deref(), Some("rate limited"));
+                assert_eq!(error, Some(McpToolCallError::execution("rate limited")));
             }
             _ => panic!("Expected McpCall"),
         }
