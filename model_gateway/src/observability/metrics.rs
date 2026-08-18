@@ -231,6 +231,18 @@ pub(crate) fn init_metrics() {
         "smg_http_rate_limit_total",
         "Rate limiting decisions by result (allowed/rejected)"
     );
+    describe_gauge!(
+        "smg_admission_queue_depth",
+        "Requests currently parked in the admission queue"
+    );
+    describe_counter!(
+        "smg_admission_queue_rejected_total",
+        "Requests rejected at admission by reason (full/timeout)"
+    );
+    describe_gauge!(
+        "smg_admission_inflight",
+        "Requests currently holding an admission token"
+    );
 
     // Layer 2: Router metrics
     describe_counter!(
@@ -730,6 +742,10 @@ pub mod metrics_labels {
     pub const RATE_LIMIT_ALLOWED: &str = "allowed";
     pub const RATE_LIMIT_REJECTED: &str = "rejected";
 
+    // Admission rejection reasons
+    pub const ADMISSION_REJECTED_FULL: &str = "full";
+    pub const ADMISSION_REJECTED_TIMEOUT: &str = "timeout";
+
     // Circuit breaker states
     pub const CB_CLOSED: &str = "closed";
     pub const CB_OPEN: &str = "open";
@@ -826,6 +842,35 @@ impl Metrics {
             "result" => result
         )
         .increment(1);
+    }
+
+    /// Track a request entering the admission queue.
+    pub fn record_admission_queue_entered() {
+        gauge!("smg_admission_queue_depth").increment(1.0);
+    }
+
+    /// Track a request leaving the admission queue (admitted, rejected, or cancelled).
+    pub fn record_admission_queue_exited() {
+        gauge!("smg_admission_queue_depth").decrement(1.0);
+    }
+
+    /// Record a request rejected at admission.
+    pub fn record_admission_rejected(reason: &'static str) {
+        counter!(
+            "smg_admission_queue_rejected_total",
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Track acquisition of an admission token.
+    pub fn record_admission_inflight_acquired() {
+        gauge!("smg_admission_inflight").increment(1.0);
+    }
+
+    /// Track release of an admission token.
+    pub fn record_admission_inflight_released() {
+        gauge!("smg_admission_inflight").decrement(1.0);
     }
 
     /// Record one multimodal tensor sent over `path` ("inline"|"shm"|"remote") for `runtime`.

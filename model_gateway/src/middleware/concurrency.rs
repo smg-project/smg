@@ -45,6 +45,7 @@ struct TokenPermit {
 impl TokenPermit {
     fn try_acquire(token_bucket: Arc<TokenBucket>, tokens: f64) -> Result<Self, ()> {
         token_bucket.try_acquire(tokens)?;
+        Metrics::record_admission_inflight_acquired();
         Ok(Self {
             token_bucket,
             tokens,
@@ -57,6 +58,7 @@ impl TokenPermit {
         timeout: Duration,
     ) -> Result<Self, Elapsed> {
         token_bucket.acquire_timeout(tokens, timeout).await?;
+        Metrics::record_admission_inflight_acquired();
         Ok(Self {
             token_bucket,
             tokens,
@@ -72,6 +74,24 @@ impl Drop for TokenPermit {
         );
         // Use lock-free sync return - no runtime needed, guaranteed token return
         self.token_bucket.return_tokens_sync(self.tokens);
+        Metrics::record_admission_inflight_released();
+    }
+}
+
+/// Holds one slot of the queue-depth gauge; drop covers admit, reject, and
+/// request cancellation.
+struct QueueDepthGuard;
+
+impl QueueDepthGuard {
+    fn enter() -> Self {
+        Metrics::record_admission_queue_entered();
+        Self
+    }
+}
+
+impl Drop for QueueDepthGuard {
+    fn drop(&mut self) {
+        Metrics::record_admission_queue_exited();
     }
 }
 
@@ -265,7 +285,11 @@ pub async fn concurrency_limit_middleware(
             match queue_tx.try_send(queued) {
                 Ok(()) => {
                     // Wait for token from queue processor
-                    match permit_rx.await {
+                    let permit_result = {
+                        let _queued = QueueDepthGuard::enter();
+                        permit_rx.await
+                    };
+                    match permit_result {
                         Ok(Ok(permit)) => {
                             debug!("Acquired token from queue");
                             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
@@ -274,6 +298,9 @@ pub async fn concurrency_limit_middleware(
                         Ok(Err(status)) => {
                             warn!("Queue returned error status: {}", status);
                             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                            Metrics::record_admission_rejected(
+                                metrics_labels::ADMISSION_REJECTED_TIMEOUT,
+                            );
                             status.into_response()
                         }
                         Err(_) => {
@@ -286,6 +313,7 @@ pub async fn concurrency_limit_middleware(
                 Err(_) => {
                     warn!("Request queue is full, returning 429");
                     Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                    Metrics::record_admission_rejected(metrics_labels::ADMISSION_REJECTED_FULL);
                     StatusCode::TOO_MANY_REQUESTS.into_response()
                 }
             }
@@ -299,7 +327,110 @@ pub async fn concurrency_limit_middleware(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        OnceLock,
+    };
+
+    use axum::{routing::post, Router};
+    use llm_tokenizer::registry::TokenizerRegistry;
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use smg_data_connector::{
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    };
+    use tokio::sync::Notify;
+    use tower::ServiceExt;
+
     use super::*;
+    use crate::{
+        app_context::AppContext, config::RouterConfig, health::ProbeState,
+        policies::PolicyRegistry, routers::router_manager::RouterManager, worker::WorkerRegistry,
+    };
+
+    fn test_app_state(
+        bucket: Arc<TokenBucket>,
+        queue_tx: Option<mpsc::Sender<QueuedRequest>>,
+    ) -> Arc<AppState> {
+        let router_config = RouterConfig::default();
+        let context = Arc::new(
+            AppContext::builder()
+                .client(reqwest::Client::new())
+                .rate_limiter(Some(bucket))
+                .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
+                .reasoning_parser_factory(None)
+                .tool_parser_factory(None)
+                .worker_registry(Arc::new(WorkerRegistry::new()))
+                .policy_registry(Arc::new(PolicyRegistry::new(router_config.policy.clone())))
+                .router_config(router_config)
+                .response_storage(Arc::new(MemoryResponseStorage::new()))
+                .conversation_storage(Arc::new(MemoryConversationStorage::new()))
+                .conversation_item_storage(Arc::new(MemoryConversationItemStorage::new()))
+                .worker_monitor(None)
+                .worker_job_queue(Arc::new(OnceLock::new()))
+                .workflow_engines(Arc::new(OnceLock::new()))
+                .mcp_orchestrator(Arc::new(OnceLock::new()))
+                .build()
+                .unwrap(),
+        );
+        Arc::new(AppState {
+            router: Arc::new(RouterManager::new(
+                context.worker_registry.clone(),
+                context.client.clone(),
+            )),
+            probe_state: ProbeState::new(context.inflight_tracker.clone()),
+            context,
+            concurrency_queue_tx: queue_tx,
+            router_manager: None,
+            mesh_handler: None,
+            mesh_adapters: None,
+        })
+    }
+
+    fn echo_app(app_state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/echo", post(|body: Bytes| async move { body }))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state,
+                concurrency_limit_middleware,
+            ))
+    }
+
+    fn echo_request(body: Body) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/echo")
+            .body(body)
+            .unwrap()
+    }
+
+    fn assert_metric_line(rendered: &str, series: &str, value: &str) {
+        let expected = format!("{series} {value}");
+        assert!(
+            rendered.lines().any(|line| line == expected),
+            "expected `{expected}`; rendered:\n{rendered}"
+        );
+    }
+
+    /// Sets `polled` on the first poll, so a test can detect any body
+    /// collection that happens while the request is parked at admission.
+    struct PollRecordingBody {
+        polled: Arc<AtomicBool>,
+        payload: Option<Bytes>,
+    }
+
+    impl http_body::Body for PollRecordingBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            this.polled.store(true, Ordering::SeqCst);
+            Poll::Ready(this.payload.take().map(|bytes| Ok(Frame::data(bytes))))
+        }
+    }
 
     #[test]
     fn response_body_holds_token_until_dropped() {
@@ -354,5 +485,176 @@ mod tests {
             .run()
             .await;
         assert_eq!(bucket.available_tokens(), 1.0);
+    }
+
+    /// A request parked in the admission queue must keep its body unpolled;
+    /// collection may only happen at handler extraction after admission.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test drives two concurrent requests through the real middleware stack"
+    )]
+    async fn queued_request_body_stays_unpolled_until_admitted() {
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+        let (limiter, processor) =
+            ConcurrencyLimiter::new(Some(bucket.clone()), 4, Duration::from_secs(5));
+        tokio::spawn(processor.unwrap().run());
+
+        let hold_gate = Arc::new(Notify::new());
+        let entered = Arc::new(Notify::new());
+        let hold = {
+            let hold_gate = hold_gate.clone();
+            let entered = entered.clone();
+            move || {
+                let hold_gate = hold_gate.clone();
+                let entered = entered.clone();
+                async move {
+                    entered.notify_one();
+                    hold_gate.notified().await;
+                    "held"
+                }
+            }
+        };
+        let app = Router::new()
+            .route("/hold", post(hold))
+            .route("/echo", post(|body: Bytes| async move { body }))
+            .layer(axum::middleware::from_fn_with_state(
+                test_app_state(bucket, limiter.queue_tx),
+                concurrency_limit_middleware,
+            ));
+
+        let first = tokio::spawn(
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hold")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        entered.notified().await;
+
+        let polled = Arc::new(AtomicBool::new(false));
+        let second = tokio::spawn(app.clone().oneshot(echo_request(Body::new(
+            PollRecordingBody {
+                polled: polled.clone(),
+                payload: Some(Bytes::from_static(b"parked-payload")),
+            },
+        ))));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !second.is_finished(),
+            "second request must be parked in the queue"
+        );
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "parked request body must not be polled"
+        );
+
+        hold_gate.notify_one();
+        let first_response = first.await.unwrap().unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        drop(first_response);
+
+        let second_response = second.await.unwrap().unwrap();
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let echoed = axum::body::to_bytes(second_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&echoed[..], b"parked-payload");
+        assert!(polled.load(Ordering::SeqCst));
+    }
+
+    /// Queue depth and inflight gauges move as requests park, and a full
+    /// queue rejects with reason="full".
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test parks a request in the background while asserting gauge movement"
+    )]
+    fn admission_metrics_track_depth_inflight_and_full_queue() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let bucket = Arc::new(TokenBucket::new(1, 0));
+                let (limiter, processor) =
+                    ConcurrencyLimiter::new(Some(bucket.clone()), 1, Duration::from_secs(5));
+                // Keep the queue channel open but undrained: the first
+                // request parks and the second finds the queue full.
+                let _processor = processor.unwrap();
+                let app = echo_app(test_app_state(bucket.clone(), limiter.queue_tx));
+
+                let held = TokenPermit::try_acquire(bucket, 1.0).unwrap();
+                let parked = tokio::spawn(app.clone().oneshot(echo_request(Body::from("parked"))));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(!parked.is_finished());
+
+                let rejected = app
+                    .oneshot(echo_request(Body::from("rejected")))
+                    .await
+                    .unwrap();
+                assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+
+                let rendered = handle.render();
+                assert_metric_line(&rendered, "smg_admission_queue_depth", "1");
+                assert_metric_line(&rendered, "smg_admission_inflight", "1");
+                assert_metric_line(
+                    &rendered,
+                    "smg_admission_queue_rejected_total{reason=\"full\"}",
+                    "1",
+                );
+
+                parked.abort();
+                let _ = parked.await;
+                drop(held);
+            });
+        });
+    }
+
+    /// A request that outlives the queue timeout is rejected with
+    /// reason="timeout" and releases its queue-depth slot.
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "queue processor runs as a background task"
+    )]
+    fn admission_metrics_record_timeout_rejections() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let bucket = Arc::new(TokenBucket::new(1, 0));
+                let (limiter, processor) =
+                    ConcurrencyLimiter::new(Some(bucket.clone()), 4, Duration::from_millis(100));
+                tokio::spawn(processor.unwrap().run());
+                let app = echo_app(test_app_state(bucket.clone(), limiter.queue_tx));
+
+                let held = TokenPermit::try_acquire(bucket, 1.0).unwrap();
+                let response = app.oneshot(echo_request(Body::from("late"))).await.unwrap();
+                assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+                drop(held);
+            });
+        });
+
+        let rendered = handle.render();
+        assert_metric_line(
+            &rendered,
+            "smg_admission_queue_rejected_total{reason=\"timeout\"}",
+            "1",
+        );
+        assert_metric_line(&rendered, "smg_admission_queue_depth", "0");
+        assert_metric_line(&rendered, "smg_admission_inflight", "0");
     }
 }

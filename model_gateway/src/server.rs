@@ -731,6 +731,9 @@ pub struct ServerConfig {
 /// the original `concurrency_limit_middleware`. Either runs innermost of the
 /// protective layers (closest to the handler), after tenant resolution has
 /// populated `RouteRequestMeta`.
+///
+/// Invariant: a request parked at admission keeps its body unread — bodies
+/// are collected only at handler extraction, after a permit is granted.
 fn with_admission_layer(
     router: Router<Arc<AppState>>,
     admission_mode: &middleware::scheduler::AdmissionMode,
