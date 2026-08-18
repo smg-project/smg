@@ -2,10 +2,10 @@
 //! (`routers/grpc/zmq_client.rs`), driven against a real in-process mock
 //! EngineCore (`mock-worker`'s `zmq` mode) over `ipc://` data-plane sockets.
 //!
-//! Everything below the router is real: the worker's lazy ZMQ connect binds
-//! the frontend sockets, completes the vLLM handshake with the mock engine(s),
-//! and streams `EngineCoreOutputs` back through the shared gRPC request
-//! pipeline (`ConnectionMode::Zmq` rides `uses_grpc_pipeline`). Before this
+//! Everything below the router is real: the worker's background handshake
+//! driver binds the frontend sockets, completes the vLLM handshake with the
+//! mock engine(s), and streams `EngineCoreOutputs` back through the shared
+//! gRPC request pipeline (`ConnectionMode::Zmq` rides `uses_grpc_pipeline`). Before this
 //! suite, that whole path had CPU coverage only inside `engine-zmq-client`;
 //! the gateway half was exercised only on GPU e2e lanes.
 //!
@@ -29,7 +29,7 @@ use smg::{
     config::RouterConfig,
     middleware::{RouteRequestMeta, TenantKey},
     routers::{RouterFactory, RouterTrait},
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
 };
 
 const MODEL: &str = "zmq-backend-test-model";
@@ -148,14 +148,27 @@ async fn build_router(fixture: &ZmqFixture, engine_count: usize) -> Box<dyn Rout
     if engine_count > 1 {
         builder = builder.zmq_engine_group(engine_count);
     }
+    let worker = Arc::new(builder.build());
     app_context
         .worker_registry
-        .register(Arc::new(builder.build()))
+        .register(worker.clone())
         .unwrap();
 
-    RouterFactory::create_router(&app_context)
+    let router = RouterFactory::create_router(&app_context)
         .await
-        .expect("router should build over a ZMQ worker")
+        .expect("router should build over a ZMQ worker");
+
+    // Acquisition fails fast while the background driver completes the
+    // handshake; wait for it to land so requests hit a connected worker.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !matches!(worker.get_backend_client().await, Ok(Some(_))) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ZMQ handshake never completed against the mock engine(s)"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    router
 }
 
 #[expect(
@@ -176,8 +189,8 @@ fn test_meta() -> RouteRequestMeta {
     RouteRequestMeta::new(TenantKey::from("zmq-backend-test"))
 }
 
-/// The full gateway path over ZMQ: router -> lazy handshake -> mock EngineCore
-/// -> streamed outputs -> assembled non-streaming response. A regression
+/// The full gateway path over ZMQ: router -> handshaked backend -> mock
+/// EngineCore -> streamed outputs -> assembled non-streaming response. A regression
 /// anywhere in the ipc:// bind, handshake, or output translation fails here on
 /// CPU, without an H100 e2e lane.
 #[tokio::test]
