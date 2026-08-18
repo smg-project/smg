@@ -147,8 +147,8 @@ class Router:
             - PolicyType.RoundRobin: Distribute requests in round-robin fashion
             - PolicyType.CacheAware: Distribute requests based on cache state and load
               balance
-            - PolicyType.PowerOfTwo: Select best of two random workers based on load
-              (PD mode only)
+            - PolicyType.PowerOfTwo: Sample two random workers and route to the
+              one with the lower expected wait (least-load scoring over the pair)
             - PolicyType.LeastLoad: Route to the worker with the lowest load score
               (in-flight requests plus KV-cache pressure)
         host: Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::,

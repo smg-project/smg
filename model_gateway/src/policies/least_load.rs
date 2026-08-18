@@ -216,26 +216,29 @@ impl LeastLoadPolicy {
             .map(|t| t.len() as u64)
             .unwrap_or(self.mean_prefill_tokens as u64)
     }
-}
 
-impl LoadBalancingPolicy for LeastLoadPolicy {
-    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
-        let healthy = get_healthy_worker_indices(workers);
-        if healthy.is_empty() {
-            return None;
-        }
-        if healthy.len() == 1 {
-            return Some(healthy[0]);
-        }
+    /// Argmin of the expected-wait score over `candidates` (indices into
+    /// `workers`), crediting the winner's in-flight estimate. The nominal
+    /// throughput and dark-fleet fallback are scoped to `candidates`, so a
+    /// caller scoring a sampled subset (power-of-two) gets a self-consistent
+    /// comparison. `policy` labels the selection log line.
+    pub(super) fn select_min_expected_wait(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        candidates: &[usize],
+        info: &SelectWorkerInfo,
+        policy: &'static str,
+    ) -> Option<usize> {
+        let (&first, rest) = candidates.split_first()?;
 
         let loads_guard = self.cached_loads.read().ok();
         let loads = loads_guard.as_deref();
 
-        // Fleet-nominal throughput (mean of positive reports) stands in for a
+        // Nominal throughput (mean of positive reports) stands in for a
         // worker missing a fresh snapshot; `fleet_has_loads` distinguishes a
         // partial gap (estimate that worker's drain time at the nominal rate)
         // from a fully dark fleet (fall back to join-shortest-queue).
-        let (tp_sum, tp_count) = healthy
+        let (tp_sum, tp_count) = candidates
             .iter()
             .filter_map(|&i| loads.and_then(|m| m.get(workers[i].url())))
             .map(|l| l.total_gen_throughput())
@@ -247,7 +250,7 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
             self.default_throughput
         };
         let fleet_has_loads = loads
-            .map(|m| healthy.iter().any(|&i| m.contains_key(workers[i].url())))
+            .map(|m| candidates.iter().any(|&i| m.contains_key(workers[i].url())))
             .unwrap_or(false);
 
         // Held across selection so the in-flight estimate stays consistent and
@@ -261,7 +264,7 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
         // idle/homogeneous case scores exactly equal) are sampled uniformly
         // instead of first-index-wins, which herded ties onto one worker.
         let mut rng = rand::rng();
-        let mut best = healthy[0];
+        let mut best = first;
         let mut best_score = self.score(
             &workers[best],
             loads,
@@ -270,7 +273,7 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
             fleet_has_loads,
         );
         let mut tied = 1u32;
-        for &idx in &healthy[1..] {
+        for &idx in rest {
             let s = self.score(
                 &workers[idx],
                 loads,
@@ -299,13 +302,26 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
         drop(inflight);
 
         debug!(
-            "least_load selected {} (score {:.4}, in_flight {})",
+            "{policy} selected {} (score {:.4}, in_flight {})",
             workers[best].url(),
             best_score,
             workers[best].load()
         );
         workers[best].increment_processed();
         Some(best)
+    }
+}
+
+impl LoadBalancingPolicy for LeastLoadPolicy {
+    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+        let healthy = get_healthy_worker_indices(workers);
+        if healthy.is_empty() {
+            return None;
+        }
+        if healthy.len() == 1 {
+            return Some(healthy[0]);
+        }
+        self.select_min_expected_wait(workers, &healthy, info, self.name())
     }
 
     fn name(&self) -> &'static str {
@@ -452,6 +468,57 @@ mod tests {
             a.increment_load();
         }
         let workers = vec![a, b];
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn nominal_throughput_is_scoped_to_the_candidates() {
+        // Dark a (2 in-flight) vs reporting b, with an outsider c reporting an
+        // extreme throughput. a's drain-time estimate must use the nominal
+        // rate of the CANDIDATES (b's 100 tok/s -> 20.48s > b's 10.04s), not
+        // a fleet-wide mean that c's 100k tok/s would dominate (0.04s < b).
+        let policy = LeastLoadPolicy::new();
+        let a = mk("http://a:8000");
+        for _ in 0..2 {
+            a.increment_load();
+        }
+        let workers = vec![a, mk("http://b:8000"), mk("http://c:8000")];
+        let mut loads = HashMap::new();
+        loads.insert("http://b:8000".to_string(), make_load(1000, 0.2, 100.0));
+        loads.insert("http://c:8000".to_string(), make_load(0, 0.2, 100_000.0));
+        policy.update_loads(&loads);
+        assert_eq!(
+            policy.select_min_expected_wait(
+                &workers,
+                &[0, 1],
+                &SelectWorkerInfo::default(),
+                "test"
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn known_token_count_credits_exact_inflight_work() {
+        // pick1 routes a 2100-token request to idle a, crediting exactly its
+        // token count: a becomes 21.04s vs b's 20.52s, so pick2 goes to b.
+        // The p̄ = 1024 fallback would leave a at 10.28s and herd onto a.
+        let policy = LeastLoadPolicy::new();
+        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let mut loads = HashMap::new();
+        loads.insert("http://a:8000".to_string(), make_load(0, 0.2, 100.0));
+        loads.insert("http://b:8000".to_string(), make_load(2048, 0.2, 100.0));
+        policy.update_loads(&loads);
+
+        let tokens = vec![7u32; 2100];
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
         assert_eq!(
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
             Some(1)

@@ -40,7 +40,7 @@
 //! 1. Skip if no load-aware policy is currently active for this group
 //!    (matches the original `LoadMonitor` policy gate).
 //! 2. Fetch loads concurrently from every `Ready` worker in the group.
-//! 3. Update PowerOfTwo policies and the DP cache.
+//! 3. Update load-aware policies and the DP cache.
 //! 4. Atomically clear stale entries for the group from the watch
 //!    channel and merge in the fresh loads.
 

@@ -520,8 +520,9 @@ pub enum PolicyConfig {
         selection_temperature: f32,
     },
 
-    /// Power-of-two choices load balancing policy.
-    /// Randomly selects two workers and routes to the one with lower load.
+    /// Power-of-two choices policy: samples two workers and routes to the one
+    /// with the lower expected wait, scored like `least_load`
+    /// (`(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`).
     /// TODO: Implement per-policy load monitoring intervals.
     /// Currently, load_check_interval_secs is populated from RouterConfig.load_monitor_interval_secs,
     /// but WorkerMonitor does not yet use per-policy intervals. This field is reserved for
