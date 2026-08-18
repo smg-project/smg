@@ -240,6 +240,7 @@ impl Router {
                 request_text: text,
                 tokens,
                 headers,
+                routing_key: header_utils::extract_routing_key_hint(headers),
                 hash_ring,
                 leg: crate::policies::WorkerLeg::Single,
             },
@@ -329,10 +330,14 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         // Pre-tokenized requests route on the token tree; the decimal-string
-        // rendering is only materialized when there are no tokens.
-        let routing_tokens: Option<Vec<u32>> = typed_req
-            .routing_tokens()
-            .map(|ids| ids.iter().map(|&id| id as u32).collect());
+        // rendering is only materialized when there are no tokens. A valid
+        // x-smg-routing-tokens hint wins over body-derived tokens/text.
+        let routing_tokens: Option<Vec<u32>> = header_utils::parse_routing_tokens_hint(headers)
+            .or_else(|| {
+                typed_req
+                    .routing_tokens()
+                    .map(|ids| ids.iter().map(|&id| id as u32).collect())
+            });
         let text = routing_tokens
             .is_none()
             .then(|| typed_req.extract_text_for_routing());
@@ -639,7 +644,11 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = body.is_stream();
-        let text = body.extract_text_for_routing();
+        // A valid x-smg-routing-tokens hint wins over body-derived text.
+        let hinted_tokens = header_utils::parse_routing_tokens_hint(headers);
+        let text = hinted_tokens
+            .is_none()
+            .then(|| body.extract_text_for_routing());
         // Resolve once, here, for the same reason as `route_typed_request`:
         // only `get_by_model` understands aliases, so the policy and hash ring
         // lookups below would silently fall back to router defaults on an
@@ -736,9 +745,10 @@ impl Router {
             &policy,
             &available,
             &SelectWorkerInfo {
-                request_text: Some(&text),
-                tokens: None,
+                request_text: text.as_deref(),
+                tokens: hinted_tokens.as_deref(),
                 headers,
+                routing_key: header_utils::extract_routing_key_hint(headers),
                 hash_ring,
                 leg: crate::policies::WorkerLeg::Single,
             },

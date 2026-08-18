@@ -21,7 +21,7 @@ use crate::{
     config::types::{PolicyConfig, RoutingKeyOverrideConfig},
     mesh::adapters::TreeSyncAdapter,
     policies::cache_aware::LoadReceiver,
-    routers::common::header_utils::extract_routing_key,
+    routers::common::header_utils::extract_routing_key_hint,
     worker::{KvEventMonitor, Worker},
 };
 
@@ -124,7 +124,7 @@ impl PolicyRegistry {
     ) -> Option<usize> {
         if let Some(sticky) = self.routing_key_sticky.as_ref() {
             if Self::routing_key_override_applies(policy.name())
-                && extract_routing_key(info.headers).is_some()
+                && extract_routing_key_hint(info.headers).is_some()
             {
                 return sticky.select_worker(workers, info);
             }

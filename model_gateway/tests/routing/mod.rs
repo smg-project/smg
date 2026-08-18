@@ -3,6 +3,7 @@
 pub mod cache_aware_backward_compat_test;
 pub mod grpc_completion_batch_test;
 pub mod header_forwarding_test;
+pub mod header_routing_hints_test;
 pub mod load_balancing_test;
 pub mod manual_routing_test;
 pub mod model_alias_test;

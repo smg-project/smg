@@ -251,12 +251,18 @@ pub struct SelectWorkerInfo<'a> {
     pub request_text: Option<&'a str>,
     /// Tokenized request for prefix-hash routing
     /// Used by PrefixHashPolicy for token-based prefix hashing
+    /// The HTTP router substitutes a valid `x-smg-routing-tokens` hint here:
+    /// the hint wins over body-derived tokens/text for selection.
     pub tokens: Option<&'a [u32]>,
     /// HTTP headers for header-based routing policies
     /// Policies can extract routing information from headers like:
     /// - X-SMG-Target-Worker: Direct routing to a specific worker by index
     /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
     pub headers: Option<&'a http::HeaderMap>,
+    /// Validated `x-smg-routing-key` hint (non-empty UTF-8, <= 128 bytes);
+    /// consistent_hashing and prefix_hash prefer it over their other keying
+    /// input.
+    pub routing_key: Option<&'a str>,
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,

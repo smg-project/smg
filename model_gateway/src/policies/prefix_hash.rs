@@ -257,13 +257,18 @@ impl PrefixHashPolicy {
             return (None, Branch::NoHealthyWorkers);
         }
 
-        // Pre-tokenized requests hash their token prefix, the rest hash the
-        // equivalent span of routing text.
-        let prefix_hash = match (info.tokens, info.request_text) {
-            (Some(tokens), _) if !tokens.is_empty() => self.compute_prefix_hash(tokens),
-            (_, Some(text)) if !text.is_empty() => self.compute_text_prefix_hash(text),
-            // Nothing to hash: stay serviceable by falling back to load.
-            _ => return (Self::least_loaded_healthy(workers), Branch::NoRoutingKey),
+        // A validated x-smg-routing-key hint overrides token/text keying.
+        // Otherwise pre-tokenized requests hash their token prefix, the rest
+        // hash the equivalent span of routing text.
+        let prefix_hash = if let Some(key) = info.routing_key {
+            xxhash_rust::xxh3::xxh3_64(key.as_bytes())
+        } else {
+            match (info.tokens, info.request_text) {
+                (Some(tokens), _) if !tokens.is_empty() => self.compute_prefix_hash(tokens),
+                (_, Some(text)) if !text.is_empty() => self.compute_text_prefix_hash(text),
+                // Nothing to hash: stay serviceable by falling back to load.
+                _ => return (Self::least_loaded_healthy(workers), Branch::NoRoutingKey),
+            }
         };
 
         // Find worker using ring with load balancing
@@ -487,6 +492,69 @@ mod tests {
         let (result2, _) = policy.select_worker_impl(&workers, &tokens_and_text);
 
         assert_eq!(result1, result2);
+    }
+
+    #[test]
+    fn test_routing_key_hint_overrides_token_and_text_keying() {
+        let policy = PrefixHashPolicy::with_defaults();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+
+        let key_only = SelectWorkerInfo {
+            routing_key: Some("session-42"),
+            hash_ring: Some(ring.clone()),
+            ..Default::default()
+        };
+        let (key_only_result, branch) = policy.select_worker_impl(&workers, &key_only);
+        assert!(key_only_result.is_some(), "a key alone must be routable");
+        assert_eq!(branch, Branch::RingHit);
+
+        // Same key with entirely different tokens and text keeps the worker.
+        for tokens in [vec![1u32, 2, 3], vec![900u32, 901, 902, 903]] {
+            let info = SelectWorkerInfo {
+                routing_key: Some("session-42"),
+                tokens: Some(&tokens),
+                request_text: Some("unrelated prompt text"),
+                hash_ring: Some(ring.clone()),
+                ..Default::default()
+            };
+            let (result, _) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(result, key_only_result, "the routing key must win");
+        }
+    }
+
+    #[test]
+    fn test_routing_key_hint_consistent_and_distributes() {
+        let policy = PrefixHashPolicy::with_defaults();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+
+        let info = SelectWorkerInfo {
+            routing_key: Some("sticky-session"),
+            hash_ring: Some(ring.clone()),
+            ..Default::default()
+        };
+        let (first, _) = policy.select_worker_impl(&workers, &info);
+        for _ in 0..10 {
+            let (result, _) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(result, first);
+        }
+
+        let mut distribution = std::collections::HashMap::new();
+        for i in 0..100 {
+            let key = format!("session-{i}");
+            let info = SelectWorkerInfo {
+                routing_key: Some(&key),
+                hash_ring: Some(ring.clone()),
+                ..Default::default()
+            };
+            let (result, _) = policy.select_worker_impl(&workers, &info);
+            *distribution.entry(result.unwrap()).or_insert(0) += 1;
+        }
+        assert!(
+            distribution.len() > 1,
+            "distinct keys must not pile onto one worker, got {distribution:?}"
+        );
     }
 
     #[test]

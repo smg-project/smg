@@ -1409,6 +1409,9 @@ impl CacheAwarePolicy {
             //   * matched worker gone/unhealthy: select nothing and DON'T insert
             //     (closure returns None), falling back to first-healthy below.
             let mut selected_idx: Option<usize> = None;
+            // Hinted token prefixes (x-smg-routing-tokens) insert as-is: the
+            // tree page-aligns internally, so a truncated prefix still trains
+            // affinity.
             let result = tree.match_and_insert_with(tokens, |result| {
                 let match_rate = if result.input_token_count == 0 {
                     0.0

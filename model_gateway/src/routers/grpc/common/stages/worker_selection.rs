@@ -264,6 +264,7 @@ impl WorkerSelectionStage {
                 request_text: text,
                 tokens,
                 headers,
+                routing_key: None,
                 hash_ring,
                 leg: WorkerLeg::Single,
             },
@@ -388,6 +389,7 @@ impl WorkerSelectionStage {
             request_text: text,
             tokens,
             headers,
+            routing_key: None,
             hash_ring,
             leg: WorkerLeg::Prefill,
         };
@@ -565,6 +567,7 @@ impl WorkerSelectionStage {
             request_text: text,
             tokens,
             headers,
+            routing_key: None,
             hash_ring: hash_ring.clone(),
             leg: WorkerLeg::Prefill,
         };
@@ -642,6 +645,7 @@ fn assign_encode_workers(
                 request_text: None,
                 tokens: None,
                 headers: Some(&routing_headers),
+                routing_key: None,
                 hash_ring: hash_ring.clone(),
                 leg: WorkerLeg::Single,
             };

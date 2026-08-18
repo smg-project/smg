@@ -949,6 +949,7 @@ impl PDRouter {
                     request_text,
                     tokens,
                     headers,
+                    routing_key: None,
                     hash_ring,
                     leg,
                 },

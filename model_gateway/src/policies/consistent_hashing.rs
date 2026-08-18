@@ -23,7 +23,7 @@ use rand::RngExt as _;
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{
     observability::metrics::Metrics,
-    routers::common::header_utils::{extract_routing_key, extract_target_worker},
+    routers::common::header_utils::{extract_routing_key_hint, extract_target_worker},
     worker::Worker,
 };
 
@@ -123,7 +123,11 @@ impl ConsistentHashingPolicy {
         }
 
         let target_worker = extract_target_worker(info.headers);
-        let routing_key = extract_routing_key(info.headers);
+        // Both sides apply the hint caps: an over-cap or non-UTF-8 key must not
+        // influence placement on any path.
+        let routing_key = info
+            .routing_key
+            .or_else(|| extract_routing_key_hint(info.headers));
 
         // Priority 1: X-SMG-Target-Worker - direct routing by worker index
         // O(1) parse + O(1) bounds check + O(1) health check
@@ -274,6 +278,22 @@ mod tests {
         }
 
         assert!(distribution.len() > 1, "Should distribute across workers");
+    }
+
+    #[test]
+    fn test_over_cap_routing_key_is_ignored() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        let headers = headers_with_routing_key(&"k".repeat(129));
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert!(result.is_some());
+        assert_eq!(branch, Branch::RandomFallback);
     }
 
     #[test]
@@ -507,6 +527,85 @@ mod tests {
             Some(original_idx),
             "Should return to original worker after recovery"
         );
+    }
+
+    #[test]
+    fn test_routing_key_hint_field_routes_consistently() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        let info = SelectWorkerInfo {
+            routing_key: Some("user-123"),
+            ..Default::default()
+        };
+
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        let first_idx = first_result.unwrap();
+        assert_eq!(branch, Branch::RoutingKeyHit);
+
+        for _ in 0..10 {
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(result, Some(first_idx));
+            assert_eq!(branch, Branch::RoutingKeyHit);
+        }
+    }
+
+    #[test]
+    fn test_routing_key_hint_field_distributes() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        let mut distribution = HashMap::new();
+        for i in 0..100 {
+            let key = format!("user-{i}");
+            let info = SelectWorkerInfo {
+                routing_key: Some(&key),
+                ..Default::default()
+            };
+            let (result, _) = policy.select_worker_impl(&workers, &info);
+            *distribution.entry(result.unwrap()).or_insert(0) += 1;
+        }
+
+        assert!(distribution.len() > 1, "Should distribute across workers");
+    }
+
+    #[test]
+    fn test_routing_key_hint_wins_over_raw_header() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = create_workers(&[
+            "http://w1:8000",
+            "http://w2:8000",
+            "http://w3:8000",
+            "http://w4:8000",
+        ]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+
+        let select_by_key = |key: &str| {
+            let info = SelectWorkerInfo {
+                routing_key: Some(key),
+                hash_ring: Some(ring.clone()),
+                ..Default::default()
+            };
+            policy.select_worker_impl(&workers, &info).0.unwrap()
+        };
+
+        // Find two keys that land on different workers.
+        let base_idx = select_by_key("key-0");
+        let other_key = (1..64)
+            .map(|i| format!("key-{i}"))
+            .find(|key| select_by_key(key) != base_idx)
+            .expect("some key must land on a different worker");
+
+        let headers = headers_with_routing_key(&other_key);
+        let info = SelectWorkerInfo {
+            routing_key: Some("key-0"),
+            headers: Some(&headers),
+            hash_ring: Some(ring.clone()),
+            ..Default::default()
+        };
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(result, Some(base_idx), "the validated hint must win");
+        assert_eq!(branch, Branch::RoutingKeyHit);
     }
 
     #[test]
