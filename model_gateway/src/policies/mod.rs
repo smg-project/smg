@@ -78,6 +78,13 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that don't use load information
     }
 
+    /// Whether routing consumes backend load snapshots, pushed via
+    /// [`Self::update_loads`] or read from the monitor's watch feed. The
+    /// `WorkerMonitor` skips backend load polling while no policy needs it.
+    fn needs_backend_loads(&self) -> bool {
+        false
+    }
+
     /// Drop any cached per-worker state for a removed worker.
     ///
     /// Called when a worker leaves the registry so load-aware policies don't

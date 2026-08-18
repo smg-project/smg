@@ -109,15 +109,17 @@ impl<O: EngineOutput> RequestRegistry<O> {
     }
 }
 
-struct ClientInner<P: EngineProtocol> {
-    /// Shared input ROUTER send half (serialized across concurrent submits).
-    input_send: tokio::sync::Mutex<RouterSendHalf>,
-    engines: Vec<ConnectedEngine>,
-    registry: Mutex<RequestRegistry<P::Output>>,
-    /// Latest per-rank load, keyed by engine index. SMG's DP load signal.
-    /// Reported values only — `select_engine` never mutates this map; its
-    /// reservations live in `inflight`.
-    load: Mutex<HashMap<u32, EngineLoad>>,
+/// The DP routing signal: what the engines report and what this client knows
+/// it put there. Both maps live under one mutex because every reader and every
+/// writer touches them together — two mutexes made the acquisition order an
+/// invariant nothing enforced, and selection (load then in-flight) taking it
+/// opposite to release (in-flight then load) deadlocked the client.
+#[derive(Default)]
+struct RoutingState {
+    /// Latest per-rank load, keyed by engine index. Reported values only —
+    /// `select_engine` never mutates this map; its reservations live in
+    /// `inflight`.
+    load: HashMap<u32, EngineLoad>,
     /// This client's own unfinished request ids, per rank: a floor under the
     /// (possibly stale) reported load, so routing never trusts a snapshot that
     /// says an engine we just loaded is idle. Keyed by id rather than counted,
@@ -127,7 +129,15 @@ struct ClientInner<P: EngineProtocol> {
     /// count. Identity makes every release idempotent; counters would let one
     /// request retire several slots and leave the rank looking emptier than it
     /// is.
-    inflight: Mutex<HashMap<u32, HashSet<String>>>,
+    inflight: HashMap<u32, HashSet<String>>,
+}
+
+struct ClientInner<P: EngineProtocol> {
+    /// Shared input ROUTER send half (serialized across concurrent submits).
+    input_send: tokio::sync::Mutex<RouterSendHalf>,
+    engines: Vec<ConnectedEngine>,
+    registry: Mutex<RequestRegistry<P::Output>>,
+    routing: Mutex<RoutingState>,
     /// Rotates the selection scan start so all-zero ties (cold start, fresh
     /// stats) don't systematically favor the first engine.
     scan_start: AtomicUsize,
@@ -176,8 +186,9 @@ impl<P: EngineProtocol> ClientInner<P> {
                         rank,
                         num_engines: self.engines.len() as u32,
                     })?;
-                self.inflight
+                self.routing
                     .lock()
+                    .inflight
                     .entry(rank)
                     .or_default()
                     .insert(request_id.to_string());
@@ -189,8 +200,8 @@ impl<P: EngineProtocol> ClientInner<P> {
                         message: "no engines connected".to_string(),
                     });
                 }
-                let load = self.load.lock();
-                let mut inflight = self.inflight.lock();
+                let mut routing = self.routing.lock();
+                let RoutingState { load, inflight } = &mut *routing;
                 let count = self.engines.len();
                 let start = self.scan_start.fetch_add(1, Ordering::Relaxed) % count;
                 let mut best: Option<(f64, usize)> = None;
@@ -237,15 +248,15 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// rank's queue is empty; the KV term is left as reported (cache pages
     /// outlive requests).
     fn release<'a>(&self, engine_index: u32, request_ids: impl IntoIterator<Item = &'a String>) {
-        let mut inflight = self.inflight.lock();
-        let Some(ids) = inflight.get_mut(&engine_index) else {
+        let mut routing = self.routing.lock();
+        let Some(ids) = routing.inflight.get_mut(&engine_index) else {
             return;
         };
         for request_id in request_ids {
             ids.remove(request_id);
         }
         if ids.is_empty() {
-            if let Some(load) = self.load.lock().get_mut(&engine_index) {
+            if let Some(load) = routing.load.get_mut(&engine_index) {
                 load.num_running = 0;
                 load.num_waiting = 0;
             }
@@ -427,8 +438,7 @@ impl<P: EngineProtocol> Client<P> {
             input_send: tokio::sync::Mutex::new(input_send),
             engines,
             registry: Mutex::new(RequestRegistry::default()),
-            load: Mutex::new(HashMap::new()),
-            inflight: Mutex::new(HashMap::new()),
+            routing: Mutex::new(RoutingState::default()),
             scan_start: AtomicUsize::new(0),
             wave: lockstep.then(|| Mutex::new(0)),
             abort_tx,
@@ -468,7 +478,7 @@ impl<P: EngineProtocol> Client<P> {
     /// The latest per-rank load for one engine index (DP routing signal), if
     /// any batch has been seen from it yet.
     pub fn engine_load(&self, engine_index: u32) -> Option<EngineLoad> {
-        self.inner.load.lock().get(&engine_index).copied()
+        self.inner.routing.lock().load.get(&engine_index).copied()
     }
 
     /// Submit a request and return a stream of its outputs. The request is
@@ -581,7 +591,7 @@ async fn run_dispatcher<P: EngineProtocol>(
                 match output {
                     Some(Ok(batch)) => {
                         if let Some(load) = batch.load {
-                            inner.load.lock().insert(batch.engine_index, load);
+                            inner.routing.lock().load.insert(batch.engine_index, load);
                         }
                         if let Some(event) = batch.wave {
                             inner.observe_wave(event, batch.engine_index).await;
@@ -608,7 +618,7 @@ async fn run_dispatcher<P: EngineProtocol>(
                         if matches!(error, Error::EngineCoreDead | Error::Transport(_)) {
                             warn!(%error, "engine transport failed; failing all in-flight requests");
                             inner.registry.lock().fail_all(Arc::new(error));
-                            inner.inflight.lock().clear();
+                            inner.routing.lock().inflight.clear();
                             return;
                         }
                         // A per-message decode error is non-fatal; keep going.
@@ -637,7 +647,7 @@ async fn run_dispatcher<P: EngineProtocol>(
             () = tokio::time::sleep(ENGINE_SILENCE_DEATH_TIMEOUT) => {
                 let mut registry = inner.registry.lock();
                 if !registry.requests.is_empty() {
-                    inner.inflight.lock().clear();
+                    inner.routing.lock().inflight.clear();
                     warn!(
                         "no engine output for {ENGINE_SILENCE_DEATH_TIMEOUT:?} with in-flight \
                          requests; treating engine as dead"
@@ -655,7 +665,7 @@ async fn run_dispatcher<P: EngineProtocol>(
         .fail_all(Arc::new(Error::ClientClosed {
             message: "engine output stream ended".to_string(),
         }));
-    inner.inflight.lock().clear();
+    inner.routing.lock().inflight.clear();
 }
 
 /// Stream of outputs for one submitted request. Dropping it before the terminal
@@ -1163,6 +1173,57 @@ mod tests {
             EngineInbound::Add(request) => assert_eq!(request.request_id, "next"),
             other => panic!("expected Add on engine 0, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn selection_and_release_race_without_deadlocking() {
+        // Selection reads the reported load and the in-flight sets together;
+        // release retires an id and, when that empties the rank, zeroes its
+        // queue counts. While those maps had a mutex each, the two paths took
+        // them in opposite orders, so a submit racing the release of a rank's
+        // last request wedged both threads forever (parking_lot: no timeout,
+        // no poisoning). Under one lock the inversion is unexpressible; this
+        // stress test trips its deadline against the two-mutex version.
+        const THREADS: usize = 8;
+        const ITERATIONS: usize = 2_000;
+
+        let (client, _engines, _ns) = connect_ranks(4, false).await;
+        let inner = client.inner.clone();
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        // Plain threads, not tasks: the racing methods are synchronous, and a
+        // regression must not be able to wedge the runtime this test is
+        // waiting on.
+        let workers: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                let inner = inner.clone();
+                let completed = completed.clone();
+                std::thread::spawn(move || {
+                    for iteration in 0..ITERATIONS {
+                        let request_id = format!("race-{thread}-{iteration}");
+                        let engine_id = inner.select_engine(None, &request_id).unwrap();
+                        inner.release_one(&engine_id, &request_id);
+                    }
+                    completed.fetch_add(1, Ordering::Release);
+                })
+            })
+            .collect();
+
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while completed.load(Ordering::Acquire) < THREADS {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "selection racing release deadlocked"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        // Every reservation was released, so no rank carries a phantom floor.
+        let routing = inner.routing.lock();
+        assert!(routing.inflight.values().all(HashSet::is_empty));
     }
 
     /// The `EngineId` of one connected rank, by index.

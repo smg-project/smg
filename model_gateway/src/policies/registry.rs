@@ -512,16 +512,14 @@ impl PolicyRegistry {
 
     /// Get all load-aware policies that need periodic load updates (lock-free).
     ///
-    /// These are policies whose routing depends on the worker load monitor:
-    /// `power_of_two` and `least_load`.
+    /// Membership is policy-reported via
+    /// [`LoadBalancingPolicy::needs_backend_loads`]: `power_of_two` and
+    /// `least_load` always consume load reports; `cache_aware` does when its
+    /// pressure knobs are configured.
     pub fn get_all_load_aware_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
-        fn is_load_aware(name: &str) -> bool {
-            name == "power_of_two" || name == "least_load"
-        }
-
         let mut policies = Vec::new();
 
-        if is_load_aware(self.default_policy.name()) {
+        if self.default_policy.needs_backend_loads() {
             policies.push(Arc::clone(&self.default_policy));
         }
 
@@ -531,13 +529,13 @@ impl PolicyRegistry {
         let encode_policy_opt = self.encode_policy.get();
 
         if let Some(policy) = prefill_policy_opt {
-            if is_load_aware(policy.name()) && !Arc::ptr_eq(policy, &self.default_policy) {
+            if policy.needs_backend_loads() && !Arc::ptr_eq(policy, &self.default_policy) {
                 policies.push(Arc::clone(policy));
             }
         }
 
         if let Some(policy) = decode_policy_opt {
-            if is_load_aware(policy.name())
+            if policy.needs_backend_loads()
                 && !Arc::ptr_eq(policy, &self.default_policy)
                 && !prefill_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
             {
@@ -546,7 +544,7 @@ impl PolicyRegistry {
         }
 
         if let Some(policy) = encode_policy_opt {
-            if is_load_aware(policy.name())
+            if policy.needs_backend_loads()
                 && !Arc::ptr_eq(policy, &self.default_policy)
                 && !prefill_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
                 && !decode_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
@@ -557,7 +555,7 @@ impl PolicyRegistry {
 
         for entry in self.model_policies.iter() {
             let policy = entry.value();
-            if is_load_aware(policy.name()) {
+            if policy.needs_backend_loads() {
                 let already_added = policies.iter().any(|p| Arc::ptr_eq(p, policy));
                 if !already_added {
                     policies.push(Arc::clone(policy));
@@ -625,12 +623,12 @@ impl PolicyRegistry {
         }
     }
 
-    /// Drop a removed worker's cached load report from all load-aware policies
-    /// (`power_of_two`, `least_load`).
+    /// Drop a removed worker's cached load report from all load-aware
+    /// policies.
     ///
-    /// These policies cache per-worker load reports keyed by URL; without this
-    /// their caches would grow unbounded under worker churn. Called on worker
-    /// removal alongside the cache-aware cleanup above.
+    /// Push-model policies cache per-worker load reports keyed by URL;
+    /// without this their caches would grow unbounded under worker churn.
+    /// Called on worker removal alongside the cache-aware cleanup above.
     pub fn remove_worker_from_load_aware(&self, worker_url: &str) {
         for policy in self.get_all_load_aware_policies() {
             policy.remove_worker(worker_url);
@@ -879,6 +877,44 @@ mod tests {
         let registry = PolicyRegistry::new(PolicyConfig::Passthrough);
         registry.on_worker_added("m", Some("passthrough"));
         assert!(registry.get_all_load_aware_policies().is_empty());
+    }
+
+    #[test]
+    fn cache_aware_is_load_aware_only_when_pressure_configured() {
+        fn cache_aware(
+            overlap_decay: f32,
+            balance_token_usage_threshold: f32,
+            overload_token_usage_threshold: f32,
+        ) -> PolicyConfig {
+            PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 0,
+                max_tree_size: 4096,
+                block_size: 16,
+                balance_token_usage_threshold,
+                overload_token_usage_threshold,
+                overlap_decay,
+                selection_temperature: 0.0,
+            }
+        }
+
+        // Plain cache_aware consumes no backend loads — the monitor must
+        // keep skipping load polling for it.
+        let plain = PolicyRegistry::new(cache_aware(0.0, 1.0, 1.0));
+        assert!(plain.get_all_load_aware_policies().is_empty());
+
+        // Any pressure knob makes it load-aware: waiting-prefill decay,
+        // KV-usage balance spread, or the KV-usage overload ceiling.
+        for pressured in [
+            cache_aware(1.0, 1.0, 1.0),
+            cache_aware(0.0, 0.5, 1.0),
+            cache_aware(0.0, 1.0, 0.9),
+        ] {
+            let registry = PolicyRegistry::new(pressured);
+            assert_eq!(registry.get_all_load_aware_policies().len(), 1);
+        }
     }
 
     #[test]

@@ -12,8 +12,8 @@ use super::{
     event::WorkerConnected,
     resilience::ResolvedResilience,
     worker::{
-        BasicWorker, ConnectionMode, RuntimeType, WorkerMetadata, WorkerRuntime, WorkerType,
-        DEFAULT_WORKER_HTTP_TIMEOUT_SECS,
+        BasicWorker, ConnectionMode, LazyHttpClient, RuntimeType, WorkerMetadata, WorkerRuntime,
+        WorkerType,
     },
 };
 use crate::{observability::metrics::Metrics, routers::grpc::backend_client::BackendClient};
@@ -314,14 +314,9 @@ impl BasicWorkerBuilder {
                 });
         Metrics::set_worker_health(&metadata.spec.url, initial_status == WorkerStatus::Ready);
 
-        let http_client = self.http_client.unwrap_or_else(|| {
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(
-                    DEFAULT_WORKER_HTTP_TIMEOUT_SECS,
-                ))
-                .pool_max_idle_per_host(8)
-                .build()
-                .unwrap_or_default()
+        let http_client = Arc::new(match self.http_client {
+            Some(client) => LazyHttpClient::ready(client),
+            None => LazyHttpClient::deferred(),
         });
 
         let resilience = self.resilience.unwrap_or_default();
@@ -409,6 +404,29 @@ mod tests {
             .connection_mode(ConnectionMode::Zmq)
             .build();
         assert_eq!(worker.metadata().zmq_engine_count(), 1);
+    }
+
+    #[test]
+    fn http_client_is_deferred_until_first_use_and_shared_across_clones() {
+        // A ZMQ worker never issues an HTTP request, so nothing is built at
+        // construction; asking for it materializes one usable client, and a
+        // clone keeps pointing at the same lazy slot.
+        let worker = BasicWorkerBuilder::new("ipc:///tmp/w.ipc")
+            .connection_mode(ConnectionMode::Zmq)
+            .build();
+        assert!(worker.http_client.cell_is_empty());
+        let clone = worker.clone();
+        let client = worker.http_client();
+        assert!(!worker.http_client.cell_is_empty());
+        assert!(std::ptr::eq(client, clone.http_client()));
+    }
+
+    #[test]
+    fn provided_http_client_is_used_as_is() {
+        let worker = BasicWorkerBuilder::new("http://localhost:8080")
+            .http_client(reqwest::Client::new())
+            .build();
+        assert!(!worker.http_client.cell_is_empty());
     }
 
     #[test]

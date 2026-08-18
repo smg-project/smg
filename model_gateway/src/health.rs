@@ -67,7 +67,7 @@ use crate::{
     config::{RouterConfig, RoutingMode},
     middleware::ProbeResponse,
     observability::inflight_tracker::InFlightRequestTracker,
-    worker::{event::WorkerEvent, ConnectionMode, WorkerRegistry, WorkerType},
+    worker::{event::WorkerEvent, WorkerRegistry, WorkerType},
 };
 
 /// How often the maintainer re-derives readiness from the registry even
@@ -86,7 +86,7 @@ pub struct ReadinessSnapshot {
     /// modes), or at least one healthy prefill AND one healthy decode
     /// worker in PrefillDecode mode.
     pub workers_ready: bool,
-    /// Tokenizer-autoload gate: every healthy gRPC worker's tokenizer is
+    /// Tokenizer-autoload gate: every healthy gRPC/ZMQ worker's tokenizer is
     /// registered (`true` when autoload is disabled — the gateway does not
     /// manage tokenizers at all then).
     pub tokenizers_ready: bool,
@@ -190,18 +190,19 @@ impl ProbeState {
         };
 
         // A worker reports healthy (engine SERVING) as soon as its process is
-        // up, but the gateway autoloads each gRPC worker's tokenizer
+        // up, but the gateway autoloads each gRPC-pipeline worker's tokenizer
         // asynchronously afterward (`SubmitTokenizerJobStep`,
         // fire-and-forget). Until that lands, generation requests fail with
         // `tokenizer_not_found`, so `/readiness` must not report ready yet.
-        // Hold readiness until every healthy gRPC worker's tokenizer is
-        // registered. HTTP/proxy workers never autoload a local tokenizer
-        // and are exempt; when autoload is disabled the gateway does not
-        // manage tokenizers at all.
+        // Hold readiness until every healthy gRPC and ZMQ worker's tokenizer
+        // is registered — both ride the gRPC pipeline and speak tokens on the
+        // wire. HTTP/proxy workers never autoload a local tokenizer and are
+        // exempt; when autoload is disabled the gateway does not manage
+        // tokenizers at all.
         let tokenizers_ready = router_config.disable_tokenizer_autoload
             || healthy_workers
                 .iter()
-                .filter(|w| matches!(w.connection_mode(), ConnectionMode::Grpc))
+                .filter(|w| w.connection_mode().uses_grpc_pipeline())
                 .all(|w| tokenizer_registered(w.model_id()));
 
         self.readiness.store(Arc::new(ReadinessSnapshot {
@@ -483,7 +484,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ModelCard, Worker};
+    use crate::worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker};
 
     fn worker(
         url: &str,
@@ -689,6 +690,39 @@ mod tests {
         };
         state.recompute_with(&registry, &no_autoload, |_| false);
         assert!(state.readiness().tokenizers_ready);
+    }
+
+    /// ZMQ workers ride the same gRPC pipeline and the same fire-and-forget
+    /// tokenizer autoload, and their wire is token-only, so they must gate
+    /// readiness exactly like gRPC workers.
+    #[test]
+    fn zmq_workers_gate_readiness_on_tokenizer_registration() {
+        let state = probe_state();
+        let registry = WorkerRegistry::new();
+        let router_config = regular_config();
+
+        registry
+            .register(worker(
+                "ipc:///tmp/smg-z1",
+                "llama-3",
+                WorkerType::Regular,
+                ConnectionMode::Zmq,
+                WorkerStatus::Ready,
+            ))
+            .unwrap();
+
+        state.recompute_with(&registry, &router_config, |_| false);
+        let snapshot = state.readiness();
+        assert!(snapshot.workers_ready);
+        assert!(!snapshot.tokenizers_ready);
+        assert_eq!(
+            state.readiness_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        state.recompute_with(&registry, &router_config, |model_id| model_id == "llama-3");
+        assert!(state.readiness().tokenizers_ready);
+        assert_eq!(state.readiness_response().status(), StatusCode::OK);
     }
 
     #[test]

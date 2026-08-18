@@ -119,6 +119,10 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         }
     }
 
+    fn needs_backend_loads(&self) -> bool {
+        true
+    }
+
     fn remove_worker(&self, url: &str) {
         if let Ok(mut cached) = self.cached_loads.write() {
             cached.remove(url);
