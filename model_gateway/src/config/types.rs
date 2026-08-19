@@ -465,9 +465,10 @@ pub enum ManualAssignmentMode {
 ///
 /// Key priority is fixed: a key derived from the typed body's `rid` (per-turn
 /// `_t<n>` and per-retry `_r<n>` suffixes stripped, so every turn of a
-/// conversation shares one key) wins over `X-SMG-Routing-Key`; the header is
-/// the fallback when no rid is present. Raw-streamed requests have no readable
-/// body and therefore derive keys from the header only.
+/// conversation shares one key) wins over the routing-key headers; the first
+/// configured header carrying a valid value is the fallback when no rid is
+/// present. Raw-streamed requests have no readable body and therefore derive
+/// keys from the headers only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingKeyOverrideConfig {
     /// When false, policies are used unchanged.
@@ -484,10 +485,20 @@ pub struct RoutingKeyOverrideConfig {
     /// policy, then pin.
     #[serde(default = "default_override_assignment_mode")]
     pub assignment_mode: ManualAssignmentMode,
+    /// Ordered header names consulted for the routing key; the first header
+    /// present with a valid value (non-empty UTF-8 within the byte cap) wins.
+    /// When the override is enabled, header keys get the same per-turn /
+    /// per-retry suffix stripping as rid-derived keys.
+    #[serde(default = "default_routing_key_headers")]
+    pub headers: Vec<String>,
 }
 
 fn default_override_assignment_mode() -> ManualAssignmentMode {
     ManualAssignmentMode::Delegate
+}
+
+fn default_routing_key_headers() -> Vec<String> {
+    vec!["x-smg-routing-key".to_string()]
 }
 
 impl Default for RoutingKeyOverrideConfig {
@@ -497,6 +508,7 @@ impl Default for RoutingKeyOverrideConfig {
             eviction_interval_secs: default_manual_eviction_interval_secs(),
             max_idle_secs: default_manual_max_idle_secs(),
             assignment_mode: default_override_assignment_mode(),
+            headers: default_routing_key_headers(),
         }
     }
 }
@@ -1314,15 +1326,21 @@ mod tests {
         let cfg: RoutingKeyOverrideConfig = serde_json::from_value(json).unwrap();
         assert!(cfg.enabled);
         assert_eq!(cfg.assignment_mode, ManualAssignmentMode::Delegate);
+        assert_eq!(cfg.headers, vec!["x-smg-routing-key".to_string()]);
 
         let cfg = RoutingKeyOverrideConfig {
             enabled: true,
             assignment_mode: ManualAssignmentMode::MinLoad,
+            headers: vec!["x-routing-key".into(), "x-smg-routing-key".into()],
             ..Default::default()
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let roundtripped: RoutingKeyOverrideConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtripped.assignment_mode, ManualAssignmentMode::MinLoad);
+        assert_eq!(
+            roundtripped.headers,
+            vec!["x-routing-key".to_string(), "x-smg-routing-key".to_string()]
+        );
     }
 
     #[test]

@@ -516,6 +516,7 @@ struct Router {
     least_load_max_waiting_requests: u32,
     stream_request_bodies_over: u64,
     stream_body_stall_timeout_secs: u64,
+    routing_key_headers: Vec<String>,
 }
 
 impl Router {
@@ -883,6 +884,7 @@ impl Router {
                 max_idle_secs: self.max_idle_secs,
                 assignment_mode: self
                     .parse_assignment_mode(config::ManualAssignmentMode::Delegate)?,
+                headers: self.routing_key_headers.clone(),
             })
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
@@ -1039,6 +1041,7 @@ impl Router {
         least_load_max_waiting_requests = 0,
         stream_request_bodies_over = 0,
         stream_body_stall_timeout_secs = 300,
+        routing_key_headers = vec![String::from("x-smg-routing-key")],
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1179,6 +1182,7 @@ impl Router {
         least_load_max_waiting_requests: u32,
         stream_request_bodies_over: u64,
         stream_body_stall_timeout_secs: u64,
+        routing_key_headers: Vec<String>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1333,6 +1337,7 @@ impl Router {
             least_load_max_waiting_requests,
             stream_request_bodies_over,
             stream_body_stall_timeout_secs,
+            routing_key_headers,
         })
     }
 

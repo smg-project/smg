@@ -94,6 +94,7 @@ impl ConfigValidator {
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
         Self::validate_storage_context_headers(config)?;
+        Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
         Self::validate_model_aliases(config)?;
@@ -183,6 +184,17 @@ impl ConfigValidator {
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_routing_key_headers(config: &RouterConfig) -> ConfigResult<()> {
+        for name in &config.routing_key_override.headers {
+            HeaderName::try_from(name.as_str()).map_err(|e| ConfigError::ValidationFailed {
+                reason: format!(
+                    "routing_key_override.headers contains an invalid HTTP header name '{name}': {e}"
+                ),
+            })?;
+        }
         Ok(())
     }
 
@@ -1223,6 +1235,23 @@ mod tests {
             },
             PolicyConfig::Random,
         )
+    }
+
+    #[test]
+    fn routing_key_headers_validated_as_header_names() {
+        let mut config = regular_mode_config();
+        config.routing_key_override.headers =
+            vec!["x-routing-key".to_string(), "x-smg-routing-key".to_string()];
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        for bad in ["", "has space", "bad\nname"] {
+            config.routing_key_override.headers = vec![bad.to_string()];
+            assert!(matches!(
+                ConfigValidator::validate(&config),
+                Err(ConfigError::ValidationFailed { ref reason })
+                    if reason.contains("routing_key_override.headers")
+            ));
+        }
     }
 
     #[test]

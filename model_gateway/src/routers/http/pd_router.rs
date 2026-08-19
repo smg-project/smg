@@ -634,7 +634,7 @@ impl PDRouter {
         let effective_key = context
             .rid_key
             .as_deref()
-            .or_else(|| header_utils::extract_routing_key_hint(headers));
+            .or_else(|| self.policy_registry.sticky_header_key(headers));
         let load_guards = vec![
             WorkerLoadGuard::with_key(prefill.clone(), effective_key),
             WorkerLoadGuard::with_key(decode.clone(), effective_key),
@@ -959,7 +959,7 @@ impl PDRouter {
                     request_text,
                     tokens,
                     headers,
-                    routing_key: None,
+                    routing_key: self.policy_registry.resolve_routing_key(headers),
                     rid_key,
                     hash_ring,
                     leg,

@@ -217,6 +217,10 @@ class RouterArgs:
     least_load_max_waiting_requests: int = 0
     stream_request_bodies_over: int = 0
     stream_body_stall_timeout_secs: int = 300
+    # Ordered header names checked for the routing key; first valid wins
+    routing_key_headers: list[str] = dataclasses.field(
+        default_factory=lambda: ["x-smg-routing-key"]
+    )
 
     @staticmethod
     def add_cli_args(
@@ -638,7 +642,17 @@ class RouterArgs:
             help=(
                 "Sticky sessions: route every request of a conversation to the"
                 " same worker, on any policy (keys derived from the request-id"
-                " lineage, falling back to X-SMG-Routing-Key)"
+                " lineage, falling back to the routing-key headers)"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}routing-key-headers",
+            type=str,
+            nargs="*",
+            action="extend",
+            help=(
+                "Ordered header names checked for the routing key; the first"
+                " header present with a valid value wins"
             ),
         )
         routing_group.add_argument(

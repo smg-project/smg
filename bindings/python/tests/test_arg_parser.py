@@ -539,6 +539,16 @@ class TestParseRouterArgs:
         assert router_args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert router_args.policy == "round_robin"
 
+    def test_parse_routing_key_headers(self):
+        """Ordered list flag; unset keeps the x-smg-routing-key default."""
+        router_args = parse_router_args(
+            ["--routing-key-headers", "x-routing-key", "x-smg-routing-key"]
+        )
+        assert router_args.routing_key_headers == ["x-routing-key", "x-smg-routing-key"]
+
+        defaults = parse_router_args([])
+        assert defaults.routing_key_headers == ["x-smg-routing-key"]
+
     def test_parse_pd_args(self):
         """Test parsing PD disaggregated mode arguments."""
         args = [
@@ -1273,6 +1283,7 @@ class TestRouterArgsFieldOrder:
         "least_load_max_waiting_requests",
         "stream_request_bodies_over",
         "stream_body_stall_timeout_secs",
+        "routing_key_headers",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1297,6 +1308,7 @@ class TestRouterArgsFieldOrder:
             "least_load_max_waiting_requests",
             "stream_request_bodies_over",
             "stream_body_stall_timeout_secs",
+            "routing_key_headers",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

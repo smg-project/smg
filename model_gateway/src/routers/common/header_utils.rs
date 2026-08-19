@@ -44,14 +44,22 @@ pub fn parse_routing_tokens_hint(headers: Option<&HeaderMap>) -> Option<Vec<u32>
     Some(ids)
 }
 
-/// Extract the `x-smg-routing-key` hint: opaque non-empty UTF-8. Over-cap or
-/// non-UTF-8 values are ignored (`None`), never an error.
-pub fn extract_routing_key_hint(headers: Option<&HeaderMap>) -> Option<&str> {
-    let value = headers?.get(&HEADER_ROUTING_KEY)?.as_bytes();
+/// Extract a routing-key hint from `name`: opaque non-empty UTF-8. Over-cap
+/// or non-UTF-8 values are ignored (`None`), never an error.
+pub fn extract_routing_key_hint_named<'a>(
+    headers: Option<&'a HeaderMap>,
+    name: &HeaderName,
+) -> Option<&'a str> {
+    let value = headers?.get(name)?.as_bytes();
     if value.is_empty() || value.len() > ROUTING_KEY_HINT_MAX_BYTES {
         return None;
     }
     std::str::from_utf8(value).ok()
+}
+
+/// Extract the `x-smg-routing-key` hint (the default routing-key header).
+pub fn extract_routing_key_hint(headers: Option<&HeaderMap>) -> Option<&str> {
+    extract_routing_key_hint_named(headers, &HEADER_ROUTING_KEY)
 }
 
 fn extract_header_value<'a>(headers: Option<&'a HeaderMap>, name: &HeaderName) -> Option<&'a str> {
@@ -683,6 +691,19 @@ mod tests {
             HeaderValue::from_bytes("clé-café".as_bytes()).unwrap(),
         );
         assert_eq!(extract_routing_key_hint(Some(&headers)), Some("clé-café"));
+    }
+
+    #[test]
+    fn test_extract_routing_key_hint_named_reads_configured_header() {
+        let name = HeaderName::from_static("x-routing-key");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-routing-key", "session-abc".parse().unwrap());
+        assert_eq!(
+            extract_routing_key_hint_named(Some(&headers), &name),
+            Some("session-abc")
+        );
+        // The default extractor stays bound to x-smg-routing-key.
+        assert_eq!(extract_routing_key_hint(Some(&headers)), None);
     }
 
     #[test]
