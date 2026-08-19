@@ -215,6 +215,7 @@ class RouterArgs:
     upstream_pool_idle_timeout_secs: int = 3
     least_load_max_waiting_requests: int = 0
     stream_request_bodies_over: int = 0
+    stream_body_stall_timeout_secs: int = 300
 
     @staticmethod
     def add_cli_args(
@@ -598,6 +599,18 @@ class RouterArgs:
                 " no body mutation. Streamed bodies cannot be replayed, so"
                 " those requests bypass router-level retries; bodies without"
                 " a Content-Length header always buffer. 0 disables"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}stream-body-stall-timeout-secs",
+            type=int,
+            default=RouterArgs.stream_body_stall_timeout_secs,
+            help=(
+                "Abort a streamed request body once the upstream sender has"
+                " waited on the client for this many seconds (408). The clock"
+                " pauses while the worker applies backpressure, so a slow"
+                " worker read never trips it. Applies only to bodies streamed"
+                " via --stream-request-bodies-over. 0 disables"
             ),
         )
         routing_group.add_argument(

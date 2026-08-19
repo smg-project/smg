@@ -536,6 +536,14 @@ struct CliArgs {
     #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
     stream_request_bodies_over: u64,
 
+    /// Abort a streamed request body once the upstream sender has waited on
+    /// the client for this many seconds (408, request_body_stalled). The
+    /// clock pauses while the worker applies backpressure, so a slow worker
+    /// read never trips it. Applies only to bodies streamed via
+    /// --stream-request-bodies-over. 0 disables
+    #[arg(long, default_value_t = 300, help_heading = "Request Handling")]
+    stream_body_stall_timeout_secs: u64,
+
     /// CORS allowed origins
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     cors_allowed_origins: Vec<String>,
@@ -1568,6 +1576,7 @@ impl CliArgs {
             .runtime_worker_threads(self.runtime_worker_threads)
             .max_payload_size(self.max_payload_size)
             .stream_request_bodies_over(self.stream_request_bodies_over)
+            .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
             .request_timeout_secs(self.request_timeout_secs)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
@@ -1937,6 +1946,18 @@ mod tests {
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.kv_indexer_ttl_secs, None);
         assert_eq!(defaults.kv_indexer_max_entries, None);
+    }
+
+    /// The streamed-body stall timeout is a router-only setting and must
+    /// flow into `RouterConfig`.
+    #[test]
+    fn stream_stall_timeout_flag_flows_into_router_config() {
+        let cli = cli_args_from(&["--stream-body-stall-timeout-secs", "120"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.stream_body_stall_timeout_secs, 120);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.stream_body_stall_timeout_secs, 300);
     }
 
     /// `--health-check-port` must flow into BOTH conversion paths

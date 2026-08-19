@@ -515,6 +515,7 @@ struct Router {
     upstream_pool_idle_timeout_secs: u64,
     least_load_max_waiting_requests: u32,
     stream_request_bodies_over: u64,
+    stream_body_stall_timeout_secs: u64,
 }
 
 impl Router {
@@ -865,6 +866,7 @@ impl Router {
             .upstream_http2(self.upstream_http2)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .stream_request_bodies_over(self.stream_request_bodies_over)
+            .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .routing_key_override(config::RoutingKeyOverrideConfig {
@@ -1027,6 +1029,7 @@ impl Router {
         upstream_pool_idle_timeout_secs = 3,
         least_load_max_waiting_requests = 0,
         stream_request_bodies_over = 0,
+        stream_body_stall_timeout_secs = 300,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1166,6 +1169,7 @@ impl Router {
         upstream_pool_idle_timeout_secs: u64,
         least_load_max_waiting_requests: u32,
         stream_request_bodies_over: u64,
+        stream_body_stall_timeout_secs: u64,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1319,6 +1323,7 @@ impl Router {
             upstream_pool_idle_timeout_secs,
             least_load_max_waiting_requests,
             stream_request_bodies_over,
+            stream_body_stall_timeout_secs,
         })
     }
 

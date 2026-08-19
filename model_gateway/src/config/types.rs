@@ -57,6 +57,12 @@ pub struct RouterConfig {
     /// bodies without a Content-Length header always buffer. `0` disables.
     #[serde(default)]
     pub stream_request_bodies_over: u64,
+    /// Abort a streamed request body once the upstream sender has waited on
+    /// the client for this many seconds (408). The clock pauses while the
+    /// worker applies backpressure, so a slow worker read never trips it.
+    /// `0` disables the watchdog.
+    #[serde(default = "default_stream_body_stall_timeout_secs")]
+    pub stream_body_stall_timeout_secs: u64,
     pub request_timeout_secs: u64,
     /// Idle timeout for pooled upstream connections. Must stay below the
     /// backend HTTP server's keep-alive timeout (vLLM and SGLang default to
@@ -657,6 +663,10 @@ fn default_upstream_pool_idle_timeout_secs() -> u64 {
     3
 }
 
+fn default_stream_body_stall_timeout_secs() -> u64 {
+    300
+}
+
 fn default_prefix_hash_balance_abs_threshold() -> usize {
     10
 }
@@ -908,6 +918,7 @@ impl Default for RouterConfig {
             runtime_worker_threads: None,
             max_payload_size: 536_870_912, // 512MB
             stream_request_bodies_over: 0,
+            stream_body_stall_timeout_secs: default_stream_body_stall_timeout_secs(),
             request_timeout_secs: 1800, // 30 minutes
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
@@ -1172,6 +1183,27 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.stream_request_bodies_over, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_stream_body_stall_timeout_serde_default_and_roundtrip() {
+        // Config files predating the field deserialize to the 300s default.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("stream_body_stall_timeout_secs")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.stream_body_stall_timeout_secs, 300);
+
+        // The disabling zero round-trips instead of reverting to the default.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .stream_body_stall_timeout_secs(0)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.stream_body_stall_timeout_secs, 0);
     }
 
     #[test]

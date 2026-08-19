@@ -210,6 +210,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn stream_body_stall_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.stream_body_stall_timeout_secs = secs;
+        self
+    }
+
     pub fn upstream_pool_idle_timeout_secs(mut self, secs: u64) -> Self {
         self.config.upstream_pool_idle_timeout_secs = secs;
         self

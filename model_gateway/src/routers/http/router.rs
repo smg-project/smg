@@ -1,4 +1,8 @@
-use std::{error::Error as _, sync::Arc, time::Instant};
+use std::{
+    error::Error as _,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     body::{to_bytes, Body},
@@ -62,7 +66,7 @@ use crate::{
         grpc::utils::{error_type_from_status, route_to_endpoint},
         http::{
             request_body::{serialize_request_body, RequestBodyError},
-            request_stream::{CappedBodyStream, StreamProgress, STREAM_PROGRESS_TIMEOUT},
+            request_stream::{CappedBodyStream, StreamProgress},
         },
         router_manager::RouterManager,
         RouterTrait,
@@ -88,6 +92,9 @@ pub struct Router {
     retry_config: RetryConfig,
     /// Cap on buffered worker response bodies, mirroring the ingress limit.
     max_payload_size: usize,
+    /// Streamed-body stall watchdog: abort a dispatch once a single client
+    /// wait lasts this long. `None` disables.
+    stream_stall_timeout: Option<Duration>,
     realtime_registry: Arc<RealtimeRegistry>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
@@ -152,6 +159,10 @@ impl Router {
             client: ctx.client.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             max_payload_size: ctx.router_config.max_payload_size,
+            stream_stall_timeout: match ctx.router_config.stream_body_stall_timeout_secs {
+                0 => None,
+                secs => Some(Duration::from_secs(secs)),
+            },
             realtime_registry: ctx.realtime_registry.clone(),
             webrtc_bind_addr: ctx.webrtc_bind_addr,
             webrtc_stun_server: ctx.webrtc_stun_server.clone(),
@@ -1223,10 +1234,11 @@ impl Router {
     ///
     /// The body is never buffered: a counting wrapper caps it at the ingress
     /// payload limit (over-limit → 413, upstream send aborted) and a watchdog
-    /// aborts the dispatch when no bytes move for [`STREAM_PROGRESS_TIMEOUT`]
-    /// (→ 408). The response relay is the buffered path's, with SSE detected
-    /// from the worker's Content-Type because the request's `stream` flag is
-    /// unread.
+    /// aborts the dispatch once the sender waits on the client for
+    /// `stream_stall_timeout` (→ 408; the clock pauses under worker
+    /// backpressure). The response relay is the buffered path's, with SSE
+    /// detected from the worker's Content-Type because the request's `stream`
+    /// flag is unread.
     async fn send_streamed_request(
         &self,
         headers: &HeaderMap,
@@ -1260,17 +1272,17 @@ impl Router {
         tokio::pin!(send);
         let sent = tokio::select! {
             sent = &mut send => sent,
-            () = progress.stalled(STREAM_PROGRESS_TIMEOUT) => {
+            () = progress.stalled(self.stream_stall_timeout) => {
+                let timeout_secs = self.stream_stall_timeout.map_or(0, |d| d.as_secs());
                 warn!(
-                    timeout_secs = STREAM_PROGRESS_TIMEOUT.as_secs(),
-                    "Streamed request body made no progress; aborting dispatch"
+                    timeout_secs,
+                    "Streamed request body stalled waiting on the client; aborting dispatch"
                 );
                 return error::create_error(
                     StatusCode::REQUEST_TIMEOUT,
                     STREAMED_BODY_STALLED,
                     format!(
-                        "No request body bytes were forwarded for {} seconds",
-                        STREAM_PROGRESS_TIMEOUT.as_secs()
+                        "No request body bytes arrived from the client for {timeout_secs} seconds"
                     ),
                 );
             }
@@ -2095,6 +2107,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             max_payload_size: 536_870_912,
+            stream_stall_timeout: Some(Duration::from_secs(60)),
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
@@ -2291,6 +2304,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             max_payload_size,
+            stream_stall_timeout: Some(Duration::from_secs(60)),
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
