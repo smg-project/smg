@@ -29,24 +29,37 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExecutionBranch {
+pub(crate) enum ExecutionBranch {
     NoHealthyWorkers,
     OccupiedHit,
     OccupiedMiss,
     Vacant,
     NoRoutingId,
+    CapRespill,
 }
 
 impl ExecutionBranch {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::NoHealthyWorkers => "no_healthy_workers",
             Self::OccupiedHit => "occupied_hit",
             Self::OccupiedMiss => "occupied_miss",
             Self::Vacant => "vacant",
             Self::NoRoutingId => "no_routing_id",
+            Self::CapRespill => "cap_respill",
         }
     }
+}
+
+/// Result of a non-mutating pin probe for a sticky key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinState {
+    /// A healthy pinned worker exists at this index.
+    Pinned(usize),
+    /// An entry exists but none of its candidates are healthy.
+    Stale,
+    /// No entry for this key.
+    Vacant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -154,9 +167,80 @@ impl ManualPolicy {
     fn select_new_worker(&self, workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
         match self.assignment_mode {
             ManualAssignmentMode::Random => random_select(healthy_indices),
-            ManualAssignmentMode::MinLoad => min_load_select(workers, healthy_indices),
+            ManualAssignmentMode::MinLoad | ManualAssignmentMode::Delegate => {
+                min_load_select(workers, healthy_indices)
+            }
             ManualAssignmentMode::MinGroup => min_group_select(workers, healthy_indices),
         }
+    }
+
+    pub(crate) fn assignment_mode(&self) -> ManualAssignmentMode {
+        self.assignment_mode
+    }
+
+    pub(crate) fn map_len(&self) -> usize {
+        self.routing_map.len()
+    }
+
+    /// Probe the pin for `key` without reassigning. Refreshes `last_access`
+    /// when an entry exists so probing counts as use.
+    pub(crate) fn peek_pin(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        key: &str,
+        healthy_indices: &[usize],
+    ) -> PinState {
+        match self.routing_map.get_mut(&RoutingId::new(key)) {
+            Some(mut entry) => {
+                entry.last_access = Instant::now();
+                match find_healthy_worker(&entry.candi_worker_urls, workers, healthy_indices) {
+                    Some(idx) => PinState::Pinned(idx),
+                    None => PinState::Stale,
+                }
+            }
+            None => PinState::Vacant,
+        }
+    }
+
+    /// Pin `key` to `url` as the primary candidate, keeping the previous
+    /// primary as bounded failover. Used by delegated assignment and
+    /// cap-respill, where the pin must follow the latest dispatch.
+    pub(crate) fn pin_front(&self, key: &str, url: &str) {
+        match self.routing_map.entry(RoutingId::new(key)) {
+            Entry::Occupied(mut entry) => {
+                let node = entry.get_mut();
+                node.candi_worker_urls.retain(|u| u != url);
+                node.candi_worker_urls.insert(0, url.to_string());
+                node.candi_worker_urls.truncate(MAX_CANDIDATE_WORKERS);
+                node.last_access = Instant::now();
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(Node {
+                    candi_worker_urls: vec![url.to_string()],
+                    last_access: Instant::now(),
+                });
+            }
+        }
+    }
+
+    /// Assign a worker for `key` via this policy's assignment mode, recording
+    /// the pin exactly like keyed selection does.
+    pub(crate) fn assign_pin(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        key: &str,
+        healthy_indices: &[usize],
+    ) -> (usize, ExecutionBranch) {
+        self.select_by_routing_id(workers, key, healthy_indices)
+    }
+
+    /// Raw assignment via this policy's mode, without touching the pin map.
+    pub(crate) fn assign_index(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+    ) -> usize {
+        self.select_new_worker(workers, healthy_indices)
     }
 
     fn select_by_routing_id(
@@ -938,6 +1022,62 @@ mod tests {
             );
             assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
+    }
+
+    #[test]
+    fn test_pin_front_promotes_and_bounds_candidates() {
+        let policy = ManualPolicy::new();
+        policy.pin_front("k", "http://w1:8000");
+        policy.pin_front("k", "http://w2:8000");
+        let node = policy.routing_map.get(&RoutingId::new("k")).unwrap();
+        assert_eq!(node.candi_worker_urls, ["http://w2:8000", "http://w1:8000"]);
+        drop(node);
+
+        // Re-pinning an existing candidate moves it to the front, deduped.
+        policy.pin_front("k", "http://w1:8000");
+        let node = policy.routing_map.get(&RoutingId::new("k")).unwrap();
+        assert_eq!(node.candi_worker_urls, ["http://w1:8000", "http://w2:8000"]);
+        drop(node);
+
+        policy.pin_front("k", "http://w3:8000");
+        let node = policy.routing_map.get(&RoutingId::new("k")).unwrap();
+        assert_eq!(node.candi_worker_urls.len(), MAX_CANDIDATE_WORKERS);
+        assert_eq!(node.candi_worker_urls[0], "http://w3:8000");
+    }
+
+    #[test]
+    fn test_peek_pin_states() {
+        let policy = ManualPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let healthy = vec![0, 1];
+
+        assert_eq!(policy.peek_pin(&workers, "k", &healthy), PinState::Vacant);
+
+        policy.pin_front("k", "http://w2:8000");
+        assert_eq!(
+            policy.peek_pin(&workers, "k", &healthy),
+            PinState::Pinned(1)
+        );
+
+        workers[1].set_status(WorkerStatus::NotReady);
+        assert_eq!(policy.peek_pin(&workers, "k", &[0]), PinState::Stale);
+    }
+
+    #[test]
+    fn test_delegate_mode_standalone_assigns_min_load() {
+        // With no underlying policy to delegate to, delegate degrades to
+        // min-load assignment.
+        let policy = ManualPolicy::with_config(ManualConfig {
+            assignment_mode: ManualAssignmentMode::Delegate,
+            ..Default::default()
+        });
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        workers[0].increment_load();
+
+        let info = SelectWorkerInfo::default();
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(result, Some(1));
+        assert_eq!(branch, ExecutionBranch::NoRoutingId);
     }
 
     #[test]

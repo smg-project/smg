@@ -53,6 +53,12 @@ pub trait GenerationRequest: Send + Sync {
     fn routing_tokens(&self) -> Option<&[i32]> {
         None
     }
+
+    /// Client-provided request id, when the protocol carries one. Routing may
+    /// derive a session-affinity key from it; a batch reports its first id.
+    fn rid(&self) -> Option<&str> {
+        None
+    }
 }
 
 // ============================================================================

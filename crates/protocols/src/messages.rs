@@ -114,6 +114,10 @@ impl CreateMessageRequest {
 }
 
 impl GenerationRequest for CreateMessageRequest {
+    fn rid(&self) -> Option<&str> {
+        self.rid.as_deref()
+    }
+
     fn is_stream(&self) -> bool {
         self.stream.unwrap_or(false)
     }

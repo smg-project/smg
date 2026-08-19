@@ -191,7 +191,7 @@ impl PipelineStage for RequestExecutionStage {
         };
         ctx.state.load_guards = Some(LoadGuards::scaled(
             workers,
-            ctx.input.headers.as_ref(),
+            ctx.state.sticky_key.as_deref(),
             sub_requests,
         ));
 

@@ -452,12 +452,22 @@ pub enum ManualAssignmentMode {
     MinLoad,
     /// Select worker with minimum active routing keys
     MinGroup,
+    /// Delegate the first assignment for a key to the underlying routing
+    /// policy, then pin. With `--policy manual` (no underlying policy to
+    /// delegate to) this falls back to min-load.
+    Delegate,
 }
 
-/// Per-request sticky-routing override: when `X-SMG-Routing-Key` is present, any
+/// Per-request sticky-routing override: when a sticky key is present, any
 /// eligible policy routes via manual sticky-map semantics. Reuses the manual
 /// policy knobs for the sticky map; eviction defaults match the manual policy so
 /// config-file users with only `enabled: true` still get TTL eviction (no leak).
+///
+/// Key priority is fixed: a key derived from the typed body's `rid` (per-turn
+/// `_t<n>` and per-retry `_r<n>` suffixes stripped, so every turn of a
+/// conversation shares one key) wins over `X-SMG-Routing-Key`; the header is
+/// the fallback when no rid is present. Raw-streamed requests have no readable
+/// body and therefore derive keys from the header only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingKeyOverrideConfig {
     /// When false, policies are used unchanged.
@@ -467,8 +477,14 @@ pub struct RoutingKeyOverrideConfig {
     pub eviction_interval_secs: u64,
     #[serde(default = "default_manual_max_idle_secs")]
     pub max_idle_secs: u64,
-    #[serde(default)]
+    /// Defaults to `delegate`: first-seen keys route via the underlying
+    /// policy, then pin.
+    #[serde(default = "default_override_assignment_mode")]
     pub assignment_mode: ManualAssignmentMode,
+}
+
+fn default_override_assignment_mode() -> ManualAssignmentMode {
+    ManualAssignmentMode::Delegate
 }
 
 impl Default for RoutingKeyOverrideConfig {
@@ -477,7 +493,7 @@ impl Default for RoutingKeyOverrideConfig {
             enabled: false,
             eviction_interval_secs: default_manual_eviction_interval_secs(),
             max_idle_secs: default_manual_max_idle_secs(),
-            assignment_mode: ManualAssignmentMode::default(),
+            assignment_mode: default_override_assignment_mode(),
         }
     }
 }
@@ -1206,6 +1222,55 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.stream_body_stall_timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_routing_key_override_serde_default_and_roundtrip() {
+        // Config files with only `enabled` deserialize to the defaults.
+        let json: serde_json::Value = serde_json::json!({ "enabled": true });
+        let cfg: RoutingKeyOverrideConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.assignment_mode, ManualAssignmentMode::Delegate);
+
+        let cfg = RoutingKeyOverrideConfig {
+            enabled: true,
+            assignment_mode: ManualAssignmentMode::MinLoad,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let roundtripped: RoutingKeyOverrideConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.assignment_mode, ManualAssignmentMode::MinLoad);
+    }
+
+    #[test]
+    fn delegate_assignment_mode_survives_serde_roundtrip() {
+        let json = serde_json::to_string(&ManualAssignmentMode::Delegate).unwrap();
+        assert_eq!(json, "\"delegate\"");
+        let back: ManualAssignmentMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ManualAssignmentMode::Delegate);
+
+        let cfg = RoutingKeyOverrideConfig {
+            enabled: true,
+            assignment_mode: ManualAssignmentMode::Delegate,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let roundtripped: RoutingKeyOverrideConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.assignment_mode, ManualAssignmentMode::Delegate);
+    }
+
+    #[test]
+    fn assignment_mode_defaults_split_by_context() {
+        // Manual policy standalone keeps random; the override sticky map
+        // defaults to delegate. Both are operator-visible defaults.
+        assert_eq!(
+            ManualAssignmentMode::default(),
+            ManualAssignmentMode::Random
+        );
+        assert_eq!(
+            RoutingKeyOverrideConfig::default().assignment_mode,
+            ManualAssignmentMode::Delegate
+        );
     }
 
     #[test]

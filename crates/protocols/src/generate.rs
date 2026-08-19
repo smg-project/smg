@@ -203,6 +203,10 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
 }
 
 impl GenerationRequest for GenerateRequest {
+    fn rid(&self) -> Option<&str> {
+        self.rid.as_deref()
+    }
+
     fn is_stream(&self) -> bool {
         self.stream
     }

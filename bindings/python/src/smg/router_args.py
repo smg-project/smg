@@ -68,7 +68,8 @@ class RouterArgs:
     least_load_default_throughput: float = 2000.0
     least_load_mean_prefill_tokens: int = 1024
     max_idle_secs: int = 4 * 3600
-    assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
+    # Routing-key assignment; defaults: random (manual policy), delegate (override)
+    assignment_mode: str | None = None
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
@@ -576,10 +577,12 @@ class RouterArgs:
             f"--{prefix}assignment-mode",
             type=str,
             default=RouterArgs.assignment_mode,
-            choices=["random", "min_load", "min_group"],
+            choices=["random", "min_load", "min_group", "delegate"],
             help=(
-                "Mode for assigning new routing keys in manual policy: random (default),"
-                " min_load (worker with fewest requests), min_group (worker with fewest routing keys)"
+                "Mode for assigning new routing keys: random, min_load (fewest"
+                " requests), min_group (fewest routing keys), delegate (route via"
+                " the underlying policy, then pin). Defaults to random for the"
+                " manual policy and delegate for the routing-key override"
             ),
         )
         routing_group.add_argument(

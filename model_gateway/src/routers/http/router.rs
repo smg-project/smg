@@ -229,6 +229,7 @@ impl Router {
         text: Option<&str>,
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
+        rid_key: Option<&str>,
     ) -> Option<Arc<dyn Worker>> {
         // UNKNOWN_MODEL_ID means caller didn't specify a model — find any available worker
         let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
@@ -267,6 +268,7 @@ impl Router {
                 tokens,
                 headers,
                 routing_key: header_utils::extract_routing_key_hint(headers),
+                rid_key,
                 hash_ring,
                 leg: crate::policies::WorkerLeg::Single,
             },
@@ -367,6 +369,7 @@ impl Router {
         let text = routing_tokens
             .is_none()
             .then(|| typed_req.extract_text_for_routing());
+        let rid_key = self.policy_registry.derive_rid_key(typed_req.rid());
         // Resolve once, here, so every registry, policy and metrics lookup
         // below is keyed by the canonical model ID. Only `get_by_model`
         // understands aliases; retry configs, hash rings and policies do not,
@@ -406,6 +409,7 @@ impl Router {
                         is_stream,
                         text.as_deref(),
                         routing_tokens.as_deref(),
+                        rid_key,
                     )
                     .await;
 
@@ -471,8 +475,9 @@ impl Router {
         is_stream: bool,
         text: Option<&str>,
         tokens: Option<&[u32]>,
+        rid_key: Option<&str>,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, text, tokens, headers) {
+        let worker = match self.select_worker_for_model(model_id, text, tokens, headers, rid_key) {
             Some(w) => w,
             None => {
                 // Distinguish "no workers for this model" from "workers exist but unavailable"
@@ -499,7 +504,12 @@ impl Router {
             }
         };
 
-        let load_guard = WorkerLoadGuard::new(worker.clone(), headers);
+        // Keyed-load accounting uses the same effective key as selection:
+        // rid-derived first, header fallback.
+        let load_guard = WorkerLoadGuard::with_key(
+            worker.clone(),
+            rid_key.or_else(|| header_utils::extract_routing_key_hint(headers)),
+        );
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -775,6 +785,7 @@ impl Router {
                 tokens: hinted_tokens.as_deref(),
                 headers,
                 routing_key: header_utils::extract_routing_key_hint(headers),
+                rid_key: None,
                 hash_ring,
                 leg: crate::policies::WorkerLeg::Single,
             },
@@ -1570,12 +1581,15 @@ impl Router {
         }
         // Buffered-path parity: a valid tokens hint is exactly what selection
         // would have received there (text is never extracted alongside it).
+        // Streamed requests have no readable body, hence no rid key; the
+        // sticky override keys them by the header alone.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
         let Some(worker) = self.select_worker_for_model(
             model_id,
             None,
             hinted_tokens.as_deref(),
             Some(req.headers()),
+            None,
         ) else {
             return Err(req);
         };

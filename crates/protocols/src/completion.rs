@@ -212,6 +212,10 @@ fn validate_completion_cross_parameters(
 }
 
 impl GenerationRequest for CompletionRequest {
+    fn rid(&self) -> Option<&str> {
+        self.rid.as_deref()
+    }
+
     fn is_stream(&self) -> bool {
         self.stream
     }

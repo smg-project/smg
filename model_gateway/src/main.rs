@@ -265,9 +265,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 14400, help_heading = "Routing Policy")]
     max_idle_secs: u64,
 
-    /// Assignment mode for manual policy when encountering a new routing key
-    #[arg(long, default_value = "random", value_parser = ["random", "min_load", "min_group"], help_heading = "Routing Policy")]
-    assignment_mode: String,
+    /// Assignment mode for a new routing key. Defaults to random for the
+    /// manual policy and delegate for the routing-key override sticky map
+    #[arg(long, value_parser = ["random", "min_load", "min_group", "delegate"], help_heading = "Routing Policy")]
+    assignment_mode: Option<String>,
 
     /// Number of prefix tokens to use for prefix_hash policy, or four times
     /// as many characters of the prompt when the request is untokenized
@@ -307,8 +308,11 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
 
-    /// Honor X-SMG-Routing-Key for sticky routing on any policy (reuses the
-    /// manual eviction/idle/assignment knobs for the sticky map)
+    /// Honor a sticky routing key on any policy (reuses the manual
+    /// eviction/idle/assignment knobs for the sticky map). The key is derived
+    /// from the request body's rid with per-turn/per-retry suffixes stripped,
+    /// falling back to X-SMG-Routing-Key when no rid is present; raw-streamed
+    /// requests carry no readable rid and use the header only
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     routing_key_override: bool,
 
@@ -1231,7 +1235,10 @@ impl CliArgs {
             "manual" => PolicyConfig::Manual {
                 eviction_interval_secs: self.eviction_interval,
                 max_idle_secs: self.max_idle_secs,
-                assignment_mode: Self::parse_assignment_mode(&self.assignment_mode),
+                assignment_mode: Self::parse_assignment_mode(
+                    self.assignment_mode.as_deref(),
+                    ManualAssignmentMode::Random,
+                ),
             },
             _ => PolicyConfig::RoundRobin,
         }
@@ -1241,11 +1248,16 @@ impl CliArgs {
         clippy::panic,
         reason = "unreachable: clap value_parser restricts valid assignment modes"
     )]
-    fn parse_assignment_mode(mode: &str) -> ManualAssignmentMode {
+    fn parse_assignment_mode(
+        mode: Option<&str>,
+        default: ManualAssignmentMode,
+    ) -> ManualAssignmentMode {
+        let Some(mode) = mode else { return default };
         match mode {
             "random" => ManualAssignmentMode::Random,
             "min_load" => ManualAssignmentMode::MinLoad,
             "min_group" => ManualAssignmentMode::MinGroup,
+            "delegate" => ManualAssignmentMode::Delegate,
             other => panic!("Unknown assignment mode: {other}"),
         }
     }
@@ -1663,7 +1675,10 @@ impl CliArgs {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval,
                 max_idle_secs: self.max_idle_secs,
-                assignment_mode: Self::parse_assignment_mode(&self.assignment_mode),
+                assignment_mode: Self::parse_assignment_mode(
+                    self.assignment_mode.as_deref(),
+                    ManualAssignmentMode::Delegate,
+                ),
             })
             .retries(!self.disable_retries)
             .upstream_http2(self.upstream_http2)
@@ -1960,6 +1975,48 @@ mod tests {
 
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.stream_body_stall_timeout_secs, 300);
+    }
+
+    #[test]
+    fn routing_key_flags_flow_into_router_config() {
+        // The override enables with no other configuration; the sticky map
+        // defaults to delegate while the manual policy default stays random.
+        let cli = cli_args_from(&["--routing-key-override"]);
+        let config = cli.to_router_config(vec![], vec![]).unwrap();
+        let override_cfg = &config.routing_key_override;
+        assert!(override_cfg.enabled);
+        assert_eq!(override_cfg.assignment_mode, ManualAssignmentMode::Delegate);
+
+        // An explicit --assignment-mode overrides the sticky-map default.
+        let explicit = cli_args_from(&["--routing-key-override", "--assignment-mode", "min_load"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert_eq!(
+            explicit.routing_key_override.assignment_mode,
+            ManualAssignmentMode::MinLoad
+        );
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(!defaults.routing_key_override.enabled);
+    }
+
+    #[test]
+    fn manual_policy_assignment_default_stays_random() {
+        // One invocation, both contexts: the manual policy keeps its random
+        // default while the override sticky map defaults to delegate.
+        let config = cli_args_from(&["--policy", "manual", "--routing-key-override"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        match &config.policy {
+            PolicyConfig::Manual {
+                assignment_mode, ..
+            } => assert_eq!(*assignment_mode, ManualAssignmentMode::Random),
+            other => panic!("expected manual policy, got {other:?}"),
+        }
+        assert_eq!(
+            config.routing_key_override.assignment_mode,
+            ManualAssignmentMode::Delegate
+        );
     }
 
     /// `--health-check-port` must flow into BOTH conversion paths
