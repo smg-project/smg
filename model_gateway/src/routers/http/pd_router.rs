@@ -634,7 +634,7 @@ impl PDRouter {
         let effective_key = context
             .rid_key
             .as_deref()
-            .or_else(|| crate::routers::common::header_utils::extract_routing_key_hint(headers));
+            .or_else(|| header_utils::extract_routing_key_hint(headers));
         let load_guards = vec![
             WorkerLoadGuard::with_key(prefill.clone(), effective_key),
             WorkerLoadGuard::with_key(decode.clone(), effective_key),

@@ -160,10 +160,7 @@ impl PolicyRegistry {
     /// Resolve the effective sticky key: the rid-derived key wins, the header
     /// is the fallback when no rid is present. Header keys go through the
     /// same validated extraction the policies use.
-    fn effective_sticky_key<'a>(
-        &self,
-        info: &SelectWorkerInfo<'a>,
-    ) -> Option<(&'a str, &'static str)> {
+    fn effective_sticky_key<'a>(info: &SelectWorkerInfo<'a>) -> Option<(&'a str, &'static str)> {
         info.rid_key.map(|k| (k, "rid")).or_else(|| {
             info.routing_key
                 .or_else(|| extract_routing_key_hint(info.headers))
@@ -184,8 +181,8 @@ impl PolicyRegistry {
     ) -> Option<usize> {
         if let Some(sticky) = self.routing_key_sticky.as_ref() {
             if Self::routing_key_override_applies(policy.name()) {
-                if let Some((key, source)) = self.effective_sticky_key(info) {
-                    return self.select_sticky(sticky, policy, workers, info, key, source);
+                if let Some((key, source)) = Self::effective_sticky_key(info) {
+                    return Self::select_sticky(sticky, policy, workers, info, key, source);
                 }
             }
         }
@@ -196,7 +193,6 @@ impl PolicyRegistry {
     /// otherwise assign — via the underlying policy in `delegate` mode, via
     /// the sticky map's own assignment mode otherwise — and pin the result.
     fn select_sticky(
-        &self,
         sticky: &Arc<ManualPolicy>,
         policy: &Arc<dyn LoadBalancingPolicy>,
         workers: &[Arc<dyn Worker>],
