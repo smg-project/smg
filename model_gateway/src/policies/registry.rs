@@ -21,7 +21,7 @@ use crate::{
     config::types::{PolicyConfig, RoutingKeyOverrideConfig},
     mesh::adapters::TreeSyncAdapter,
     policies::cache_aware::LoadReceiver,
-    routers::common::header_utils::extract_routing_key_hint,
+    routers::common::header_utils::{extract_routing_key_hint, parse_routing_tokens_hint},
     worker::{KvEventMonitor, Worker},
 };
 
@@ -510,23 +510,38 @@ impl PolicyRegistry {
             .unwrap_or_else(|| PolicyFactory::create_from_config(&PolicyConfig::ConsistentHashing))
     }
 
+    /// Whether any registered policy (default or per-model) routes on
+    /// request text this request cannot supply. Content-blind dispatch must
+    /// stay buffered when one does: the model inside the unread body could
+    /// select that policy. A routing hint lifts the requirement — with a
+    /// valid `x-smg-routing-tokens` the buffered path never extracts text
+    /// either (the hint wins over body-derived routing), and a valid
+    /// `x-smg-routing-key` under the sticky override supersedes the policy
+    /// before it reads text. Hints are validated by the same extractors
+    /// selection uses, so malformed or over-cap values lift nothing.
+    pub fn any_policy_needs_request_text(&self, headers: Option<&http::HeaderMap>) -> bool {
+        if parse_routing_tokens_hint(headers).is_some() {
+            return false;
+        }
+        let keyed_override =
+            self.routing_key_sticky.is_some() && extract_routing_key_hint(headers).is_some();
+        let needs_text = |policy: &Arc<dyn LoadBalancingPolicy>| {
+            policy.needs_request_text()
+                && !(keyed_override && Self::routing_key_override_applies(policy.name()))
+        };
+        needs_text(&self.default_policy)
+            || self
+                .model_policies
+                .iter()
+                .any(|entry| needs_text(entry.value()))
+    }
+
     /// Get all load-aware policies that need periodic load updates (lock-free).
     ///
     /// Membership is policy-reported via
     /// [`LoadBalancingPolicy::needs_backend_loads`]: `power_of_two` and
     /// `least_load` always consume load reports; `cache_aware` does when its
     /// pressure knobs are configured.
-    /// Whether any registered policy (default or per-model) routes on
-    /// request text. Content-blind dispatch must stay buffered when one
-    /// does: the model inside the unread body could select that policy.
-    pub fn any_policy_needs_request_text(&self) -> bool {
-        self.default_policy.needs_request_text()
-            || self
-                .model_policies
-                .iter()
-                .any(|entry| entry.value().needs_request_text())
-    }
-
     pub fn get_all_load_aware_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
         let mut policies = Vec::new();
 
@@ -812,6 +827,74 @@ mod tests {
         let a = reg.select_worker(&policy, &workers, &info).unwrap();
         let b = reg.select_worker(&policy, &workers, &info).unwrap();
         assert_ne!(a, b);
+    }
+
+    fn cache_aware_config() -> PolicyConfig {
+        PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 4096,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+        }
+    }
+
+    fn headers_with_tokens(value: &str) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        h.insert("x-smg-routing-tokens", value.parse().unwrap());
+        h
+    }
+
+    fn enabled_override() -> RoutingKeyOverrideConfig {
+        RoutingKeyOverrideConfig {
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn request_text_scan_is_false_for_text_free_policies() {
+        let reg = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        assert!(!reg.any_policy_needs_request_text(None));
+        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_key("k"))));
+    }
+
+    #[test]
+    fn tokens_hint_lifts_text_requirement_only_when_valid() {
+        let reg = PolicyRegistry::new(cache_aware_config());
+        assert!(reg.any_policy_needs_request_text(None));
+        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_tokens("1,2,3"))));
+        // Malformed and over-cap hints are ignored, exactly like selection.
+        assert!(reg.any_policy_needs_request_text(Some(&headers_with_tokens("1,,3"))));
+        let over_cap = vec!["7"; 513].join(",");
+        assert!(reg.any_policy_needs_request_text(Some(&headers_with_tokens(&over_cap))));
+    }
+
+    #[test]
+    fn key_hint_lifts_text_requirement_only_under_enabled_override() {
+        let without = PolicyRegistry::new(cache_aware_config());
+        assert!(without.any_policy_needs_request_text(Some(&headers_with_key("session-A"))));
+
+        let with = PolicyRegistry::with_override(cache_aware_config(), enabled_override());
+        assert!(with.any_policy_needs_request_text(None));
+        assert!(!with.any_policy_needs_request_text(Some(&headers_with_key("session-A"))));
+        let over_cap = "k".repeat(129);
+        assert!(with.any_policy_needs_request_text(Some(&headers_with_key(&over_cap))));
+    }
+
+    #[test]
+    fn per_model_text_policy_scanned_with_the_same_hint_rules() {
+        let reg = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
+        assert!(!reg.any_policy_needs_request_text(None));
+        reg.on_worker_added("llama-3", Some("cache_aware"));
+        assert!(reg.any_policy_needs_request_text(None));
+        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_tokens("1,2,3"))));
+        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_key("session-A"))));
     }
 
     #[test]

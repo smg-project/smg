@@ -52,9 +52,11 @@ pub struct RouterConfig {
     pub max_payload_size: usize,
     /// Forward request bodies larger than this many bytes to the worker as a
     /// raw stream instead of buffering, when the route's policy needs no
-    /// request text and the worker applies no body mutation. Streamed bodies
-    /// cannot be replayed, so those requests bypass router-level retries;
-    /// bodies without a Content-Length header always buffer. `0` disables.
+    /// request text — or the request carries a valid routing hint header
+    /// that stands in for it — and the worker applies no body mutation.
+    /// Streamed bodies cannot be replayed, so those requests bypass
+    /// router-level retries; bodies without a Content-Length header always
+    /// buffer. `0` disables.
     #[serde(default)]
     pub stream_request_bodies_over: u64,
     /// Abort a streamed request body once the upstream sender has waited on
