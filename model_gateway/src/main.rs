@@ -526,13 +526,15 @@ struct CliArgs {
 
     /// Forward request bodies larger than this many bytes to the worker as a
     /// raw stream instead of buffering, when the route's policy needs no
-    /// request text and the worker applies no body mutation. Streamed bodies
-    /// are forwarded verbatim, so JSON validation and normalization defer to
-    /// the worker, and they cannot be replayed, so those requests bypass
-    /// router-level retries; bodies without a Content-Length header always
-    /// buffer. WASM OnRequest modules inspect buffered bodies, so deployments
-    /// running them keep buffering (and their own body-size cap) ahead of
-    /// this. Must be below max-payload-size. 0 disables
+    /// request text — or the request carries a valid x-smg-routing-tokens
+    /// hint, or a valid x-smg-routing-key under --routing-key-override — and
+    /// the worker applies no body mutation. Streamed bodies are forwarded
+    /// verbatim, so JSON validation and normalization defer to the worker,
+    /// and they cannot be replayed, so those requests bypass router-level
+    /// retries; bodies without a Content-Length header always buffer. WASM
+    /// OnRequest modules inspect buffered bodies, so deployments running
+    /// them keep buffering (and their own body-size cap) ahead of this.
+    /// Must be below max-payload-size. 0 disables
     #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
     stream_request_bodies_over: u64,
 

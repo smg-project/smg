@@ -1546,10 +1546,14 @@ impl Router {
     ) -> Result<Response, Request<Body>> {
         // Content-blind eligibility: the model and stream flag sit inside the
         // unread body, so any registered policy that routes on request text
-        // (the body's model could select it) forces the buffered path, and
-        // every fallback hands the request back with its body unconsumed.
+        // (the body's model could select it) forces the buffered path unless
+        // a valid routing hint header stands in for the text. Every fallback
+        // hands the request back with its body unconsumed.
         let model_id = crate::worker::UNKNOWN_MODEL_ID;
-        if self.policy_registry.any_policy_needs_request_text() {
+        if self
+            .policy_registry
+            .any_policy_needs_request_text(Some(req.headers()))
+        {
             return Err(req);
         }
         // A body-mutating worker (`prepare_request`) anywhere in the fleet
@@ -1564,8 +1568,15 @@ impl Router {
         if candidates.iter().any(|w| w.mutates_request()) {
             return Err(req);
         }
-        let Some(worker) = self.select_worker_for_model(model_id, None, None, Some(req.headers()))
-        else {
+        // Buffered-path parity: a valid tokens hint is exactly what selection
+        // would have received there (text is never extracted alongside it).
+        let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
+        let Some(worker) = self.select_worker_for_model(
+            model_id,
+            None,
+            hinted_tokens.as_deref(),
+            Some(req.headers()),
+        ) else {
             return Err(req);
         };
         // Guards a registration race: a mutating worker that joined after the
@@ -2004,7 +2015,11 @@ mod tests {
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
-    use crate::{config::types::PolicyConfig, worker::BasicWorkerBuilder};
+    use crate::{
+        config::types::{PolicyConfig, RoutingKeyOverrideConfig},
+        policies::CacheAwarePolicy,
+        worker::BasicWorkerBuilder,
+    };
 
     /// Accepts `kill_first` connections and closes them before any response
     /// bytes, then serves a minimal 200 on every later connection. Returns
@@ -2293,8 +2308,37 @@ mod tests {
         max_payload_size: usize,
         workers: Vec<crate::worker::BasicWorker>,
     ) -> Router {
+        streaming_router_with_registry(
+            Arc::new(PolicyRegistry::new(policy)),
+            max_payload_size,
+            workers,
+        )
+    }
+
+    fn streaming_router_with_key_override(
+        policy: PolicyConfig,
+        max_payload_size: usize,
+        workers: Vec<crate::worker::BasicWorker>,
+    ) -> Router {
+        streaming_router_with_registry(
+            Arc::new(PolicyRegistry::with_override(
+                policy,
+                RoutingKeyOverrideConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            )),
+            max_payload_size,
+            workers,
+        )
+    }
+
+    fn streaming_router_with_registry(
+        policy_registry: Arc<PolicyRegistry>,
+        max_payload_size: usize,
+        workers: Vec<crate::worker::BasicWorker>,
+    ) -> Router {
         let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(policy));
         for worker in workers {
             worker_registry.register_or_replace(Arc::new(worker));
         }
@@ -2578,6 +2622,150 @@ mod tests {
             vec![plain_worker("http://worker1:8080")],
         );
         assert_falls_back_with_body_intact(&router).await;
+    }
+
+    fn with_header(mut req: Request<Body>, name: &'static str, value: &str) -> Request<Body> {
+        req.headers_mut().insert(name, value.parse().unwrap());
+        req
+    }
+
+    async fn routed_worker_id(router: &Router, req: Request<Body>) -> String {
+        let response = router
+            .route_streaming_request(req, "/generate")
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response
+            .headers()
+            .get("x-smg-routed-worker-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn tokens_hint_streams_under_cache_aware_with_tree_affinity() {
+        let (url_a, _cap_a) = spawn_capture_stub("application/json", "{}").await;
+        let (url_b, _cap_b) = spawn_capture_stub("application/json", "{}").await;
+        let router = streaming_router(
+            cache_aware_policy(),
+            1024 * 1024,
+            vec![plain_worker(&url_a), plain_worker(&url_b)],
+        );
+        let workers = router.worker_registry.get_all();
+        router
+            .policy_registry
+            .get_default_policy()
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .unwrap()
+            .init_workers(&workers);
+
+        // The token tree pages by 16, so shorter hints train no affinity.
+        let hint: String = (1..=32u32)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let first = routed_worker_id(
+            &router,
+            with_header(
+                streamed_request(&[b"{\"text\":\"hello\"}"]),
+                "x-smg-routing-tokens",
+                &hint,
+            ),
+        )
+        .await;
+        let second = routed_worker_id(
+            &router,
+            with_header(
+                streamed_request(&[b"{\"text\":\"other\"}"]),
+                "x-smg-routing-tokens",
+                &hint,
+            ),
+        )
+        .await;
+        assert_eq!(first, second, "same hint must stick to the tree tenant");
+    }
+
+    #[tokio::test]
+    async fn invalid_tokens_hint_keeps_text_needing_policy_buffered() {
+        let router = streaming_router(
+            cache_aware_policy(),
+            1024 * 1024,
+            vec![plain_worker("http://worker1:8080")],
+        );
+        let over_cap = vec!["7"; 513].join(",");
+        for hint in ["1,,3", over_cap.as_str()] {
+            let req = with_header(
+                streamed_request(&[b"{\"text\":\"hello\"}"]),
+                "x-smg-routing-tokens",
+                hint,
+            );
+            let req = router
+                .route_streaming_request(req, "/generate")
+                .await
+                .unwrap_err();
+            let body = to_bytes(req.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(body.as_ref(), b"{\"text\":\"hello\"}");
+        }
+    }
+
+    #[tokio::test]
+    async fn key_hint_streams_under_cache_aware_only_with_override() {
+        // Without the sticky override nothing consumes the key content-blind.
+        let router = streaming_router(
+            cache_aware_policy(),
+            1024 * 1024,
+            vec![plain_worker("http://worker1:8080")],
+        );
+        let req = with_header(
+            streamed_request(&[b"{\"text\":\"hello\"}"]),
+            "x-smg-routing-key",
+            "media-1",
+        );
+        assert!(router
+            .route_streaming_request(req, "/generate")
+            .await
+            .is_err());
+
+        let (url_a, _cap_a) = spawn_capture_stub("application/json", "{}").await;
+        let (url_b, _cap_b) = spawn_capture_stub("application/json", "{}").await;
+        let router = streaming_router_with_key_override(
+            cache_aware_policy(),
+            1024 * 1024,
+            vec![plain_worker(&url_a), plain_worker(&url_b)],
+        );
+        let first = routed_worker_id(
+            &router,
+            with_header(
+                streamed_request(&[b"{\"text\":\"hello\"}"]),
+                "x-smg-routing-key",
+                "media-1",
+            ),
+        )
+        .await;
+        let second = routed_worker_id(
+            &router,
+            with_header(
+                streamed_request(&[b"{\"text\":\"other\"}"]),
+                "x-smg-routing-key",
+                "media-1",
+            ),
+        )
+        .await;
+        assert_eq!(first, second, "keyed requests must stick to one worker");
+
+        // Over-cap keys are ignored by the same extractor selection uses.
+        let req = with_header(
+            streamed_request(&[b"{\"text\":\"hello\"}"]),
+            "x-smg-routing-key",
+            &"k".repeat(129),
+        );
+        assert!(router
+            .route_streaming_request(req, "/generate")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
