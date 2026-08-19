@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use reqwest::Client;
+use smg_grpc_client::connect_channel_with_timeout;
 
 use crate::routers::grpc::client::GrpcClient;
 
@@ -113,12 +114,34 @@ pub(crate) async fn do_grpc_health_check(
     Ok(())
 }
 
+/// Dial the endpoint once to decide whether it is worth probing per-runtime.
+///
+/// All five runtime clients dial the same authority, so an endpoint that
+/// cannot be reached at the transport level fails five identical connects.
+/// One dial answers that question, which matters during a mass worker
+/// registration: an unready pod that black-holes SYN would otherwise hold
+/// five in-flight sockets per attempt instead of one.
+async fn grpc_transport_reachable(grpc_url: &str, timeout_secs: u64) -> Result<(), String> {
+    let timeout = Duration::from_secs(timeout_secs);
+    let connect_future = connect_channel_with_timeout(grpc_url, timeout);
+    tokio::time::timeout(timeout, connect_future)
+        .await
+        .map_err(|_| "gRPC connection timeout".to_string())?
+        .map_err(|e| format!("gRPC connection failed: {e}"))?;
+    Ok(())
+}
+
 /// Check if gRPC is reachable by trying all known runtime types in parallel.
 ///
 /// We don't care which runtime it is here — that's `DetectBackendStep`'s job.
 /// We just need to know: does this endpoint speak gRPC at all?
+///
+/// The per-runtime fan-out is gated behind a single transport probe so an
+/// unreachable endpoint costs one connect rather than five.
 pub(crate) async fn try_grpc_reachable(url: &str, timeout_secs: u64) -> Result<(), String> {
     let grpc_url = grpc_reachable_url(url)?;
+
+    grpc_transport_reachable(&grpc_url, timeout_secs).await?;
 
     let (sglang, vllm, trtllm, mlx, tokenspeed) = tokio::join!(
         do_grpc_health_check(&grpc_url, timeout_secs, "sglang"),
@@ -186,5 +209,36 @@ mod tests {
     fn grpc_reachable_url_rejects_http_schemes() {
         assert!(grpc_reachable_url("http://localhost:30000").is_err());
         assert!(grpc_reachable_url("https://localhost:30000").is_err());
+    }
+
+    /// An endpoint that cannot be reached at the transport level must
+    /// short-circuit before the per-runtime fan-out, so one unreachable worker
+    /// costs one dial rather than five.
+    ///
+    /// The two failure paths are distinguishable by their error text, and only
+    /// the aggregate can be constructed *after* all five `do_grpc_health_check`
+    /// calls have run. So asserting the transport error — and the absence of any
+    /// runtime name — is what proves no per-runtime probe was started.
+    /// `192.0.2.1` is TEST-NET-1 (RFC 5737) and is not routable.
+    #[tokio::test]
+    async fn unreachable_transport_short_circuits_the_runtime_fanout() {
+        let err = try_grpc_reachable("grpc://192.0.2.1:1", 1)
+            .await
+            .expect_err("unroutable endpoint should not be reachable");
+
+        assert!(
+            err.starts_with("gRPC connection"),
+            "expected the transport-gate error, got: {err}"
+        );
+        assert!(
+            !err.contains("gRPC not reachable"),
+            "fan-out aggregate was produced, so the gate did not short-circuit: {err}"
+        );
+        for runtime in ["sglang", "vllm", "trtllm", "mlx", "tokenspeed"] {
+            assert!(
+                !err.contains(runtime),
+                "error names {runtime}, so a per-runtime probe ran: {err}"
+            );
+        }
     }
 }
