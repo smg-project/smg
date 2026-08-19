@@ -1072,6 +1072,54 @@ class TestPrefixHashArgs:
         assert router_args.prefix_hash_load_factor == 2.0
 
 
+class TestFlagAliases:
+    """Intent-revealing alias flags land on the same dests as the canonical names."""
+
+    def test_alias_flags_land_on_canonical_dests(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        namespace = parser.parse_args(
+            [
+                "--sticky-sessions",
+                "--worker-auto-recovery",
+                "--cache-match-threshold",
+                "0.6",
+                "--spill-abs-threshold",
+                "8",
+                "--spill-rel-threshold",
+                "1.2",
+                "--sticky-key-idle-secs",
+                "300",
+            ]
+        )
+        router_args = RouterArgs.from_cli_args(namespace)
+        assert router_args.routing_key_override is True
+        assert router_args.remove_unhealthy_workers is True
+        assert router_args.cache_threshold == 0.6
+        assert router_args.balance_abs_threshold == 8
+        assert router_args.balance_rel_threshold == 1.2
+        assert router_args.max_idle_secs == 300
+
+    def test_alias_flags_match_canonical_parse(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        canonical = RouterArgs.from_cli_args(
+            parser.parse_args(["--routing-key-override", "--cache-threshold", "0.6"])
+        )
+        aliased = RouterArgs.from_cli_args(
+            parser.parse_args(["--sticky-sessions", "--cache-match-threshold", "0.6"])
+        )
+        assert canonical == aliased
+
+    def test_alias_flags_honor_router_prefix(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(["--router-sticky-sessions", "--router-worker-auto-recovery"])
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+        assert router_args.routing_key_override is True
+        assert router_args.remove_unhealthy_workers is True
+
+
 class TestRouterArgsFieldOrder:
     """RouterArgs generates a positional __init__, so field order is a public
     contract: a mid-list insertion silently rebinds every later positional

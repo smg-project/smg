@@ -415,9 +415,13 @@ class RouterArgs:
         )
         routing_group.add_argument(
             f"--{prefix}cache-threshold",
+            f"--{prefix}cache-match-threshold",
             type=float,
             default=RouterArgs.cache_threshold,
-            help="Cache threshold (0.0-1.0) for cache-aware routing",
+            help=(
+                "Minimum matched-prefix share (0.0-1.0) before cache-aware routing"
+                " pins a request to a worker already holding that prefix"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}prefix-token-count",
@@ -479,19 +483,21 @@ class RouterArgs:
         )
         routing_group.add_argument(
             f"--{prefix}balance-abs-threshold",
+            f"--{prefix}spill-abs-threshold",
             type=int,
             default=RouterArgs.balance_abs_threshold,
             help=(
-                "Absolute threshold for load difference. Balancing is triggered if"
+                "Spill gate, absolute part. Balancing is triggered if"
                 " `(max_load - min_load) > abs_threshold` and the relative threshold is also met."
             ),
         )
         routing_group.add_argument(
             f"--{prefix}balance-rel-threshold",
+            f"--{prefix}spill-rel-threshold",
             type=float,
             default=RouterArgs.balance_rel_threshold,
             help=(
-                "Relative threshold for load difference. Balancing is triggered if"
+                "Spill gate, relative part. Balancing is triggered if"
                 " `max_load > min_load * rel_threshold` and the absolute threshold is also met."
             ),
         )
@@ -569,9 +575,13 @@ class RouterArgs:
         )
         routing_group.add_argument(
             f"--{prefix}max-idle-secs",
+            f"--{prefix}sticky-key-idle-secs",
             type=int,
             default=RouterArgs.max_idle_secs,
-            help="Maximum idle time in seconds before eviction (for manual policy)",
+            help=(
+                "How long an unused sticky routing key stays pinned: keys idle"
+                " beyond this many seconds are evicted from the sticky map"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}assignment-mode",
@@ -623,8 +633,13 @@ class RouterArgs:
         )
         routing_group.add_argument(
             f"--{prefix}routing-key-override",
+            f"--{prefix}sticky-sessions",
             action="store_true",
-            help="Honor X-SMG-Routing-Key for sticky routing on any policy",
+            help=(
+                "Sticky sessions: route every request of a conversation to the"
+                " same worker, on any policy (keys derived from the request-id"
+                " lineage, falling back to X-SMG-Routing-Key)"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}dp-minimum-tokens-scheduler",
@@ -1044,9 +1059,14 @@ class RouterArgs:
         )
         health_group.add_argument(
             f"--{prefix}remove-unhealthy-workers",
+            f"--{prefix}worker-auto-recovery",
             action="store_true",
             default=RouterArgs.remove_unhealthy_workers,
-            help="Remove workers from the registry when they are marked unhealthy",
+            help=(
+                "Let workers recover after prolonged failure: unhealthy workers"
+                " are removed so service discovery re-registers and re-probes"
+                " them once their engine returns"
+            ),
         )
         # Tokenizer configuration
         tokenizer_group.add_argument(
