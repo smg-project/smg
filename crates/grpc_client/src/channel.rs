@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 
 /// Convert a `grpc://` or `grpcs://` endpoint to a tonic-compatible
 /// `http://` or `https://` URI. Other schemes (or schemeless inputs) are
@@ -55,8 +55,18 @@ pub async fn connect_channel_with_timeout(
     endpoint: &str,
     connect_timeout: Duration,
 ) -> Result<Channel, Box<dyn std::error::Error + Send + Sync>> {
+    let channel = configured_endpoint(endpoint, connect_timeout)?
+        .connect()
+        .await?;
+    Ok(channel)
+}
+
+fn configured_endpoint(
+    endpoint: &str,
+    connect_timeout: Duration,
+) -> Result<Endpoint, tonic::transport::Error> {
     let http_endpoint = normalize_grpc_endpoint(endpoint);
-    let channel = Channel::from_shared(http_endpoint)?
+    Ok(Endpoint::from_shared(http_endpoint)?
         .connect_timeout(connect_timeout)
         .http2_keep_alive_interval(Duration::from_secs(30))
         .keep_alive_timeout(Duration::from_secs(10))
@@ -68,17 +78,40 @@ pub async fn connect_channel_with_timeout(
         // typical inference response (multi-MB tokenized payloads +
         // streaming chunks) without head-of-line blocking.
         .initial_stream_window_size(Some(16 * 1024 * 1024))
-        .initial_connection_window_size(Some(32 * 1024 * 1024))
-        .connect()
-        .await?;
-    Ok(channel)
+        .initial_connection_window_size(Some(32 * 1024 * 1024)))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        future::{pending, Pending},
+        io,
+        task::{Context, Poll},
+        time::{Duration, Instant},
+    };
 
-    use super::{connect_channel_with_timeout, normalize_grpc_endpoint, DEFAULT_CONNECT_TIMEOUT};
+    use hyper_util::rt::TokioIo;
+    use tokio::io::DuplexStream;
+    use tonic::codegen::{http::Uri, Service};
+
+    use super::{configured_endpoint, normalize_grpc_endpoint, DEFAULT_CONNECT_TIMEOUT};
+
+    #[derive(Clone, Copy)]
+    struct PendingConnector;
+
+    impl Service<Uri> for PendingConnector {
+        type Response = TokioIo<DuplexStream>;
+        type Error = io::Error;
+        type Future = Pending<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Uri) -> Self::Future {
+            pending()
+        }
+    }
 
     #[test]
     fn default_connect_timeout_is_below_the_kernel_syn_ceiling() {
@@ -87,19 +120,17 @@ mod tests {
         assert!(DEFAULT_CONNECT_TIMEOUT < Duration::from_secs(127));
     }
 
-    /// A dial to a black-holing peer must be bounded by the caller's
-    /// `connect_timeout` rather than by the kernel's SYN retry ceiling.
-    /// `192.0.2.1` is TEST-NET-1 (RFC 5737) and is not routable, so the connect
-    /// either fails fast with an unreachable error or is cut off by our
-    /// timeout — never hangs for the ~127s a retrying SYN would otherwise take.
+    /// A connector that never completes must be bounded by the caller's
+    /// `connect_timeout`.
     ///
     /// The upper bound has to sit *below* [`DEFAULT_CONNECT_TIMEOUT`], otherwise
     /// an implementation that silently ignored the argument and fell back to the
     /// default would still pass. `PROBE_TIMEOUT` is generous enough to absorb
     /// scheduler variance on a loaded CI box.
     #[tokio::test]
-    async fn connect_timeout_bounds_a_blackholed_dial() {
+    async fn connect_timeout_bounds_a_pending_connector() {
         const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+        const LOWER_BOUND: Duration = Duration::from_millis(200);
         const UPPER_BOUND: Duration = Duration::from_secs(2);
 
         // Guards the discriminating power of the assertion below: if the
@@ -112,10 +143,18 @@ mod tests {
         );
 
         let start = Instant::now();
-        let result = connect_channel_with_timeout("grpc://192.0.2.1:1", PROBE_TIMEOUT).await;
+        let result = configured_endpoint("grpc://unused.invalid", PROBE_TIMEOUT)
+            .expect("build test endpoint")
+            .connect_with_connector(PendingConnector)
+            .await;
         let elapsed = start.elapsed();
 
-        assert!(result.is_err(), "unroutable dial should not succeed");
+        assert!(result.is_err(), "pending connector should time out");
+        assert!(
+            elapsed >= LOWER_BOUND,
+            "dial failed in {elapsed:?}, before the {PROBE_TIMEOUT:?} timeout; \
+             the test did not exercise timeout handling"
+        );
         assert!(
             elapsed < UPPER_BOUND,
             "dial took {elapsed:?}, over the {UPPER_BOUND:?} bound; \

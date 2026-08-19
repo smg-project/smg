@@ -28,8 +28,7 @@ use std::sync::Arc;
 
 pub use abort_on_drop::{AbortOnDropClient, AbortOnDropStream};
 pub use channel::{
-    connect_channel, connect_channel_with_timeout, normalize_grpc_endpoint,
-    DEFAULT_CONNECT_TIMEOUT,
+    connect_channel, connect_channel_with_timeout, normalize_grpc_endpoint, DEFAULT_CONNECT_TIMEOUT,
 };
 pub use mlx_engine::{proto as mlx_proto, MlxEngineClient};
 pub use sglang_scheduler::{
