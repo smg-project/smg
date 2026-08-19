@@ -55,8 +55,12 @@ use crate::{
         metrics_server, otel_trace, runtime_metrics,
     },
     routers::{
-        common::realtime::ws::RealtimeQueryParams, conversations, parse,
-        responses as response_handlers, router_manager::RouterManager, tokenize, RouterTrait,
+        common::realtime::ws::RealtimeQueryParams,
+        conversations,
+        http::router::{stream_large_request_bodies, StreamBodyState},
+        parse, responses as response_handlers,
+        router_manager::RouterManager,
+        tokenize, RouterTrait,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
@@ -828,6 +832,12 @@ pub fn build_app(
             .route("/v1/messages", post(v1_messages))
             .route("/v1/interactions", post(v1_interactions))
             .route("/v1/classify", post(v1_classify))
+            // Streamed pass-through for large typed-JSON bodies; everything
+            // else passes to the handlers untouched.
+            .route_layer(axum::middleware::from_fn_with_state(
+                StreamBodyState::new(app_state.router.clone(), &app_state.context.router_config),
+                stream_large_request_bodies,
+            ))
             // Tokenize / Detokenize endpoints
             .route("/v1/tokenize", post(v1_tokenize))
             .route("/v1/detokenize", post(v1_detokenize))

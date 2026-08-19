@@ -50,6 +50,13 @@ pub struct RouterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_worker_threads: Option<usize>,
     pub max_payload_size: usize,
+    /// Forward request bodies larger than this many bytes to the worker as a
+    /// raw stream instead of buffering, when the route's policy needs no
+    /// request text and the worker applies no body mutation. Streamed bodies
+    /// cannot be replayed, so those requests bypass router-level retries;
+    /// bodies without a Content-Length header always buffer. `0` disables.
+    #[serde(default)]
+    pub stream_request_bodies_over: u64,
     pub request_timeout_secs: u64,
     /// Idle timeout for pooled upstream connections. Must stay below the
     /// backend HTTP server's keep-alive timeout (vLLM and SGLang default to
@@ -900,7 +907,8 @@ impl Default for RouterConfig {
             health_check_port: None,
             runtime_worker_threads: None,
             max_payload_size: 536_870_912, // 512MB
-            request_timeout_secs: 1800,    // 30 minutes
+            stream_request_bodies_over: 0,
+            request_timeout_secs: 1800, // 30 minutes
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_delay_secs: 0,
@@ -1052,6 +1060,7 @@ mod tests {
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 3001);
         assert_eq!(config.max_payload_size, 536_870_912);
+        assert_eq!(config.stream_request_bodies_over, 0);
         assert_eq!(config.request_timeout_secs, 1800);
         assert_eq!(config.upstream_pool_idle_timeout_secs, 3);
         assert_eq!(config.worker_startup_timeout_secs, 1800);
@@ -1142,6 +1151,27 @@ mod tests {
         assert!(json.contains("health_check_port"));
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.health_check_port, Some(8081));
+    }
+
+    #[test]
+    fn test_stream_request_bodies_over_serde_roundtrip_and_backward_compat() {
+        // Config files predating the field deserialize to the disabled default.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("stream_request_bodies_over")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.stream_request_bodies_over, 0);
+
+        // When set, the value round-trips.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .stream_request_bodies_over(4 * 1024 * 1024)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.stream_request_bodies_over, 4 * 1024 * 1024);
     }
 
     #[test]

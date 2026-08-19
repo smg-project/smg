@@ -214,6 +214,7 @@ class RouterArgs:
     selection_temperature: float = 0.0
     upstream_pool_idle_timeout_secs: int = 3
     least_load_max_waiting_requests: int = 0
+    stream_request_bodies_over: int = 0
 
     @staticmethod
     def add_cli_args(
@@ -585,6 +586,19 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_payload_size,
             help="Maximum payload size in bytes",
+        )
+        routing_group.add_argument(
+            f"--{prefix}stream-request-bodies-over",
+            type=int,
+            default=RouterArgs.stream_request_bodies_over,
+            help=(
+                "Forward request bodies larger than this many bytes to the"
+                " worker as a raw stream instead of buffering, when the"
+                " route's policy needs no request text and the worker applies"
+                " no body mutation. Streamed bodies cannot be replayed, so"
+                " those requests bypass router-level retries; bodies without"
+                " a Content-Length header always buffer. 0 disables"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}dp-aware",

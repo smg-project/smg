@@ -516,6 +516,17 @@ impl PolicyRegistry {
     /// [`LoadBalancingPolicy::needs_backend_loads`]: `power_of_two` and
     /// `least_load` always consume load reports; `cache_aware` does when its
     /// pressure knobs are configured.
+    /// Whether any registered policy (default or per-model) routes on
+    /// request text. Content-blind dispatch must stay buffered when one
+    /// does: the model inside the unread body could select that policy.
+    pub fn any_policy_needs_request_text(&self) -> bool {
+        self.default_policy.needs_request_text()
+            || self
+                .model_policies
+                .iter()
+                .any(|entry| entry.value().needs_request_text())
+    }
+
     pub fn get_all_load_aware_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
         let mut policies = Vec::new();
 

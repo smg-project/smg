@@ -524,6 +524,18 @@ struct CliArgs {
     #[arg(long, default_value_t = 536870912, help_heading = "Request Handling")]
     max_payload_size: usize,
 
+    /// Forward request bodies larger than this many bytes to the worker as a
+    /// raw stream instead of buffering, when the route's policy needs no
+    /// request text and the worker applies no body mutation. Streamed bodies
+    /// are forwarded verbatim, so JSON validation and normalization defer to
+    /// the worker, and they cannot be replayed, so those requests bypass
+    /// router-level retries; bodies without a Content-Length header always
+    /// buffer. WASM OnRequest modules inspect buffered bodies, so deployments
+    /// running them keep buffering (and their own body-size cap) ahead of
+    /// this. Must be below max-payload-size. 0 disables
+    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
+    stream_request_bodies_over: u64,
+
     /// CORS allowed origins
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     cors_allowed_origins: Vec<String>,
@@ -1555,6 +1567,7 @@ impl CliArgs {
             .health_check_port(self.health_check_port)
             .runtime_worker_threads(self.runtime_worker_threads)
             .max_payload_size(self.max_payload_size)
+            .stream_request_bodies_over(self.stream_request_bodies_over)
             .request_timeout_secs(self.request_timeout_secs)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)

@@ -205,6 +205,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn stream_request_bodies_over(mut self, bytes: u64) -> Self {
+        self.config.stream_request_bodies_over = bytes;
+        self
+    }
+
     pub fn upstream_pool_idle_timeout_secs(mut self, secs: u64) -> Self {
         self.config.upstream_pool_idle_timeout_secs = secs;
         self
