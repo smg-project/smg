@@ -18,7 +18,8 @@ use llm_tokenizer::{
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionStreamResponse},
     common::{
-        FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice, ToolChoiceValue, Usage,
+        ChatLogProbs, FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice,
+        ToolChoiceValue, Usage,
     },
     completion::{CompletionRequest, CompletionStreamChoice, CompletionStreamResponse},
     generate::GenerateRequest,
@@ -95,6 +96,32 @@ struct GenerateStreamContext {
     expected_choices: u32,
 }
 
+type PooledReasoningParser = Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>;
+type PooledToolParser = Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>;
+
+struct ChatTextProcessingContext<'a> {
+    separate_reasoning: bool,
+    reasoning_parser_available: bool,
+    thinking_override: bool,
+    think_in_prefill: bool,
+    // Resolved once per request by the caller: re-resolving inside the helper
+    // could disagree with the upfront availability check if the worker
+    // registry changed mid-stream.
+    reasoning_parser_name: Option<&'a str>,
+    tool_choice: Option<&'a ToolChoice>,
+    tools: Option<&'a [Tool]>,
+    tool_choice_enabled: bool,
+    tool_parser_available: bool,
+    tool_parser_name: Option<&'a str>,
+    used_json_schema: bool,
+    is_specific_function: bool,
+    request_id: &'a str,
+    model: &'a str,
+    created: u64,
+    system_fingerprint: Option<&'a str>,
+    history_tool_calls_count: usize,
+}
+
 impl StreamingProcessor {
     pub fn new(
         tool_parser_factory: ToolParserFactory,
@@ -108,6 +135,31 @@ impl StreamingProcessor {
             parser_resolver,
             backend_type,
         }
+    }
+
+    async fn finish_openai_streaming_task(
+        tx: &SseSender,
+        result: Result<(), String>,
+    ) {
+        match result {
+            Ok(()) => {
+                let _ = tx
+                    .send(Ok(Bytes::from("data: [DONE]\n\n")))
+                    .await;
+            }
+            Err(error) => {
+                utils::send_error_sse(tx, error, "internal_error").await;
+            }
+        }
+    }
+
+    fn decode_generate_chunk(
+        tokenizer: &dyn Tokenizer,
+        token_ids: &[u32],
+    ) -> Result<String, String> {
+        tokenizer
+            .decode(token_ids, true)
+            .map_err(|e| format!("Failed to decode generate chunk: {e}"))
     }
 
     /// Process streaming chat response and return SSE response
@@ -164,11 +216,8 @@ impl StreamingProcessor {
                         )
                         .await;
 
-                    if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error").await;
-                    }
+                    Self::finish_openai_streaming_task(&tx, result).await;
 
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
                 });
             }
             context::ExecutionResult::PrefillDecode {
@@ -197,11 +246,8 @@ impl StreamingProcessor {
                         )
                         .await;
 
-                    if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error").await;
-                    }
+                    Self::finish_openai_streaming_task(&tx, result).await;
 
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
                 });
             }
             context::ExecutionResult::Embedding { .. } => {
@@ -282,7 +328,6 @@ impl StreamingProcessor {
 
         // Phase 1: Initialize state tracking (per-index for n>1 support)
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
-        let mut stream_buffers: HashMap<u32, String> = HashMap::new();
         let mut finish_reasons: HashMap<u32, String> = HashMap::new();
         let mut matched_stops: HashMap<u32, Option<Value>> = HashMap::new();
         // Indices whose local stop decoder fired: their finish reason is pinned
@@ -294,10 +339,8 @@ impl StreamingProcessor {
         let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
 
         // Parser state (lazy initialization per index)
-        type PooledReasoningParser = Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>;
         let mut reasoning_parsers: HashMap<u32, PooledReasoningParser> = HashMap::new();
 
-        type PooledToolParser = Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>;
         let mut tool_parsers: HashMap<u32, PooledToolParser> = HashMap::new();
         let mut has_tool_calls: HashMap<u32, bool> = HashMap::new();
 
@@ -369,6 +412,8 @@ impl StreamingProcessor {
                 tool_parser_name.as_deref(),
                 model,
             );
+        let tool_choice_enabled =
+            !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
 
         if separate_reasoning && !reasoning_parser_available {
             debug!(
@@ -383,6 +428,26 @@ impl StreamingProcessor {
                 model
             );
         }
+
+        let text_processing_context = ChatTextProcessingContext {
+            separate_reasoning,
+            reasoning_parser_available,
+            thinking_override,
+            think_in_prefill,
+            reasoning_parser_name: reasoning_parser_name.as_deref(),
+            tool_choice: tool_choice.as_ref(),
+            tools: tools.as_deref(),
+            tool_choice_enabled,
+            tool_parser_available,
+            tool_parser_name: tool_parser_name.as_deref(),
+            used_json_schema,
+            is_specific_function,
+            request_id,
+            model,
+            created,
+            system_fingerprint,
+            history_tool_calls_count,
+        };
 
         // Phase 2: Main streaming loop
         while let Some(response) = grpc_stream.next().await {
@@ -434,7 +499,8 @@ impl StreamingProcessor {
 
                     // Process tokens through stop decoder
                     let (chunk_text, should_stop) =
-                        Self::process_chunk_tokens(stop_decoder, chunk.token_ids());
+                        Self::process_chunk_tokens(stop_decoder, chunk.token_ids())?;
+
 
                     if should_stop {
                         // Stop-decoder match takes precedence: pin "stop" even if
@@ -462,9 +528,6 @@ impl StreamingProcessor {
                         utils::convert_proto_to_openai_logprobs(proto_logprobs, &tokenizer)
                     });
 
-                    // Initialize stream buffer if first time
-                    let stream_buffer = stream_buffers.entry(index).or_default();
-
                     // Send first chunk with role
                     if is_firsts.get(&index).copied().unwrap_or(true) {
                         let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
@@ -479,109 +542,23 @@ impl StreamingProcessor {
                         is_firsts.insert(index, false);
                     }
 
-                    // Calculate delta
-                    let mut delta = chunk_text;
-                    stream_buffer.push_str(&delta);
-
-                    // Reasoning content handling
-                    let in_reasoning = if separate_reasoning && reasoning_parser_available {
-                        let (normal_text, reasoning_chunk, in_reasoning) = self
-                            .process_reasoning_stream(
-                                &delta,
-                                index,
-                                &mut reasoning_parsers,
-                                thinking_override,
-                                think_in_prefill,
-                                reasoning_parser_name.as_deref(),
-                                request_id,
-                                model,
-                                created,
-                                system_fingerprint,
-                            )
-                            .await;
-                        if let Some(chunk) = reasoning_chunk {
-                            Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
-                            tx.send(Ok(Bytes::from(sse_buffer.clone())))
-                                .await
-                                .map_err(|_| "Failed to send reasoning chunk".to_string())?;
-                        }
-                        delta = normal_text;
-                        in_reasoning
-                    } else {
-                        false
-                    };
-
-                    // Tool call handling
-                    let tool_choice_enabled =
-                        !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
-
-                    if let Some(tools_ref) = tools.as_ref() {
-                        if !in_reasoning
-                            && tool_choice_enabled
-                            && (tool_parser_available || used_json_schema)
-                        {
-                            let tool_chunks = if is_specific_function {
-                                // Handle specific function case - emit tool call deltas with arguments
-                                Self::process_specific_function_stream(
-                                    &delta,
-                                    index,
-                                    &mut has_tool_calls,
-                                    tool_choice.as_ref(),
-                                    request_id,
-                                    model,
-                                    created,
-                                    system_fingerprint,
-                                    history_tool_calls_count,
-                                )
-                            } else {
-                                // Use incremental parser for regular/required modes
-                                self.process_tool_calls_stream(
-                                    &delta,
-                                    index,
-                                    &mut tool_parsers,
-                                    &mut has_tool_calls,
-                                    tools_ref,
-                                    tool_parser_name.as_deref(),
-                                    request_id,
-                                    model,
-                                    created,
-                                    system_fingerprint,
-                                    history_tool_calls_count,
-                                    used_json_schema,
-                                )
-                                .await
-                            };
-
-                            for chunk in tool_chunks {
-                                Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
-                                tx.send(Ok(Bytes::from(sse_buffer.clone())))
-                                    .await
-                                    .map_err(|_| "Failed to send tool call chunk".to_string())?;
-                            }
-
-                            // Always skip regular content when tool parsing is active
-                            // Parser either emitted chunks or buffered content
-                            continue;
-                        }
-                    }
-
-                    // Regular content emission
-                    if !delta.is_empty() {
-                        let content_chunk =
-                            ChatCompletionStreamResponse::builder(request_id, model)
-                                .created(created)
-                                .add_choice_content_with_logprobs(
-                                    index,
-                                    "assistant",
-                                    delta,
-                                    choice_logprobs,
-                                )
-                                .maybe_system_fingerprint(system_fingerprint)
-                                .build();
-                        Self::format_sse_chunk_into(&mut sse_buffer, &content_chunk);
+                    let chunks = self
+                        .process_chat_text_delta(
+                            &chunk_text,
+                            index,
+                            choice_logprobs,
+                            &mut reasoning_parsers,
+                            &mut tool_parsers,
+                            &mut has_tool_calls,
+                            &text_processing_context,
+                        )
+                        .await?;
+                    for chunk in chunks {
+                        Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
                         tx.send(Ok(Bytes::from(sse_buffer.clone())))
                             .await
-                            .map_err(|_| "Failed to send content chunk".to_string())?;
+                            .map_err(|_| "Failed to send parsed chunk".to_string())?;
+
                     }
                 }
                 ProtoResponseVariant::Complete(complete) => {
@@ -591,23 +568,27 @@ impl StreamingProcessor {
                     if let Some(decoder) = stop_decoders.get_mut(&index) {
                         if let SequenceDecoderOutput::Text(text) = decoder.flush() {
                             if !text.is_empty() {
-                                let stream_buffer = stream_buffers.entry(index).or_default();
-                                stream_buffer.push_str(&text);
+                                let chunks = self
+                                    .process_chat_text_delta(
+                                        &text,
+                                        index,
+                                        None,
+                                        &mut reasoning_parsers,
+                                        &mut tool_parsers,
+                                        &mut has_tool_calls,
+                                        &text_processing_context,
+                                    )
+                                    .await?;
+                                for chunk in chunks {
+                                    let sse_chunk =
+                                        sse_encoder.encode_data(&chunk).map_err(|e| {
+                                            format!("Failed to serialize flushed chunk: {e}")
+                                        })?;
+                                    tx.send(Ok(sse_chunk))
+                                        .await
+                                        .map_err(|_| "Failed to send flushed chunk".to_string())?;
+                                }
 
-                                let content_chunk =
-                                    ChatCompletionStreamResponse::builder(request_id, model)
-                                        .created(created)
-                                        .add_choice_content(index, "assistant", text)
-                                        .maybe_system_fingerprint(system_fingerprint)
-                                        .build();
-
-                                let sse_chunk =
-                                    sse_encoder.encode_data(&content_chunk).map_err(|e| {
-                                        format!("Failed to serialize content chunk: {e}")
-                                    })?;
-                                tx.send(Ok(sse_chunk))
-                                    .await
-                                    .map_err(|_| "Failed to send flushed content".to_string())?;
                             }
                         }
                     }
@@ -635,7 +616,29 @@ impl StreamingProcessor {
 
         // Phase 3: Check unstreamed tool args
         for (index, parser) in &tool_parsers {
-            let parser_guard = parser.lock().await;
+            let mut parser_guard = parser.lock().await;
+            let final_result = parser_guard
+                .finalize(tools.as_deref().unwrap_or_default())
+                .await
+                .map_err(|e| format!("Tool parser finalization failed: {e}"))?;
+            for chunk in Self::tool_result_to_chat_chunks(
+                final_result,
+                *index,
+                &mut has_tool_calls,
+                request_id,
+                model,
+                created,
+                system_fingerprint,
+                history_tool_calls_count,
+                None,
+            ) {
+                let sse_chunk = sse_encoder
+                    .encode_data(&chunk)
+                    .map_err(|e| format!("Failed to serialize finalized tool chunk: {e}"))?;
+                tx.send(Ok(sse_chunk))
+                    .await
+                    .map_err(|_| "Failed to send finalized tool output".to_string())?;
+            }
             if let Some(unstreamed_items) = parser_guard.get_unstreamed_tool_args() {
                 for tool_call_item in unstreamed_items {
                     let tool_call_delta = ToolCallDelta {
@@ -866,11 +869,8 @@ impl StreamingProcessor {
                         Self::process_generate_streaming(tokenizer, stream, ctx, &tx, reservation)
                             .await;
 
-                    if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error").await;
-                    }
+                    Self::finish_openai_streaming_task(&tx, result).await;
 
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
                 });
             }
             context::ExecutionResult::PrefillDecode {
@@ -896,11 +896,8 @@ impl StreamingProcessor {
                     )
                     .await;
 
-                    if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error").await;
-                    }
+                    Self::finish_openai_streaming_task(&tx, result).await;
 
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
                 });
             }
             context::ExecutionResult::Embedding { .. } => {
@@ -970,9 +967,8 @@ impl StreamingProcessor {
                     let current_completion_tokens = *completion_tokens;
 
                     // Decode tokens to text (skip_special_tokens=true to handle newlines correctly)
-                    let chunk_text = tokenizer
-                        .decode(chunk.token_ids(), true)
-                        .unwrap_or_default();
+                    let chunk_text =
+                        Self::decode_generate_chunk(tokenizer.as_ref(), chunk.token_ids())?;
 
                     // Accumulate text for this index
                     let accumulated_text = accumulated_texts.entry(index).or_default();
@@ -1175,9 +1171,8 @@ impl StreamingProcessor {
                     let current_completion_tokens = *completion_tokens;
 
                     // Decode tokens to text
-                    let chunk_text = tokenizer
-                        .decode(chunk.token_ids(), true)
-                        .unwrap_or_default();
+                    let chunk_text =
+                        Self::decode_generate_chunk(tokenizer.as_ref(), chunk.token_ids())?;
 
                     // Accumulate text for this index
                     let accumulated_text = accumulated_texts.entry(index).or_default();
@@ -1337,31 +1332,28 @@ impl StreamingProcessor {
     fn process_chunk_tokens(
         stop_decoder: &mut StopSequenceDecoder,
         token_ids: &[u32],
-    ) -> (String, bool) {
+    ) -> Result<(String, bool), String> {
         let mut chunk_text = String::new();
 
         for &token_id in token_ids {
-            match stop_decoder.process_token(token_id).unwrap_or_else(|e| {
-                debug!(
-                    "Error processing token {}: {}. Treating as Held.",
-                    token_id, e
-                );
-                SequenceDecoderOutput::Held
-            }) {
+            let output = stop_decoder
+                .process_token(token_id)
+                .map_err(|e| format!("Failed to decode token {token_id}: {e}"))?;
+            match output {
                 SequenceDecoderOutput::Text(text) => {
                     chunk_text.push_str(&text);
                 }
                 SequenceDecoderOutput::StoppedWithText(text) => {
                     chunk_text.push_str(&text);
-                    return (chunk_text, true);
+                    return Ok((chunk_text, true));
                 }
                 SequenceDecoderOutput::Stopped => {
-                    return (chunk_text, true);
+                    return Ok((chunk_text, true));
                 }
                 SequenceDecoderOutput::Held => {}
             }
         }
-        (chunk_text, false)
+        Ok((chunk_text, false))
     }
 
     /// Helper: Process reasoning content in streaming mode
@@ -1381,7 +1373,7 @@ impl StreamingProcessor {
         model: &str,
         created: u64,
         system_fingerprint: Option<&str>,
-    ) -> (String, Option<ChatCompletionStreamResponse>, bool) {
+    ) -> Result<(String, Option<ChatCompletionStreamResponse>, bool), String> {
         // Create fresh parser for this index (not pooled, to avoid state pollution)
         #[expect(
             clippy::expect_used,
@@ -1427,15 +1419,111 @@ impl StreamingProcessor {
                                 .build(),
                         )
                     };
-                    return (normal_text, chunk, in_reasoning);
+                    return Ok((normal_text, chunk, in_reasoning));
                 }
                 Err(e) => {
-                    warn!("Reasoning parsing error: {}", e);
+                    return Err(format!("Reasoning parsing failed: {e}"));
                 }
             }
         }
 
-        (delta.to_string(), None, false)
+        Ok((delta.to_string(), None, false))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    async fn process_chat_text_delta(
+        &self,
+        delta: &str,
+        index: u32,
+        choice_logprobs: Option<ChatLogProbs>,
+        reasoning_parsers: &mut HashMap<u32, PooledReasoningParser>,
+        tool_parsers: &mut HashMap<u32, PooledToolParser>,
+        has_tool_calls: &mut HashMap<u32, bool>,
+        context: &ChatTextProcessingContext<'_>,
+    ) -> Result<Vec<ChatCompletionStreamResponse>, String> {
+        let mut chunks = Vec::new();
+        let mut normal_text = delta.to_string();
+
+        let in_reasoning = if context.separate_reasoning && context.reasoning_parser_available {
+            let (parsed_text, reasoning_chunk, in_reasoning) = self
+                .process_reasoning_stream(
+                    &normal_text,
+                    index,
+                    reasoning_parsers,
+                    context.thinking_override,
+                    context.think_in_prefill,
+                    context.reasoning_parser_name,
+                    context.request_id,
+                    context.model,
+                    context.created,
+                    context.system_fingerprint,
+                )
+                .await?;
+            if let Some(chunk) = reasoning_chunk {
+                chunks.push(chunk);
+            }
+            normal_text = parsed_text;
+            in_reasoning
+        } else {
+            false
+        };
+
+        if let Some(tools) = context.tools {
+            if !in_reasoning
+                && context.tool_choice_enabled
+                && (context.tool_parser_available || context.used_json_schema)
+            {
+                let tool_chunks = if context.is_specific_function {
+                    Self::process_specific_function_stream(
+                        &normal_text,
+                        index,
+                        has_tool_calls,
+                        context.tool_choice,
+                        context.request_id,
+                        context.model,
+                        context.created,
+                        context.system_fingerprint,
+                        context.history_tool_calls_count,
+                    )
+                } else {
+                    self.process_tool_calls_stream(
+                        &normal_text,
+                        index,
+                        tool_parsers,
+                        has_tool_calls,
+                        tools,
+                        context.tool_parser_name,
+                        context.request_id,
+                        context.model,
+                        context.created,
+                        context.system_fingerprint,
+                        context.history_tool_calls_count,
+                        context.used_json_schema,
+                        choice_logprobs,
+                    )
+                    .await?
+                };
+                chunks.extend(tool_chunks);
+                return Ok(chunks);
+            }
+        }
+
+        if !normal_text.is_empty() {
+            chunks.push(
+                ChatCompletionStreamResponse::builder(context.request_id, context.model)
+                    .created(context.created)
+                    .add_choice_content_with_logprobs(
+                        index,
+                        "assistant",
+                        normal_text,
+                        choice_logprobs,
+                    )
+                    .maybe_system_fingerprint(context.system_fingerprint)
+                    .build(),
+            );
+        }
+
+        Ok(chunks)
     }
 
     /// Helper: Process specific function case - emit tool call deltas with arguments
@@ -1508,9 +1596,8 @@ impl StreamingProcessor {
         system_fingerprint: Option<&str>,
         history_tool_calls_count: usize,
         use_json_parser: bool,
-    ) -> Vec<ChatCompletionStreamResponse> {
-        let mut chunks = Vec::new();
-
+        choice_logprobs: Option<ChatLogProbs>,
+    ) -> Result<Vec<ChatCompletionStreamResponse>, String> {
         // Create fresh parser for this index (not pooled, to avoid state pollution)
         #[expect(
             clippy::expect_used,
@@ -1531,68 +1618,84 @@ impl StreamingProcessor {
             let mut parser = pooled_parser.lock().await;
 
             match parser.parse_incremental(delta, tools).await {
-                Ok(StreamingParseResult { normal_text, calls }) => {
-                    // Emit normal text if present
-                    if !normal_text.is_empty() {
-                        chunks.push(
-                            ChatCompletionStreamResponse::builder(request_id, model)
-                                .created(created)
-                                .add_choice_content(index, "assistant", normal_text)
-                                .maybe_system_fingerprint(system_fingerprint)
-                                .build(),
-                        );
-                    }
-
-                    // Emit tool call chunks
-                    for tool_call_item in calls {
-                        has_tool_calls.insert(index, true);
-
-                        let tool_call_id = if let Some(ref name) = tool_call_item.name {
-                            Some(utils::generate_tool_call_id(
-                                model,
-                                name,
-                                tool_call_item.tool_index,
-                                history_tool_calls_count,
-                            ))
-                        } else {
-                            None
-                        };
-
-                        let tool_call_delta = ToolCallDelta {
-                            index: tool_call_item.tool_index as u32,
-                            id: tool_call_id,
-                            tool_type: if tool_call_item.name.is_some() {
-                                Some("function".to_string())
-                            } else {
-                                None
-                            },
-                            function: Some(FunctionCallDelta {
-                                name: tool_call_item.name,
-                                arguments: if tool_call_item.parameters.is_empty() {
-                                    None
-                                } else {
-                                    Some(tool_call_item.parameters)
-                                },
-                            }),
-                        };
-
-                        chunks.push(
-                            ChatCompletionStreamResponse::builder(request_id, model)
-                                .created(created)
-                                .add_choice_tool_call_delta(index, tool_call_delta)
-                                .maybe_system_fingerprint(system_fingerprint)
-                                .build(),
-                        );
-                    }
-
-                    return chunks;
+                Ok(result) => {
+                    return Ok(Self::tool_result_to_chat_chunks(
+                        result,
+                        index,
+                        has_tool_calls,
+                        request_id,
+                        model,
+                        created,
+                        system_fingerprint,
+                        history_tool_calls_count,
+                        choice_logprobs,
+                    ));
                 }
                 Err(e) => {
-                    error!("Tool call parsing error: {}", e);
+                    return Err(format!("Tool call parsing failed: {e}"));
                 }
             }
         }
 
+        Ok(Vec::new())
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn tool_result_to_chat_chunks(
+        result: StreamingParseResult,
+        index: u32,
+        has_tool_calls: &mut HashMap<u32, bool>,
+        request_id: &str,
+        model: &str,
+        created: u64,
+        system_fingerprint: Option<&str>,
+        history_tool_calls_count: usize,
+        choice_logprobs: Option<ChatLogProbs>,
+    ) -> Vec<ChatCompletionStreamResponse> {
+        let mut chunks = Vec::new();
+        if !result.normal_text.is_empty() {
+            chunks.push(
+                ChatCompletionStreamResponse::builder(request_id, model)
+                    .created(created)
+                    .add_choice_content_with_logprobs(
+                        index,
+                        "assistant",
+                        result.normal_text,
+                        choice_logprobs,
+                    )
+                    .maybe_system_fingerprint(system_fingerprint)
+                    .build(),
+            );
+        }
+
+        for tool_call_item in result.calls {
+            has_tool_calls.insert(index, true);
+            let tool_call_id = tool_call_item.name.as_ref().map(|name| {
+                utils::generate_tool_call_id(
+                    model,
+                    name,
+                    tool_call_item.tool_index,
+                    history_tool_calls_count,
+                )
+            });
+            let tool_call_delta = ToolCallDelta {
+                index: tool_call_item.tool_index as u32,
+                id: tool_call_id,
+                tool_type: tool_call_item.name.as_ref().map(|_| "function".to_string()),
+                function: Some(FunctionCallDelta {
+                    name: tool_call_item.name,
+                    arguments: (!tool_call_item.parameters.is_empty())
+                        .then_some(tool_call_item.parameters),
+                }),
+            };
+            chunks.push(
+                ChatCompletionStreamResponse::builder(request_id, model)
+                    .created(created)
+                    .add_choice_tool_call_delta(index, tool_call_delta)
+                    .maybe_system_fingerprint(system_fingerprint)
+                    .build(),
+            );
+        }
         chunks
     }
 
@@ -2045,7 +2148,8 @@ impl StreamingProcessor {
                     completion_tokens.record_chunk(&chunk);
 
                     let (chunk_text, should_stop) =
-                        Self::process_chunk_tokens(&mut stop_decoder, chunk.token_ids());
+                        Self::process_chunk_tokens(&mut stop_decoder, chunk.token_ids())?;
+
 
                     if should_stop {
                         // Stop-decoder match takes precedence over the engine's
@@ -2287,7 +2391,19 @@ impl StreamingProcessor {
                                     }
                                 }
                                 Err(e) => {
-                                    error!("Tool call parsing error in messages streaming: {}", e);
+                                    let error_event = MessageStreamEvent::Error {
+                                        error: messages::ErrorResponse {
+                                            error_type: "api_error".to_string(),
+                                            message: format!("Tool call parsing failed: {e}"),
+                                        },
+                                    };
+                                    let _ = Self::send_messages_event(
+                                        tx,
+                                        &mut sse_buffer,
+                                        &error_event,
+                                    )
+                                    .await;
+                                    return Ok(());
                                 }
                             }
                         }
@@ -2896,7 +3012,7 @@ impl StreamingProcessor {
                     });
 
                     let (decoded_text, stopped) =
-                        Self::process_chunk_tokens(stop_decoder, chunk.token_ids());
+                        Self::process_chunk_tokens(stop_decoder, chunk.token_ids())?;
                     chunk_text.clear();
                     chunk_text.push_str(&decoded_text);
 
@@ -3210,7 +3326,146 @@ impl StreamingProcessor {
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::common::Function;
+
     use super::*;
+    use crate::routers::grpc::regular::test_fakes::{FailingReasoningParser, FailingToolParser, FailingTokenizer};
+
+    fn test_processor(
+        configured_tool_parser: Option<&str>,
+        configured_reasoning_parser: Option<&str>,
+    ) -> StreamingProcessor {
+        StreamingProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::configured_only(
+                configured_tool_parser.map(ToString::to_string),
+                configured_reasoning_parser.map(ToString::to_string),
+            ),
+            "sglang",
+        )
+    }
+
+    fn lookup_tools() -> Vec<Tool> {
+        vec![Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "lookup".to_string(),
+                description: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}}
+                }),
+                strict: None,
+            },
+        }]
+    }
+
+    fn text_context<'a>(
+        tools: Option<&'a [Tool]>,
+        separate_reasoning: bool,
+        tool_parser_name: Option<&'a str>,
+        reasoning_parser_name: Option<&'a str>,
+    ) -> ChatTextProcessingContext<'a> {
+        ChatTextProcessingContext {
+            separate_reasoning,
+            reasoning_parser_available: separate_reasoning,
+            thinking_override: false,
+            think_in_prefill: false,
+            reasoning_parser_name,
+            tool_choice: None,
+            tools,
+            tool_choice_enabled: true,
+            tool_parser_available: tools.is_some(),
+            tool_parser_name,
+            used_json_schema: false,
+            is_specific_function: false,
+            request_id: "chatcmpl-test",
+            model: if separate_reasoning {
+                "glm47"
+            } else {
+                "test-model"
+            },
+            created: 1,
+            system_fingerprint: None,
+            history_tool_calls_count: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_chat_stream_sends_error_without_done() {
+        let (tx, mut rx) = sse_channel();
+
+        StreamingProcessor::finish_openai_streaming_task(
+            &tx,
+            Err("fake parse failure".to_string()),
+        )
+        .await;
+        drop(tx);
+
+        let mut events: Vec<String> = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(
+                String::from_utf8(event.expect("SSE event").to_vec()).expect("valid UTF-8 SSE"),
+            );
+        }
+
+        assert_eq!(events.len(), 1);
+        assert!(events[0].contains("fake parse failure"));
+        assert!(!events.iter().any(|event| event.contains("[DONE]")));
+    }
+
+    #[tokio::test]
+    async fn failed_generate_and_completion_streams_send_error_without_done() {
+        for endpoint in ["generate", "completion"] {
+            let (tx, mut rx) = sse_channel();
+
+            StreamingProcessor::finish_openai_streaming_task(
+                &tx,
+                Err(format!("fake {endpoint} failure")),
+            )
+            .await;
+            drop(tx);
+
+            let mut events: Vec<String> = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(
+                    String::from_utf8(event.expect("SSE event").to_vec()).expect("valid UTF-8 SSE"),
+                );
+            }
+
+            assert_eq!(events.len(), 1, "{endpoint}");
+            assert!(events[0].contains(&format!("fake {endpoint} failure")));
+            assert!(
+                !events.iter().any(|event| event.contains("[DONE]")),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_decode_error_is_returned_instead_of_held() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(FailingTokenizer::default());
+        let mut decoder = StopSequenceDecoder::new(tokenizer, Default::default(), false);
+
+        let error = StreamingProcessor::process_chunk_tokens(&mut decoder, &[7]).unwrap_err();
+
+        assert_eq!(error, "Failed to decode token 7: fake decode failure");
+    }
+
+    #[test]
+    fn generate_decode_error_is_returned_for_regular_and_pd_paths() {
+        let tokenizer = FailingTokenizer::default();
+
+        for path in ["regular", "prefill-decode"] {
+            let error = StreamingProcessor::decode_generate_chunk(&tokenizer, &[7]).unwrap_err();
+
+            assert_eq!(
+                error, "Failed to decode generate chunk: fake decode failure",
+                "{path}"
+            );
+        }
+    }
 
     #[test]
     fn completion_streaming_usage_includes_reasoning_tokens() {
@@ -3233,5 +3488,145 @@ mod tests {
                 .and_then(|details| details.reasoning_tokens),
             Some(3)
         );
+    }
+
+    #[tokio::test]
+    async fn tool_parse_error_is_returned_without_success_chunks() {
+        let processor = test_processor(None, None);
+        let tools = lookup_tools();
+        let mut reasoning_parsers = HashMap::new();
+        let mut tool_parsers: HashMap<u32, PooledToolParser> = HashMap::new();
+        tool_parsers.insert(
+            0,
+            Arc::new(tokio::sync::Mutex::new(Box::new(FailingToolParser))),
+        );
+        let mut has_tool_calls = HashMap::new();
+
+        let result = processor
+            .process_chat_text_delta(
+                "ignored",
+                0,
+                None,
+                &mut reasoning_parsers,
+                &mut tool_parsers,
+                &mut has_tool_calls,
+                &text_context(Some(&tools), false, None, None),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(has_tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reasoning_parse_error_is_returned_without_raw_fallback() {
+        let processor = test_processor(None, None);
+        let mut reasoning_parsers: HashMap<u32, PooledReasoningParser> = HashMap::new();
+        reasoning_parsers.insert(
+            0,
+            Arc::new(tokio::sync::Mutex::new(Box::new(FailingReasoningParser))),
+        );
+        let mut tool_parsers = HashMap::new();
+        let mut has_tool_calls = HashMap::new();
+
+        let result = processor
+            .process_chat_text_delta(
+                "<think>must not leak",
+                0,
+                None,
+                &mut reasoning_parsers,
+                &mut tool_parsers,
+                &mut has_tool_calls,
+                &text_context(None, true, None, None),
+            )
+            .await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            "Reasoning parsing failed: Parser configuration error: fake failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_only_cjk_tool_call_emits_tool_delta() {
+        let processor = test_processor(Some("glm47"), None);
+        let tools = lookup_tools();
+        let mut reasoning_parsers = HashMap::new();
+        let mut tool_parsers = HashMap::new();
+        let mut has_tool_calls = HashMap::new();
+
+        let chunks = processor
+            .process_chat_text_delta(
+                "<tool_call>lookup<arg_key>query</arg_key><arg_value>查询人事</arg_value></tool_call>",
+                0,
+                None,
+                &mut reasoning_parsers,
+                &mut tool_parsers,
+                &mut has_tool_calls,
+                &text_context(Some(&tools), false, Some("glm47"), None),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        let tool_calls = chunks[0].choices[0]
+            .delta
+            .tool_calls
+            .as_ref()
+            .expect("tool delta");
+        let arguments = tool_calls[0]
+            .function
+            .as_ref()
+            .and_then(|function| function.arguments.as_deref())
+            .expect("arguments");
+        assert_eq!(
+            serde_json::from_str::<Value>(arguments).unwrap()["query"],
+            "查询人事"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_only_reasoning_close_tag_does_not_leak_as_content() {
+        let processor = test_processor(None, Some("glm45"));
+        let mut reasoning_parsers = HashMap::new();
+        let mut tool_parsers = HashMap::new();
+        let mut has_tool_calls = HashMap::new();
+        let context = text_context(None, true, None, Some("glm45"));
+
+        processor
+            .process_chat_text_delta(
+                "<think>内部推理",
+                0,
+                None,
+                &mut reasoning_parsers,
+                &mut tool_parsers,
+                &mut has_tool_calls,
+                &context,
+            )
+            .await
+            .unwrap();
+        let flushed = processor
+            .process_chat_text_delta(
+                "</think>",
+                0,
+                None,
+                &mut reasoning_parsers,
+                &mut tool_parsers,
+                &mut has_tool_calls,
+                &context,
+            )
+            .await
+            .unwrap();
+
+        assert!(flushed.iter().all(|chunk| {
+            chunk.choices.iter().all(|choice| {
+                choice
+                    .delta
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+            })
+        }));
     }
 }

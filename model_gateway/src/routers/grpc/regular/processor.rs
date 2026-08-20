@@ -128,17 +128,13 @@ impl ResponseProcessor {
                     parser.mark_reasoning_started();
                 }
 
-                match parser.detect_and_parse_reasoning(&processed_text) {
-                    Ok(result) => {
-                        if !result.reasoning_text.is_empty() {
-                            reasoning_text = Some(result.reasoning_text);
-                        }
-                        processed_text = result.normal_text;
-                    }
-                    Err(e) => {
-                        warn!("Reasoning parsing error, skipping parsing: {e}");
-                    }
+                let result = parser
+                    .detect_and_parse_reasoning(&processed_text)
+                    .map_err(|e| format!("Reasoning parsing failed: {e}"))?;
+                if !result.reasoning_text.is_empty() {
+                    reasoning_text = Some(result.reasoning_text);
                 }
+                processed_text = result.normal_text;
             }
         }
 
@@ -182,7 +178,8 @@ impl ResponseProcessor {
                         original_request.tools.as_deref().unwrap_or(&[]),
                         history_tool_calls_count,
                     )
-                    .await;
+                    .await
+                    .map_err(|e| format!("Tool call parsing failed: {e}"))?;
             }
         }
 
@@ -309,10 +306,7 @@ impl ResponseProcessor {
             {
                 Ok(choice) => choices.push(choice),
                 Err(e) => {
-                    return Err(error::internal_error(
-                        "process_choice_failed",
-                        format!("Failed to process choice {index}: {e}"),
-                    ));
+                    return Err(process_choice_error_response(index, e));
                 }
             }
         }
@@ -340,7 +334,7 @@ impl ResponseProcessor {
         tool_parser_name: Option<&str>,
         tools: &[Tool],
         history_tool_calls_count: usize,
-    ) -> (Option<Vec<ToolCall>>, String) {
+    ) -> tool_parser::errors::ParserResult<(Option<Vec<ToolCall>>, String)> {
         // Get pooled parser for this model
         let pooled_parser =
             utils::get_tool_parser(&self.tool_parser_factory, tool_parser_name, model);
@@ -356,40 +350,33 @@ impl ResponseProcessor {
             // Lock is dropped here
         };
 
-        match result {
-            Ok((normal_text, parsed_tool_calls)) => {
-                if parsed_tool_calls.is_empty() {
-                    return (None, normal_text);
-                }
-
-                let spec_tool_calls = parsed_tool_calls
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, tc)| {
-                        // Generate ID for this tool call
-                        let id = utils::generate_tool_call_id(
-                            model,
-                            &tc.function.name,
-                            index,
-                            history_tool_calls_count,
-                        );
-                        ToolCall {
-                            id,
-                            tool_type: "function".to_string(),
-                            function: FunctionCallResponse {
-                                name: tc.function.name,
-                                arguments: Some(tc.function.arguments),
-                            },
-                        }
-                    })
-                    .collect();
-                (Some(spec_tool_calls), normal_text)
-            }
-            Err(e) => {
-                error!("Tool call parsing error: {}", e);
-                (None, processed_text.to_string())
-            }
+        let (normal_text, parsed_tool_calls) = result?;
+        if parsed_tool_calls.is_empty() {
+            return Ok((None, normal_text));
         }
+
+        let spec_tool_calls = parsed_tool_calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, tc)| {
+                // Generate ID for this tool call
+                let id = utils::generate_tool_call_id(
+                    model,
+                    &tc.function.name,
+                    index,
+                    history_tool_calls_count,
+                );
+                ToolCall {
+                    id,
+                    tool_type: "function".to_string(),
+                    function: FunctionCallResponse {
+                        name: tc.function.name,
+                        arguments: Some(tc.function.arguments),
+                    },
+                }
+            })
+            .collect();
+        Ok((Some(spec_tool_calls), normal_text))
     }
 
     /// Process non-streaming generate response (collects all responses and builds final response array)
@@ -412,15 +399,7 @@ impl ResponseProcessor {
             stop_decoder.reset();
 
             // Process tokens through stop decoder
-            let outputs = match stop_decoder.process_tokens(complete.output_ids()) {
-                Ok(outputs) => outputs,
-                Err(e) => {
-                    return Err(error::internal_error(
-                        "process_tokens_failed",
-                        format!("Failed to process tokens: {e}"),
-                    ))
-                }
-            };
+            let outputs = process_non_streaming_output_tokens(stop_decoder, complete.output_ids())?;
 
             // Accumulate text with early breaks
             let mut decoded_text = String::new();
@@ -701,7 +680,7 @@ impl ResponseProcessor {
                     .as_deref()
                     .map(utils::message_utils::extract_chat_tools)
                     .unwrap_or_default();
-                (tool_calls, processed_text) = self
+                match self
                     .parse_tool_calls(
                         &processed_text,
                         &messages_request.model,
@@ -711,7 +690,16 @@ impl ResponseProcessor {
                             &messages_request,
                         ),
                     )
-                    .await;
+                    .await
+                {
+                    Ok(parsed) => (tool_calls, processed_text) = parsed,
+                    Err(e) => {
+                        return Err(error::bad_gateway(
+                            "upstream_output_parse_failed",
+                            format!("Tool call parsing failed: {e}"),
+                        ));
+                    }
+                }
             }
         }
 
@@ -864,15 +852,8 @@ impl ResponseProcessor {
             for (i, complete) in all_responses.into_iter().enumerate() {
                 stop_decoder.reset();
 
-                let outputs = match stop_decoder.process_tokens(complete.output_ids()) {
-                    Ok(outputs) => outputs,
-                    Err(e) => {
-                        return Err(error::internal_error(
-                            "process_tokens_failed",
-                            format!("Failed to process tokens: {e}"),
-                        ))
-                    }
-                };
+                let outputs =
+                    process_non_streaming_output_tokens(stop_decoder, complete.output_ids())?;
 
                 let mut decoded_text = String::new();
                 let mut stopped = false;
@@ -968,6 +949,32 @@ impl ResponseProcessor {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "router errors are returned as complete HTTP responses"
+)]
+fn process_non_streaming_output_tokens(
+    stop_decoder: &mut StopSequenceDecoder,
+    output_ids: &[u32],
+) -> Result<Vec<SequenceDecoderOutput>, axum::response::Response> {
+    stop_decoder.process_tokens(output_ids).map_err(|e| {
+        error::bad_gateway(
+            "upstream_output_parse_failed",
+            format!("Failed to process tokens: {e}"),
+        )
+    })
+}
+
+fn process_choice_error_response(
+    index: usize,
+    error_message: impl std::fmt::Display,
+) -> axum::response::Response {
+    error::bad_gateway(
+        "upstream_output_parse_failed",
+        format!("Failed to process choice {index}: {error_message}"),
+    )
+}
+
 /// Residual assistant text → OpenAI `content`. Whitespace-only (the `"\n\n"` left
 /// after reasoning + tool-call extraction) becomes `None`, not `Some("\n\n")`, which
 /// would otherwise diverge multi-turn conversations. Real content is kept verbatim.
@@ -980,8 +987,34 @@ fn normalize_assistant_content(text: String) -> Option<String> {
 }
 
 #[cfg(test)]
-mod content_normalization_tests {
-    use super::normalize_assistant_content;
+mod tests {
+    use axum::http::StatusCode;
+    use llm_tokenizer::{mock::MockTokenizer, stop::StopSequenceConfig};
+    use openai_protocol::common::Function;
+    use smg_grpc_client::sglang_proto;
+
+    use super::*;
+    use crate::routers::grpc::regular::test_fakes::{FailingReasoningParser, FailingToolParser, FailingTokenizer};
+
+    fn complete_with_text_token() -> ProtoGenerateComplete {
+        ProtoGenerateComplete::Sglang(sglang_proto::GenerateComplete {
+            output_ids: vec![1],
+            finish_reason: "stop".to_string(),
+            ..Default::default()
+        })
+    }
+
+    fn lookup_tool() -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "lookup".to_string(),
+                description: None,
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+            },
+        }
+    }
 
     #[test]
     fn whitespace_only_is_none_real_text_kept_verbatim() {
@@ -991,5 +1024,142 @@ mod content_normalization_tests {
             normalize_assistant_content("\n\nDone.".to_string()),
             Some("\n\nDone.".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn non_streaming_reasoning_parse_error_is_returned() {
+        let reasoning_factory = ReasoningParserFactory::new();
+        reasoning_factory
+            .registry()
+            .register_parser("failing", || Box::new(FailingReasoningParser));
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            reasoning_factory,
+            utils::ParserResolver::configured_only(None, Some("failing".to_string())),
+        );
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let mut decoder =
+            StopSequenceDecoder::new(Arc::clone(&tokenizer), StopSequenceConfig::default(), false);
+        let request = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            separate_reasoning: true,
+            ..Default::default()
+        };
+
+        let error = processor
+            .process_single_choice(
+                &complete_with_text_token(),
+                0,
+                &request,
+                &tokenizer,
+                &mut decoder,
+                0,
+                true,
+                false,
+                Some("failing"),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("Reasoning parsing failed"));
+        assert!(error.contains("fake failure"));
+    }
+
+    #[tokio::test]
+    async fn non_streaming_tool_parse_error_is_returned() {
+        let tool_factory = ToolParserFactory::new();
+        tool_factory
+            .registry()
+            .register_parser("failing", || Box::new(FailingToolParser));
+        let processor = ResponseProcessor::new(
+            tool_factory,
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::configured_only(Some("failing".to_string()), None),
+        );
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let mut decoder =
+            StopSequenceDecoder::new(Arc::clone(&tokenizer), StopSequenceConfig::default(), false);
+        let request = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            tools: Some(vec![lookup_tool()]),
+            separate_reasoning: false,
+            ..Default::default()
+        };
+
+        let error = processor
+            .process_single_choice(
+                &complete_with_text_token(),
+                0,
+                &request,
+                &tokenizer,
+                &mut decoder,
+                0,
+                false,
+                true,
+                None,
+                Some("failing"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("Tool call parsing failed"));
+        assert!(error.contains("fake failure"));
+    }
+
+    #[tokio::test]
+    async fn non_streaming_parse_error_maps_to_bad_gateway() {
+        let response = process_choice_error_response(2, "fake parse failure");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .and_then(|value| value.to_str().ok()),
+            Some("upstream_output_parse_failed")
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "upstream_output_parse_failed");
+        assert!(json["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("fake parse failure")));
+    }
+
+    #[tokio::test]
+    async fn non_streaming_generate_and_completion_decode_errors_map_to_bad_gateway() {
+        for endpoint in ["generate", "completion"] {
+            let tokenizer: Arc<dyn Tokenizer> = Arc::new(FailingTokenizer::default());
+            let mut decoder =
+                StopSequenceDecoder::new(tokenizer, StopSequenceConfig::default(), false);
+
+            let response = process_non_streaming_output_tokens(&mut decoder, &[7]).unwrap_err();
+
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{endpoint}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(error::HEADER_X_SMG_ERROR_CODE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("upstream_output_parse_failed"),
+                "{endpoint}"
+            );
+
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json["error"]["code"], "upstream_output_parse_failed",
+                "{endpoint}"
+            );
+            assert!(json["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("fake decode failure")));
+        }
     }
 }

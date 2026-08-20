@@ -57,6 +57,21 @@ impl ParserResolver {
         }
     }
 
+    /// Test-only resolver that carries configured parser names but skips
+    /// model-card lookups (no worker registry). Mirrors `disabled()` for
+    /// endpoints that rely solely on the gateway-configured parser names.
+    #[cfg(test)]
+    pub(crate) fn configured_only(
+        configured_tool_parser: Option<String>,
+        configured_reasoning_parser: Option<String>,
+    ) -> Self {
+        Self {
+            worker_registry: None,
+            configured_tool_parser,
+            configured_reasoning_parser,
+        }
+    }
+
     /// Effective tool-parser name for `model`, if any.
     pub(crate) fn tool_parser(&self, model: &str) -> Option<String> {
         self.card_parser(model, |card| card.tool_parser.as_ref())

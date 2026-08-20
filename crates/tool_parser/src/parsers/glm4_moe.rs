@@ -97,21 +97,48 @@ impl Glm4MoeParser {
         &self,
         args_text: &str,
         param_types: &HashMap<String, String>,
-    ) -> serde_json::Map<String, Value> {
+    ) -> ParserResult<serde_json::Map<String, Value>> {
         let mut arguments = serde_json::Map::new();
+        let mut consumed = 0;
 
         for capture in self.arg_extractor.captures_iter(args_text) {
-            let key = capture.get(1).map_or("", |m| m.as_str()).trim();
-            let value_str = capture.get(2).map_or("", |m| m.as_str()).trim();
+            let full_match = capture.get(0).ok_or_else(|| {
+                ParserError::ParsingFailed("malformed GLM argument block".to_string())
+            })?;
+            if !args_text[consumed..full_match.start()].trim().is_empty() {
+                return Err(ParserError::ParsingFailed(
+                    "malformed GLM argument tags".to_string(),
+                ));
+            }
 
-            let value =
-                helpers::coerce_by_schema_type(value_str, param_types.get(key).map(String::as_str))
-                    .unwrap_or_else(|| infer_value(value_str));
+            let key = capture.get(1).map_or("", |m| m.as_str()).trim();
+            if key.is_empty() {
+                return Err(ParserError::ParsingFailed(
+                    "GLM argument key must not be empty".to_string(),
+                ));
+            }
+            let raw_value = capture.get(2).map_or("", |m| m.as_str());
+            let declared_type = param_types.get(key).map(String::as_str);
+            let value_str = if declared_type == Some("string") {
+                raw_value
+            } else {
+                raw_value.trim()
+            };
+
+            let value = helpers::coerce_by_schema_type(value_str, declared_type)
+                .unwrap_or_else(|| infer_value(value_str));
 
             arguments.insert(key.to_string(), value);
+            consumed = full_match.end();
         }
 
-        arguments
+        if !args_text[consumed..].trim().is_empty() {
+            return Err(ParserError::ParsingFailed(
+                "malformed GLM argument tags".to_string(),
+            ));
+        }
+
+        Ok(arguments)
     }
 
     /// Parse a single tool call block
@@ -124,7 +151,7 @@ impl Glm4MoeParser {
             let args_text = captures.get(2).map_or("", |m| m.as_str());
 
             let param_types = helpers::param_types_for_function(tools, func_name);
-            let arguments = self.parse_arguments(args_text, &param_types);
+            let arguments = self.parse_arguments(args_text, &param_types)?;
 
             let arguments_str = serde_json::to_string(&arguments)
                 .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
@@ -141,33 +168,239 @@ impl Glm4MoeParser {
     }
 
     /// Parse all tool calls from text (shared logic for complete and incremental parsing)
-    fn parse_tool_calls_from_text(&self, text: &str, tools: &[Tool]) -> Vec<ToolCall> {
+    fn parse_tool_calls_from_text(
+        &self,
+        text: &str,
+        tools: &[Tool],
+    ) -> ParserResult<Vec<ToolCall>> {
         let mut parsed = Vec::new();
+        let tool_indices = helpers::get_tool_indices(tools);
 
         for mat in self.tool_call_extractor.find_iter(text) {
-            match self.parse_tool_call(mat.as_str(), tools) {
-                Ok(Some(tool)) => parsed.push(tool),
-                Ok(None) => continue,
-                Err(e) => {
-                    tracing::debug!("Failed to parse tool call: {}", e);
-                    continue;
-                }
+            let Some(tool) = self.parse_tool_call(mat.as_str(), tools)? else {
+                return Err(ParserError::ParsingFailed(
+                    "malformed GLM tool call".to_string(),
+                ));
+            };
+            if !tools.is_empty() && !tool_indices.contains_key(&tool.function.name) {
+                return Err(ParserError::InvalidToolName(tool.function.name));
             }
+            parsed.push(tool);
         }
 
-        parsed
+        Ok(parsed)
     }
 }
 
 impl Glm4MoeParser {
+    const STRUCTURAL_MARKERS: [&str; 6] = [
+        "<tool_call>",
+        "</tool_call>",
+        "<arg_key>",
+        "</arg_key>",
+        "<arg_value>",
+        "</arg_value>",
+    ];
+
+    fn partial_marker_suffix_len(text: &str, marker: &str) -> usize {
+        (1..marker.len())
+            .rev()
+            .find(|&len| text.ends_with(&marker[..len]))
+            .unwrap_or(0)
+    }
+
+    fn partial_structural_marker_suffix_len(text: &str) -> usize {
+        Self::STRUCTURAL_MARKERS
+            .iter()
+            .map(|marker| Self::partial_marker_suffix_len(text, marker))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn contains_structural_fragment(text: &str) -> bool {
+        ["<tool_", "</tool_", "<arg_", "</arg_"]
+            .iter()
+            .any(|prefix| text.contains(prefix))
+    }
+
+    fn has_post_call_structural_residue(&self, text: &str) -> bool {
+        let mut saw_call = false;
+        let mut previous_end = 0;
+
+        for block in self.tool_call_extractor.find_iter(text) {
+            if saw_call && Self::contains_structural_fragment(&text[previous_end..block.start()]) {
+                return true;
+            }
+            saw_call = true;
+            previous_end = block.end();
+        }
+
+        saw_call
+            && (Self::contains_structural_fragment(&text[previous_end..])
+                || Self::partial_structural_marker_suffix_len(&text[previous_end..]) > 0)
+    }
+
+    fn record_tool_call(&mut self, tool_call: ToolCall) -> ToolCallItem {
+        if self.current_tool_id == -1 {
+            self.current_tool_id = 0;
+            self.prev_tool_call_arr.clear();
+            self.streamed_args_for_tool.clear();
+        }
+
+        let tool_id = self.current_tool_id as usize;
+        helpers::ensure_capacity(
+            self.current_tool_id,
+            &mut self.prev_tool_call_arr,
+            &mut self.streamed_args_for_tool,
+        );
+
+        if let Ok(args) = serde_json::from_str::<Value>(&tool_call.function.arguments) {
+            self.prev_tool_call_arr[tool_id] = serde_json::json!({
+                "name": tool_call.function.name,
+                "arguments": args,
+            });
+        }
+        self.streamed_args_for_tool[tool_id].clone_from(&tool_call.function.arguments);
+        self.current_tool_id += 1;
+
+        ToolCallItem {
+            tool_index: tool_id,
+            name: Some(tool_call.function.name),
+            parameters: tool_call.function.arguments,
+        }
+    }
+
+    fn drain_incremental(
+        &mut self,
+        tools: &[Tool],
+        end_of_input: bool,
+    ) -> ParserResult<StreamingParseResult> {
+        let mut normal_text = String::new();
+        let mut calls = Vec::new();
+        let tool_indices = helpers::get_tool_indices(tools);
+
+        loop {
+            if let Some(start) = self.buffer.find(self.bot_token) {
+                if start > 0 {
+                    if self.current_tool_id == -1 {
+                        normal_text.push_str(&self.buffer[..start]);
+                    }
+                    self.buffer.drain(..start);
+                    continue;
+                }
+
+                let Some(end_pos) = self.buffer.find(self.eot_token) else {
+                    break;
+                };
+                let block_end = end_pos + self.eot_token.len();
+                let block = self.buffer[..block_end].to_string();
+
+                let Some(tool_call) = self.parse_tool_call(&block, tools)? else {
+                    return Err(ParserError::ParsingFailed(
+                        "malformed GLM tool call".to_string(),
+                    ));
+                };
+                // Only validate tool names against a schema when tools are
+                // provided; no-schema callers (inference-only, native markup
+                // decoding) pass an empty slice and should accept any name.
+                if !tools.is_empty() && !tool_indices.contains_key(&tool_call.function.name) {
+                    return Err(ParserError::InvalidToolName(tool_call.function.name));
+                }
+                self.buffer.drain(..block_end);
+                calls.push(self.record_tool_call(tool_call));
+                continue;
+            }
+
+            if self.current_tool_id != -1 && Self::contains_structural_fragment(&self.buffer) {
+                return Err(ParserError::ParsingFailed(
+                    "unexpected GLM structure after tool call".to_string(),
+                ));
+            }
+
+            // If bot_token is already in the buffer (but eot_token hasn't arrived),
+            // we must hold everything from that index so the tool-call marker isn't
+            // drained and emitted as normal text.
+            let held_len = if let Some(start) = self.buffer.find(self.bot_token) {
+                self.buffer.len() - start
+            } else if self.current_tool_id == -1 {
+                Self::partial_marker_suffix_len(&self.buffer, self.bot_token)
+            } else {
+                Self::partial_structural_marker_suffix_len(&self.buffer)
+            };
+            let emit_len = self.buffer.len() - held_len;
+            if self.current_tool_id == -1 {
+                normal_text.push_str(&self.buffer[..emit_len]);
+            }
+            self.buffer.drain(..emit_len);
+            break;
+        }
+
+        if end_of_input && !self.buffer.is_empty() {
+            // At EOF, release short ambiguous prefixes (≤ 2 bytes) as normal
+            // text rather than failing with Incomplete. A lone "<" or "</" in
+            // ordinary output should not trigger an upstream error.
+            if self.current_tool_id == -1
+                && self.buffer.len() <= 2
+                && !Self::contains_structural_fragment(&self.buffer)
+            {
+                normal_text.push_str(&self.buffer);
+                self.buffer.clear();
+            } else {
+                return Err(ParserError::Incomplete);
+            }
+        }
+
+        Ok(StreamingParseResult { normal_text, calls })
+    }
+
     /// Shared non-streaming parse, schema-aware when `tools` are provided.
     fn parse_complete_inner(
         &self,
         text: &str,
         tools: &[Tool],
     ) -> ParserResult<(String, Vec<ToolCall>)> {
-        if !self.has_tool_markers(text) {
+        let has_complete_marker = self.has_tool_markers(text);
+        // Short ambiguous prefixes ("<", "</", "<t") are too common in
+        // ordinary text to treat as incomplete at EOF; only reject meaningful
+        // structural prefixes (3+ bytes, e.g. "<to", "</t", "<ar"). This
+        // mirrors the streaming EOF path, which releases <=2-byte buffers.
+        let has_partial_marker = Self::partial_structural_marker_suffix_len(text) > 2;
+        if has_partial_marker {
+            return Err(ParserError::Incomplete);
+        }
+        // A standalone unmatched closing marker (`eot_token`) with no matching
+        // opening `bot_token` is malformed structured output. Without this
+        // guard `has_complete_marker` would be false and the raw GLM markup
+        // would leak to clients as ordinary assistant text, bypassing the
+        // parse-error/502 path. The streaming path already rejects this via
+        // its post-call structural-residue checks.
+        if !has_complete_marker && text.contains(self.eot_token) {
+            return Err(ParserError::ParsingFailed(
+                "unmatched GLM closing marker without opening marker".to_string(),
+            ));
+        }
+        if !has_complete_marker {
             return Ok((text.to_string(), vec![]));
+        }
+        // Strip extracted tool-call blocks so orphan marker checks are not
+        // tripped by marker text that happens to appear inside argument values
+        // (e.g. a search query containing the literal "<tool_call>").
+        let mut stripped = String::with_capacity(text.len());
+        let mut last_end = 0;
+        for m in self.tool_call_extractor.find_iter(text) {
+            stripped.push_str(&text[last_end..m.start()]);
+            last_end = m.end();
+        }
+        stripped.push_str(&text[last_end..]);
+
+        if stripped.contains(self.bot_token) {
+            return Err(ParserError::Incomplete);
+        }
+        if stripped.contains(self.eot_token) || self.has_post_call_structural_residue(text)
+        {
+            return Err(ParserError::ParsingFailed(
+                "unexpected GLM structure outside tool call".to_string(),
+            ));
         }
 
         // Find where tool calls begin
@@ -177,11 +410,13 @@ impl Glm4MoeParser {
             .ok_or_else(|| ParserError::ParsingFailed("tool call marker not found".to_string()))?;
         let normal_text = text[..idx].to_string();
 
-        let parsed = self.parse_tool_calls_from_text(text, tools);
+        let parsed = self.parse_tool_calls_from_text(text, tools)?;
 
-        // If no tools were successfully parsed despite having markers, return entire text as fallback
+        // Structured output must never silently fall back to raw marker text.
         if parsed.is_empty() {
-            return Ok((text.to_string(), vec![]));
+            return Err(ParserError::ParsingFailed(
+                "malformed or incomplete GLM tool call".to_string(),
+            ));
         }
 
         Ok((normal_text, parsed))
@@ -236,126 +471,12 @@ impl ToolParser for Glm4MoeParser {
         chunk: &str,
         tools: &[Tool],
     ) -> ParserResult<StreamingParseResult> {
-        // Python logic: Wait for complete tool call, then parse it all at once
         self.buffer.push_str(chunk);
-        let current_text = &self.buffer.clone();
+        self.drain_incremental(tools, false)
+    }
 
-        // Check if we have bot_token
-        let start = current_text.find(self.bot_token);
-        if start.is_none() {
-            self.buffer.clear();
-            // If we're in the middle of streaming (current_tool_id > 0), don't return text
-            let normal_text = if self.current_tool_id > 0 {
-                String::new()
-            } else {
-                current_text.clone()
-            };
-            return Ok(StreamingParseResult {
-                normal_text,
-                calls: vec![],
-            });
-        }
-
-        // Check if we have eot_token (end of tool call)
-        let end = current_text.find(self.eot_token);
-        if let Some(end_pos) = end {
-            // We have a complete tool call!
-
-            // Initialize state if this is the first tool call
-            if self.current_tool_id == -1 {
-                self.current_tool_id = 0;
-                self.prev_tool_call_arr = Vec::new();
-                self.streamed_args_for_tool = vec![String::new()];
-            }
-
-            // Ensure we have enough entries in our tracking arrays
-            helpers::ensure_capacity(
-                self.current_tool_id,
-                &mut self.prev_tool_call_arr,
-                &mut self.streamed_args_for_tool,
-            );
-
-            // Parse the complete block using shared helper
-            let block_end = end_pos + self.eot_token.len();
-            let parsed_tools = self.parse_tool_calls_from_text(&current_text[..block_end], tools);
-
-            // Extract normal text before tool calls
-            let idx = current_text.find(self.bot_token);
-            let normal_text = if let Some(pos) = idx {
-                current_text[..pos].trim().to_string()
-            } else {
-                String::new()
-            };
-
-            // Build tool indices for validation
-            let tool_indices = helpers::get_tool_indices(tools);
-
-            let mut calls = Vec::new();
-
-            if !parsed_tools.is_empty() {
-                // Take the first tool and convert to ToolCallItem
-                let tool_call = &parsed_tools[0];
-                let tool_id = self.current_tool_id as usize;
-
-                // Validate tool name
-                if !tool_indices.contains_key(&tool_call.function.name) {
-                    // Invalid tool name - skip this tool, preserve indexing for next tool
-                    tracing::debug!("Invalid tool name '{}' - skipping", tool_call.function.name);
-                    helpers::reset_current_tool_state(
-                        &mut self.buffer,
-                        &mut false, // glm45_moe/glm47_moe doesn't track name_sent per tool
-                        &mut self.streamed_args_for_tool,
-                        &self.prev_tool_call_arr,
-                    );
-                    return Ok(StreamingParseResult::default());
-                }
-
-                calls.push(ToolCallItem {
-                    tool_index: tool_id,
-                    name: Some(tool_call.function.name.clone()),
-                    parameters: tool_call.function.arguments.clone(),
-                });
-
-                // Store in tracking arrays
-                if self.prev_tool_call_arr.len() <= tool_id {
-                    self.prev_tool_call_arr
-                        .resize_with(tool_id + 1, || Value::Null);
-                }
-
-                // Parse parameters as JSON and store
-                if let Ok(args) = serde_json::from_str::<Value>(&tool_call.function.arguments) {
-                    self.prev_tool_call_arr[tool_id] = serde_json::json!({
-                        "name": tool_call.function.name,
-                        "arguments": args,
-                    });
-                }
-
-                if self.streamed_args_for_tool.len() <= tool_id {
-                    self.streamed_args_for_tool
-                        .resize_with(tool_id + 1, String::new);
-                }
-                self.streamed_args_for_tool[tool_id].clone_from(&tool_call.function.arguments);
-
-                self.current_tool_id += 1;
-            }
-
-            // Remove processed portion from buffer
-            self.buffer = current_text[block_end..].to_string();
-            return Ok(StreamingParseResult { normal_text, calls });
-        }
-
-        // No complete tool call yet - return normal text before start token
-        // Safe: start.is_none() case was handled above (early return)
-        let Some(start_pos) = start else {
-            return Ok(StreamingParseResult::default());
-        };
-        let normal_text = current_text[..start_pos].to_string();
-        self.buffer = current_text[start_pos..].to_string();
-
-        Ok(StreamingParseResult {
-            normal_text,
-            calls: vec![],
-        })
+    async fn finalize(&mut self, tools: &[Tool]) -> ParserResult<StreamingParseResult> {
+        self.drain_incremental(tools, true)
     }
 
     fn has_tool_markers(&self, text: &str) -> bool {
@@ -437,5 +558,190 @@ mod tests {
         let args: Value = serde_json::from_str(&result.calls[0].parameters).unwrap();
         assert_eq!(args["limit"], Value::String("4".to_string()));
         assert_eq!(args["count"], Value::Number(5.into()));
+    }
+
+    #[tokio::test]
+    async fn test_non_streaming_rejects_incomplete_or_malformed_markers() {
+        let parser = Glm4MoeParser::glm47();
+
+        for text in [
+            "plain text <tool_cal",
+            "<tool_call>f<arg_key>query</arg_key>",
+            "<tool_call></tool_call>",
+        ] {
+            assert!(
+                parser.parse_complete(text).await.is_err(),
+                "structured marker must not fall back to raw text: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_non_streaming_rejects_standalone_unmatched_closing_marker() {
+        let parser = Glm4MoeParser::glm47();
+        // Build the closing marker via `format!` so the literal tag cannot be
+        // accidentally stripped from the source. A standalone `</tool_call>`
+        // with no matching `<tool_call>` is malformed structured output and
+        // must surface as a parse error rather than leaking as ordinary text.
+        let eot = format!("<{}tool_call>", "/");
+
+        for text in [
+            eot.clone(),
+            format!("some preamble{eot}"),
+            format!("lorem ipsum {eot} trailing"),
+        ] {
+            assert!(
+                parser.parse_complete(&text).await.is_err(),
+                "a standalone unmatched GLM closing marker must not leak as ordinary text: {text}"
+            );
+        }
+    }
+
+    // Short (<=2 byte) ambiguous prefixes like "</" or "<t" are common in
+    // ordinary text and must not be rejected as Incomplete by the complete
+    // path, mirroring the streaming EOF exemption. Longer prefixes (3+ bytes)
+    // are still treated as incomplete.
+    #[tokio::test]
+    async fn test_non_streaming_accepts_short_ambiguous_prefixes() {
+        let parser = Glm4MoeParser::glm47();
+
+        for text in ["some output </", "more output <t", "trailing <"] {
+            let (normal, calls) = parser
+                .parse_complete(text)
+                .await
+                .expect("short ambiguous prefix must not be Incomplete");
+            assert!(calls.is_empty(), "no tool calls expected for: {text}");
+            assert_eq!(normal, text, "text must pass through unchanged: {text}");
+        }
+
+        // 3+ byte prefixes are still meaningful and must be rejected.
+        for text in ["output <to", "output </t", "output <ar"] {
+            assert!(
+                parser.parse_complete(text).await.is_err(),
+                "meaningful structural prefix must be Incomplete: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_non_streaming_rejects_incomplete_second_call_after_valid_call() {
+        let parser = Glm4MoeParser::glm47();
+        let valid = "<tool_call>f</tool_call>";
+
+        for trailing in [
+            "<tool_cal",
+            "<tool_call>f<arg_key>query</arg_key><arg_value>unfinished",
+            "<tool_call></tool_call>",
+        ] {
+            let text = format!("{valid}{trailing}");
+            assert!(
+                parser.parse_complete(&text).await.is_err(),
+                "a valid first call must not hide an incomplete second call: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_non_streaming_rejects_unknown_tool_name() {
+        let tools = tool_with_props(serde_json::json!({}));
+        let text = "<tool_call>missing</tool_call>";
+
+        let error = Glm4MoeParser::glm47()
+            .parse_complete_with_tools(text, &tools)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ParserError::InvalidToolName(name) if name == "missing"));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_rejects_unknown_tool_name() {
+        let tools = tool_with_props(serde_json::json!({}));
+        let text = "<tool_call>missing</tool_call>";
+        let mut parser = Glm4MoeParser::glm47();
+
+        let error = parser.parse_incremental(text, &tools).await.unwrap_err();
+
+        assert!(matches!(error, ParserError::InvalidToolName(name) if name == "missing"));
+        assert!(matches!(
+            parser.parse_incremental("", &tools).await.unwrap_err(),
+            ParserError::InvalidToolName(name) if name == "missing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rejects_malformed_argument_tags() {
+        let tools = tool_with_props(serde_json::json!({"query": {"type": "string"}}));
+
+        for text in [
+            "<tool_call>f<arg_key>query</arg_key><arg_value>people</arg_val></tool_call>",
+            "<tool_call>f<arg_key>query</arg_key><arg_value>people</tool_call>",
+            "<tool_call>f<arg_key>query</arg_key>people</tool_call>",
+            "<tool_call>f<arg_value>people</arg_value></tool_call>",
+        ] {
+            assert!(
+                Glm4MoeParser::glm47()
+                    .parse_complete_with_tools(text, &tools)
+                    .await
+                    .is_err(),
+                "malformed argument tags must fail in complete parsing: {text}"
+            );
+
+            let mut parser = Glm4MoeParser::glm47();
+            assert!(
+                parser.parse_incremental(text, &tools).await.is_err(),
+                "malformed argument tags must fail in incremental parsing: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rejects_structural_residue_after_valid_call() {
+        let tools = tool_with_props(serde_json::json!({"query": {"type": "string"}}));
+        let valid = "<tool_call>f</tool_call>";
+
+        for residue in [
+            "</tool_call>",
+            "</tool_cal",
+            "<arg_key>query</arg_key>",
+            "<arg_value>people</arg_value>",
+        ] {
+            let text = format!("{valid}{residue}");
+            assert!(
+                Glm4MoeParser::glm47()
+                    .parse_complete_with_tools(&text, &tools)
+                    .await
+                    .is_err(),
+                "complete parsing must reject post-call structural residue: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streaming_rejects_unmatched_end_marker_at_every_split() {
+        let tools = tool_with_props(serde_json::json!({}));
+        let valid = "<tool_call>f</tool_call>";
+        let residue = "</tool_call>";
+
+        for split in 0..=residue.len() {
+            let mut parser = Glm4MoeParser::glm47();
+            let first = format!("{valid}{}", &residue[..split]);
+            let mut failed = parser.parse_incremental(&first, &tools).await.is_err();
+            if !failed {
+                failed = parser
+                    .parse_incremental(&residue[split..], &tools)
+                    .await
+                    .is_err();
+            }
+            if !failed {
+                failed = parser.finalize(&tools).await.is_err();
+            }
+
+            assert!(
+                failed,
+                "unmatched end marker must fail at split {split}: {first:?} + {:?}",
+                &residue[split..]
+            );
+        }
     }
 }
