@@ -702,6 +702,11 @@ pub enum PolicyConfig {
         /// before it counts as overloaded (default: 10)
         #[serde(default = "default_prefix_hash_balance_abs_threshold")]
         balance_abs_threshold: usize,
+        /// Resolved copy of `RouterConfig::cache_boundaries`: ascending token
+        /// positions; requests hash at the deepest boundary they reach.
+        /// Empty = hash at `prefix_token_count` only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cache_boundaries: Vec<usize>,
     },
 }
 

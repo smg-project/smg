@@ -1307,6 +1307,7 @@ impl CliArgs {
                 prefix_token_count: self.prefix_token_count,
                 load_factor: self.prefix_hash_load_factor,
                 balance_abs_threshold: self.prefix_hash_balance_abs_threshold,
+                cache_boundaries: self.cache_boundaries.clone(),
             },
             "consistent_hashing" => PolicyConfig::ConsistentHashing,
             "manual" => PolicyConfig::Manual {
@@ -2437,6 +2438,52 @@ mod tests {
             router_config.startup_worker_runtime_type,
             Some(RuntimeType::Vllm)
         );
+    }
+
+    /// The shared `--cache-boundaries` flag must also reach the prefix_hash
+    /// policy's resolved copy (the shared-field flow is covered by
+    /// `cache_index_flags_flow_into_both_configs`).
+    #[test]
+    fn cache_boundaries_flow_into_prefix_hash_policy() {
+        let cli = cli_args_from(&[
+            "--policy",
+            "prefix_hash",
+            "--cache-boundaries",
+            "2048,8192,32768",
+        ]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        match &router_config.policy {
+            PolicyConfig::PrefixHash {
+                cache_boundaries, ..
+            } => assert_eq!(cache_boundaries, &vec![2048, 8192, 32768]),
+            other => panic!("expected prefix_hash policy, got {other:?}"),
+        }
+
+        let defaults = cli_args_from(&["--policy", "prefix_hash"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        match &defaults.policy {
+            PolicyConfig::PrefixHash {
+                cache_boundaries, ..
+            } => assert!(cache_boundaries.is_empty()),
+            other => panic!("expected prefix_hash policy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_ascending_cache_boundaries_are_rejected() {
+        for bad in ["8192,2048", "0,2048", "2048,2048"] {
+            let cli = cli_args_from(&["--cache-boundaries", bad]);
+            assert!(
+                matches!(
+                    cli.to_router_config(vec![], vec![]),
+                    Err(ConfigError::InvalidValue { ref field, .. })
+                        if field == "cache_boundaries"
+                ),
+                "--cache-boundaries {bad} should be rejected"
+            );
+        }
     }
 
     #[test]

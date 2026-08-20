@@ -1103,6 +1103,23 @@ class TestPrefixHashArgs:
         assert router_args.prefix_hash_load_factor == 2.0
 
 
+class TestCacheBoundariesArgs:
+    """Boundary-list parsing beyond the basic parse/default coverage."""
+
+    def test_router_prefix_flag(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(["--router-cache-boundaries", "4096"])
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+        assert router_args.cache_boundaries == [4096]
+
+    def test_non_numeric_rejected(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--cache-boundaries", "2048,big"])
+
+
 class TestFlagAliases:
     """Intent-revealing alias flags land on the same dests as the canonical names."""
 

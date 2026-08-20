@@ -649,6 +649,7 @@ impl Router {
                     prefix_token_count: self.prefix_token_count,
                     load_factor: self.prefix_hash_load_factor,
                     balance_abs_threshold: self.prefix_hash_balance_abs_threshold,
+                    cache_boundaries: self.cache_boundaries.clone(),
                 },
             })
         };

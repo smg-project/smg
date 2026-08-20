@@ -647,6 +647,7 @@ impl ConfigValidator {
                 prefix_token_count,
                 load_factor,
                 balance_abs_threshold: _,
+                cache_boundaries,
             } => {
                 if *prefix_token_count == 0 {
                     return Err(ConfigError::InvalidValue {
@@ -663,6 +664,8 @@ impl ConfigValidator {
                         reason: "Must be >= 1.0".to_string(),
                     });
                 }
+
+                Self::validate_cache_boundaries(cache_boundaries)?;
             }
         }
         Ok(())
@@ -1159,6 +1162,23 @@ mod tests {
             ConfigValidator::validate(&at_cap),
             Err(ConfigError::InvalidValue { ref field, .. })
                 if field == "stream_request_bodies_over"
+        ));
+    }
+
+    #[test]
+    fn prefix_hash_policy_cache_boundaries_are_validated() {
+        let config = RouterConfig {
+            policy: PolicyConfig::PrefixHash {
+                prefix_token_count: 256,
+                load_factor: 1.25,
+                balance_abs_threshold: 10,
+                cache_boundaries: vec![8192, 2048],
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "cache_boundaries"
         ));
     }
 
