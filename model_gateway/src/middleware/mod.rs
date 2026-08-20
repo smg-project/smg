@@ -37,6 +37,10 @@ pub use crate::tenant::{
     RouteRequestMeta, TenantIdentity, TenantKey, TenantResolutionError,
 };
 
+/// `Retry-After` seconds on overload sheds: sheds must signal back-off; 408
+/// reads as a client transport error and gets instant proxy retries.
+pub(crate) const SHED_RETRY_AFTER_SECS: u32 = 2;
+
 /// Backward-compatible alias for the older tenant metadata name used in a few
 /// router-path tests and plumbing call sites.
 pub type TenantRequestMeta = RouteRequestMeta;

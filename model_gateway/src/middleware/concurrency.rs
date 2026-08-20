@@ -17,7 +17,7 @@ use std::{
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::StatusCode,
+    http::{header::RETRY_AFTER, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -29,11 +29,21 @@ use tokio::{
 };
 use tracing::{debug, error, warn};
 
-use super::token_bucket::TokenBucket;
+use super::{token_bucket::TokenBucket, SHED_RETRY_AFTER_SECS};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
+    routers::error::create_error,
     server::AppState,
 };
+
+/// Standard error body plus `Retry-After` for admission sheds.
+fn shed_response(status: StatusCode, code: &'static str, message: &'static str) -> Response {
+    let mut response = create_error(status, code, message);
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from(SHED_RETRY_AFTER_SECS));
+    response
+}
 
 /// Returns an acquired token when the request is cancelled or the response body is dropped.
 struct TokenPermit {
@@ -176,7 +186,7 @@ impl QueueProcessor {
             let elapsed = queued.queued_at.elapsed();
             if elapsed >= self.queue_timeout {
                 warn!("Request already timed out in queue");
-                let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
+                let _ = queued.permit_tx.send(Err(StatusCode::SERVICE_UNAVAILABLE));
                 continue;
             }
 
@@ -204,7 +214,7 @@ impl QueueProcessor {
                         let _ = queued.permit_tx.send(Ok(permit));
                     } else {
                         warn!("Queue: request timed out waiting for token");
-                        let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
+                        let _ = queued.permit_tx.send(Err(StatusCode::SERVICE_UNAVAILABLE));
                     }
                 });
             }
@@ -301,7 +311,11 @@ pub async fn concurrency_limit_middleware(
                             Metrics::record_admission_rejected(
                                 metrics_labels::ADMISSION_REJECTED_TIMEOUT,
                             );
-                            status.into_response()
+                            shed_response(
+                                status,
+                                "admission_queue_timeout",
+                                "timed out waiting for an admission slot",
+                            )
                         }
                         Err(_) => {
                             error!("Queue response channel closed");
@@ -314,13 +328,21 @@ pub async fn concurrency_limit_middleware(
                     warn!("Request queue is full, returning 429");
                     Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
                     Metrics::record_admission_rejected(metrics_labels::ADMISSION_REJECTED_FULL);
-                    StatusCode::TOO_MANY_REQUESTS.into_response()
+                    shed_response(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "admission_queue_full",
+                        "admission queue is at capacity",
+                    )
                 }
             }
         } else {
             warn!("No tokens available and queuing is disabled, returning 429");
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-            StatusCode::TOO_MANY_REQUESTS.into_response()
+            shed_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "admission_queue_full",
+                "concurrency limit reached and queuing is disabled",
+            )
         }
     }
 }
@@ -497,6 +519,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(shed.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            shed.headers().get(RETRY_AFTER).unwrap(),
+            &HeaderValue::from(SHED_RETRY_AFTER_SECS)
+        );
 
         frame_tx
             .send(Ok(Bytes::from_static(b"chunk")))
@@ -739,6 +765,15 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(
+                    rejected.headers().get(RETRY_AFTER).unwrap(),
+                    &HeaderValue::from(SHED_RETRY_AFTER_SECS)
+                );
+                let body = axum::body::to_bytes(rejected.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["error"]["code"], "admission_queue_full");
 
                 let rendered = handle.render();
                 assert_metric_line(&rendered, "smg_admission_queue_depth", "1");
@@ -756,8 +791,8 @@ mod tests {
         });
     }
 
-    /// A request that outlives the queue timeout is rejected with
-    /// reason="timeout" and releases its queue-depth slot.
+    /// A request that outlives the queue timeout sheds as 503 + Retry-After
+    /// with reason="timeout" and releases its queue-depth slot.
     #[test]
     #[expect(
         clippy::disallowed_methods,
@@ -781,7 +816,16 @@ mod tests {
 
                 let held = TokenPermit::try_acquire(bucket, 1.0).unwrap();
                 let response = app.oneshot(echo_request(Body::from("late"))).await.unwrap();
-                assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    response.headers().get(RETRY_AFTER).unwrap(),
+                    &HeaderValue::from(SHED_RETRY_AFTER_SECS)
+                );
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["error"]["code"], "admission_queue_timeout");
                 drop(held);
             });
         });
