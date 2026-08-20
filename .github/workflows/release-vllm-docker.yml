@@ -2,7 +2,7 @@ name: Release SMG+vLLM Docker Image
 
 run-name: >-
   SMG+vLLM |
-  ${{ github.event_name == 'push' && '3-version matrix' || format('base={0}', inputs.base_image_ref || 'vllm/vllm-openai:v0.26.0') }} |
+  ${{ github.event_name == 'push' && '3-version matrix' || format('base={0}', inputs.base_image_ref || 'vllm/vllm-openai:v0.27.1') }} |
   engine=${{ inputs.vllm_commit || 'latest' }} |
   smg=${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.9.0' }} |
   ${{ github.event_name == 'pull_request' && 'dry-run |' || '' }}
@@ -23,8 +23,8 @@ on:
   workflow_dispatch:
     inputs:
       base_image_ref:
-        description: 'Base image (e.g. vllm/vllm-openai:v0.26.0)'
-        default: 'vllm/vllm-openai:v0.26.0'
+        description: 'Base image (e.g. vllm/vllm-openai:v0.27.1)'
+        default: 'vllm/vllm-openai:v0.27.1'
         required: true
         type: string
       vllm_repo:
@@ -60,7 +60,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        base_image: ${{ github.event_name == 'push' && fromJSON('["vllm/vllm-openai:v0.26.0","vllm/vllm-openai:v0.25.0","vllm/vllm-openai:v0.23.0"]') || fromJSON(format('["{0}"]', inputs.base_image_ref || 'vllm/vllm-openai:v0.26.0')) }}
+        base_image: ${{ github.event_name == 'push' && fromJSON('["vllm/vllm-openai:v0.27.1","vllm/vllm-openai:v0.26.0","vllm/vllm-openai:v0.25.0"]') || fromJSON(format('["{0}"]', inputs.base_image_ref || 'vllm/vllm-openai:v0.27.1')) }}
     uses: ./.github/workflows/_build-engine-image.yml
     with:
       engine: vllm

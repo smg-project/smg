@@ -19,12 +19,15 @@ fi
 
 echo "Using uv version: $(uv --version)"
 
-# Floor 0.26.0: older vllm releases do not guarantee torchcodec, while the
-# import canary below deliberately validates it, and 0.26 caps
-# fastapi<0.137 (0.137 breaks the prometheus-fastapi-instrumentator health route).
+# Pinned to the release-matrix default so the CI lane tests the same engine
+# version the images ship (and stays deterministic like the sglang/trtllm
+# installs). 0.27.1 keeps the properties the lane depends on: torchcodec is
+# guaranteed (the import canary below deliberately validates it) and fastapi
+# is capped <0.137 (0.137 breaks the prometheus-fastapi-instrumentator health
+# route; verified in 0.27.1's dependency constraints).
 # --torch-backend=auto matches the torch CUDA variant to the pod's driver.
 echo "Installing vLLM..."
-uv pip install "vllm>=0.26.0" --torch-backend=auto
+uv pip install "vllm==0.27.1" --torch-backend=auto
 
 # vLLM >=0.25 eagerly imports torchcodec, which dlopens the FFmpeg shared
 # libraries (libavutil/libavcodec/libavformat/...) at import time. The runner

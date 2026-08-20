@@ -43,8 +43,8 @@ jobs:
       matrix:
         include:
           - engine: vllm
-            base_image_ref: vllm/vllm-openai:v0.22.1
-            engine_ver: v0.22.1
+            base_image_ref: vllm/vllm-openai:v0.27.1
+            engine_ver: v0.27.1
           - engine: sglang
             base_image_ref: lmsysorg/sglang:v0.5.12.post1
             engine_ver: v0.5.12.post1
