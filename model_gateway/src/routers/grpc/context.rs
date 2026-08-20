@@ -490,6 +490,10 @@ pub(crate) struct ResponseState {
     /// response_processing runs.
     pub skip_special_tokens: Option<bool>,
 
+    /// Response-phase view of the request, set by request building so
+    /// response processing never reads the payload after dispatch.
+    pub request_view: Option<super::regular::views::RequestView>,
+
     /// Execution result (streams from workers)
     pub execution_result: Option<ExecutionResult>,
 
@@ -637,18 +641,6 @@ impl RequestContext {
         )
     }
 
-    /// Get chat request (panics if not chat)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
-    pub fn chat_request(&self) -> &ChatCompletionRequest {
-        match &self.input.request_type {
-            RequestType::Chat(req) => req.as_ref(),
-            _ => panic!("Expected chat request"),
-        }
-    }
-
     /// Get Arc clone of chat request (panics if not chat)
     #[expect(
         clippy::panic,
@@ -661,18 +653,6 @@ impl RequestContext {
         }
     }
 
-    /// Get generate request (panics if not generate)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
-    pub fn generate_request(&self) -> &GenerateRequest {
-        match &self.input.request_type {
-            RequestType::Generate(req) => req.as_ref(),
-            _ => panic!("Expected generate request"),
-        }
-    }
-
     /// Get Arc clone of generate request (panics if not generate)
     #[expect(
         clippy::panic,
@@ -682,22 +662,6 @@ impl RequestContext {
         match &self.input.request_type {
             RequestType::Generate(req) => Arc::clone(req),
             _ => panic!("Expected generate request"),
-        }
-    }
-
-    /// Get completion request (panics if not completion)
-    #[expect(
-        dead_code,
-        reason = "ref accessor provided for API completeness alongside Arc accessor"
-    )]
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
-    pub fn completion_request(&self) -> &CompletionRequest {
-        match &self.input.request_type {
-            RequestType::Completion(req) => req.as_ref(),
-            _ => panic!("Expected completion request"),
         }
     }
 
@@ -722,22 +686,6 @@ impl RequestContext {
         match &self.input.request_type {
             RequestType::Responses(req) => Arc::clone(req),
             _ => panic!("Expected responses request"),
-        }
-    }
-
-    /// Get messages request (panics if not messages)
-    #[expect(
-        dead_code,
-        reason = "scaffolding for Messages API pipeline, wired in follow-up PR"
-    )]
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
-    pub fn messages_request(&self) -> &CreateMessageRequest {
-        match &self.input.request_type {
-            RequestType::Messages(req) => req.as_ref(),
-            _ => panic!("Expected messages request"),
         }
     }
 

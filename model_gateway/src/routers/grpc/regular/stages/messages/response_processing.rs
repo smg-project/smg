@@ -15,7 +15,7 @@ use crate::routers::{
     grpc::{
         common::stages::{helpers, PipelineStage, RateLimitCell},
         context::{FinalResponse, RequestContext},
-        regular::{processor, streaming},
+        regular::{processor, streaming, views},
     },
 };
 
@@ -77,6 +77,21 @@ impl PipelineStage for MessageResponseProcessingStage {
             )
         })?;
 
+        // Response-phase view set by request building; the payload itself may
+        // already be released.
+        let Some(views::RequestView::Messages(messages_request)) =
+            ctx.state.response.request_view.take()
+        else {
+            error!(
+                function = "MessageResponseProcessingStage::execute",
+                "Request view not set"
+            );
+            return Err(error::internal_error(
+                "request_view_not_set",
+                "Request view not set",
+            ));
+        };
+
         if is_streaming {
             // Read derived skip_special_tokens (set in preparation, survives request_building .take())
             let skip_special_tokens = ctx.state.response.skip_special_tokens.unwrap_or(true);
@@ -91,13 +106,14 @@ impl PipelineStage for MessageResponseProcessingStage {
                 .as_deref()
                 .and_then(RateLimitCell::take_for_streaming_handoff);
 
-            // Streaming: use StreamingProcessor and return SSE response
+            // Streaming: use StreamingProcessor and return SSE response. The
+            // stream task consumes the view, never the parsed request.
             let response = self
                 .streaming_processor
                 .clone()
                 .process_messages_streaming_response(
                     execution_result,
-                    ctx.messages_request_arc(),
+                    messages_request,
                     dispatch,
                     tokenizer,
                     skip_special_tokens,
@@ -117,8 +133,6 @@ impl PipelineStage for MessageResponseProcessingStage {
         }
 
         // Non-streaming: delegate to ResponseProcessor
-        let messages_request = ctx.messages_request_arc();
-
         let stop_decoder = ctx.state.response.stop_decoder.as_mut().ok_or_else(|| {
             error!(
                 function = "MessageResponseProcessingStage::execute",

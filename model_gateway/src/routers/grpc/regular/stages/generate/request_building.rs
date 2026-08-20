@@ -9,6 +9,7 @@ use crate::routers::{
     grpc::{
         common::stages::{helpers, PipelineStage},
         context::{ClientSelection, ExecutionPlan, ExecutionPlanKind, RequestContext},
+        regular::views,
     },
 };
 
@@ -103,6 +104,12 @@ impl PipelineStage for GenerateRequestBuildingStage {
         if let Some(workers) = ctx.state.workers.as_ref() {
             helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
         }
+
+        // Last request reader before dispatch: extract the response-phase view
+        // so response processing never needs the (possibly released) payload.
+        ctx.state.response.request_view = Some(views::RequestView::Generate(
+            views::GenerateRequestView::from(generate_request.as_ref()),
+        ));
 
         ctx.state.execution_plan = Some(ExecutionPlan::generate(self.plan_kind, proto_request));
         Ok(None)

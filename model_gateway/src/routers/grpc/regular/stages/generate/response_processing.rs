@@ -11,7 +11,7 @@ use crate::routers::{
     grpc::{
         common::stages::{helpers, PipelineStage, RateLimitCell},
         context::{FinalResponse, RequestContext},
-        regular::{processor, streaming},
+        regular::{processor, streaming, views},
     },
 };
 
@@ -89,6 +89,21 @@ impl GenerateResponseProcessingStage {
             )
         })?;
 
+        // Response-phase view set by request building; the payload itself may
+        // already be released.
+        let Some(views::RequestView::Generate(generate_request)) =
+            ctx.state.response.request_view.take()
+        else {
+            error!(
+                function = "GenerateResponseProcessingStage::execute",
+                "Request view not set"
+            );
+            return Err(error::internal_error(
+                "request_view_not_set",
+                "Request view not set",
+            ));
+        };
+
         if is_streaming {
             // Reserved (if tenant rate limiting is enabled): settled with real
             // usage inside the streaming processor on success, or abandoned
@@ -106,7 +121,7 @@ impl GenerateResponseProcessingStage {
                 .clone()
                 .process_streaming_generate(
                     execution_result,
-                    ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
+                    generate_request,
                     dispatch,
                     tokenizer,
                     reservation.clone(),
@@ -125,8 +140,7 @@ impl GenerateResponseProcessingStage {
         }
 
         // Non-streaming: Delegate to ResponseProcessor
-        let request_logprobs = ctx.generate_request().return_logprob.unwrap_or(false);
-        let generate_request = ctx.generate_request_arc();
+        let request_logprobs = generate_request.return_logprob;
 
         let stop_decoder = ctx.state.response.stop_decoder.as_mut().ok_or_else(|| {
             error!(
@@ -143,7 +157,6 @@ impl GenerateResponseProcessingStage {
             .processor
             .process_non_streaming_generate_response(
                 execution_result,
-                generate_request,
                 dispatch,
                 stop_decoder,
                 request_logprobs,

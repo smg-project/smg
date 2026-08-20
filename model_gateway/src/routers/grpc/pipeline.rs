@@ -1588,7 +1588,7 @@ mod alias_pipeline_tests {
         );
 
         assert_eq!(ctx.input.model_id, CANONICAL_MODEL);
-        assert_eq!(ctx.generate_request().model, CANONICAL_MODEL);
+        assert_eq!(ctx.generate_request_arc().model, CANONICAL_MODEL);
 
         for stage in pipeline.stages.iter() {
             assert!(stage.execute(&mut ctx).await.unwrap().is_none());
@@ -1598,7 +1598,7 @@ mod alias_pipeline_tests {
         }
 
         assert_eq!(ctx.input.model_id, CANONICAL_MODEL);
-        assert_eq!(ctx.generate_request().model, CANONICAL_MODEL);
+        assert_eq!(ctx.generate_request_arc().model, CANONICAL_MODEL);
         assert!(ctx.state.tokenizer.is_some());
         match ctx.state.workers.as_ref().unwrap() {
             WorkerSelection::Disaggregated {
@@ -1609,6 +1609,377 @@ mod alias_pipeline_tests {
             }
             WorkerSelection::Single { .. } => panic!("expected PD worker selection"),
         }
+    }
+}
+
+#[cfg(test)]
+mod request_release_tests {
+    use std::{
+        pin::Pin,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Weak,
+        },
+        time::Duration,
+    };
+
+    use futures::Stream;
+    use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
+    use openai_protocol::{
+        completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
+    };
+    use portpicker::pick_unused_port;
+    use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts};
+    use tokio_stream::wrappers::ReceiverStream;
+    use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
+    use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
+
+    use super::*;
+    use crate::{
+        config::types::PolicyConfig,
+        worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    };
+
+    const MODEL: &str = "request-release-test-model";
+
+    type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
+    type KvEventStream = Pin<Box<dyn Stream<Item = Result<common::KvEventBatch, Status>> + Send>>;
+    type TokenizerStream =
+        Pin<Box<dyn Stream<Item = Result<common::GetTokenizerChunk, Status>> + Send>>;
+
+    /// TokenSpeed stub gated on the parsed request's drop probe: it withholds
+    /// its tokens until the probe reaches zero strong references or a
+    /// deadline passes, recording the outcome in `released`. An ungated stub
+    /// (no probe) answers immediately -- used for the PD prefill leg.
+    #[derive(Clone, Default)]
+    struct GatedScheduler {
+        probe: Option<Weak<CompletionRequest>>,
+        released: Arc<AtomicBool>,
+    }
+
+    impl GatedScheduler {
+        async fn await_probe(probe: &Weak<CompletionRequest>, released: &AtomicBool) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while probe.strong_count() > 0 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            released.store(probe.strong_count() == 0, Ordering::SeqCst);
+        }
+    }
+
+    fn generate_frames(request_id: &str) -> Vec<Result<ts::GenerateResponse, Status>> {
+        use ts::generate_response::Response as GenResp;
+        vec![
+            Ok(ts::GenerateResponse {
+                request_id: request_id.to_string(),
+                response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
+                    token_ids: vec![100],
+                    prompt_tokens: 2,
+                    completion_tokens: 1,
+                    cached_tokens: 0,
+                    output_logprobs: None,
+                    index: 0,
+                })),
+            }),
+            Ok(ts::GenerateResponse {
+                request_id: request_id.to_string(),
+                response: Some(GenResp::Complete(ts::GenerateComplete {
+                    output_ids: vec![100],
+                    finish_reason: "stop".to_string(),
+                    prompt_tokens: 2,
+                    completion_tokens: 1,
+                    cached_tokens: 0,
+                    output_logprobs: None,
+                    matched_stop: None,
+                    index: 0,
+                })),
+            }),
+        ]
+    }
+
+    #[tonic::async_trait]
+    impl TokenSpeedScheduler for GatedScheduler {
+        type GenerateStream = GenStream;
+        type SubscribeKvEventsStream = KvEventStream;
+        type GetTokenizerStream = TokenizerStream;
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub; the gate task ends at its deadline"
+        )]
+        async fn generate(
+            &self,
+            request: TonicRequest<ts::GenerateRequest>,
+        ) -> Result<TonicResponse<Self::GenerateStream>, Status> {
+            let request_id = request.into_inner().request_id;
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            let probe = self.probe.clone();
+            let released = Arc::clone(&self.released);
+            tokio::spawn(async move {
+                if let Some(probe) = probe {
+                    Self::await_probe(&probe, &released).await;
+                }
+                for frame in generate_frames(&request_id) {
+                    if tx.send(frame).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            Ok(TonicResponse::new(Box::pin(ReceiverStream::new(rx))))
+        }
+
+        async fn health_check(
+            &self,
+            _request: TonicRequest<ts::HealthCheckRequest>,
+        ) -> Result<TonicResponse<ts::HealthCheckResponse>, Status> {
+            Ok(TonicResponse::new(ts::HealthCheckResponse {
+                healthy: true,
+                message: "ok".to_string(),
+            }))
+        }
+
+        async fn abort(
+            &self,
+            _request: TonicRequest<ts::AbortRequest>,
+        ) -> Result<TonicResponse<ts::AbortResponse>, Status> {
+            Ok(TonicResponse::new(ts::AbortResponse {
+                success: true,
+                message: String::new(),
+            }))
+        }
+
+        async fn get_model_info(
+            &self,
+            _request: TonicRequest<ts::GetModelInfoRequest>,
+        ) -> Result<TonicResponse<ts::GetModelInfoResponse>, Status> {
+            Ok(TonicResponse::new(ts::GetModelInfoResponse {
+                model_path: MODEL.to_string(),
+                tokenizer_path: MODEL.to_string(),
+                served_model_name: MODEL.to_string(),
+                model_type: "mock".to_string(),
+                architectures: vec!["MockForCausalLM".to_string()],
+                max_context_length: 32768,
+                max_req_input_len: 32768,
+                vocab_size: 32000,
+                eos_token_ids: vec![2],
+                pad_token_id: 0,
+                bos_token_id: 1,
+                weight_version: "mock".to_string(),
+                default_sampling_params_json: String::new(),
+                supports_vision: false,
+                ..Default::default()
+            }))
+        }
+
+        async fn get_server_info(
+            &self,
+            _request: TonicRequest<ts::GetServerInfoRequest>,
+        ) -> Result<TonicResponse<ts::GetServerInfoResponse>, Status> {
+            Ok(TonicResponse::new(ts::GetServerInfoResponse {
+                max_total_num_tokens: 1_000_000,
+                tokenspeed_version: "mock".to_string(),
+                ..Default::default()
+            }))
+        }
+
+        async fn get_loads(
+            &self,
+            _request: TonicRequest<ts::GetLoadsRequest>,
+        ) -> Result<TonicResponse<ts::GetLoadsResponse>, Status> {
+            Err(Status::unimplemented("release-test stub"))
+        }
+
+        async fn subscribe_kv_events(
+            &self,
+            _request: TonicRequest<common::SubscribeKvEventsRequest>,
+        ) -> Result<TonicResponse<Self::SubscribeKvEventsStream>, Status> {
+            Err(Status::unimplemented("release-test stub"))
+        }
+
+        async fn flush_cache(
+            &self,
+            _request: TonicRequest<common::FlushCacheRequest>,
+        ) -> Result<TonicResponse<common::FlushCacheResponse>, Status> {
+            Err(Status::unimplemented("release-test stub"))
+        }
+
+        async fn start_profile(
+            &self,
+            _request: TonicRequest<common::StartProfileRequest>,
+        ) -> Result<TonicResponse<common::ProfileResponse>, Status> {
+            Err(Status::unimplemented("release-test stub"))
+        }
+
+        async fn stop_profile(
+            &self,
+            _request: TonicRequest<common::StopProfileRequest>,
+        ) -> Result<TonicResponse<common::ProfileResponse>, Status> {
+            Err(Status::unimplemented("release-test stub"))
+        }
+
+        async fn get_tokenizer(
+            &self,
+            _request: TonicRequest<common::GetTokenizerRequest>,
+        ) -> Result<TonicResponse<Self::GetTokenizerStream>, Status> {
+            Err(Status::unimplemented("release-test stub"))
+        }
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test helper; the stub server lives for the test process"
+    )]
+    async fn spawn_stub(scheduler: GatedScheduler) -> u16 {
+        let port = pick_unused_port().expect("no free port for release-test stub");
+        let addr = format!("127.0.0.1:{port}").parse().expect("stub addr");
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(TokenSpeedSchedulerServer::new(scheduler))
+                .serve(addr)
+                .await
+                .expect("release-test stub server");
+        });
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                return port;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("release-test stub on port {port} never came up");
+    }
+
+    fn register_worker(registry: &WorkerRegistry, port: u16, worker_type: WorkerType) {
+        let worker = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+            .worker_type(worker_type)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::TokenSpeed)
+            .model(ModelCard::new(MODEL))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        registry
+            .register(Arc::new(worker))
+            .expect("register release-test worker");
+    }
+
+    async fn components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponents> {
+        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+        let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
+        tokenizer_registry
+            .load(
+                "tokenizer-id",
+                MODEL,
+                "test",
+                || async move { Ok(tokenizer) },
+            )
+            .await
+            .expect("load mock tokenizer");
+        Arc::new(SharedComponents {
+            tokenizer_registry,
+            worker_registry,
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            parser_resolver: utils::ParserResolver::disabled(),
+            multimodal: None,
+        })
+    }
+
+    fn completion_request(stream: bool) -> Arc<CompletionRequest> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "prompt": "Hello world",
+                "stream": stream,
+            }))
+            .expect("completion request"),
+        )
+    }
+
+    fn completion_pipeline(worker_registry: &Arc<WorkerRegistry>, mode: Mode) -> RequestPipeline {
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+        );
+        RequestPipeline::build(Endpoint::Completion, mode, &deps).expect("completion pipeline")
+    }
+
+    async fn run_and_drain(
+        pipeline: RequestPipeline,
+        components: Arc<SharedComponents>,
+        request: Arc<CompletionRequest>,
+    ) -> bytes::Bytes {
+        let response = pipeline
+            .execute_completion(request, None, MODEL.to_string(), components, None, None)
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain SSE body")
+    }
+
+    /// The stream task must run off an extracted view: the stub refuses to
+    /// emit tokens until the parsed request has been freed, so a stream that
+    /// still pinned it would stall past the stub's deadline.
+    #[tokio::test]
+    async fn streaming_releases_parsed_request_before_first_token() {
+        let request = completion_request(true);
+        let released = Arc::new(AtomicBool::new(false));
+        let port = spawn_stub(GatedScheduler {
+            probe: Some(Arc::downgrade(&request)),
+            released: Arc::clone(&released),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, port, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let body = run_and_drain(pipeline, components, request).await;
+
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the parsed request must be freed before the first token"
+        );
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("data: [DONE]"), "stream must finish: {body}");
+    }
+
+    /// grpc_pd twin: the decode leg's stream task must not pin the parsed
+    /// request either (the prefill stub answers immediately).
+    #[tokio::test]
+    async fn pd_streaming_releases_parsed_request_before_first_token() {
+        let request = completion_request(true);
+        let released = Arc::new(AtomicBool::new(false));
+        let prefill_port = spawn_stub(GatedScheduler::default()).await;
+        let decode_port = spawn_stub(GatedScheduler {
+            probe: Some(Arc::downgrade(&request)),
+            released: Arc::clone(&released),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+        register_worker(&worker_registry, decode_port, WorkerType::Decode);
+        let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+        let components = components(worker_registry).await;
+
+        let body = run_and_drain(pipeline, components, request).await;
+
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the parsed request must be freed before the first decode token"
+        );
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("data: [DONE]"), "stream must finish: {body}");
     }
 }
 

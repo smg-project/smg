@@ -24,6 +24,7 @@ use crate::routers::{
             RequestContext, RequestType, WorkerSelection,
         },
         proto_wrapper::ProtoGenerateRequest,
+        regular::views,
     },
 };
 
@@ -213,6 +214,12 @@ impl PipelineStage for CompletionRequestBuildingStage {
                 }
             }
         };
+
+        // Last request reader before dispatch: extract the response-phase view
+        // so response processing never needs the (possibly released) payload.
+        ctx.state.response.request_view = Some(views::RequestView::Completion(
+            views::CompletionRequestView::from(completion_request.as_ref()),
+        ));
 
         ctx.state.execution_plan = Some(plan);
         Ok(None)

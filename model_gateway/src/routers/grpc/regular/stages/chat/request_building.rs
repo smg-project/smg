@@ -13,6 +13,7 @@ use crate::routers::{
             ClientSelection, ExecutionPlan, ExecutionPlanKind, PreparationOutput, RequestContext,
         },
         multimodal::{assemble_multimodal_data, assemble_multimodal_data_after_encode},
+        regular::views,
         utils,
     },
 };
@@ -172,6 +173,12 @@ impl PipelineStage for ChatRequestBuildingStage {
         if let Some(workers) = ctx.state.workers.as_ref() {
             helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
         }
+
+        // Last request reader before dispatch: extract the response-phase view
+        // so response processing never needs the (possibly released) payload.
+        ctx.state.response.request_view = Some(views::RequestView::Chat(
+            views::ChatRequestView::from(chat_request.as_ref()),
+        ));
 
         ctx.state.execution_plan = Some(ExecutionPlan::generate(self.plan_kind, proto_request));
         Ok(None)

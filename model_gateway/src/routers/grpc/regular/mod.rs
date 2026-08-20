@@ -7,3 +7,4 @@ pub(crate) mod processor;
 pub(crate) mod responses;
 pub(crate) mod stages;
 pub(crate) mod streaming;
+pub(crate) mod views;

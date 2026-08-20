@@ -17,7 +17,7 @@ use crate::routers::{
     grpc::{
         common::stages::{helpers, PipelineStage, RateLimitCell},
         context::{FinalResponse, RequestContext},
-        regular::{processor, streaming},
+        regular::{processor, streaming, views},
     },
 };
 
@@ -76,6 +76,21 @@ impl PipelineStage for CompletionResponseProcessingStage {
             )
         })?;
 
+        // Response-phase view set by request building; the payload itself may
+        // already be released.
+        let Some(views::RequestView::Completion(completion_request)) =
+            ctx.state.response.request_view.take()
+        else {
+            error!(
+                function = "CompletionResponseProcessingStage::execute",
+                "Request view not set"
+            );
+            return Err(error::internal_error(
+                "request_view_not_set",
+                "Request view not set",
+            ));
+        };
+
         if is_streaming {
             // Reserved (if tenant rate limiting is enabled): settled with real
             // usage inside the streaming processor on success, or abandoned
@@ -87,12 +102,14 @@ impl PipelineStage for CompletionResponseProcessingStage {
                 .as_deref()
                 .and_then(RateLimitCell::take_for_streaming_handoff);
 
+            // Streaming: the stream tasks consume the view, never the parsed
+            // request.
             let response = self
                 .streaming_processor
                 .clone()
                 .process_completion_streaming_response(
                     execution_result,
-                    ctx.completion_request_arc(),
+                    completion_request,
                     dispatch,
                     tokenizer,
                     reservation.clone(),
@@ -111,8 +128,6 @@ impl PipelineStage for CompletionResponseProcessingStage {
         }
 
         // Non-streaming path
-        let completion_request = ctx.completion_request_arc();
-
         let stop_decoder = ctx.state.response.stop_decoder.as_mut().ok_or_else(|| {
             error!(
                 function = "CompletionResponseProcessingStage::execute",

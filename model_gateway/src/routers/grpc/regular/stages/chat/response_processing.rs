@@ -14,7 +14,7 @@ use crate::routers::{
     grpc::{
         common::stages::{helpers, PipelineStage, RateLimitCell},
         context::{FinalResponse, RequestContext},
-        regular::{processor, streaming},
+        regular::{processor, streaming, views},
     },
 };
 
@@ -89,13 +89,27 @@ impl ChatResponseProcessingStage {
             )
         })?;
 
+        // Response-phase view set by request building; the payload itself may
+        // already be released.
+        let Some(views::RequestView::Chat(chat_request)) = ctx.state.response.request_view.take()
+        else {
+            error!(
+                function = "ChatResponseProcessingStage::execute",
+                "Request view not set"
+            );
+            return Err(error::internal_error(
+                "request_view_not_set",
+                "Request view not set",
+            ));
+        };
+
         if is_streaming {
             // Read derived skip_special_tokens (set in preparation, survives request_building .take())
             let skip_special_tokens = ctx
                 .state
                 .response
                 .skip_special_tokens
-                .unwrap_or_else(|| ctx.chat_request().skip_special_tokens);
+                .unwrap_or(chat_request.skip_special_tokens);
 
             // Reserved (if tenant rate limiting is enabled): settled with real
             // usage inside the streaming processor on success, or abandoned
@@ -107,13 +121,14 @@ impl ChatResponseProcessingStage {
                 .as_deref()
                 .and_then(RateLimitCell::take_for_streaming_handoff);
 
-            // Streaming: Use StreamingProcessor and return SSE response
+            // Streaming: Use StreamingProcessor and return SSE response. The
+            // stream task consumes the view, never the parsed request.
             let response = self
                 .streaming_processor
                 .clone()
                 .process_streaming_response(
                     execution_result,
-                    ctx.chat_request_arc(), // Cheap Arc clone (8 bytes)
+                    chat_request,
                     dispatch,
                     tokenizer,
                     skip_special_tokens,
@@ -133,9 +148,7 @@ impl ChatResponseProcessingStage {
         }
 
         // Non-streaming: Delegate to ResponseProcessor
-        let request_logprobs = ctx.chat_request().logprobs;
-
-        let chat_request = ctx.chat_request_arc();
+        let request_logprobs = chat_request.logprobs;
 
         let stop_decoder = ctx.state.response.stop_decoder.as_mut().ok_or_else(|| {
             error!(
