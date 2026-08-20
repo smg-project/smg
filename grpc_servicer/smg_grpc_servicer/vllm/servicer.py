@@ -484,13 +484,27 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # the router derives the suffix from the rank it pins per request
             kv_engine_id = getattr(kv_transfer_config, "engine_id", "") or ""
 
-        return vllm_engine_pb2.GetServerInfoResponse(
+        response = vllm_engine_pb2.GetServerInfoResponse(
             kv_connector=kv_connector,
             kv_role=kv_role,
             kv_engine_id=kv_engine_id,
             data_parallel_size=parallel.data_parallel_size,
             shm_namespace_id=mm_shm.shm_namespace_id(),
         )
+        # Declare how decode constraints interact with reasoning: with a
+        # reasoning parser configured, vLLM activates grammars only after the
+        # reasoning block; otherwise the grammar binds from the first output
+        # token and constrained completions cannot contain reasoning. Guarded
+        # so older smg-grpc-proto packages (without the field) keep working.
+        if "constrained_decoding_mode" in response.DESCRIPTOR.fields_by_name:
+            response.constrained_decoding_mode = self._constrained_decoding_mode()
+        return response
+
+    def _constrained_decoding_mode(self) -> str:
+        """Derive the engine's constrained-decoding behavior from its config."""
+        structured_outputs = getattr(self.engine.vllm_config, "structured_outputs_config", None)
+        reasoning_parser = getattr(structured_outputs, "reasoning_parser", "") or ""
+        return "after_reasoning" if reasoning_parser else "from_first_token"
 
     async def GetLoads(
         self,

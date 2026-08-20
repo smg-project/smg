@@ -852,6 +852,7 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
     "is_embedding",
     "vocab_size",
     "weight_version",
+    "constrained_decoding_mode",
 ];
 
 /// Keys worth extracting from TokenSpeed gRPC `server_args` (post-rename: bare
@@ -870,6 +871,7 @@ const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     "is_embedding",
     "vocab_size",
     "weight_version",
+    "constrained_decoding_mode",
 ];
 
 // ---------------------------------------------------------------------------
@@ -942,7 +944,7 @@ fn pick_prost_fields(labels: &mut HashMap<String, String>, s: &prost_types::Stru
 mod tests {
     use std::collections::BTreeMap;
 
-    use smg_grpc_client::{sglang_proto, tokenspeed_proto};
+    use smg_grpc_client::{sglang_proto, tokenspeed_proto, vllm_proto};
 
     use super::{trtllm_status_healthy, ModelInfo, ServerInfo};
 
@@ -1055,6 +1057,43 @@ mod tests {
         );
         assert_eq!(labels.get("version").map(String::as_str), Some("0.4.0"));
         assert!(!labels.contains_key("api_key"));
+    }
+
+    /// The engine-declared constrained-decoding behavior travels as a label
+    /// for every backend: via `server_args` for SGLang/TokenSpeed, via the
+    /// flat proto field for vLLM (absent when the engine doesn't declare it).
+    #[test]
+    fn server_info_to_labels_carries_constrained_decoding_mode() {
+        let info = ServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
+            server_args: Some(prost_types::Struct {
+                fields: BTreeMap::from([(
+                    "constrained_decoding_mode".to_string(),
+                    string_value("from_first_token"),
+                )]),
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(
+            info.to_labels()
+                .get("constrained_decoding_mode")
+                .map(String::as_str),
+            Some("from_first_token")
+        );
+
+        let info = ServerInfo::Vllm(vllm_proto::GetServerInfoResponse {
+            constrained_decoding_mode: "after_reasoning".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(
+            info.to_labels()
+                .get("constrained_decoding_mode")
+                .map(String::as_str),
+            Some("after_reasoning")
+        );
+
+        // Engines that don't declare (older servicers) produce no label.
+        let info = ServerInfo::Vllm(vllm_proto::GetServerInfoResponse::default());
+        assert!(!info.to_labels().contains_key("constrained_decoding_mode"));
     }
 
     /// `GetModelInfoResponse` is flat for every backend, so it serializes via

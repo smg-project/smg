@@ -535,7 +535,12 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         else:
             server_args_dict = dict(getattr(self.server_args, "__dict__", {}))
         server_args_struct = Struct()
-        server_args_struct.update(_make_json_serializable(server_args_dict))
+        server_args_dict = _make_json_serializable(server_args_dict)
+        # Decode constraints are enforced by the grammar backend from the first
+        # output token. Declared so the router knows constrained completions
+        # cannot contain reasoning.
+        server_args_dict["constrained_decoding_mode"] = "from_first_token"
+        server_args_struct.update(server_args_dict)
 
         scheduler_info_struct = Struct()
         scheduler_info_struct.update(_make_json_serializable(dict(self.scheduler_info)))

@@ -9,7 +9,9 @@ use tracing::error;
 use super::PipelineStage;
 use crate::routers::{
     error,
-    grpc::context::{DispatchMetadata, RequestContext, RequestType, WorkerSelection},
+    grpc::context::{
+        ConstrainedDecodingMode, DispatchMetadata, RequestContext, RequestType, WorkerSelection,
+    },
 };
 
 /// Dispatch metadata stage: Prepare metadata for dispatch
@@ -43,16 +45,20 @@ impl PipelineStage for DispatchMetadataStage {
             RequestType::Messages(req) => req.model.clone(),
         };
 
-        let weight_version = ctx
-            .state
-            .workers
-            .as_ref()
-            .map(|w| match w {
-                WorkerSelection::Single { worker } => worker,
-                WorkerSelection::Disaggregated { decode, .. } => decode,
-            })
+        // For PD disaggregation the decode leg generates the tokens, so its
+        // labels describe the completion (weight version, decode behavior).
+        let generating_worker = ctx.state.workers.as_ref().map(|w| match w {
+            WorkerSelection::Single { worker } => worker,
+            WorkerSelection::Disaggregated { decode, .. } => decode,
+        });
+
+        let weight_version = generating_worker
             .and_then(|w| w.metadata().spec.labels.get("weight_version").cloned())
             .unwrap_or_else(|| "default".to_string());
+
+        let constrained_decoding_mode = generating_worker
+            .and_then(|w| w.metadata().spec.labels.get("constrained_decoding_mode"))
+            .and_then(|value| ConstrainedDecodingMode::from_label(value));
 
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -64,6 +70,7 @@ impl PipelineStage for DispatchMetadataStage {
             model,
             created,
             weight_version: Some(weight_version),
+            constrained_decoding_mode,
         });
 
         Ok(None)

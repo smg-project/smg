@@ -416,6 +416,30 @@ pub(crate) enum ClientSelection {
     },
 }
 
+/// Engine-declared behavior for grammar-constrained decoding, advertised via
+/// `GetServerInfo` and carried as the `constrained_decoding_mode` worker label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConstrainedDecodingMode {
+    /// The grammar binds from the first output token: a constrained
+    /// completion cannot contain reasoning.
+    FromFirstToken,
+    /// The grammar activates after the reasoning block: reasoning and a
+    /// think-end token precede the constrained payload.
+    AfterReasoning,
+}
+
+impl ConstrainedDecodingMode {
+    /// Parse the worker label. Unknown values resolve to `None` so the
+    /// response pipeline falls back to its capability-agnostic behavior.
+    pub(crate) fn from_label(value: &str) -> Option<Self> {
+        match value {
+            "from_first_token" => Some(Self::FromFirstToken),
+            "after_reasoning" => Some(Self::AfterReasoning),
+            _ => None,
+        }
+    }
+}
+
 /// Dispatch metadata (Step 5)
 #[derive(Clone)]
 pub(crate) struct DispatchMetadata {
@@ -423,6 +447,15 @@ pub(crate) struct DispatchMetadata {
     pub model: String,
     pub created: u64,
     pub weight_version: Option<String>,
+    /// How the dispatched worker applies decode constraints, when declared.
+    /// `None` for workers that don't advertise the label (older servicers).
+    #[expect(
+        dead_code,
+        reason = "read by the reasoning/tool decision sites in the follow-up \
+                  that lands after the required-tool-choice fix merges; the \
+                  unfulfilled expectation then forces removal of this attribute"
+    )]
+    pub constrained_decoding_mode: Option<ConstrainedDecodingMode>,
 }
 
 /// Load guards for worker load tracking
@@ -1050,5 +1083,20 @@ mod tests {
         assert_eq!(plan.request_id(), "cmpl_shared");
         assert_eq!(plan.request_type(), "generate");
         assert_eq!(plan.mode_label(), "prefill_decode");
+    }
+
+    #[test]
+    fn constrained_decoding_mode_parses_known_labels_only() {
+        assert_eq!(
+            ConstrainedDecodingMode::from_label("from_first_token"),
+            Some(ConstrainedDecodingMode::FromFirstToken)
+        );
+        assert_eq!(
+            ConstrainedDecodingMode::from_label("after_reasoning"),
+            Some(ConstrainedDecodingMode::AfterReasoning)
+        );
+        // Unknown/future values fall back to capability-agnostic behavior.
+        assert_eq!(ConstrainedDecodingMode::from_label("adaptive"), None);
+        assert_eq!(ConstrainedDecodingMode::from_label(""), None);
     }
 }

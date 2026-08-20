@@ -360,6 +360,15 @@ message GetServerInfoResponse {
   // the router can verify a shared /dev/shm before using the SHM tensor
   // transport under `auto`. Empty when it can't be determined.
   string shm_namespace_id = 10;
+
+  // How the engine applies decode constraints (json_schema/regex/grammar):
+  //   "from_first_token" - grammar enforced from the first output token; the
+  //                        completion cannot contain reasoning/think tokens.
+  //   "after_reasoning"  - grammar activates after the reasoning block; the
+  //                        payload is preceded by reasoning + think-end token.
+  // Empty when unknown. The router uses this to decide whether reasoning
+  // parsing applies to grammar-constrained completions.
+  string constrained_decoding_mode = 11;
 }
 
 // =====================
