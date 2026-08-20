@@ -103,6 +103,29 @@ impl ResponseProcessor {
             final_text.push_str(&t);
         }
 
+        // Check if a JSON schema constraint was used (specific function or
+        // required mode): it changes both reasoning arming and tool parsing.
+        let tool_choice_enabled = !matches!(
+            &original_request.tool_choice,
+            Some(ToolChoice::Value(ToolChoiceValue::None))
+        );
+        let has_structural_tag = self
+            .tool_parser_factory
+            .registry()
+            .has_structural_tag_for_parser(tool_parser_name);
+        let used_json_schema = if has_structural_tag {
+            false
+        } else {
+            match &original_request.tool_choice {
+                Some(ToolChoice::Function { .. }) => true,
+                Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
+                Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
+                _ => false,
+            }
+        };
+        let tool_constraint_active =
+            tool_choice_enabled && original_request.tools.is_some() && used_json_schema;
+
         // Step 1: Handle reasoning content parsing
         let mut reasoning_text: Option<String> = None;
         let mut processed_text = final_text;
@@ -115,25 +138,25 @@ impl ResponseProcessor {
                 reasoning_parser_name,
                 &original_request.model,
             ) {
-                // If the template injected `<think>` in the prefill (thinking toggle
-                // is supported and effectively ON), start in reasoning mode.
-                if utils::should_mark_reasoning_started(
+                if utils::should_start_in_reasoning(
                     utils::resolve_user_thinking(
                         original_request.chat_template_kwargs.as_ref(),
                         original_request.reasoning_effort.as_deref(),
                         tokenizer.as_ref(),
                     ),
                     tokenizer.as_ref(),
+                    tool_constraint_active,
                 ) {
                     parser.mark_reasoning_started();
                 }
 
                 match parser.detect_and_parse_reasoning(&processed_text) {
                     Ok(result) => {
-                        if !result.reasoning_text.is_empty() {
-                            reasoning_text = Some(result.reasoning_text);
-                        }
-                        processed_text = result.normal_text;
+                        (reasoning_text, processed_text) = utils::split_reasoning_result(
+                            result,
+                            processed_text,
+                            tool_constraint_active,
+                        );
                     }
                     Err(e) => {
                         warn!("Reasoning parsing error, skipping parsing: {e}");
@@ -144,28 +167,8 @@ impl ResponseProcessor {
 
         // Step 2: Handle tool call parsing
         let mut tool_calls: Option<Vec<ToolCall>> = None;
-        let tool_choice_enabled = !matches!(
-            &original_request.tool_choice,
-            Some(ToolChoice::Value(ToolChoiceValue::None))
-        );
 
         if tool_choice_enabled && original_request.tools.is_some() {
-            // Check if JSON schema constraint was used (specific function or required mode)
-            let has_structural_tag = self
-                .tool_parser_factory
-                .registry()
-                .has_structural_tag_for_parser(tool_parser_name);
-            let used_json_schema = if has_structural_tag {
-                false
-            } else {
-                match &original_request.tool_choice {
-                    Some(ToolChoice::Function { .. }) => true,
-                    Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
-                    Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-                    _ => false,
-                }
-            };
-
             if used_json_schema {
                 (tool_calls, processed_text) = utils::parse_json_schema_response(
                     &processed_text,
@@ -579,6 +582,20 @@ impl ResponseProcessor {
                 &messages_request.model,
             );
 
+        // Check if a JSON schema constraint was used (specific tool or any/required
+        // mode): it changes both reasoning arming and tool parsing.
+        let has_structural_tag = self
+            .tool_parser_factory
+            .registry()
+            .has_structural_tag_for_parser(tool_parser_name.as_deref());
+        let used_json_schema = !has_structural_tag
+            && matches!(
+                &messages_request.tool_choice,
+                Some(messages::ToolChoice::Tool { .. } | messages::ToolChoice::Any { .. })
+            );
+        let tool_constraint_active =
+            tool_choice_enabled && messages_request.tools.is_some() && used_json_schema;
+
         if separate_reasoning && !reasoning_parser_available {
             tracing::debug!(
                 "No reasoning parser found for model '{}', reasoning content will not be separated",
@@ -648,17 +665,22 @@ impl ResponseProcessor {
                         Some(messages::ThinkingConfig::Disabled) => Some(false),
                         None => None,
                     };
-                    if utils::should_mark_reasoning_started(user_thinking, tokenizer.as_ref()) {
+                    if utils::should_start_in_reasoning(
+                        user_thinking,
+                        tokenizer.as_ref(),
+                        tool_constraint_active,
+                    ) {
                         parser.mark_reasoning_started();
                     }
                 }
 
                 match parser.detect_and_parse_reasoning(&processed_text) {
                     Ok(result) => {
-                        if !result.reasoning_text.is_empty() {
-                            reasoning_text = Some(result.reasoning_text);
-                        }
-                        processed_text = result.normal_text;
+                        (reasoning_text, processed_text) = utils::split_reasoning_result(
+                            result,
+                            processed_text,
+                            tool_constraint_active,
+                        );
                     }
                     Err(e) => {
                         warn!("Reasoning parsing error, skipping parsing: {e}");
@@ -671,17 +693,6 @@ impl ResponseProcessor {
         let mut tool_calls: Option<Vec<ToolCall>> = None;
 
         if tool_choice_enabled && messages_request.tools.is_some() {
-            // Check if JSON schema constraint was used (specific tool or any/required mode)
-            let has_structural_tag = self
-                .tool_parser_factory
-                .registry()
-                .has_structural_tag_for_parser(tool_parser_name.as_deref());
-            let used_json_schema = !has_structural_tag
-                && matches!(
-                    &messages_request.tool_choice,
-                    Some(messages::ToolChoice::Tool { .. } | messages::ToolChoice::Any { .. })
-                );
-
             if used_json_schema {
                 // Bridge Messages ToolChoice to Chat ToolChoice for reuse
                 let chat_tool_choice = messages_request

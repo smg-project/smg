@@ -246,13 +246,21 @@ impl<'a> Detector<'a> {
     }
 
     /// Check if a list of statements contains `<think>` in EmitRaw or string constants.
+    /// `<think>` not closed by a later `</think>` in the same literal — an
+    /// open tag leaves the completion mid-reasoning, a closed pair (e.g.
+    /// Qwen3's thinking-off `<think>\n\n</think>` filler) does not.
+    fn str_has_open_think_tag(s: &str) -> bool {
+        s.rfind("<think>")
+            .is_some_and(|idx| !s[idx..].contains("</think>"))
+    }
+
     fn body_has_think_tag(stmts: &[Stmt]) -> bool {
         for stmt in stmts {
             match stmt {
-                Stmt::EmitRaw(raw) if raw.raw.contains("<think>") => return true,
+                Stmt::EmitRaw(raw) if Self::str_has_open_think_tag(raw.raw) => return true,
                 Stmt::EmitExpr(e) => {
                     if let Expr::Const(c) = &e.expr {
-                        if c.value.as_str().is_some_and(|s| s.contains("<think>")) {
+                        if c.value.as_str().is_some_and(Self::str_has_open_think_tag) {
                             return true;
                         }
                     }
@@ -1143,6 +1151,37 @@ impl ChatTemplateState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn think_in_prefill_requires_open_think_tag() {
+        // Qwen3-style: the generation prompt injects a CLOSED empty think
+        // block only when thinking is disabled — completions never start
+        // mid-reasoning, so this must not count as think-in-prefill.
+        let qwen3_style = r"
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- endif %}
+{%- endif %}";
+        let (_, think_in_prefill) = detect_all_with_ast(qwen3_style);
+        assert!(
+            !think_in_prefill,
+            "closed <think></think> pair is not a prefill think"
+        );
+
+        // Thinking-only style: the generation prompt ends with an OPEN
+        // <think>, so completions genuinely start mid-reasoning.
+        let thinking_style = r"
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n<think>\n' }}
+{%- endif %}";
+        let (_, think_in_prefill) = detect_all_with_ast(thinking_style);
+        assert!(
+            think_in_prefill,
+            "open <think> in the prefill must be detected"
+        );
+    }
 
     #[test]
     fn test_chat_template_state_no_template() {

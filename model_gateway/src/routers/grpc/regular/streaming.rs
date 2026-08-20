@@ -328,17 +328,6 @@ impl StreamingProcessor {
                 model,
             );
 
-        // If the template supports a thinking toggle and the user enabled it,
-        // the template injected `<think>` in the prefill — parsers should start
-        // in reasoning mode.
-        let thinking_override = utils::should_mark_reasoning_started(
-            utils::resolve_user_thinking(
-                original_request.chat_template_kwargs.as_ref(),
-                original_request.reasoning_effort.as_deref(),
-                tokenizer.as_ref(),
-            ),
-            tokenizer.as_ref(),
-        );
         let think_in_prefill = tokenizer.think_in_prefill();
 
         // Check if JSON schema constraint was used (specific function or required mode)
@@ -356,6 +345,19 @@ impl StreamingProcessor {
                 _ => false,
             }
         };
+        let tool_constraint_active = used_json_schema && tools.is_some();
+
+        // Thinking effectively ON: parsers start in reasoning mode — unless a
+        // JSON-schema tool constraint is active (see should_start_in_reasoning).
+        let thinking_override = utils::should_start_in_reasoning(
+            utils::resolve_user_thinking(
+                original_request.chat_template_kwargs.as_ref(),
+                original_request.reasoning_effort.as_deref(),
+                tokenizer.as_ref(),
+            ),
+            tokenizer.as_ref(),
+            tool_constraint_active,
+        );
 
         // Check if this is the specific function case (LLM generates parameters only, no name field).
         // Only applies when json_schema is used — structural tags include framing tokens
@@ -665,6 +667,59 @@ impl StreamingProcessor {
                         .await
                         .map_err(|_| "Failed to send unstreamed tool args".to_string())?;
                 }
+            }
+        }
+
+        // Phase 3.5: JSON-schema constraint recovery. An engine that enforces
+        // the tool grammar from the first token emits pure JSON; a pre-armed
+        // (think-in-prefill) parser then classifies the whole payload as
+        // reasoning and the tool stage never runs. The buffered raw text is
+        // the tool payload — parse it so tool calls are still delivered.
+        if tool_constraint_active {
+            for (index, buffer) in &stream_buffers {
+                if buffer.is_empty() || has_tool_calls.get(index).copied().unwrap_or(false) {
+                    continue;
+                }
+                let still_in_reasoning = match reasoning_parsers.get(index) {
+                    Some(parser) => parser.lock().await.is_in_reasoning(),
+                    None => false,
+                };
+                if !still_in_reasoning {
+                    continue;
+                }
+                let (calls, _) = utils::parse_json_schema_response(
+                    buffer,
+                    tool_choice.as_ref(),
+                    model,
+                    history_tool_calls_count,
+                );
+                let Some(calls) = calls else { continue };
+                if calls.is_empty() {
+                    continue;
+                }
+                for (call_index, call) in calls.into_iter().enumerate() {
+                    let tool_call_delta = ToolCallDelta {
+                        index: call_index as u32,
+                        id: Some(call.id),
+                        tool_type: Some("function".to_string()),
+                        function: Some(FunctionCallDelta {
+                            name: Some(call.function.name),
+                            arguments: call.function.arguments,
+                        }),
+                    };
+                    let tool_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                        .created(created)
+                        .add_choice_tool_call_delta(*index, tool_call_delta)
+                        .maybe_system_fingerprint(system_fingerprint)
+                        .build();
+                    let sse_chunk = sse_encoder
+                        .encode_data(&tool_chunk)
+                        .map_err(|e| format!("Failed to serialize recovered tool chunk: {e}"))?;
+                    tx.send(Ok(sse_chunk))
+                        .await
+                        .map_err(|_| "Failed to send recovered tool chunk".to_string())?;
+                }
+                has_tool_calls.insert(*index, true);
             }
         }
 
@@ -1877,6 +1932,10 @@ impl StreamingProcessor {
         // Parser state (simple variables — Messages is always n=1)
         let mut reasoning_parser: Option<Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>> = None;
 
+        // Raw text accumulated under a JSON-schema tool constraint, for
+        // end-of-stream recovery when a pre-armed parser ate the payload.
+        let mut constrained_raw_text = String::new();
+
         // Stop decoder
         let mut stop_decoder = {
             let (ref stop, ref stop_token_ids, skip_special_tokens, no_stop_trim, ignore_eos) =
@@ -1931,19 +1990,6 @@ impl StreamingProcessor {
                 model,
             );
 
-        // Determine if thinking is effectively ON (for mark_reasoning_started).
-        let user_thinking = match &original_request.thinking {
-            Some(
-                messages::ThinkingConfig::Enabled { .. }
-                | messages::ThinkingConfig::Adaptive { .. },
-            ) => Some(true),
-            Some(messages::ThinkingConfig::Disabled) => Some(false),
-            None => None,
-        };
-        let thinking_override =
-            utils::should_mark_reasoning_started(user_thinking, tokenizer.as_ref());
-        let think_in_prefill = tokenizer.think_in_prefill();
-
         let tool_choice_enabled = !matches!(
             &original_request.tool_choice,
             Some(messages::ToolChoice::None)
@@ -1966,6 +2012,25 @@ impl StreamingProcessor {
                 &original_request.tool_choice,
                 Some(messages::ToolChoice::Tool { .. } | messages::ToolChoice::Any { .. })
             );
+        let tool_constraint_active = has_tools && used_json_schema;
+
+        // Determine if thinking is effectively ON (for mark_reasoning_started).
+        // Under a JSON-schema tool constraint the parser must not be pre-armed
+        // (see should_start_in_reasoning).
+        let user_thinking = match &original_request.thinking {
+            Some(
+                messages::ThinkingConfig::Enabled { .. }
+                | messages::ThinkingConfig::Adaptive { .. },
+            ) => Some(true),
+            Some(messages::ThinkingConfig::Disabled) => Some(false),
+            None => None,
+        };
+        let thinking_override = utils::should_start_in_reasoning(
+            user_thinking,
+            tokenizer.as_ref(),
+            tool_constraint_active,
+        );
+        let think_in_prefill = tokenizer.think_in_prefill();
 
         // Check if model output is arguments-only for a specific function (ToolChoice::Tool).
         // Only applies when json_schema is used — structural tags include framing tokens.
@@ -2061,6 +2126,10 @@ impl StreamingProcessor {
 
                     if chunk_text.is_empty() {
                         continue;
+                    }
+
+                    if tool_constraint_active {
+                        constrained_raw_text.push_str(&chunk_text);
                     }
 
                     // Apply reasoning parser
@@ -2364,6 +2433,95 @@ impl StreamingProcessor {
                     }
                 }
                 ProtoResponseVariant::None => continue,
+            }
+        }
+
+        // JSON-schema constraint recovery: a pre-armed (think-in-prefill)
+        // parser that never saw a think-end token streamed the grammar-forced
+        // payload as thinking. Parse the raw text so tool_use is still delivered.
+        if tool_constraint_active && !has_tool_calls && !constrained_raw_text.is_empty() {
+            let still_in_reasoning = match &reasoning_parser {
+                Some(parser) => parser.lock().await.is_in_reasoning(),
+                None => false,
+            };
+            if still_in_reasoning {
+                let chat_tool_choice = original_request
+                    .tool_choice
+                    .as_ref()
+                    .map(message_utils::convert_message_tool_choice);
+                let (calls, _) = utils::parse_json_schema_response(
+                    &constrained_raw_text,
+                    chat_tool_choice.as_ref(),
+                    model,
+                    history_tool_calls_count,
+                );
+                if let Some(calls) = calls.filter(|calls| !calls.is_empty()) {
+                    // Close any open block before emitting tool_use blocks.
+                    if thinking_block_open {
+                        Self::send_messages_event(
+                            tx,
+                            &mut sse_buffer,
+                            &MessageStreamEvent::ContentBlockStop {
+                                index: current_block_index,
+                            },
+                        )
+                        .await?;
+                        thinking_block_open = false;
+                        current_block_index += 1;
+                    }
+                    if text_block_open {
+                        Self::send_messages_event(
+                            tx,
+                            &mut sse_buffer,
+                            &MessageStreamEvent::ContentBlockStop {
+                                index: current_block_index,
+                            },
+                        )
+                        .await?;
+                        text_block_open = false;
+                        current_block_index += 1;
+                    }
+                    for call in calls {
+                        has_tool_calls = true;
+                        Self::send_messages_event(
+                            tx,
+                            &mut sse_buffer,
+                            &MessageStreamEvent::ContentBlockStart {
+                                index: current_block_index,
+                                content_block: ContentBlock::ToolUse {
+                                    id: message_utils::anthropic_tool_use_id(&call.id),
+                                    name: call.function.name.clone(),
+                                    input: Value::Object(serde_json::Map::new()),
+                                },
+                            },
+                        )
+                        .await?;
+                        if let Some(args) = call.function.arguments {
+                            if !args.is_empty() {
+                                Self::send_messages_event(
+                                    tx,
+                                    &mut sse_buffer,
+                                    &MessageStreamEvent::ContentBlockDelta {
+                                        index: current_block_index,
+                                        delta: ContentBlockDelta::InputJsonDelta {
+                                            partial_json: args,
+                                        },
+                                    },
+                                )
+                                .await?;
+                            }
+                        }
+                        Self::send_messages_event(
+                            tx,
+                            &mut sse_buffer,
+                            &MessageStreamEvent::ContentBlockStop {
+                                index: current_block_index,
+                            },
+                        )
+                        .await?;
+                        current_block_index += 1;
+                    }
+                }
             }
         }
 

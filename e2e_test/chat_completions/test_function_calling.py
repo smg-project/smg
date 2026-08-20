@@ -1566,6 +1566,134 @@ class TestToolChoiceMistral(_TestToolChoiceBase):
 
 
 # =============================================================================
+# Tool Choice Required + Thinking Tests (reasoning parser interaction)
+# Regression for: with a JSON-schema tool constraint (tool_choice "required" /
+# named function) and thinking effectively ON, the pre-armed reasoning parser
+# classified the grammar-forced JSON payload as reasoning_content, returning
+# no tool_calls and finish_reason "stop".
+# =============================================================================
+
+THINKING_WEATHER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "Name of the city"},
+                },
+                "required": ["city"],
+            },
+        },
+    }
+]
+
+
+# TokenSpeed excluded: its cold-start kernel compilation for Qwen3-30B-A3B
+# exceeds the worker launch timeout on the 1-GPU CI rig.
+@pytest.mark.engine("sglang", "vllm", "trtllm")
+@pytest.mark.gpu(1)
+@pytest.mark.model("Qwen/Qwen3-30B-A3B")
+@pytest.mark.gateway(
+    extra_args=[
+        "--tool-call-parser",
+        "qwen",
+        "--reasoning-parser",
+        "qwen3",
+        "--history-backend",
+        "memory",
+    ]
+)
+@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+class TestToolChoiceRequiredThinking:
+    """tool_choice "required" on a thinking model (enable_thinking defaults ON)."""
+
+    def _assert_weather_tool_call(self, tool_calls) -> None:
+        assert tool_calls, "tool_choice='required' must produce tool_calls"
+        call = tool_calls[0]
+        assert call.function.name == "get_weather"
+        args = json.loads(call.function.arguments)
+        assert isinstance(args.get("city"), str), f"expected string 'city' arg, got: {args}"
+
+    def test_required_non_streaming(self, model, api_client):
+        response = api_client.chat.completions.create(
+            model=model,
+            max_tokens=512,
+            messages=[{"role": "user", "content": "What is the weather in Paris right now?"}],
+            stream=False,
+            tools=THINKING_WEATHER_TOOLS,
+            tool_choice="required",
+        )
+
+        choice = response.choices[0]
+        self._assert_weather_tool_call(choice.message.tool_calls)
+        assert choice.finish_reason == "tool_calls", (
+            f"expected finish_reason 'tool_calls', got: {choice.finish_reason}"
+        )
+        # The grammar-forced payload must not be misclassified as reasoning.
+        reasoning = getattr(choice.message, "reasoning_content", None)
+        if reasoning:
+            try:
+                parsed = json.loads(reasoning)
+            except ValueError:
+                parsed = None
+            assert not isinstance(parsed, list), (
+                f"tool payload leaked into reasoning_content: {reasoning}"
+            )
+
+    def test_required_streaming(self, model, api_client):
+        stream = api_client.chat.completions.create(
+            model=model,
+            max_tokens=512,
+            messages=[{"role": "user", "content": "What is the weather in Paris right now?"}],
+            stream=True,
+            tools=THINKING_WEATHER_TOOLS,
+            tool_choice="required",
+        )
+
+        finish_reason = None
+        tool_name = None
+        arguments = ""
+        reasoning_parts: list[str] = []
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+            delta = choice.delta
+            if delta is None:
+                continue
+            for tool_call in delta.tool_calls or []:
+                if tool_call.function and tool_call.function.name:
+                    tool_name = tool_call.function.name
+                if tool_call.function and tool_call.function.arguments:
+                    arguments += tool_call.function.arguments
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                reasoning_parts.append(reasoning)
+
+        assert tool_name == "get_weather", f"expected streamed tool call, got: {tool_name}"
+        args = json.loads(arguments)
+        assert isinstance(args.get("city"), str), f"expected string 'city' arg, got: {args}"
+        assert finish_reason == "tool_calls", (
+            f"expected finish_reason 'tool_calls', got: {finish_reason}"
+        )
+        # The grammar-forced payload must not stream out as reasoning deltas.
+        reasoning_text = "".join(reasoning_parts)
+        if reasoning_text:
+            try:
+                parsed = json.loads(reasoning_text)
+            except ValueError:
+                parsed = None
+            assert not isinstance(parsed, list), (
+                f"tool payload leaked into reasoning deltas: {reasoning_text}"
+            )
+
+
+# =============================================================================
 # Multi-Turn Tool Call Tests
 # Regression for: assistant messages with tool_calls serialized without
 # `content` key due to skip_serializing_none, causing chat template crash.

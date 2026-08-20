@@ -125,6 +125,42 @@ pub fn should_mark_reasoning_started(
     }
 }
 
+/// Whether the reasoning parser should start pre-armed (in reasoning mode).
+///
+/// Under a JSON-schema tool constraint (`tool_choice: required` / named
+/// function without a structural tag) engines may grammar-force pure JSON
+/// from the first token; a pre-armed parser would classify that payload as
+/// truncated reasoning. Templates without `<think>` in the prefill emit an
+/// explicit start token whenever reasoning does happen, so they stay
+/// un-armed under the constraint. Think-in-prefill templates keep the
+/// pre-arm: their completions genuinely begin mid-reasoning.
+pub(crate) fn should_start_in_reasoning(
+    user_thinking: Option<bool>,
+    tokenizer: &dyn Tokenizer,
+    used_json_schema: bool,
+) -> bool {
+    should_mark_reasoning_started(user_thinking, tokenizer)
+        && (tokenizer.think_in_prefill() || !used_json_schema)
+}
+
+/// Split a completed generation into `(reasoning_content, normal_text)`.
+///
+/// Under a JSON-schema tool constraint an all-reasoning result is impossible
+/// (the grammar forces a JSON payload): it means a pre-armed parser never saw
+/// a think-end token, so the original text is returned for tool parsing.
+pub(crate) fn split_reasoning_result(
+    result: reasoning_parser::ParserResult,
+    original_text: String,
+    used_json_schema: bool,
+) -> (Option<String>, String) {
+    if used_json_schema && result.normal_text.is_empty() && !result.reasoning_text.is_empty() {
+        (None, original_text)
+    } else {
+        let reasoning = (!result.reasoning_text.is_empty()).then_some(result.reasoning_text);
+        (reasoning, result.normal_text)
+    }
+}
+
 /// Extract the user's thinking preference from chat_template_kwargs.
 ///
 /// Only checks the key that the template actually uses (e.g. `enable_thinking`
@@ -315,6 +351,128 @@ pub(crate) fn create_tool_parser(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MockTokenizer wrapper with a configurable thinking toggle and
+    /// think-in-prefill flag (trait defaults are `None`/`false`).
+    struct ToggleTok {
+        inner: llm_tokenizer::MockTokenizer,
+        toggle: ThinkingToggle,
+        prefill: bool,
+    }
+
+    impl ToggleTok {
+        fn new(toggle: ThinkingToggle, prefill: bool) -> Self {
+            Self {
+                inner: llm_tokenizer::MockTokenizer::new(),
+                toggle,
+                prefill,
+            }
+        }
+    }
+
+    impl llm_tokenizer::traits::Encoder for ToggleTok {
+        fn encode(&self, i: &str, s: bool) -> anyhow::Result<llm_tokenizer::traits::Encoding> {
+            self.inner.encode(i, s)
+        }
+        fn encode_batch(
+            &self,
+            i: &[&str],
+            s: bool,
+        ) -> anyhow::Result<Vec<llm_tokenizer::traits::Encoding>> {
+            self.inner.encode_batch(i, s)
+        }
+    }
+
+    impl llm_tokenizer::traits::Decoder for ToggleTok {
+        fn decode(&self, ids: &[u32], s: bool) -> anyhow::Result<String> {
+            self.inner.decode(ids, s)
+        }
+    }
+
+    impl Tokenizer for ToggleTok {
+        fn vocab_size(&self) -> usize {
+            self.inner.vocab_size()
+        }
+        fn get_special_tokens(&self) -> &llm_tokenizer::traits::SpecialTokens {
+            self.inner.get_special_tokens()
+        }
+        fn token_to_id(&self, t: &str) -> Option<u32> {
+            self.inner.token_to_id(t)
+        }
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            self.inner.id_to_token(id)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn thinking_toggle(&self) -> ThinkingToggle {
+            self.toggle
+        }
+        fn think_in_prefill(&self) -> bool {
+            self.prefill
+        }
+    }
+
+    #[test]
+    fn start_in_reasoning_unarmed_under_json_schema_for_toggle_templates() {
+        // Qwen3-style template: thinking toggle DefaultOn, no <think> in prefill.
+        let tok = ToggleTok::new(ThinkingToggle::DefaultOn, false);
+
+        // Unconstrained: thinking ON arms the parser.
+        assert!(should_start_in_reasoning(None, &tok, false));
+        // JSON-schema constraint: must not pre-arm (payload has no think tokens).
+        assert!(!should_start_in_reasoning(None, &tok, true));
+        // Thinking explicitly off never arms.
+        assert!(!should_start_in_reasoning(Some(false), &tok, false));
+    }
+
+    #[test]
+    fn start_in_reasoning_keeps_prearm_for_think_in_prefill_templates() {
+        // DeepSeek-style: `<think>` in the prefill, completions start mid-reasoning.
+        let tok = ToggleTok::new(ThinkingToggle::DefaultOn, true);
+
+        assert!(should_start_in_reasoning(None, &tok, true));
+        assert!(should_start_in_reasoning(None, &tok, false));
+        assert!(!should_start_in_reasoning(Some(false), &tok, true));
+
+        // No thinking toggle at all: never armed, constraint or not.
+        let plain = ToggleTok::new(ThinkingToggle::None, false);
+        assert!(!should_start_in_reasoning(None, &plain, true));
+        assert!(!should_start_in_reasoning(None, &plain, false));
+    }
+
+    #[test]
+    fn split_reasoning_result_recovers_constrained_payload() {
+        use reasoning_parser::ParserResult;
+
+        let payload = r#"[{"name":"get_weather","parameters":{"city":"Paris"}}]"#;
+
+        // All-reasoning under the constraint: the payload is recovered.
+        let all_reasoning = ParserResult::reasoning(payload.to_string());
+        let (reasoning, normal) = split_reasoning_result(all_reasoning, payload.to_string(), true);
+        assert_eq!(reasoning, None);
+        assert_eq!(normal, payload);
+
+        // All-reasoning without the constraint: kept as truncated reasoning.
+        let all_reasoning = ParserResult::reasoning("partial thought".to_string());
+        let (reasoning, normal) =
+            split_reasoning_result(all_reasoning, "partial thought".to_string(), false);
+        assert_eq!(reasoning.as_deref(), Some("partial thought"));
+        assert_eq!(normal, "");
+
+        // A proper reasoning/payload split passes through unchanged.
+        let split = ParserResult::new(payload.to_string(), "thought".to_string());
+        let (reasoning, normal) =
+            split_reasoning_result(split, format!("thought</think>{payload}"), true);
+        assert_eq!(reasoning.as_deref(), Some("thought"));
+        assert_eq!(normal, payload);
+
+        // Empty reasoning stays None.
+        let plain = ParserResult::normal("hi".to_string());
+        let (reasoning, normal) = split_reasoning_result(plain, "hi".to_string(), true);
+        assert_eq!(reasoning, None);
+        assert_eq!(normal, "hi");
+    }
 
     #[test]
     fn resolve_thinking_pref_precedence() {
