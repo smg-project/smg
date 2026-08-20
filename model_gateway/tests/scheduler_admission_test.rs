@@ -326,7 +326,9 @@ async fn queue_full_returns_429() {
     );
     assert_eq!(error_code(&resp).as_deref(), Some("scheduler_queue_full"));
     assert_eq!(
-        resp.headers().get("retry-after").map(|v| v.to_str().unwrap()),
+        resp.headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
         Some("2"),
         "queue-full 429 must carry Retry-After: 2"
     );
@@ -380,7 +382,9 @@ async fn queue_timeout_returns_503() {
         "queue timeout must map to 503"
     );
     assert_eq!(
-        resp.headers().get("retry-after").map(|v| v.to_str().unwrap()),
+        resp.headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
         Some("2"),
         "queue-timeout 503 must carry Retry-After: 2"
     );
