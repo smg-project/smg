@@ -336,11 +336,11 @@ mod tests {
     use http_body_util::BodyExt;
     use llm_tokenizer::registry::TokenizerRegistry;
     use metrics_exporter_prometheus::PrometheusBuilder;
-    use tokio_stream::wrappers::ReceiverStream;
     use smg_data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     };
     use tokio::sync::Notify;
+    use tokio_stream::wrappers::ReceiverStream;
     use tower::ServiceExt;
 
     use super::*;
