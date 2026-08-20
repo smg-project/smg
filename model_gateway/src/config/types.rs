@@ -105,9 +105,9 @@ pub struct RouterConfig {
     /// to 90% of the ceiling. `None`/`0` disables the ceiling (default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_indexer_max_entries: Option<usize>,
-    /// Re-export engine `GetLoads` signals as `smg_engine_*` gauges, polling
-    /// even when no load-aware routing policy is active. Decouples engine
-    /// observability from routing.
+    /// Force `GetLoads` polling for `smg_engine_*` gauges even when no
+    /// load-aware routing policy is active. Successful routing-owned polls are
+    /// always re-exported without an additional Engine RPC.
     #[serde(default)]
     pub engine_metrics: bool,
     /// Global multimodal tensor transport mode (`inline` | `shm` | `auto` | `rdma`).

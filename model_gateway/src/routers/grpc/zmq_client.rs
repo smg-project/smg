@@ -681,6 +681,7 @@ impl ZmqEngineClient {
             timestamp: String::new(),
             dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
             loads,
+            ..Default::default()
         }
     }
 

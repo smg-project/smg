@@ -562,9 +562,10 @@ impl Usage {
 
     /// Add cached token details to this Usage
     pub fn with_cached_tokens(mut self, cached_tokens: u32) -> Self {
-        if cached_tokens > 0 {
-            self.prompt_tokens_details = Some(PromptTokenUsageInfo { cached_tokens });
-        }
+        // Calling this builder means the backend supplied cache accounting.
+        // Zero is therefore evidence of a cold miss, not absence of support,
+        // and must remain distinguishable from `prompt_tokens_details: None`.
+        self.prompt_tokens_details = Some(PromptTokenUsageInfo { cached_tokens });
         self
     }
 
@@ -850,6 +851,15 @@ mod tests {
     fn test_deserialize_null_as_false_rejects_non_bool() {
         let result = serde_json::from_value::<NullableBoolTest>(json!({"field": "yes"}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cached_token_builder_preserves_explicit_zero() {
+        let usage = Usage::from_counts(16, 1).with_cached_tokens(0);
+        assert!(matches!(
+            usage.prompt_tokens_details,
+            Some(PromptTokenUsageInfo { cached_tokens: 0 })
+        ));
     }
 
     #[test]
