@@ -215,6 +215,14 @@ impl PolicyRegistry {
         let finish = |result: Option<usize>, branch: ExecutionBranch| {
             Metrics::record_worker_manual_policy_branch(branch.as_str());
             Metrics::set_manual_policy_cache_entries(sticky.map_len());
+            debug!(
+                source,
+                key,
+                branch = branch.as_str(),
+                worker = result.map_or("none", |idx| workers[idx].url()),
+                model_id = result.map_or("none", |idx| workers[idx].model_id()),
+                "Sticky routing decision"
+            );
             result
         };
 
@@ -865,6 +873,7 @@ impl std::fmt::Debug for PolicyRegistry {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::HealthCheckConfig;
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::{
@@ -1204,6 +1213,29 @@ mod tests {
             reg.select_worker(&policy, &workers, &keyed_turn2),
             Some(seeded)
         );
+    }
+
+    #[test]
+    #[traced_test]
+    fn sticky_selection_emits_decision_line_per_request() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let info = SelectWorkerInfo {
+            rid_key: Some("conv1"),
+            ..Default::default()
+        };
+        reg.select_worker(&policy, &workers, &info).unwrap();
+        assert!(logs_contain("Sticky routing decision"));
+        assert!(logs_contain("vacant"));
+        reg.select_worker(&policy, &workers, &info).unwrap();
+        assert!(logs_contain("occupied_hit"));
     }
 
     #[test]

@@ -615,13 +615,6 @@ impl CacheAwarePolicy {
         min_load_idx: Option<usize>,
         model_id: &str,
     ) -> Option<usize> {
-        // Log load balancing trigger (only compute worker loads if debug enabled)
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let worker_loads: Vec<(&str, usize)> =
-                workers.iter().map(|w| (w.url(), w.load())).collect();
-            debug!("Load balancing triggered | workers: {:?}", worker_loads);
-        }
-
         // Shortest queue when imbalanced. The min-load index is gathered upstream
         // in select_worker with the (load, processed_requests, idx) tie-break
         // from #1714 (spreads load when decode outpaces prefill).
@@ -696,6 +689,12 @@ impl CacheAwarePolicy {
         // Increment processed counter
         workers[min_load_idx].increment_processed();
 
+        debug!(
+            branch = "kv_pressure_min_load",
+            worker = worker_url,
+            model_id,
+            "Cache-aware selection"
+        );
         Some(min_load_idx)
     }
 }
@@ -1381,6 +1380,46 @@ impl CacheAwarePolicy {
         candidates.last().map(|c| c.idx)
     }
 
+    /// One decision line per tree-routed request. `selected_url == None`
+    /// means the caller fell back to `fallback_url` (first healthy).
+    fn log_tree_decision(
+        &self,
+        selected_url: Option<&str>,
+        fallback_url: Option<&str>,
+        matched_units: usize,
+        input_units: usize,
+        matched_tenants: &[TenantId],
+        model_id: &str,
+    ) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let matched_ratio = if input_units == 0 {
+            0.0
+        } else {
+            matched_units as f32 / input_units as f32
+        };
+        let branch = match selected_url {
+            None => "first_healthy_fallback",
+            Some(_) if matched_ratio <= self.config.cache_threshold => "min_load_fallback",
+            Some(url) => {
+                if matched_tenants.iter().any(|tenant| tenant.as_ref() == url) {
+                    "tree_match"
+                } else {
+                    "spill"
+                }
+            }
+        };
+        debug!(
+            branch,
+            worker = selected_url.or(fallback_url).unwrap_or("none"),
+            model_id,
+            matched_ratio = f64::from(matched_ratio),
+            threshold = f64::from(self.config.cache_threshold),
+            "Cache-aware selection"
+        );
+    }
+
     /// Select worker using token-based tree (gRPC path)
     fn select_worker_with_tokens(
         &self,
@@ -1443,6 +1482,15 @@ impl CacheAwarePolicy {
                 selected_idx.map(|idx| workers[idx].url())
             });
 
+            self.log_tree_decision(
+                selected_idx.map(|idx| workers[idx].url()),
+                healthy_indices.first().map(|&idx| workers[idx].url()),
+                result.matched_token_count,
+                result.input_token_count,
+                &result.matched_tenants,
+                model_id,
+            );
+
             if let Some(idx) = selected_idx {
                 // Record hash(full_tokens)→matched_prefix tokens.
                 // The hash key matches what sync_tree_operation
@@ -1488,13 +1536,14 @@ impl CacheAwarePolicy {
             // Stale entries will be cleaned up by LRU eviction
             healthy_indices.first().copied()
         } else {
+            let idx = healthy_indices[rand::rng().random_range(0..healthy_indices.len())];
             debug!(
-                "Warning: No token tree found for model '{}', using random worker selection",
-                model_id
+                branch = "no_tree_random",
+                worker = workers[idx].url(),
+                model_id,
+                "Cache-aware selection"
             );
-            let mut rng = rand::rng();
-            let random_idx = rng.random_range(0..healthy_indices.len());
-            Some(healthy_indices[random_idx])
+            Some(idx)
         }
     }
 
@@ -1550,6 +1599,15 @@ impl CacheAwarePolicy {
                 selected_idx.map(|idx| workers[idx].url())
             });
 
+            self.log_tree_decision(
+                selected_idx.map(|idx| workers[idx].url()),
+                healthy_indices.first().map(|&idx| workers[idx].url()),
+                result.matched_char_count,
+                result.input_char_count,
+                &result.matched_tenants,
+                model_id,
+            );
+
             if let Some(idx) = selected_idx {
                 // Record hash(full_text)→matched_prefix for mesh tenant delta
                 // resolution. The hash key matches what sync_tree_operation sends
@@ -1586,13 +1644,14 @@ impl CacheAwarePolicy {
             // Stale entries will be cleaned up by LRU eviction
             healthy_indices.first().copied()
         } else {
+            let idx = healthy_indices[rand::rng().random_range(0..healthy_indices.len())];
             debug!(
-                "Warning: No string tree found for model '{}', using random worker selection",
-                model_id
+                branch = "no_tree_random",
+                worker = workers[idx].url(),
+                model_id,
+                "Cache-aware selection"
             );
-            let mut rng = rand::rng();
-            let random_idx = rng.random_range(0..healthy_indices.len());
-            Some(healthy_indices[random_idx])
+            Some(idx)
         }
     }
 }
@@ -1607,6 +1666,7 @@ impl Default for CacheAwarePolicy {
 mod tests {
     use kv_index::{compute_content_hash, SequenceHash, StoredBlock, WorkerBlockMap};
     use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerStatus};
+    use tracing_test::traced_test;
 
     use super::*;
 
@@ -2007,6 +2067,39 @@ mod tests {
                 .any(|tenant| tenant.as_ref() == "http://w2:8000"),
             "spill target must become a tenant of the hot prefix"
         );
+    }
+
+    #[test]
+    #[traced_test]
+    fn token_tree_selection_emits_decision_line() {
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let tokens: Vec<u32> = (0..32).collect();
+        seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
+
+        policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(logs_contain("Cache-aware selection"));
+        assert!(logs_contain("tree_match"));
+
+        let novel: Vec<u32> = (1000..1064).collect();
+        policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&novel),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(logs_contain("min_load_fallback"));
     }
 
     #[test]
