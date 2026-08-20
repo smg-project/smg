@@ -26,7 +26,7 @@ GO_PID=$!
 # Build Python wheel in foreground
 echo "Building Python wheel..."
 cd bindings/python
-maturin build --profile ci --features vendored-openssl --manylinux 2_28 --zig --out dist
+maturin build --profile ci --locked --features vendored-openssl --manylinux 2_28 --zig --out dist
 echo "Python wheel: OK"
 ls -lh dist/
 

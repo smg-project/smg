@@ -29,7 +29,7 @@ pip install --no-cache-dir --upgrade pip \
     && pip install maturin --no-cache-dir --force-reinstall
 
 cd "${SMG_SRC}/bindings/python"
-ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist
+ulimit -n 65536 && maturin build --release --locked --features vendored-openssl --out dist
 pip install --force-reinstall dist/*.whl
 
 # Install smg-grpc-proto and smg-grpc-servicer from source so the image stays
