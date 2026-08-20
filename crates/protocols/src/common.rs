@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, value::SeqAccessDeserializer, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 use serde_json::Value;
 use validator;
 
@@ -19,13 +22,31 @@ pub fn default_true() -> bool {
     true
 }
 
+/// Helper for `#[serde(skip_serializing_if = "is_false")]` on default-`false` flags.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes &T"
+)]
+pub fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+/// Helper for `#[serde(skip_serializing_if = "is_true")]` on default-`true` flags.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes &T"
+)]
+pub fn is_true(v: &bool) -> bool {
+    *v
+}
+
 /// Deserialize a bool that also accepts JSON `null` (mapped to `false`).
 ///
 /// Use with `#[serde(default, deserialize_with = "deserialize_null_as_false")]`
 /// on fields that the OpenAI spec defines as `Optional[bool]` defaulting to `false`.
 pub fn deserialize_null_as_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
-    D: serde::Deserializer<'de>,
+    D: Deserializer<'de>,
 {
     Option::<bool>::deserialize(deserializer).map(|opt| opt.unwrap_or(false))
 }
@@ -479,13 +500,13 @@ impl Serialize for FunctionCall {
 }
 
 impl<'de> Deserialize<'de> for FunctionCall {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = Value::deserialize(deserializer)?;
         match &value {
             Value::String(s) => match s.as_str() {
                 "none" => Ok(FunctionCall::None),
                 "auto" => Ok(FunctionCall::Auto),
-                other => Err(serde::de::Error::custom(format!(
+                other => Err(de::Error::custom(format!(
                     "unknown function_call value: \"{other}\""
                 ))),
             },
@@ -493,12 +514,12 @@ impl<'de> Deserialize<'de> for FunctionCall {
                 if let Some(Value::String(name)) = map.get("name") {
                     Ok(FunctionCall::Function { name: name.clone() })
                 } else {
-                    Err(serde::de::Error::custom(
+                    Err(de::Error::custom(
                         "function_call object must have a \"name\" string field",
                     ))
                 }
             }
-            _ => Err(serde::de::Error::custom(
+            _ => Err(de::Error::custom(
                 "function_call must be a string or object",
             )),
         }
@@ -661,11 +682,101 @@ pub struct ErrorDetail {
 // Input Types
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum InputIds {
     Single(Vec<i32>),
     Batch(Vec<Vec<i32>>),
+}
+
+/// Shape probe for the first `input_ids` element: it alone picks the variant,
+/// so the rest parses in place instead of through untagged-enum buffering.
+enum FirstInputId {
+    Id(i32),
+    Ids(Vec<i32>),
+}
+
+impl<'de> Deserialize<'de> for FirstInputId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FirstInputIdVisitor;
+
+        impl<'de> Visitor<'de> for FirstInputIdVisitor {
+            type Value = FirstInputId;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a token id or an array of token ids")
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                i32::try_from(v)
+                    .map(FirstInputId::Id)
+                    .map_err(|_| E::invalid_value(de::Unexpected::Signed(v), &self))
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                i32::try_from(v)
+                    .map(FirstInputId::Id)
+                    .map_err(|_| E::invalid_value(de::Unexpected::Unsigned(v), &self))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                Deserialize::deserialize(SeqAccessDeserializer::new(seq)).map(FirstInputId::Ids)
+            }
+        }
+
+        deserializer.deserialize_any(FirstInputIdVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for InputIds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct InputIdsVisitor;
+
+        impl<'de> Visitor<'de> for InputIdsVisitor {
+            type Value = InputIds;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of token ids or an array of token id arrays")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                // An empty array is Single, matching untagged first-match order.
+                let Some(first) = seq.next_element::<FirstInputId>()? else {
+                    return Ok(InputIds::Single(Vec::new()));
+                };
+                let remaining = seq.size_hint().unwrap_or(0);
+                match first {
+                    FirstInputId::Id(id) => {
+                        let mut ids = Vec::with_capacity(remaining.saturating_add(1));
+                        ids.push(id);
+                        while let Some(id) = seq.next_element()? {
+                            ids.push(id);
+                        }
+                        Ok(InputIds::Single(ids))
+                    }
+                    FirstInputId::Ids(head) => {
+                        let mut seqs = Vec::with_capacity(remaining.saturating_add(1));
+                        seqs.push(head);
+                        while let Some(ids) = seq.next_element()? {
+                            seqs.push(ids);
+                        }
+                        Ok(InputIds::Batch(seqs))
+                    }
+                }
+            }
+        }
+
+        deserializer.deserialize_seq(InputIdsVisitor)
+    }
 }
 
 /// LoRA adapter path - can be single path or batch of paths (SGLang extension)
@@ -919,6 +1030,51 @@ mod tests {
         assert!(ConversationRef::Id(String::new()).is_empty());
         assert!(!ConversationRef::Id("conv_1".to_string()).is_empty());
         assert!(ConversationRef::Object { id: String::new() }.is_empty());
+    }
+
+    #[test]
+    fn input_ids_deserializes_single() {
+        let ids: InputIds = serde_json::from_str("[1, -2, 3]").unwrap();
+        assert!(matches!(ids, InputIds::Single(ref v) if v == &[1, -2, 3]));
+    }
+
+    #[test]
+    fn input_ids_deserializes_batch() {
+        let ids: InputIds = serde_json::from_str("[[1, 2], [3], []]").unwrap();
+        assert!(matches!(ids, InputIds::Batch(ref v) if v == &[vec![1, 2], vec![3], vec![]]));
+    }
+
+    #[test]
+    fn input_ids_empty_array_is_single() {
+        let ids: InputIds = serde_json::from_str("[]").unwrap();
+        assert!(matches!(ids, InputIds::Single(ref v) if v.is_empty()));
+    }
+
+    #[test]
+    fn input_ids_rejects_invalid_input() {
+        for input in [
+            "[1, [2]]",
+            "[[1], 2]",
+            "[\"a\"]",
+            "[1.5]",
+            "[5000000000]",
+            "\"nope\"",
+            "null",
+            "7",
+        ] {
+            assert!(
+                serde_json::from_str::<InputIds>(input).is_err(),
+                "accepted {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_ids_round_trip() {
+        for input in [json!([1, 2, 3]), json!([[1, 2], [3]]), json!([])] {
+            let ids: InputIds = serde_json::from_value(input.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&ids).unwrap(), input);
+        }
     }
 
     #[test]

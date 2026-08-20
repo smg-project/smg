@@ -6,10 +6,10 @@ use validator::Validate;
 
 use super::{
     common::{
-        default_true, deserialize_null_as_false, validate_stop, ChatLogProbs, ContentPart,
-        Function, FunctionCall, FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions,
-        StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference,
-        Usage,
+        default_true, deserialize_null_as_false, is_false, is_true, validate_stop, ChatLogProbs,
+        ContentPart, Function, FunctionCall, FunctionChoice, GenerationRequest, ResponseFormat,
+        StreamOptions, StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue,
+        ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -285,15 +285,15 @@ pub struct ChatCompletionRequest {
     pub stop_token_ids: Option<Vec<u32>>,
 
     /// Skip trimming stop tokens from output
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub no_stop_trim: bool,
 
     /// Ignore end-of-sequence tokens during generation
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub ignore_eos: bool,
 
     /// Continue generating from final assistant message
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub continue_final_message: bool,
 
     /// Skip special tokens during detokenization
@@ -307,18 +307,18 @@ pub struct ChatCompletionRequest {
     pub session_params: Option<HashMap<String, Value>>,
 
     /// Separate reasoning content from final answer (O1-style models)
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub separate_reasoning: bool,
 
     /// Stream reasoning tokens during generation
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub stream_reasoning: bool,
 
     /// Chat template kwargs
     pub chat_template_kwargs: Option<HashMap<String, Value>>,
 
     /// Return model hidden states
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub return_hidden_states: bool,
 
     /// Random seed for sampling for deterministic outputs
@@ -817,6 +817,57 @@ mod tests {
             object.insert((*name).to_string(), field_value.clone());
         }
         serde_json::from_value(value).expect("request must deserialize")
+    }
+
+    #[test]
+    fn default_sglang_flags_are_omitted_and_absent_reads_defaults() {
+        let request = request_with_output_fields(&[]);
+        let value = serde_json::to_value(&request).expect("serialize");
+        for field in [
+            "no_stop_trim",
+            "ignore_eos",
+            "continue_final_message",
+            "return_hidden_states",
+            "separate_reasoning",
+            "stream_reasoning",
+        ] {
+            assert!(value.get(field).is_none(), "{field} serialized at default");
+        }
+
+        let back: ChatCompletionRequest = serde_json::from_value(value).expect("roundtrip");
+        assert!(!back.no_stop_trim);
+        assert!(!back.ignore_eos);
+        assert!(!back.continue_final_message);
+        assert!(!back.return_hidden_states);
+        assert!(back.separate_reasoning);
+        assert!(back.stream_reasoning);
+    }
+
+    #[test]
+    fn non_default_sglang_flags_round_trip() {
+        let request = request_with_output_fields(&[
+            ("no_stop_trim", json!(true)),
+            ("ignore_eos", json!(true)),
+            ("continue_final_message", json!(true)),
+            ("return_hidden_states", json!(true)),
+            ("separate_reasoning", json!(false)),
+            ("stream_reasoning", json!(false)),
+        ]);
+        let value = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(value["no_stop_trim"], true);
+        assert_eq!(value["ignore_eos"], true);
+        assert_eq!(value["continue_final_message"], true);
+        assert_eq!(value["return_hidden_states"], true);
+        assert_eq!(value["separate_reasoning"], false);
+        assert_eq!(value["stream_reasoning"], false);
+
+        let back: ChatCompletionRequest = serde_json::from_value(value).expect("roundtrip");
+        assert!(back.no_stop_trim);
+        assert!(back.ignore_eos);
+        assert!(back.continue_final_message);
+        assert!(back.return_hidden_states);
+        assert!(!back.separate_reasoning);
+        assert!(!back.stream_reasoning);
     }
 
     #[test]

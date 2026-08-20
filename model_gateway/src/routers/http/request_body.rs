@@ -311,6 +311,19 @@ mod tests {
     }
 
     #[test]
+    fn default_generate_body_reuses_the_direct_serialization() {
+        let worker = worker();
+        // No default-noise field survives serialization, so the strip is a
+        // no-op and the first serialization goes out as-is.
+        let req = generate_request(json!({}));
+
+        let body = serialize_request_body(&req, None, &worker, None).unwrap();
+
+        assert_eq!(body, value_path_bytes(&req, None, &worker));
+        assert_eq!(body, to_vec_value_compatible(&req, None).unwrap());
+    }
+
+    #[test]
     fn untouched_body_reuses_the_direct_serialization() {
         let worker = worker();
         // `return_hidden_states: true` survives the strip, so nothing in this
@@ -350,6 +363,9 @@ mod tests {
 
         let plain = serialize_request_body(&req, None, &worker, None).unwrap();
         assert_eq!(plain, value_path_bytes(&req, None, &worker));
+        // Default-noise flags are omitted at serialization, so the strip is a
+        // no-op and the first serialization goes out as-is.
+        assert_eq!(plain, to_vec_value_compatible(&req, None).unwrap());
         let parsed: Value = serde_json::from_slice(&plain).unwrap();
         assert!(parsed.get("separate_reasoning").is_none());
         assert_eq!(parsed["skip_special_tokens"], true);
@@ -359,6 +375,22 @@ mod tests {
             aliased,
             value_path_bytes(&req, Some("canonical-model"), &worker)
         );
+    }
+
+    #[test]
+    fn default_completion_body_reuses_the_direct_serialization() {
+        let worker = worker();
+        let req: openai_protocol::completion::CompletionRequest = serde_json::from_value(json!({
+            "model": "alias-model",
+            "prompt": "hello",
+            "temperature": 0.7
+        }))
+        .unwrap();
+
+        let body = serialize_request_body(&req, None, &worker, None).unwrap();
+
+        assert_eq!(body, value_path_bytes(&req, None, &worker));
+        assert_eq!(body, to_vec_value_compatible(&req, None).unwrap());
     }
 
     #[test]
