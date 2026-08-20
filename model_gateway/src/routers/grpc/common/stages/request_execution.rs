@@ -195,6 +195,19 @@ impl PipelineStage for RequestExecutionStage {
             sub_requests,
         ));
 
+        // Dispatch-phase release: response processing reads only the view
+        // captured at request building, so the context sheds its payload
+        // handle before the send. The lease then frees the parsed request
+        // now (retries disabled) or keeps it for replay until the retry
+        // window closes.
+        if let Some(lease) = ctx.input.request_lease.take() {
+            ctx.input.request_type.release_payload();
+            if lease.releases_after_dispatch() {
+                lease.note_upstream_len(execution_plan.wire_len());
+            }
+            lease.release_dispatch();
+        }
+
         // Extract dispatch metadata for tracing span
         let dispatch = ctx.state.dispatch.as_ref();
         let request_id = dispatch.map(|d| d.request_id.as_str()).unwrap_or("unknown");

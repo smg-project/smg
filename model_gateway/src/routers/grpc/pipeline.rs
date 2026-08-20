@@ -54,7 +54,7 @@ use crate::{
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     policies::PolicyRegistry,
     rate_limit::{RateLimitManager, UsageSettlement},
-    routers::error,
+    routers::{common::request_lease::ErasedLease, error},
     worker::WorkerRegistry,
 };
 
@@ -453,12 +453,14 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
         rate_limit_cell: Option<Arc<RateLimitCell>>,
+        request_lease: Option<Arc<dyn ErasedLease>>,
     ) -> Response {
         let start = Instant::now();
         let streaming = request.stream;
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
         ctx.input.rate_limit_cell = rate_limit_cell;
+        ctx.input.request_lease = request_lease;
         let model = ctx.input.model_id.clone();
 
         // Record request start
@@ -552,12 +554,14 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
         rate_limit_cell: Option<Arc<RateLimitCell>>,
+        request_lease: Option<Arc<dyn ErasedLease>>,
     ) -> Response {
         let start = Instant::now();
         let streaming = request.stream;
         let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
         ctx.input.rate_limit_cell = rate_limit_cell;
+        ctx.input.request_lease = request_lease;
         let model_id = ctx.input.model_id.clone();
 
         // Record request start
@@ -654,12 +658,14 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
         rate_limit_cell: Option<Arc<RateLimitCell>>,
+        request_lease: Option<Arc<dyn ErasedLease>>,
     ) -> Response {
         let start = Instant::now();
         let streaming = request.stream;
         let mut ctx = RequestContext::for_completion(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
         ctx.input.rate_limit_cell = rate_limit_cell;
+        ctx.input.request_lease = request_lease;
         let model = ctx.input.model_id.clone();
 
         Metrics::record_router_request(
@@ -957,12 +963,14 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
         rate_limit_cell: Option<Arc<RateLimitCell>>,
+        request_lease: Option<Arc<dyn ErasedLease>>,
     ) -> Response {
         let start = Instant::now();
         let streaming = request.stream.unwrap_or(false);
         let mut ctx = RequestContext::for_messages(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
         ctx.input.rate_limit_cell = rate_limit_cell;
+        ctx.input.request_lease = request_lease;
         let model = ctx.input.model_id.clone();
 
         // Record request start
@@ -1637,6 +1645,7 @@ mod request_release_tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
+        routers::common::request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
         worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
     };
 
@@ -1648,13 +1657,20 @@ mod request_release_tests {
         Pin<Box<dyn Stream<Item = Result<common::GetTokenizerChunk, Status>> + Send>>;
 
     /// TokenSpeed stub gated on the parsed request's drop probe: it withholds
-    /// its tokens until the probe reaches zero strong references or a
-    /// deadline passes, recording the outcome in `released`. An ungated stub
-    /// (no probe) answers immediately -- used for the PD prefill leg.
+    /// its tokens (or, with `gate_rpc`, the generate RPC itself) until the
+    /// probe reaches zero strong references or a deadline passes, recording
+    /// the outcome in `released`. An ungated stub (no probe) answers
+    /// immediately -- used for the PD prefill leg. `fail_first` makes the
+    /// first generate call return UNAVAILABLE, for retry-replay tests; every
+    /// call's input token ids are recorded in `seen_input_ids`.
     #[derive(Clone, Default)]
     struct GatedScheduler {
         probe: Option<Weak<CompletionRequest>>,
+        gate_rpc: bool,
         released: Arc<AtomicBool>,
+        fail_first: bool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        seen_input_ids: Arc<std::sync::Mutex<Vec<Vec<u32>>>>,
     }
 
     impl GatedScheduler {
@@ -1711,9 +1727,22 @@ mod request_release_tests {
             &self,
             request: TonicRequest<ts::GenerateRequest>,
         ) -> Result<TonicResponse<Self::GenerateStream>, Status> {
-            let request_id = request.into_inner().request_id;
+            let request = request.into_inner();
+            self.seen_input_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.tokenized.map(|t| t.input_ids).unwrap_or_default());
+            if self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(Status::unavailable("release-test induced failure"));
+            }
+            if self.gate_rpc {
+                if let Some(probe) = &self.probe {
+                    Self::await_probe(probe, &self.released).await;
+                }
+            }
+            let request_id = request.request_id;
             let (tx, rx) = tokio::sync::mpsc::channel(8);
-            let probe = self.probe.clone();
+            let probe = (!self.gate_rpc).then(|| self.probe.clone()).flatten();
             let released = Arc::clone(&self.released);
             tokio::spawn(async move {
                 if let Some(probe) = probe {
@@ -1913,9 +1942,18 @@ mod request_release_tests {
         pipeline: RequestPipeline,
         components: Arc<SharedComponents>,
         request: Arc<CompletionRequest>,
+        lease: Option<Arc<dyn ErasedLease>>,
     ) -> bytes::Bytes {
         let response = pipeline
-            .execute_completion(request, None, MODEL.to_string(), components, None, None)
+            .execute_completion(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                lease,
+            )
             .await;
         assert_eq!(response.status(), http::StatusCode::OK);
         axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1942,7 +1980,7 @@ mod request_release_tests {
         let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
         let components = components(worker_registry).await;
 
-        let body = run_and_drain(pipeline, components, request).await;
+        let body = run_and_drain(pipeline, components, request, None).await;
 
         assert!(
             released.load(Ordering::SeqCst),
@@ -1972,7 +2010,7 @@ mod request_release_tests {
         let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
         let components = components(worker_registry).await;
 
-        let body = run_and_drain(pipeline, components, request).await;
+        let body = run_and_drain(pipeline, components, request, None).await;
 
         assert!(
             released.load(Ordering::SeqCst),
@@ -1980,6 +2018,175 @@ mod request_release_tests {
         );
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("data: [DONE]"), "stream must finish: {body}");
+    }
+
+    /// Retries disabled: the parsed request must be freed at dispatch. The
+    /// stub refuses to answer the generate RPC until the probe frees.
+    #[tokio::test]
+    async fn disabled_retries_release_parsed_request_before_upstream_responds() {
+        let request = completion_request(false);
+        let released = Arc::new(AtomicBool::new(false));
+        let port = spawn_stub(GatedScheduler {
+            probe: Some(Arc::downgrade(&request)),
+            gate_rpc: true,
+            released: Arc::clone(&released),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, port, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let lease = Arc::new(RequestLease::new(
+            request,
+            RoutingDerivatives::default(),
+            ReleasePoint::AfterDispatch,
+        ));
+        let attempt = lease.with_view(|view| Arc::clone(view.request));
+        let response = pipeline
+            .execute_completion(
+                attempt,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                Some(lease as Arc<dyn ErasedLease>),
+            )
+            .await;
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the parsed request must be freed before the upstream answers"
+        );
+    }
+
+    /// grpc_pd twin of the dispatch-release probe: both legs' RPCs answer
+    /// only after the parsed request is freed.
+    #[tokio::test]
+    async fn pd_disabled_retries_release_parsed_request_before_upstream_responds() {
+        let request = completion_request(false);
+        let released = Arc::new(AtomicBool::new(false));
+        let prefill_port = spawn_stub(GatedScheduler::default()).await;
+        let decode_port = spawn_stub(GatedScheduler {
+            probe: Some(Arc::downgrade(&request)),
+            gate_rpc: true,
+            released: Arc::clone(&released),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+        register_worker(&worker_registry, decode_port, WorkerType::Decode);
+        let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+        let components = components(worker_registry).await;
+
+        let lease = Arc::new(RequestLease::new(
+            request,
+            RoutingDerivatives::default(),
+            ReleasePoint::AfterDispatch,
+        ));
+        let attempt = lease.with_view(|view| Arc::clone(view.request));
+        let response = pipeline
+            .execute_completion(
+                attempt,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                Some(lease as Arc<dyn ErasedLease>),
+            )
+            .await;
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the parsed request must be freed before the decode leg answers"
+        );
+    }
+
+    /// Retries enabled (AtRetryClose): a failed first dispatch must leave the
+    /// request intact, the second attempt must send identical token ids, and
+    /// the retry-window close (lease drop) frees it.
+    #[tokio::test]
+    async fn enabled_retries_replay_identical_token_ids() {
+        let request = completion_request(false);
+        let probe = Arc::downgrade(&request);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            fail_first: true,
+            seen_input_ids: Arc::clone(&seen),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, port, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let lease = Arc::new(RequestLease::new(
+            request,
+            RoutingDerivatives::default(),
+            ReleasePoint::AtRetryClose,
+        ));
+
+        let attempt = lease.with_view(|view| Arc::clone(view.request));
+        let response = pipeline
+            .execute_completion(
+                attempt,
+                None,
+                MODEL.to_string(),
+                components.clone(),
+                None,
+                None,
+                Some(lease.clone() as Arc<dyn ErasedLease>),
+            )
+            .await;
+        assert!(
+            !response.status().is_success(),
+            "first dispatch is induced to fail"
+        );
+        assert!(probe.upgrade().is_some(), "request must survive for replay");
+
+        let attempt = lease.with_view(|view| Arc::clone(view.request));
+        let response = pipeline
+            .execute_completion(
+                attempt,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                Some(lease.clone() as Arc<dyn ErasedLease>),
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "503 then 200 must mean two attempts");
+            assert_eq!(
+                seen[0], seen[1],
+                "the retry must replay identical input ids"
+            );
+            assert!(
+                !seen[0].is_empty(),
+                "attempts must carry the tokenized prompt"
+            );
+        }
+
+        drop(lease);
+        assert_eq!(
+            probe.strong_count(),
+            0,
+            "retry-window close must free the request"
+        );
     }
 }
 

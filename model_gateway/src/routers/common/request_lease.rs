@@ -69,6 +69,9 @@ enum SerializedBody {
     None,
     Single(Bytes),
     Legs(Bytes, Bytes),
+    /// Wire size only: the serialization lives outside the lease (typed
+    /// proto dispatch).
+    Sized(usize),
 }
 
 impl SerializedBody {
@@ -79,6 +82,7 @@ impl SerializedBody {
             Self::None => 0,
             Self::Single(body) => body.len(),
             Self::Legs(prefill, decode) => prefill.len().max(decode.len()),
+            Self::Sized(len) => *len,
         }
     }
 }
@@ -144,8 +148,14 @@ impl<T> RequestLease<T> {
     pub(crate) fn body(&self) -> Option<Bytes> {
         match &self.lock().body {
             SerializedBody::Single(body) => Some(body.clone()),
-            SerializedBody::None | SerializedBody::Legs(..) => None,
+            SerializedBody::None | SerializedBody::Legs(..) | SerializedBody::Sized(_) => None,
         }
+    }
+
+    /// Record the upstream wire size for the release metric when the wire
+    /// serialization lives outside the lease (typed proto dispatch).
+    pub(crate) fn note_upstream_len(&self, len: usize) {
+        self.lock().body = SerializedBody::Sized(len);
     }
 
     /// Under `AfterDispatch`, free the parsed request and derivatives and
@@ -182,6 +192,31 @@ impl<T> RequestLease<T> {
             text: held.routing.text.as_deref(),
             rid_key: held.routing.rid_key.as_deref(),
         }
+    }
+}
+
+/// Object-safe lease handle for pipelines that thread the release point
+/// through a heterogeneous request context (the gRPC stage pipeline).
+pub(crate) trait ErasedLease: Send + Sync {
+    /// True when the lease frees at dispatch (retries disabled).
+    fn releases_after_dispatch(&self) -> bool;
+    /// See [`RequestLease::note_upstream_len`].
+    fn note_upstream_len(&self, len: usize);
+    /// See [`RequestLease::release_dispatch`].
+    fn release_dispatch(&self);
+}
+
+impl<T: Send> ErasedLease for RequestLease<T> {
+    fn releases_after_dispatch(&self) -> bool {
+        self.release_point() == ReleasePoint::AfterDispatch
+    }
+
+    fn note_upstream_len(&self, len: usize) {
+        RequestLease::note_upstream_len(self, len);
+    }
+
+    fn release_dispatch(&self) {
+        RequestLease::release_dispatch(self);
     }
 }
 

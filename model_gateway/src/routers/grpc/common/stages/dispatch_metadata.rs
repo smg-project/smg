@@ -41,6 +41,9 @@ impl PipelineStage for DispatchMetadataStage {
             RequestType::Embedding(req) => req.model.clone(),
             RequestType::Classify(req) => req.model.clone(),
             RequestType::Messages(req) => req.model.clone(),
+            // Runs before request execution, so the payload is never released
+            // here; the canonical model ID is the same value regardless.
+            RequestType::Released(_) => ctx.input.model_id.clone(),
         };
 
         let weight_version = ctx

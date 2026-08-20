@@ -33,6 +33,7 @@ use super::{
 };
 use crate::{
     middleware::TenantRequestMeta,
+    routers::common::request_lease::ErasedLease,
     worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
 };
 
@@ -53,12 +54,19 @@ pub(crate) struct RequestInput {
     pub headers: Option<HeaderMap>,
     /// Canonical model ID used after aliases are resolved at request entry.
     pub model_id: String,
+    /// Captured at construction so it survives payload release.
+    pub streaming: bool,
     pub tenant_request_meta: Option<TenantRequestMeta>,
     /// Shared across every retry attempt of one logical request so
     /// `RateLimitReserveStage` reserves at most once. `None` for endpoints
     /// that haven't opted into tenant rate limiting yet (Responses,
     /// embeddings, classify).
     pub rate_limit_cell: Option<Arc<RateLimitCell>>,
+    /// Dispatch-phase owner of the parsed request (the router retry loop's
+    /// handle). When set, `RequestExecutionStage` drops the context's own
+    /// payload handle at dispatch and releases the lease; response stages
+    /// then read only the pre-extracted request view.
+    pub request_lease: Option<Arc<dyn ErasedLease>>,
 }
 
 /// Request type variants
@@ -71,9 +79,58 @@ pub(crate) enum RequestType {
     Embedding(Arc<EmbeddingRequest>),
     Classify(Arc<ClassifyRequest>),
     Messages(Arc<CreateMessageRequest>),
+    /// Payload dropped at dispatch; only the original kind survives for
+    /// post-dispatch stage dispatching.
+    Released(RequestKind),
+}
+
+/// Payload-free discriminant of [`RequestType`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestKind {
+    Chat,
+    Generate,
+    Completion,
+    Responses,
+    Embedding,
+    Classify,
+    Messages,
+}
+
+impl std::fmt::Display for RequestKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Chat => "Chat",
+            Self::Generate => "Generate",
+            Self::Completion => "Completion",
+            Self::Responses => "Responses",
+            Self::Embedding => "Embedding",
+            Self::Classify => "Classify",
+            Self::Messages => "Messages",
+        };
+        write!(f, "{name}")
+    }
 }
 
 impl RequestType {
+    pub fn kind(&self) -> RequestKind {
+        match self {
+            Self::Chat(_) => RequestKind::Chat,
+            Self::Generate(_) => RequestKind::Generate,
+            Self::Completion(_) => RequestKind::Completion,
+            Self::Responses(_) => RequestKind::Responses,
+            Self::Embedding(_) => RequestKind::Embedding,
+            Self::Classify(_) => RequestKind::Classify,
+            Self::Messages(_) => RequestKind::Messages,
+            Self::Released(kind) => *kind,
+        }
+    }
+
+    /// Drop the context's payload handle at dispatch. The lease (or the
+    /// router loop) is the remaining owner; the typed accessors panic past
+    /// this point by construction.
+    pub fn release_payload(&mut self) {
+        *self = Self::Released(self.kind());
+    }
     /// Overwrite the request's own `model` field.
     ///
     /// Callers hold the request behind an `Arc` that the retry loop also
@@ -94,6 +151,7 @@ impl RequestType {
             Self::Embedding(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Classify(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Messages(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Released(_) => {}
         }
     }
 
@@ -107,22 +165,14 @@ impl RequestType {
             Self::Embedding(r) => r.rid.as_deref(),
             Self::Classify(r) => r.rid.as_deref(),
             Self::Messages(r) => r.rid.as_deref(),
-            Self::Responses(_) => None,
+            Self::Responses(_) | Self::Released(_) => None,
         }
     }
 }
 
 impl std::fmt::Display for RequestType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Chat(_) => write!(f, "Chat"),
-            Self::Generate(_) => write!(f, "Generate"),
-            Self::Completion(_) => write!(f, "Completion"),
-            Self::Responses(_) => write!(f, "Responses"),
-            Self::Embedding(_) => write!(f, "Embedding"),
-            Self::Classify(_) => write!(f, "Classify"),
-            Self::Messages(_) => write!(f, "Messages"),
-        }
+        self.kind().fmt(f)
     }
 }
 
@@ -279,6 +329,19 @@ impl ExecutionPlan {
                 ExecutionPlanKind::PrefillDecode => "prefill_decode",
                 ExecutionPlanKind::EncodePrefillDecode => "encode_prefill_decode",
             },
+        }
+    }
+
+    /// Serialized wire size of the built request(s), for the release metric.
+    pub(crate) fn wire_len(&self) -> usize {
+        match self {
+            Self::Single(request) => request.wire_len(),
+            Self::PrefillDecode(request) | Self::EncodePrefillDecode { request } => {
+                request.wire_len()
+            }
+            Self::Batch { requests, .. } => {
+                requests.iter().map(ProtoGenerateRequest::wire_len).sum()
+            }
         }
     }
 }
@@ -491,7 +554,7 @@ pub(crate) struct ResponseState {
     pub skip_special_tokens: Option<bool>,
 
     /// Response-phase view of the request, set by request building so
-    /// response processing never reads the payload after dispatch.
+    /// response processing never reads the (possibly released) payload.
     pub request_view: Option<super::regular::views::RequestView>,
 
     /// Execution result (streams from workers)
@@ -528,13 +591,25 @@ impl RequestContext {
             model_id.push_str(&canonical_model_id);
             request_type.set_model(&model_id);
         }
+        let streaming = match &request_type {
+            RequestType::Chat(req) => req.stream,
+            RequestType::Generate(req) => req.stream,
+            RequestType::Completion(req) => req.stream,
+            RequestType::Responses(req) => req.stream.unwrap_or(false),
+            RequestType::Messages(req) => req.stream.unwrap_or(false),
+            // Embeddings and classification never stream.
+            RequestType::Embedding(_) | RequestType::Classify(_) => false,
+            RequestType::Released(_) => false,
+        };
         Self {
             input: RequestInput {
                 request_type,
                 headers,
                 model_id,
+                streaming,
                 tenant_request_meta: None,
                 rate_limit_cell: None,
+                request_lease: None,
             },
             components,
             state: ProcessingState::default(),
@@ -701,17 +776,10 @@ impl RequestContext {
         }
     }
 
-    /// Check if request is streaming
+    /// Check if request is streaming (captured at construction, so valid
+    /// after payload release).
     pub fn is_streaming(&self) -> bool {
-        match &self.input.request_type {
-            RequestType::Chat(req) => req.stream,
-            RequestType::Generate(req) => req.stream,
-            RequestType::Completion(req) => req.stream,
-            RequestType::Responses(req) => req.stream.unwrap_or(false),
-            RequestType::Messages(req) => req.stream.unwrap_or(false),
-            RequestType::Embedding(_) => false, // Embeddings are never streaming
-            RequestType::Classify(_) => false,  // Classification is never streaming
-        }
+        self.input.streaming
     }
 
     /// Get the cached tokenizer, cloning the Arc (cheap 8-byte clone)

@@ -41,7 +41,10 @@ use crate::{
     middleware::TenantRequestMeta,
     observability::metrics::{metrics_labels, Metrics},
     routers::{
-        common::retry::{is_retryable_response, RetryExecutor},
+        common::{
+            request_lease::{ErasedLease, ReleasePoint, RequestLease, RoutingDerivatives},
+            retry::{is_retryable_response, RetryExecutor},
+        },
         error, RouterTrait,
     },
     worker::{WorkerRegistry, WorkerType},
@@ -569,7 +572,6 @@ impl GrpcRouter {
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
-        let request = Arc::new(canonical_body);
         let headers_cloned = headers.cloned();
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
@@ -577,16 +579,32 @@ impl GrpcRouter {
 
         let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
+        // The lease owns the parsed request for the dispatch phase; its
+        // release point encodes the retry policy. The pipeline releases it at
+        // dispatch — except on the Harmony pipeline, whose response
+        // processing still reads the request after dispatch.
+        let lease = Arc::new(RequestLease::new(
+            Arc::new(canonical_body),
+            RoutingDerivatives::default(),
+            ReleasePoint::from_retry_config(&retry_config),
+        ));
+        let pipeline_lease: Option<Arc<dyn ErasedLease>> = if is_harmony {
+            None
+        } else {
+            Some(lease.clone())
+        };
+
         let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
             // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
-                let request = Arc::clone(&request);
+                let request = lease.with_view(|view| Arc::clone(view.request));
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
                 let tenant_meta = tenant_meta_cloned.clone();
                 let rate_limit_cell = Arc::clone(&rate_limit_cell);
+                let request_lease = pipeline_lease.clone();
                 async move {
                     pipeline
                         .execute_chat(
@@ -596,6 +614,7 @@ impl GrpcRouter {
                             components,
                             Some(tenant_meta),
                             Some(rate_limit_cell),
+                            request_lease,
                         )
                         .await
                 }
@@ -641,7 +660,6 @@ impl GrpcRouter {
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
-        let request = Arc::new(canonical_body);
         let headers_cloned = headers.cloned();
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
@@ -650,16 +668,24 @@ impl GrpcRouter {
 
         let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
+        // Dispatch-phase owner of the parsed request; see route_chat_impl.
+        let lease = Arc::new(RequestLease::new(
+            Arc::new(canonical_body),
+            RoutingDerivatives::default(),
+            ReleasePoint::from_retry_config(&retry_config),
+        ));
+
         let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
             // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
-                let request = Arc::clone(&request);
+                let request = lease.with_view(|view| Arc::clone(view.request));
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
                 let tenant_meta = tenant_meta_cloned.clone();
                 let rate_limit_cell = Arc::clone(&rate_limit_cell);
+                let request_lease: Arc<dyn ErasedLease> = lease.clone();
                 async move {
                     pipeline
                         .execute_generate(
@@ -669,6 +695,7 @@ impl GrpcRouter {
                             components,
                             Some(tenant_meta),
                             Some(rate_limit_cell),
+                            Some(request_lease),
                         )
                         .await
                 }
@@ -809,7 +836,6 @@ impl GrpcRouter {
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
-        let request = Arc::new(canonical_body);
         let headers_cloned = headers.cloned();
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
@@ -818,15 +844,23 @@ impl GrpcRouter {
 
         let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
+        // Dispatch-phase owner of the parsed request; see route_chat_impl.
+        let lease = Arc::new(RequestLease::new(
+            Arc::new(canonical_body),
+            RoutingDerivatives::default(),
+            ReleasePoint::from_retry_config(&retry_config),
+        ));
+
         let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
             |_attempt| {
-                let request = Arc::clone(&request);
+                let request = lease.with_view(|view| Arc::clone(view.request));
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
                 let tenant_meta = tenant_meta_cloned.clone();
                 let rate_limit_cell = Arc::clone(&rate_limit_cell);
+                let request_lease: Arc<dyn ErasedLease> = lease.clone();
                 async move {
                     pipeline
                         .execute_messages(
@@ -836,6 +870,7 @@ impl GrpcRouter {
                             components,
                             Some(tenant_meta),
                             Some(rate_limit_cell),
+                            Some(request_lease),
                         )
                         .await
                 }
@@ -877,7 +912,6 @@ impl GrpcRouter {
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
-        let request = Arc::new(canonical_body);
         let headers_cloned = headers.cloned();
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
@@ -886,15 +920,23 @@ impl GrpcRouter {
 
         let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
+        // Dispatch-phase owner of the parsed request; see route_chat_impl.
+        let lease = Arc::new(RequestLease::new(
+            Arc::new(canonical_body),
+            RoutingDerivatives::default(),
+            ReleasePoint::from_retry_config(&retry_config),
+        ));
+
         let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
             |_attempt| {
-                let request = Arc::clone(&request);
+                let request = lease.with_view(|view| Arc::clone(view.request));
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
                 let tenant_meta = tenant_meta_cloned.clone();
                 let rate_limit_cell = Arc::clone(&rate_limit_cell);
+                let request_lease: Arc<dyn ErasedLease> = lease.clone();
                 async move {
                     pipeline
                         .execute_completion(
@@ -904,6 +946,7 @@ impl GrpcRouter {
                             components,
                             Some(tenant_meta),
                             Some(rate_limit_cell),
+                            Some(request_lease),
                         )
                         .await
                 }

@@ -100,7 +100,8 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             | RequestType::Completion(_)
             | RequestType::Embedding(_)
             | RequestType::Classify(_)
-            | RequestType::Messages(_)) => {
+            | RequestType::Messages(_)
+            | RequestType::Released(_)) => {
                 error!(
                     function = "HarmonyRequestBuildingStage::execute",
                     request_type = %request_type,

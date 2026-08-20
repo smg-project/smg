@@ -71,9 +71,10 @@ impl SamplingDefaultsMask {
                 min_p: true,
                 repetition_penalty: true,
             }),
-            RequestType::Responses(_) | RequestType::Embedding(_) | RequestType::Classify(_) => {
-                None
-            }
+            RequestType::Responses(_)
+            | RequestType::Embedding(_)
+            | RequestType::Classify(_)
+            | RequestType::Released(_) => None,
         }
     }
 

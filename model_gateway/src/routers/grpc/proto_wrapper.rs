@@ -1096,6 +1096,14 @@ pub enum ProtoRequest {
 }
 
 impl ProtoRequest {
+    /// Serialized wire size, for the release metric.
+    pub fn wire_len(&self) -> usize {
+        match self {
+            Self::Generate(request) => request.wire_len(),
+            Self::Embed(request) => request.wire_len(),
+        }
+    }
+
     /// Get request ID from either variant
     pub fn request_id(&self) -> &str {
         match self {
@@ -1299,6 +1307,18 @@ impl ProtoGenerateRequest {
     /// Clone the inner request (for passing to generate())
     pub fn clone_inner(&self) -> Self {
         self.clone()
+    }
+
+    /// Serialized wire size, for the release metric.
+    pub fn wire_len(&self) -> usize {
+        use prost::Message;
+        match self {
+            Self::Sglang(req) => req.encoded_len(),
+            Self::Vllm(req) => req.encoded_len(),
+            Self::Trtllm(req) => req.encoded_len(),
+            Self::Mlx(req) => req.encoded_len(),
+            Self::TokenSpeed(req) => req.encoded_len(),
+        }
     }
 
     /// Drop raw multimodal encoder tensors while keeping item metadata.
@@ -2094,6 +2114,15 @@ pub enum ProtoEmbedRequest {
 }
 
 impl ProtoEmbedRequest {
+    /// Serialized wire size, for the release metric.
+    pub fn wire_len(&self) -> usize {
+        use prost::Message;
+        match self {
+            Self::Sglang(req) => req.encoded_len(),
+            Self::Vllm(req) => req.encoded_len(),
+        }
+    }
+
     /// Get SGLang variant
     #[expect(
         clippy::panic,
