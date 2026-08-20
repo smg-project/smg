@@ -2394,47 +2394,11 @@ impl StreamingProcessor {
         // does not pin stop_reason to "tool_use".
         if let Some(ref mut parser) = streaming_tool_parser {
             let finalized = parser.finish_incremental();
-            if !finalized.normal_text.is_empty() {
-                if tool_block_open {
-                    Self::send_messages_event(
-                        tx,
-                        &mut sse_buffer,
-                        &MessageStreamEvent::ContentBlockStop {
-                            index: current_block_index,
-                        },
-                    )
-                    .await?;
-                    tool_block_open = false;
-                    current_block_index += 1;
-                }
-                if !text_block_open {
-                    Self::send_messages_event(
-                        tx,
-                        &mut sse_buffer,
-                        &MessageStreamEvent::ContentBlockStart {
-                            index: current_block_index,
-                            content_block: ContentBlock::Text {
-                                text: String::new(),
-                                citations: None,
-                            },
-                        },
-                    )
-                    .await?;
-                    text_block_open = true;
-                }
-                Self::send_messages_event(
-                    tx,
-                    &mut sse_buffer,
-                    &MessageStreamEvent::ContentBlockDelta {
-                        index: current_block_index,
-                        delta: ContentBlockDelta::TextDelta {
-                            text: finalized.normal_text,
-                        },
-                    },
-                )
-                .await?;
-            }
 
+            // Flush terminal tool-call items first, while a tool_use block is
+            // still open: emitting text first would close the block and send
+            // trailing InputJsonDelta inside a text block, which the
+            // content-block contract forbids.
             let terminal_items = finalized.calls.into_iter().chain(
                 parser.get_unstreamed_tool_args().into_iter().flatten(),
             );
@@ -2502,6 +2466,47 @@ impl StreamingProcessor {
                     )
                     .await?;
                 }
+            }
+
+            if !finalized.normal_text.is_empty() {
+                if tool_block_open {
+                    Self::send_messages_event(
+                        tx,
+                        &mut sse_buffer,
+                        &MessageStreamEvent::ContentBlockStop {
+                            index: current_block_index,
+                        },
+                    )
+                    .await?;
+                    tool_block_open = false;
+                    current_block_index += 1;
+                }
+                if !text_block_open {
+                    Self::send_messages_event(
+                        tx,
+                        &mut sse_buffer,
+                        &MessageStreamEvent::ContentBlockStart {
+                            index: current_block_index,
+                            content_block: ContentBlock::Text {
+                                text: String::new(),
+                                citations: None,
+                            },
+                        },
+                    )
+                    .await?;
+                    text_block_open = true;
+                }
+                Self::send_messages_event(
+                    tx,
+                    &mut sse_buffer,
+                    &MessageStreamEvent::ContentBlockDelta {
+                        index: current_block_index,
+                        delta: ContentBlockDelta::TextDelta {
+                            text: finalized.normal_text,
+                        },
+                    },
+                )
+                .await?;
             }
 
             // Provisional deltas from a complete-but-invalid call were
