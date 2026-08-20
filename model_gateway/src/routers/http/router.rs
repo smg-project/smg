@@ -53,11 +53,12 @@ use crate::{
     policies::{PolicyRegistry, SelectWorkerInfo},
     routers::{
         common::{
-            header_utils, overload,
+            attach_sized_body, header_utils, overload,
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
+            request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, is_retryable_status, RetryExecutor},
             sse::SSE_CHANNEL_BUFFER,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
@@ -83,65 +84,6 @@ const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 const STREAMED_BODY_STALLED: &str = "request_body_stalled";
 const STREAMED_BODY_TOO_LARGE: &str = "request_body_too_large";
 const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
-
-/// Per-attempt view of the parsed request and its routing derivatives.
-///
-/// `Borrowed` keeps them alive across retry attempts for replay; `Owned`
-/// (retries disabled) is released by the dispatch path as soon as the
-/// serialized upstream body exists, so neither the send wait nor the response
-/// relay pins the parsed request.
-enum AttemptPayload<'a, T> {
-    Borrowed {
-        req: &'a T,
-        text: Option<&'a str>,
-        tokens: Option<&'a [u32]>,
-        rid_key: Option<&'a str>,
-    },
-    Owned {
-        req: T,
-        text: Option<String>,
-        tokens: Option<Vec<u32>>,
-        rid_key: Option<String>,
-    },
-}
-
-impl<T> AttemptPayload<'_, T> {
-    fn req(&self) -> &T {
-        match self {
-            Self::Borrowed { req, .. } => req,
-            Self::Owned { req, .. } => req,
-        }
-    }
-
-    fn text(&self) -> Option<&str> {
-        match self {
-            Self::Borrowed { text, .. } => *text,
-            Self::Owned { text, .. } => text.as_deref(),
-        }
-    }
-
-    fn tokens(&self) -> Option<&[u32]> {
-        match self {
-            Self::Borrowed { tokens, .. } => *tokens,
-            Self::Owned { tokens, .. } => tokens.as_deref(),
-        }
-    }
-
-    fn rid_key(&self) -> Option<&str> {
-        match self {
-            Self::Borrowed { rid_key, .. } => *rid_key,
-            Self::Owned { rid_key, .. } => rid_key.as_deref(),
-        }
-    }
-
-    /// Consume the payload once the upstream body is serialized.
-    /// `upstream_bytes` sizes the early-release metric for `Owned`.
-    fn release(self, upstream_bytes: usize) {
-        if matches!(self, Self::Owned { .. }) {
-            Metrics::record_request_buffers_released_early(upstream_bytes);
-        }
-    }
-}
 
 /// Regular router that uses injected load balancing policies
 pub struct Router {
@@ -428,6 +370,10 @@ impl Router {
         let text = routing_tokens
             .is_none()
             .then(|| typed_req.extract_text_for_routing());
+        let rid_key = self
+            .policy_registry
+            .derive_rid_key(typed_req.rid())
+            .map(str::to_string);
         // Resolve once, here, so every registry, policy and metrics lookup
         // below is keyed by the canonical model ID. Only `get_by_model`
         // understands aliases; retry configs, hash rings and policies do not,
@@ -453,23 +399,25 @@ impl Router {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
-        let response = if retry_config.max_retries.max(1) <= 1 {
-            // Retries disabled: one dispatch that owns the parsed request and
-            // its routing derivatives, releasing them the moment the upstream
-            // bytes are serialized instead of holding them for the response.
-            let rid_key = self
-                .policy_registry
-                .derive_rid_key(typed_req.rid())
-                .map(str::to_string);
+        // The lease owns the parsed request and its routing derivatives for
+        // the dispatch phase; its release point encodes the retry policy.
+        let lease = RequestLease::new(
+            typed_req,
+            RoutingDerivatives {
+                tokens: routing_tokens,
+                text,
+                rid_key,
+            },
+            ReleasePoint::from_retry_config(retry_config),
+        );
+
+        let response = if lease.release_point() == ReleasePoint::AfterDispatch {
+            // Retries disabled: one dispatch; the lease frees the parsed
+            // request the moment the upstream bytes are serialized.
             let res = self
                 .route_typed_request_once(
                     headers,
-                    AttemptPayload::Owned {
-                        req: typed_req,
-                        text,
-                        tokens: routing_tokens,
-                        rid_key,
-                    },
+                    &lease,
                     route,
                     model_id,
                     canonical_model.as_deref(),
@@ -482,28 +430,22 @@ impl Router {
                 extract_error_code_from_response(&res),
             );
             // Mirror the retry executor's exhaustion accounting for a
-            // retryable status that gets no retry.
+            // retryable response that gets no retry.
             if is_retryable_response(&res) {
                 Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
             }
             res
         } else {
-            let rid_key = self.policy_registry.derive_rid_key(typed_req.rid());
             RetryExecutor::execute_response_with_retry(
                 retry_config,
-                // operation per attempt; the parsed request stays alive for
-                // replay until the retry window closes (first non-retryable
-                // response).
+                // operation per attempt; the lease keeps the request alive
+                // for replay until the retry window closes (first
+                // non-retryable response).
                 |_: u32| async {
                     let res = self
                         .route_typed_request_once(
                             headers,
-                            AttemptPayload::Borrowed {
-                                req: &typed_req,
-                                text: text.as_deref(),
-                                tokens: routing_tokens.as_deref(),
-                                rid_key,
-                            },
+                            &lease,
                             route,
                             model_id,
                             canonical_model.as_deref(),
@@ -566,19 +508,15 @@ impl Router {
     async fn route_typed_request_once<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
-        payload: AttemptPayload<'_, T>,
+        lease: &RequestLease<T>,
         route: &'static str,
         model_id: &str,
         canonical_model: Option<&str>,
         is_stream: bool,
     ) -> Response {
-        let worker = match self.select_worker_for_model(
-            model_id,
-            payload.text(),
-            payload.tokens(),
-            headers,
-            payload.rid_key(),
-        ) {
+        let worker = match lease.with_view(|view| {
+            self.select_worker_for_model(model_id, view.text, view.tokens, headers, view.rid_key)
+        }) {
             Some(w) => w,
             None => {
                 // Distinguish "no workers for this model" from "workers exist but unavailable"
@@ -620,12 +558,13 @@ impl Router {
 
         // Keyed-load accounting uses the same effective key as selection:
         // rid-derived first, header fallback.
-        let load_guard = WorkerLoadGuard::with_key(
-            worker.clone(),
-            payload
-                .rid_key()
-                .or_else(|| self.policy_registry.sticky_header_key(headers)),
-        );
+        let load_guard = lease.with_view(|view| {
+            WorkerLoadGuard::with_key(
+                worker.clone(),
+                view.rid_key
+                    .or_else(|| self.policy_registry.sticky_header_key(headers)),
+            )
+        });
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -633,13 +572,14 @@ impl Router {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        let response = match serialize_request_body(payload.req(), canonical_model, worker.as_ref())
-        {
+        let response = match lease.serialize_with(|view| {
+            serialize_request_body(view.request, canonical_model, worker.as_ref())
+        }) {
             Ok(body) => {
-                // Past this point dispatch needs only the serialized bytes: an
-                // owned payload (retries disabled) frees the parsed request and
-                // its routing token/text derivatives before the upstream send.
-                payload.release(body.len());
+                // Past this point dispatch needs only the serialized bytes;
+                // the lease frees the parsed request and its routing
+                // derivatives now when retries are disabled.
+                lease.release_dispatch();
                 self.send_serialized_request(
                     headers,
                     body,
@@ -1235,7 +1175,7 @@ impl Router {
     async fn send_serialized_request(
         &self,
         headers: Option<&HeaderMap>,
-        body: Vec<u8>,
+        body: Bytes,
         route: &'static str,
         worker: &dyn Worker,
         is_stream: bool,
@@ -1244,11 +1184,12 @@ impl Router {
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
 
-        let mut request_builder = self
-            .client
-            .post(&endpoint_url)
-            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-            .body(body);
+        let mut request_builder = attach_sized_body(
+            self.client
+                .post(&endpoint_url)
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            bytes::Bytes::from(body),
+        );
 
         request_builder = header_utils::apply_forwarded_request_headers(
             request_builder,
@@ -2173,7 +2114,7 @@ impl RouterTrait for Router {
 mod tests {
     use std::{
         net::SocketAddr,
-        sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
+        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
     };
 
     use openai_protocol::worker::HealthCheckConfig;
@@ -2182,6 +2123,7 @@ mod tests {
     use crate::{
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
         policies::CacheAwarePolicy,
+        routers::common::request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
         worker::BasicWorkerBuilder,
     };
 
@@ -2937,61 +2879,6 @@ mod tests {
             .route_streaming_request(req, "/generate")
             .await
             .is_err());
-    }
-
-    /// Typed request with a drop probe: the test watches the `Arc` count to
-    /// observe exactly when the router frees the parsed body.
-    #[derive(serde::Serialize)]
-    struct DropProbeRequest {
-        text: String,
-        #[serde(skip)]
-        _probe: Arc<()>,
-    }
-
-    impl GenerationRequest for DropProbeRequest {
-        fn is_stream(&self) -> bool {
-            false
-        }
-
-        fn get_model(&self) -> Option<&str> {
-            None
-        }
-
-        fn extract_text_for_routing(&self) -> String {
-            self.text.clone()
-        }
-    }
-
-    /// Upstream stub that answers only after every probe clone outside the
-    /// test is gone (or after a deadline, leaving `released` false).
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "test stub server lives for the duration of the test process"
-    )]
-    async fn spawn_release_gated_stub(probe: std::sync::Weak<()>) -> (String, Arc<AtomicBool>) {
-        let released = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&released);
-        let app = axum::Router::new().route(
-            "/generate",
-            axum::routing::post(move || {
-                let probe = probe.clone();
-                let flag = Arc::clone(&flag);
-                async move {
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                    while probe.strong_count() > 1 && tokio::time::Instant::now() < deadline {
-                        tokio::time::sleep(Duration::from_millis(2)).await;
-                    }
-                    flag.store(probe.strong_count() <= 1, AtomicOrdering::SeqCst);
-                    ([(CONTENT_TYPE, "application/json")], "{}")
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (format!("http://{addr}"), released)
     }
 
     /// With retries disabled the parsed request must be freed at dispatch:
