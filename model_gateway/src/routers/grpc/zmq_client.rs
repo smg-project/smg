@@ -243,8 +243,8 @@ fn derive_handshake_port(path: &str) -> u16 {
 /// `ts serve --headless` with a manually registered worker.
 /// Returns `(handshake, input, output)`.
 ///
-/// [`zmq_handshake_address`] exposes just the handshake half, for collision
-/// checks at registration time.
+/// [`zmq_handshake_address`] exposes just the handshake half, for the
+/// registration-time validation of that address.
 fn zmq_socket_addresses(
     base_url: &str,
     handshake_override: Option<&str>,
@@ -269,15 +269,17 @@ fn zmq_socket_addresses(
     Ok((handshake, input, output))
 }
 
-/// The TCP handshake address a ZMQ worker will bind, or `None` when the URL is
-/// not a usable `ipc://` base (connect reports that with its own error).
+/// The TCP handshake address a ZMQ worker will bind.
+///
+/// Carries [`zmq_socket_addresses`]'s error verbatim rather than flattening it
+/// to "no address": an unusable `ipc://` base or a non-`tcp://` override is a
+/// misconfiguration registration must reject, not a value to skip past and
+/// rediscover at every later connect attempt.
 pub(crate) fn zmq_handshake_address(
     base_url: &str,
     handshake_override: Option<&str>,
-) -> Option<String> {
-    zmq_socket_addresses(base_url, handshake_override)
-        .ok()
-        .map(|(handshake, _, _)| handshake)
+) -> Result<String, String> {
+    zmq_socket_addresses(base_url, handshake_override).map(|(handshake, _, _)| handshake)
 }
 
 /// Create the parent directory for a worker's `ipc://` sockets. Kept off the

@@ -197,3 +197,55 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use tracing_test::traced_test;
+
+    use super::*;
+    use crate::worker::BasicWorkerBuilder;
+
+    fn worker(url: &str, connection_mode: ConnectionMode) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .connection_mode(connection_mode)
+                .build(),
+        )
+    }
+
+    #[traced_test]
+    #[test]
+    fn cache_aware_over_zmq_warns_that_kv_events_are_missing() {
+        // The ZMQ wire carries no KV-event stream, so this worker's cache
+        // tracking is the approximate prefix tree alone. Degrading a policy the
+        // operator asked for is fine; doing it silently is not.
+        UpdatePoliciesStep::warn_on_cache_aware_without_kv_events(
+            "glm-5.2",
+            &worker("ipc:///tmp/smg-zmq/a.ipc", ConnectionMode::Zmq),
+            true,
+        );
+
+        assert!(logs_contain("has no KV-event stream"));
+        assert!(logs_contain("glm-5.2"));
+        assert!(logs_contain("ipc:///tmp/smg-zmq/a.ipc"));
+    }
+
+    #[traced_test]
+    #[test]
+    fn kv_event_capable_and_non_cache_aware_workers_stay_quiet() {
+        // gRPC has the KV-event stream, so cache_aware is served in full...
+        UpdatePoliciesStep::warn_on_cache_aware_without_kv_events(
+            "glm-5.2",
+            &worker("grpc://worker:8080", ConnectionMode::Grpc),
+            true,
+        );
+        // ...and a ZMQ worker under any other policy loses nothing to warn about.
+        UpdatePoliciesStep::warn_on_cache_aware_without_kv_events(
+            "glm-5.2",
+            &worker("ipc:///tmp/smg-zmq/a.ipc", ConnectionMode::Zmq),
+            false,
+        );
+
+        assert!(!logs_contain("has no KV-event stream"));
+    }
+}
