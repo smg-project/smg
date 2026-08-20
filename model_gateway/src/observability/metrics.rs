@@ -1346,6 +1346,15 @@ impl Metrics {
         gauge!("smg_manual_policy_cache_entries").set(count as f64);
     }
 
+    /// Record which source supplied the sticky routing key for a keyed request
+    pub fn record_routing_key_source(source: &'static str) {
+        counter!(
+            "smg_routing_key_source_total",
+            "source" => source
+        )
+        .increment(1);
+    }
+
     /// Set cache-aware string-tree cached characters for a model
     pub fn set_cache_tree_chars(model_id: &str, chars: usize) {
         let model = intern_model_label(model_id);

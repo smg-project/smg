@@ -14,6 +14,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
+        common::header_utils::extract_routing_key_hint,
         error,
         grpc::{
             context::{EncodeWorkerAssignment, RequestContext, WorkerSelection},
@@ -91,11 +92,19 @@ impl PipelineStage for WorkerSelectionStage {
         let tokens = if ids.is_empty() { None } else { Some(ids) };
 
         let headers = ctx.input.headers.as_ref();
+        let rid_key = self
+            .policy_registry
+            .derive_rid_key(ctx.input.request_type.rid())
+            .map(str::to_string);
+        ctx.state.sticky_key = rid_key
+            .clone()
+            .or_else(|| extract_routing_key_hint(headers).map(str::to_string));
+        let rid_key = rid_key.as_deref();
 
         let model_id = ctx.input.model_id.as_str();
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(model_id, text, tokens, headers) {
+                match self.select_single_worker(model_id, text, tokens, headers, rid_key) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
                         error!(
@@ -109,7 +118,7 @@ impl PipelineStage for WorkerSelectionStage {
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
-                match self.select_pd_pair(model_id, text, tokens, headers) {
+                match self.select_pd_pair(model_id, text, tokens, headers, rid_key) {
                     Some((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
                         prefill,
@@ -147,6 +156,7 @@ impl PipelineStage for WorkerSelectionStage {
                     text,
                     tokens,
                     headers,
+                    rid_key,
                     &encode_item_hashes,
                 ) {
                     Some((encode_assignments, prefill, decode, runtime_type)) => {
@@ -221,6 +231,7 @@ impl WorkerSelectionStage {
         text: Option<&str>,
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
+        rid_key: Option<&str>,
     ) -> Option<Arc<dyn Worker>> {
         // Treat "unknown" model as wildcard (match any worker)
         let model_filter = if model_id == UNKNOWN_MODEL_ID {
@@ -265,6 +276,7 @@ impl WorkerSelectionStage {
                 tokens,
                 headers,
                 routing_key: None,
+                rid_key,
                 hash_ring,
                 leg: WorkerLeg::Single,
             },
@@ -288,6 +300,7 @@ impl WorkerSelectionStage {
         text: Option<&str>,
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
+        rid_key: Option<&str>,
     ) -> Option<PdWorkerPair> {
         // Treat "unknown" model as wildcard (match any worker)
         let model_filter = if model_id == UNKNOWN_MODEL_ID {
@@ -390,6 +403,7 @@ impl WorkerSelectionStage {
             tokens,
             headers,
             routing_key: None,
+            rid_key,
             hash_ring,
             leg: WorkerLeg::Prefill,
         };
@@ -440,6 +454,7 @@ impl WorkerSelectionStage {
         text: Option<&str>,
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
+        rid_key: Option<&str>,
         encode_item_hashes: &[Vec<u8>],
     ) -> Option<EncodePrefillDecodeWorkerSelection> {
         // Treat "unknown" model as wildcard (match any worker)
@@ -568,6 +583,7 @@ impl WorkerSelectionStage {
             tokens,
             headers,
             routing_key: None,
+            rid_key,
             hash_ring: hash_ring.clone(),
             leg: WorkerLeg::Prefill,
         };
@@ -646,6 +662,9 @@ fn assign_encode_workers(
                 tokens: None,
                 headers: Some(&routing_headers),
                 routing_key: None,
+                // Encode items key by media-content hash; a conversation key
+                // here would defeat per-item encode reuse.
+                rid_key: None,
                 hash_ring: hash_ring.clone(),
                 leg: WorkerLeg::Single,
             };
@@ -779,7 +798,7 @@ mod tests {
         let mut decode_hits = HashMap::new();
         for _ in 0..iterations {
             let (prefill, decode, _) = stage
-                .select_pd_pair(model_id, None, None, None)
+                .select_pd_pair(model_id, None, None, None, None)
                 .expect("select_pd_pair should return a pair");
             *prefill_hits.entry(prefill.url().to_string()).or_default() += 1;
             *decode_hits.entry(decode.url().to_string()).or_default() += 1;
@@ -883,16 +902,80 @@ mod tests {
         );
 
         assert!(
-            stage.select_pd_pair(model_id, None, None, None).is_none(),
+            stage
+                .select_pd_pair(model_id, None, None, None, None)
+                .is_none(),
             "ZMQ-only PD pools must not yield a pair"
         );
 
         // Adding gRPC legs makes selection succeed, and it never picks the ZMQ ones.
         let (prefill_urls, decode_urls) = register_pd_workers(&worker_registry, model_id, 4);
         let (prefill, decode, _) = stage
-            .select_pd_pair(model_id, None, None, None)
+            .select_pd_pair(model_id, None, None, None, None)
             .expect("gRPC PD pair should be selected");
         assert!(prefill_urls.contains(&prefill.url().to_string()));
         assert!(decode_urls.contains(&decode.url().to_string()));
+    }
+
+    /// gRPC selection pins by the rid-derived key under the override: repeats
+    /// of one conversation land on one worker even as a poisoned per-request
+    /// header key rotates; the header only keys requests without a rid.
+    #[test]
+    fn grpc_selection_pins_by_rid_key_under_override() {
+        use crate::config::types::{ManualAssignmentMode, RoutingKeyOverrideConfig};
+
+        let model_id = "test-model-rid-sticky";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for i in 0..2 {
+            worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{}", 8300 + i))
+                        .model(ModelCard::new(model_id))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        }
+        let policy_registry = Arc::new(PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                assignment_mode: ManualAssignmentMode::Delegate,
+                ..Default::default()
+            },
+        ));
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            policy_registry.clone(),
+            WorkerSelectionMode::Regular,
+        );
+
+        let rid_key = policy_registry.derive_rid_key(Some("conv7_t1"));
+        assert_eq!(rid_key, Some("conv7"));
+
+        let mut poison = HeaderMap::new();
+        poison.insert("x-smg-routing-key", "req-unique-1".parse().unwrap());
+        let first = stage
+            .select_single_worker(model_id, None, None, Some(&poison), rid_key)
+            .unwrap();
+        for (i, rid) in ["conv7_t2", "conv7_t2_r1", "conv7_t3"].iter().enumerate() {
+            let mut rotated = HeaderMap::new();
+            rotated.insert(
+                "x-smg-routing-key",
+                format!("req-unique-{}", i + 2).parse().unwrap(),
+            );
+            let again = stage
+                .select_single_worker(
+                    model_id,
+                    None,
+                    None,
+                    Some(&rotated),
+                    policy_registry.derive_rid_key(Some(rid)),
+                )
+                .unwrap();
+            assert_eq!(again.url(), first.url(), "follow-up must pin by rid key");
+        }
     }
 }

@@ -263,6 +263,10 @@ pub struct SelectWorkerInfo<'a> {
     /// consistent_hashing and prefix_hash prefer it over their other keying
     /// input.
     pub routing_key: Option<&'a str>,
+    /// Session key derived from the request body's `rid` (routers with typed
+    /// body access populate it); consumed by the routing-key override when
+    /// its key source includes rid.
+    pub rid_key: Option<&'a str>,
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,

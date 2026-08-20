@@ -34,8 +34,8 @@ pub struct RouterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zmq_engine_count: Option<usize>,
     pub policy: PolicyConfig,
-    /// Per-request sticky-routing override (honors `X-SMG-Routing-Key`).
-    #[serde(default)]
+    /// Per-request sticky-session routing (rid-lineage keys, header fallback).
+    #[serde(default, alias = "sticky_sessions")]
     pub routing_key_override: RoutingKeyOverrideConfig,
     pub host: String,
     pub port: u16,
@@ -452,12 +452,22 @@ pub enum ManualAssignmentMode {
     MinLoad,
     /// Select worker with minimum active routing keys
     MinGroup,
+    /// Delegate the first assignment for a key to the underlying routing
+    /// policy, then pin. With `--policy manual` (no underlying policy to
+    /// delegate to) this falls back to min-load.
+    Delegate,
 }
 
-/// Per-request sticky-routing override: when `X-SMG-Routing-Key` is present, any
+/// Per-request sticky-routing override: when a sticky key is present, any
 /// eligible policy routes via manual sticky-map semantics. Reuses the manual
 /// policy knobs for the sticky map; eviction defaults match the manual policy so
 /// config-file users with only `enabled: true` still get TTL eviction (no leak).
+///
+/// Key priority is fixed: a key derived from the typed body's `rid` (per-turn
+/// `_t<n>` and per-retry `_r<n>` suffixes stripped, so every turn of a
+/// conversation shares one key) wins over `X-SMG-Routing-Key`; the header is
+/// the fallback when no rid is present. Raw-streamed requests have no readable
+/// body and therefore derive keys from the header only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingKeyOverrideConfig {
     /// When false, policies are used unchanged.
@@ -465,10 +475,19 @@ pub struct RoutingKeyOverrideConfig {
     pub enabled: bool,
     #[serde(default = "default_manual_eviction_interval_secs")]
     pub eviction_interval_secs: u64,
-    #[serde(default = "default_manual_max_idle_secs")]
+    #[serde(
+        default = "default_manual_max_idle_secs",
+        alias = "sticky_key_idle_secs"
+    )]
     pub max_idle_secs: u64,
-    #[serde(default)]
+    /// Defaults to `delegate`: first-seen keys route via the underlying
+    /// policy, then pin.
+    #[serde(default = "default_override_assignment_mode")]
     pub assignment_mode: ManualAssignmentMode,
+}
+
+fn default_override_assignment_mode() -> ManualAssignmentMode {
+    ManualAssignmentMode::Delegate
 }
 
 impl Default for RoutingKeyOverrideConfig {
@@ -477,7 +496,7 @@ impl Default for RoutingKeyOverrideConfig {
             enabled: false,
             eviction_interval_secs: default_manual_eviction_interval_secs(),
             max_idle_secs: default_manual_max_idle_secs(),
-            assignment_mode: ManualAssignmentMode::default(),
+            assignment_mode: default_override_assignment_mode(),
         }
     }
 }
@@ -500,15 +519,17 @@ pub enum PolicyConfig {
 
     #[serde(rename = "cache_aware")]
     CacheAware {
+        /// Minimum matched-prefix share before a request pins to a holder.
+        #[serde(alias = "cache_match_threshold")]
         cache_threshold: f32,
-        /// Absolute load margin for the per-request candidate gate: the
-        /// selected worker spills to least-loaded when its load exceeds the
-        /// healthy-fleet mean by this many requests AND by
-        /// `balance_rel_threshold`.
+        /// Spill gate, absolute part: the selected worker spills to
+        /// least-loaded when its load exceeds the healthy-fleet mean by this
+        /// many requests AND by `balance_rel_threshold`.
+        #[serde(alias = "spill_abs_threshold")]
         balance_abs_threshold: usize,
-        /// Relative load margin (multiple of the healthy-fleet mean) for the
-        /// per-request candidate gate; fires only together with
-        /// `balance_abs_threshold`.
+        /// Spill gate, relative part (multiple of the healthy-fleet mean);
+        /// fires only together with `balance_abs_threshold`.
+        #[serde(alias = "spill_rel_threshold")]
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
@@ -582,8 +603,10 @@ pub enum PolicyConfig {
     #[serde(rename = "bucket")]
     Bucket {
         /// Absolute load difference threshold for load balancing
+        #[serde(alias = "spill_abs_threshold")]
         balance_abs_threshold: usize,
         /// Relative load ratio threshold for load balancing
+        #[serde(alias = "spill_rel_threshold")]
         balance_rel_threshold: f32,
         /// Interval between bucket boundary adjustment cycles (seconds)
         bucket_adjust_interval_secs: usize,
@@ -599,8 +622,12 @@ pub enum PolicyConfig {
         /// Interval between TTL eviction cycles (seconds, default: 60)
         #[serde(default = "default_manual_eviction_interval_secs")]
         eviction_interval_secs: u64,
-        /// Maximum idle time before eviction (seconds, default: 14400 = 4 hours)
-        #[serde(default = "default_manual_max_idle_secs")]
+        /// Maximum idle time before a key is evicted (seconds, default:
+        /// 14400 = 4 hours)
+        #[serde(
+            default = "default_manual_max_idle_secs",
+            alias = "sticky_key_idle_secs"
+        )]
         max_idle_secs: u64,
         /// Assignment mode for new routing keys (default: random)
         #[serde(default)]
@@ -812,7 +839,9 @@ pub struct HealthCheckConfig {
     pub check_interval_secs: u64,
     pub endpoint: String,
     pub disable_health_check: bool,
-    #[serde(default)]
+    /// Let workers recover after prolonged failure: removal re-enters them
+    /// through service discovery once their engine returns.
+    #[serde(default, alias = "worker_auto_recovery")]
     pub remove_unhealthy_workers: bool,
     /// Seconds to keep a Ready worker in `Draining` after `RemoveWorker`
     /// is submitted before the registry entry is removed. Lets in-flight
@@ -1206,6 +1235,125 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.stream_body_stall_timeout_secs, 0);
+    }
+
+    #[test]
+    fn alias_field_spellings_deserialize_and_serialize_canonically() {
+        // Config files may use the intent-revealing spellings; alias in,
+        // canonical out.
+        let mut json = serde_json::to_value(RouterConfig::default()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        let v = obj.remove("routing_key_override").unwrap();
+        obj.insert("sticky_sessions".to_string(), v);
+        let hc = obj
+            .get_mut("health_check")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        hc.remove("remove_unhealthy_workers").unwrap();
+        hc.insert(
+            "worker_auto_recovery".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let cfg: RouterConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.health_check.remove_unhealthy_workers);
+        let out = serde_json::to_string(&cfg).unwrap();
+        assert!(out.contains("routing_key_override"));
+        assert!(out.contains("remove_unhealthy_workers"));
+        assert!(!out.contains("sticky_sessions"));
+        assert!(!out.contains("worker_auto_recovery"));
+    }
+
+    #[test]
+    fn policy_alias_field_spellings_deserialize_identically() {
+        let canonical: PolicyConfig = serde_json::from_value(serde_json::json!({
+            "type": "cache_aware",
+            "cache_threshold": 0.6,
+            "balance_abs_threshold": 8,
+            "balance_rel_threshold": 1.2,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1024,
+        }))
+        .unwrap();
+        let aliased: PolicyConfig = serde_json::from_value(serde_json::json!({
+            "type": "cache_aware",
+            "cache_match_threshold": 0.6,
+            "spill_abs_threshold": 8,
+            "spill_rel_threshold": 1.2,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1024,
+        }))
+        .unwrap();
+        assert_eq!(format!("{canonical:?}"), format!("{aliased:?}"));
+        let out = serde_json::to_string(&aliased).unwrap();
+        assert!(!out.contains("cache_match_threshold"));
+        assert!(!out.contains("spill_abs_threshold"));
+
+        let manual: PolicyConfig = serde_json::from_value(serde_json::json!({
+            "type": "manual",
+            "sticky_key_idle_secs": 123,
+        }))
+        .unwrap();
+        match manual {
+            PolicyConfig::Manual { max_idle_secs, .. } => assert_eq!(max_idle_secs, 123),
+            other => panic!("expected manual policy, got {other:?}"),
+        }
+
+        let override_cfg: RoutingKeyOverrideConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "sticky_key_idle_secs": 321,
+        }))
+        .unwrap();
+        assert_eq!(override_cfg.max_idle_secs, 321);
+    }
+
+    #[test]
+    fn test_routing_key_override_serde_default_and_roundtrip() {
+        // Config files with only `enabled` deserialize to the defaults.
+        let json: serde_json::Value = serde_json::json!({ "enabled": true });
+        let cfg: RoutingKeyOverrideConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.assignment_mode, ManualAssignmentMode::Delegate);
+
+        let cfg = RoutingKeyOverrideConfig {
+            enabled: true,
+            assignment_mode: ManualAssignmentMode::MinLoad,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let roundtripped: RoutingKeyOverrideConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.assignment_mode, ManualAssignmentMode::MinLoad);
+    }
+
+    #[test]
+    fn delegate_assignment_mode_survives_serde_roundtrip() {
+        let json = serde_json::to_string(&ManualAssignmentMode::Delegate).unwrap();
+        assert_eq!(json, "\"delegate\"");
+        let back: ManualAssignmentMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ManualAssignmentMode::Delegate);
+
+        let cfg = RoutingKeyOverrideConfig {
+            enabled: true,
+            assignment_mode: ManualAssignmentMode::Delegate,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let roundtripped: RoutingKeyOverrideConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.assignment_mode, ManualAssignmentMode::Delegate);
+    }
+
+    #[test]
+    fn assignment_mode_defaults_split_by_context() {
+        // Manual policy standalone keeps random; the override sticky map
+        // defaults to delegate. Both are operator-visible defaults.
+        assert_eq!(
+            ManualAssignmentMode::default(),
+            ManualAssignmentMode::Random
+        );
+        assert_eq!(
+            RoutingKeyOverrideConfig::default().assignment_mode,
+            ManualAssignmentMode::Delegate
+        );
     }
 
     #[test]

@@ -402,7 +402,7 @@ struct Router {
     least_load_default_throughput: f64,
     least_load_mean_prefill_tokens: u32,
     max_idle_secs: u64,
-    assignment_mode: String,
+    assignment_mode: Option<String>,
     max_payload_size: usize,
     dp_aware: bool,
     dp_minimum_tokens_scheduler: bool,
@@ -545,15 +545,22 @@ impl Router {
         })
     }
 
-    fn parse_assignment_mode(&self) -> Result<config::ManualAssignmentMode, config::ConfigError> {
-        match self.assignment_mode.as_str() {
+    fn parse_assignment_mode(
+        &self,
+        default: config::ManualAssignmentMode,
+    ) -> Result<config::ManualAssignmentMode, config::ConfigError> {
+        let Some(mode) = self.assignment_mode.as_deref() else {
+            return Ok(default);
+        };
+        match mode {
             "random" => Ok(config::ManualAssignmentMode::Random),
             "min_load" => Ok(config::ManualAssignmentMode::MinLoad),
             "min_group" => Ok(config::ManualAssignmentMode::MinGroup),
+            "delegate" => Ok(config::ManualAssignmentMode::Delegate),
             other => Err(config::ConfigError::InvalidValue {
                 field: "assignment_mode".to_string(),
                 value: other.to_string(),
-                reason: "expected 'random', 'min_load', or 'min_group'".to_string(),
+                reason: "expected 'random', 'min_load', 'min_group', or 'delegate'".to_string(),
             }),
         }
     }
@@ -615,7 +622,8 @@ impl Router {
                 PolicyType::Manual => ConfigPolicyConfig::Manual {
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_idle_secs: self.max_idle_secs,
-                    assignment_mode: self.parse_assignment_mode()?,
+                    assignment_mode: self
+                        .parse_assignment_mode(config::ManualAssignmentMode::Random)?,
                 },
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
@@ -873,7 +881,8 @@ impl Router {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval_secs,
                 max_idle_secs: self.max_idle_secs,
-                assignment_mode: self.parse_assignment_mode()?,
+                assignment_mode: self
+                    .parse_assignment_mode(config::ManualAssignmentMode::Delegate)?,
             })
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
@@ -915,7 +924,7 @@ impl Router {
         least_load_default_throughput = 2000.0,
         least_load_mean_prefill_tokens = 1024,
         max_idle_secs = 14400,
-        assignment_mode = String::from("random"),
+        assignment_mode = None,
         max_payload_size = 512 * 1024 * 1024,
         dp_aware = false,
         dp_minimum_tokens_scheduler = false,
@@ -1056,7 +1065,7 @@ impl Router {
         least_load_default_throughput: f64,
         least_load_mean_prefill_tokens: u32,
         max_idle_secs: u64,
-        assignment_mode: String,
+        assignment_mode: Option<String>,
         max_payload_size: usize,
         dp_aware: bool,
         dp_minimum_tokens_scheduler: bool,

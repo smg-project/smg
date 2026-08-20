@@ -1663,10 +1663,16 @@ pub struct WorkerLoadGuard {
 
 impl WorkerLoadGuard {
     pub fn new(worker: Arc<dyn Worker>, headers: Option<&http::HeaderMap>) -> Self {
+        let key = extract_routing_key(headers).map(String::from);
+        Self::with_key(worker, key.as_deref())
+    }
+
+    /// Guard keyed by the caller-resolved effective sticky key (rid-derived
+    /// wins over the header), so keyed-load accounting matches selection.
+    pub fn with_key(worker: Arc<dyn Worker>, routing_key: Option<&str>) -> Self {
         worker.increment_load();
 
-        let routing_key = extract_routing_key(headers).map(String::from);
-
+        let routing_key = routing_key.map(String::from);
         if let Some(ref key) = routing_key {
             worker.increment_routing_key_load(key);
         }

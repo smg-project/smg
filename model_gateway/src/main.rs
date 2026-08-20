@@ -205,49 +205,65 @@ struct CliArgs {
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
     policy: String,
 
-    /// Cache threshold (0.0-1.0) for cache-aware routing
-    #[arg(long, default_value_t = 0.3, help_heading = "Routing Policy")]
+    /// Minimum matched-prefix share (0.0-1.0) before cache-aware routing
+    /// pins a request to a worker already holding that prefix; below it the
+    /// request is load-balanced instead
+    #[arg(
+        long,
+        visible_alias = "cache-match-threshold",
+        default_value_t = 0.3,
+        help_heading = "Routing Policy"
+    )]
     cache_threshold: f32,
 
-    /// Absolute load margin for the balancing check. For cache-aware routing
-    /// the selected worker spills to least-loaded when its load exceeds the
-    /// healthy-fleet mean by this many requests AND by balance_rel_threshold.
-    #[arg(long, default_value_t = 64, help_heading = "Routing Policy")]
+    /// Spill gate, absolute part: a matched worker is skipped for the
+    /// least-loaded one when its load exceeds the healthy-fleet mean by this
+    /// many requests AND by --balance-rel-threshold
+    #[arg(
+        long,
+        visible_alias = "spill-abs-threshold",
+        default_value_t = 64,
+        help_heading = "Routing Policy"
+    )]
     balance_abs_threshold: usize,
 
-    /// Relative load margin for the balancing check (multiple of the
-    /// healthy-fleet mean); fires only together with balance_abs_threshold.
-    #[arg(long, default_value_t = 1.5, help_heading = "Routing Policy")]
+    /// Spill gate, relative part (multiple of the healthy-fleet mean); fires
+    /// only together with --balance-abs-threshold
+    #[arg(
+        long,
+        visible_alias = "spill-rel-threshold",
+        default_value_t = 1.5,
+        help_heading = "Routing Policy"
+    )]
     balance_rel_threshold: f32,
 
-    /// Cache-aware KV-usage spread (hottest minus coldest backend, 0.0-1.0)
-    /// above which cache affinity is abandoned for shortest-queue, even if
-    /// request counts look balanced (catches long-context KV imbalance). Backend
-    /// must report token_usage. >= 1.0 disables it.
+    /// Abandon cache affinity for shortest-queue when the KV-usage spread
+    /// (hottest minus coldest backend, 0.0-1.0) exceeds this — catches
+    /// long-context KV imbalance that request counts miss. Backend must
+    /// report token_usage. >= 1.0 disables it.
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     balance_token_usage_threshold: f32,
 
-    /// Cache-aware KV-utilization ceiling (0.0-1.0): when the hottest backend
-    /// exceeds it, shed load off that engine regardless of spread. A safety
-    /// valve for critically-saturated engines, best set high (e.g. 0.9).
-    /// >= 1.0 disables it.
+    /// Safety valve for critically-saturated engines: when the hottest
+    /// backend's KV utilization (0.0-1.0) exceeds this, shed load off it
+    /// regardless of spread. Best set high (e.g. 0.9). >= 1.0 disables it.
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     overload_token_usage_threshold: f32,
 
-    /// Cache-aware anti-hotspot decay: divide each candidate's overlap score
-    /// by 1 + overlap_decay * x, where x is the worker's waiting-prefill
-    /// backlog (blocks above the candidate minimum) per request block.
-    /// Requires backend load reporting. 0.0 disables.
+    /// Anti-hotspot decay: de-rank cache-affine candidates by their
+    /// waiting-prefill backlog (overlap score divided by 1 + overlap_decay
+    /// * backlog blocks per request block). Requires backend load
+    /// reporting. 0.0 disables.
     #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
     overlap_decay: f32,
 
-    /// Cache-aware softmax temperature over min-max normalized scores for
-    /// event-driven selection. 0.0 is exact argmax; larger values spread
-    /// picks across candidates.
+    /// Spread event-driven cache-aware picks across near-equal candidates:
+    /// softmax temperature over min-max normalized scores. 0.0 is exact
+    /// argmax.
     #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
     selection_temperature: f32,
 
-    /// Interval in seconds between cache eviction operations
+    /// Interval in seconds between cache-tree eviction cycles
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
     eviction_interval: u64,
 
@@ -257,17 +273,28 @@ struct CliArgs {
     #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
 
-    /// KV cache block size for event-driven cache-aware routing
+    /// Match granularity for cache-aware token routing: the token-tree page
+    /// size, and the KV block size assumed for event-driven selection
     #[arg(long, default_value_t = 16, help_heading = "Routing Policy")]
     block_size: usize,
 
-    /// Maximum idle time in seconds before eviction (for manual policy)
-    #[arg(long, default_value_t = 14400, help_heading = "Routing Policy")]
+    /// How long an unused sticky routing key stays pinned: keys idle beyond
+    /// this many seconds are evicted from the manual-policy / sticky-session
+    /// map
+    #[arg(
+        long,
+        visible_alias = "sticky-key-idle-secs",
+        default_value_t = 14400,
+        help_heading = "Routing Policy"
+    )]
     max_idle_secs: u64,
 
-    /// Assignment mode for manual policy when encountering a new routing key
-    #[arg(long, default_value = "random", value_parser = ["random", "min_load", "min_group"], help_heading = "Routing Policy")]
-    assignment_mode: String,
+    /// How a first-seen routing key picks its worker: random, min_load
+    /// (fewest requests), min_group (fewest keys), or delegate (route via
+    /// the underlying policy, then pin). Defaults to random for the manual
+    /// policy and delegate for the sticky-session map
+    #[arg(long, value_parser = ["random", "min_load", "min_group", "delegate"], help_heading = "Routing Policy")]
+    assignment_mode: Option<String>,
 
     /// Number of prefix tokens to use for prefix_hash policy, or four times
     /// as many characters of the prompt when the request is untokenized
@@ -307,9 +334,18 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
 
-    /// Honor X-SMG-Routing-Key for sticky routing on any policy (reuses the
-    /// manual eviction/idle/assignment knobs for the sticky map)
-    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    /// Sticky sessions: route every request of a conversation to the same
+    /// worker, on any policy. The key is derived from the request body's rid
+    /// with per-turn/per-retry suffixes stripped (conv_t2_r1 -> conv),
+    /// falling back to X-SMG-Routing-Key when no rid is present;
+    /// raw-streamed requests carry no readable rid and use the header only.
+    /// Reuses the manual eviction/idle/assignment knobs for the sticky map
+    #[arg(
+        long,
+        visible_alias = "sticky-sessions",
+        default_value_t = false,
+        help_heading = "Routing Policy"
+    )]
     routing_key_override: bool,
 
     /// Enable IGW (Inference Gateway) mode for multi-model support
@@ -644,32 +680,41 @@ struct CliArgs {
     disable_circuit_breaker: bool,
 
     // ==================== Health Checks ====================
-    /// Failures before marking worker unhealthy
+    /// Consecutive probe failures before a worker is taken out of rotation
     #[arg(long, default_value_t = 3, help_heading = "Health Checks")]
     health_failure_threshold: u32,
 
-    /// Successes before marking worker healthy
+    /// Consecutive probe successes before a worker returns to rotation
     #[arg(long, default_value_t = 2, help_heading = "Health Checks")]
     health_success_threshold: u32,
 
-    /// Timeout in seconds for health check requests
+    /// Timeout in seconds for a single health probe
     #[arg(long, default_value_t = 5, help_heading = "Health Checks")]
     health_check_timeout_secs: u64,
 
-    /// Interval in seconds between health checks
+    /// Interval in seconds between health probes of each worker
     #[arg(long, default_value_t = 60, help_heading = "Health Checks")]
     health_check_interval_secs: u64,
 
-    /// Health check endpoint path
+    /// HTTP path probed on each worker
     #[arg(long, default_value = "/health", help_heading = "Health Checks")]
     health_check_endpoint: String,
 
-    /// Disable all worker health checks at startup
+    /// Disable all worker health probing
     #[arg(long, default_value_t = false, help_heading = "Health Checks")]
     disable_health_check: bool,
 
-    /// Remove workers from the registry when they are marked unhealthy
-    #[arg(long, default_value_t = false, help_heading = "Health Checks")]
+    /// Let workers recover after prolonged failure: a worker that stays
+    /// unhealthy long enough is removed from the registry so service
+    /// discovery re-registers and re-probes it once its engine returns
+    /// (without this, a worker unreachable for ~12 minutes reaches a
+    /// terminal Failed state and is never probed again)
+    #[arg(
+        long,
+        visible_alias = "worker-auto-recovery",
+        default_value_t = false,
+        help_heading = "Health Checks"
+    )]
     remove_unhealthy_workers: bool,
 
     /// Seconds to keep a Ready worker in `Draining` before removing it from
@@ -1231,7 +1276,10 @@ impl CliArgs {
             "manual" => PolicyConfig::Manual {
                 eviction_interval_secs: self.eviction_interval,
                 max_idle_secs: self.max_idle_secs,
-                assignment_mode: Self::parse_assignment_mode(&self.assignment_mode),
+                assignment_mode: Self::parse_assignment_mode(
+                    self.assignment_mode.as_deref(),
+                    ManualAssignmentMode::Random,
+                ),
             },
             _ => PolicyConfig::RoundRobin,
         }
@@ -1241,11 +1289,16 @@ impl CliArgs {
         clippy::panic,
         reason = "unreachable: clap value_parser restricts valid assignment modes"
     )]
-    fn parse_assignment_mode(mode: &str) -> ManualAssignmentMode {
+    fn parse_assignment_mode(
+        mode: Option<&str>,
+        default: ManualAssignmentMode,
+    ) -> ManualAssignmentMode {
+        let Some(mode) = mode else { return default };
         match mode {
             "random" => ManualAssignmentMode::Random,
             "min_load" => ManualAssignmentMode::MinLoad,
             "min_group" => ManualAssignmentMode::MinGroup,
+            "delegate" => ManualAssignmentMode::Delegate,
             other => panic!("Unknown assignment mode: {other}"),
         }
     }
@@ -1663,7 +1716,10 @@ impl CliArgs {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval,
                 max_idle_secs: self.max_idle_secs,
-                assignment_mode: Self::parse_assignment_mode(&self.assignment_mode),
+                assignment_mode: Self::parse_assignment_mode(
+                    self.assignment_mode.as_deref(),
+                    ManualAssignmentMode::Delegate,
+                ),
             })
             .retries(!self.disable_retries)
             .upstream_http2(self.upstream_http2)
@@ -1960,6 +2016,85 @@ mod tests {
 
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.stream_body_stall_timeout_secs, 300);
+    }
+
+    #[test]
+    fn routing_key_flags_flow_into_router_config() {
+        // The override enables with no other configuration; the sticky map
+        // defaults to delegate while the manual policy default stays random.
+        let cli = cli_args_from(&["--routing-key-override"]);
+        let config = cli.to_router_config(vec![], vec![]).unwrap();
+        let override_cfg = &config.routing_key_override;
+        assert!(override_cfg.enabled);
+        assert_eq!(override_cfg.assignment_mode, ManualAssignmentMode::Delegate);
+
+        // An explicit --assignment-mode overrides the sticky-map default.
+        let explicit = cli_args_from(&["--routing-key-override", "--assignment-mode", "min_load"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert_eq!(
+            explicit.routing_key_override.assignment_mode,
+            ManualAssignmentMode::MinLoad
+        );
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(!defaults.routing_key_override.enabled);
+    }
+
+    #[test]
+    fn manual_policy_assignment_default_stays_random() {
+        // One invocation, both contexts: the manual policy keeps its random
+        // default while the override sticky map defaults to delegate.
+        let config = cli_args_from(&["--policy", "manual", "--routing-key-override"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        match &config.policy {
+            PolicyConfig::Manual {
+                assignment_mode, ..
+            } => assert_eq!(*assignment_mode, ManualAssignmentMode::Random),
+            other => panic!("expected manual policy, got {other:?}"),
+        }
+        assert_eq!(
+            config.routing_key_override.assignment_mode,
+            ManualAssignmentMode::Delegate
+        );
+    }
+
+    #[test]
+    fn alias_flags_parse_identically_to_canonical() {
+        let canonical = cli_args_from(&[
+            "--policy",
+            "cache_aware",
+            "--cache-threshold",
+            "0.6",
+            "--balance-abs-threshold",
+            "8",
+            "--balance-rel-threshold",
+            "1.2",
+            "--max-idle-secs",
+            "300",
+            "--routing-key-override",
+            "--remove-unhealthy-workers",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        let aliased = cli_args_from(&[
+            "--policy",
+            "cache_aware",
+            "--cache-match-threshold",
+            "0.6",
+            "--spill-abs-threshold",
+            "8",
+            "--spill-rel-threshold",
+            "1.2",
+            "--sticky-key-idle-secs",
+            "300",
+            "--sticky-sessions",
+            "--worker-auto-recovery",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        assert_eq!(format!("{canonical:?}"), format!("{aliased:?}"));
     }
 
     /// `--health-check-port` must flow into BOTH conversion paths

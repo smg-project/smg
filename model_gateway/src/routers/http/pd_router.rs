@@ -64,6 +64,7 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     request_text: Option<String>,
     routing_tokens: Option<Vec<u32>>,
+    rid_key: Option<String>,
     model_id: &'a str,
     headers: Option<HeaderMap>,
 }
@@ -332,6 +333,7 @@ impl PDRouter {
                             .select_pd_pair(
                                 context.request_text.as_deref(),
                                 context.routing_tokens.as_deref(),
+                                context.rid_key.as_deref(),
                                 context.model_id,
                                 context.headers.as_ref(),
                             )
@@ -629,9 +631,13 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
+        let effective_key = context
+            .rid_key
+            .as_deref()
+            .or_else(|| header_utils::extract_routing_key_hint(headers));
         let load_guards = vec![
-            WorkerLoadGuard::new(prefill.clone(), headers),
-            WorkerLoadGuard::new(decode.clone(), headers),
+            WorkerLoadGuard::with_key(prefill.clone(), effective_key),
+            WorkerLoadGuard::with_key(decode.clone(), effective_key),
         ];
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
@@ -822,6 +828,7 @@ impl PDRouter {
         &self,
         request_text: Option<&str>,
         tokens: Option<&[u32]>,
+        rid_key: Option<&str>,
         model_id: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
@@ -872,6 +879,7 @@ impl PDRouter {
             &prefill_policy,
             request_text,
             tokens,
+            rid_key,
             headers,
             hash_ring.clone(),
             "prefill",
@@ -883,6 +891,7 @@ impl PDRouter {
             &decode_policy,
             request_text,
             tokens,
+            rid_key,
             headers,
             hash_ring,
             "decode",
@@ -917,6 +926,7 @@ impl PDRouter {
         policy: &Arc<dyn LoadBalancingPolicy>,
         request_text: Option<&str>,
         tokens: Option<&[u32]>,
+        rid_key: Option<&str>,
         headers: Option<&HeaderMap>,
         hash_ring: Option<Arc<HashRing>>,
         worker_type: &str,
@@ -950,6 +960,7 @@ impl PDRouter {
                     tokens,
                     headers,
                     routing_key: None,
+                    rid_key,
                     hash_ring,
                     leg,
                 },
@@ -1340,7 +1351,7 @@ impl RouterTrait for PDRouter {
 
         // Select a random worker pair using the policy
         let (prefill, decode) = match self
-            .select_pd_pair(None, None, UNKNOWN_MODEL_ID, None)
+            .select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None)
             .await
         {
             Ok(pair) => pair,
@@ -1458,6 +1469,10 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             routing_tokens,
+            rid_key: self
+                .policy_registry
+                .derive_rid_key(body.rid())
+                .map(str::to_string),
             model_id,
             headers: headers.cloned(),
         };
@@ -1491,6 +1506,10 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             routing_tokens: None,
+            rid_key: self
+                .policy_registry
+                .derive_rid_key(body.rid())
+                .map(str::to_string),
             model_id,
             headers: headers.cloned(),
         };
@@ -1527,6 +1546,10 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             routing_tokens: None,
+            rid_key: self
+                .policy_registry
+                .derive_rid_key(body.rid())
+                .map(str::to_string),
             model_id,
             headers: headers.cloned(),
         };
@@ -1555,6 +1578,10 @@ impl RouterTrait for PDRouter {
             return_logprob: false,
             request_text: req_text,
             routing_tokens: None,
+            rid_key: self
+                .policy_registry
+                .derive_rid_key(body.rid())
+                .map(str::to_string),
             model_id,
             headers: headers.cloned(),
         };
@@ -1727,7 +1754,7 @@ mod tests {
             .register_or_replace(Arc::from(decode_worker));
 
         let result = router
-            .select_pd_pair(None, None, UNKNOWN_MODEL_ID, None)
+            .select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None)
             .await;
 
         assert!(result.is_ok());
@@ -1753,14 +1780,14 @@ mod tests {
         }
 
         let (prefill, decode) = router
-            .select_pd_pair(None, None, "GLM-5.2-Coding", None)
+            .select_pd_pair(None, None, None, "GLM-5.2-Coding", None)
             .await
             .expect("alias should select a PD pair");
         assert_eq!(prefill.url(), "http://prefill");
         assert_eq!(decode.url(), "http://decode");
 
         assert!(router
-            .select_pd_pair(None, None, "GLM-5.2-Unknown", None)
+            .select_pd_pair(None, None, None, "GLM-5.2-Unknown", None)
             .await
             .is_err());
     }
@@ -1770,7 +1797,7 @@ mod tests {
         let router = create_test_pd_router();
 
         let result = router
-            .select_pd_pair(None, None, UNKNOWN_MODEL_ID, None)
+            .select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None)
             .await;
 
         assert!(result.is_err());
@@ -1831,6 +1858,7 @@ mod tests {
             return_logprob: false,
             request_text: None,
             routing_tokens: None,
+            rid_key: None,
             model_id: UNKNOWN_MODEL_ID,
             headers: None,
         };
