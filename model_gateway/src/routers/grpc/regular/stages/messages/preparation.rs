@@ -36,10 +36,10 @@ fn invalid_multimodal_request(error: impl Display) -> Response {
 
 #[async_trait]
 impl PipelineStage for MessagePreparationStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         let request = ctx.messages_request_arc();
         self.prepare_messages(ctx, &request).await?;
-        Ok(None)
+        Ok(())
     }
 
     fn name(&self) -> &'static str {

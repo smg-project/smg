@@ -1,12 +1,11 @@
 //! Tenant rate-limit reserve stage: admit or reject a logical request once,
-//! before dispatch, reusing the exact input-token count preparation just
-//! produced.
+//! at ingress, reusing the exact input-token count preparation just produced.
 //!
-//! `RetryExecutor` reruns the whole pipeline (this stage included) fresh on
-//! every retry attempt, so [`RateLimitCell`] is threaded in from the router
-//! and shared across attempts of one logical request: the first attempt to
-//! reach this stage reserves (or is denied) and caches the outcome; every
-//! later attempt sees the cached outcome and skips straight through.
+//! Ingress runs once per logical request (retries re-dispatch the retained
+//! plan without re-running this stage), so the reservation is naturally
+//! single-shot. [`RateLimitCell`] is threaded in from the router and holds
+//! the outcome for the paths that resolve it later: non-streaming settle,
+//! the streaming handoff, and the router's close-if-unsettled.
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -35,10 +34,10 @@ pub(crate) enum RateLimitOutcome {
     Denied,
 }
 
-/// Shared across every retry attempt of one logical request. `parking_lot::Mutex`
-/// (not `tokio::sync::Mutex`) is fine: `peek`/`set` never hold the lock
-/// across an `.await`, and `RetryExecutor` runs attempts strictly
-/// sequentially, so there's no real contention -- this is just correct
+/// One cell per logical request, holding the reservation outcome for every
+/// later resolver (settle, streaming handoff, close-if-unsettled).
+/// `parking_lot::Mutex` (not `tokio::sync::Mutex`) is fine: `peek`/`set`
+/// never hold the lock across an `.await` -- this is just correct
 /// check-then-act bookkeeping, not a concurrency primitive.
 ///
 /// `Drop` is the safety net for a reservation that never gets the chance to
@@ -124,22 +123,19 @@ impl RateLimitReserveStage {
 
 #[async_trait]
 impl PipelineStage for RateLimitReserveStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         let Some(manager) = &self.manager else {
-            return Ok(None);
+            return Ok(());
         };
         let Some(cell) = ctx.input.rate_limit_cell.as_ref() else {
-            return Ok(None);
+            return Ok(());
         };
 
         match cell.peek() {
-            Some(RateLimitOutcome::Admitted(_)) => Ok(None),
-            Some(RateLimitOutcome::Denied) => {
-                // Defensive: `should_retry` in router.rs stops the retry loop
-                // as soon as a Denied outcome is cached, so a second attempt
-                // should never actually reach this stage.
-                Err(rejection_response(0))
-            }
+            Some(RateLimitOutcome::Admitted(_)) => Ok(()),
+            // Defensive: ingress runs once per logical request, so a cached
+            // Denied outcome should never be seen here again.
+            Some(RateLimitOutcome::Denied) => Err(rejection_response(0)),
             None => {
                 let Some(tenant_meta) = ctx.input.tenant_request_meta.as_ref() else {
                     // No tenant identity resolved (shouldn't happen once
@@ -149,7 +145,7 @@ impl PipelineStage for RateLimitReserveStage {
                         function = "RateLimitReserveStage::execute",
                         "tenant_request_meta missing; skipping rate-limit reservation"
                     );
-                    return Ok(None);
+                    return Ok(());
                 };
                 let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
                     error!(
@@ -172,7 +168,7 @@ impl PipelineStage for RateLimitReserveStage {
                 match manager.reserve(request).await {
                     Reservation::Admitted(handle) => {
                         cell.set(RateLimitOutcome::Admitted(handle));
-                        Ok(None)
+                        Ok(())
                     }
                     Reservation::Denied { retry_after_secs } => {
                         cell.set(RateLimitOutcome::Denied);

@@ -24,7 +24,7 @@ impl EmbeddingPreparationStage {
 
 #[async_trait]
 impl PipelineStage for EmbeddingPreparationStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         // Extract text from embedding or classify request (both use same preparation)
         let text = match &ctx.input.request_type {
             RequestType::Embedding(req) => req.extract_text_for_routing(),
@@ -72,7 +72,7 @@ impl PipelineStage for EmbeddingPreparationStage {
             token_ids,
         });
 
-        Ok(None)
+        Ok(())
     }
 
     fn name(&self) -> &'static str {

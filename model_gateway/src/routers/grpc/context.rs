@@ -1,8 +1,8 @@
-//! Request context types for gRPC router pipeline
+//! Request context types for the two-phase gRPC router pipeline.
 //!
-//! This module provides the core context types that flow through the router pipeline,
-//! eliminating deep parameter passing chains and providing a single source of truth
-//! for request state.
+//! [`RequestContext`] owns the parsed request through the ingress phase;
+//! request building is its terminal consumer and [`RequestContext::into_dispatch`]
+//! yields the request-free [`DispatchContext`] the dispatch phase runs on.
 
 use std::sync::Arc;
 
@@ -19,28 +19,34 @@ use openai_protocol::{
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::debug;
+use tracing::{debug, error};
 
 use super::{
     backend_client::BackendClient,
-    common::stages::{encode::EncodeDispatchPlan, RateLimitCell},
+    common::stages::{
+        encode::EncodeDispatchPlan,
+        helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask},
+        RateLimitCell,
+    },
     multimodal::{MultimodalComponents, MultimodalIntermediate},
     proto_wrapper::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
         ProtoRequest, ProtoStream,
     },
+    spec::ResponseSpec,
     utils::ParserResolver,
 };
 use crate::{
     middleware::TenantRequestMeta,
-    worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
+    routers::error::internal_error,
+    worker::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
 };
 
-/// Main request processing context
+/// Ingress-phase request context: owns the parsed request.
 ///
-/// This is the single source of truth for all request state as it flows
-/// through the pipeline stages. Uses Rust's type system to enforce proper
-/// stage ordering at compile time.
+/// Lives from request entry through request building, which is the terminal
+/// consumer — [`RequestContext::into_dispatch`] drops the request and yields
+/// the [`DispatchContext`] the post-build phase runs on.
 pub(crate) struct RequestContext {
     pub input: RequestInput,
     pub components: Arc<SharedComponents>,
@@ -53,11 +59,13 @@ pub(crate) struct RequestInput {
     pub headers: Option<HeaderMap>,
     /// Canonical model ID used after aliases are resolved at request entry.
     pub model_id: String,
+    /// Captured at construction so it survives the request drop at build.
+    pub streaming: bool,
     pub tenant_request_meta: Option<TenantRequestMeta>,
-    /// Shared across every retry attempt of one logical request so
-    /// `RateLimitReserveStage` reserves at most once. `None` for endpoints
-    /// that haven't opted into tenant rate limiting yet (Responses,
-    /// embeddings, classify).
+    /// Holds the reservation outcome for the whole request (settle on
+    /// success, denial check, streaming handoff). `None` for endpoints that
+    /// haven't opted into tenant rate limiting yet (Responses, embeddings,
+    /// classify).
     pub rate_limit_cell: Option<Arc<RateLimitCell>>,
 }
 
@@ -76,10 +84,10 @@ pub(crate) enum RequestType {
 impl RequestType {
     /// Overwrite the request's own `model` field.
     ///
-    /// Callers hold the request behind an `Arc` that the retry loop also
-    /// holds, so `Arc::make_mut` copies the request here. That cost is paid
-    /// only on the alias path — [`RequestContext::new`] skips this call
-    /// entirely when the client already used the canonical model ID.
+    /// `Arc::make_mut` copies the request when another handle is still
+    /// alive. That cost is paid only on the alias path —
+    /// [`RequestContext::new`] skips this call entirely when the client
+    /// already used the canonical model ID.
     fn set_model(&mut self, model_id: &str) {
         fn replace(model: &mut String, model_id: &str) {
             model.clear();
@@ -152,7 +160,8 @@ pub(crate) struct SharedComponents {
     pub multimodal: Option<Arc<MultimodalComponents>>,
 }
 
-/// Mutable processing state (evolves through pipeline stages)
+/// Ingress-phase state (evolves through preparation, worker selection,
+/// client acquisition, encode, and request building).
 #[derive(Default)]
 pub(crate) struct ProcessingState {
     // Stage 1: Preparation outputs
@@ -179,20 +188,110 @@ pub(crate) struct ProcessingState {
     /// worker selection so load guards account keyed load identically.
     pub sticky_key: Option<String>,
 
+    /// Selection inputs that survive the request drop, captured by worker
+    /// selection for per-attempt re-selection in the dispatch phase.
+    pub routing_snapshot: Option<RoutingSnapshot>,
+
     // Stage 3: Client acquisition outputs
     pub clients: Option<ClientSelection>,
 
-    // Stage 4: Request building outputs
-    pub execution_plan: Option<ExecutionPlan>,
-
-    // Stage 5: Dispatch metadata
-    pub dispatch: Option<DispatchMetadata>,
-
-    // Load guard for worker load tracking (created at execution stage)
-    pub load_guards: Option<LoadGuards>,
-
-    // Stage 6: Response processing state
+    // Response processing state seeded during ingress (stop decoder, router
+    // stop obligations, derived skip_special_tokens).
     pub response: ResponseState,
+}
+
+/// Worker-selection inputs that outlive the parsed request.
+#[derive(Default)]
+pub(crate) struct RoutingSnapshot {
+    /// Captured only when a configured policy actually consumes request text.
+    pub routing_text: Option<String>,
+    /// Routing-affinity token proxy (first prompt for batched completions).
+    pub token_ids: Vec<u32>,
+    /// rid-derived sticky key, derived once at first selection.
+    pub rid_key: Option<String>,
+}
+
+/// The wire the retained plan was built for. Retry re-selection filters
+/// candidates to this (runtime, transport): the plan's proto flavor and its
+/// stop-resolution are wire-specific and cannot be rebuilt post-drop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WireConstraint {
+    pub runtime: RuntimeType,
+    pub connection: ConnectionMode,
+}
+
+impl WireConstraint {
+    fn of(workers: &WorkerSelection) -> Self {
+        match workers {
+            WorkerSelection::Single { worker } => Self {
+                runtime: worker.metadata().spec.runtime_type,
+                connection: *worker.connection_mode(),
+            },
+            // Disaggregated legs are gRPC-only.
+            WorkerSelection::Disaggregated { runtime_type, .. } => Self {
+                runtime: *runtime_type,
+                connection: ConnectionMode::Grpc,
+            },
+        }
+    }
+}
+
+/// Post-build request context.
+///
+/// Invariant, by type structure: there is no request field here, so the
+/// dispatch phase (worker re-selection, dispatch, response processing,
+/// streaming) cannot reach the parsed request — it dropped in
+/// [`RequestContext::into_dispatch`]. `ResponseSpec` is the only
+/// request-derived channel past this point.
+pub(crate) struct DispatchContext {
+    /// Canonical model ID (routing, registries).
+    pub model_id: String,
+    /// Model the response reports, captured from the request at the build
+    /// boundary.
+    pub dispatch_model: String,
+    pub streaming: bool,
+    pub headers: Option<HeaderMap>,
+    pub rate_limit_cell: Option<Arc<RateLimitCell>>,
+    pub routing: RoutingSnapshot,
+    pub wire: WireConstraint,
+    pub tokenizer: Option<Arc<dyn Tokenizer>>,
+    pub workers: Option<WorkerSelection>,
+    pub sticky_key: Option<String>,
+    pub clients: Option<ClientSelection>,
+    /// Consumed by the first dispatch; retries re-dispatch only the
+    /// prefill/decode legs against the already-running encode jobs.
+    pub encode_outputs: Option<EncodeOutputs>,
+    pub dispatch: Option<DispatchMetadata>,
+    pub load_guards: Option<LoadGuards>,
+    pub response: ResponseState,
+}
+
+impl DispatchContext {
+    /// Cached tokenizer (cheap Arc clone).
+    pub fn tokenizer_arc(&self) -> Option<Arc<dyn Tokenizer>> {
+        self.tokenizer.clone()
+    }
+}
+
+/// Everything request building hands the dispatch phase.
+pub(crate) struct BuildOutput {
+    pub plan: ExecutionPlan,
+    pub spec: ResponseSpec,
+    pub stamp: AttemptStamp,
+}
+
+/// Per-attempt plan stamping inputs, captured at build so retries reproduce
+/// exactly what a fresh build would have minted for the new attempt.
+pub(crate) struct AttemptStamp {
+    pub id: IdStamp,
+    /// Which sampling fields the client left unset; retry attempts re-apply
+    /// the newly selected worker's defaults through this mask.
+    pub sampling_mask: Option<SamplingDefaultsMask>,
+    /// Pre-default values of the masked fields, so re-application never
+    /// carries a previous attempt's worker defaults forward.
+    pub sampling_baseline: Option<SamplingBaseline>,
+    /// Mode::PrefillDecode only (mirrors the build stage's flag).
+    pub inject_pd_metadata: bool,
 }
 
 /// Per-item bootstrap rendezvous info for prefill, plus the dispatch plan that
@@ -209,7 +308,9 @@ pub(crate) struct EncodeOutputs {
     pub dispatch: EncodeDispatchPlan,
 }
 
-/// Execution shape produced by request building and consumed by request execution.
+/// Execution shape produced by request building. Retained until the retry
+/// window closes; each attempt dispatches a clone (the last moves it).
+#[derive(Clone)]
 pub(crate) enum ExecutionPlan {
     Single(ProtoRequest),
     PrefillDecode(ProtoGenerateRequest),
@@ -279,6 +380,67 @@ impl ExecutionPlan {
                 ExecutionPlanKind::PrefillDecode => "prefill_decode",
                 ExecutionPlanKind::EncodePrefillDecode => "encode_prefill_decode",
             },
+        }
+    }
+
+    /// Serialized wire size of the built request(s), for the release metric.
+    pub(crate) fn wire_len(&self) -> usize {
+        match self {
+            Self::Single(request) => request.wire_len(),
+            Self::PrefillDecode(request) | Self::EncodePrefillDecode { request } => {
+                request.wire_len()
+            }
+            Self::Batch { requests, .. } => {
+                requests.iter().map(ProtoGenerateRequest::wire_len).sum()
+            }
+        }
+    }
+
+    /// Set the engine request id on a non-batch plan. A batch plan here is a
+    /// build-stage wiring bug (its sub ids are stamped individually): fail
+    /// rather than let a retry re-dispatch the previous attempt's ids.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Response is the standard error type in the pipeline stage pattern"
+    )]
+    pub(crate) fn set_request_id(
+        &mut self,
+        request_id: String,
+    ) -> Result<(), axum::response::Response> {
+        match self {
+            Self::Single(ProtoRequest::Generate(request))
+            | Self::PrefillDecode(request)
+            | Self::EncodePrefillDecode { request } => {
+                request.set_request_id(request_id);
+                Ok(())
+            }
+            Self::Single(ProtoRequest::Embed(request)) => {
+                request.set_request_id(request_id);
+                Ok(())
+            }
+            Self::Batch { .. } => {
+                error!(
+                    function = "ExecutionPlan::set_request_id",
+                    "Single id stamp on a batch plan"
+                );
+                Err(internal_error(
+                    "id_stamp_plan_mismatch",
+                    "Id stamp does not match the plan shape",
+                ))
+            }
+        }
+    }
+
+    /// Every generate request in the plan, for per-attempt re-stamping.
+    pub(crate) fn generate_requests_mut(
+        &mut self,
+    ) -> impl Iterator<Item = &mut ProtoGenerateRequest> {
+        match self {
+            Self::Single(ProtoRequest::Generate(request))
+            | Self::PrefillDecode(request)
+            | Self::EncodePrefillDecode { request } => std::slice::from_mut(request).iter_mut(),
+            Self::Single(ProtoRequest::Embed(_)) => [].iter_mut(),
+            Self::Batch { requests, .. } => requests.iter_mut(),
         }
     }
 }
@@ -524,17 +686,111 @@ impl RequestContext {
             model_id.push_str(&canonical_model_id);
             request_type.set_model(&model_id);
         }
+        let streaming = match &request_type {
+            RequestType::Chat(req) => req.stream,
+            RequestType::Generate(req) => req.stream,
+            RequestType::Completion(req) => req.stream,
+            RequestType::Responses(req) => req.stream.unwrap_or(false),
+            RequestType::Messages(req) => req.stream.unwrap_or(false),
+            // Embeddings and classification never stream.
+            RequestType::Embedding(_) | RequestType::Classify(_) => false,
+        };
         Self {
             input: RequestInput {
                 request_type,
                 headers,
                 model_id,
+                streaming,
                 tenant_request_meta: None,
                 rate_limit_cell: None,
             },
             components,
             state: ProcessingState::default(),
         }
+    }
+
+    /// Build-boundary conversion. The parsed request is dropped inside this
+    /// function — `DispatchContext` has no field to carry it, so post-build
+    /// stages cannot read it even by mistake.
+    ///
+    /// Fails loudly when worker selection's outputs (routing snapshot, wire)
+    /// are absent: a retry context with defaulted routing inputs could
+    /// re-select a worker the retained plan cannot be dispatched to.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Response is the standard error type in the pipeline stage pattern"
+    )]
+    pub fn into_dispatch(self) -> Result<DispatchContext, axum::response::Response> {
+        let RequestContext {
+            input,
+            components,
+            state,
+        } = self;
+        let RequestInput {
+            request_type,
+            headers,
+            model_id,
+            streaming,
+            tenant_request_meta: _,
+            rate_limit_cell,
+        } = input;
+        // The model the response reports. `RequestContext::new` already
+        // canonicalized both the request's `model` field and `model_id`, so a
+        // request that arrived under an alias is answered under the canonical
+        // name. Native `/generate` callers may leave the field empty, so
+        // prefer the resolved id there.
+        let dispatch_model = match &request_type {
+            RequestType::Chat(req) => req.model.clone(),
+            RequestType::Completion(req) => req.model.clone(),
+            RequestType::Generate(_) => model_id.clone(),
+            RequestType::Responses(req) => req.model.clone(),
+            RequestType::Embedding(req) => req.model.clone(),
+            RequestType::Classify(req) => req.model.clone(),
+            RequestType::Messages(req) => req.model.clone(),
+        };
+        drop(request_type);
+        drop(components);
+        let routing = state.routing_snapshot.ok_or_else(|| {
+            error!(
+                function = "RequestContext::into_dispatch",
+                "Routing snapshot not captured by worker selection"
+            );
+            internal_error(
+                "routing_snapshot_not_captured",
+                "Routing snapshot not captured",
+            )
+        })?;
+        let wire = state
+            .workers
+            .as_ref()
+            .map(WireConstraint::of)
+            .ok_or_else(|| {
+                error!(
+                    function = "RequestContext::into_dispatch",
+                    "Worker selection not completed"
+                );
+                internal_error(
+                    "worker_selection_not_completed",
+                    "Worker selection not completed",
+                )
+            })?;
+        Ok(DispatchContext {
+            model_id,
+            dispatch_model,
+            streaming,
+            headers,
+            rate_limit_cell,
+            routing,
+            wire,
+            tokenizer: state.tokenizer,
+            workers: state.workers,
+            sticky_key: state.sticky_key,
+            clients: state.clients,
+            encode_outputs: state.encode_outputs,
+            dispatch: None,
+            load_guards: None,
+            response: state.response,
+        })
     }
 
     /// Create context for chat completion request
@@ -637,18 +893,6 @@ impl RequestContext {
         )
     }
 
-    /// Get chat request (panics if not chat)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
-    pub fn chat_request(&self) -> &ChatCompletionRequest {
-        match &self.input.request_type {
-            RequestType::Chat(req) => req.as_ref(),
-            _ => panic!("Expected chat request"),
-        }
-    }
-
     /// Get Arc clone of chat request (panics if not chat)
     #[expect(
         clippy::panic,
@@ -661,18 +905,6 @@ impl RequestContext {
         }
     }
 
-    /// Get generate request (panics if not generate)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
-    pub fn generate_request(&self) -> &GenerateRequest {
-        match &self.input.request_type {
-            RequestType::Generate(req) => req.as_ref(),
-            _ => panic!("Expected generate request"),
-        }
-    }
-
     /// Get Arc clone of generate request (panics if not generate)
     #[expect(
         clippy::panic,
@@ -682,22 +914,6 @@ impl RequestContext {
         match &self.input.request_type {
             RequestType::Generate(req) => Arc::clone(req),
             _ => panic!("Expected generate request"),
-        }
-    }
-
-    /// Get completion request (panics if not completion)
-    #[expect(
-        dead_code,
-        reason = "ref accessor provided for API completeness alongside Arc accessor"
-    )]
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
-    pub fn completion_request(&self) -> &CompletionRequest {
-        match &self.input.request_type {
-            RequestType::Completion(req) => req.as_ref(),
-            _ => panic!("Expected completion request"),
         }
     }
 
@@ -725,22 +941,6 @@ impl RequestContext {
         }
     }
 
-    /// Get messages request (panics if not messages)
-    #[expect(
-        dead_code,
-        reason = "scaffolding for Messages API pipeline, wired in follow-up PR"
-    )]
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
-    pub fn messages_request(&self) -> &CreateMessageRequest {
-        match &self.input.request_type {
-            RequestType::Messages(req) => req.as_ref(),
-            _ => panic!("Expected messages request"),
-        }
-    }
-
     /// Get Arc clone of messages request (panics if not messages)
     #[expect(
         clippy::panic,
@@ -753,17 +953,9 @@ impl RequestContext {
         }
     }
 
-    /// Check if request is streaming
+    /// Check if request is streaming (captured at construction).
     pub fn is_streaming(&self) -> bool {
-        match &self.input.request_type {
-            RequestType::Chat(req) => req.stream,
-            RequestType::Generate(req) => req.stream,
-            RequestType::Completion(req) => req.stream,
-            RequestType::Responses(req) => req.stream.unwrap_or(false),
-            RequestType::Messages(req) => req.stream.unwrap_or(false),
-            RequestType::Embedding(_) => false, // Embeddings are never streaming
-            RequestType::Classify(_) => false,  // Classification is never streaming
-        }
+        self.input.streaming
     }
 
     /// Get the cached tokenizer, cloning the Arc (cheap 8-byte clone)

@@ -13,9 +13,10 @@ use tracing::error;
 use crate::routers::{
     error,
     grpc::{
-        common::stages::{helpers, PipelineStage, RateLimitCell},
-        context::{FinalResponse, RequestContext},
+        common::stages::{helpers, ProcessStage, RateLimitCell},
+        context::{DispatchContext, FinalResponse},
         regular::{processor, streaming},
+        spec::ResponseSpec,
     },
 };
 
@@ -38,14 +39,29 @@ impl MessageResponseProcessingStage {
 }
 
 #[async_trait]
-impl PipelineStage for MessageResponseProcessingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        let is_streaming = ctx.is_streaming();
+impl ProcessStage for MessageResponseProcessingStage {
+    async fn process(
+        &self,
+        ctx: &mut DispatchContext,
+        spec: ResponseSpec,
+    ) -> Result<Option<Response>, Response> {
+        let ResponseSpec::Messages(messages_request) = spec else {
+            error!(
+                function = "MessageResponseProcessingStage::process",
+                "Wrong response spec"
+            );
+            return Err(error::internal_error(
+                "wrong_response_spec",
+                "Wrong response spec",
+            ));
+        };
+
+        let is_streaming = ctx.streaming;
 
         // Extract execution result
-        let execution_result = ctx.state.response.execution_result.take().ok_or_else(|| {
+        let execution_result = ctx.response.execution_result.take().ok_or_else(|| {
             error!(
-                function = "MessageResponseProcessingStage::execute",
+                function = "MessageResponseProcessingStage::process",
                 "No execution result"
             );
             error::internal_error("no_execution_result", "No execution result")
@@ -53,12 +69,11 @@ impl PipelineStage for MessageResponseProcessingStage {
 
         // Get dispatch metadata
         let dispatch = ctx
-            .state
             .dispatch
             .as_ref()
             .ok_or_else(|| {
                 error!(
-                    function = "MessageResponseProcessingStage::execute",
+                    function = "MessageResponseProcessingStage::process",
                     "Dispatch metadata not set"
                 );
                 error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
@@ -68,7 +83,7 @@ impl PipelineStage for MessageResponseProcessingStage {
         // Get cached tokenizer
         let tokenizer = ctx.tokenizer_arc().ok_or_else(|| {
             error!(
-                function = "MessageResponseProcessingStage::execute",
+                function = "MessageResponseProcessingStage::process",
                 "Tokenizer not cached in context"
             );
             error::internal_error(
@@ -79,14 +94,13 @@ impl PipelineStage for MessageResponseProcessingStage {
 
         if is_streaming {
             // Read derived skip_special_tokens (set in preparation, survives request_building .take())
-            let skip_special_tokens = ctx.state.response.skip_special_tokens.unwrap_or(true);
+            let skip_special_tokens = ctx.response.skip_special_tokens.unwrap_or(true);
 
             // Reserved (if tenant rate limiting is enabled): settled with real
             // usage inside the streaming processor on success, or abandoned
             // via the attached ReservationAttachment's Drop below on early
             // disconnect/error.
             let reservation = ctx
-                .input
                 .rate_limit_cell
                 .as_deref()
                 .and_then(RateLimitCell::take_for_streaming_handoff);
@@ -97,7 +111,7 @@ impl PipelineStage for MessageResponseProcessingStage {
                 .clone()
                 .process_messages_streaming_response(
                     execution_result,
-                    ctx.messages_request_arc(),
+                    messages_request,
                     dispatch,
                     tokenizer,
                     skip_special_tokens,
@@ -107,21 +121,16 @@ impl PipelineStage for MessageResponseProcessingStage {
 
             // Attach load guards (and the reservation's disconnect/error
             // safety net) for RAII lifecycle.
-            let response = helpers::attach_response_guards(
-                response,
-                ctx.state.load_guards.take(),
-                reservation,
-            );
+            let response =
+                helpers::attach_response_guards(response, ctx.load_guards.take(), reservation);
 
             return Ok(Some(response));
         }
 
         // Non-streaming: delegate to ResponseProcessor
-        let messages_request = ctx.messages_request_arc();
-
-        let stop_decoder = ctx.state.response.stop_decoder.as_mut().ok_or_else(|| {
+        let stop_decoder = ctx.response.stop_decoder.as_mut().ok_or_else(|| {
             error!(
-                function = "MessageResponseProcessingStage::execute",
+                function = "MessageResponseProcessingStage::process",
                 "Stop decoder not initialized"
             );
             error::internal_error(
@@ -142,7 +151,7 @@ impl PipelineStage for MessageResponseProcessingStage {
             .await?;
 
         // Store the final response
-        ctx.state.response.final_response = Some(FinalResponse::Messages(response));
+        ctx.response.final_response = Some(FinalResponse::Messages(response));
 
         Ok(None)
     }

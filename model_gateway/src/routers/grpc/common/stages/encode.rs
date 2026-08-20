@@ -58,7 +58,7 @@ impl EncodeStage {
 
 #[async_trait]
 impl PipelineStage for EncodeStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         if ctx
             .state
             .workers
@@ -66,11 +66,11 @@ impl PipelineStage for EncodeStage {
             .and_then(WorkerSelection::encode_assignments)
             .is_none_or(|assignments| assignments.is_empty())
         {
-            return Ok(None);
+            return Ok(());
         }
 
         let Some(intermediate) = ctx.state.multimodal_intermediate.as_ref() else {
-            return Ok(None);
+            return Ok(());
         };
 
         let plan = build_plan(
@@ -87,7 +87,7 @@ impl PipelineStage for EncodeStage {
         // request building takes the plain prefill path (with pixels) rather
         // than the pixel-drop encode path.
         if plan.is_empty() {
-            return Ok(None);
+            return Ok(());
         }
 
         let (bootstrap_info, dispatch) = plan.into_parts();
@@ -95,16 +95,11 @@ impl PipelineStage for EncodeStage {
             bootstrap_info,
             dispatch,
         });
-        Ok(None)
+        Ok(())
     }
 
     fn name(&self) -> &'static str {
         "Encode"
-    }
-
-    #[cfg(test)]
-    fn signature(&self) -> String {
-        "EncodeStage".to_string()
     }
 }
 

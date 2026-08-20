@@ -9,9 +9,10 @@ use crate::routers::{
     grpc::{
         backend_client::BackendClient,
         client::GrpcClient,
-        common::stages::{helpers, PipelineStage},
-        context::{ExecutionPlan, RequestContext, RequestType},
+        common::stages::{helpers, BuildStage},
+        context::{AttemptStamp, BuildOutput, ExecutionPlan, RequestContext, RequestType},
         proto_wrapper::ProtoEmbedRequest,
+        spec::ResponseSpec,
     },
 };
 
@@ -31,12 +32,12 @@ impl Default for EmbeddingRequestBuildingStage {
 }
 
 #[async_trait]
-impl PipelineStage for EmbeddingRequestBuildingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+impl BuildStage for EmbeddingRequestBuildingStage {
+    async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         // Preparation output should have tokenized input
         let prep_output = ctx.state.preparation.as_ref().ok_or_else(|| {
             error!(
-                function = "EmbeddingRequestBuildingStage::execute",
+                function = "EmbeddingRequestBuildingStage::build",
                 "Preparation output missing"
             );
             error::internal_error("preparation_missing", "Preparation output missing")
@@ -50,18 +51,29 @@ impl PipelineStage for EmbeddingRequestBuildingStage {
             .and_then(|c| c.single())
             .ok_or_else(|| {
                 error!(
-                    function = "EmbeddingRequestBuildingStage::execute",
+                    function = "EmbeddingRequestBuildingStage::build",
                     "Client not selected"
                 );
                 error::internal_error("client_missing", "Client not selected")
             })?;
 
         // Embeddings/classify are single-worker only (never disaggregated).
-        let prefix = match &ctx.input.request_type {
-            RequestType::Classify(_) => "classify-",
-            _ => "embed-",
+        let (prefix, spec) = match &ctx.input.request_type {
+            RequestType::Classify(_) => ("classify-", ResponseSpec::Classify),
+            RequestType::Embedding(_) => ("embed-", ResponseSpec::Embedding),
+            request_type => {
+                error!(
+                    function = "EmbeddingRequestBuildingStage::build",
+                    request_type = %request_type,
+                    "{request_type} should not reach this stage"
+                );
+                return Err(error::internal_error(
+                    "wrong_pipeline",
+                    format!("{request_type} should use its dedicated pipeline"),
+                ));
+            }
         };
-        let request_id = helpers::resolve_request_id(
+        let (request_id, id_stamp) = helpers::resolve_request_id_stamp(
             &ctx.input.request_type,
             ctx.input.tenant_request_meta.as_ref(),
             prefix,
@@ -83,7 +95,7 @@ impl PipelineStage for EmbeddingRequestBuildingStage {
             }
             BackendClient::Grpc(GrpcClient::Trtllm(_)) => {
                 error!(
-                    function = "EmbeddingRequestBuildingStage::execute",
+                    function = "EmbeddingRequestBuildingStage::build",
                     "TensorRT-LLM embedding not yet supported"
                 );
                 return Err(error::not_implemented(
@@ -93,7 +105,7 @@ impl PipelineStage for EmbeddingRequestBuildingStage {
             }
             BackendClient::Grpc(GrpcClient::Mlx(_)) => {
                 error!(
-                    function = "EmbeddingRequestBuildingStage::execute",
+                    function = "EmbeddingRequestBuildingStage::build",
                     "MLX embedding not supported"
                 );
                 return Err(error::not_implemented(
@@ -103,7 +115,7 @@ impl PipelineStage for EmbeddingRequestBuildingStage {
             }
             BackendClient::Grpc(GrpcClient::TokenSpeed(_)) => {
                 error!(
-                    function = "EmbeddingRequestBuildingStage::execute",
+                    function = "EmbeddingRequestBuildingStage::build",
                     "TokenSpeed backend does not support embeddings"
                 );
                 return Err(error::not_implemented(
@@ -119,11 +131,24 @@ impl PipelineStage for EmbeddingRequestBuildingStage {
             }
         };
 
-        ctx.state.execution_plan = Some(ExecutionPlan::embed(proto_req));
-        Ok(None)
+        Ok(BuildOutput {
+            plan: ExecutionPlan::embed(proto_req),
+            spec,
+            stamp: AttemptStamp {
+                id: id_stamp,
+                sampling_mask: None,
+                sampling_baseline: None,
+                inject_pd_metadata: false,
+            },
+        })
     }
 
     fn name(&self) -> &'static str {
         "EmbeddingRequestBuilding"
+    }
+
+    #[cfg(test)]
+    fn signature(&self) -> String {
+        "EmbeddingRequestBuildingStage".to_string()
     }
 }
