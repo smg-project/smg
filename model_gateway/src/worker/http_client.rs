@@ -166,7 +166,15 @@ mod tests {
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
     /// h2c on the same listener, mirroring a dual-protocol engine.
     async fn spawn_echo_server() -> String {
-        let app = axum::Router::new().route("/probe", axum::routing::get(|| async { "ok" }));
+        let app = axum::Router::new()
+            .route("/probe", axum::routing::get(|| async { "ok" }))
+            .route(
+                "/hang",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    "late"
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind echo server");
@@ -281,14 +289,20 @@ mod tests {
     async fn per_request_timeout_overrides_client_default() {
         let url = spawn_echo_server().await;
         // A zero client-level total timeout fails every request that relies
-        // on the client default...
+        // on the client default. Aim it at the hanging route: a fast local
+        // response can otherwise win the race against a zero-duration timer.
+        let hang_url = url.replace("/probe", "/hang");
         let client = cache(RouterConfig {
             request_timeout_secs: 0,
             ..RouterConfig::default()
         })
         .get(&HttpPoolConfig::default())
         .expect("client");
-        let err = client.get(&url).send().await.expect_err("default applies");
+        let err = client
+            .get(&hang_url)
+            .send()
+            .await
+            .expect_err("default applies");
         assert!(err.is_timeout());
         // ...while a per-request timeout replaces it entirely.
         let resp = client
