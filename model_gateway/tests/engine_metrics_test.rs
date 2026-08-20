@@ -41,6 +41,7 @@ async fn engine_pd_gauge_appears_on_metrics_endpoint() {
             decode_queue_reqs: Some(2),
             ..Default::default()
         }],
+        ..Default::default()
     };
     Metrics::record_engine_load("grpc://prefill-0:30000", "test-model", &response);
 

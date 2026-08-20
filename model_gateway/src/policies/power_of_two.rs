@@ -108,6 +108,7 @@ mod tests {
                 gen_throughput,
                 ..Default::default()
             }],
+            ..Default::default()
         }
     }
 
