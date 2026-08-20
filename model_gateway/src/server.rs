@@ -1131,7 +1131,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     }
 
     let weak_context = Arc::downgrade(&app_context);
-    let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);
+    let worker_job_queue = JobQueue::new(
+        JobQueueConfig {
+            queue_capacity: config.router_config.job_queue_capacity,
+            max_concurrent_jobs: config.router_config.job_queue_concurrency,
+        },
+        weak_context,
+    );
     #[expect(
         clippy::expect_used,
         reason = "OnceLock initialization during startup; double-init is a fatal bug"

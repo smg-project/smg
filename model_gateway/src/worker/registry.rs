@@ -1442,16 +1442,26 @@ impl WorkerRegistry {
         Some(worker_id)
     }
 
-    /// Rebuild the hash ring for a model based on current workers in the model index.
+    /// Reconcile the hash ring for a model to the current model index.
+    ///
+    /// Diffs against the cached ring so only changed URLs are rehashed: a
+    /// full rebuild is O(workers) hashing plus a sort on every mutation,
+    /// which at fleet scale turns a registration wave quadratic and
+    /// saturates the runtime.
     fn rebuild_hash_ring(&self, model_id: &str) {
-        let ring = self
-            .model_index
-            .get(model_id)
-            .map(|workers| Arc::new(HashRing::new(workers.value().iter().map(|w| w.url()))));
+        // Clone the copy-on-write slice out so the ring build never runs
+        // under the index shard guard.
+        let workers = self.model_index.get(model_id).map(|entry| entry.clone());
 
-        match ring {
-            Some(ring) => {
-                self.hash_rings.insert(model_id.to_string(), ring);
+        match workers {
+            Some(workers) => {
+                let previous = self.hash_rings.get(model_id).map(|ring| Arc::clone(&ring));
+                let urls = workers.iter().map(|w| w.url());
+                let ring = match previous {
+                    Some(previous) => previous.updated(urls),
+                    None => HashRing::new(urls),
+                };
+                self.hash_rings.insert(model_id.to_string(), Arc::new(ring));
             }
             None => {
                 // No workers for this model, remove the ring
@@ -1494,8 +1504,16 @@ impl WorkerRegistry {
                 for entry in self.model_index.iter() {
                     urls.extend(entry.value().iter().map(|w| w.url().to_string()));
                 }
+                let previous = self
+                    .hash_rings
+                    .get(UNKNOWN_MODEL_ID)
+                    .map(|ring| Arc::clone(&ring));
+                let ring = match previous {
+                    Some(previous) => previous.updated(&urls),
+                    None => HashRing::new(&urls),
+                };
                 self.hash_rings
-                    .insert(UNKNOWN_MODEL_ID.to_string(), Arc::new(HashRing::new(urls)));
+                    .insert(UNKNOWN_MODEL_ID.to_string(), Arc::new(ring));
             }
         }
     }

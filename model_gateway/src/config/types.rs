@@ -84,6 +84,13 @@ pub struct RouterConfig {
     #[serde(default)]
     pub worker_startup_delay_secs: u64,
     pub worker_startup_check_interval_secs: u64,
+    /// Control-plane job queue: max pending jobs. Size to fleet scale so a
+    /// discovery reconcile pass can enqueue every worker without blocking.
+    #[serde(default = "default_job_queue_capacity")]
+    pub job_queue_capacity: usize,
+    /// Control-plane job queue: max jobs dispatched concurrently.
+    #[serde(default = "default_job_queue_concurrency")]
+    pub job_queue_concurrency: usize,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
     /// TTL in seconds for entries in the event-driven cache-aware positional
@@ -289,6 +296,14 @@ pub struct TokenizerCacheConfig {
 
 fn default_load_monitor_interval_secs() -> u64 {
     10
+}
+
+fn default_job_queue_capacity() -> usize {
+    1000
+}
+
+fn default_job_queue_concurrency() -> usize {
+    200
 }
 
 fn default_enable_l0() -> bool {
@@ -1001,6 +1016,8 @@ impl Default for RouterConfig {
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_delay_secs: 0,
             worker_startup_check_interval_secs: 30,
+            job_queue_capacity: default_job_queue_capacity(),
+            job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
             kv_indexer_ttl_secs: None,
             kv_indexer_max_entries: None,
@@ -1260,6 +1277,44 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.stream_request_bodies_over, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_job_queue_sizing_serde_default_and_roundtrip() {
+        // Config files predating the fields deserialize to today's values.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("job_queue_capacity").unwrap();
+        obj.remove("job_queue_concurrency").unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.job_queue_capacity, 1000);
+        assert_eq!(without.job_queue_concurrency, 200);
+
+        // When set, the values round-trip.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .job_queue_capacity(20_000)
+            .job_queue_concurrency(500)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.job_queue_capacity, 20_000);
+        assert_eq!(with.job_queue_concurrency, 500);
+    }
+
+    #[test]
+    fn test_job_queue_sizing_rejects_zero() {
+        // Config-file values bypass the CLI parsers, so validation is the
+        // backstop against a zero-capacity channel panic at startup and
+        // mirrors the CLI upper bounds.
+        for (capacity, concurrency) in [(0, 200), (1000, 0), (1_000_001, 200), (1000, 100_001)] {
+            let config = RouterConfig::builder()
+                .regular_mode(vec![])
+                .job_queue_capacity(capacity)
+                .job_queue_concurrency(concurrency)
+                .build_unchecked();
+            assert!(config.validate().is_err());
+        }
     }
 
     #[test]

@@ -172,6 +172,22 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     }
 }
 
+fn parse_usize_in_range(value: &str, max: usize) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(n) if (1..=max).contains(&n) => Ok(n),
+        Ok(n) => Err(format!("invalid value '{n}'; expected 1..={max}")),
+        Err(err) => Err(format!("invalid value '{value}': {err}")),
+    }
+}
+
+fn parse_job_queue_capacity(value: &str) -> Result<usize, String> {
+    parse_usize_in_range(value, 1_000_000)
+}
+
+fn parse_job_queue_concurrency(value: &str) -> Result<usize, String> {
+    parse_usize_in_range(value, 100_000)
+}
+
 #[derive(Parser, Debug)]
 struct CliArgs {
     // ==================== Worker Configuration ====================
@@ -419,6 +435,16 @@ struct CliArgs {
     /// Interval in seconds between worker startup checks
     #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
     worker_startup_check_interval: u64,
+
+    /// Max pending control-plane jobs (worker add/remove, tokenizer, MCP,
+    /// WASM). Size to fleet scale so a service-discovery reconcile pass can
+    /// enqueue every worker without blocking.
+    #[arg(long, default_value_t = 1000, value_parser = parse_job_queue_capacity, help_heading = "Worker Configuration")]
+    job_queue_capacity: usize,
+
+    /// Max control-plane jobs dispatched concurrently
+    #[arg(long, default_value_t = 200, value_parser = parse_job_queue_concurrency, help_heading = "Worker Configuration")]
+    job_queue_concurrency: usize,
 
     /// DP engines per startup ZMQ worker: each ipc:// worker becomes a grouped
     /// worker whose handshake awaits this many engines on one socket set.
@@ -1686,6 +1712,8 @@ impl CliArgs {
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
+            .job_queue_capacity(self.job_queue_capacity)
+            .job_queue_concurrency(self.job_queue_concurrency)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
             .kv_indexer_max_entries(self.kv_indexer_max_entries)
@@ -2054,6 +2082,48 @@ mod tests {
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.kv_indexer_ttl_secs, None);
         assert_eq!(defaults.kv_indexer_max_entries, None);
+    }
+
+    /// Job queue sizing must flow through both conversion paths: into
+    /// `RouterConfig` and through the `RouterConfig` carried by
+    /// `ServerConfig`, which is what constructs the queue at startup.
+    #[test]
+    fn job_queue_flags_flow_into_both_config_paths() {
+        let cli = cli_args_from(&[
+            "--job-queue-capacity",
+            "20000",
+            "--job-queue-concurrency",
+            "500",
+        ]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.job_queue_capacity, 20_000);
+        assert_eq!(router_config.job_queue_concurrency, 500);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.job_queue_capacity, 20_000);
+        assert_eq!(server_config.router_config.job_queue_concurrency, 500);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.job_queue_capacity, 1000);
+        assert_eq!(defaults.job_queue_concurrency, 200);
+    }
+
+    /// A zero-capacity channel panics at construction and a zero-permit
+    /// dispatcher never dequeues; both bounds are enforced at parse time.
+    #[test]
+    fn job_queue_flags_reject_out_of_range_values() {
+        for (flag, bad) in [
+            ("--job-queue-capacity", "0"),
+            ("--job-queue-capacity", "1000001"),
+            ("--job-queue-concurrency", "0"),
+            ("--job-queue-concurrency", "100001"),
+        ] {
+            let argv = ["smg", flag, bad];
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "{flag} {bad} should be rejected"
+            );
+        }
     }
 
     /// The streamed-body stall timeout is a router-only setting and must

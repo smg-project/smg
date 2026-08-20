@@ -1308,6 +1308,8 @@ class TestRouterArgsFieldOrder:
         "cache_boundaries",
         "cache_index",
         "cache_ttl_secs",
+        "job_queue_capacity",
+        "job_queue_concurrency",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

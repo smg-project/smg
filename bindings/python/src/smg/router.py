@@ -162,6 +162,12 @@ class Router:
             every worker_startup_check_interval. Default: 0
         worker_startup_check_interval: Interval in seconds between checks for worker
             initialization. Default: 30
+        job_queue_capacity: Max pending control-plane jobs (worker add/remove,
+            tokenizer, MCP, WASM). Size to fleet scale so a service-discovery
+            reconcile pass can enqueue every worker without blocking.
+            Default: 1000
+        job_queue_concurrency: Max control-plane jobs dispatched concurrently.
+            Default: 200
         cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to
             cached worker if the match rate exceeds threshold, otherwise routes to the
             worker with the smallest tree. Default: 0.5

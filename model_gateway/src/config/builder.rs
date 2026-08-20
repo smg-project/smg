@@ -248,6 +248,16 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn job_queue_capacity(mut self, capacity: usize) -> Self {
+        self.config.job_queue_capacity = capacity;
+        self
+    }
+
+    pub fn job_queue_concurrency(mut self, concurrency: usize) -> Self {
+        self.config.job_queue_concurrency = concurrency;
+        self
+    }
+
     pub fn load_monitor_interval_secs(mut self, interval: u64) -> Self {
         self.config.load_monitor_interval_secs = interval;
         self

@@ -232,6 +232,9 @@ class RouterArgs:
     cache_index: str = "tree"
     # Seconds a cache-affinity placement stays routable
     cache_ttl_secs: int = 180
+    # Control-plane job queue sizing (worker registration/removal jobs)
+    job_queue_capacity: int = 1000
+    job_queue_concurrency: int = 200
 
     @staticmethod
     def add_cli_args(
@@ -762,6 +765,22 @@ class RouterArgs:
             type=int,
             default=RouterArgs.worker_startup_check_interval,
             help="Interval in seconds between checks for worker startup",
+        )
+        parser.add_argument(
+            f"--{prefix}job-queue-capacity",
+            type=int,
+            default=RouterArgs.job_queue_capacity,
+            help=(
+                "Max pending control-plane jobs (worker add/remove, tokenizer, MCP, WASM)."
+                " Size to fleet scale so a service-discovery reconcile pass can enqueue"
+                " every worker without blocking (default: 1000)"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}job-queue-concurrency",
+            type=int,
+            default=RouterArgs.job_queue_concurrency,
+            help="Max control-plane jobs dispatched concurrently (default: 200)",
         )
 
         # Load monitoring

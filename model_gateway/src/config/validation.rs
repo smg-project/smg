@@ -729,6 +729,27 @@ impl ConfigValidator {
             });
         }
 
+        // A zero-capacity job channel panics at construction and a
+        // zero-permit dispatcher never dequeues; reject both here so a
+        // config-file value fails as early as the CLI parsers do.
+        // Mirror the CLI parser bounds so config-file and bindings paths get
+        // the same guarantees (zero panics at channel construction; unbounded
+        // values are allocation hazards).
+        if !(1..=1_000_000).contains(&config.job_queue_capacity) {
+            return Err(ConfigError::InvalidValue {
+                field: "job_queue_capacity".to_string(),
+                value: config.job_queue_capacity.to_string(),
+                reason: "Must be in 1..=1000000".to_string(),
+            });
+        }
+        if !(1..=100_000).contains(&config.job_queue_concurrency) {
+            return Err(ConfigError::InvalidValue {
+                field: "job_queue_concurrency".to_string(),
+                value: config.job_queue_concurrency.to_string(),
+                reason: "Must be in 1..=100000".to_string(),
+            });
+        }
+
         // The body-limit layer rejects payloads above max_payload_size before
         // the streaming threshold is consulted, so a threshold at or above it
         // could never activate.
