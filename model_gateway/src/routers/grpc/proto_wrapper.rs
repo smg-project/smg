@@ -1296,9 +1296,45 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Clone the inner request (for passing to generate())
-    pub fn clone_inner(&self) -> Self {
-        self.clone()
+    /// Clone for a PD leg that carries no multimodal pixels (see
+    /// `clear_mm_pixel_values`), without ever duplicating them: detach,
+    /// clone, reattach to `self`.
+    pub fn clone_without_mm_pixels(&mut self) -> Self {
+        match self {
+            Self::Sglang(req) => {
+                let mm = req.mm_inputs.take();
+                let clone = Self::Sglang(req.clone());
+                req.mm_inputs = mm;
+                clone
+            }
+            Self::Vllm(req) => {
+                let mm = req.mm_inputs.take();
+                let clone = Self::Vllm(req.clone());
+                req.mm_inputs = mm;
+                clone
+            }
+            Self::TokenSpeed(req) => {
+                let detached: Vec<_> = req
+                    .mm_inputs
+                    .as_mut()
+                    .map(|mm| {
+                        mm.items
+                            .iter_mut()
+                            .map(|item| item.encoder_input.take())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let clone = Self::TokenSpeed(req.clone());
+                if let Some(mm) = req.mm_inputs.as_mut() {
+                    for (item, encoder_input) in mm.items.iter_mut().zip(detached) {
+                        item.encoder_input = encoder_input;
+                    }
+                }
+                clone
+            }
+            Self::Trtllm(req) => Self::Trtllm(req.clone()),
+            Self::Mlx(req) => Self::Mlx(req.clone()),
+        }
     }
 
     /// Drop raw multimodal encoder tensors while keeping item metadata.

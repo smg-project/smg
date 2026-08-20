@@ -478,14 +478,14 @@ impl RequestExecutionStage {
             )
         })?;
 
-        let mut prefill_request = proto_request.clone_inner();
         // Decode consumes the KV handoff from prefill, but TokenSpeed still
         // needs multimodal metadata to pad placeholders and compute MRoPE in
         // the same way as prefill. Drop raw pixels and prefill-only encode
-        // rooms, but keep the per-item metadata.
-        let mut decode_request = proto_request;
+        // rooms, but keep the per-item metadata. The pixel-free leg is the
+        // clone, so pixel tensors are never duplicated.
+        let mut prefill_request = proto_request;
+        let mut decode_request = prefill_request.clone_without_mm_pixels();
         decode_request.clear_encode_bootstrap_info();
-        decode_request.clear_mm_pixel_values();
         if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
             prefill_request.set_data_parallel_rank(rank as i32);
         }
@@ -566,7 +566,7 @@ impl RequestExecutionStage {
     /// then relays the kv_transfer_params returned by the prefill engine to decode.
     async fn execute_sequential_pd(
         &self,
-        proto_request: ProtoGenerateRequest,
+        mut proto_request: ProtoGenerateRequest,
         clients: &mut ClientSelection,
         workers: &WorkerSelection,
         model: &str,
@@ -651,8 +651,15 @@ impl RequestExecutionStage {
             _ => None,
         };
 
-        // Clone request and sanitize sampling (max_tokens=1, n=1), stream=false for prefill
-        let mut prefill_request = proto_request.clone_inner();
+        // Decode reuses the request minus pixels: it receives KV via the P/D
+        // transfer, and prefill reads and unlinks any /dev/shm segments, so a
+        // reused ShmHandle would be unreadable. Same request_id on both legs
+        // is load-bearing for NIXL P/D correlation on vLLM < 0.13. The
+        // pixel-free leg is the clone, so pixel tensors are never duplicated
+        // and die with the prefill send.
+        let mut decode_request = proto_request.clone_without_mm_pixels();
+        // Sanitize prefill sampling (max_tokens=1, n=1), stream=false.
+        let mut prefill_request = proto_request;
         prefill_request.sanitize_sampling_for_prefill(1);
         prefill_request.set_stream(false);
         if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
@@ -731,14 +738,6 @@ impl RequestExecutionStage {
 
         debug!("vLLM PD: prefill completed, sending decode request");
 
-        // Decode reuses proto_request as-is; same request_id as the prefill leg is
-        // load-bearing for NIXL P/D correlation on vLLM < 0.13
-        let mut decode_request = proto_request;
-        // Decode doesn't run the vision encoder (it receives KV via the P/D
-        // transfer), so drop the multimodal inputs — mirrors the parallel PD
-        // path. Load-bearing for SHM: prefill already read and unlinked the
-        // /dev/shm segments, so a reused ShmHandle here would be unreadable.
-        decode_request.clear_mm_pixel_values();
         if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
             decode_request.set_data_parallel_rank(rank as i32);
         }
@@ -844,7 +843,7 @@ impl RequestExecutionStage {
 mod tests {
     use std::sync::Arc;
 
-    use smg_grpc_client::vllm_proto as vllm;
+    use smg_grpc_client::{tokenspeed_proto as ts, vllm_proto as vllm};
 
     use super::*;
     use crate::worker::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerType};
@@ -973,6 +972,63 @@ mod tests {
         assert_eq!(value["do_remote_decode"], true);
         assert_eq!(value["do_remote_prefill"], false);
         assert_eq!(value.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn clone_without_mm_pixels_keeps_pixels_on_the_original_only() {
+        let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: "pd-1".to_string(),
+            mm_inputs: Some(vllm::MultimodalInputs::default()),
+            ..Default::default()
+        }));
+        let clone = request.clone_without_mm_pixels();
+        let ProtoGenerateRequest::Vllm(original) = request else {
+            panic!("expected vLLM request");
+        };
+        let ProtoGenerateRequest::Vllm(decode) = clone else {
+            panic!("expected vLLM clone");
+        };
+        assert!(original.mm_inputs.is_some(), "prefill leg keeps pixels");
+        assert!(
+            decode.mm_inputs.is_none(),
+            "decode leg never carries pixels"
+        );
+        assert_eq!(decode.request_id, "pd-1");
+    }
+
+    #[test]
+    fn clone_without_mm_pixels_keeps_tokenspeed_item_metadata() {
+        let item = ts::MultimodalItem {
+            encoder_input: Some(ts::TensorData::default()),
+            placeholder_token_id: Some(7),
+            ..Default::default()
+        };
+        let mut request = ProtoGenerateRequest::TokenSpeed(Box::new(ts::GenerateRequest {
+            mm_inputs: Some(ts::MultimodalInputs { items: vec![item] }),
+            ..Default::default()
+        }));
+        let clone = request.clone_without_mm_pixels();
+        let ProtoGenerateRequest::TokenSpeed(original) = request else {
+            panic!("expected TokenSpeed request");
+        };
+        let ProtoGenerateRequest::TokenSpeed(decode) = clone else {
+            panic!("expected TokenSpeed clone");
+        };
+        let original_item = &original.mm_inputs.as_ref().unwrap().items[0];
+        assert!(
+            original_item.encoder_input.is_some(),
+            "prefill leg keeps encoder input"
+        );
+        let decode_item = &decode.mm_inputs.as_ref().unwrap().items[0];
+        assert!(
+            decode_item.encoder_input.is_none(),
+            "decode leg drops encoder input"
+        );
+        assert_eq!(
+            decode_item.placeholder_token_id,
+            Some(7),
+            "decode leg keeps per-item metadata"
+        );
     }
 
     #[test]
