@@ -217,6 +217,7 @@ class RouterArgs:
     least_load_max_waiting_requests: int = 0
     stream_request_bodies_over: int = 0
     stream_body_stall_timeout_secs: int = 300
+    routing_token_boundaries: list[int] = dataclasses.field(default_factory=list)
     # Ordered header names checked for the routing key; first valid wins
     routing_key_headers: list[str] = dataclasses.field(
         default_factory=lambda: ["x-smg-routing-key"]
@@ -628,6 +629,21 @@ class RouterArgs:
                 " pauses while the worker applies backpressure, so a slow"
                 " worker read never trips it. Applies only to bodies streamed"
                 " via --stream-request-bodies-over. 0 disables"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}routing-token-boundaries",
+            type=int,
+            nargs="*",
+            action="extend",
+            # None (not []) so an unset prefixed variant falls back to the
+            # unprefixed backend value in from_cli_args.
+            default=None,
+            help=(
+                "Token ids that end the routing-relevant prefix. Routing"
+                " tokens are truncated at the first occurrence of any listed"
+                " id before worker selection (e.g. multimodal placeholder"
+                " ids). Empty disables truncation"
             ),
         )
         routing_group.add_argument(

@@ -1289,6 +1289,15 @@ impl Metrics {
         .set(count as f64);
     }
 
+    /// Record a routing-token truncation at a configured boundary id
+    pub fn record_routing_tokens_truncated(router_type: &'static str) {
+        counter!(
+            "smg_routing_tokens_truncated_total",
+            "router_type" => router_type
+        )
+        .increment(1);
+    }
+
     /// Record health check result
     pub fn record_worker_health_check(worker_type: &'static str, result: &'static str) {
         counter!(

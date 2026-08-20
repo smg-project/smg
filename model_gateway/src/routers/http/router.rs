@@ -59,6 +59,7 @@ use crate::{
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
             retry::{is_retryable_status, RetryExecutor},
+            routing_tokens,
             sse::SSE_CHANNEL_BUFFER,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
@@ -95,6 +96,8 @@ pub struct Router {
     /// Streamed-body stall watchdog: abort a dispatch once a single client
     /// wait lasts this long. `None` disables.
     stream_stall_timeout: Option<Duration>,
+    /// Token ids that end the routing-relevant prefix; empty disables.
+    routing_token_boundaries: Vec<u32>,
     realtime_registry: Arc<RealtimeRegistry>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
@@ -163,6 +166,7 @@ impl Router {
                 0 => None,
                 secs => Some(Duration::from_secs(secs)),
             },
+            routing_token_boundaries: ctx.router_config.routing_token_boundaries.clone(),
             realtime_registry: ctx.realtime_registry.clone(),
             webrtc_bind_addr: ctx.webrtc_bind_addr,
             webrtc_stun_server: ctx.webrtc_stun_server.clone(),
@@ -218,6 +222,18 @@ impl Router {
             }
             Err(e) => error::service_unavailable("no_workers", e),
         }
+    }
+
+    /// A boundary in first position yields an empty prefix: match rate 0,
+    /// min-load, and no full-text fallback into the string tree.
+    fn truncate_routing_tokens(&self, tokens: Option<Vec<u32>>) -> Option<Vec<u32>> {
+        tokens.map(|t| {
+            routing_tokens::truncate_owned(
+                t,
+                &self.routing_token_boundaries,
+                metrics_labels::ROUTER_HTTP,
+            )
+        })
     }
 
     /// Select worker considering circuit breaker state.
@@ -360,12 +376,13 @@ impl Router {
         // Pre-tokenized requests route on the token tree; the decimal-string
         // rendering is only materialized when there are no tokens. A valid
         // x-smg-routing-tokens hint wins over body-derived tokens/text.
-        let routing_tokens: Option<Vec<u32>> = header_utils::parse_routing_tokens_hint(headers)
-            .or_else(|| {
+        let routing_tokens: Option<Vec<u32>> = self.truncate_routing_tokens(
+            header_utils::parse_routing_tokens_hint(headers).or_else(|| {
                 typed_req
                     .routing_tokens()
                     .map(|ids| ids.iter().map(|&id| id as u32).collect())
-            });
+            }),
+        );
         let text = routing_tokens
             .is_none()
             .then(|| typed_req.extract_text_for_routing());
@@ -681,7 +698,8 @@ impl Router {
         let start = Instant::now();
         let is_stream = body.is_stream();
         // A valid x-smg-routing-tokens hint wins over body-derived text.
-        let hinted_tokens = header_utils::parse_routing_tokens_hint(headers);
+        let hinted_tokens =
+            self.truncate_routing_tokens(header_utils::parse_routing_tokens_hint(headers));
         let text = hinted_tokens
             .is_none()
             .then(|| body.extract_text_for_routing());
@@ -1587,7 +1605,14 @@ impl Router {
         // would have received there (text is never extracted alongside it).
         // Streamed requests have no readable body, hence no rid key; the
         // sticky override keys them by the header alone.
-        let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
+        let hinted_tokens = self
+            .truncate_routing_tokens(header_utils::parse_routing_tokens_hint(Some(req.headers())));
+        // The stream was admitted on the hint's strength; a boundary-emptied
+        // hint leaves no shareable prefix, so route it buffered instead of
+        // content-blind.
+        if hinted_tokens.as_deref() == Some(&[]) {
+            return Err(req);
+        }
         let Some(worker) = self.select_worker_for_model(
             model_id,
             None,
@@ -2144,6 +2169,7 @@ mod tests {
             retry_config: RetryConfig::default(),
             max_payload_size: 536_870_912,
             stream_stall_timeout: Some(Duration::from_secs(60)),
+            routing_token_boundaries: Vec::new(),
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
@@ -2155,6 +2181,192 @@ mod tests {
         let workers = router.worker_registry.get_all();
         workers[0].set_status(openai_protocol::worker::WorkerStatus::NotReady);
         router
+    }
+
+    fn cache_aware_router(boundaries: Vec<u32>) -> Router {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 1_000,
+            balance_rel_threshold: 1_000.0,
+            eviction_interval_secs: 3_600,
+            max_tree_size: 1 << 24,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+        }));
+        for url in ["http://worker1:8080", "http://worker2:8080"] {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build();
+            worker_registry.register_or_replace(Arc::new(worker));
+        }
+        policy_registry.on_worker_added(crate::worker::UNKNOWN_MODEL_ID, None);
+        policy_registry
+            .init_cache_aware_policy(crate::worker::UNKNOWN_MODEL_ID, &worker_registry.get_all());
+        Router {
+            worker_registry,
+            policy_registry,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            max_payload_size: 536_870_912,
+            stream_stall_timeout: None,
+            routing_token_boundaries: boundaries,
+            realtime_registry: Arc::new(RealtimeRegistry::new()),
+            webrtc_bind_addr: None,
+            webrtc_stun_server: None,
+        }
+    }
+
+    const BOUNDARY: u32 = 900;
+
+    /// 64-token conversation prefix (four full 16-token pages), then the
+    /// boundary, then per-request media/generation tail.
+    fn conversation_body(prefix_seed: u32, tail_seed: u32, tail_len: u32) -> Vec<u32> {
+        let mut t: Vec<u32> = (prefix_seed..prefix_seed + 64).collect();
+        t.push(BOUNDARY);
+        t.extend(tail_seed..tail_seed + tail_len);
+        t
+    }
+
+    #[test]
+    fn truncate_cuts_at_first_boundary_only() {
+        let mut router = create_test_regular_router();
+        router.routing_token_boundaries = vec![BOUNDARY, 901];
+
+        let cut = router
+            .truncate_routing_tokens(Some(vec![1, 2, 3, BOUNDARY, 4, 901, 5]))
+            .unwrap();
+        assert_eq!(cut, vec![1, 2, 3]);
+
+        let untouched = router.truncate_routing_tokens(Some(vec![1, 2, 3])).unwrap();
+        assert_eq!(untouched, vec![1, 2, 3]);
+
+        assert_eq!(
+            router.truncate_routing_tokens(Some(vec![BOUNDARY, 1])),
+            Some(Vec::new())
+        );
+        assert_eq!(router.truncate_routing_tokens(None), None);
+    }
+
+    #[test]
+    fn no_boundary_config_is_identity() {
+        let router = create_test_regular_router();
+        let tokens = vec![1, BOUNDARY, 2];
+        assert_eq!(
+            router
+                .truncate_routing_tokens(Some(tokens.clone()))
+                .unwrap(),
+            tokens
+        );
+    }
+
+    /// A follow-up replaying its conversation prefix plus a long tail pins to
+    /// the engine that served the first turn: truncation makes the match
+    /// ratio length-invariant (~1.0 instead of prefix/full ≈ 0.3).
+    #[tokio::test]
+    async fn follow_up_pins_to_first_turn_worker_with_boundaries() {
+        let router = cache_aware_router(vec![BOUNDARY]);
+
+        let turn1 = router
+            .truncate_routing_tokens(Some(conversation_body(1, 5_000, 32)))
+            .unwrap();
+        let first = router
+            .select_worker_for_model(
+                crate::worker::UNKNOWN_MODEL_ID,
+                None,
+                Some(&turn1),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let turn2 = router
+            .truncate_routing_tokens(Some(conversation_body(1, 7_000, 200)))
+            .unwrap();
+        assert_eq!(turn2, turn1);
+        for _ in 0..4 {
+            let follow_up = router
+                .select_worker_for_model(
+                    crate::worker::UNKNOWN_MODEL_ID,
+                    None,
+                    Some(&turn2),
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(first.url(), follow_up.url());
+        }
+    }
+
+    /// Without truncation the same follow-up scores prefix/full below the
+    /// threshold and lands on the least-loaded (other) worker.
+    #[tokio::test]
+    async fn follow_up_misses_first_turn_worker_without_boundaries() {
+        let router = cache_aware_router(Vec::new());
+
+        let turn1 = conversation_body(1, 5_000, 32);
+        let first = router
+            .select_worker_for_model(
+                crate::worker::UNKNOWN_MODEL_ID,
+                None,
+                Some(&turn1),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let mut turn2 = turn1.clone();
+        turn2.extend(7_000..7_200);
+        let second = router
+            .select_worker_for_model(
+                crate::worker::UNKNOWN_MODEL_ID,
+                None,
+                Some(&turn2),
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_ne!(first.url(), second.url());
+    }
+
+    /// Distinct conversations share no pre-boundary prefix and must not pin
+    /// to each other.
+    #[tokio::test]
+    async fn different_conversations_do_not_pin_with_boundaries() {
+        let router = cache_aware_router(vec![BOUNDARY]);
+
+        let conv_a = router
+            .truncate_routing_tokens(Some(conversation_body(1, 5_000, 32)))
+            .unwrap();
+        let first = router
+            .select_worker_for_model(
+                crate::worker::UNKNOWN_MODEL_ID,
+                None,
+                Some(&conv_a),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let conv_b = router
+            .truncate_routing_tokens(Some(conversation_body(3_000, 5_000, 32)))
+            .unwrap();
+        let second = router
+            .select_worker_for_model(
+                crate::worker::UNKNOWN_MODEL_ID,
+                None,
+                Some(&conv_b),
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_ne!(first.url(), second.url());
     }
 
     #[test]
@@ -2370,6 +2582,7 @@ mod tests {
             retry_config: RetryConfig::default(),
             max_payload_size,
             stream_stall_timeout: Some(Duration::from_secs(60)),
+            routing_token_boundaries: Vec::new(),
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
@@ -2707,6 +2920,79 @@ mod tests {
         )
         .await;
         assert_eq!(first, second, "same hint must stick to the tree tenant");
+    }
+
+    #[tokio::test]
+    async fn boundary_emptied_hint_falls_back_to_buffered() {
+        let mut router = streaming_router(
+            cache_aware_policy(),
+            1024 * 1024,
+            vec![plain_worker("http://worker1:8080")],
+        );
+        router.routing_token_boundaries = vec![BOUNDARY];
+
+        let req = with_header(
+            streamed_request(&[b"{\"text\":\"hello\"}"]),
+            "x-smg-routing-tokens",
+            "900,1,2",
+        );
+        let req = router
+            .route_streaming_request(req, "/generate")
+            .await
+            .unwrap_err();
+        let body = to_bytes(req.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"{\"text\":\"hello\"}");
+    }
+
+    #[tokio::test]
+    async fn boundary_truncated_hint_streams_with_prefix_affinity() {
+        let (url_a, _cap_a) = spawn_capture_stub("application/json", "{}").await;
+        let (url_b, _cap_b) = spawn_capture_stub("application/json", "{}").await;
+        let mut router = streaming_router(
+            cache_aware_policy(),
+            1024 * 1024,
+            vec![plain_worker(&url_a), plain_worker(&url_b)],
+        );
+        router.routing_token_boundaries = vec![BOUNDARY];
+        let workers = router.worker_registry.get_all();
+        router
+            .policy_registry
+            .get_default_policy()
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .unwrap()
+            .init_workers(&workers);
+
+        // Same 32-token prefix, boundary, then divergent tails: only the
+        // truncated prefix can pin the second request (untruncated ratio is
+        // 32/65 < threshold).
+        let hint = |tail_seed: u32| -> String {
+            (1..=32u32)
+                .chain(std::iter::once(BOUNDARY))
+                .chain(tail_seed..tail_seed + 32)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let first = routed_worker_id(
+            &router,
+            with_header(
+                streamed_request(&[b"{\"text\":\"hello\"}"]),
+                "x-smg-routing-tokens",
+                &hint(5_000),
+            ),
+        )
+        .await;
+        let second = routed_worker_id(
+            &router,
+            with_header(
+                streamed_request(&[b"{\"text\":\"other\"}"]),
+                "x-smg-routing-tokens",
+                &hint(7_000),
+            ),
+        )
+        .await;
+        assert_eq!(first, second, "truncated prefixes must share a tenant");
     }
 
     #[tokio::test]

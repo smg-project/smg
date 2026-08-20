@@ -37,6 +37,13 @@ pub struct RouterConfig {
     /// Per-request sticky-session routing (rid-lineage keys, header fallback).
     #[serde(default, alias = "sticky_sessions")]
     pub routing_key_override: RoutingKeyOverrideConfig,
+    /// Token ids that end the routing-relevant prefix. Routing tokens are
+    /// truncated at the first occurrence of any listed id before worker
+    /// selection: content past a media placeholder is never shareable across
+    /// conversations, and match ratios over the full sequence shrink as
+    /// conversations grow. Empty disables truncation.
+    #[serde(default)]
+    pub routing_token_boundaries: Vec<u32>,
     pub host: String,
     pub port: u16,
     /// Dedicated port for the isolated Kubernetes liveness/readiness/health
@@ -955,6 +962,7 @@ impl Default for RouterConfig {
             },
             policy: PolicyConfig::Random,
             routing_key_override: RoutingKeyOverrideConfig::default(),
+            routing_token_boundaries: Vec::new(),
             host: "0.0.0.0".to_string(),
             port: 3001,
             health_check_port: None,
@@ -1372,6 +1380,26 @@ mod tests {
             RoutingKeyOverrideConfig::default().assignment_mode,
             ManualAssignmentMode::Delegate
         );
+    }
+
+    #[test]
+    fn test_routing_token_boundaries_serde_default_and_roundtrip() {
+        // Config files predating the field deserialize to no boundaries.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("routing_token_boundaries")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert!(without.routing_token_boundaries.is_empty());
+
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .routing_token_boundaries(vec![200091, 200038])
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.routing_token_boundaries, vec![200091, 200038]);
     }
 
     #[test]

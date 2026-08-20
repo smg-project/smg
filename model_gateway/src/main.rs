@@ -355,6 +355,12 @@ struct CliArgs {
     #[arg(long, num_args = 0.., default_value = "x-smg-routing-key", value_parser = parse_routing_key_header, help_heading = "Routing Policy")]
     routing_key_headers: Vec<String>,
 
+    /// Token ids that end the routing-relevant prefix (e.g. multimodal
+    /// placeholder ids); routing tokens are truncated at the first occurrence
+    /// before worker selection. Empty disables
+    #[arg(long, num_args = 0.., help_heading = "Routing Policy")]
+    routing_token_boundaries: Vec<u32>,
+
     /// Enable IGW (Inference Gateway) mode for multi-model support
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     enable_igw: bool,
@@ -1737,6 +1743,7 @@ impl CliArgs {
                 ),
                 headers: self.routing_key_headers.clone(),
             })
+            .routing_token_boundaries(self.routing_token_boundaries.clone())
             .retries(!self.disable_retries)
             .upstream_http2(self.upstream_http2)
             .circuit_breaker(!self.disable_circuit_breaker)
@@ -2139,6 +2146,18 @@ mod tests {
         .to_router_config(vec![], vec![])
         .unwrap();
         assert_eq!(format!("{canonical:?}"), format!("{aliased:?}"));
+    }
+
+    /// Routing-token boundaries are a router-only setting and must flow into
+    /// `RouterConfig`.
+    #[test]
+    fn routing_token_boundaries_flag_flows_into_router_config() {
+        let cli = cli_args_from(&["--routing-token-boundaries", "200091", "200038"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.routing_token_boundaries, vec![200091, 200038]);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(defaults.routing_token_boundaries.is_empty());
     }
 
     /// `--health-check-port` must flow into BOTH conversion paths

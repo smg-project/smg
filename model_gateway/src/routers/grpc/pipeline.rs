@@ -87,11 +87,17 @@ pub(crate) struct PipelineDeps {
     /// `None` when tenant rate limiting is disabled; read only by the
     /// endpoints that insert `RateLimitReserveStage` (chat/messages/completion/harmony).
     rate_limit_manager: Option<Arc<RateLimitManager>>,
+    /// Token ids that end the routing-relevant prefix; empty disables.
+    routing_token_boundaries: Vec<u32>,
 }
 
 impl PipelineDeps {
     /// Full deps for the chat/messages/harmony endpoints, which consume the
     /// configured parser factories/overrides.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor mirrors the deps struct; a builder would only move the arity"
+    )]
     pub(crate) fn new(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
@@ -100,6 +106,7 @@ impl PipelineDeps {
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
+        routing_token_boundaries: Vec<u32>,
     ) -> Self {
         Self {
             worker_registry,
@@ -109,6 +116,7 @@ impl PipelineDeps {
             configured_tool_parser,
             configured_reasoning_parser,
             rate_limit_manager,
+            routing_token_boundaries,
         }
     }
 
@@ -118,6 +126,7 @@ impl PipelineDeps {
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
+        routing_token_boundaries: Vec<u32>,
     ) -> Self {
         Self {
             worker_registry,
@@ -127,6 +136,7 @@ impl PipelineDeps {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             rate_limit_manager,
+            routing_token_boundaries,
         }
     }
 
@@ -191,6 +201,7 @@ impl PipelineDeps {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             rate_limit_manager: None,
+            routing_token_boundaries: Vec::new(),
         }
     }
 }
@@ -296,6 +307,7 @@ impl RequestPipeline {
                         deps.worker_registry.clone(),
                         deps.policy_registry.clone(),
                         worker_selection,
+                        deps.routing_token_boundaries.clone(),
                     )),
                     Box::new(ClientAcquisitionStage),
                 ];
@@ -325,6 +337,7 @@ impl RequestPipeline {
                         deps.worker_registry.clone(),
                         deps.policy_registry.clone(),
                         worker_selection,
+                        deps.routing_token_boundaries.clone(),
                     )),
                     Box::new(ClientAcquisitionStage),
                 ];
@@ -355,6 +368,7 @@ impl RequestPipeline {
                         deps.worker_registry.clone(),
                         deps.policy_registry.clone(),
                         worker_selection,
+                        deps.routing_token_boundaries.clone(),
                     )),
                     Box::new(ClientAcquisitionStage),
                 ];
@@ -387,6 +401,7 @@ impl RequestPipeline {
                         deps.worker_registry.clone(),
                         deps.policy_registry.clone(),
                         worker_selection,
+                        deps.routing_token_boundaries.clone(),
                     )),
                     Box::new(ClientAcquisitionStage),
                     Box::new(harmony::stages::HarmonyRequestBuildingStage::new(
@@ -409,6 +424,7 @@ impl RequestPipeline {
                         deps.worker_registry.clone(),
                         deps.policy_registry.clone(),
                         worker_selection,
+                        deps.routing_token_boundaries.clone(),
                     )),
                     Box::new(ClientAcquisitionStage),
                     Box::new(EmbeddingRequestBuildingStage::new()),
@@ -428,6 +444,7 @@ impl RequestPipeline {
                         deps.worker_registry.clone(),
                         deps.policy_registry.clone(),
                         worker_selection,
+                        deps.routing_token_boundaries.clone(),
                     )),
                     Box::new(ClientAcquisitionStage),
                     Box::new(EmbeddingRequestBuildingStage::new()),
@@ -1565,7 +1582,7 @@ mod alias_pipeline_tests {
             .unwrap();
 
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        let deps = PipelineDeps::pair(worker_registry.clone(), policy_registry, None);
+        let deps = PipelineDeps::pair(worker_registry.clone(), policy_registry, None, Vec::new());
         let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
         let components = Arc::new(SharedComponents {
             tokenizer_registry,

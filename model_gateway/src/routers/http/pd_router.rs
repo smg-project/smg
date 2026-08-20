@@ -37,6 +37,7 @@ use crate::{
         common::{
             header_utils,
             retry::{is_retryable_status, RetryExecutor},
+            routing_tokens,
             sse::{SseEncoder, SSE_CHANNEL_BUFFER},
         },
         error,
@@ -54,6 +55,8 @@ pub struct PDRouter {
     pub client: Client,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
+    /// Token ids that end the routing-relevant prefix; empty disables.
+    pub routing_token_boundaries: Vec<u32>,
 }
 
 #[derive(Clone)]
@@ -172,6 +175,7 @@ impl PDRouter {
             client: ctx.client.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
+            routing_token_boundaries: ctx.router_config.routing_token_boundaries.clone(),
         })
     }
 
@@ -820,6 +824,31 @@ impl PDRouter {
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
     }
 
+    /// Routing inputs for `/generate`: token ids win over text, truncated at
+    /// the configured boundaries.
+    fn generate_routing_inputs(
+        &self,
+        body: &GenerateRequest,
+    ) -> (Option<String>, Option<Vec<u32>>) {
+        if !self.policies_need_request_text() {
+            return (None, None);
+        }
+        match body.routing_tokens() {
+            Some(ids) => {
+                let tokens = ids.iter().map(|&id| id as u32).collect();
+                (
+                    None,
+                    Some(routing_tokens::truncate_owned(
+                        tokens,
+                        &self.routing_token_boundaries,
+                        metrics_labels::ROUTER_HTTP,
+                    )),
+                )
+            }
+            None => (body.text.as_deref().map(|s| s.to_string()), None),
+        }
+    }
+
     #[expect(
         clippy::unused_async,
         reason = "async for API consistency; callers await uniformly"
@@ -1451,14 +1480,7 @@ impl RouterTrait for PDRouter {
         let is_stream = body.stream;
         let return_logprob = body.return_logprob.unwrap_or(false);
 
-        let (request_text, routing_tokens) = if self.policies_need_request_text() {
-            match body.routing_tokens() {
-                Some(ids) => (None, Some(ids.iter().map(|&id| id as u32).collect())),
-                None => (body.text.as_deref().map(|s| s.to_string()), None),
-            }
-        } else {
-            (None, None)
-        };
+        let (request_text, routing_tokens) = self.generate_routing_inputs(body);
 
         let batch_size = Self::get_generate_batch_size(body);
 
@@ -1614,7 +1636,59 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
+            routing_token_boundaries: Vec::new(),
         }
+    }
+
+    fn cache_aware_pd_router(boundaries: Vec<u32>) -> PDRouter {
+        let mut router = create_test_pd_router();
+        router.policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 1_000,
+            balance_rel_threshold: 1_000.0,
+            eviction_interval_secs: 3_600,
+            max_tree_size: 1 << 24,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+        }));
+        router.routing_token_boundaries = boundaries;
+        router
+    }
+
+    #[tokio::test]
+    async fn pd_generate_routing_inputs_truncate_at_boundary() {
+        let router = cache_aware_pd_router(vec![900]);
+        let body: GenerateRequest =
+            serde_json::from_value(serde_json::json!({"input_ids": [1, 2, 3, 900, 4, 5]})).unwrap();
+        let (text, tokens) = router.generate_routing_inputs(&body);
+        assert_eq!(text, None);
+        assert_eq!(tokens, Some(vec![1, 2, 3]));
+
+        let media_first: GenerateRequest =
+            serde_json::from_value(serde_json::json!({"input_ids": [900, 4, 5]})).unwrap();
+        let (text, tokens) = router.generate_routing_inputs(&media_first);
+        assert_eq!(text, None);
+        assert_eq!(tokens, Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn pd_generate_routing_inputs_identity_without_boundaries() {
+        let router = cache_aware_pd_router(Vec::new());
+        let body: GenerateRequest =
+            serde_json::from_value(serde_json::json!({"input_ids": [1, 2, 900, 3]})).unwrap();
+        let (_, tokens) = router.generate_routing_inputs(&body);
+        assert_eq!(tokens, Some(vec![1, 2, 900, 3]));
+    }
+
+    #[test]
+    fn pd_generate_routing_inputs_skips_text_free_policies() {
+        let router = create_test_pd_router();
+        let body: GenerateRequest =
+            serde_json::from_value(serde_json::json!({"input_ids": [1, 2, 3]})).unwrap();
+        assert_eq!(router.generate_routing_inputs(&body), (None, None));
     }
 
     fn create_test_worker(url: String, worker_type: WorkerType, healthy: bool) -> Box<dyn Worker> {

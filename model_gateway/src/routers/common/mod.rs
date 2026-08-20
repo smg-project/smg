@@ -28,5 +28,6 @@ pub mod openai_bridge;
 pub mod persistence_utils;
 pub mod realtime;
 pub mod retry;
+pub(crate) mod routing_tokens;
 pub mod sse;
 pub mod worker_selection;

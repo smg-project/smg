@@ -14,6 +14,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
+        common::routing_tokens,
         error,
         grpc::{
             context::{EncodeWorkerAssignment, RequestContext, WorkerSelection},
@@ -42,6 +43,8 @@ pub(crate) struct WorkerSelectionStage {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     mode: WorkerSelectionMode,
+    /// Token ids that end the routing-relevant prefix; empty disables.
+    routing_token_boundaries: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,12 +62,28 @@ impl WorkerSelectionStage {
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
         mode: WorkerSelectionMode,
+        routing_token_boundaries: Vec<u32>,
     ) -> Self {
         Self {
             worker_registry,
             policy_registry,
             mode,
+            routing_token_boundaries,
         }
+    }
+
+    /// Boundary-truncated routing tokens. No token ids at all falls back to
+    /// text; a boundary-emptied prefix stays `Some(&[])` (match rate 0,
+    /// min-load) so full text cannot defeat the truncation.
+    fn truncated_routing_tokens<'a>(&self, ids: &'a [u32]) -> Option<&'a [u32]> {
+        if ids.is_empty() {
+            return None;
+        }
+        Some(routing_tokens::truncate_slice(
+            ids,
+            &self.routing_token_boundaries,
+            metrics_labels::ROUTER_GRPC,
+        ))
     }
 }
 
@@ -87,8 +106,7 @@ impl PipelineStage for WorkerSelectionStage {
         let text = prep.routing_text();
 
         // Get tokens for PrefixHash policy support
-        let ids = prep.token_ids();
-        let tokens = if ids.is_empty() { None } else { Some(ids) };
+        let tokens = self.truncated_routing_tokens(prep.token_ids());
 
         let headers = ctx.input.headers.as_ref();
         let rid_key = self
@@ -830,6 +848,7 @@ mod tests {
             worker_registry,
             policy_registry,
             WorkerSelectionMode::PrefillDecode,
+            Vec::new(),
         );
         let (prefill_hits, decode_hits) = count_select_pd_pair_hits(&stage, model_id, 40);
         assert_even_pd_round_robin_coverage(
@@ -862,6 +881,7 @@ mod tests {
             worker_registry,
             policy_registry,
             WorkerSelectionMode::PrefillDecode,
+            Vec::new(),
         );
         let (prefill_hits, decode_hits) = count_select_pd_pair_hits(&stage, model_id, 40);
         assert_even_pd_round_robin_coverage(
@@ -900,6 +920,7 @@ mod tests {
             Arc::clone(&worker_registry),
             Arc::clone(&policy_registry),
             WorkerSelectionMode::PrefillDecode,
+            Vec::new(),
         );
 
         assert!(
@@ -951,6 +972,7 @@ mod tests {
             worker_registry,
             policy_registry.clone(),
             WorkerSelectionMode::Regular,
+            Vec::new(),
         );
 
         let rid_key = policy_registry.derive_rid_key(Some("conv7_t1"));
@@ -978,5 +1000,118 @@ mod tests {
                 .unwrap();
             assert_eq!(again.url(), first.url(), "follow-up must pin by rid key");
         }
+    }
+
+    fn register_regular_grpc_workers(registry: &WorkerRegistry, model_id: &str, n: usize) {
+        for i in 0..n {
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{}", 8200 + i))
+                        .model(ModelCard::new(model_id))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        }
+    }
+
+    fn cache_aware_stage(model_id: &str, boundaries: Vec<u32>) -> WorkerSelectionStage {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_regular_grpc_workers(&worker_registry, model_id, 2);
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 1_000,
+            balance_rel_threshold: 1_000.0,
+            eviction_interval_secs: 3_600,
+            max_tree_size: 1 << 24,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+        }));
+        policy_registry.on_worker_added(model_id, None);
+        policy_registry.init_cache_aware_policy(model_id, &worker_registry.get_all());
+        WorkerSelectionStage::new(
+            worker_registry,
+            policy_registry,
+            WorkerSelectionMode::Regular,
+            boundaries,
+        )
+    }
+
+    /// 64-token conversation prefix, boundary 900, per-request tail.
+    fn grpc_conversation(tail_seed: u32, tail_len: u32) -> Vec<u32> {
+        let mut t: Vec<u32> = (1..65).collect();
+        t.push(900);
+        t.extend(tail_seed..tail_seed + 32.min(tail_len));
+        if tail_len > 32 {
+            t.extend(10_000 + tail_seed..10_000 + tail_seed + (tail_len - 32));
+        }
+        t
+    }
+
+    #[tokio::test]
+    async fn grpc_follow_up_pins_with_boundaries() {
+        let model_id = "test-model-boundaries";
+        let stage = cache_aware_stage(model_id, vec![900]);
+
+        let turn1_full = grpc_conversation(5_000, 32);
+        let turn1 = stage.truncated_routing_tokens(&turn1_full);
+        assert_eq!(turn1, Some(&turn1_full[..64]));
+        let first = stage
+            .select_single_worker(model_id, None, turn1, None, None)
+            .unwrap();
+
+        let turn2_full = grpc_conversation(7_000, 200);
+        for _ in 0..4 {
+            let follow_up = stage
+                .select_single_worker(
+                    model_id,
+                    None,
+                    stage.truncated_routing_tokens(&turn2_full),
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(first.url(), follow_up.url());
+        }
+
+        // Boundary-emptied prefix stays Some(&[]): min-load, never the text
+        // fallback. Only a genuinely token-free request yields None.
+        assert_eq!(
+            stage.truncated_routing_tokens(&[900, 1]),
+            Some(&[] as &[u32])
+        );
+        assert_eq!(stage.truncated_routing_tokens(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn grpc_follow_up_misses_without_boundaries() {
+        let model_id = "test-model-no-boundaries";
+        let stage = cache_aware_stage(model_id, Vec::new());
+
+        let turn1_full = grpc_conversation(5_000, 32);
+        let tokens1 = stage.truncated_routing_tokens(&turn1_full);
+        assert_eq!(tokens1, Some(turn1_full.as_slice()));
+        let first = stage
+            .select_single_worker(model_id, None, tokens1, None, None)
+            .unwrap();
+
+        let mut turn2_full = turn1_full.clone();
+        turn2_full.extend(7_000..7_200);
+        let second = stage
+            .select_single_worker(
+                model_id,
+                None,
+                stage.truncated_routing_tokens(&turn2_full),
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_ne!(first.url(), second.url());
     }
 }

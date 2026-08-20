@@ -372,6 +372,7 @@ impl GrpcRouter {
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
             ctx.rate_limit_manager.clone(),
+            ctx.router_config.routing_token_boundaries.clone(),
         );
         // Deps for the parser-free endpoints (completion/embeddings/classify).
         // Only completion's stage list actually reads `rate_limit_manager`;
@@ -380,6 +381,7 @@ impl GrpcRouter {
             worker_registry.clone(),
             policy_registry.clone(),
             ctx.rate_limit_manager.clone(),
+            ctx.router_config.routing_token_boundaries.clone(),
         );
 
         // Present in every mode: chat/generate, messages, completion.

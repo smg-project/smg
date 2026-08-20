@@ -843,6 +843,44 @@ class TestParseRouterArgs:
 
         assert router_args.selector == {"component": "engine", "env": "prod"}
 
+    def test_routing_token_boundaries_fall_back_to_backend_value(self):
+        """An unset prefixed list must not shadow the backend's value."""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args([])
+        namespace.routing_token_boundaries = [200091, 200038]
+
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+
+        assert router_args.routing_token_boundaries == [200091, 200038]
+
+    def test_routing_token_boundaries_prefixed_value_wins(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(["--router-routing-token-boundaries", "200091", "200038"])
+        # A competing backend value must lose to the explicit prefixed list.
+        namespace.routing_token_boundaries = [111]
+
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+
+        assert router_args.routing_token_boundaries == [200091, 200038]
+
+    def test_routing_token_boundaries_explicit_empty_disables(self):
+        """A bare prefixed flag yields [] and beats the backend value.
+
+        Regression pin for the prefixed default: it must stay None (unset)
+        so only an explicitly supplied flag — even valueless — takes
+        precedence.
+        """
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(["--router-routing-token-boundaries"])
+        namespace.routing_token_boundaries = [200091]
+
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+
+        assert router_args.routing_token_boundaries == []
+
     def test_parse_repeated_model_alias_args(self):
         router_args = parse_router_args(
             [
@@ -1283,6 +1321,7 @@ class TestRouterArgsFieldOrder:
         "least_load_max_waiting_requests",
         "stream_request_bodies_over",
         "stream_body_stall_timeout_secs",
+        "routing_token_boundaries",
         "routing_key_headers",
     ]
 
@@ -1308,6 +1347,7 @@ class TestRouterArgsFieldOrder:
             "least_load_max_waiting_requests",
             "stream_request_bodies_over",
             "stream_body_stall_timeout_secs",
+            "routing_token_boundaries",
             "routing_key_headers",
         ):
             assert names.index(appended) > marker, (

@@ -215,6 +215,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn routing_token_boundaries(mut self, ids: Vec<u32>) -> Self {
+        self.config.routing_token_boundaries = ids;
+        self
+    }
+
     pub fn upstream_pool_idle_timeout_secs(mut self, secs: u64) -> Self {
         self.config.upstream_pool_idle_timeout_secs = secs;
         self
