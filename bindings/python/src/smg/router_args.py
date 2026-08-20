@@ -112,13 +112,13 @@ class RouterArgs:
     request_timeout_secs: int = 1800
     # Grace period in seconds to wait for in-flight requests during shutdown
     shutdown_grace_period_secs: int = 180
-    # Max concurrent requests for rate limiting (-1 to disable)
+    # Standing-concurrency cap (-1 to disable); permits span the full response
     max_concurrent_requests: int = -1
     # Queue size for pending requests when max concurrent limit reached
     queue_size: int = 100
     # Maximum time (in seconds) a request can wait in queue before timing out
     queue_timeout_secs: int = 60
-    # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
+    # Token bucket refill rate (tokens per second). Unset or 0 = no refill
     rate_limit_tokens_per_second: int | None = None
     # CORS allowed origins
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
@@ -1062,8 +1062,9 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_concurrent_requests,
             help=(
-                "Maximum number of concurrent requests allowed (for rate limiting)."
-                " Set to -1 to disable rate limiting."
+                "Maximum standing concurrent requests; each admission permit"
+                " is held for the full response, including streaming bodies."
+                " Set to -1 to disable."
             ),
         )
         rate_limit_group.add_argument(
@@ -1086,8 +1087,9 @@ class RouterArgs:
             type=int,
             default=RouterArgs.rate_limit_tokens_per_second,
             help=(
-                "Token bucket refill rate (tokens per second)."
-                " If not set, defaults to max_concurrent_requests"
+                "Token bucket refill rate (tokens per second). Unset or 0 ="
+                " no refill: --max-concurrent-requests bounds standing"
+                " concurrency alone."
             ),
         )
 

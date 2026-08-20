@@ -338,7 +338,7 @@ async fn build_test_app_context(
             let rate_limit_tokens = config
                 .rate_limit_tokens_per_second
                 .filter(|&t| t > 0)
-                .unwrap_or(n);
+                .unwrap_or(0);
             Some(Arc::new(TokenBucket::new(
                 n as usize,
                 rate_limit_tokens as usize,

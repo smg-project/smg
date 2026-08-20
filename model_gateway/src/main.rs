@@ -704,7 +704,8 @@ struct CliArgs {
     cors_allowed_origins: Vec<String>,
 
     // ==================== Rate Limiting ====================
-    /// Maximum concurrent requests (-1 to disable)
+    /// Maximum standing concurrent requests (-1 to disable). Each admission
+    /// permit is held for the full response, including streaming bodies.
     #[arg(long, default_value_t = -1, help_heading = "Rate Limiting")]
     max_concurrent_requests: i32,
 
@@ -746,7 +747,8 @@ struct CliArgs {
     #[arg(long, help_heading = "Tenant Rate Limit")]
     tenant_rate_limit_config: Option<String>,
 
-    /// Token bucket refill rate (tokens per second)
+    /// Token bucket refill rate (tokens per second). Unset or 0 = no refill:
+    /// --max-concurrent-requests bounds standing concurrency alone.
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
 

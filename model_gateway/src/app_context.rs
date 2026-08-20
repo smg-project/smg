@@ -524,10 +524,12 @@ impl AppContextBuilder {
         self.rate_limiter = match config.max_concurrent_requests {
             n if n <= 0 => None,
             n => {
+                // No refill unless explicitly configured: the cap bounds
+                // standing concurrency, not admission rate.
                 let rate_limit_tokens = config
                     .rate_limit_tokens_per_second
-                    .filter(|&t| t >= 0)
-                    .unwrap_or(n);
+                    .filter(|&t| t > 0)
+                    .unwrap_or(0);
                 Some(Arc::new(TokenBucket::new(
                     n as usize,
                     rate_limit_tokens as usize,
@@ -831,6 +833,28 @@ mod tests {
             .expect("h1 request");
         assert_eq!(resp.version(), http::Version::HTTP_11);
         assert_eq!(resp.text().await.expect("body"), "ok");
+    }
+
+    #[tokio::test]
+    async fn unset_rate_limit_defaults_to_no_refill() {
+        let config = RouterConfig {
+            max_concurrent_requests: 10,
+            rate_limit_tokens_per_second: None,
+            ..RouterConfig::default()
+        };
+        let bucket = AppContextBuilder::new()
+            .maybe_rate_limiter(&config)
+            .rate_limiter
+            .expect("rate limiter should be enabled");
+
+        assert!(bucket.try_acquire(10.0).is_ok());
+        // The old fallback refilled at max_concurrent_requests per second,
+        // which would restore a token during this wait.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(bucket.try_acquire(1.0).is_err());
+
+        bucket.return_tokens_sync(1.0);
+        assert!(bucket.try_acquire(1.0).is_ok());
     }
 
     #[tokio::test]

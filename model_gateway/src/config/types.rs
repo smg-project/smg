@@ -167,11 +167,13 @@ pub struct RouterConfig {
     pub storage_context_headers: HashMap<String, String>,
     #[serde(default)]
     pub tenant_resolution: TenantResolutionConfig,
-    /// Set to -1 to disable rate limiting
+    /// Standing-concurrency cap; -1 disables. Each admission permit is
+    /// held for the full response, including streaming bodies.
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
     pub queue_timeout_secs: u64,
-    /// If not set, defaults to max_concurrent_requests
+    /// Unset or 0 = no refill: `max_concurrent_requests` bounds standing
+    /// concurrency alone.
     pub rate_limit_tokens_per_second: Option<i32>,
     /// Enable the priority-aware admission scheduler. When false (default),
     /// the legacy concurrency-limit middleware stays wired — zero behavior

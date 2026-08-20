@@ -333,8 +333,10 @@ mod tests {
     };
 
     use axum::{routing::post, Router};
+    use http_body_util::BodyExt;
     use llm_tokenizer::registry::TokenizerRegistry;
     use metrics_exporter_prometheus::PrometheusBuilder;
+    use tokio_stream::wrappers::ReceiverStream;
     use smg_data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     };
@@ -403,6 +405,42 @@ mod tests {
             .unwrap()
     }
 
+    /// App with a one-shot channel-fed streaming route plus `/echo`,
+    /// queueing disabled.
+    fn stream_app(
+        bucket: Arc<TokenBucket>,
+    ) -> (
+        Router,
+        mpsc::Sender<Result<Bytes, std::convert::Infallible>>,
+    ) {
+        let (frame_tx, frame_rx) = mpsc::channel(4);
+        let frame_rx = Arc::new(std::sync::Mutex::new(Some(frame_rx)));
+        let stream = move || {
+            let rx = frame_rx
+                .lock()
+                .unwrap()
+                .take()
+                .expect("stream route is one-shot");
+            async move { Body::from_stream(ReceiverStream::new(rx)) }
+        };
+        let app = Router::new()
+            .route("/stream", post(stream))
+            .route("/echo", post(|body: Bytes| async move { body }))
+            .layer(axum::middleware::from_fn_with_state(
+                test_app_state(bucket, None),
+                concurrency_limit_middleware,
+            ));
+        (app, frame_tx)
+    }
+
+    fn stream_request() -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/stream")
+            .body(Body::empty())
+            .unwrap()
+    }
+
     fn assert_metric_line(rendered: &str, series: &str, value: &str) {
         let expected = format!("{series} {value}");
         assert!(
@@ -441,6 +479,106 @@ mod tests {
         assert_eq!(bucket.available_tokens(), 0.0);
         drop(body);
         assert_eq!(bucket.available_tokens(), 1.0);
+    }
+
+    /// A streaming response keeps its token after the handler returns: a
+    /// request beyond the cap sheds until the stream is consumed and dropped.
+    #[tokio::test]
+    async fn streaming_response_holds_token_until_stream_consumed() {
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+        let (app, frame_tx) = stream_app(bucket.clone());
+
+        let response = app.clone().oneshot(stream_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let shed = app
+            .clone()
+            .oneshot(echo_request(Body::from("x")))
+            .await
+            .unwrap();
+        assert_eq!(shed.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        frame_tx
+            .send(Ok(Bytes::from_static(b"chunk")))
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+        let frame = body.frame().await.unwrap().unwrap();
+        assert_eq!(frame.into_data().unwrap(), Bytes::from_static(b"chunk"));
+
+        let shed = app
+            .clone()
+            .oneshot(echo_request(Body::from("x")))
+            .await
+            .unwrap();
+        assert_eq!(
+            shed.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "token must stay held mid-stream"
+        );
+
+        drop(frame_tx);
+        assert!(body.frame().await.is_none());
+        drop(body);
+        assert_eq!(bucket.available_tokens(), 1.0);
+
+        let admitted = app.oneshot(echo_request(Body::from("x"))).await.unwrap();
+        assert_eq!(admitted.status(), StatusCode::OK);
+    }
+
+    /// Dropping the response mid-stream (client disconnect) returns the token.
+    #[tokio::test]
+    async fn client_disconnect_mid_stream_returns_token() {
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+        let (app, frame_tx) = stream_app(bucket.clone());
+
+        let response = app.clone().oneshot(stream_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        frame_tx
+            .send(Ok(Bytes::from_static(b"first")))
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+        body.frame().await.unwrap().unwrap();
+
+        assert_eq!(bucket.available_tokens(), 0.0);
+        drop(body);
+        assert_eq!(bucket.available_tokens(), 1.0);
+
+        let admitted = app.oneshot(echo_request(Body::from("x"))).await.unwrap();
+        assert_eq!(admitted.status(), StatusCode::OK);
+    }
+
+    /// A buffered response also spans the write: the token frees only once
+    /// the body has been consumed.
+    #[tokio::test]
+    async fn buffered_response_holds_token_until_body_consumed() {
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+        let app = echo_app(test_app_state(bucket.clone(), None));
+
+        let response = app
+            .clone()
+            .oneshot(echo_request(Body::from("payload")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let shed = app
+            .clone()
+            .oneshot(echo_request(Body::from("x")))
+            .await
+            .unwrap();
+        assert_eq!(shed.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let echoed = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&echoed[..], b"payload");
+        assert_eq!(bucket.available_tokens(), 1.0);
+
+        let admitted = app.oneshot(echo_request(Body::from("x"))).await.unwrap();
+        assert_eq!(admitted.status(), StatusCode::OK);
     }
 
     #[tokio::test]
