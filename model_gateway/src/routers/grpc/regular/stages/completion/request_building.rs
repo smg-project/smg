@@ -12,18 +12,18 @@ use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::completion::CompletionRequest;
 use tracing::error;
-use uuid::Uuid;
 
 use crate::routers::{
     error,
     grpc::{
         backend_client::BackendClient,
-        common::stages::{helpers, PipelineStage},
+        common::stages::{helpers, BuildStage},
         context::{
-            ClientSelection, CompletionItem, ExecutionPlan, ExecutionPlanKind, PreparationOutput,
-            RequestContext, RequestType, WorkerSelection,
+            AttemptStamp, BuildOutput, ClientSelection, CompletionItem, ExecutionPlan,
+            ExecutionPlanKind, PreparationOutput, RequestContext, WorkerSelection,
         },
         proto_wrapper::ProtoGenerateRequest,
+        spec::{CompletionResponseSpec, ResponseSpec},
     },
 };
 
@@ -49,9 +49,9 @@ impl CompletionRequestBuildingStage {
         request_id: String,
         item: &CompletionItem,
         completion_request: &CompletionRequest,
-        request_type: &RequestType,
+        sampling_mask: Option<helpers::SamplingDefaultsMask>,
         workers: Option<&WorkerSelection>,
-    ) -> Result<ProtoGenerateRequest, Response> {
+    ) -> Result<(ProtoGenerateRequest, Option<helpers::SamplingBaseline>), Response> {
         let mut proto_request = builder_client
             .build_completion_request(
                 request_id,
@@ -61,7 +61,7 @@ impl CompletionRequestBuildingStage {
             )
             .map_err(|e| {
                 error!(
-                    function = "CompletionRequestBuildingStage::execute",
+                    function = "CompletionRequestBuildingStage::build",
                     error = %e,
                     "Failed to build generate request"
                 );
@@ -71,11 +71,8 @@ impl CompletionRequestBuildingStage {
                 )
             })?;
 
-        helpers::apply_sampling_defaults_to_generate_request(
-            &mut proto_request,
-            request_type,
-            workers,
-        );
+        let sampling_baseline =
+            helpers::apply_sampling_defaults(&mut proto_request, sampling_mask, workers);
 
         if self.inject_pd_metadata {
             if let Some(workers) = workers {
@@ -90,16 +87,16 @@ impl CompletionRequestBuildingStage {
             helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
         }
 
-        Ok(proto_request)
+        Ok((proto_request, sampling_baseline))
     }
 }
 
 #[async_trait]
-impl PipelineStage for CompletionRequestBuildingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+impl BuildStage for CompletionRequestBuildingStage {
+    async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
             error!(
-                function = "CompletionRequestBuildingStage::execute",
+                function = "CompletionRequestBuildingStage::build",
                 "Preparation not completed"
             );
             error::internal_error("preparation_not_completed", "Preparation not completed")
@@ -107,7 +104,7 @@ impl PipelineStage for CompletionRequestBuildingStage {
 
         let PreparationOutput::Completion { items, .. } = prep else {
             error!(
-                function = "CompletionRequestBuildingStage::execute",
+                function = "CompletionRequestBuildingStage::build",
                 "Preparation output is not a completion"
             );
             return Err(error::internal_error(
@@ -118,7 +115,7 @@ impl PipelineStage for CompletionRequestBuildingStage {
 
         let clients = ctx.state.clients.as_ref().ok_or_else(|| {
             error!(
-                function = "CompletionRequestBuildingStage::execute",
+                function = "CompletionRequestBuildingStage::build",
                 "Client acquisition not completed"
             );
             error::internal_error(
@@ -137,12 +134,14 @@ impl PipelineStage for CompletionRequestBuildingStage {
         let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
         let request_type = &ctx.input.request_type;
         let workers = ctx.state.workers.as_ref();
+        let sampling_mask = helpers::SamplingDefaultsMask::from_request_type(request_type);
+        let mut sampling_baseline = None;
         // Each built request is finalized by the client below: it resolves
         // string `stop`s its engine can't match and reports the router's
         // residual trim obligation.
         let tokenizer = ctx.tokenizer_arc();
 
-        let plan = match items.as_slice() {
+        let (plan, id_stamp) = match items.as_slice() {
             [] => {
                 return Err(error::internal_error(
                     "preparation_not_completed",
@@ -150,68 +149,79 @@ impl PipelineStage for CompletionRequestBuildingStage {
                 ))
             }
             [item] => {
-                let mut proto_request = self.build_proto_request(
+                let (request_id, id_stamp) = helpers::resolve_request_id_stamp(
+                    request_type,
+                    ctx.input.tenant_request_meta.as_ref(),
+                    "cmpl_",
+                    disaggregated,
+                );
+                let (mut proto_request, baseline) = self.build_proto_request(
                     builder_client,
-                    helpers::resolve_request_id(
-                        request_type,
-                        ctx.input.tenant_request_meta.as_ref(),
-                        "cmpl_",
-                        disaggregated,
-                    ),
+                    request_id,
                     item,
                     &completion_request,
-                    request_type,
+                    sampling_mask,
                     workers,
                 )?;
+                sampling_baseline = baseline;
                 ctx.state.response.router_stop_obligations = builder_client
                     .finalize_generate_request(&mut proto_request, tokenizer.as_ref());
-                ExecutionPlan::generate(self.plan_kind, proto_request)
+                (
+                    ExecutionPlan::generate(self.plan_kind, proto_request),
+                    id_stamp,
+                )
             }
             batch_items => {
-                // The shared id (client rid or middleware request id) stays
-                // clean for the response; per-sub engine ids get a uniqueness
-                // suffix in PD mode and whenever the shared id is stable
-                // across pipeline executions (middleware-derived).
-                let middleware_id =
-                    helpers::middleware_request_id(ctx.input.tenant_request_meta.as_ref());
-                let (shared_request_id, always_unique_subs) = match request_type.rid() {
-                    Some(rid) => (rid.to_string(), false),
-                    None => match middleware_id {
-                        Some(request_id) => (request_id.to_string(), true),
-                        None => (format!("cmpl_{}", Uuid::now_v7()), false),
-                    },
-                };
+                let (shared_request_id, batch_stamp) = helpers::resolve_batch_id_stamp(
+                    request_type,
+                    ctx.input.tenant_request_meta.as_ref(),
+                    "cmpl_",
+                    disaggregated,
+                );
                 let mut requests = Vec::with_capacity(batch_items.len());
                 for (i, item) in batch_items.iter().enumerate() {
-                    let sub_request_id = if disaggregated || always_unique_subs {
-                        format!("{shared_request_id}-p{i}-{}", Uuid::now_v7())
-                    } else {
-                        format!("{shared_request_id}-p{i}")
-                    };
-                    let mut proto_request = self.build_proto_request(
+                    let (mut proto_request, baseline) = self.build_proto_request(
                         builder_client,
-                        sub_request_id,
+                        helpers::batch_sub_id(&shared_request_id, i, batch_stamp.unique_subs),
                         item,
                         &completion_request,
-                        request_type,
+                        sampling_mask,
                         workers,
                     )?;
+                    // Every sub-request shares the CompletionRequest's
+                    // sampling params, so the first baseline stands for all.
+                    if sampling_baseline.is_none() {
+                        sampling_baseline = baseline;
+                    }
                     // Same CompletionRequest per prompt: every iteration
                     // yields the same residual duty, so keep the last.
                     ctx.state.response.router_stop_obligations = builder_client
                         .finalize_generate_request(&mut proto_request, tokenizer.as_ref());
                     requests.push(proto_request);
                 }
-                ExecutionPlan::Batch {
-                    kind: self.plan_kind,
-                    shared_request_id,
-                    requests,
-                }
+                (
+                    ExecutionPlan::Batch {
+                        kind: self.plan_kind,
+                        shared_request_id,
+                        requests,
+                    },
+                    helpers::IdStamp::Batch(batch_stamp),
+                )
             }
         };
 
-        ctx.state.execution_plan = Some(plan);
-        Ok(None)
+        Ok(BuildOutput {
+            plan,
+            spec: ResponseSpec::Completion(CompletionResponseSpec::from(
+                completion_request.as_ref(),
+            )),
+            stamp: AttemptStamp {
+                id: id_stamp,
+                sampling_mask,
+                sampling_baseline,
+                inject_pd_metadata: self.inject_pd_metadata,
+            },
+        })
     }
 
     fn name(&self) -> &'static str {

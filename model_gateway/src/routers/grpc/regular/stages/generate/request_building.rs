@@ -7,8 +7,12 @@ use tracing::error;
 use crate::routers::{
     error,
     grpc::{
-        common::stages::{helpers, PipelineStage},
-        context::{ClientSelection, ExecutionPlan, ExecutionPlanKind, RequestContext},
+        common::stages::{helpers, BuildStage},
+        context::{
+            AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
+            RequestContext,
+        },
+        spec::{GenerateResponseSpec, ResponseSpec},
     },
 };
 
@@ -30,11 +34,11 @@ impl GenerateRequestBuildingStage {
 }
 
 #[async_trait]
-impl PipelineStage for GenerateRequestBuildingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+impl BuildStage for GenerateRequestBuildingStage {
+    async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
             error!(
-                function = "GenerateRequestBuildingStage::execute",
+                function = "GenerateRequestBuildingStage::build",
                 "Preparation not completed"
             );
             error::internal_error("preparation_not_completed", "Preparation not completed")
@@ -42,7 +46,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
 
         let clients = ctx.state.clients.as_ref().ok_or_else(|| {
             error!(
-                function = "GenerateRequestBuildingStage::execute",
+                function = "GenerateRequestBuildingStage::build",
                 "Client acquisition not completed"
             );
             error::internal_error(
@@ -60,7 +64,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
         };
 
         let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
-        let request_id = helpers::resolve_request_id(
+        let (request_id, id_stamp) = helpers::resolve_request_id_stamp(
             &ctx.input.request_type,
             ctx.input.tenant_request_meta.as_ref(),
             "gen-",
@@ -76,13 +80,15 @@ impl PipelineStage for GenerateRequestBuildingStage {
                 prep.token_ids().to_vec(),
             )
             .map_err(|e| {
-                error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to build generate request");
+                error!(function = "GenerateRequestBuildingStage::build", error = %e, "Failed to build generate request");
                 error::bad_request("build_request_failed", e)
             })?;
 
-        helpers::apply_sampling_defaults_to_generate_request(
+        let sampling_mask =
+            helpers::SamplingDefaultsMask::from_request_type(&ctx.input.request_type);
+        let sampling_baseline = helpers::apply_sampling_defaults(
             &mut proto_request,
-            &ctx.input.request_type,
+            sampling_mask,
             ctx.state.workers.as_ref(),
         );
 
@@ -104,8 +110,16 @@ impl PipelineStage for GenerateRequestBuildingStage {
             helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
         }
 
-        ctx.state.execution_plan = Some(ExecutionPlan::generate(self.plan_kind, proto_request));
-        Ok(None)
+        Ok(BuildOutput {
+            plan: ExecutionPlan::generate(self.plan_kind, proto_request),
+            spec: ResponseSpec::Generate(GenerateResponseSpec::from(generate_request.as_ref())),
+            stamp: AttemptStamp {
+                id: id_stamp,
+                sampling_mask,
+                sampling_baseline,
+                inject_pd_metadata: self.inject_pd_metadata,
+            },
+        })
     }
 
     fn name(&self) -> &'static str {

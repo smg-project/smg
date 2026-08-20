@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use axum::response::Response;
 use llm_tokenizer::traits::Tokenizer;
 use rand::RngExt;
 use smg_grpc_client::{
@@ -9,15 +10,18 @@ use smg_grpc_client::{
     sglang_proto::{self, DisaggregatedParams},
     tokenspeed_proto, vllm_proto,
 };
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use super::pd_protocol::{DpPlacement, PdProtocol, PdRendezvous};
 use crate::{
     middleware::{RequestId, TenantRequestMeta},
     rate_limit::{ReservationAttachment, SharedReservationHandle},
-    routers::grpc::{
-        context::{LoadGuards, RequestType, WorkerSelection},
-        proto_wrapper::ProtoGenerateRequest,
+    routers::{
+        error,
+        grpc::{
+            context::{AttemptStamp, ExecutionPlan, LoadGuards, RequestType, WorkerSelection},
+            proto_wrapper::ProtoGenerateRequest,
+        },
     },
     worker::{
         sampling_defaults::SamplingDefaults, AttachedBody, Worker, DEFAULT_BOOTSTRAP_PORT,
@@ -26,7 +30,7 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug, Default)]
-struct SamplingDefaultsMask {
+pub(crate) struct SamplingDefaultsMask {
     temperature: bool,
     top_p: bool,
     top_k: bool,
@@ -35,7 +39,7 @@ struct SamplingDefaultsMask {
 }
 
 impl SamplingDefaultsMask {
-    fn from_request_type(request_type: &RequestType) -> Option<Self> {
+    pub(crate) fn from_request_type(request_type: &RequestType) -> Option<Self> {
         match request_type {
             RequestType::Chat(request) => Some(Self {
                 temperature: request.temperature.is_none(),
@@ -89,10 +93,10 @@ impl SamplingDefaultsMask {
 /// regardless of how the client disconnects. A no-op returning `response`
 /// unchanged when both are `None`.
 pub(crate) fn attach_response_guards(
-    response: axum::response::Response,
+    response: Response,
     guards: Option<LoadGuards>,
     reservation: Option<Arc<SharedReservationHandle>>,
-) -> axum::response::Response {
+) -> Response {
     match (guards, reservation) {
         (Some(guards), Some(handle)) => {
             AttachedBody::wrap_response(response, (guards, ReservationAttachment::new(handle)))
@@ -114,34 +118,281 @@ pub(crate) fn middleware_request_id(tenant_meta: Option<&TenantRequestMeta>) -> 
         .map(|request_id| request_id.0.as_str())
 }
 
-/// Backend request id for any endpoint.
+/// How each retry attempt re-mints the engine request id, captured at build
+/// so replays reproduce exactly what a fresh build would have minted.
+///
+/// Engine ids must be unique per dispatch — a NIXL-tagged prefill keeps the
+/// id alive until the KV lease expires, and responses tool loops re-execute
+/// the pipeline per iteration — so every derived id gets a fresh
+/// per-execution component. A bare `rid` outside PD is the one exception:
+/// its value is the caller's contract (matching /generate's long-standing
+/// behavior) and stays stable across attempts.
+pub(crate) enum IdStamp {
+    /// Bare client `rid` outside PD: stable across attempts.
+    Exact,
+    /// `{base}-{uuid}` minted fresh per attempt (rid under PD,
+    /// middleware-derived ids).
+    Suffixed { base: String },
+    /// `{prefix}{uuid}` minted fresh per attempt.
+    Minted { prefix: &'static str },
+    /// Batched completion fan-out: shared id plus per-sub engine ids.
+    Batch(BatchIdStamp),
+}
+
+pub(crate) struct BatchIdStamp {
+    /// `None`: the shared id is minted fresh per attempt as `{prefix}{uuid}`.
+    pub stable_shared: Option<String>,
+    pub prefix: &'static str,
+    /// Sub ids carry a per-execution uuid (PD, or a shared id that is stable
+    /// across executions).
+    pub unique_subs: bool,
+}
+
+/// Backend request id for any single-request endpoint, plus the stamp retry
+/// attempts re-mint it with.
 ///
 /// Priority: the protocol `rid`, else the middleware request id, else a fresh
-/// `{prefix}{uuid}`.
-///
-/// Engine ids must be unique per dispatch — PD retries re-run request
-/// building while a NIXL-tagged prefill keeps the id alive until the KV lease
-/// expires, and responses tool loops re-execute the pipeline per iteration —
-/// so middleware-derived ids always get a per-execution suffix. A bare `rid`
-/// outside PD is used exactly: its value is the caller's contract (matching
-/// /generate's long-standing behavior).
-pub(crate) fn resolve_request_id(
+/// `{prefix}{uuid}` (see [`IdStamp`] for the uniqueness rules).
+pub(crate) fn resolve_request_id_stamp(
     request_type: &RequestType,
     tenant_meta: Option<&TenantRequestMeta>,
-    prefix: &str,
+    prefix: &'static str,
     disaggregated: bool,
-) -> String {
+) -> (String, IdStamp) {
     if let Some(rid) = request_type.rid() {
         return if disaggregated {
-            format!("{rid}-{}", uuid::Uuid::now_v7())
+            let stamp = IdStamp::Suffixed {
+                base: rid.to_string(),
+            };
+            (format!("{rid}-{}", uuid::Uuid::now_v7()), stamp)
         } else {
-            rid.to_string()
+            (rid.to_string(), IdStamp::Exact)
         };
     }
     match middleware_request_id(tenant_meta) {
-        Some(request_id) => format!("{request_id}-{}", uuid::Uuid::now_v7()),
-        None => format!("{prefix}{}", uuid::Uuid::now_v7()),
+        Some(request_id) => (
+            format!("{request_id}-{}", uuid::Uuid::now_v7()),
+            IdStamp::Suffixed {
+                base: request_id.to_string(),
+            },
+        ),
+        None => (
+            format!("{prefix}{}", uuid::Uuid::now_v7()),
+            IdStamp::Minted { prefix },
+        ),
     }
+}
+
+/// Shared id + stamp for the batched completion fan-out. The shared id
+/// (client rid or middleware request id) stays clean for the response;
+/// per-sub engine ids get a uniqueness suffix in PD mode and whenever the
+/// shared id is stable across executions (rid- or middleware-derived).
+pub(crate) fn resolve_batch_id_stamp(
+    request_type: &RequestType,
+    tenant_meta: Option<&TenantRequestMeta>,
+    prefix: &'static str,
+    disaggregated: bool,
+) -> (String, BatchIdStamp) {
+    let (shared, stable_shared, unique_subs) = match request_type.rid() {
+        Some(rid) => (rid.to_string(), Some(rid.to_string()), disaggregated),
+        None => match middleware_request_id(tenant_meta) {
+            Some(request_id) => (request_id.to_string(), Some(request_id.to_string()), true),
+            None => (
+                format!("{prefix}{}", uuid::Uuid::now_v7()),
+                None,
+                disaggregated,
+            ),
+        },
+    };
+    (
+        shared,
+        BatchIdStamp {
+            stable_shared,
+            prefix,
+            unique_subs,
+        },
+    )
+}
+
+/// One batched sub-request's engine id.
+pub(crate) fn batch_sub_id(shared: &str, index: usize, unique: bool) -> String {
+    if unique {
+        format!("{shared}-p{index}-{}", uuid::Uuid::now_v7())
+    } else {
+        format!("{shared}-p{index}")
+    }
+}
+
+impl IdStamp {
+    /// Re-mint the retained plan's engine id(s) for a retry attempt. A plan
+    /// shape that doesn't match the stamp is a build-stage wiring bug: fail
+    /// rather than re-dispatch the previous attempt's engine ids.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Response is the standard error type in the pipeline stage pattern"
+    )]
+    pub(crate) fn restamp(&self, plan: &mut ExecutionPlan) -> Result<(), Response> {
+        match self {
+            Self::Exact => Ok(()),
+            Self::Suffixed { base } => {
+                plan.set_request_id(format!("{base}-{}", uuid::Uuid::now_v7()))
+            }
+            Self::Minted { prefix } => {
+                plan.set_request_id(format!("{prefix}{}", uuid::Uuid::now_v7()))
+            }
+            Self::Batch(batch) => {
+                let ExecutionPlan::Batch {
+                    shared_request_id,
+                    requests,
+                    ..
+                } = plan
+                else {
+                    error!(
+                        function = "IdStamp::restamp",
+                        "Batch id stamp on a non-batch plan"
+                    );
+                    return Err(error::internal_error(
+                        "id_stamp_plan_mismatch",
+                        "Id stamp does not match the plan shape",
+                    ));
+                };
+                let shared = batch
+                    .stable_shared
+                    .clone()
+                    .unwrap_or_else(|| format!("{}{}", batch.prefix, uuid::Uuid::now_v7()));
+                for (i, request) in requests.iter_mut().enumerate() {
+                    request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
+                }
+                *shared_request_id = shared;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Pre-worker-default values of a plan's sampling params, captured at build
+/// before the first worker's defaults are applied. Retry re-application
+/// restores the masked fields from this baseline first, so attempt N's
+/// effective params are exactly (request values) + (worker N's defaults) —
+/// never contaminated by a previous attempt's worker.
+#[derive(Clone)]
+pub(crate) enum SamplingBaseline {
+    Sglang(sglang_proto::SamplingParams),
+    Vllm(vllm_proto::SamplingParams),
+    Mlx(mlx_proto::SamplingParams),
+    TokenSpeed(tokenspeed_proto::SamplingParams),
+}
+
+impl SamplingBaseline {
+    fn capture(request: &ProtoGenerateRequest) -> Option<Self> {
+        match request {
+            ProtoGenerateRequest::Sglang(req) => req.sampling_params.clone().map(Self::Sglang),
+            ProtoGenerateRequest::Vllm(req) => req.sampling_params.clone().map(Self::Vllm),
+            ProtoGenerateRequest::Mlx(req) => req.sampling_params.clone().map(Self::Mlx),
+            ProtoGenerateRequest::TokenSpeed(req) => {
+                req.sampling_params.clone().map(Self::TokenSpeed)
+            }
+            ProtoGenerateRequest::Trtllm(_) => None,
+        }
+    }
+
+    /// Reset the masked fields to their pre-default values.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Response is the standard error type in the pipeline stage pattern"
+    )]
+    fn restore_masked(
+        &self,
+        request: &mut ProtoGenerateRequest,
+        mask: SamplingDefaultsMask,
+    ) -> Result<(), Response> {
+        macro_rules! restore {
+            ($params:expr, $baseline:expr) => {{
+                let params = $params;
+                let baseline = $baseline;
+                if mask.temperature {
+                    params.temperature = baseline.temperature;
+                }
+                if mask.top_p {
+                    params.top_p = baseline.top_p;
+                }
+                if mask.top_k {
+                    params.top_k = baseline.top_k;
+                }
+                if mask.min_p {
+                    params.min_p = baseline.min_p;
+                }
+                if mask.repetition_penalty {
+                    params.repetition_penalty = baseline.repetition_penalty;
+                }
+            }};
+        }
+        match (request, self) {
+            (ProtoGenerateRequest::Sglang(req), Self::Sglang(baseline)) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    restore!(params, baseline);
+                }
+                Ok(())
+            }
+            (ProtoGenerateRequest::Vllm(req), Self::Vllm(baseline)) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    restore!(params, baseline);
+                }
+                Ok(())
+            }
+            (ProtoGenerateRequest::Mlx(req), Self::Mlx(baseline)) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    restore!(params, baseline);
+                }
+                Ok(())
+            }
+            (ProtoGenerateRequest::TokenSpeed(req), Self::TokenSpeed(baseline)) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    restore!(params, baseline);
+                }
+                Ok(())
+            }
+            _ => {
+                error!(
+                    function = "SamplingBaseline::restore_masked",
+                    "Sampling baseline does not match the plan's backend"
+                );
+                Err(error::internal_error(
+                    "sampling_baseline_plan_mismatch",
+                    "Sampling baseline does not match the plan shape",
+                ))
+            }
+        }
+    }
+}
+
+/// Re-stamp the retained plan for a retry attempt's newly selected workers:
+/// fresh engine ids per [`IdStamp`], the new worker's sampling defaults
+/// (re-applied over the build-time baseline), and fresh PD
+/// bootstrap/rendezvous rooms. EPD encode bootstrap info is deliberately
+/// untouched — those rooms are the rendezvous with encode jobs the first
+/// dispatch already launched.
+#[expect(
+    clippy::result_large_err,
+    reason = "Response is the standard error type in the pipeline stage pattern"
+)]
+pub(crate) fn restamp_plan_for_attempt(
+    plan: &mut ExecutionPlan,
+    stamp: &AttemptStamp,
+    workers: &WorkerSelection,
+) -> Result<(), Response> {
+    stamp.id.restamp(plan)?;
+    for request in plan.generate_requests_mut() {
+        if let (Some(mask), Some(baseline)) = (stamp.sampling_mask, &stamp.sampling_baseline) {
+            baseline.restore_masked(request, mask)?;
+            apply_sampling_defaults_with_mask(request, mask, Some(workers));
+        }
+        if stamp.inject_pd_metadata {
+            maybe_inject_pd_metadata(request, workers);
+        }
+        maybe_inject_pd_rendezvous(request, workers);
+    }
+    Ok(())
 }
 
 /// Decode selected-worker sampling defaults from labels.
@@ -175,22 +426,37 @@ pub(crate) fn sampling_defaults_for_request(
     }
 }
 
+/// Apply the selected worker's sampling defaults at build, capturing the
+/// masked fields' pre-default baseline first: retry attempts re-apply the
+/// new worker's defaults over this baseline, not over the previous worker's.
+pub(crate) fn apply_sampling_defaults(
+    request: &mut ProtoGenerateRequest,
+    mask: Option<SamplingDefaultsMask>,
+    workers: Option<&WorkerSelection>,
+) -> Option<SamplingBaseline> {
+    let mask = mask?;
+    if !mask.any() || matches!(request, ProtoGenerateRequest::Trtllm(_)) {
+        return None;
+    }
+    let baseline = SamplingBaseline::capture(request);
+    apply_sampling_defaults_with_mask(request, mask, workers);
+    baseline
+}
+
 /// Apply model sampling defaults to a built proto request.
 ///
-/// The proto already contains backend fallback values, so `request_type` is
-/// used only as an omission mask: defaults fill fields the user did not set.
-pub(crate) fn apply_sampling_defaults_to_generate_request(
+/// The proto already contains backend fallback values, so `mask` (derived
+/// from the request at build) selects only fields the user did not set.
+/// Retry attempts reuse the same mask against the newly selected worker.
+fn apply_sampling_defaults_with_mask(
     request: &mut ProtoGenerateRequest,
-    request_type: &RequestType,
+    mask: SamplingDefaultsMask,
     workers: Option<&WorkerSelection>,
 ) {
     if matches!(request, ProtoGenerateRequest::Trtllm(_)) {
         return;
     }
 
-    let Some(mask) = SamplingDefaultsMask::from_request_type(request_type) else {
-        return;
-    };
     if !mask.any() {
         return;
     }
@@ -578,21 +844,82 @@ mod request_id_tests {
             .with_extension(RequestId(id.to_string()))
     }
 
+    fn single_plan(request_id: &str) -> ExecutionPlan {
+        use smg_grpc_client::sglang_proto;
+
+        use crate::routers::grpc::proto_wrapper::ProtoRequest;
+        let request = ProtoGenerateRequest::Sglang(Box::new(sglang_proto::GenerateRequest {
+            request_id: request_id.to_string(),
+            ..Default::default()
+        }));
+        ExecutionPlan::Single(ProtoRequest::Generate(request))
+    }
+
+    fn batch_plan(shared: &str, sub_ids: &[String]) -> ExecutionPlan {
+        use smg_grpc_client::sglang_proto;
+
+        use crate::routers::grpc::context::ExecutionPlanKind;
+        ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::Single,
+            shared_request_id: shared.to_string(),
+            requests: sub_ids
+                .iter()
+                .map(|id| {
+                    ProtoGenerateRequest::Sglang(Box::new(sglang_proto::GenerateRequest {
+                        request_id: id.clone(),
+                        ..Default::default()
+                    }))
+                })
+                .collect(),
+        }
+    }
+
+    fn plan_ids(plan: &ExecutionPlan) -> (String, Vec<String>) {
+        match plan {
+            ExecutionPlan::Batch {
+                shared_request_id,
+                requests,
+                ..
+            } => (
+                shared_request_id.clone(),
+                requests
+                    .iter()
+                    .map(|r| r.request_id().to_string())
+                    .collect(),
+            ),
+            other => (other.request_id().to_string(), Vec::new()),
+        }
+    }
+
     #[test]
-    fn rid_is_used_exactly_outside_pd() {
+    fn rid_is_used_exactly_outside_pd_and_stays_stable_on_restamp() {
         let request_type = chat_request_type(Some("client-rid"));
         let meta = meta_with_request_id("chatcmpl-mw");
 
-        let id = resolve_request_id(&request_type, Some(&meta), "chatcmpl-", false);
+        let (id, stamp) = resolve_request_id_stamp(&request_type, Some(&meta), "chatcmpl-", false);
         assert_eq!(id, "client-rid");
+
+        let mut plan = single_plan(&id);
+        stamp.restamp(&mut plan).unwrap();
+        assert_eq!(
+            plan.request_id(),
+            "client-rid",
+            "rid is the caller's contract"
+        );
     }
 
     #[test]
     fn rid_gets_per_attempt_suffix_in_pd() {
         let request_type = chat_request_type(Some("client-rid"));
 
-        let id = resolve_request_id(&request_type, None, "chatcmpl-", true);
+        let (id, stamp) = resolve_request_id_stamp(&request_type, None, "chatcmpl-", true);
         assert!(id.starts_with("client-rid-") && id != "client-rid");
+
+        let mut plan = single_plan(&id);
+        stamp.restamp(&mut plan).unwrap();
+        let restamped = plan.request_id().to_string();
+        assert!(restamped.starts_with("client-rid-"));
+        assert_ne!(restamped, id, "each attempt gets a fresh engine id");
     }
 
     #[test]
@@ -600,9 +927,13 @@ mod request_id_tests {
         let request_type = chat_request_type(None);
         let meta = meta_with_request_id("chatcmpl-mw");
 
-        let first = resolve_request_id(&request_type, Some(&meta), "chatcmpl-", false);
-        let second = resolve_request_id(&request_type, Some(&meta), "chatcmpl-", false);
+        let (first, stamp) =
+            resolve_request_id_stamp(&request_type, Some(&meta), "chatcmpl-", false);
         assert!(first.starts_with("chatcmpl-mw-"));
+
+        let mut plan = single_plan(&first);
+        stamp.restamp(&mut plan).unwrap();
+        let second = plan.request_id().to_string();
         assert!(second.starts_with("chatcmpl-mw-"));
         assert_ne!(first, second);
     }
@@ -612,8 +943,71 @@ mod request_id_tests {
         let request_type = chat_request_type(None);
         let meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
-        let id = resolve_request_id(&request_type, Some(&meta), "chatcmpl-", false);
+        let (id, stamp) = resolve_request_id_stamp(&request_type, Some(&meta), "chatcmpl-", false);
         assert!(id.starts_with("chatcmpl-"));
+
+        let mut plan = single_plan(&id);
+        stamp.restamp(&mut plan).unwrap();
+        assert!(plan.request_id().starts_with("chatcmpl-"));
+        assert_ne!(plan.request_id(), id, "minted ids are fresh per attempt");
+    }
+
+    #[test]
+    fn batch_rid_subs_stay_stable_outside_pd() {
+        let request_type = chat_request_type(Some("client-rid"));
+        let (shared, stamp) = resolve_batch_id_stamp(&request_type, None, "cmpl_", false);
+        assert_eq!(shared, "client-rid");
+        assert!(!stamp.unique_subs);
+
+        let subs: Vec<String> = (0..2).map(|i| batch_sub_id(&shared, i, false)).collect();
+        assert_eq!(subs, ["client-rid-p0", "client-rid-p1"]);
+
+        let mut plan = batch_plan(&shared, &subs);
+        IdStamp::Batch(stamp).restamp(&mut plan).unwrap();
+        assert_eq!(plan_ids(&plan), (shared, subs), "rid batch ids are stable");
+    }
+
+    #[test]
+    fn batch_middleware_subs_are_unique_per_attempt_under_stable_shared() {
+        let request_type = chat_request_type(None);
+        let meta = meta_with_request_id("mw-id");
+        let (shared, stamp) = resolve_batch_id_stamp(&request_type, Some(&meta), "cmpl_", false);
+        assert_eq!(shared, "mw-id");
+        assert!(stamp.unique_subs);
+
+        let subs: Vec<String> = (0..2)
+            .map(|i| batch_sub_id(&shared, i, stamp.unique_subs))
+            .collect();
+        let mut plan = batch_plan(&shared, &subs);
+        IdStamp::Batch(stamp).restamp(&mut plan).unwrap();
+        let (restamped_shared, restamped_subs) = plan_ids(&plan);
+        assert_eq!(restamped_shared, "mw-id");
+        for (i, (before, after)) in subs.iter().zip(&restamped_subs).enumerate() {
+            assert!(after.starts_with(&format!("mw-id-p{i}-")));
+            assert_ne!(before, after, "sub engine ids must be fresh per attempt");
+        }
+    }
+
+    #[test]
+    fn batch_minted_shared_is_fresh_per_attempt() {
+        let request_type = chat_request_type(None);
+        let (shared, stamp) = resolve_batch_id_stamp(&request_type, None, "cmpl_", false);
+        assert!(shared.starts_with("cmpl_"));
+        assert!(stamp.stable_shared.is_none());
+
+        let subs: Vec<String> = (0..2).map(|i| batch_sub_id(&shared, i, false)).collect();
+        let mut plan = batch_plan(&shared, &subs);
+        IdStamp::Batch(stamp).restamp(&mut plan).unwrap();
+        let (restamped_shared, restamped_subs) = plan_ids(&plan);
+        assert!(restamped_shared.starts_with("cmpl_"));
+        assert_ne!(restamped_shared, shared);
+        assert_eq!(
+            restamped_subs,
+            [
+                format!("{restamped_shared}-p0"),
+                format!("{restamped_shared}-p1")
+            ]
+        );
     }
 }
 
@@ -856,5 +1250,177 @@ mod stop_resolution_tests {
         let params = tokenspeed_params(&req);
         assert!(params.stop.is_empty());
         assert_eq!(params.stop_token_ids, vec![42], "existing ids kept");
+    }
+}
+
+#[cfg(test)]
+mod restamp_shape_mismatch_tests {
+    use std::sync::Arc;
+
+    use openai_protocol::chat::ChatCompletionRequest;
+    use smg_grpc_client::sglang_proto;
+
+    use super::*;
+    use crate::routers::{
+        error::extract_error_code_from_response,
+        grpc::{context::ExecutionPlanKind, proto_wrapper::ProtoRequest},
+    };
+
+    fn single_plan() -> ExecutionPlan {
+        ExecutionPlan::Single(ProtoRequest::Generate(ProtoGenerateRequest::Sglang(
+            Box::default(),
+        )))
+    }
+
+    fn batch_plan() -> ExecutionPlan {
+        ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::Single,
+            shared_request_id: "cmpl_shared".to_string(),
+            requests: vec![ProtoGenerateRequest::Sglang(Box::default())],
+        }
+    }
+
+    /// A stamp/plan shape mismatch is a build-stage wiring bug; a warn-and-
+    /// continue would re-dispatch the previous attempt's engine ids.
+    #[test]
+    fn id_stamp_shape_mismatch_is_an_error() {
+        let batch_stamp = IdStamp::Batch(BatchIdStamp {
+            stable_shared: None,
+            prefix: "cmpl_",
+            unique_subs: false,
+        });
+        let response = batch_stamp
+            .restamp(&mut single_plan())
+            .expect_err("batch stamp on a single plan must fail");
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "id_stamp_plan_mismatch"
+        );
+
+        let minted_stamp = IdStamp::Minted { prefix: "cmpl_" };
+        let response = minted_stamp
+            .restamp(&mut batch_plan())
+            .expect_err("single stamp on a batch plan must fail");
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "id_stamp_plan_mismatch"
+        );
+    }
+
+    /// A baseline captured from one backend flavor cannot restore another.
+    #[test]
+    fn sampling_baseline_backend_mismatch_is_an_error() {
+        let baseline = SamplingBaseline::Vllm(vllm_proto::SamplingParams::default());
+        let mut request = ProtoGenerateRequest::Sglang(Box::new(sglang_proto::GenerateRequest {
+            sampling_params: Some(sglang_proto::SamplingParams::default()),
+            ..Default::default()
+        }));
+        let mask = SamplingDefaultsMask::from_request_type(&RequestType::Chat(Arc::new(
+            ChatCompletionRequest::default(),
+        )))
+        .expect("chat requests always carry a mask");
+        let response = baseline
+            .restore_masked(&mut request, mask)
+            .expect_err("cross-backend baseline must fail");
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "sampling_baseline_plan_mismatch"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sampling_restamp_tests {
+    use std::sync::Arc;
+
+    use openai_protocol::chat::ChatCompletionRequest;
+    use smg_grpc_client::sglang_proto;
+
+    use super::*;
+    use crate::{
+        routers::grpc::{context::ExecutionPlanKind, proto_wrapper::ProtoRequest},
+        worker::{BasicWorkerBuilder, WorkerType},
+    };
+
+    fn worker_with_defaults(url: &str, defaults_json: Option<&str>) -> WorkerSelection {
+        let mut builder = BasicWorkerBuilder::new(url).worker_type(WorkerType::Regular);
+        if let Some(json) = defaults_json {
+            builder = builder.label(DEFAULT_SAMPLING_PARAMS_LABEL, json);
+        }
+        WorkerSelection::Single {
+            worker: Arc::new(builder.build()),
+        }
+    }
+
+    fn sglang_request() -> ProtoGenerateRequest {
+        ProtoGenerateRequest::Sglang(Box::new(sglang_proto::GenerateRequest {
+            request_id: "sampling-restamp".to_string(),
+            sampling_params: Some(sglang_proto::SamplingParams {
+                temperature: 1.0,
+                top_k: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+
+    fn sglang_params(plan: &ExecutionPlan) -> &sglang_proto::SamplingParams {
+        match plan {
+            ExecutionPlan::Single(ProtoRequest::Generate(ProtoGenerateRequest::Sglang(req))) => {
+                req.sampling_params.as_ref().unwrap()
+            }
+            _ => panic!("expected single SGLang plan"),
+        }
+    }
+
+    /// Attempt N's effective sampling params must be exactly (request values)
+    /// + (worker N's defaults). A retry worker that omits a field the first
+    /// worker defaulted must fall back to the build-time baseline, never to
+    /// the first worker's value.
+    #[test]
+    fn retry_reapplies_defaults_from_the_baseline_not_the_previous_worker() {
+        let mask = SamplingDefaultsMask::from_request_type(&RequestType::Chat(Arc::new(
+            ChatCompletionRequest::default(),
+        )))
+        .expect("chat requests always carry a mask");
+
+        let worker_a = worker_with_defaults(
+            "grpc://worker-a:30000",
+            Some(r#"{"temperature":0.5,"top_k":7}"#),
+        );
+        let mut request = sglang_request();
+        let baseline = apply_sampling_defaults(&mut request, Some(mask), Some(&worker_a));
+        let stamp = AttemptStamp {
+            id: IdStamp::Exact,
+            sampling_mask: Some(mask),
+            sampling_baseline: baseline,
+            inject_pd_metadata: false,
+        };
+        let mut plan = ExecutionPlan::generate(ExecutionPlanKind::Single, request);
+        {
+            let params = sglang_params(&plan);
+            assert_eq!(params.temperature, 0.5, "worker A's default applied");
+            assert_eq!(params.top_k, 7);
+        }
+
+        // Worker B omits temperature: it must return to the baseline (1.0),
+        // not keep worker A's 0.5.
+        let worker_b = worker_with_defaults("grpc://worker-b:30000", Some(r#"{"top_k":9}"#));
+        restamp_plan_for_attempt(&mut plan, &stamp, &worker_b).unwrap();
+        {
+            let params = sglang_params(&plan);
+            assert_eq!(params.temperature, 1.0, "baseline restored, not worker A's");
+            assert_eq!(params.top_k, 9, "worker B's default applied");
+        }
+
+        // Worker C has no defaults label at all: everything returns to the
+        // baseline.
+        let worker_c = worker_with_defaults("grpc://worker-c:30000", None);
+        restamp_plan_for_attempt(&mut plan, &stamp, &worker_c).unwrap();
+        {
+            let params = sglang_params(&plan);
+            assert_eq!(params.temperature, 1.0);
+            assert_eq!(params.top_k, 3);
+        }
     }
 }

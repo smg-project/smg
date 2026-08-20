@@ -9,11 +9,13 @@ use crate::routers::{
     error,
     grpc::{
         client::GenerateRequestBuildOptions,
-        common::stages::{helpers, PipelineStage},
+        common::stages::{helpers, BuildStage},
         context::{
-            ClientSelection, ExecutionPlan, ExecutionPlanKind, PreparationOutput, RequestContext,
+            AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
+            PreparationOutput, RequestContext,
         },
         multimodal::{assemble_multimodal_data, assemble_multimodal_data_after_encode},
+        spec::{MessagesResponseSpec, ResponseSpec},
         utils,
     },
 };
@@ -37,12 +39,12 @@ impl MessageRequestBuildingStage {
 }
 
 #[async_trait]
-impl PipelineStage for MessageRequestBuildingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+impl BuildStage for MessageRequestBuildingStage {
+    async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         // Take preparation state (last consumer — worker_selection already ran)
         let prep = ctx.state.preparation.take().ok_or_else(|| {
             error!(
-                function = "MessageRequestBuildingStage::execute",
+                function = "MessageRequestBuildingStage::build",
                 "Preparation not completed"
             );
             error::internal_error("preparation_not_completed", "Preparation not completed")
@@ -50,7 +52,7 @@ impl PipelineStage for MessageRequestBuildingStage {
 
         let clients = ctx.state.clients.as_ref().ok_or_else(|| {
             error!(
-                function = "MessageRequestBuildingStage::execute",
+                function = "MessageRequestBuildingStage::build",
                 "Client acquisition not completed"
             );
             error::internal_error(
@@ -82,7 +84,7 @@ impl PipelineStage for MessageRequestBuildingStage {
 
         // Build message request
         let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
-        let request_id = helpers::resolve_request_id(
+        let (request_id, id_stamp) = helpers::resolve_request_id_stamp(
             &ctx.input.request_type,
             ctx.input.tenant_request_meta.as_ref(),
             "msg_",
@@ -108,7 +110,7 @@ impl PipelineStage for MessageRequestBuildingStage {
                     .await
             };
             Some(assembled.map_err(|e| {
-                error!(function = "MessageRequestBuildingStage::execute", error = %e, "Failed to assemble multimodal request");
+                error!(function = "MessageRequestBuildingStage::build", error = %e, "Failed to assemble multimodal request");
                 error::bad_request("multimodal_not_supported", format!("{e}"))
             })?)
         } else {
@@ -138,13 +140,15 @@ impl PipelineStage for MessageRequestBuildingStage {
                 },
             )
             .map_err(|e| {
-                error!(function = "MessageRequestBuildingStage::execute", error = %e, "Failed to build generate request");
+                error!(function = "MessageRequestBuildingStage::build", error = %e, "Failed to build generate request");
                 error::bad_request("invalid_request_parameters", format!("Invalid request parameters: {e}"))
             })?;
 
-        helpers::apply_sampling_defaults_to_generate_request(
+        let sampling_mask =
+            helpers::SamplingDefaultsMask::from_request_type(&ctx.input.request_type);
+        let sampling_baseline = helpers::apply_sampling_defaults(
             &mut proto_request,
-            &ctx.input.request_type,
+            sampling_mask,
             ctx.state.workers.as_ref(),
         );
 
@@ -173,8 +177,16 @@ impl PipelineStage for MessageRequestBuildingStage {
             helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
         }
 
-        ctx.state.execution_plan = Some(ExecutionPlan::generate(self.plan_kind, proto_request));
-        Ok(None)
+        Ok(BuildOutput {
+            plan: ExecutionPlan::generate(self.plan_kind, proto_request),
+            spec: ResponseSpec::Messages(MessagesResponseSpec::from(messages_request.as_ref())),
+            stamp: AttemptStamp {
+                id: id_stamp,
+                sampling_mask,
+                sampling_baseline,
+                inject_pd_metadata: self.inject_pd_metadata,
+            },
+        })
     }
 
     fn name(&self) -> &'static str {

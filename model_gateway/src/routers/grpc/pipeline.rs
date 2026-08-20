@@ -1,7 +1,14 @@
-//! Pipeline orchestrator for gRPC router request processing
+//! Two-phase pipeline orchestrator for gRPC router request processing.
 //!
-//! This module defines the RequestPipeline orchestrator that coordinates
-//! the execution of pipeline stages from request preparation to response delivery.
+//! Ingress phase (owns the parsed request): preparation → rate-limit reserve
+//! → worker selection → client acquisition → encode (EPD) → request building.
+//! Request building is the terminal consumer: it yields `(ExecutionPlan,
+//! ResponseSpec)` and the request drops at [`RequestContext::into_dispatch`].
+//!
+//! Dispatch phase (no request, by type structure): per-attempt worker
+//! re-selection + dispatch of the retained plan, then response processing.
+//! The plan is held until the retry window closes (first non-retryable
+//! response).
 
 use std::{sync::Arc, time::Instant};
 
@@ -16,10 +23,8 @@ use openai_protocol::{
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::{debug, error};
+use tracing::error;
 
-// Import embedding-specific, classify-specific, messages-specific, and completion-specific stages
-use super::regular::stages::classify::ClassifyResponseProcessingStage;
 use super::{
     common::{responses::ResponsesContext, stages::*},
     context::*,
@@ -28,6 +33,7 @@ use super::{
     regular::{
         processor,
         stages::{
+            classify::ClassifyResponseProcessingStage,
             completion::{
                 CompletionPreparationStage, CompletionRequestBuildingStage,
                 CompletionResponseProcessingStage,
@@ -46,21 +52,26 @@ use super::{
         },
         streaming,
     },
+    spec::ResponseSpec,
     utils,
     utils::error_type_from_status,
 };
 use crate::{
+    config::types::RetryConfig,
     middleware::TenantRequestMeta,
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     policies::PolicyRegistry,
     rate_limit::{RateLimitManager, UsageSettlement},
-    routers::error,
+    routers::{
+        common::retry::{is_retryable_response, BackoffCalculator},
+        error,
+    },
     worker::WorkerRegistry,
 };
 
-/// Which endpoint a pipeline serves. Selects the endpoint-specific stage list
+/// Which endpoint a pipeline serves. Selects the endpoint-specific stage set
 /// (preparation / request-building / response-processing); `Mode` then selects
-/// the disaggregation params within that list.
+/// the disaggregation params within that set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Endpoint {
     Chat,
@@ -195,18 +206,455 @@ impl PipelineDeps {
     }
 }
 
-/// Generic request pipeline for all request types
-///
-/// Orchestrates all stages from request preparation to response delivery.
-/// Configured differently for regular vs PD mode.
+/// The two-phase stage set. Phase ordering is encoded by the struct itself:
+/// ingress stages operate on the request-owning [`RequestContext`], the
+/// process stage on the request-free [`DispatchContext`].
+struct PipelineStages {
+    preparation: Box<dyn PipelineStage>,
+    /// `None` for endpoints that haven't opted into tenant rate limiting
+    /// (embeddings/classify).
+    rate_limit: Option<RateLimitReserveStage>,
+    worker_selection: WorkerSelectionStage,
+    /// EPD-only encode planning/staging.
+    encode: Option<EncodeStage>,
+    request_building: Box<dyn BuildStage>,
+    response_processing: Box<dyn ProcessStage>,
+}
+
+/// Generic request pipeline for all request types.
 #[derive(Clone)]
 pub(crate) struct RequestPipeline {
-    stages: Arc<Vec<Box<dyn PipelineStage>>>,
+    stages: Arc<PipelineStages>,
     /// Backend type for metrics labeling
     backend_type: &'static str,
+    /// Disaggregation mode, for per-leg retry metric labels.
+    mode: Mode,
+}
+
+/// Outcome of one full pipeline run.
+enum RunOutcome {
+    /// Early response (streaming SSE) already produced by response processing.
+    Early(Response),
+    /// Buffered completion: the final response (or responses-iteration state)
+    /// sits on the dispatch context; the Instant is the successful attempt's
+    /// start, for duration metrics.
+    Final(Box<DispatchContext>, Instant),
 }
 
 impl RequestPipeline {
+    /// Build the pipeline for `endpoint` in the given disaggregation `mode`,
+    /// mapping `mode` to the per-stage worker-selection, execution-plan, and
+    /// PD-injection params. `None` for endpoint/mode combinations that have no
+    /// pipeline: Harmony has no EPD variant, and embeddings/classify are
+    /// single-worker only.
+    pub(crate) fn build(endpoint: Endpoint, mode: Mode, deps: &PipelineDeps) -> Option<Self> {
+        // PD and EPD are both served by the "pd" backend metrics bucket; only
+        // plain Regular reports as "regular".
+        let backend = match mode {
+            Mode::Regular => metrics_labels::BACKEND_REGULAR,
+            Mode::PrefillDecode | Mode::EncodePrefillDecode => metrics_labels::BACKEND_PD,
+        };
+        let worker_selection = WorkerSelectionStage::new(
+            deps.worker_registry.clone(),
+            deps.policy_registry.clone(),
+            mode.worker_selection(),
+        );
+        let plan_kind = mode.plan_kind();
+        let inject_pd_metadata = mode.inject_pd_metadata();
+        let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);
+        let rate_limit = || RateLimitReserveStage::new(deps.rate_limit_manager.clone());
+
+        let stages = match endpoint {
+            Endpoint::Chat => {
+                let (processor, streaming_processor) = deps.configured_processors(backend);
+                PipelineStages {
+                    preparation: Box::new(ChatGeneratePreparationStage::new()),
+                    rate_limit: Some(rate_limit()),
+                    worker_selection,
+                    encode,
+                    request_building: Box::new(ChatGenerateRequestBuildingStage::new(
+                        inject_pd_metadata,
+                        plan_kind,
+                    )),
+                    response_processing: Box::new(ChatGenerateResponseProcessingStage::new(
+                        processor,
+                        streaming_processor,
+                    )),
+                }
+            }
+            Endpoint::Messages => {
+                let (processor, streaming_processor) = deps.configured_processors(backend);
+                PipelineStages {
+                    preparation: Box::new(MessagePreparationStage),
+                    rate_limit: Some(rate_limit()),
+                    worker_selection,
+                    encode,
+                    request_building: Box::new(MessageRequestBuildingStage::new(
+                        inject_pd_metadata,
+                        plan_kind,
+                    )),
+                    response_processing: Box::new(MessageResponseProcessingStage::new(
+                        processor,
+                        streaming_processor,
+                    )),
+                }
+            }
+            Endpoint::Completion => {
+                // Completion uses default parser factories, not the configured ones.
+                let (processor, streaming_processor) = PipelineDeps::default_processors(backend);
+                PipelineStages {
+                    preparation: Box::new(CompletionPreparationStage),
+                    rate_limit: Some(rate_limit()),
+                    worker_selection,
+                    encode,
+                    request_building: Box::new(CompletionRequestBuildingStage::new(
+                        inject_pd_metadata,
+                        plan_kind,
+                    )),
+                    response_processing: Box::new(CompletionResponseProcessingStage::new(
+                        processor,
+                        streaming_processor,
+                    )),
+                }
+            }
+            Endpoint::Harmony => {
+                // Harmony has no EPD variant.
+                if matches!(mode, Mode::EncodePrefillDecode) {
+                    return None;
+                }
+                PipelineStages {
+                    preparation: Box::new(harmony::stages::HarmonyPreparationStage::new()),
+                    rate_limit: Some(rate_limit()),
+                    worker_selection,
+                    encode: None,
+                    request_building: Box::new(harmony::stages::HarmonyRequestBuildingStage::new(
+                        inject_pd_metadata,
+                        plan_kind,
+                    )),
+                    response_processing: Box::new(
+                        harmony::stages::HarmonyResponseProcessingStage::new(),
+                    ),
+                }
+            }
+            Endpoint::Embeddings => {
+                // Embeddings are single-worker only.
+                if !matches!(mode, Mode::Regular) {
+                    return None;
+                }
+                PipelineStages {
+                    preparation: Box::new(EmbeddingPreparationStage::new()),
+                    rate_limit: None,
+                    worker_selection,
+                    encode: None,
+                    request_building: Box::new(EmbeddingRequestBuildingStage::new()),
+                    response_processing: Box::new(EmbeddingResponseProcessingStage::new()),
+                }
+            }
+            Endpoint::Classify => {
+                // Classify is single-worker only.
+                if !matches!(mode, Mode::Regular) {
+                    return None;
+                }
+                PipelineStages {
+                    preparation: Box::new(EmbeddingPreparationStage::new()),
+                    rate_limit: None,
+                    worker_selection,
+                    encode: None,
+                    request_building: Box::new(EmbeddingRequestBuildingStage::new()),
+                    response_processing: Box::new(ClassifyResponseProcessingStage::new()),
+                }
+            }
+        };
+
+        Some(Self {
+            stages: Arc::new(stages),
+            backend_type: backend,
+            mode,
+        })
+    }
+
+    /// Ingress phase: run the request-owning stages through request building.
+    async fn run_ingress(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
+        macro_rules! step {
+            ($stage:expr, $result:expr) => {
+                $result.inspect_err(|response: &Response| {
+                    error!("Stage {} failed with status {}", $stage, response.status());
+                })
+            };
+        }
+
+        let stages = &self.stages;
+        step!(
+            stages.preparation.name(),
+            stages.preparation.execute(ctx).await
+        )?;
+        if let Some(rate_limit) = &stages.rate_limit {
+            step!(rate_limit.name(), rate_limit.execute(ctx).await)?;
+        }
+        step!(
+            stages.worker_selection.name(),
+            stages.worker_selection.execute(ctx).await
+        )?;
+        let workers = ctx.state.workers.as_ref().ok_or_else(|| {
+            error!(function = "run_ingress", "Worker selection not completed");
+            error::internal_error(
+                "worker_selection_not_completed",
+                "Worker selection not completed",
+            )
+        })?;
+        ctx.state.clients = Some(step!(
+            "ClientAcquisition",
+            acquire_clients(workers, &ctx.input.model_id).await
+        )?);
+        if let Some(encode) = &stages.encode {
+            step!(encode.name(), encode.execute(ctx).await)?;
+        }
+        step!(
+            stages.request_building.name(),
+            stages.request_building.build(ctx).await
+        )
+    }
+
+    /// One dispatch attempt: (re-)selection for retries, plan stamping,
+    /// dispatch metadata, execution, response processing.
+    async fn run_attempt(
+        &self,
+        dctx: &mut DispatchContext,
+        plan: &mut Option<ExecutionPlan>,
+        spec: &ResponseSpec,
+        stamp: &AttemptStamp,
+        attempt: u32,
+        last_attempt: bool,
+    ) -> Result<Option<Response>, Response> {
+        if attempt > 0 {
+            // Fresh worker selection per attempt; the retained plan is
+            // re-stamped (engine ids, sampling defaults, PD rooms) for the
+            // new workers. Buffered decode state from the failed attempt is
+            // reset.
+            self.stages.worker_selection.reselect(dctx)?;
+            let workers = dctx.workers.as_ref().ok_or_else(|| {
+                error!(
+                    function = "run_attempt",
+                    "Worker re-selection not completed"
+                );
+                error::internal_error(
+                    "worker_selection_not_completed",
+                    "Worker selection not completed",
+                )
+            })?;
+            dctx.clients = Some(acquire_clients(workers, &dctx.model_id).await?);
+            if let Some(plan) = plan.as_mut() {
+                helpers::restamp_plan_for_attempt(plan, stamp, workers)?;
+            }
+            if let Some(decoder) = dctx.response.stop_decoder.as_mut() {
+                decoder.reset();
+            }
+            dctx.response.execution_result = None;
+        }
+
+        // The last allowed attempt moves the plan (no clone); earlier
+        // attempts dispatch a clone and retain the original for replay.
+        let attempt_plan = if last_attempt {
+            plan.take()
+        } else {
+            plan.clone()
+        }
+        .ok_or_else(|| {
+            error!(function = "run_attempt", "Execution plan already consumed");
+            error::internal_error("execution_plan_consumed", "Execution plan already consumed")
+        })?;
+
+        dctx.dispatch = Some(prepare_dispatch_metadata(
+            &attempt_plan,
+            &dctx.dispatch_model,
+            dctx.workers.as_ref(),
+        ));
+
+        execute_plan(dctx, attempt_plan).await?;
+        self.stages
+            .response_processing
+            .process(dctx, spec.clone())
+            .await
+            .inspect_err(|response| {
+                error!(
+                    "Stage {} failed with status {}",
+                    self.stages.response_processing.name(),
+                    response.status()
+                );
+            })
+    }
+
+    /// Full two-phase run. `metrics_endpoint` enables per-attempt
+    /// router-request/error/duration recording (the responses-internal entry
+    /// points pass `None`, matching their historical behavior); `retry_config`
+    /// enables the dispatch-phase retry loop. Callers `Box::pin` this future:
+    /// it holds ingress + per-attempt state across awaits.
+    async fn run(
+        &self,
+        mut ctx: RequestContext,
+        metrics_endpoint: Option<&'static str>,
+        retry_config: Option<&RetryConfig>,
+    ) -> Result<RunOutcome, Response> {
+        let mut attempt_start = Instant::now();
+        if let Some(endpoint) = metrics_endpoint {
+            Metrics::record_router_request(
+                metrics_labels::ROUTER_GRPC,
+                self.backend_type,
+                metrics_labels::CONNECTION_GRPC,
+                &ctx.input.model_id,
+                endpoint,
+                bool_to_static_str(ctx.is_streaming()),
+            );
+        }
+
+        let build = match self.run_ingress(&mut ctx).await {
+            Ok(build) => build,
+            Err(response) => {
+                self.record_error(metrics_endpoint, &ctx.input.model_id, &response);
+                return Err(response);
+            }
+        };
+        let BuildOutput { plan, spec, stamp } = build;
+
+        // Build boundary: the parsed request drops inside into_dispatch —
+        // the dispatch phase has no field that could carry it. The built
+        // plan's wire size stands in for the released buffers.
+        let model_id = ctx.input.model_id.clone();
+        let mut dctx = match ctx.into_dispatch() {
+            Ok(dctx) => Box::new(dctx),
+            Err(response) => {
+                self.record_error(metrics_endpoint, &model_id, &response);
+                return Err(response);
+            }
+        };
+        Metrics::record_request_buffers_released_early(plan.wire_len());
+
+        let max_attempts = retry_config.map_or(1, |config| config.max_retries.max(1));
+        let mut plan = Some(plan);
+        let mut attempt: u32 = 0;
+        loop {
+            if attempt > 0 {
+                attempt_start = Instant::now();
+                if let Some(endpoint) = metrics_endpoint {
+                    Metrics::record_router_request(
+                        metrics_labels::ROUTER_GRPC,
+                        self.backend_type,
+                        metrics_labels::CONNECTION_GRPC,
+                        &dctx.model_id,
+                        endpoint,
+                        bool_to_static_str(dctx.streaming),
+                    );
+                }
+            }
+
+            let last_attempt = attempt + 1 >= max_attempts;
+            let failure = match self
+                .run_attempt(&mut dctx, &mut plan, &spec, &stamp, attempt, last_attempt)
+                .await
+            {
+                Ok(Some(response)) => {
+                    if let Some(endpoint) = metrics_endpoint {
+                        Metrics::record_router_duration(
+                            metrics_labels::ROUTER_GRPC,
+                            self.backend_type,
+                            metrics_labels::CONNECTION_GRPC,
+                            &dctx.model_id,
+                            endpoint,
+                            attempt_start.elapsed(),
+                        );
+                    }
+                    return Ok(RunOutcome::Early(response));
+                }
+                Ok(None) => return Ok(RunOutcome::Final(dctx, attempt_start)),
+                Err(response) => response,
+            };
+
+            self.record_error(metrics_endpoint, &dctx.model_id, &failure);
+            error!(
+                attempt,
+                status = %failure.status(),
+                "pipeline attempt failed"
+            );
+            // The failed attempt's worker load must not stay elevated through
+            // the backoff window (a fresh context dropped them here before).
+            dctx.load_guards = None;
+
+            let Some(config) = retry_config else {
+                return Err(failure);
+            };
+            if !is_retryable_response(&failure) {
+                return Err(failure);
+            }
+            if last_attempt {
+                if let Some(endpoint) = metrics_endpoint {
+                    self.record_retries_exhausted(endpoint);
+                }
+                return Err(failure);
+            }
+
+            let next_attempt = attempt + 1;
+            let delay = BackoffCalculator::calculate_delay(config, attempt);
+            if let Some(endpoint) = metrics_endpoint {
+                self.record_retry(endpoint);
+                Metrics::record_worker_retry_backoff(next_attempt, delay);
+            }
+            tokio::time::sleep(delay).await;
+            attempt = next_attempt;
+        }
+    }
+
+    fn record_error(&self, endpoint: Option<&'static str>, model: &str, response: &Response) {
+        if let Some(endpoint) = endpoint {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_GRPC,
+                self.backend_type,
+                metrics_labels::CONNECTION_GRPC,
+                model,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
+        }
+    }
+
+    /// Retry metrics for one backoff, labeled per mode: Regular emits a single
+    /// `regular` worker label; PD/EPD emit `prefill` and `decode` (never
+    /// `encode`).
+    fn record_retry(&self, endpoint: &'static str) {
+        match self.mode {
+            Mode::Regular => {
+                Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+            }
+            Mode::PrefillDecode | Mode::EncodePrefillDecode => {
+                Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
+                Metrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
+            }
+        }
+    }
+
+    /// Record retry-exhaustion metrics, labeled per mode (see [`Self::record_retry`]).
+    fn record_retries_exhausted(&self, endpoint: &'static str) {
+        match self.mode {
+            Mode::Regular => {
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
+            }
+            Mode::PrefillDecode | Mode::EncodePrefillDecode => {
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
+            }
+        }
+    }
+
+    fn record_duration(&self, endpoint: &'static str, model: &str, start: Instant) {
+        Metrics::record_router_duration(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_type,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            endpoint,
+            start.elapsed(),
+        );
+    }
+
     fn wrong_response_type(
         &self,
         function: &'static str,
@@ -231,6 +679,24 @@ impl RequestPipeline {
         error::internal_error("wrong_response_type", "Internal error: wrong response type")
     }
 
+    fn no_response_produced(
+        &self,
+        function: &'static str,
+        model: &str,
+        endpoint: &'static str,
+    ) -> Response {
+        error!(function = function, "No response produced by pipeline");
+        Metrics::record_router_error(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_type,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            endpoint,
+            metrics_labels::ERROR_INTERNAL,
+        );
+        error::internal_error("no_response_produced", "No response produced")
+    }
+
     /// Settle a non-streaming success's reservation with real usage, if this
     /// logical request reserved one. No-op if the cell is unset (feature
     /// disabled or endpoint opted out) or was never admitted (e.g. prep
@@ -252,199 +718,8 @@ impl RequestPipeline {
             .await;
     }
 
-    fn no_response_produced(
-        &self,
-        function: &'static str,
-        model: &str,
-        endpoint: &'static str,
-    ) -> Response {
-        error!(function = function, "No response produced by pipeline");
-        Metrics::record_router_error(
-            metrics_labels::ROUTER_GRPC,
-            self.backend_type,
-            metrics_labels::CONNECTION_GRPC,
-            model,
-            endpoint,
-            metrics_labels::ERROR_INTERNAL,
-        );
-        error::internal_error("no_response_produced", "No response produced")
-    }
-
-    /// Build the pipeline for `endpoint` in the given disaggregation `mode`,
-    /// mapping `mode` to the per-stage worker-selection, execution-plan, and
-    /// PD-injection params. `None` for endpoint/mode combinations that have no
-    /// pipeline: Harmony has no EPD variant, and embeddings/classify are
-    /// single-worker only.
-    pub(crate) fn build(endpoint: Endpoint, mode: Mode, deps: &PipelineDeps) -> Option<Self> {
-        // PD and EPD are both served by the "pd" backend metrics bucket; only
-        // plain Regular reports as "regular".
-        let backend = match mode {
-            Mode::Regular => metrics_labels::BACKEND_REGULAR,
-            Mode::PrefillDecode | Mode::EncodePrefillDecode => metrics_labels::BACKEND_PD,
-        };
-        let worker_selection = mode.worker_selection();
-        let plan_kind = mode.plan_kind();
-        let inject_pd_metadata = mode.inject_pd_metadata();
-
-        let stages: Vec<Box<dyn PipelineStage>> = match endpoint {
-            Endpoint::Chat => {
-                let (processor, streaming_processor) = deps.configured_processors(backend);
-                let mut stages: Vec<Box<dyn PipelineStage>> = vec![
-                    Box::new(ChatGeneratePreparationStage::new()),
-                    Box::new(RateLimitReserveStage::new(deps.rate_limit_manager.clone())),
-                    Box::new(WorkerSelectionStage::new(
-                        deps.worker_registry.clone(),
-                        deps.policy_registry.clone(),
-                        worker_selection,
-                    )),
-                    Box::new(ClientAcquisitionStage),
-                ];
-                if matches!(mode, Mode::EncodePrefillDecode) {
-                    stages.push(Box::new(EncodeStage::new()));
-                }
-                stages.extend([
-                    Box::new(ChatGenerateRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
-                    )) as Box<dyn PipelineStage>,
-                    Box::new(DispatchMetadataStage),
-                    Box::new(RequestExecutionStage::new()),
-                    Box::new(ChatGenerateResponseProcessingStage::new(
-                        processor,
-                        streaming_processor,
-                    )),
-                ]);
-                stages
-            }
-            Endpoint::Messages => {
-                let (processor, streaming_processor) = deps.configured_processors(backend);
-                let mut stages: Vec<Box<dyn PipelineStage>> = vec![
-                    Box::new(MessagePreparationStage),
-                    Box::new(RateLimitReserveStage::new(deps.rate_limit_manager.clone())),
-                    Box::new(WorkerSelectionStage::new(
-                        deps.worker_registry.clone(),
-                        deps.policy_registry.clone(),
-                        worker_selection,
-                    )),
-                    Box::new(ClientAcquisitionStage),
-                ];
-                if matches!(mode, Mode::EncodePrefillDecode) {
-                    stages.push(Box::new(EncodeStage::new()));
-                }
-                stages.extend([
-                    Box::new(MessageRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
-                    )) as Box<dyn PipelineStage>,
-                    Box::new(DispatchMetadataStage),
-                    Box::new(RequestExecutionStage::new()),
-                    Box::new(MessageResponseProcessingStage::new(
-                        processor,
-                        streaming_processor,
-                    )),
-                ]);
-                stages
-            }
-            Endpoint::Completion => {
-                // Completion uses default parser factories, not the configured ones.
-                let (processor, streaming_processor) = PipelineDeps::default_processors(backend);
-                let mut stages: Vec<Box<dyn PipelineStage>> = vec![
-                    Box::new(CompletionPreparationStage),
-                    Box::new(RateLimitReserveStage::new(deps.rate_limit_manager.clone())),
-                    Box::new(WorkerSelectionStage::new(
-                        deps.worker_registry.clone(),
-                        deps.policy_registry.clone(),
-                        worker_selection,
-                    )),
-                    Box::new(ClientAcquisitionStage),
-                ];
-                if matches!(mode, Mode::EncodePrefillDecode) {
-                    stages.push(Box::new(EncodeStage::new()));
-                }
-                stages.extend([
-                    Box::new(CompletionRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
-                    )) as Box<dyn PipelineStage>,
-                    Box::new(DispatchMetadataStage),
-                    Box::new(RequestExecutionStage::new()),
-                    Box::new(CompletionResponseProcessingStage::new(
-                        processor,
-                        streaming_processor,
-                    )),
-                ]);
-                stages
-            }
-            Endpoint::Harmony => {
-                // Harmony has no EPD variant.
-                if matches!(mode, Mode::EncodePrefillDecode) {
-                    return None;
-                }
-                vec![
-                    Box::new(harmony::stages::HarmonyPreparationStage::new()),
-                    Box::new(RateLimitReserveStage::new(deps.rate_limit_manager.clone())),
-                    Box::new(WorkerSelectionStage::new(
-                        deps.worker_registry.clone(),
-                        deps.policy_registry.clone(),
-                        worker_selection,
-                    )),
-                    Box::new(ClientAcquisitionStage),
-                    Box::new(harmony::stages::HarmonyRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
-                    )),
-                    Box::new(DispatchMetadataStage),
-                    Box::new(RequestExecutionStage::new()),
-                    Box::new(harmony::stages::HarmonyResponseProcessingStage::new()),
-                ]
-            }
-            Endpoint::Embeddings => {
-                // Embeddings are single-worker only.
-                if !matches!(mode, Mode::Regular) {
-                    return None;
-                }
-                vec![
-                    Box::new(EmbeddingPreparationStage::new()),
-                    Box::new(WorkerSelectionStage::new(
-                        deps.worker_registry.clone(),
-                        deps.policy_registry.clone(),
-                        worker_selection,
-                    )),
-                    Box::new(ClientAcquisitionStage),
-                    Box::new(EmbeddingRequestBuildingStage::new()),
-                    Box::new(DispatchMetadataStage),
-                    Box::new(RequestExecutionStage::new()),
-                    Box::new(EmbeddingResponseProcessingStage::new()),
-                ]
-            }
-            Endpoint::Classify => {
-                // Classify is single-worker only.
-                if !matches!(mode, Mode::Regular) {
-                    return None;
-                }
-                vec![
-                    Box::new(EmbeddingPreparationStage::new()),
-                    Box::new(WorkerSelectionStage::new(
-                        deps.worker_registry.clone(),
-                        deps.policy_registry.clone(),
-                        worker_selection,
-                    )),
-                    Box::new(ClientAcquisitionStage),
-                    Box::new(EmbeddingRequestBuildingStage::new()),
-                    Box::new(DispatchMetadataStage),
-                    Box::new(RequestExecutionStage::new()),
-                    Box::new(ClassifyResponseProcessingStage::new()),
-                ]
-            }
-        };
-
-        Some(Self {
-            stages: Arc::new(stages),
-            backend_type: backend,
-        })
-    }
-
     /// Execute the complete pipeline for a chat request
+    #[expect(clippy::too_many_arguments)]
     pub async fn execute_chat(
         &self,
         request: Arc<ChatCompletionRequest>,
@@ -453,97 +728,42 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
         rate_limit_cell: Option<Arc<RateLimitCell>>,
+        retry_config: Option<&RetryConfig>,
     ) -> Response {
-        let start = Instant::now();
-        let streaming = request.stream;
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
         ctx.input.rate_limit_cell = rate_limit_cell;
-        let model = ctx.input.model_id.clone();
 
-        // Record request start
-        Metrics::record_router_request(
-            metrics_labels::ROUTER_GRPC,
-            self.backend_type,
-            metrics_labels::CONNECTION_GRPC,
-            &model,
-            metrics_labels::ENDPOINT_CHAT,
-            bool_to_static_str(streaming),
-        );
-
-        for stage in self.stages.iter() {
-            match stage.execute(&mut ctx).await {
-                Ok(Some(response)) => {
-                    // Stage completed with streaming response - record success and return
-                    Metrics::record_router_duration(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &model,
-                        metrics_labels::ENDPOINT_CHAT,
-                        start.elapsed(),
-                    );
-                    return response;
+        const ENDPOINT: &str = metrics_labels::ENDPOINT_CHAT;
+        match Box::pin(self.run(ctx, Some(ENDPOINT), retry_config)).await {
+            Ok(RunOutcome::Early(response)) => response,
+            Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
+                Some(FinalResponse::Chat(response)) => {
+                    let usage = response.usage.as_ref();
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        usage.map_or(0, |u| u.prompt_tokens),
+                        usage.map_or(0, |u| u.completion_tokens),
+                    )
+                    .await;
+                    self.record_duration(ENDPOINT, &dctx.model_id, start);
+                    axum::Json(response).into_response()
                 }
-                Ok(None) => continue,
-                Err(response) => {
-                    Metrics::record_router_error(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &model,
-                        metrics_labels::ENDPOINT_CHAT,
-                        error_type_from_status(response.status()),
-                    );
-                    error!(
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
-                    return response;
-                }
-            }
-        }
-
-        match ctx.state.response.final_response {
-            Some(FinalResponse::Chat(response)) => {
-                let usage = response.usage.as_ref();
-                Self::settle_reservation(
-                    ctx.input.rate_limit_cell.as_deref(),
-                    usage.map_or(0, |u| u.prompt_tokens),
-                    usage.map_or(0, |u| u.completion_tokens),
-                )
-                .await;
-                Metrics::record_router_duration(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    &model,
-                    metrics_labels::ENDPOINT_CHAT,
-                    start.elapsed(),
-                );
-                axum::Json(response).into_response()
-            }
-            Some(
-                response_type @ (FinalResponse::Generate(_)
-                | FinalResponse::Completion(_)
-                | FinalResponse::Embedding(_)
-                | FinalResponse::Classify(_)
-                | FinalResponse::Messages(_)),
-            ) => self.wrong_response_type(
-                "execute_chat",
-                "Chat",
-                &response_type,
-                &model,
-                metrics_labels::ENDPOINT_CHAT,
-            ),
-            None => {
-                self.no_response_produced("execute_chat", &model, metrics_labels::ENDPOINT_CHAT)
-            }
+                Some(other) => self.wrong_response_type(
+                    "execute_chat",
+                    "Chat",
+                    &other,
+                    &dctx.model_id,
+                    ENDPOINT,
+                ),
+                None => self.no_response_produced("execute_chat", &dctx.model_id, ENDPOINT),
+            },
+            Err(response) => response,
         }
     }
 
     /// Execute the complete pipeline for a generate request
+    #[expect(clippy::too_many_arguments)]
     pub async fn execute_generate(
         &self,
         request: Arc<GenerateRequest>,
@@ -552,100 +772,45 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
         rate_limit_cell: Option<Arc<RateLimitCell>>,
+        retry_config: Option<&RetryConfig>,
     ) -> Response {
-        let start = Instant::now();
-        let streaming = request.stream;
         let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
         ctx.input.rate_limit_cell = rate_limit_cell;
-        let model_id = ctx.input.model_id.clone();
 
-        // Record request start
-        Metrics::record_router_request(
-            metrics_labels::ROUTER_GRPC,
-            self.backend_type,
-            metrics_labels::CONNECTION_GRPC,
-            &model_id,
-            metrics_labels::ENDPOINT_GENERATE,
-            bool_to_static_str(streaming),
-        );
-
-        for stage in self.stages.iter() {
-            match stage.execute(&mut ctx).await {
-                Ok(Some(response)) => {
-                    Metrics::record_router_duration(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &model_id,
-                        metrics_labels::ENDPOINT_GENERATE,
-                        start.elapsed(),
-                    );
-                    return response;
+        const ENDPOINT: &str = metrics_labels::ENDPOINT_GENERATE;
+        match Box::pin(self.run(ctx, Some(ENDPOINT), retry_config)).await {
+            Ok(RunOutcome::Early(response)) => response,
+            Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
+                Some(FinalResponse::Generate(response)) => {
+                    let actual_input_tokens =
+                        response.first().map_or(0, |r| r.meta_info.prompt_tokens);
+                    let completion_tokens =
+                        response.iter().map(|r| r.meta_info.completion_tokens).sum();
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        actual_input_tokens,
+                        completion_tokens,
+                    )
+                    .await;
+                    self.record_duration(ENDPOINT, &dctx.model_id, start);
+                    axum::Json(response).into_response()
                 }
-                Ok(None) => continue,
-                Err(response) => {
-                    Metrics::record_router_error(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &model_id,
-                        metrics_labels::ENDPOINT_GENERATE,
-                        error_type_from_status(response.status()),
-                    );
-                    error!(
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
-                    return response;
-                }
-            }
-        }
-
-        match ctx.state.response.final_response {
-            Some(FinalResponse::Generate(response)) => {
-                let actual_input_tokens = response.first().map_or(0, |r| r.meta_info.prompt_tokens);
-                let completion_tokens =
-                    response.iter().map(|r| r.meta_info.completion_tokens).sum();
-                Self::settle_reservation(
-                    ctx.input.rate_limit_cell.as_deref(),
-                    actual_input_tokens,
-                    completion_tokens,
-                )
-                .await;
-                Metrics::record_router_duration(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    &model_id,
-                    metrics_labels::ENDPOINT_GENERATE,
-                    start.elapsed(),
-                );
-                axum::Json(response).into_response()
-            }
-            Some(
-                response_type @ (FinalResponse::Chat(_)
-                | FinalResponse::Completion(_)
-                | FinalResponse::Embedding(_)
-                | FinalResponse::Classify(_)
-                | FinalResponse::Messages(_)),
-            ) => self.wrong_response_type(
-                "execute_generate",
-                "Generate",
-                &response_type,
-                &model_id,
-                metrics_labels::ENDPOINT_GENERATE,
-            ),
-            None => self.no_response_produced(
-                "execute_generate",
-                &model_id,
-                metrics_labels::ENDPOINT_GENERATE,
-            ),
+                Some(other) => self.wrong_response_type(
+                    "execute_generate",
+                    "Generate",
+                    &other,
+                    &dctx.model_id,
+                    ENDPOINT,
+                ),
+                None => self.no_response_produced("execute_generate", &dctx.model_id, ENDPOINT),
+            },
+            Err(response) => response,
         }
     }
 
     /// Execute the complete pipeline for a completion request
+    #[expect(clippy::too_many_arguments)]
     pub async fn execute_completion(
         &self,
         request: Arc<CompletionRequest>,
@@ -654,93 +819,80 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
         rate_limit_cell: Option<Arc<RateLimitCell>>,
+        retry_config: Option<&RetryConfig>,
     ) -> Response {
-        let start = Instant::now();
-        let streaming = request.stream;
         let mut ctx = RequestContext::for_completion(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
         ctx.input.rate_limit_cell = rate_limit_cell;
-        let model = ctx.input.model_id.clone();
 
-        Metrics::record_router_request(
-            metrics_labels::ROUTER_GRPC,
-            self.backend_type,
-            metrics_labels::CONNECTION_GRPC,
-            &model,
-            metrics_labels::ENDPOINT_COMPLETIONS,
-            bool_to_static_str(streaming),
-        );
-
-        for stage in self.stages.iter() {
-            match stage.execute(&mut ctx).await {
-                Ok(Some(response)) => {
-                    Metrics::record_router_duration(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &model,
-                        metrics_labels::ENDPOINT_COMPLETIONS,
-                        start.elapsed(),
-                    );
-                    return response;
+        const ENDPOINT: &str = metrics_labels::ENDPOINT_COMPLETIONS;
+        match Box::pin(self.run(ctx, Some(ENDPOINT), retry_config)).await {
+            Ok(RunOutcome::Early(response)) => response,
+            Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
+                Some(FinalResponse::Completion(response)) => {
+                    let usage = response.usage.as_ref();
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        usage.map_or(0, |u| u.prompt_tokens),
+                        usage.map_or(0, |u| u.completion_tokens),
+                    )
+                    .await;
+                    self.record_duration(ENDPOINT, &dctx.model_id, start);
+                    axum::Json(response).into_response()
                 }
-                Ok(None) => continue,
-                Err(response) => {
-                    Metrics::record_router_error(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &model,
-                        metrics_labels::ENDPOINT_COMPLETIONS,
-                        error_type_from_status(response.status()),
-                    );
-                    error!(
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
-                    return response;
-                }
-            }
+                Some(other) => self.wrong_response_type(
+                    "execute_completion",
+                    "Completion",
+                    &other,
+                    &dctx.model_id,
+                    ENDPOINT,
+                ),
+                None => self.no_response_produced("execute_completion", &dctx.model_id, ENDPOINT),
+            },
+            Err(response) => response,
         }
+    }
 
-        match ctx.state.response.final_response {
-            Some(FinalResponse::Completion(response)) => {
-                let usage = response.usage.as_ref();
-                Self::settle_reservation(
-                    ctx.input.rate_limit_cell.as_deref(),
-                    usage.map_or(0, |u| u.prompt_tokens),
-                    usage.map_or(0, |u| u.completion_tokens),
-                )
-                .await;
-                Metrics::record_router_duration(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    &model,
-                    metrics_labels::ENDPOINT_COMPLETIONS,
-                    start.elapsed(),
-                );
-                axum::Json(response).into_response()
-            }
-            Some(
-                response_type @ (FinalResponse::Chat(_)
-                | FinalResponse::Generate(_)
-                | FinalResponse::Embedding(_)
-                | FinalResponse::Classify(_)
-                | FinalResponse::Messages(_)),
-            ) => self.wrong_response_type(
-                "execute_completion",
-                "Completion",
-                &response_type,
-                &model,
-                metrics_labels::ENDPOINT_COMPLETIONS,
-            ),
-            None => self.no_response_produced(
-                "execute_completion",
-                &model,
-                metrics_labels::ENDPOINT_COMPLETIONS,
-            ),
+    /// Execute the complete pipeline for a Messages API request
+    #[expect(clippy::too_many_arguments)]
+    pub async fn execute_messages(
+        &self,
+        request: Arc<CreateMessageRequest>,
+        headers: Option<http::HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+        tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
+        retry_config: Option<&RetryConfig>,
+    ) -> Response {
+        let mut ctx = RequestContext::for_messages(request, headers, model_id, components);
+        ctx.input.tenant_request_meta = tenant_request_meta;
+        ctx.input.rate_limit_cell = rate_limit_cell;
+
+        const ENDPOINT: &str = metrics_labels::ENDPOINT_MESSAGES;
+        match Box::pin(self.run(ctx, Some(ENDPOINT), retry_config)).await {
+            Ok(RunOutcome::Early(response)) => response,
+            Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
+                Some(FinalResponse::Messages(response)) => {
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        response.usage.input_tokens,
+                        response.usage.output_tokens,
+                    )
+                    .await;
+                    self.record_duration(ENDPOINT, &dctx.model_id, start);
+                    axum::Json(response).into_response()
+                }
+                Some(other) => self.wrong_response_type(
+                    "execute_messages",
+                    "Messages",
+                    &other,
+                    &dctx.model_id,
+                    ENDPOINT,
+                ),
+                None => self.no_response_produced("execute_messages", &dctx.model_id, ENDPOINT),
+            },
+            Err(response) => response,
         }
     }
 
@@ -755,94 +907,25 @@ impl RequestPipeline {
     ) -> Response {
         let mut ctx = RequestContext::for_embedding(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
-        let model_id = ctx.input.model_id.clone();
-        debug!(
-            "execute_embeddings: Starting execution for model: {}",
-            &model_id
-        );
-        let start = Instant::now();
 
-        // Record request start
-        Metrics::record_router_request(
-            metrics_labels::ROUTER_GRPC,
-            self.backend_type,
-            metrics_labels::CONNECTION_GRPC,
-            &model_id,
-            metrics_labels::ENDPOINT_EMBEDDINGS,
-            bool_to_static_str(false),
-        );
-
-        for stage in self.stages.iter() {
-            debug!("execute_embeddings: Executing stage: {}", stage.name());
-            match stage.execute(&mut ctx).await {
-                Ok(Some(response)) => {
-                    debug!(
-                        "execute_embeddings: Stage {} returned final response.",
-                        stage.name()
-                    );
-                    Metrics::record_router_duration(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &model_id,
-                        metrics_labels::ENDPOINT_EMBEDDINGS,
-                        start.elapsed(),
-                    );
-                    return response;
+        const ENDPOINT: &str = metrics_labels::ENDPOINT_EMBEDDINGS;
+        match Box::pin(self.run(ctx, Some(ENDPOINT), None)).await {
+            Ok(RunOutcome::Early(response)) => response,
+            Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
+                Some(FinalResponse::Embedding(response)) => {
+                    self.record_duration(ENDPOINT, &dctx.model_id, start);
+                    axum::Json(response).into_response()
                 }
-                Ok(None) => {
-                    debug!(
-                        "execute_embeddings: Stage {} completed, continuing to next stage.",
-                        stage.name()
-                    );
-                    continue;
-                }
-                Err(response) => {
-                    error!(
-                        "execute_embeddings: Stage {} failed with status {:?}, returning error response.",
-                        stage.name(),
-                        response.status()
-                    );
-                    Metrics::record_router_error(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &model_id,
-                        metrics_labels::ENDPOINT_EMBEDDINGS,
-                        error_type_from_status(response.status()),
-                    );
-                    return response;
-                }
-            }
-        }
-
-        debug!(
-            "execute_embeddings: Pipeline finished, processing final_response. Current state: {:?}",
-            ctx.state.response.final_response
-        );
-        match ctx.state.response.final_response {
-            Some(FinalResponse::Embedding(response)) => {
-                Metrics::record_router_duration(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    &model_id,
-                    metrics_labels::ENDPOINT_EMBEDDINGS,
-                    start.elapsed(),
-                );
-                axum::Json(response).into_response()
-            }
-            Some(_) => {
-                error!(function = "execute_embeddings", "Wrong response type");
-                error::internal_error("wrong_response_type", "Internal error: wrong response type")
-            }
-            None => {
-                error!(
-                    function = "execute_embeddings",
-                    "No final response produced by pipeline."
-                );
-                error::internal_error("no_response_produced", "No response produced")
-            }
+                Some(other) => self.wrong_response_type(
+                    "execute_embeddings",
+                    "Embedding",
+                    &other,
+                    &dctx.model_id,
+                    ENDPOINT,
+                ),
+                None => self.no_response_produced("execute_embeddings", &dctx.model_id, ENDPOINT),
+            },
+            Err(response) => response,
         }
     }
 
@@ -857,201 +940,32 @@ impl RequestPipeline {
     ) -> Response {
         let mut ctx = RequestContext::for_classify(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
-        let model_id = ctx.input.model_id.clone();
-        debug!(
-            "execute_classify: Starting execution for model: {}",
-            &model_id
-        );
-        let start = Instant::now();
 
-        // Record request start
-        Metrics::record_router_request(
-            metrics_labels::ROUTER_GRPC,
-            self.backend_type,
-            metrics_labels::CONNECTION_GRPC,
-            &model_id,
-            metrics_labels::ENDPOINT_CLASSIFY,
-            bool_to_static_str(false), // Classify is never streaming
-        );
-
-        for stage in self.stages.iter() {
-            debug!("execute_classify: Executing stage: {}", stage.name());
-            match stage.execute(&mut ctx).await {
-                Ok(Some(response)) => {
-                    debug!(
-                        "execute_classify: Stage {} returned final response.",
-                        stage.name()
-                    );
-                    Metrics::record_router_duration(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &model_id,
-                        metrics_labels::ENDPOINT_CLASSIFY,
-                        start.elapsed(),
-                    );
-                    return response;
+        const ENDPOINT: &str = metrics_labels::ENDPOINT_CLASSIFY;
+        match Box::pin(self.run(ctx, Some(ENDPOINT), None)).await {
+            Ok(RunOutcome::Early(response)) => response,
+            Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
+                Some(FinalResponse::Classify(response)) => {
+                    self.record_duration(ENDPOINT, &dctx.model_id, start);
+                    axum::Json(response).into_response()
                 }
-                Ok(None) => {
-                    debug!(
-                        "execute_classify: Stage {} completed, continuing to next stage.",
-                        stage.name()
-                    );
-                    continue;
-                }
-                Err(response) => {
-                    error!(
-                        "execute_classify: Stage {} failed with status {:?}, returning error response.",
-                        stage.name(),
-                        response.status()
-                    );
-                    Metrics::record_router_error(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &model_id,
-                        metrics_labels::ENDPOINT_CLASSIFY,
-                        error_type_from_status(response.status()),
-                    );
-                    return response;
-                }
-            }
-        }
-
-        debug!(
-            "execute_classify: Pipeline finished, processing final_response. Current state: {:?}",
-            ctx.state.response.final_response
-        );
-        match ctx.state.response.final_response {
-            Some(FinalResponse::Classify(response)) => {
-                Metrics::record_router_duration(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    &model_id,
-                    metrics_labels::ENDPOINT_CLASSIFY,
-                    start.elapsed(),
-                );
-                axum::Json(response).into_response()
-            }
-            Some(_) => {
-                error!(function = "execute_classify", "Wrong response type");
-                error::internal_error("wrong_response_type", "Internal error: wrong response type")
-            }
-            None => {
-                error!(
-                    function = "execute_classify",
-                    "No final response produced by pipeline."
-                );
-                error::internal_error("no_response_produced", "No response produced")
-            }
-        }
-    }
-
-    /// Execute the complete pipeline for a Messages API request
-    pub async fn execute_messages(
-        &self,
-        request: Arc<CreateMessageRequest>,
-        headers: Option<http::HeaderMap>,
-        model_id: String,
-        components: Arc<SharedComponents>,
-        tenant_request_meta: Option<TenantRequestMeta>,
-        rate_limit_cell: Option<Arc<RateLimitCell>>,
-    ) -> Response {
-        let start = Instant::now();
-        let streaming = request.stream.unwrap_or(false);
-        let mut ctx = RequestContext::for_messages(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-        ctx.input.rate_limit_cell = rate_limit_cell;
-        let model = ctx.input.model_id.clone();
-
-        // Record request start
-        Metrics::record_router_request(
-            metrics_labels::ROUTER_GRPC,
-            self.backend_type,
-            metrics_labels::CONNECTION_GRPC,
-            &model,
-            metrics_labels::ENDPOINT_MESSAGES,
-            bool_to_static_str(streaming),
-        );
-
-        for stage in self.stages.iter() {
-            match stage.execute(&mut ctx).await {
-                Ok(Some(response)) => {
-                    // Stage completed with streaming response
-                    Metrics::record_router_duration(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &model,
-                        metrics_labels::ENDPOINT_MESSAGES,
-                        start.elapsed(),
-                    );
-                    return response;
-                }
-                Ok(None) => continue,
-                Err(response) => {
-                    Metrics::record_router_error(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &model,
-                        metrics_labels::ENDPOINT_MESSAGES,
-                        error_type_from_status(response.status()),
-                    );
-                    error!(
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
-                    return response;
-                }
-            }
-        }
-
-        match ctx.state.response.final_response {
-            Some(FinalResponse::Messages(response)) => {
-                Self::settle_reservation(
-                    ctx.input.rate_limit_cell.as_deref(),
-                    response.usage.input_tokens,
-                    response.usage.output_tokens,
-                )
-                .await;
-                Metrics::record_router_duration(
-                    metrics_labels::ROUTER_GRPC,
-                    self.backend_type,
-                    metrics_labels::CONNECTION_GRPC,
-                    &model,
-                    metrics_labels::ENDPOINT_MESSAGES,
-                    start.elapsed(),
-                );
-                axum::Json(response).into_response()
-            }
-            Some(
-                response_type @ (FinalResponse::Chat(_)
-                | FinalResponse::Generate(_)
-                | FinalResponse::Completion(_)
-                | FinalResponse::Embedding(_)
-                | FinalResponse::Classify(_)),
-            ) => self.wrong_response_type(
-                "execute_messages",
-                "Messages",
-                &response_type,
-                &model,
-                metrics_labels::ENDPOINT_MESSAGES,
-            ),
-            None => self.no_response_produced(
-                "execute_messages",
-                &model,
-                metrics_labels::ENDPOINT_MESSAGES,
-            ),
+                Some(other) => self.wrong_response_type(
+                    "execute_classify",
+                    "Classify",
+                    &other,
+                    &dctx.model_id,
+                    ENDPOINT,
+                ),
+                None => self.no_response_produced("execute_classify", &dctx.model_id, ENDPOINT),
+            },
+            Err(response) => response,
         }
     }
 
     /// Execute chat pipeline for responses endpoint
     ///
     /// Used by ALL non-streaming /v1/responses requests.
-    /// Uses the same 7 pipeline stages as execute_chat(), with two differences:
+    /// Same stages as execute_chat(), with two differences:
     /// 1. Returns Result<ChatCompletionResponse, Response> for tool_loop composition
     /// 2. Disallows streaming (responses endpoint uses different SSE format)
     pub async fn execute_chat_for_responses(
@@ -1065,86 +979,56 @@ impl RequestPipeline {
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
 
-        for (idx, stage) in self.stages.iter().enumerate() {
-            match stage.execute(&mut ctx).await {
-                Ok(Some(_response)) => {
-                    // Streaming not supported for responses sync mode
+        match Box::pin(self.run(ctx, None, None)).await {
+            Ok(RunOutcome::Early(_)) => {
+                // Streaming not supported for responses sync mode
+                error!(
+                    function = "execute_chat_for_responses",
+                    "Streaming attempted in responses context"
+                );
+                Err(error::bad_request(
+                    "streaming_not_supported",
+                    "Streaming is not supported in this context".to_string(),
+                ))
+            }
+            Ok(RunOutcome::Final(mut dctx, _)) => match dctx.response.final_response.take() {
+                Some(FinalResponse::Chat(response)) => Ok(response),
+                Some(_) => {
                     error!(
                         function = "execute_chat_for_responses",
-                        "Streaming attempted in responses context"
+                        "Wrong response type: expected Chat"
                     );
-                    return Err(error::bad_request(
-                        "streaming_not_supported",
-                        "Streaming is not supported in this context".to_string(),
-                    ));
+                    Err(error::internal_error(
+                        "wrong_response_type",
+                        "Internal error: wrong response type",
+                    ))
                 }
-                Ok(None) => {
-                    continue;
-                }
-                Err(response) => {
-                    // Error occurred - return the response as-is to preserve HTTP status codes
+                None => {
                     error!(
-                        "Stage {} ({}) failed with status {}",
-                        idx + 1,
-                        stage.name(),
-                        response.status()
+                        function = "execute_chat_for_responses",
+                        "No response produced by pipeline"
                     );
-                    return Err(response);
+                    Err(error::internal_error(
+                        "no_response_produced",
+                        "No response produced",
+                    ))
                 }
-            }
-        }
-
-        match ctx.state.response.final_response {
-            Some(FinalResponse::Chat(response)) => Ok(response),
-            Some(FinalResponse::Generate(_))
-            | Some(FinalResponse::Completion(_))
-            | Some(FinalResponse::Embedding(_))
-            | Some(FinalResponse::Classify(_))
-            | Some(FinalResponse::Messages(_)) => {
-                error!(
-                    function = "execute_chat_for_responses",
-                    "Wrong response type: expected Chat, got Generate/Embedding/Classify/Messages"
-                );
-                Err(error::internal_error(
-                    "wrong_response_type",
-                    "Internal error: wrong response type",
-                ))
-            }
-            None => {
-                error!(
-                    function = "execute_chat_for_responses",
-                    "No response produced by pipeline"
-                );
-                Err(error::internal_error(
-                    "no_response_produced",
-                    "No response produced",
-                ))
-            }
+            },
+            Err(response) => Err(response),
         }
     }
 
-    /// Execute Harmony Responses API request through all pipeline stages
+    /// Execute one Harmony Responses API iteration through the pipeline.
     ///
-    /// This method runs a single iteration of the Responses API request,
-    /// returning either ToolCallsFound (continue serving) or Completed (final response).
-    ///
-    /// Called by harmony::responses::serve_harmony_responses() for each iteration.
-    ///
-    /// # Arguments
-    ///
-    /// * `request` - Responses API request
-    /// * `ctx` - Harmony Responses context with MCP manager and components
-    ///
-    /// # Returns
-    ///
-    /// ResponsesIterationResult indicating whether to continue iteration or return
+    /// Returns ToolCallsFound (continue serving) or Completed (final
+    /// response); called by harmony::responses::serve_harmony_responses()
+    /// per iteration.
     pub async fn execute_harmony_responses(
         &self,
         request: &openai_protocol::responses::ResponsesRequest,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Result<harmony::ResponsesIterationResult, Response> {
-        // Create RequestContext for this Responses request
         let mut ctx = RequestContext::for_responses(
             Arc::new(request.clone()),
             None,                  // No headers needed for internal pipeline execution
@@ -1153,37 +1037,19 @@ impl RequestPipeline {
         );
         ctx.input.tenant_request_meta = tenant_request_meta;
 
-        for (idx, stage) in self.stages.iter().enumerate() {
-            match stage.execute(&mut ctx).await {
-                Ok(Some(response)) => {
-                    // Stage returned early response (e.g., streaming) - not expected for Responses iteration
-                    error!(
-                        "Stage {} ({}) returned unexpected response during Responses iteration",
-                        idx + 1,
-                        stage.name()
-                    );
-                    return Err(response);
-                }
-                Ok(None) => {
-                    continue;
-                }
-                Err(response) => {
-                    // Stage failed
-                    error!(
-                        "Stage {} ({}) failed with status {}",
-                        idx + 1,
-                        stage.name(),
-                        response.status()
-                    );
-                    return Err(response);
-                }
+        let mut dctx = match Box::pin(self.run(ctx, None, None)).await {
+            Ok(RunOutcome::Early(response)) => {
+                error!(
+                    function = "execute_harmony_responses",
+                    "Unexpected early response during Responses iteration"
+                );
+                return Err(response);
             }
-        }
+            Ok(RunOutcome::Final(dctx, _)) => dctx,
+            Err(response) => return Err(response),
+        };
 
-        // Extract ResponsesIterationResult from context
-        // This should have been set by HarmonyResponseProcessingStage
-        ctx.state
-            .response
+        dctx.response
             .responses_iteration_result
             .take()
             .ok_or_else(|| {
@@ -1198,18 +1064,17 @@ impl RequestPipeline {
             })
     }
 
-    /// Execute Harmony Responses pipeline iteration with streaming support
+    /// Execute a Harmony Responses pipeline iteration with streaming support.
     ///
-    /// This version executes the pipeline up to the dispatch stage and returns
-    /// the raw ExecutionResult (with stream) and LoadGuards for token-level streaming processing.
-    /// The caller is responsible for keeping load_guards alive until stream processing completes.
+    /// Runs through dispatch and returns the raw ExecutionResult (with
+    /// stream) and LoadGuards for token-level streaming processing. The
+    /// caller keeps load_guards alive until stream processing completes.
     pub async fn execute_harmony_responses_streaming(
         &self,
         request: &openai_protocol::responses::ResponsesRequest,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Result<(ExecutionResult, Option<LoadGuards>), Response> {
-        // Create RequestContext for this Responses request
         let mut ctx = RequestContext::for_responses(
             Arc::new(request.clone()),
             None,
@@ -1218,31 +1083,19 @@ impl RequestPipeline {
         );
         ctx.input.tenant_request_meta = tenant_request_meta;
 
-        for (idx, stage) in self.stages.iter().enumerate() {
-            match stage.execute(&mut ctx).await {
-                Ok(Some(response)) => {
-                    error!(
-                        "Stage {} ({}) returned unexpected response during streaming Responses",
-                        idx + 1,
-                        stage.name()
-                    );
-                    return Err(response);
-                }
-                Ok(None) => continue,
-                Err(response) => {
-                    error!(
-                        "Stage {} ({}) failed with status {}",
-                        idx + 1,
-                        stage.name(),
-                        response.status()
-                    );
-                    return Err(response);
-                }
+        let mut dctx = match Box::pin(self.run(ctx, None, None)).await {
+            Ok(RunOutcome::Early(response)) => {
+                error!(
+                    function = "execute_harmony_responses_streaming",
+                    "Unexpected early response during streaming Responses"
+                );
+                return Err(response);
             }
-        }
+            Ok(RunOutcome::Final(dctx, _)) => dctx,
+            Err(response) => return Err(response),
+        };
 
-        // Extract execution_result (the raw stream from workers) and load_guards
-        let execution_result = ctx.state.response.execution_result.take().ok_or_else(|| {
+        let execution_result = dctx.response.execution_result.take().ok_or_else(|| {
             error!(
                 function = "execute_harmony_responses_streaming",
                 "No ExecutionResult produced by pipeline"
@@ -1253,9 +1106,25 @@ impl RequestPipeline {
             )
         })?;
 
-        let load_guards = ctx.state.load_guards.take();
+        let load_guards = dctx.load_guards.take();
 
         Ok((execution_result, load_guards))
+    }
+}
+
+#[cfg(test)]
+impl RequestPipeline {
+    /// Mode-bearing construction descriptor for the parity test. Stage
+    /// ordering itself is structural (see `PipelineStages`), so only the
+    /// per-mode args and optional stages need freezing.
+    fn signature(&self) -> String {
+        format!(
+            "{}|rate_limit={}|encode={}|{}",
+            self.stages.worker_selection.signature(),
+            self.stages.rate_limit.is_some(),
+            self.stages.encode.is_some(),
+            self.stages.request_building.signature(),
+        )
     }
 }
 
@@ -1264,219 +1133,65 @@ mod build_parity_tests {
     use super::*;
     use crate::routers::grpc::mode::Mode;
 
-    fn sigs(p: &RequestPipeline) -> Vec<String> {
-        p.stages.iter().map(|s| s.signature()).collect()
-    }
-
-    fn v(stages: &[&str]) -> Vec<String> {
-        stages.iter().map(|s| (*s).to_string()).collect()
-    }
-
-    /// Hand-transcribed expected stage signatures + metrics backend label per
-    /// endpoint/mode. Do not regenerate from `build()` output, or this stops
-    /// guarding anything: it exists to catch a wrong `build`/`mode.rs` mapping
-    /// (a flipped `inject_pd_metadata`, wrong `plan_kind`, or swapped
-    /// `WorkerSelectionMode`).
-    ///
-    /// Signature format: stages with no mode-varying args emit their short type
-    /// name; the mode-bearing overrides append their args.
-    /// `ChatGenerateRequestBuildingStage` is a composite wrapping the chat and
-    /// generate request-building stages, both fed the same mode args.
-    fn golden(endpoint: Endpoint, mode: Mode) -> (Vec<String>, &'static str) {
+    /// Hand-transcribed expected construction descriptor + metrics backend
+    /// label per endpoint/mode. Do not regenerate from `build()` output, or
+    /// this stops guarding anything: it exists to catch a wrong
+    /// `build`/`mode.rs` mapping (a flipped `inject_pd_metadata`, wrong
+    /// `plan_kind`, or swapped `WorkerSelectionMode`). Stage ordering is
+    /// structural in `PipelineStages` and needs no golden.
+    fn golden(endpoint: Endpoint, mode: Mode) -> (String, &'static str) {
         const REGULAR: &str = metrics_labels::BACKEND_REGULAR;
         const PD: &str = metrics_labels::BACKEND_PD;
-        match (endpoint, mode) {
-            (Endpoint::Chat, Mode::Regular) => (
-                v(&[
-                    "ChatGeneratePreparationStage",
-                    "RateLimitReserveStage",
-                    "WorkerSelectionStage(Regular)",
-                    "ClientAcquisitionStage",
-                    "ChatGenerateRequestBuildingStage(ChatRequestBuildingStage(inject_pd_metadata=false, Single), GenerateRequestBuildingStage(inject_pd_metadata=false, Single))",
-                    "DispatchMetadataStage",
-                    "RequestExecutionStage",
-                    "ChatGenerateResponseProcessingStage",
-                ]),
-                REGULAR,
+        let (selection, inject, plan, backend) = match mode {
+            Mode::Regular => ("Regular", "false", "Single", REGULAR),
+            Mode::PrefillDecode => ("PrefillDecode", "true", "PrefillDecode", PD),
+            Mode::EncodePrefillDecode => {
+                ("EncodePrefillDecode", "false", "EncodePrefillDecode", PD)
+            }
+        };
+        let encode = matches!(mode, Mode::EncodePrefillDecode);
+        let build = match endpoint {
+            Endpoint::Chat => format!(
+                "ChatGenerateRequestBuildingStage(ChatRequestBuildingStage(inject_pd_metadata={inject}, {plan}), GenerateRequestBuildingStage(inject_pd_metadata={inject}, {plan}))"
             ),
-            (Endpoint::Chat, Mode::PrefillDecode) => (
-                v(&[
-                    "ChatGeneratePreparationStage",
-                    "RateLimitReserveStage",
-                    "WorkerSelectionStage(PrefillDecode)",
-                    "ClientAcquisitionStage",
-                    "ChatGenerateRequestBuildingStage(ChatRequestBuildingStage(inject_pd_metadata=true, PrefillDecode), GenerateRequestBuildingStage(inject_pd_metadata=true, PrefillDecode))",
-                    "DispatchMetadataStage",
-                    "RequestExecutionStage",
-                    "ChatGenerateResponseProcessingStage",
-                ]),
-                PD,
+            Endpoint::Messages => {
+                format!("MessageRequestBuildingStage(inject_pd_metadata={inject}, {plan})")
+            }
+            Endpoint::Completion => {
+                format!("CompletionRequestBuildingStage(inject_pd_metadata={inject}, {plan})")
+            }
+            Endpoint::Harmony => {
+                format!("HarmonyRequestBuildingStage(inject_pd_metadata={inject}, {plan})")
+            }
+            Endpoint::Embeddings | Endpoint::Classify => {
+                "EmbeddingRequestBuildingStage".to_string()
+            }
+        };
+        let rate_limit = !matches!(endpoint, Endpoint::Embeddings | Endpoint::Classify);
+        // Harmony never carries the encode stage.
+        let encode = encode && !matches!(endpoint, Endpoint::Harmony);
+        (
+            format!(
+                "WorkerSelectionStage({selection})|rate_limit={rate_limit}|encode={encode}|{build}"
             ),
-            (Endpoint::Chat, Mode::EncodePrefillDecode) => (
-                v(&[
-                    "ChatGeneratePreparationStage",
-                    "RateLimitReserveStage",
-                    "WorkerSelectionStage(EncodePrefillDecode)",
-                    "ClientAcquisitionStage",
-                    "EncodeStage",
-                    "ChatGenerateRequestBuildingStage(ChatRequestBuildingStage(inject_pd_metadata=false, EncodePrefillDecode), GenerateRequestBuildingStage(inject_pd_metadata=false, EncodePrefillDecode))",
-                    "DispatchMetadataStage",
-                    "RequestExecutionStage",
-                    "ChatGenerateResponseProcessingStage",
-                ]),
-                PD,
-            ),
-            (Endpoint::Messages, Mode::Regular) => (
-                v(&[
-                    "MessagePreparationStage",
-                    "RateLimitReserveStage",
-                    "WorkerSelectionStage(Regular)",
-                    "ClientAcquisitionStage",
-                    "MessageRequestBuildingStage(inject_pd_metadata=false, Single)",
-                    "DispatchMetadataStage",
-                    "RequestExecutionStage",
-                    "MessageResponseProcessingStage",
-                ]),
-                REGULAR,
-            ),
-            (Endpoint::Messages, Mode::PrefillDecode) => (
-                v(&[
-                    "MessagePreparationStage",
-                    "RateLimitReserveStage",
-                    "WorkerSelectionStage(PrefillDecode)",
-                    "ClientAcquisitionStage",
-                    "MessageRequestBuildingStage(inject_pd_metadata=true, PrefillDecode)",
-                    "DispatchMetadataStage",
-                    "RequestExecutionStage",
-                    "MessageResponseProcessingStage",
-                ]),
-                PD,
-            ),
-            (Endpoint::Messages, Mode::EncodePrefillDecode) => (
-                v(&[
-                    "MessagePreparationStage",
-                    "RateLimitReserveStage",
-                    "WorkerSelectionStage(EncodePrefillDecode)",
-                    "ClientAcquisitionStage",
-                    "EncodeStage",
-                    "MessageRequestBuildingStage(inject_pd_metadata=false, EncodePrefillDecode)",
-                    "DispatchMetadataStage",
-                    "RequestExecutionStage",
-                    "MessageResponseProcessingStage",
-                ]),
-                PD,
-            ),
-            (Endpoint::Completion, Mode::Regular) => (
-                v(&[
-                    "CompletionPreparationStage",
-                    "RateLimitReserveStage",
-                    "WorkerSelectionStage(Regular)",
-                    "ClientAcquisitionStage",
-                    "CompletionRequestBuildingStage(inject_pd_metadata=false, Single)",
-                    "DispatchMetadataStage",
-                    "RequestExecutionStage",
-                    "CompletionResponseProcessingStage",
-                ]),
-                REGULAR,
-            ),
-            (Endpoint::Completion, Mode::PrefillDecode) => (
-                v(&[
-                    "CompletionPreparationStage",
-                    "RateLimitReserveStage",
-                    "WorkerSelectionStage(PrefillDecode)",
-                    "ClientAcquisitionStage",
-                    "CompletionRequestBuildingStage(inject_pd_metadata=true, PrefillDecode)",
-                    "DispatchMetadataStage",
-                    "RequestExecutionStage",
-                    "CompletionResponseProcessingStage",
-                ]),
-                PD,
-            ),
-            (Endpoint::Completion, Mode::EncodePrefillDecode) => (
-                v(&[
-                    "CompletionPreparationStage",
-                    "RateLimitReserveStage",
-                    "WorkerSelectionStage(EncodePrefillDecode)",
-                    "ClientAcquisitionStage",
-                    "EncodeStage",
-                    "CompletionRequestBuildingStage(inject_pd_metadata=false, EncodePrefillDecode)",
-                    "DispatchMetadataStage",
-                    "RequestExecutionStage",
-                    "CompletionResponseProcessingStage",
-                ]),
-                PD,
-            ),
-            (Endpoint::Harmony, Mode::Regular) => (
-                v(&[
-                    "HarmonyPreparationStage",
-                    "RateLimitReserveStage",
-                    "WorkerSelectionStage(Regular)",
-                    "ClientAcquisitionStage",
-                    "HarmonyRequestBuildingStage(inject_pd_metadata=false, Single)",
-                    "DispatchMetadataStage",
-                    "RequestExecutionStage",
-                    "HarmonyResponseProcessingStage",
-                ]),
-                REGULAR,
-            ),
-            (Endpoint::Harmony, Mode::PrefillDecode) => (
-                v(&[
-                    "HarmonyPreparationStage",
-                    "RateLimitReserveStage",
-                    "WorkerSelectionStage(PrefillDecode)",
-                    "ClientAcquisitionStage",
-                    "HarmonyRequestBuildingStage(inject_pd_metadata=true, PrefillDecode)",
-                    "DispatchMetadataStage",
-                    "RequestExecutionStage",
-                    "HarmonyResponseProcessingStage",
-                ]),
-                PD,
-            ),
-            // Embeddings and classify share prep + request building; classify
-            // only swaps the response processor.
-            (Endpoint::Embeddings, Mode::Regular) => (
-                v(&[
-                    "EmbeddingPreparationStage",
-                    "WorkerSelectionStage(Regular)",
-                    "ClientAcquisitionStage",
-                    "EmbeddingRequestBuildingStage",
-                    "DispatchMetadataStage",
-                    "RequestExecutionStage",
-                    "EmbeddingResponseProcessingStage",
-                ]),
-                REGULAR,
-            ),
-            (Endpoint::Classify, Mode::Regular) => (
-                v(&[
-                    "EmbeddingPreparationStage",
-                    "WorkerSelectionStage(Regular)",
-                    "ClientAcquisitionStage",
-                    "EmbeddingRequestBuildingStage",
-                    "DispatchMetadataStage",
-                    "RequestExecutionStage",
-                    "ClassifyResponseProcessingStage",
-                ]),
-                REGULAR,
-            ),
-            (endpoint, mode) => panic!("no golden for invalid combo {endpoint:?}/{mode:?}"),
-        }
+            backend,
+        )
     }
 
-    /// Assert `build(endpoint, mode)` matches the hand-transcribed golden (stage
-    /// sequence + mode-bearing args + metrics backend label).
     fn assert_parity(endpoint: Endpoint, mode: Mode, deps: &PipelineDeps) {
-        let (expected_sigs, expected_backend) = golden(endpoint, mode);
+        let (expected_sig, expected_backend) = golden(endpoint, mode);
         let built = RequestPipeline::build(endpoint, mode, deps)
             .unwrap_or_else(|| panic!("build({endpoint:?}, {mode:?}) should be valid"));
         assert_eq!(
-            sigs(&built),
-            expected_sigs,
-            "stage parity for {endpoint:?}/{mode:?}"
+            built.signature(),
+            expected_sig,
+            "construction parity for {endpoint:?}/{mode:?}"
         );
         assert_eq!(
             built.backend_type, expected_backend,
             "backend_type parity for {endpoint:?}/{mode:?}"
         );
+        assert_eq!(built.mode, mode, "mode parity for {endpoint:?}/{mode:?}");
     }
 
     #[test]
@@ -1588,17 +1303,20 @@ mod alias_pipeline_tests {
         );
 
         assert_eq!(ctx.input.model_id, CANONICAL_MODEL);
-        assert_eq!(ctx.generate_request().model, CANONICAL_MODEL);
+        assert_eq!(ctx.generate_request_arc().model, CANONICAL_MODEL);
 
-        for stage in pipeline.stages.iter() {
-            assert!(stage.execute(&mut ctx).await.unwrap().is_none());
-            if ctx.state.workers.is_some() {
-                break;
-            }
-        }
+        // Ingress up to worker selection: the canonical id must already be in
+        // place when selection runs.
+        pipeline.stages.preparation.execute(&mut ctx).await.unwrap();
+        pipeline
+            .stages
+            .worker_selection
+            .execute(&mut ctx)
+            .await
+            .unwrap();
 
         assert_eq!(ctx.input.model_id, CANONICAL_MODEL);
-        assert_eq!(ctx.generate_request().model, CANONICAL_MODEL);
+        assert_eq!(ctx.generate_request_arc().model, CANONICAL_MODEL);
         assert!(ctx.state.tokenizer.is_some());
         match ctx.state.workers.as_ref().unwrap() {
             WorkerSelection::Disaggregated {
@@ -1608,6 +1326,565 @@ mod alias_pipeline_tests {
                 assert_eq!(decode.url(), "grpc://decode:30000");
             }
             WorkerSelection::Single { .. } => panic!("expected PD worker selection"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_release_tests {
+    use std::{
+        pin::Pin,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Mutex, PoisonError, Weak,
+        },
+        time::Duration,
+    };
+
+    use futures::Stream;
+    use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
+    use openai_protocol::{
+        completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
+    };
+    use portpicker::pick_unused_port;
+    use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts};
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+    use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
+    use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
+
+    use super::*;
+    use crate::{
+        config::types::PolicyConfig,
+        worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    };
+
+    const MODEL: &str = "request-release-test-model";
+
+    type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
+    type KvEventStream = Pin<Box<dyn Stream<Item = Result<common::KvEventBatch, Status>> + Send>>;
+    type TokenizerStream =
+        Pin<Box<dyn Stream<Item = Result<common::GetTokenizerChunk, Status>> + Send>>;
+
+    /// TokenSpeed stub gated on the parsed request's drop probe: it withholds
+    /// its tokens (or, with `gate_rpc`, the generate RPC itself) until the
+    /// probe reaches zero strong references or a deadline passes, recording
+    /// the outcome in `released`. An ungated stub (no probe) answers
+    /// immediately -- used for the PD prefill leg. `fail_first` makes the
+    /// first generate call return UNAVAILABLE, for retry-replay tests; every
+    /// call's input token ids and engine request id are recorded.
+    #[derive(Clone, Default)]
+    struct GatedScheduler {
+        probe: Option<Weak<CompletionRequest>>,
+        gate_rpc: bool,
+        released: Arc<AtomicBool>,
+        fail_first: bool,
+        calls: Arc<AtomicUsize>,
+        seen_input_ids: Arc<Mutex<Vec<Vec<u32>>>>,
+        seen_request_ids: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl GatedScheduler {
+        async fn await_probe(probe: &Weak<CompletionRequest>, released: &AtomicBool) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while probe.strong_count() > 0 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            released.store(probe.strong_count() == 0, Ordering::SeqCst);
+        }
+    }
+
+    fn generate_frames(request_id: &str) -> Vec<Result<ts::GenerateResponse, Status>> {
+        use ts::generate_response::Response as GenResp;
+        vec![
+            Ok(ts::GenerateResponse {
+                request_id: request_id.to_string(),
+                response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
+                    token_ids: vec![100],
+                    prompt_tokens: 2,
+                    completion_tokens: 1,
+                    cached_tokens: 0,
+                    output_logprobs: None,
+                    index: 0,
+                })),
+            }),
+            Ok(ts::GenerateResponse {
+                request_id: request_id.to_string(),
+                response: Some(GenResp::Complete(ts::GenerateComplete {
+                    output_ids: vec![100],
+                    finish_reason: "stop".to_string(),
+                    prompt_tokens: 2,
+                    completion_tokens: 1,
+                    cached_tokens: 0,
+                    output_logprobs: None,
+                    matched_stop: None,
+                    index: 0,
+                })),
+            }),
+        ]
+    }
+
+    #[tonic::async_trait]
+    impl TokenSpeedScheduler for GatedScheduler {
+        type GenerateStream = GenStream;
+        type SubscribeKvEventsStream = KvEventStream;
+        type GetTokenizerStream = TokenizerStream;
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub; the gate task ends at its deadline"
+        )]
+        async fn generate(
+            &self,
+            request: TonicRequest<ts::GenerateRequest>,
+        ) -> Result<TonicResponse<Self::GenerateStream>, Status> {
+            let request = request.into_inner();
+            self.seen_input_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request.tokenized.map(|t| t.input_ids).unwrap_or_default());
+            self.seen_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request.request_id.clone());
+            if self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(Status::unavailable("release-test induced failure"));
+            }
+            if self.gate_rpc {
+                if let Some(probe) = &self.probe {
+                    Self::await_probe(probe, &self.released).await;
+                }
+            }
+            let request_id = request.request_id;
+            let (tx, rx) = mpsc::channel(8);
+            let probe = (!self.gate_rpc).then(|| self.probe.clone()).flatten();
+            let released = Arc::clone(&self.released);
+            tokio::spawn(async move {
+                if let Some(probe) = probe {
+                    Self::await_probe(&probe, &released).await;
+                }
+                for frame in generate_frames(&request_id) {
+                    if tx.send(frame).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            Ok(TonicResponse::new(Box::pin(ReceiverStream::new(rx))))
+        }
+
+        async fn health_check(
+            &self,
+            _request: TonicRequest<ts::HealthCheckRequest>,
+        ) -> Result<TonicResponse<ts::HealthCheckResponse>, Status> {
+            Ok(TonicResponse::new(ts::HealthCheckResponse {
+                healthy: true,
+                message: "ok".to_string(),
+            }))
+        }
+
+        async fn abort(
+            &self,
+            _request: TonicRequest<ts::AbortRequest>,
+        ) -> Result<TonicResponse<ts::AbortResponse>, Status> {
+            Ok(TonicResponse::new(ts::AbortResponse {
+                success: true,
+                message: String::new(),
+            }))
+        }
+
+        async fn get_model_info(
+            &self,
+            _request: TonicRequest<ts::GetModelInfoRequest>,
+        ) -> Result<TonicResponse<ts::GetModelInfoResponse>, Status> {
+            Ok(TonicResponse::new(ts::GetModelInfoResponse {
+                model_path: MODEL.to_string(),
+                tokenizer_path: MODEL.to_string(),
+                served_model_name: MODEL.to_string(),
+                model_type: "mock".to_string(),
+                architectures: vec!["MockForCausalLM".to_string()],
+                max_context_length: 32768,
+                max_req_input_len: 32768,
+                vocab_size: 32000,
+                eos_token_ids: vec![2],
+                pad_token_id: 0,
+                bos_token_id: 1,
+                weight_version: "mock".to_string(),
+                default_sampling_params_json: String::new(),
+                supports_vision: false,
+                ..Default::default()
+            }))
+        }
+
+        async fn get_server_info(
+            &self,
+            _request: TonicRequest<ts::GetServerInfoRequest>,
+        ) -> Result<TonicResponse<ts::GetServerInfoResponse>, Status> {
+            Ok(TonicResponse::new(ts::GetServerInfoResponse {
+                max_total_num_tokens: 1_000_000,
+                tokenspeed_version: "mock".to_string(),
+                ..Default::default()
+            }))
+        }
+
+        async fn get_loads(
+            &self,
+            _request: TonicRequest<ts::GetLoadsRequest>,
+        ) -> Result<TonicResponse<ts::GetLoadsResponse>, Status> {
+            Err(Status::unimplemented("release-test stub"))
+        }
+
+        async fn subscribe_kv_events(
+            &self,
+            _request: TonicRequest<common::SubscribeKvEventsRequest>,
+        ) -> Result<TonicResponse<Self::SubscribeKvEventsStream>, Status> {
+            Err(Status::unimplemented("release-test stub"))
+        }
+
+        async fn flush_cache(
+            &self,
+            _request: TonicRequest<common::FlushCacheRequest>,
+        ) -> Result<TonicResponse<common::FlushCacheResponse>, Status> {
+            Err(Status::unimplemented("release-test stub"))
+        }
+
+        async fn start_profile(
+            &self,
+            _request: TonicRequest<common::StartProfileRequest>,
+        ) -> Result<TonicResponse<common::ProfileResponse>, Status> {
+            Err(Status::unimplemented("release-test stub"))
+        }
+
+        async fn stop_profile(
+            &self,
+            _request: TonicRequest<common::StopProfileRequest>,
+        ) -> Result<TonicResponse<common::ProfileResponse>, Status> {
+            Err(Status::unimplemented("release-test stub"))
+        }
+
+        async fn get_tokenizer(
+            &self,
+            _request: TonicRequest<common::GetTokenizerRequest>,
+        ) -> Result<TonicResponse<Self::GetTokenizerStream>, Status> {
+            Err(Status::unimplemented("release-test stub"))
+        }
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test helper; the stub server lives for the test process"
+    )]
+    async fn spawn_stub(scheduler: GatedScheduler) -> u16 {
+        let port = pick_unused_port().expect("no free port for release-test stub");
+        let addr = format!("127.0.0.1:{port}").parse().expect("stub addr");
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(TokenSpeedSchedulerServer::new(scheduler))
+                .serve(addr)
+                .await
+                .expect("release-test stub server");
+        });
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                return port;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("release-test stub on port {port} never came up");
+    }
+
+    fn register_worker(registry: &WorkerRegistry, port: u16, worker_type: WorkerType) {
+        let worker = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+            .worker_type(worker_type)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::TokenSpeed)
+            .model(ModelCard::new(MODEL))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        registry
+            .register(Arc::new(worker))
+            .expect("register release-test worker");
+    }
+
+    async fn components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponents> {
+        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+        let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
+        tokenizer_registry
+            .load(
+                "tokenizer-id",
+                MODEL,
+                "test",
+                || async move { Ok(tokenizer) },
+            )
+            .await
+            .expect("load mock tokenizer");
+        Arc::new(SharedComponents {
+            tokenizer_registry,
+            worker_registry,
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            parser_resolver: utils::ParserResolver::disabled(),
+            multimodal: None,
+        })
+    }
+
+    fn completion_request(stream: bool) -> Arc<CompletionRequest> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "prompt": "Hello world",
+                "stream": stream,
+            }))
+            .expect("completion request"),
+        )
+    }
+
+    fn completion_pipeline(worker_registry: &Arc<WorkerRegistry>, mode: Mode) -> RequestPipeline {
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+        );
+        RequestPipeline::build(Endpoint::Completion, mode, &deps).expect("completion pipeline")
+    }
+
+    fn fast_retry_config(max_retries: u32) -> RetryConfig {
+        RetryConfig {
+            max_retries,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 2,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        }
+    }
+
+    async fn run_and_drain(
+        pipeline: RequestPipeline,
+        components: Arc<SharedComponents>,
+        request: Arc<CompletionRequest>,
+    ) -> bytes::Bytes {
+        let response = pipeline
+            .execute_completion(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain SSE body")
+    }
+
+    /// The stream task must run off the response spec: the stub refuses to
+    /// emit tokens until the parsed request has been freed, so a stream that
+    /// still pinned it would stall past the stub's deadline.
+    #[tokio::test]
+    async fn streaming_releases_parsed_request_before_first_token() {
+        let request = completion_request(true);
+        let released = Arc::new(AtomicBool::new(false));
+        let port = spawn_stub(GatedScheduler {
+            probe: Some(Arc::downgrade(&request)),
+            released: Arc::clone(&released),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, port, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let body = run_and_drain(pipeline, components, request).await;
+
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the parsed request must be freed before the first token"
+        );
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("data: [DONE]"), "stream must finish: {body}");
+    }
+
+    /// grpc_pd twin: the decode leg's stream task must not pin the parsed
+    /// request either (the prefill stub answers immediately).
+    #[tokio::test]
+    async fn pd_streaming_releases_parsed_request_before_first_token() {
+        let request = completion_request(true);
+        let released = Arc::new(AtomicBool::new(false));
+        let prefill_port = spawn_stub(GatedScheduler::default()).await;
+        let decode_port = spawn_stub(GatedScheduler {
+            probe: Some(Arc::downgrade(&request)),
+            released: Arc::clone(&released),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+        register_worker(&worker_registry, decode_port, WorkerType::Decode);
+        let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+        let components = components(worker_registry).await;
+
+        let body = run_and_drain(pipeline, components, request).await;
+
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the parsed request must be freed before the first decode token"
+        );
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("data: [DONE]"), "stream must finish: {body}");
+    }
+
+    /// The parsed request dies at the build boundary even with the retry
+    /// window open: only the execution plan is retained for replay. The stub
+    /// refuses to answer the generate RPC until the probe frees.
+    #[tokio::test]
+    async fn buffered_dispatch_releases_parsed_request_even_with_retries_enabled() {
+        let request = completion_request(false);
+        let released = Arc::new(AtomicBool::new(false));
+        let port = spawn_stub(GatedScheduler {
+            probe: Some(Arc::downgrade(&request)),
+            gate_rpc: true,
+            released: Arc::clone(&released),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, port, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let retry = fast_retry_config(3);
+        let response = pipeline
+            .execute_completion(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                Some(&retry),
+            )
+            .await;
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the parsed request must be freed before the upstream answers"
+        );
+    }
+
+    /// grpc_pd twin of the dispatch-release probe: the gated decode leg
+    /// answers only after the parsed request is freed.
+    #[tokio::test]
+    async fn pd_buffered_dispatch_releases_parsed_request_before_upstream_responds() {
+        let request = completion_request(false);
+        let released = Arc::new(AtomicBool::new(false));
+        let prefill_port = spawn_stub(GatedScheduler::default()).await;
+        let decode_port = spawn_stub(GatedScheduler {
+            probe: Some(Arc::downgrade(&request)),
+            gate_rpc: true,
+            released: Arc::clone(&released),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+        register_worker(&worker_registry, decode_port, WorkerType::Decode);
+        let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+        let components = components(worker_registry).await;
+
+        let response = pipeline
+            .execute_completion(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the parsed request must be freed before the decode leg answers"
+        );
+    }
+
+    /// A failed first dispatch retries from the retained plan: the second
+    /// attempt must send identical token ids without re-tokenizing, under a
+    /// fresh per-attempt engine id, and the parsed request must already be
+    /// gone when the first attempt is sent.
+    #[tokio::test]
+    async fn retry_replays_identical_token_ids_from_the_retained_plan() {
+        let request = completion_request(false);
+        let probe = Arc::downgrade(&request);
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let seen_request_ids = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            fail_first: true,
+            seen_input_ids: Arc::clone(&seen_ids),
+            seen_request_ids: Arc::clone(&seen_request_ids),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, port, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let retry = fast_retry_config(2);
+        let response = pipeline
+            .execute_completion(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                Some(&retry),
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            probe.strong_count(),
+            0,
+            "request freed at the build boundary"
+        );
+
+        {
+            let seen = seen_ids.lock().unwrap_or_else(PoisonError::into_inner);
+            assert_eq!(seen.len(), 2, "503 then 200 must mean two attempts");
+            assert_eq!(
+                seen[0], seen[1],
+                "the retry must replay identical input ids"
+            );
+            assert!(
+                !seen[0].is_empty(),
+                "attempts must carry the tokenized prompt"
+            );
+        }
+        {
+            let ids = seen_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            assert_eq!(ids.len(), 2);
+            assert!(ids[0].starts_with("cmpl_") && ids[1].starts_with("cmpl_"));
+            assert_ne!(ids[0], ids[1], "each attempt gets a fresh engine id");
         }
     }
 }
@@ -1688,7 +1965,7 @@ mod rate_limit_reserve_tests {
     }
 
     #[tokio::test]
-    async fn reserves_exactly_once_across_retry_attempts() {
+    async fn reserve_is_admitted_once_and_cached_on_the_cell() {
         // Admits one 5-token reservation but not two (5 + 5 > 6).
         let manager = manager_with_tokens_per_minute(6);
         let components = test_components().await;
@@ -1697,15 +1974,10 @@ mod rate_limit_reserve_tests {
 
         let stage = RateLimitReserveStage::new(Some(manager));
 
-        // Simulate two retry attempts sharing the same cell, as router.rs does.
-        assert!(
-            stage.execute(&mut ctx).await.unwrap().is_none(),
-            "first attempt should reserve and be admitted"
-        );
-        assert!(
-            stage.execute(&mut ctx).await.unwrap().is_none(),
-            "second attempt should see the cached Admitted outcome and skip reserving again"
-        );
+        assert!(stage.execute(&mut ctx).await.is_ok());
+        // A second pass (defensive; ingress runs once) sees the cached
+        // Admitted outcome and does not reserve again.
+        assert!(stage.execute(&mut ctx).await.is_ok());
 
         assert!(matches!(
             ctx.input.rate_limit_cell.as_ref().unwrap().peek(),
@@ -1714,7 +1986,7 @@ mod rate_limit_reserve_tests {
     }
 
     #[tokio::test]
-    async fn denial_is_cached_for_should_retry_to_read() {
+    async fn denial_is_cached_on_the_cell() {
         // Too small for even one 5-token reservation.
         let manager = manager_with_tokens_per_minute(3);
         let components = test_components().await;
@@ -1723,12 +1995,9 @@ mod rate_limit_reserve_tests {
 
         let stage = RateLimitReserveStage::new(Some(manager));
 
-        let result = stage.execute(&mut ctx).await;
-        let response = result.expect_err("should be denied");
+        let response = stage.execute(&mut ctx).await.expect_err("should be denied");
         assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
 
-        // This is the signal router.rs's `should_retry` reads to stop the
-        // retry loop instead of retrying a rate-limit denial.
         assert!(matches!(
             ctx.input.rate_limit_cell.as_ref().unwrap().peek(),
             Some(RateLimitOutcome::Denied)
@@ -1742,7 +2011,7 @@ mod rate_limit_reserve_tests {
         ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
 
         let stage = RateLimitReserveStage::new(None);
-        assert!(stage.execute(&mut ctx).await.unwrap().is_none());
+        assert!(stage.execute(&mut ctx).await.is_ok());
         assert!(ctx.input.rate_limit_cell.as_ref().unwrap().peek().is_none());
     }
 
@@ -1754,7 +2023,7 @@ mod rate_limit_reserve_tests {
         let mut ctx = ctx_with_tokens(components, 5);
 
         let stage = RateLimitReserveStage::new(Some(manager));
-        assert!(stage.execute(&mut ctx).await.unwrap().is_none());
+        assert!(stage.execute(&mut ctx).await.is_ok());
     }
 
     #[tokio::test]
@@ -1771,7 +2040,7 @@ mod rate_limit_reserve_tests {
         ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
 
         let stage = RateLimitReserveStage::new(Some(manager.clone()));
-        assert!(stage.execute(&mut ctx).await.unwrap().is_none());
+        assert!(stage.execute(&mut ctx).await.is_ok());
 
         RequestPipeline::settle_reservation(ctx.input.rate_limit_cell.as_deref(), 0, 0).await;
 

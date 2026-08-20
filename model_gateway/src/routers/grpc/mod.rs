@@ -16,6 +16,7 @@ pub(crate) mod pipeline;
 pub(crate) mod proto_wrapper;
 pub(crate) mod regular;
 pub(crate) mod router; // Used by routers/factory
+pub(crate) mod spec;
 pub mod utils; // Used by routers/http and bindings/golang
 pub mod zmq_client; // ZMQ backend adapter behind the vLLM client surface
 pub(crate) mod zmq_multimodal; // Proto mm inputs → EngineCore mm_features
