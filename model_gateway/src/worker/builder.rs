@@ -3,13 +3,14 @@ use std::{collections::HashMap, sync::Arc};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use openai_protocol::{
     model_card::ModelCard,
-    worker::{HealthCheckConfig, WorkerModels, WorkerSpec, WorkerStatus},
+    worker::{HealthCheckConfig, OverloadUpdate, WorkerModels, WorkerSpec, WorkerStatus},
 };
 use tokio::sync::mpsc;
 
 use super::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
     event::WorkerConnected,
+    overload::OverloadThresholds,
     resilience::ResolvedResilience,
     worker::{
         BasicWorker, ConnectionMode, LazyHttpClient, RuntimeType, WorkerMetadata, WorkerRuntime,
@@ -41,6 +42,10 @@ pub struct BasicWorkerBuilder {
     initial_status: Option<WorkerStatus>,
     /// Connect-readiness signal sender (ZMQ registration path only).
     connect_signal_tx: Option<mpsc::UnboundedSender<WorkerConnected>>,
+    /// Gateway-level overload thresholds the spec's `overload` block resolves
+    /// against. Default empty: a spec block alone still enables protection
+    /// for this worker.
+    overload_defaults: OverloadThresholds,
 }
 
 impl BasicWorkerBuilder {
@@ -56,6 +61,7 @@ impl BasicWorkerBuilder {
             resilience: None,
             initial_status: None,
             connect_signal_tx: None,
+            overload_defaults: OverloadThresholds::default(),
         }
     }
 
@@ -71,6 +77,7 @@ impl BasicWorkerBuilder {
             resilience: None,
             initial_status: None,
             connect_signal_tx: None,
+            overload_defaults: OverloadThresholds::default(),
         }
     }
 
@@ -88,6 +95,7 @@ impl BasicWorkerBuilder {
             resilience: None,
             initial_status: None,
             connect_signal_tx: None,
+            overload_defaults: OverloadThresholds::default(),
         }
     }
 
@@ -201,6 +209,20 @@ impl BasicWorkerBuilder {
         self
     }
 
+    /// Set per-worker overload threshold overrides (carried on the spec so
+    /// they survive replacement and show up in `GET /workers`).
+    pub fn overload(mut self, overrides: OverloadUpdate) -> Self {
+        self.spec.overload = overrides;
+        self
+    }
+
+    /// Set the gateway-level overload thresholds the spec overrides resolve
+    /// against (per signal: worker override, else this default).
+    pub fn overload_defaults(mut self, defaults: OverloadThresholds) -> Self {
+        self.overload_defaults = defaults;
+        self
+    }
+
     /// Set KV connector type (e.g., "MooncakeConnector", "NixlConnector")
     pub fn kv_connector(mut self, connector: impl Into<String>) -> Self {
         self.spec.kv_connector = Some(connector.into());
@@ -285,6 +307,7 @@ impl BasicWorkerBuilder {
             .unwrap_or_else(|| self.spec.health.apply_to(&HealthCheckConfig::default()));
 
         let metadata = WorkerMetadata {
+            overload: OverloadThresholds::resolve(&self.spec.overload, self.overload_defaults),
             spec: Arc::new(self.spec),
             health_config,
             health_endpoint: self.health_endpoint,
@@ -429,6 +452,44 @@ mod tests {
             .http_client(Arc::new(reqwest::Client::new()))
             .build();
         assert!(!worker.http_client.cell_is_empty());
+    }
+
+    #[test]
+    fn overload_overrides_resolve_per_signal_against_gateway_defaults() {
+        let worker = BasicWorkerBuilder::new("http://w:1")
+            .overload(OverloadUpdate {
+                waiting_requests: None,
+                token_usage: Some(0.5),
+            })
+            .overload_defaults(OverloadThresholds {
+                waiting_requests: Some(16),
+                token_usage: Some(0.9),
+            })
+            .build();
+        // Worker override wins its signal; the other keeps the gateway value.
+        assert_eq!(
+            worker.metadata().overload,
+            OverloadThresholds {
+                waiting_requests: Some(16),
+                token_usage: Some(0.5),
+            }
+        );
+        // The block itself rides the spec, so it survives spec-based rebuilds
+        // and appears in `GET /workers`.
+        assert_eq!(worker.metadata().spec.overload.token_usage, Some(0.5));
+    }
+
+    #[test]
+    fn spec_overload_block_alone_enables_protection() {
+        let mut spec = WorkerSpec::new("http://w:1");
+        spec.overload.waiting_requests = Some(4);
+        let worker = BasicWorkerBuilder::from_spec(spec).build();
+        assert!(worker.metadata().overload.is_enabled());
+        assert_eq!(worker.metadata().overload.waiting_requests, Some(4));
+
+        // No block, no defaults: protection stays off for this worker.
+        let plain = BasicWorkerBuilder::new("http://w:2").build();
+        assert!(!plain.metadata().overload.is_enabled());
     }
 
     #[test]

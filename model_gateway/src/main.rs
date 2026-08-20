@@ -278,6 +278,24 @@ struct CliArgs {
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     overload_token_usage_threshold: f32,
 
+    /// Enable worker overload protection with the gateway default thresholds.
+    ///
+    /// A worker whose load signal crosses a threshold is considered overloaded
+    /// and excluded from routing until the signal recovers; when every worker
+    /// is overloaded, requests are shed immediately rather than queued.
+    ///
+    /// This flag alone applies --worker-overload-token-usage 0.9 and leaves
+    /// --worker-overload-waiting-requests unset: KV token usage means the same
+    /// thing on every engine, while a sensible waiting-requests ceiling is
+    /// workload-dependent, so it has no universal default. Explicit thresholds
+    /// override the default, and either threshold set on its own enables
+    /// protection without this flag — exactly as before it existed. Per-worker
+    /// `overload` blocks on a WorkerSpec override the gateway values per
+    /// signal, and enable protection for that worker even with everything here
+    /// unset.
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    worker_overload_protection: bool,
+
     /// Queued-request count at or above which a worker is considered
     /// overloaded and excluded from routing until the signal recovers; when
     /// every worker is overloaded, requests are shed immediately rather than
@@ -500,6 +518,14 @@ struct CliArgs {
     /// Interval in seconds between load monitor checks for PowerOfTwo routing
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
+
+    /// Only poll worker loads when a load-aware routing policy,
+    /// --engine-metrics, or worker overload protection needs the data. By
+    /// default every worker group is polled from registration onward; this
+    /// restores the old conditional gate (a load-aware policy is always fed
+    /// regardless).
+    #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
+    disable_load_monitoring: bool,
 
     /// Re-export engine GetLoads signals (incl. PD) as smg_engine_* Prometheus
     /// gauges, polling even without a load-aware routing policy.
@@ -1756,6 +1782,8 @@ impl CliArgs {
             .job_queue_capacity(self.job_queue_capacity)
             .job_queue_concurrency(self.job_queue_concurrency)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .disable_load_monitoring(self.disable_load_monitoring)
+            .worker_overload_protection(self.worker_overload_protection)
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
             .worker_overload_token_usage(self.worker_overload_token_usage)
             .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
@@ -2423,6 +2451,53 @@ mod tests {
         // The inclusive ends of the accepted ranges must still parse.
         assert!(Cli::try_parse_from(["smg", "--worker-overload-waiting-requests", "1"]).is_ok());
         assert!(Cli::try_parse_from(["smg", "--worker-overload-token-usage", "1.0"]).is_ok());
+    }
+
+    /// `--worker-overload-protection` and `--disable-load-monitoring` must
+    /// reach `RouterConfig` and survive nesting into
+    /// `ServerConfig.router_config`. Two-path config-plumbing guard.
+    #[test]
+    fn overload_protection_and_monitoring_flags_flow_into_both_configs() {
+        let cli = cli_args_from(&["--worker-overload-protection", "--disable-load-monitoring"]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            router_config.worker_overload_protection,
+            "worker_overload_protection must reach RouterConfig via to_router_config"
+        );
+        assert!(
+            router_config.disable_load_monitoring,
+            "disable_load_monitoring must reach RouterConfig via to_router_config"
+        );
+        // The flag alone carries no thresholds; the token default is applied
+        // at resolution, not stored in config.
+        assert_eq!(router_config.worker_overload_waiting_requests, None);
+        assert_eq!(router_config.worker_overload_token_usage, None);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(
+            server_config.router_config.worker_overload_protection,
+            "worker_overload_protection must survive into ServerConfig"
+        );
+        assert!(
+            server_config.router_config.disable_load_monitoring,
+            "disable_load_monitoring must survive into ServerConfig"
+        );
+    }
+
+    /// Defaults: protection off, monitoring default-on (opt-out false) — the
+    /// behavior change is monitoring, and it is carried by the default here.
+    #[test]
+    fn overload_protection_and_monitoring_flags_default_off_in_both_configs() {
+        let cli = cli_args_from(&[]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(!router_config.worker_overload_protection);
+        assert!(!router_config.disable_load_monitoring);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(!server_config.router_config.worker_overload_protection);
+        assert!(!server_config.router_config.disable_load_monitoring);
     }
 
     /// Cache-index flags must reach the cache_aware policy variant and the

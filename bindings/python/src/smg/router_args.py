@@ -238,6 +238,10 @@ class RouterArgs:
     # Absolute per-worker overload thresholds; both None disables the feature
     worker_overload_waiting_requests: int | None = None
     worker_overload_token_usage: float | None = None
+    # Enable overload protection with the gateway default token ceiling (0.9)
+    worker_overload_protection: bool = False
+    # Restore the conditional load-monitor poll gate (default: poll always)
+    disable_load_monitoring: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -579,6 +583,21 @@ class RouterArgs:
             ),
         )
         routing_group.add_argument(
+            f"--{prefix}worker-overload-protection",
+            action="store_true",
+            help=(
+                "Enable worker overload protection with the gateway default"
+                " thresholds. This flag alone applies"
+                " --worker-overload-token-usage 0.9 and leaves"
+                " --worker-overload-waiting-requests unset: KV token usage means"
+                " the same thing on every engine, while a sensible"
+                " waiting-requests ceiling is workload-dependent, so it has no"
+                " universal default. Explicit thresholds override the default,"
+                " and either threshold set on its own enables protection without"
+                " this flag."
+            ),
+        )
+        routing_group.add_argument(
             f"--{prefix}overlap-decay",
             type=float,
             default=RouterArgs.overlap_decay,
@@ -825,6 +844,17 @@ class RouterArgs:
             type=int,
             default=RouterArgs.load_monitor_interval,
             help="Interval in seconds between load monitor checks for PowerOfTwo routing (default: 10)",
+        )
+        parser.add_argument(
+            f"--{prefix}disable-load-monitoring",
+            action="store_true",
+            help=(
+                "Only poll worker loads when a load-aware routing policy,"
+                " --engine-metrics, or worker overload protection needs the"
+                " data. By default every worker group is polled from"
+                " registration onward; this restores the old conditional gate"
+                " (a load-aware policy is always fed regardless)."
+            ),
         )
 
         # Multimodal tensor transport

@@ -611,6 +611,35 @@ class TestParseRouterArgs:
         assert router_args.worker_overload_waiting_requests == 8
         assert router_args.worker_overload_token_usage == pytest.approx(0.75)
 
+    def test_parse_overload_protection_and_monitoring_flags(self):
+        """The enable/opt-out flags round-trip, and both default to False.
+
+        Same failure mode as the threshold flags: a dest/field mismatch would
+        silently disable the feature from Python.
+        """
+        router_args = parse_router_args(
+            ["--worker-overload-protection", "--disable-load-monitoring"]
+        )
+        assert router_args.worker_overload_protection is True
+        assert router_args.disable_load_monitoring is True
+
+        defaults = parse_router_args([])
+        assert defaults.worker_overload_protection is False
+        assert defaults.disable_load_monitoring is False
+
+    def test_prefixed_overload_protection_and_monitoring_flags(self):
+        """The --router-prefixed aliases reach the same fields."""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(
+            ["--router-worker-overload-protection", "--router-disable-load-monitoring"]
+        )
+
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+
+        assert router_args.worker_overload_protection is True
+        assert router_args.disable_load_monitoring is True
+
     def test_parse_pd_args(self):
         """Test parsing PD disaggregated mode arguments."""
         args = [
@@ -1370,6 +1399,8 @@ class TestRouterArgsFieldOrder:
         "job_queue_concurrency",
         "worker_overload_waiting_requests",
         "worker_overload_token_usage",
+        "worker_overload_protection",
+        "disable_load_monitoring",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1400,6 +1431,8 @@ class TestRouterArgsFieldOrder:
             "cache_ttl_secs",
             "worker_overload_waiting_requests",
             "worker_overload_token_usage",
+            "worker_overload_protection",
+            "disable_load_monitoring",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

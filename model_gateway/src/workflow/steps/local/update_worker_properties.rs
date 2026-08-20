@@ -8,7 +8,7 @@ use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    worker::{BasicWorkerBuilder, ConnectionMode, Worker},
+    worker::{overload::OverloadThresholds, BasicWorkerBuilder, ConnectionMode, Worker},
     workflow::data::WorkerUpdateWorkflowData,
 };
 
@@ -98,6 +98,13 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 .resilience(worker.resilience().clone())
                 .priority(updated_priority)
                 .cost(updated_cost)
+                // The overload block is not updatable here, but it must survive
+                // the rebuild; effective thresholds re-resolve against the same
+                // gateway defaults registration used.
+                .overload(worker.metadata().spec.overload)
+                .overload_defaults(OverloadThresholds::from_gateway_config(
+                    &app_context.router_config,
+                ))
                 .status(next_status);
 
             // Adopt the old worker's client only if it was materialized: a
@@ -188,7 +195,7 @@ mod tests {
         mock_engine::{connect_to_frontend, default_ready_response},
         EngineId,
     };
-    use openai_protocol::worker::{HealthCheckConfig, WorkerUpdateRequest};
+    use openai_protocol::worker::{HealthCheckConfig, OverloadUpdate, WorkerUpdateRequest};
     use wfaas::WorkflowInstanceId;
 
     use super::*;
@@ -320,6 +327,10 @@ mod tests {
                 .zmq_handshake_address(handshake.clone())
                 .zmq_engine_group(2)
                 .health_config(HealthCheckConfig::default())
+                .overload(OverloadUpdate {
+                    waiting_requests: Some(8),
+                    token_usage: None,
+                })
                 .status(WorkerStatus::Ready)
                 .build(),
         );
@@ -359,6 +370,10 @@ mod tests {
             Some(handshake.as_str())
         );
         assert_eq!(new.metadata().zmq_engine_count(), 2);
+        // The overload block survives a metadata-only update, and so does the
+        // effective threshold resolved from it.
+        assert_eq!(new.metadata().spec.overload.waiting_requests, Some(8));
+        assert_eq!(new.metadata().overload.waiting_requests, Some(8));
         assert!(
             new.connect_signal_tx.is_some(),
             "ZMQ promotion stays event-driven after an update"

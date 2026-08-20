@@ -14,8 +14,9 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 use crate::{
     routers::grpc::zmq_client::zmq_handshake_address,
     worker::{
-        circuit_breaker::CircuitBreakerConfig, resilience::resolve_resilience, worker::RuntimeType,
-        BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
+        circuit_breaker::CircuitBreakerConfig, overload::OverloadThresholds,
+        resilience::resolve_resilience, worker::RuntimeType, BasicWorkerBuilder, ConnectionMode,
+        Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
 };
@@ -138,6 +139,11 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             RuntimeType::Sglang
         };
 
+        validate_overload_overrides(config).map_err(|message| WorkflowError::StepFailed {
+            step_id: StepId::new("create_worker"),
+            message,
+        })?;
+
         validate_zmq_handshake_override(config, *connection_mode).map_err(|message| {
             WorkflowError::StepFailed {
                 step_id: StepId::new("create_worker"),
@@ -211,6 +217,8 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 message: e,
             })?;
 
+        let overload_defaults = OverloadThresholds::from_gateway_config(&app_context.router_config);
+
         let health_base = app_context.router_config.health_check.to_protocol_config();
         let health_config =
             resolve_zmq_health_config(config.health.apply_to(&health_base), *connection_mode, &url);
@@ -245,7 +253,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     .health_endpoint(health_endpoint)
                     .bootstrap_port(config.bootstrap_port)
                     .priority(config.priority)
-                    .cost(config.cost);
+                    .cost(config.cost)
+                    .overload(config.overload)
+                    .overload_defaults(overload_defaults);
 
                 if let Some((rank, size)) = dp {
                     builder = builder.dp_config(rank, size);
@@ -520,6 +530,30 @@ fn infer_non_generation_type(labels: &HashMap<String, String>) -> ModelType {
     ModelType::EMBEDDINGS
 }
 
+/// Reject degenerate per-worker overload thresholds at registration — same
+/// rules and wording as `ConfigValidator` applies to the gateway-level
+/// `worker_overload_*` fields. Both comparisons are inclusive, so the excluded
+/// ends of these ranges would mark this worker overloaded unconditionally.
+fn validate_overload_overrides(config: &WorkerSpec) -> Result<(), String> {
+    if config.overload.waiting_requests == Some(0) {
+        return Err(format!(
+            "worker {} sets overload.waiting_requests to 0: Must be >= 1 \
+             (0 would mark every worker overloaded)",
+            config.url
+        ));
+    }
+    if let Some(threshold) = config.overload.token_usage {
+        if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
+            return Err(format!(
+                "worker {} sets overload.token_usage to {threshold}: Must be a \
+                 fraction in (0.0, 1.0]",
+                config.url
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `zmq_handshake_address` only steers the ZMQ handshake bind; on any other
 /// connection mode it would be silently ignored, so reject the registration
 /// loudly instead.
@@ -723,6 +757,33 @@ mod tests {
             normalize_url("localhost:30001", ConnectionMode::Grpc),
             "grpc://localhost:30001"
         );
+    }
+
+    #[test]
+    fn degenerate_overload_overrides_are_rejected_at_registration() {
+        // Silent acceptance would strand the worker permanently vetoed; the
+        // ConfigValidator rules apply to spec blocks too.
+        let mut spec = WorkerSpec::new("http://worker:8080");
+        spec.overload.waiting_requests = Some(0);
+        let err =
+            validate_overload_overrides(&spec).expect_err("waiting_requests = 0 must be rejected");
+        assert!(err.contains("overload.waiting_requests"), "{err}");
+        assert!(err.contains("http://worker:8080"), "{err}");
+
+        for bad in [0.0, -0.5, 1.5, f64::NAN] {
+            let mut spec = WorkerSpec::new("http://worker:8080");
+            spec.overload.token_usage = Some(bad);
+            let err = validate_overload_overrides(&spec)
+                .expect_err("degenerate token_usage must be rejected");
+            assert!(err.contains("(0.0, 1.0]"), "{err}");
+        }
+
+        // The excluded ends' valid neighbors and an empty block pass.
+        let mut spec = WorkerSpec::new("http://worker:8080");
+        spec.overload.waiting_requests = Some(1);
+        spec.overload.token_usage = Some(1.0);
+        assert!(validate_overload_overrides(&spec).is_ok());
+        assert!(validate_overload_overrides(&WorkerSpec::new("x")).is_ok());
     }
 
     #[test]

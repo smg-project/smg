@@ -26,8 +26,8 @@ use tokio::{
 };
 
 use super::{
-    event::WorkerConnected, CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult,
-    UNKNOWN_MODEL_ID,
+    event::WorkerConnected, overload::OverloadThresholds, CircuitBreaker, ResolvedResilience,
+    WorkerError, WorkerResult, UNKNOWN_MODEL_ID,
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
@@ -855,6 +855,11 @@ pub struct WorkerMetadata {
     pub health_config: HealthCheckConfig,
     /// Health check endpoint path (internal-only, from router config).
     pub health_endpoint: String,
+    /// Effective absolute overload thresholds (per signal: `spec.overload`
+    /// override, else gateway default). Resolved once at registration; the
+    /// load monitor's ingestion predicate scores every report against these,
+    /// so nothing on a request path re-resolves them.
+    pub overload: OverloadThresholds,
 }
 
 impl WorkerMetadata {
@@ -2693,6 +2698,7 @@ mod tests {
             spec: Arc::new(WorkerSpec::new("http://test:8080")),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
+            overload: OverloadThresholds::default(),
         };
 
         // Empty models list should accept any model
@@ -2716,6 +2722,7 @@ mod tests {
             spec: Arc::new(spec),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
+            overload: OverloadThresholds::default(),
         };
 
         // Find by primary ID

@@ -727,6 +727,12 @@ pub struct WorkerSpec {
     /// fixed, pre-agreed address rather than the derived one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zmq_handshake_address: Option<String>,
+
+    /// Per-worker absolute overload threshold overrides (partial — only `Some`
+    /// fields override gateway defaults). Either field set enables overload
+    /// protection for this worker even when the gateway leaves it off.
+    #[serde(default, skip_serializing_if = "OverloadUpdate::is_empty")]
+    pub overload: OverloadUpdate,
 }
 
 impl WorkerSpec {
@@ -760,6 +766,7 @@ impl WorkerSpec {
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,
             zmq_handshake_address: None,
+            overload: OverloadUpdate::default(),
         }
     }
 }
@@ -1026,6 +1033,28 @@ impl HttpPoolConfig {
             && self.pool_idle_timeout_secs.is_none()
             && self.timeout_secs.is_none()
             && self.connect_timeout_secs.is_none()
+    }
+}
+
+/// Per-worker absolute overload threshold overrides.
+/// All fields optional — `None` means "use gateway default". Either field set
+/// enables overload protection for this worker even when the gateway leaves
+/// it off. Mirrors `HealthCheckUpdate` pattern for PATCH-style config.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OverloadUpdate {
+    /// Queued (waiting) requests summed across DP ranks at or above which this
+    /// worker is considered overloaded. Must be `>= 1`.
+    pub waiting_requests: Option<usize>,
+    /// Mean KV-cache token usage across DP ranks at or above which this worker
+    /// is considered overloaded. Must be in `(0.0, 1.0]`.
+    pub token_usage: Option<f64>,
+}
+
+impl OverloadUpdate {
+    /// Returns `true` if all fields are `None` (no overrides specified).
+    pub fn is_empty(&self) -> bool {
+        self.waiting_requests.is_none() && self.token_usage.is_none()
     }
 }
 
@@ -1585,5 +1614,61 @@ mod health_check_drain_settle_tests {
         }"#;
         let cfg: HealthCheckConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.drain_settle_secs, 5);
+    }
+}
+
+#[cfg(test)]
+mod overload_update_tests {
+    use serde_json::json;
+
+    use super::{OverloadUpdate, WorkerSpec};
+
+    #[test]
+    fn spec_without_block_deserializes_empty_and_is_not_serialized() {
+        // Existing serialized specs carry no `overload` key; they must keep
+        // deserializing, and an empty block must not appear on output.
+        let spec: WorkerSpec = serde_json::from_value(json!({"url": "http://w:1"})).unwrap();
+        assert!(spec.overload.is_empty());
+
+        let out = serde_json::to_value(&spec).unwrap();
+        assert!(out.get("overload").is_none());
+    }
+
+    #[test]
+    fn overload_block_round_trips_per_field() {
+        let spec: WorkerSpec = serde_json::from_value(json!({
+            "url": "http://w:1",
+            "overload": {"waiting_requests": 8, "token_usage": 0.85},
+        }))
+        .unwrap();
+        assert_eq!(spec.overload.waiting_requests, Some(8));
+        assert_eq!(spec.overload.token_usage, Some(0.85));
+
+        let out = serde_json::to_value(&spec).unwrap();
+        assert_eq!(out["overload"]["waiting_requests"], 8);
+        assert_eq!(out["overload"]["token_usage"], 0.85);
+
+        // A one-field block leaves the other signal unset, not defaulted.
+        let partial: WorkerSpec = serde_json::from_value(json!({
+            "url": "http://w:1",
+            "overload": {"token_usage": 0.9},
+        }))
+        .unwrap();
+        assert_eq!(partial.overload.waiting_requests, None);
+        assert_eq!(partial.overload.token_usage, Some(0.9));
+        assert!(!partial.overload.is_empty());
+    }
+
+    #[test]
+    fn is_empty_tracks_both_fields() {
+        let mut update = OverloadUpdate::default();
+        assert!(update.is_empty());
+        update.waiting_requests = Some(1);
+        assert!(!update.is_empty());
+        update = OverloadUpdate {
+            waiting_requests: None,
+            token_usage: Some(1.0),
+        };
+        assert!(!update.is_empty());
     }
 }

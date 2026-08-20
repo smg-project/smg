@@ -263,6 +263,16 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn disable_load_monitoring(mut self, disabled: bool) -> Self {
+        self.config.disable_load_monitoring = disabled;
+        self
+    }
+
+    pub fn worker_overload_protection(mut self, enabled: bool) -> Self {
+        self.config.worker_overload_protection = enabled;
+        self
+    }
+
     pub fn worker_overload_waiting_requests(mut self, threshold: Option<usize>) -> Self {
         self.config.worker_overload_waiting_requests = threshold;
         self

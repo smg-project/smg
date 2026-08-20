@@ -6,9 +6,15 @@
 //! and a whole-model predicate would miss a saturated PD leg, a mixed-transport
 //! model, or the model-less wildcard.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
-use axum::response::Response;
+use axum::{
+    http::{header::RETRY_AFTER, HeaderValue},
+    response::Response,
+};
 use tracing::debug;
 
 use crate::{
@@ -22,6 +28,18 @@ use crate::{
         Worker,
     },
 };
+
+/// Retry-After seconds advertised on every shed: the load-monitor poll
+/// interval, since the veto provably cannot clear faster. Process-wide because
+/// the shed helpers are free functions called from every router; the value is
+/// a client hint, not a correctness input. Default matches the config default.
+static SHED_RETRY_AFTER_SECS: AtomicU64 = AtomicU64::new(10);
+
+/// Latch the poll interval the shed responses advertise. Called once at
+/// startup when the load monitor is built.
+pub fn set_shed_retry_after_secs(secs: u64) {
+    SHED_RETRY_AFTER_SECS.store(secs.max(1), Ordering::Relaxed);
+}
 
 /// Whether every worker in a non-empty candidate pool is vetoed.
 ///
@@ -67,10 +85,16 @@ pub fn shed_if_worker_overloaded(worker: &dyn Worker, model_id: &str) -> Option<
 /// One decision line, one counter, one response — marked non-retryable: the
 /// veto clears at the poll interval, which no backoff window outlives, and a
 /// terminal shed is what keeps the counter per-request rather than per-attempt.
+/// Retry-After carries that interval so clients and proxies pace themselves;
+/// internal retries stay off regardless.
 fn shed(branch: &'static str, stage: &'static str, worker: &str, message: String) -> Response {
     Metrics::record_worker_overload_shed(stage);
     debug!(branch, stage, worker, "Overload shed");
     let mut response = error::service_unavailable("no_available_workers", message);
+    response.headers_mut().insert(
+        RETRY_AFTER,
+        HeaderValue::from(SHED_RETRY_AFTER_SECS.load(Ordering::Relaxed)),
+    );
     mark_non_retryable(&mut response);
     response
 }
@@ -145,6 +169,30 @@ mod tests {
 
         let dispatch = shed_if_worker_overloaded(a.as_ref(), "m").expect("shed");
         assert!(!is_retryable_response(&dispatch));
+    }
+
+    /// Both shed kinds advertise the poll interval as Retry-After — the veto
+    /// cannot clear faster — while staying terminal for the retry layer.
+    #[test]
+    fn shed_responses_carry_retry_after() {
+        let a = worker("http://127.0.0.1:9821", "m");
+        a.set_overloaded(true);
+
+        let selection = shed_if_all_overloaded(std::slice::from_ref(&a), "m").expect("shed");
+        let dispatch = shed_if_worker_overloaded(a.as_ref(), "m").expect("shed");
+        for response in [&selection, &dispatch] {
+            let value = response
+                .headers()
+                .get(RETRY_AFTER)
+                .expect("Retry-After present")
+                .to_str()
+                .expect("ascii");
+            assert!(
+                value.parse::<u64>().is_ok_and(|secs| secs >= 1),
+                "Retry-After must be whole seconds >= 1, got {value}"
+            );
+            assert!(!is_retryable_response(response));
+        }
     }
 
     /// An empty pool is a 404/unavailable question for the caller, not a shed.

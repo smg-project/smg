@@ -93,6 +93,20 @@ pub struct RouterConfig {
     pub job_queue_concurrency: usize,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// Restore the conditional load-monitor poll gate: only poll worker groups
+    /// when a load-aware routing policy, `engine_metrics`, or overload
+    /// protection needs the data. Default `false` — the monitor polls every
+    /// group unconditionally from registration onward. A load-aware policy is
+    /// always fed regardless of this flag.
+    #[serde(default)]
+    pub disable_load_monitoring: bool,
+    /// Enable absolute worker overload protection with the gateway default of
+    /// `worker_overload_token_usage = 0.9` (KV token usage is engine-universal;
+    /// a waiting-requests default would be workload-dependent, so that signal
+    /// stays unset). Redundant when either explicit threshold below is set —
+    /// those enable protection on their own, exactly as before this flag.
+    #[serde(default)]
+    pub worker_overload_protection: bool,
     /// Queued-request count at or above which a worker is considered
     /// overloaded and excluded from routing until the signal recovers; when all
     /// workers are overloaded, requests are shed immediately rather than
@@ -1040,6 +1054,8 @@ impl Default for RouterConfig {
             job_queue_capacity: default_job_queue_capacity(),
             job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
+            disable_load_monitoring: false,
+            worker_overload_protection: false,
             worker_overload_waiting_requests: None,
             worker_overload_token_usage: None,
             kv_indexer_ttl_secs: None,

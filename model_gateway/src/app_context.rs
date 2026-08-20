@@ -21,14 +21,14 @@ use crate::{
     policies::PolicyRegistry,
     rate_limit::RateLimitManager,
     routers::{
-        common::{openai_bridge::FormatRegistry, realtime::RealtimeRegistry},
+        common::{openai_bridge::FormatRegistry, overload, realtime::RealtimeRegistry},
         grpc::multimodal::MultimodalConfigRegistry,
         router_manager::RouterManager,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
-        http_client::apply_upstream_http2, KvEventMonitor, OverloadThresholds,
-        WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService,
+        http_client::apply_upstream_http2, KvEventMonitor, WorkerHttpClientCache, WorkerMonitor,
+        WorkerRegistry, WorkerService,
     },
     workflow::{JobQueue, WorkflowEngines},
 };
@@ -636,14 +636,14 @@ impl AppContextBuilder {
             client.clone(),
             config.load_monitor_interval_secs,
             config.engine_metrics,
-            OverloadThresholds {
-                waiting_requests: config.worker_overload_waiting_requests,
-                token_usage: config.worker_overload_token_usage,
-            },
+            config.disable_load_monitoring,
         ));
+        // The overload shed advertises the poll interval as Retry-After — the
+        // veto cannot clear between polls.
+        overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
         // Wire the backend load-snapshot feed into every policy that consumes
-        // it; the monitor itself only polls while some policy reports needing
-        // the data.
+        // it; the monitor polls every group by default, conditionally under
+        // `--disable-load-monitoring`.
         policy_registry.set_load_receiver(Some(monitor.subscribe()));
         self.worker_monitor = Some(monitor);
         Ok(self)

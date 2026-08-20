@@ -31,7 +31,7 @@ use smg::{
         },
         module_manager::WasmModuleManager,
     },
-    worker::{OverloadThresholds, WorkerMonitor, WorkerRegistry},
+    worker::{WorkerMonitor, WorkerRegistry},
 };
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
@@ -70,7 +70,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
         client.clone(),
         config.load_monitor_interval_secs,
         config.engine_metrics,
-        OverloadThresholds::default(),
+        config.disable_load_monitoring,
     )));
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator

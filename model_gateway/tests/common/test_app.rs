@@ -12,8 +12,8 @@ use smg::{
     routers::RouterTrait,
     server::{build_app, AppState},
     worker::{
-        BasicWorkerBuilder, ModelCard, OverloadThresholds, RuntimeType, Worker, WorkerMonitor,
-        WorkerRegistry, WorkerType,
+        BasicWorkerBuilder, ModelCard, RuntimeType, Worker, WorkerMonitor, WorkerRegistry,
+        WorkerType,
     },
 };
 use smg_data_connector::{
@@ -64,7 +64,7 @@ pub fn create_test_app(
         client.clone(),
         router_config.load_monitor_interval_secs,
         router_config.engine_metrics,
-        OverloadThresholds::default(),
+        router_config.disable_load_monitoring,
     )));
 
     // Create empty OnceLock for worker job queue and workflow engines
