@@ -92,7 +92,8 @@ mod tests {
 
     use hyper_util::rt::TokioIo;
     use tokio::io::DuplexStream;
-    use tonic::codegen::{http::Uri, Service};
+    use tonic::codegen::http::Uri;
+    use tower::Service;
 
     use super::{configured_endpoint, normalize_grpc_endpoint, DEFAULT_CONNECT_TIMEOUT};
 
@@ -121,7 +122,8 @@ mod tests {
     }
 
     /// A connector that never completes must be bounded by the caller's
-    /// `connect_timeout`.
+    /// `connect_timeout`, preventing the kernel SYN retry ceiling described by
+    /// [`DEFAULT_CONNECT_TIMEOUT`] from governing a black-holed dial.
     ///
     /// The upper bound has to sit *below* [`DEFAULT_CONNECT_TIMEOUT`], otherwise
     /// an implementation that silently ignored the argument and fell back to the

@@ -123,8 +123,13 @@ pub(crate) async fn do_grpc_health_check(
 /// five in-flight sockets per attempt instead of one.
 async fn grpc_transport_reachable(grpc_url: &str, timeout_secs: u64) -> Result<(), String> {
     let timeout = Duration::from_secs(timeout_secs);
-    connect_channel_with_timeout(grpc_url, timeout)
+    let connect_future = connect_channel_with_timeout(grpc_url, timeout);
+
+    // tonic's connect timeout is applied to the connector. Keep an outer
+    // deadline as a safety net for the remaining Channel::connect setup.
+    tokio::time::timeout(timeout, connect_future)
         .await
+        .map_err(|_| "gRPC connection timeout".to_string())?
         .map_err(|e| format!("gRPC connection failed: {e}"))?;
     Ok(())
 }
@@ -213,19 +218,13 @@ mod tests {
     /// short-circuit before the per-runtime fan-out, so one unreachable worker
     /// costs one dial rather than five.
     ///
-    /// Use a freshly released local port so the transport dial fails
-    /// deterministically instead of depending on TEST-NET routing behavior.
+    /// Use the reserved local port 1 so the transport dial fails without a
+    /// bind-then-drop port-reuse race or dependence on TEST-NET routing.
     /// The fan-out aggregate can only be constructed after all runtime probes
     /// run, so the transport error proves the gate returned first.
     #[tokio::test]
     async fn unreachable_transport_short_circuits_the_runtime_fanout() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test listener");
-        let address = listener.local_addr().expect("read listener address");
-        drop(listener);
-
-        let err = try_grpc_reachable(&format!("grpc://{address}"), 1)
+        let err = try_grpc_reachable("grpc://127.0.0.1:1", 1)
             .await
             .expect_err("closed local endpoint should not be reachable");
 
