@@ -607,6 +607,53 @@ async fn test_deepseek_dsml_v4_terminal_partial_preserves_only_prefix_text() {
     assert!(terminal.calls.is_empty());
 }
 
+/// Regression for the router terminal-flush finding: an invoke that streams
+/// provisional name/argument deltas while still incomplete, then closes with
+/// invalid JSON arguments, must not count as a completed call. The streaming
+/// routers rely on `completed_tool_call_count()` staying zero here to degrade
+/// the terminal finish/stop reason instead of pinning "tool_calls"/"tool_use".
+#[tokio::test]
+async fn test_deepseek_dsml_v4_split_invalid_invoke_stays_uncompleted() {
+    let tools = create_test_tools();
+    let mut parser = DeepSeekDsmlParser::v4();
+
+    // Chunk 1: incomplete invoke — provisional deltas stream before the
+    // arguments can be validated.
+    let first = parser
+        .parse_incremental(
+            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"get_weather\">{\"city\": \"Ber",
+            &tools,
+        )
+        .await
+        .unwrap();
+    assert!(
+        first
+            .calls
+            .iter()
+            .any(|call| call.name.as_deref() == Some("get_weather")),
+        "provisional tool name delta should stream before validation, got: {:?}",
+        first.calls
+    );
+    assert_eq!(parser.completed_tool_call_count(), Some(0));
+
+    // Chunk 2 closes the invoke with invalid JSON arguments; the parser
+    // skips the call, so the completed count stays zero and only genuine
+    // trailing text is released.
+    let second = parser
+        .parse_incremental(
+            "lin\" oops}</｜DSML｜invoke></｜DSML｜tool_calls>Trailing answer.",
+            &tools,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.normal_text, "Trailing answer.");
+    assert_eq!(parser.completed_tool_call_count(), Some(0));
+
+    let terminal = parser.finish_incremental();
+    assert!(terminal.normal_text.is_empty());
+    assert!(terminal.calls.is_empty());
+}
+
 /// A malformed complete invoke with `name=""` must not stall the buffer.
 /// Previously the streaming `invoke_regex` required `[^"]+` so `name=""`
 /// never matched, leaving the bad block stuck at the head of the buffer —
