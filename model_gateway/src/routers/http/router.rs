@@ -1188,7 +1188,7 @@ impl Router {
             self.client
                 .post(&endpoint_url)
                 .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
-            bytes::Bytes::from(body),
+            body,
         );
 
         request_builder = header_utils::apply_forwarded_request_headers(

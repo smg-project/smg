@@ -1302,7 +1302,7 @@ impl PDRouter {
             client
                 .post(endpoint_url)
                 .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
-            bytes::Bytes::from(body),
+            body,
         );
         if connection_close {
             request = request.header("Connection", "close");
@@ -1910,7 +1910,7 @@ mod tests {
         assert!(result.is_err());
         // No workers at all is the pre-existing unavailable string, not a shed:
         // an empty pool has nothing to be overloaded.
-        match result.unwrap_err() {
+        match *result.unwrap_err() {
             PdSelectionFailure::Unavailable(error) => {
                 assert!(error.contains("No prefill workers available"));
             }
