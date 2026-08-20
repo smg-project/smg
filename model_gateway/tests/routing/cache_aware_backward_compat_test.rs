@@ -28,6 +28,7 @@ fn test_backward_compatibility_with_empty_model_id() {
         overload_token_usage_threshold: 1.0,
         overlap_decay: 0.0,
         selection_temperature: 0.0,
+        ..Default::default()
     };
 
     let policy = CacheAwarePolicy::with_config(config);
@@ -84,6 +85,7 @@ fn test_mixed_model_ids() {
         overload_token_usage_threshold: 1.0,
         overlap_decay: 0.0,
         selection_temperature: 0.0,
+        ..Default::default()
     };
 
     let policy = CacheAwarePolicy::with_config(config);

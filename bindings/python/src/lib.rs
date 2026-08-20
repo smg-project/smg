@@ -517,6 +517,9 @@ struct Router {
     stream_request_bodies_over: u64,
     stream_body_stall_timeout_secs: u64,
     routing_key_headers: Vec<String>,
+    cache_boundaries: Vec<usize>,
+    cache_index: String,
+    cache_ttl_secs: u64,
 }
 
 impl Router {
@@ -544,6 +547,18 @@ impl Router {
                 "Invalid value for {field}='{host}': invalid mesh socket address '{addr}': {e}"
             ))
         })
+    }
+
+    fn parse_cache_index(&self) -> Result<config::CacheIndexKind, config::ConfigError> {
+        match self.cache_index.as_str() {
+            "tree" => Ok(config::CacheIndexKind::Tree),
+            "hash" => Ok(config::CacheIndexKind::Hash),
+            other => Err(config::ConfigError::InvalidValue {
+                field: "cache_index".to_string(),
+                value: other.to_string(),
+                reason: "expected 'tree' or 'hash'".to_string(),
+            }),
+        }
     }
 
     fn parse_assignment_mode(
@@ -604,6 +619,9 @@ impl Router {
                     overload_token_usage_threshold: self.overload_token_usage_threshold,
                     overlap_decay: self.overlap_decay,
                     selection_temperature: self.selection_temperature,
+                    cache_index: self.parse_cache_index()?,
+                    cache_ttl_secs: self.cache_ttl_secs,
+                    cache_boundaries: self.cache_boundaries.clone(),
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: self.load_monitor_interval,
@@ -798,6 +816,7 @@ impl Router {
         config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
+            .cache_boundaries(self.cache_boundaries.clone())
             .host(&self.host)
             .port(self.port)
             .health_check_port(self.health_check_port)
@@ -1042,6 +1061,9 @@ impl Router {
         stream_request_bodies_over = 0,
         stream_body_stall_timeout_secs = 300,
         routing_key_headers = vec![String::from("x-smg-routing-key")],
+        cache_boundaries = vec![],
+        cache_index = String::from("tree"),
+        cache_ttl_secs = 180,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1183,6 +1205,9 @@ impl Router {
         stream_request_bodies_over: u64,
         stream_body_stall_timeout_secs: u64,
         routing_key_headers: Vec<String>,
+        cache_boundaries: Vec<usize>,
+        cache_index: String,
+        cache_ttl_secs: u64,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1338,6 +1363,9 @@ impl Router {
             stream_request_bodies_over,
             stream_body_stall_timeout_secs,
             routing_key_headers,
+            cache_boundaries,
+            cache_index,
+            cache_ttl_secs,
         })
     }
 

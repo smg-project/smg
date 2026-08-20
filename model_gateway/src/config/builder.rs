@@ -4,10 +4,10 @@ use openai_protocol::worker::TransportMode;
 use smg_mcp::McpConfig;
 
 use super::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-    HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
-    RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry,
-    TokenizerCacheConfig, TraceConfig,
+    CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
+    HealthCheckConfig, HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig,
+    RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+    TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
 
@@ -107,6 +107,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn cache_boundaries(mut self, boundaries: Vec<usize>) -> Self {
+        self.config.cache_boundaries = boundaries;
+        self
+    }
+
     pub fn random_policy(mut self) -> Self {
         self.config.policy = PolicyConfig::Random;
         self
@@ -136,6 +141,9 @@ impl RouterConfigBuilder {
             overload_token_usage_threshold: 1.0,
             overlap_decay: 0.0,
             selection_temperature: 0.0,
+            cache_index: CacheIndexKind::Tree,
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         };
         self
     }

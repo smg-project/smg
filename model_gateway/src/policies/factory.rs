@@ -51,6 +51,9 @@ impl PolicyFactory {
                 overload_token_usage_threshold,
                 overlap_decay,
                 selection_temperature,
+                cache_index,
+                cache_ttl_secs,
+                cache_boundaries,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -63,6 +66,9 @@ impl PolicyFactory {
                     overload_token_usage_threshold: *overload_token_usage_threshold,
                     overlap_decay: *overlap_decay,
                     selection_temperature: *selection_temperature,
+                    cache_index: *cache_index,
+                    cache_ttl_secs: *cache_ttl_secs,
+                    cache_boundaries: cache_boundaries.clone(),
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
@@ -157,6 +163,9 @@ mod tests {
             overload_token_usage_threshold: 1.0,
             overlap_decay: 0.0,
             selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         });
         assert_eq!(policy.name(), "cache_aware");
 

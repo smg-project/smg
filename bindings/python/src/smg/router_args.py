@@ -26,6 +26,11 @@ PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 
 
+def _parse_int_csv(value: str) -> list[int]:
+    """Parse a comma-separated integer list (mirrors the CLI value_delimiter)."""
+    return [int(item) for item in value.split(",") if item]
+
+
 @dataclasses.dataclass
 class RouterArgs:
     # Worker configuration
@@ -221,6 +226,12 @@ class RouterArgs:
     routing_key_headers: list[str] = dataclasses.field(
         default_factory=lambda: ["x-smg-routing-key"]
     )
+    # Token positions at which serving engines retain reusable prefix state
+    cache_boundaries: list[int] = dataclasses.field(default_factory=list)
+    # cache_aware index under-layer: "tree" or "hash"
+    cache_index: str = "tree"
+    # Seconds a cache-affinity placement stays routable
+    cache_ttl_secs: int = 180
 
     @staticmethod
     def add_cli_args(
@@ -576,6 +587,37 @@ class RouterArgs:
             type=int,
             default=RouterArgs.block_size,
             help="KV cache block size for event-driven cache-aware routing (default: 16)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}cache-boundaries",
+            type=_parse_int_csv,
+            default=[],
+            help=(
+                "Comma-separated token positions at which serving engines retain"
+                " reusable prefix state; cache-affinity policies hash request"
+                " heads at the deepest applicable boundary."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}cache-index",
+            type=str,
+            choices=["tree", "hash"],
+            default=RouterArgs.cache_index,
+            help=(
+                "Index under-layer for cache_aware: 'tree' (radix prefix trees)"
+                " or 'hash' (TTL'd exact-match placement map keyed on request"
+                " heads at --cache-boundaries; token-bearing requests only —"
+                " untokenized requests stay load-balanced). Defaults to 'tree'."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}cache-ttl-secs",
+            type=int,
+            default=RouterArgs.cache_ttl_secs,
+            help=(
+                "Seconds a cache-affinity placement stays routable; should"
+                " approximate serving-engine cache retention. Defaults to 180."
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}max-idle-secs",

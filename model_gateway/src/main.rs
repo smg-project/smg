@@ -12,7 +12,7 @@ use openai_protocol::worker::TransportMode;
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        validate_mesh_server_name, CircuitBreakerConfig, ConfigError, ConfigResult,
+        validate_mesh_server_name, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
         DiscoveryConfig, HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig,
         OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
         RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
@@ -277,6 +277,24 @@ struct CliArgs {
     /// size, and the KV block size assumed for event-driven selection
     #[arg(long, default_value_t = 16, help_heading = "Routing Policy")]
     block_size: usize,
+
+    /// Token positions at which serving engines retain reusable prefix
+    /// state; cache-affinity policies hash request heads at the deepest
+    /// applicable boundary.
+    #[arg(long, value_delimiter = ',', help_heading = "Routing Policy")]
+    cache_boundaries: Vec<usize>,
+
+    /// Index under-layer for cache_aware: "tree" (radix prefix trees) or
+    /// "hash" (TTL'd exact-match placement map keyed on request heads at
+    /// --cache-boundaries; token-bearing requests only — untokenized
+    /// requests stay load-balanced)
+    #[arg(long, default_value = "tree", value_parser = ["tree", "hash"], help_heading = "Routing Policy")]
+    cache_index: String,
+
+    /// Seconds a cache-affinity placement stays routable; should
+    /// approximate serving-engine cache retention
+    #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Routing Policy")]
+    cache_ttl_secs: u64,
 
     /// How long an unused sticky routing key stays pinned: keys idle beyond
     /// this many seconds are evicted from the manual-policy / sticky-session
@@ -1266,6 +1284,9 @@ impl CliArgs {
                 overload_token_usage_threshold: self.overload_token_usage_threshold,
                 overlap_decay: self.overlap_decay,
                 selection_temperature: self.selection_temperature,
+                cache_index: Self::parse_cache_index(&self.cache_index),
+                cache_ttl_secs: self.cache_ttl_secs,
+                cache_boundaries: self.cache_boundaries.clone(),
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
@@ -1297,6 +1318,18 @@ impl CliArgs {
                 ),
             },
             _ => PolicyConfig::RoundRobin,
+        }
+    }
+
+    #[expect(
+        clippy::panic,
+        reason = "unreachable: clap value_parser restricts valid cache index kinds"
+    )]
+    fn parse_cache_index(kind: &str) -> CacheIndexKind {
+        match kind {
+            "tree" => CacheIndexKind::Tree,
+            "hash" => CacheIndexKind::Hash,
+            other => panic!("Unknown cache index: {other}"),
         }
     }
 
@@ -1637,6 +1670,7 @@ impl CliArgs {
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
+            .cache_boundaries(self.cache_boundaries.clone())
             .connection_mode(connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
             .zmq_engine_count(self.zmq_engine_count)
@@ -2196,6 +2230,64 @@ mod tests {
             server_config.router_config.engine_metrics,
             "engine_metrics must survive into ServerConfig via to_server_config"
         );
+    }
+
+    /// Cache-index flags must reach the cache_aware policy variant and the
+    /// shared `RouterConfig.cache_boundaries`, and survive into
+    /// `ServerConfig.router_config`. Two-path config-plumbing guard.
+    #[test]
+    fn cache_index_flags_flow_into_both_configs() {
+        let cli = cli_args_from(&[
+            "--cache-boundaries",
+            "2048,8192",
+            "--cache-index",
+            "hash",
+            "--cache-ttl-secs",
+            "60",
+        ]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.cache_boundaries, vec![2048, 8192]);
+        match &router_config.policy {
+            PolicyConfig::CacheAware {
+                cache_index,
+                cache_ttl_secs,
+                cache_boundaries,
+                ..
+            } => {
+                assert_eq!(*cache_index, CacheIndexKind::Hash);
+                assert_eq!(*cache_ttl_secs, 60);
+                assert_eq!(*cache_boundaries, vec![2048, 8192]);
+            }
+            other => panic!("expected cache_aware policy, got {other:?}"),
+        }
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(
+            server_config.router_config.cache_boundaries,
+            vec![2048, 8192],
+            "cache_boundaries must survive into ServerConfig via to_server_config"
+        );
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(defaults.cache_boundaries.is_empty());
+        match &defaults.policy {
+            PolicyConfig::CacheAware {
+                cache_index,
+                cache_ttl_secs,
+                cache_boundaries,
+                ..
+            } => {
+                assert_eq!(*cache_index, CacheIndexKind::Tree);
+                assert_eq!(*cache_ttl_secs, 180);
+                assert!(cache_boundaries.is_empty());
+            }
+            other => panic!("expected cache_aware policy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_ttl_secs_zero_rejected_at_parse() {
+        assert!(Cli::try_parse_from(["smg", "--cache-ttl-secs", "0"]).is_err());
     }
 
     /// The multimodal transport flags must reach both `RouterConfig` and the

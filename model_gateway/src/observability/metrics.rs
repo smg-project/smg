@@ -361,6 +361,10 @@ pub(crate) fn init_metrics() {
         "smg_cache_tree_tenants",
         "Cache-aware tree tenant count by model and tree (string/token)"
     );
+    describe_gauge!(
+        "smg_cache_placement_entries",
+        "Cache-aware hash-index placement entries by model (keys with a live holder)"
+    );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
     describe_gauge!(
@@ -1371,6 +1375,12 @@ impl Metrics {
     pub fn set_cache_tree_tenants(model_id: &str, tree: &'static str, count: usize) {
         let model = intern_model_label(model_id);
         gauge!("smg_cache_tree_tenants", "model" => model, "tree" => tree).set(count as f64);
+    }
+
+    /// Set cache-aware hash-index placement entry count for a model
+    pub fn set_cache_placement_entries(model_id: &str, count: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_cache_placement_entries", "model" => model).set(count as f64);
     }
 
     /// Record consistent hashing policy execution branch for routing decisions

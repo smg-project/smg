@@ -34,6 +34,11 @@ pub struct RouterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zmq_engine_count: Option<usize>,
     pub policy: PolicyConfig,
+    /// Token positions at which serving engines retain reusable prefix state;
+    /// cache-affinity policies hash request heads at the deepest applicable
+    /// boundary. Ascending; empty disables boundary-based keying.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_boundaries: Vec<usize>,
     /// Per-request sticky-session routing (rid-lineage keys, header fallback).
     #[serde(default, alias = "sticky_sessions")]
     pub routing_key_override: RoutingKeyOverrideConfig,
@@ -513,6 +518,18 @@ impl Default for RoutingKeyOverrideConfig {
     }
 }
 
+/// Under-layer index the cache_aware policy keeps per model.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheIndexKind {
+    /// Radix prefix tree (default).
+    #[default]
+    Tree,
+    /// TTL'd exact-match placement map keyed on quantized request heads
+    /// (`cache_boundaries`); the radix tree is neither consulted nor populated.
+    Hash,
+}
+
 /// Policy configuration for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -566,6 +583,18 @@ pub enum PolicyConfig {
         /// existing tie-breaks; larger values spread picks across candidates.
         #[serde(default = "default_selection_temperature")]
         selection_temperature: f32,
+        /// Index under-layer: `tree` (default) or `hash` (TTL'd exact-match
+        /// placement map over `cache_boundaries` heads).
+        #[serde(default)]
+        cache_index: CacheIndexKind,
+        /// Seconds a cache-affinity placement stays routable; should
+        /// approximate serving-engine cache retention.
+        #[serde(default = "default_cache_ttl_secs")]
+        cache_ttl_secs: u64,
+        /// Boundary token positions for the hash index (copied from the
+        /// shared `cache_boundaries` config).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cache_boundaries: Vec<usize>,
     },
 
     /// Power-of-two choices policy: samples two workers and routes to the one
@@ -690,6 +719,10 @@ fn default_overlap_decay() -> f32 {
 
 fn default_selection_temperature() -> f32 {
     0.0
+}
+
+fn default_cache_ttl_secs() -> u64 {
+    180
 }
 
 fn default_prefix_token_count() -> usize {
@@ -954,6 +987,7 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             policy: PolicyConfig::Random,
+            cache_boundaries: Vec::new(),
             routing_key_override: RoutingKeyOverrideConfig::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
@@ -1460,6 +1494,9 @@ mod tests {
             overload_token_usage_threshold: 1.0,
             overlap_decay: 0.0,
             selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -1486,6 +1523,9 @@ mod tests {
             overload_token_usage_threshold: 1.0,
             overlap_decay: 0.0,
             selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -1513,6 +1553,9 @@ mod tests {
             overload_token_usage_threshold: 1.0,
             overlap_decay: 0.0,
             selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         };
 
         match cache_aware {
@@ -1558,6 +1601,85 @@ mod tests {
             }
             _ => panic!("Expected CacheAware"),
         }
+    }
+
+    #[test]
+    fn test_cache_aware_index_fields_default_when_absent() {
+        // Config files written before the hash index existed must keep
+        // parsing as tree mode with the default TTL and no boundaries.
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.5,
+            "balance_abs_threshold": 32,
+            "balance_rel_threshold": 1.1,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1000
+        }"#;
+        let policy: PolicyConfig = serde_json::from_str(json).unwrap();
+        match policy {
+            PolicyConfig::CacheAware {
+                cache_index,
+                cache_ttl_secs,
+                cache_boundaries,
+                ..
+            } => {
+                assert_eq!(cache_index, CacheIndexKind::Tree);
+                assert_eq!(cache_ttl_secs, 180);
+                assert!(cache_boundaries.is_empty());
+            }
+            _ => panic!("Expected CacheAware"),
+        }
+    }
+
+    #[test]
+    fn test_cache_aware_index_fields_round_trip() {
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.5,
+            "balance_abs_threshold": 32,
+            "balance_rel_threshold": 1.1,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1000,
+            "cache_index": "hash",
+            "cache_ttl_secs": 90,
+            "cache_boundaries": [2048, 8192]
+        }"#;
+        let policy: PolicyConfig = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_string(&policy).unwrap();
+        assert!(serialized.contains("\"cache_index\":\"hash\""));
+        assert!(serialized.contains("\"cache_ttl_secs\":90"));
+        assert!(serialized.contains("\"cache_boundaries\":[2048,8192]"));
+        match serde_json::from_str::<PolicyConfig>(&serialized).unwrap() {
+            PolicyConfig::CacheAware {
+                cache_index,
+                cache_ttl_secs,
+                cache_boundaries,
+                ..
+            } => {
+                assert_eq!(cache_index, CacheIndexKind::Hash);
+                assert_eq!(cache_ttl_secs, 90);
+                assert_eq!(cache_boundaries, vec![2048, 8192]);
+            }
+            _ => panic!("Expected CacheAware"),
+        }
+    }
+
+    #[test]
+    fn test_router_config_cache_boundaries_default_and_skip() {
+        // Absent in old configs → empty; empty is skipped on serialize.
+        let config = RouterConfig::default();
+        assert!(config.cache_boundaries.is_empty());
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("cache_boundaries"));
+
+        let with_boundaries = RouterConfig {
+            cache_boundaries: vec![16, 64],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&with_boundaries).unwrap();
+        assert!(json.contains("\"cache_boundaries\":[16,64]"));
+        let parsed: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.cache_boundaries, vec![16, 64]);
     }
 
     #[test]
@@ -1954,6 +2076,9 @@ mod tests {
                 overload_token_usage_threshold: 1.0,
                 overlap_decay: 0.0,
                 selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1989,6 +2114,9 @@ mod tests {
                 overload_token_usage_threshold: 1.0,
                 overlap_decay: 0.0,
                 selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
             }),
             decode_policy: None,
         };
@@ -2050,6 +2178,9 @@ mod tests {
             overload_token_usage_threshold: 1.0,
             overlap_decay: 0.0,
             selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         };
 
         match pd.get_prefill_policy(&main_policy) {

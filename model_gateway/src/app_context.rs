@@ -891,6 +891,9 @@ mod tests {
             overload_token_usage_threshold: 1.0,
             overlap_decay: 1.0,
             selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         });
         let builder = AppContextBuilder::new()
             .with_client(&config, 5)
@@ -931,6 +934,9 @@ mod tests {
             overload_token_usage_threshold: 1.0,
             overlap_decay: 0.0,
             selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         }));
     }
 
@@ -951,6 +957,9 @@ mod tests {
             overload_token_usage_threshold: 1.0,
             overlap_decay: 0.0,
             selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         };
 
         let mut config = config_with_policy(PolicyConfig::Random);

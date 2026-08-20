@@ -549,6 +549,27 @@ class TestParseRouterArgs:
         defaults = parse_router_args([])
         assert defaults.routing_key_headers == ["x-smg-routing-key"]
 
+    def test_parse_cache_index_args(self):
+        """Comma-separated boundaries plus the index/TTL knobs."""
+        router_args = parse_router_args(
+            [
+                "--cache-boundaries",
+                "2048,8192,32768",
+                "--cache-index",
+                "hash",
+                "--cache-ttl-secs",
+                "120",
+            ]
+        )
+        assert router_args.cache_boundaries == [2048, 8192, 32768]
+        assert router_args.cache_index == "hash"
+        assert router_args.cache_ttl_secs == 120
+
+        defaults = parse_router_args([])
+        assert defaults.cache_boundaries == []
+        assert defaults.cache_index == "tree"
+        assert defaults.cache_ttl_secs == 180
+
     def test_parse_pd_args(self):
         """Test parsing PD disaggregated mode arguments."""
         args = [
@@ -1284,6 +1305,9 @@ class TestRouterArgsFieldOrder:
         "stream_request_bodies_over",
         "stream_body_stall_timeout_secs",
         "routing_key_headers",
+        "cache_boundaries",
+        "cache_index",
+        "cache_ttl_secs",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1309,6 +1333,9 @@ class TestRouterArgsFieldOrder:
             "stream_request_bodies_over",
             "stream_body_stall_timeout_secs",
             "routing_key_headers",
+            "cache_boundaries",
+            "cache_index",
+            "cache_ttl_secs",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

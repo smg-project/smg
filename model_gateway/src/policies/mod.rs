@@ -7,7 +7,10 @@ use std::{fmt::Debug, sync::Arc};
 
 use openai_protocol::worker::WorkerLoadResponse;
 
-use crate::worker::{HashRing, Worker};
+use crate::{
+    config::CacheIndexKind,
+    worker::{HashRing, Worker},
+};
 
 mod bucket;
 mod cache_aware;
@@ -159,6 +162,16 @@ pub struct CacheAwareConfig {
     /// score spread matters): small values mostly follow the best candidate,
     /// large values approach uniform.
     pub selection_temperature: f32,
+    /// Index under-layer: `Tree` (default, radix prefix trees) or `Hash`
+    /// (TTL'd exact-match placement map over `cache_boundaries` heads; the
+    /// radix trees are neither consulted nor populated).
+    pub cache_index: CacheIndexKind,
+    /// Seconds a hash-index placement stays routable; should approximate
+    /// serving-engine cache retention.
+    pub cache_ttl_secs: u64,
+    /// Ascending token positions at which serving engines retain reusable
+    /// prefix state; the hash index keys request heads at these boundaries.
+    pub cache_boundaries: Vec<usize>,
 }
 
 impl Default for CacheAwareConfig {
@@ -178,6 +191,9 @@ impl Default for CacheAwareConfig {
             // to pre-knob selection until explicitly tuned.
             overlap_decay: 0.0,
             selection_temperature: 0.0,
+            cache_index: CacheIndexKind::Tree,
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         }
     }
 }

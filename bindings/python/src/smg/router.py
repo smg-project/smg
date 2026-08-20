@@ -165,6 +165,15 @@ class Router:
         cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to
             cached worker if the match rate exceeds threshold, otherwise routes to the
             worker with the smallest tree. Default: 0.5
+        cache_boundaries: Token positions at which serving engines retain reusable
+            prefix state; cache-affinity policies hash request heads at the deepest
+            applicable boundary. Default: []
+        cache_index: Index under-layer for cache_aware: 'tree' (radix prefix trees)
+            or 'hash' (TTL'd exact-match placement map keyed on request heads at
+            cache_boundaries; token-bearing requests only — untokenized requests
+            stay load-balanced). Default: 'tree'
+        cache_ttl_secs: Seconds a cache-affinity placement stays routable; should
+            approximate serving-engine cache retention. Default: 180
         prefix_token_count: Number of prefix tokens hashed by the prefix_hash
             policy, or four times as many characters of the prompt when the
             request is untokenized. Size it past any shared system prompt so

@@ -1561,6 +1561,9 @@ mod native_loads_tests {
             overload_token_usage_threshold: 1.0,
             overlap_decay,
             selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         }
     }
 

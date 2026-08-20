@@ -92,6 +92,7 @@ impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
+        Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
         Self::validate_storage_context_headers(config)?;
         Self::validate_routing_key_headers(config)?;
@@ -470,7 +471,28 @@ impl ConfigValidator {
                 overload_token_usage_threshold,
                 overlap_decay,
                 selection_temperature,
+                cache_index,
+                cache_ttl_secs,
+                cache_boundaries,
             } => {
+                Self::validate_cache_boundaries(cache_boundaries)?;
+
+                if *cache_ttl_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cache_ttl_secs".to_string(),
+                        value: cache_ttl_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *cache_index == CacheIndexKind::Hash && cache_boundaries.is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cache_index".to_string(),
+                        value: "hash".to_string(),
+                        reason: "cache_index=hash requires non-empty cache_boundaries".to_string(),
+                    });
+                }
+
                 if !overlap_decay.is_finite() || *overlap_decay < 0.0 {
                     return Err(ConfigError::InvalidValue {
                         field: "overlap_decay".to_string(),
@@ -642,6 +664,24 @@ impl ConfigValidator {
                     });
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn validate_cache_boundaries(boundaries: &[usize]) -> ConfigResult<()> {
+        if boundaries.first() == Some(&0) {
+            return Err(ConfigError::InvalidValue {
+                field: "cache_boundaries".to_string(),
+                value: "0".to_string(),
+                reason: "Boundaries must be > 0".to_string(),
+            });
+        }
+        if boundaries.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(ConfigError::InvalidValue {
+                field: "cache_boundaries".to_string(),
+                value: format!("{boundaries:?}"),
+                reason: "Boundaries must be strictly ascending".to_string(),
+            });
         }
         Ok(())
     }
@@ -1475,6 +1515,9 @@ mod tests {
                 overload_token_usage_threshold: 1.0,
                 overlap_decay: 0.0,
                 selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
             },
         );
 
@@ -1502,6 +1545,9 @@ mod tests {
                     overload_token_usage_threshold: 1.0,
                     overlap_decay,
                     selection_temperature,
+                    cache_index: Default::default(),
+                    cache_ttl_secs: 180,
+                    cache_boundaries: Vec::new(),
                 },
             )
         };
@@ -1514,6 +1560,58 @@ mod tests {
         assert!(ConfigValidator::validate(&make(0.0, -1.0)).is_err());
         assert!(ConfigValidator::validate(&make(f32::NAN, 0.0)).is_err());
         assert!(ConfigValidator::validate(&make(0.0, f32::INFINITY)).is_err());
+    }
+
+    #[test]
+    fn test_validate_cache_index_fields() {
+        let make = |cache_index: CacheIndexKind, cache_ttl_secs: u64, boundaries: Vec<usize>| {
+            RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec!["http://worker1:8000".to_string()],
+                },
+                PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                    block_size: 16,
+                    balance_token_usage_threshold: 1.0,
+                    overload_token_usage_threshold: 1.0,
+                    overlap_decay: 0.0,
+                    selection_temperature: 0.0,
+                    cache_index,
+                    cache_ttl_secs,
+                    cache_boundaries: boundaries,
+                },
+            )
+        };
+
+        assert!(ConfigValidator::validate(&make(CacheIndexKind::Tree, 180, vec![])).is_ok());
+        assert!(ConfigValidator::validate(&make(CacheIndexKind::Hash, 180, vec![16, 64])).is_ok());
+        // TTL must be positive.
+        assert!(ConfigValidator::validate(&make(CacheIndexKind::Tree, 0, vec![])).is_err());
+        // Hash mode without boundaries has nothing to key on.
+        assert!(ConfigValidator::validate(&make(CacheIndexKind::Hash, 180, vec![])).is_err());
+        // Boundaries must be strictly ascending and non-zero.
+        assert!(ConfigValidator::validate(&make(CacheIndexKind::Hash, 180, vec![64, 16])).is_err());
+        assert!(ConfigValidator::validate(&make(CacheIndexKind::Hash, 180, vec![16, 16])).is_err());
+        assert!(ConfigValidator::validate(&make(CacheIndexKind::Hash, 180, vec![0, 16])).is_err());
+    }
+
+    #[test]
+    fn test_validate_shared_cache_boundaries_field() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        config.cache_boundaries = vec![16, 64];
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.cache_boundaries = vec![64, 16];
+        assert!(ConfigValidator::validate(&config).is_err());
     }
 
     #[test]
@@ -1534,6 +1632,9 @@ mod tests {
                 overload_token_usage_threshold: 1.0,
                 overlap_decay: 0.0,
                 selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
             },
         );
 
@@ -1593,6 +1694,9 @@ mod tests {
                 overload_token_usage_threshold: 1.0,
                 overlap_decay: 0.0,
                 selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
             },
         );
 
@@ -1642,6 +1746,9 @@ mod tests {
                     overload_token_usage_threshold: 1.0,
                     overlap_decay: 0.0,
                     selection_temperature: 0.0,
+                    cache_index: Default::default(),
+                    cache_ttl_secs: 180,
+                    cache_boundaries: Vec::new(),
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
@@ -1770,6 +1877,9 @@ mod tests {
                     overload_token_usage_threshold: 1.0,
                     overlap_decay: 0.0,
                     selection_temperature: 0.0,
+                    cache_index: Default::default(),
+                    cache_ttl_secs: 180,
+                    cache_boundaries: Vec::new(),
                 }),
                 prefill_policy: None,
                 decode_policy: None,
