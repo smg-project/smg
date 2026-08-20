@@ -3,7 +3,7 @@
 #
 # The gRPC serve command from PR #11037 and the Harmony parser fixes (#12045,
 # #12467) referenced by SMG #801 first shipped in 1.3.0rc14 (released
-# 2026-05-07) and remain included in the pinned 1.3.0rc22 pre-release wheel.
+# 2026-05-07) and remain included in the pinned 1.3.0rc24 pre-release wheel.
 # We install it directly from PyPI instead of building TensorRT-LLM from
 # source, which saves ~30 min of CMake compile time per CI run. See git
 # history for the previous source-build logic.
@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-TRTLLM_VERSION="1.3.0rc22"
+TRTLLM_VERSION="1.3.0rc24"
 NCCL_VERSION_CONSTRAINT="nvidia-nccl-cu13>=2.28.9,<=2.29.2"
 
 # Activate venv if it exists
