@@ -14,9 +14,8 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 use crate::{
     routers::grpc::zmq_client::zmq_handshake_address,
     worker::{
-        circuit_breaker::CircuitBreakerConfig, http_client::build_worker_http_client,
-        resilience::resolve_resilience, worker::RuntimeType, BasicWorkerBuilder, ConnectionMode,
-        Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
+        circuit_breaker::CircuitBreakerConfig, resilience::resolve_resilience, worker::RuntimeType,
+        BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
 };
@@ -204,11 +203,13 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             &config.resilience,
         );
 
-        let http_client = build_worker_http_client(&config.http_pool, &app_context.router_config)
+        let http_client = app_context
+            .worker_client_cache
+            .get(&config.http_pool)
             .map_err(|e| WorkflowError::StepFailed {
-            step_id: StepId::new("create_worker"),
-            message: e,
-        })?;
+                step_id: StepId::new("create_worker"),
+                message: e,
+            })?;
 
         let health_base = app_context.router_config.health_check.to_protocol_config();
         let health_config =

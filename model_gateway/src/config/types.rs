@@ -243,10 +243,11 @@ pub struct RouterConfig {
     /// PEM format, loaded from ca_cert_paths during config creation
     #[serde(default)]
     pub ca_certificates: Vec<Vec<u8>>,
-    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext),
-    /// multiplexing every request to a worker over one connection instead of
-    /// one TCP connection per in-flight request. Requires every HTTP worker
-    /// to serve HTTP/2 without an upgrade handshake.
+    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext) on all
+    /// engine-directed connections — request dispatch and health/probe traffic
+    /// alike — multiplexing every request to a worker over one connection
+    /// instead of one TCP connection per in-flight request. Requires every
+    /// HTTP worker to serve HTTP/2 without an upgrade handshake.
     #[serde(default)]
     pub upstream_http2: bool,
     /// Loaded from mcp_config_path during config creation

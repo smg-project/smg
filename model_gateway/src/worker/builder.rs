@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use openai_protocol::{
@@ -30,8 +30,8 @@ pub struct BasicWorkerBuilder {
     health_endpoint: String,
     circuit_breaker_config: CircuitBreakerConfig,
     backend_client: Option<BackendClient>,
-    /// Pre-built per-worker HTTP client (if not set, a default is created).
-    http_client: Option<reqwest::Client>,
+    /// Pre-built worker-directed HTTP client (if not set, a default is created).
+    http_client: Option<Arc<reqwest::Client>>,
     /// Resolved resilience config (if not set, defaults are used).
     resilience: Option<ResolvedResilience>,
     /// Initial lifecycle status. If unset, defaults to `Pending` for
@@ -188,8 +188,9 @@ impl BasicWorkerBuilder {
         self
     }
 
-    /// Set a pre-built per-worker HTTP client.
-    pub fn http_client(mut self, client: reqwest::Client) -> Self {
+    /// Set a pre-built worker-directed HTTP client. The strong handle keeps
+    /// the client's shared cache entry alive for the worker's lifetime.
+    pub fn http_client(mut self, client: Arc<reqwest::Client>) -> Self {
         self.http_client = Some(client);
         self
     }
@@ -264,7 +265,7 @@ impl BasicWorkerBuilder {
 
     /// Build the BasicWorker instance
     pub fn build(mut self) -> BasicWorker {
-        use std::sync::{atomic::AtomicBool, Arc};
+        use std::sync::atomic::AtomicBool;
 
         use tokio::sync::OnceCell;
 
@@ -425,7 +426,7 @@ mod tests {
     #[test]
     fn provided_http_client_is_used_as_is() {
         let worker = BasicWorkerBuilder::new("http://localhost:8080")
-            .http_client(reqwest::Client::new())
+            .http_client(Arc::new(reqwest::Client::new()))
             .build();
         assert!(!worker.http_client.cell_is_empty());
     }

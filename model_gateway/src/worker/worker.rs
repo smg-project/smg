@@ -40,20 +40,21 @@ use crate::{
 /// Default HTTP client timeout for worker requests (in seconds)
 pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
 
-/// Per-worker HTTP client with an isolated connection pool, materialized on
-/// first use.
+/// A worker's HTTP client handle, materialized on first use.
 ///
-/// A worker whose connection mode never speaks HTTP (ZMQ: local health check,
-/// admin ops rejected up front) would otherwise pay for a connector and idle
-/// pool it can never use, so the fallback client is built only when a caller
-/// actually asks for it.
+/// Registration hands in a shared client from the worker client cache. A
+/// worker built without one whose connection mode never speaks HTTP (ZMQ:
+/// local health check, admin ops rejected up front) would otherwise pay for a
+/// connector and idle pool it can never use, so the fallback client is built
+/// only when a caller actually asks for it.
 pub struct LazyHttpClient {
-    cell: OnceLock<reqwest::Client>,
+    cell: OnceLock<Arc<reqwest::Client>>,
 }
 
 impl LazyHttpClient {
     /// Wrap an already-built client (the registration paths hand one in).
-    pub fn ready(client: reqwest::Client) -> Self {
+    /// The strong handle is what keeps the client's cache entry alive.
+    pub fn ready(client: Arc<reqwest::Client>) -> Self {
         let cell = OnceLock::new();
         let _ = cell.set(client);
         Self { cell }
@@ -74,19 +75,32 @@ impl LazyHttpClient {
 
     /// The client, building the default one on first use.
     pub fn client(&self) -> &reqwest::Client {
+        self.init()
+    }
+
+    /// A strong handle to the client if one was materialized, for a
+    /// replacement worker to adopt. Never forces the lazy cell: a worker
+    /// that never spoke HTTP hands its replacement a still-deferred slot.
+    pub fn handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
+        self.cell.get().map(Arc::clone)
+    }
+
+    fn init(&self) -> &Arc<reqwest::Client> {
         self.cell.get_or_init(|| {
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(DEFAULT_WORKER_HTTP_TIMEOUT_SECS))
-                .pool_max_idle_per_host(8)
-                .build()
-                .unwrap_or_else(|e| {
-                    tracing::warn!(
-                        error = %e,
-                        "failed to build the default per-worker HTTP client; \
-                         falling back to reqwest defaults (no request timeout)"
-                    );
-                    reqwest::Client::new()
-                })
+            Arc::new(
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(DEFAULT_WORKER_HTTP_TIMEOUT_SECS))
+                    .pool_max_idle_per_host(8)
+                    .build()
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to build the default per-worker HTTP client; \
+                             falling back to reqwest defaults (no request timeout)"
+                        );
+                        reqwest::Client::new()
+                    }),
+            )
         })
     }
 }
@@ -520,6 +534,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Get the per-worker HTTP client.
     fn http_client(&self) -> &reqwest::Client;
+
+    /// Strong handle to the worker's HTTP client, if one was materialized.
+    /// Must not force a deferred client into existence; cache-fed workers
+    /// return the shared handle so a replacement worker keeps the cache
+    /// entry alive.
+    fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>>;
 
     // ── Metadata convenience delegates ──────────────────────────────
     //
@@ -1182,8 +1202,8 @@ pub struct BasicWorker {
     /// When not `Wildcard`, overrides metadata.models for routing decisions.
     /// Uses `ArcSwap` for lock-free reads on the hot path (`supports_model`).
     pub models_override: Arc<ArcSwap<WorkerModels>>,
-    /// Per-worker HTTP client with isolated connection pool, built on first
-    /// use (see [`LazyHttpClient`]).
+    /// Worker-directed HTTP client, shared across same-config workers, built
+    /// on first use (see [`LazyHttpClient`]).
     pub http_client: Arc<LazyHttpClient>,
     /// Resolved resilience config (retry + circuit breaker settings).
     pub resilience: ResolvedResilience,
@@ -1526,6 +1546,10 @@ impl Worker for BasicWorker {
 
     fn http_client(&self) -> &reqwest::Client {
         self.http_client.client()
+    }
+
+    fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
+        self.http_client.handle_if_initialized()
     }
 
     fn supports_model(&self, model_id: &str) -> bool {

@@ -95,11 +95,17 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 .health_config(updated_health_config.clone())
                 .health_endpoint(&health_endpoint)
                 .models(worker.metadata().spec.models.clone())
-                .http_client(worker.http_client().clone())
                 .resilience(worker.resilience().clone())
                 .priority(updated_priority)
                 .cost(updated_cost)
                 .status(next_status);
+
+            // Adopt the old worker's client only if it was materialized: a
+            // never-HTTP worker (ZMQ) keeps a deferred slot instead of having
+            // a client it will never use built for the replacement.
+            if let Some(client) = worker.http_client_handle_if_initialized() {
+                builder = builder.http_client(client);
+            }
 
             if let Some(ref api_key) = updated_api_key {
                 builder = builder.api_key(api_key.clone());
@@ -243,6 +249,9 @@ mod tests {
             tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
             wasm_manager: None,
+            worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
+                &router_config,
+            )),
             worker_service: Arc::new(WorkerService::new(registry, job_queue, router_config)),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
@@ -363,5 +372,35 @@ mod tests {
             .expect("replacement must inherit the connected client");
         assert!(Arc::ptr_eq(&adopted, &client));
         assert_eq!(new.status(), WorkerStatus::Ready);
+
+        // Neither side of a ZMQ replacement may materialize an HTTP client
+        // it will never use.
+        assert!(old.http_client.cell_is_empty());
+        assert!(new.http_client.cell_is_empty());
+    }
+
+    /// An HTTP worker's replacement must adopt the same shared client — a
+    /// fresh client would silently detach it from the worker-client cache
+    /// entry the old worker was keeping alive.
+    #[tokio::test]
+    async fn http_update_adopts_the_materialized_shared_client() {
+        let client = Arc::new(reqwest::Client::new());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w:8080")
+                .http_client(Arc::clone(&client))
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+        let mut ctx = make_context(app_ctx, Arc::clone(&worker), HashMap::new());
+
+        let result = UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap();
+        assert_eq!(result, StepResult::Success);
+
+        let updated = &ctx.data.updated_workers.as_ref().expect("updated workers")[0];
+        let adopted = updated
+            .http_client_handle_if_initialized()
+            .expect("materialized client is adopted");
+        assert!(Arc::ptr_eq(&adopted, &client));
     }
 }

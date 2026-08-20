@@ -31,7 +31,7 @@ pub use capacity::{CapacitySource, CapacityTrackerSettings, WorkerCapacity};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 pub use error::{WorkerError, WorkerResult};
 pub use hash_ring::HashRing;
-pub use http_client::build_worker_http_client;
+pub use http_client::WorkerHttpClientCache;
 pub use kv_event_monitor::KvEventMonitor;
 pub use manager::WorkerManager;
 pub use monitor::{WorkerLoadManager, WorkerMonitor};

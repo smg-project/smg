@@ -490,9 +490,10 @@ struct CliArgs {
     #[arg(long, value_parser = parse_positive_usize, help_heading = "Worker Configuration")]
     zmq_engine_count: Option<usize>,
 
-    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext),
-    /// multiplexing every request to a worker over one connection. Requires
-    /// every HTTP worker to serve HTTP/2 without an upgrade handshake.
+    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext) on all
+    /// engine-directed connections — request dispatch and health/probe traffic
+    /// alike — multiplexing every request to a worker over one connection.
+    /// Requires every HTTP worker to serve HTTP/2 without an upgrade handshake.
     #[arg(long, default_value_t = false, help_heading = "Worker Configuration")]
     upstream_http2: bool,
 
