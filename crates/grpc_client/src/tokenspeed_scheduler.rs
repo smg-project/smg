@@ -326,6 +326,7 @@ impl TokenSpeedSchedulerClient {
             spaces_between_special_tokens: true,
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
+            sampling_seed: Self::chat_sampling_seed(request)?,
             n: request.n.unwrap_or(1),
             constraint: Self::build_constraint_for_chat(request, tool_call_constraint)?,
             ..Default::default()
@@ -412,6 +413,7 @@ impl TokenSpeedSchedulerClient {
             spaces_between_special_tokens: true,
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
+            sampling_seed: Self::completion_sampling_seed(request)?,
             n: request.n.unwrap_or(1),
             constraint: Self::build_constraint_from_completion(request)?,
             ..Default::default()
@@ -484,6 +486,7 @@ impl TokenSpeedSchedulerClient {
         if let Some(v) = p.n {
             sampling.n = v;
         }
+        sampling.sampling_seed = p.sampling_seed;
 
         sampling.constraint = Self::build_constraint_from_plain(p)?;
 
@@ -642,6 +645,25 @@ impl TokenSpeedSchedulerClient {
             1 => Ok(constraints.pop()),
             _ => Err("Multiple structured constraints are not allowed".to_string()),
         }
+    }
+
+    fn unsigned_sampling_seed(seed: Option<i64>) -> Result<Option<u64>, String> {
+        seed.map(|seed| {
+            u64::try_from(seed).map_err(|_| "sampling seed must be an unsigned integer".to_owned())
+        })
+        .transpose()
+    }
+
+    #[expect(
+        deprecated,
+        reason = "TokenSpeed preserves the OpenAI-compatible chat seed on its sampling wire"
+    )]
+    fn chat_sampling_seed(request: &ChatCompletionRequest) -> Result<Option<u64>, String> {
+        Self::unsigned_sampling_seed(request.seed)
+    }
+
+    fn completion_sampling_seed(request: &CompletionRequest) -> Result<Option<u64>, String> {
+        Self::unsigned_sampling_seed(request.seed)
     }
 }
 

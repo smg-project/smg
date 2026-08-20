@@ -86,6 +86,10 @@ message SamplingParams {
 
   // Escape hatch for backend-specific knobs without bumping the proto.
   google.protobuf.Struct custom_params = 21;
+
+  // Per-request stochastic sampling seed. Omission delegates seed selection
+  // to the token engine.
+  optional uint64 sampling_seed = 23;
 }
 
 // =====================

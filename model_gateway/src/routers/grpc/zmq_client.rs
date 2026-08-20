@@ -1307,9 +1307,9 @@ fn fan_out_n<R: Clone>(mut req: R, n: u32, mut per_sub: impl FnMut(&mut R, u32))
 /// Split an `n > 1` TokenSpeed proto request into `n` single-sample
 /// sub-requests, the TokenSpeed analogue of [`fan_out_requests`] (the wire has
 /// no per-sample demux, so `generate` fans out here). An `n <= 1` request passes
-/// through untouched. The TokenSpeed proto carries no seed, so the samples
-/// differ by the engine's per-rid seeding alone — the suffixed request ids are
-/// unique, so each rid seeds independently.
+/// through untouched. Seed handling matches [`fan_out_requests`]: omission
+/// delegates independent seed assignment to the engine, while explicit seed
+/// `s` derives deterministic per-sample seeds `s + i`.
 fn fan_out_tokenspeed_requests(
     req: tokenspeed_proto::GenerateRequest,
 ) -> Vec<tokenspeed_proto::GenerateRequest> {
@@ -1318,6 +1318,7 @@ fn fan_out_tokenspeed_requests(
         sub.request_id = format!("{}-{i}", sub.request_id);
         if let Some(sp) = sub.sampling_params.as_mut() {
             sp.n = 1;
+            sp.sampling_seed = sp.sampling_seed.map(|seed| seed.wrapping_add(u64::from(i)));
         }
     })
 }
@@ -1398,6 +1399,7 @@ fn translate_sampling_tokenspeed(sp: tokenspeed_proto::SamplingParams) -> TokenS
         skip_special_tokens: sp.skip_special_tokens,
         spaces_between_special_tokens: sp.spaces_between_special_tokens,
         no_stop_trim: sp.no_stop_trim,
+        seed: sp.sampling_seed,
         // Proto `0` means unspecified; TokenSpeed expects at least one sample.
         // n>1 is fanned out before translation, so this is always 1 on the wire.
         n: sp.n.max(1),
@@ -2571,11 +2573,13 @@ mod tests {
         // forwards.
         let mapped = translate_sampling_tokenspeed(tokenspeed_proto::SamplingParams {
             top_k: None,
+            sampling_seed: Some(1_234),
             n: 0,
             max_new_tokens: Some(8),
             ..Default::default()
         });
         assert_eq!(mapped.top_k, TOP_K_DISABLED);
+        assert_eq!(mapped.seed, Some(1_234));
         assert_eq!(mapped.n, 1);
         assert_eq!(mapped.max_new_tokens, Some(8));
         // The wire form is always normalized (the engine skips re-derivation).
@@ -2958,6 +2962,36 @@ mod tests {
         let single = fan_out_requests(tokenized_req(vllm::SamplingParams::default()));
         assert_eq!(single.len(), 1);
         assert_eq!(single[0].request_id, "r1");
+    }
+
+    #[test]
+    fn tokenspeed_fan_out_derives_explicit_sampling_seeds() {
+        let subs =
+            fan_out_tokenspeed_requests(ts_tokenized_req(tokenspeed_proto::SamplingParams {
+                n: 3,
+                sampling_seed: Some(7),
+                ..Default::default()
+            }));
+
+        assert_eq!(subs.len(), 3);
+        for (i, sub) in (0_u64..).zip(&subs) {
+            let sampling = sub.sampling_params.as_ref().expect("sampling params");
+            assert_eq!(sub.request_id, format!("r1-{i}"));
+            assert_eq!(sampling.n, 1);
+            assert_eq!(sampling.sampling_seed, Some(7 + i));
+        }
+
+        let subs =
+            fan_out_tokenspeed_requests(ts_tokenized_req(tokenspeed_proto::SamplingParams {
+                n: 2,
+                ..Default::default()
+            }));
+        assert!(subs.iter().all(|sub| sub
+            .sampling_params
+            .as_ref()
+            .expect("sampling params")
+            .sampling_seed
+            .is_none()));
     }
 
     /// n=2 over a vLLM EngineCore: two engine-side requests with distinct
