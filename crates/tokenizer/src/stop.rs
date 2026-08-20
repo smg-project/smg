@@ -376,6 +376,8 @@ mod tests {
         // Process stop token
         let result = decoder.process_token(999).unwrap(); // <eos>
         assert_eq!(result, SequenceDecoderOutput::Stopped);
+        // Token-level stops don't record a matched string stop.
+        assert_eq!(decoder.matched_stop(), None);
 
         // Further tokens should also return Stopped
         let result = decoder.process_token(2).unwrap();
@@ -620,6 +622,7 @@ mod tests {
             decoder.is_stopped(),
             "Decoder should be stopped after the full stop sequence match"
         );
+        assert_eq!(decoder.matched_stop(), Some("Hello world"));
 
         // Any further tokens should also return Stopped
         let result3 = decoder.process_token(3).unwrap();
