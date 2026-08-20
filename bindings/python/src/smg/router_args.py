@@ -235,6 +235,9 @@ class RouterArgs:
     # Control-plane job queue sizing (worker registration/removal jobs)
     job_queue_capacity: int = 1000
     job_queue_concurrency: int = 200
+    # Absolute per-worker overload thresholds; both None disables the feature
+    worker_overload_waiting_requests: int | None = None
+    worker_overload_token_usage: float | None = None
 
     @staticmethod
     def add_cli_args(
@@ -540,6 +543,39 @@ class RouterArgs:
                 " exceeds it, shed load off that engine regardless of spread. A safety"
                 " valve for critically-saturated engines, best set high (e.g. 0.9)."
                 " Backend must report token_usage. Defaults to 1.0 (disabled)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-overload-waiting-requests",
+            type=int,
+            default=RouterArgs.worker_overload_waiting_requests,
+            help=(
+                "Queued-request count AT OR ABOVE which a worker is considered"
+                " overloaded and excluded from routing until the signal recovers;"
+                " when every worker is overloaded, requests are shed immediately"
+                " rather than queued. Unset disables overload protection. This"
+                " signal is the queued (waiting) request count, summed across DP"
+                " ranks. Must be >= 1: the comparison is inclusive, so 0 would veto"
+                " every worker unconditionally."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-overload-token-usage",
+            type=float,
+            default=RouterArgs.worker_overload_token_usage,
+            help=(
+                "KV-cache token usage AT OR ABOVE which a worker is considered"
+                " overloaded and excluded from routing until the signal recovers;"
+                " when every worker is overloaded, requests are shed immediately"
+                " rather than queued. Unset disables overload protection. This"
+                " signal is mean KV-cache token usage across DP ranks, the same one"
+                " --balance-token-usage-threshold reads, applied as an absolute"
+                " per-worker CEILING rather than a fleet-relative spread. Backend"
+                " must report token_usage. Must be in (0.0, 1.0]: the comparison is"
+                " inclusive, so 0.0 would veto every worker unconditionally."
+                " Distinct from --overload-token-usage-threshold, which only"
+                " de-ranks the hottest backend within cache-aware affinity; this"
+                " flag removes the worker from routing entirely."
             ),
         )
         routing_group.add_argument(

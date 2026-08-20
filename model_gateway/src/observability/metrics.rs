@@ -346,6 +346,15 @@ pub(crate) fn init_metrics() {
          (panic, join_error, intern_failed)"
     );
     describe_gauge!(
+        "smg_workers_overloaded",
+        "Workers currently flagged overloaded and excluded from routing, by model"
+    );
+    describe_counter!(
+        "smg_worker_overload_shed_total",
+        "Requests shed because every worker for the model is overloaded, by stage \
+         (selection, dispatch)"
+    );
+    describe_gauge!(
         "smg_manual_policy_cache_entries",
         "Number of routing entries in manual policy cache"
     );
@@ -1332,6 +1341,23 @@ impl Metrics {
             "worker_type" => worker_type,
             "connection_mode" => connection_mode,
             "error_type" => error_type
+        )
+        .increment(1);
+    }
+
+    /// Set the count of workers a model currently has vetoed by the absolute
+    /// overload guard. Written only when a worker's flag transitions.
+    pub fn set_workers_overloaded(model_id: &str, count: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_workers_overloaded", "model" => model).set(count as f64);
+    }
+
+    /// Record a request shed because every worker for the model is overloaded.
+    /// `stage` is "selection" or "dispatch".
+    pub fn record_worker_overload_shed(stage: &'static str) {
+        counter!(
+            "smg_worker_overload_shed_total",
+            "stage" => stage
         )
         .increment(1);
     }

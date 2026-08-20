@@ -53,12 +53,12 @@ use crate::{
     policies::{PolicyRegistry, SelectWorkerInfo},
     routers::{
         common::{
-            header_utils,
+            header_utils, overload,
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
-            retry::{is_retryable_status, RetryExecutor},
+            retry::{is_retryable_response, is_retryable_status, RetryExecutor},
             sse::SSE_CHANNEL_BUFFER,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
@@ -423,7 +423,7 @@ impl Router {
                 res
             },
             // should_retry predicate
-            |res, _attempt| is_retryable_status(res.status()),
+            |res, _attempt| is_retryable_response(res),
             // on_backoff hook
             |delay, attempt| {
                 // Layer 3 worker metrics
@@ -493,8 +493,14 @@ impl Router {
                     None,
                     false,
                 );
+                // `total` is exactly the pool selection drew from, wildcard
+                // model included — classifying from it rather than from the
+                // model index is what makes the shed fire for a model-less
+                // `/generate` and for a model that is also served over gRPC.
                 return if total.is_empty() {
                     error::model_not_found(model_id)
+                } else if let Some(shed) = overload::shed_if_all_overloaded(&total, model_id) {
+                    shed
                 } else {
                     error::service_unavailable(
                         "no_available_workers",
@@ -503,6 +509,13 @@ impl Router {
                 };
             }
         };
+
+        // Dispatch-time re-check of the one chosen worker: O(1), and the only
+        // thing that closes the window between selection and dispatch in which
+        // a load report can flip the veto.
+        if let Some(shed) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
+            return shed;
+        }
 
         // Keyed-load accounting uses the same effective key as selection:
         // rid-derived first, header fallback.
@@ -767,10 +780,13 @@ impl Router {
             .cloned()
             .collect();
         if available.is_empty() {
-            let resp = error::service_unavailable(
-                "no_available_workers",
-                "All workers are unavailable (circuit breaker open or unhealthy)",
-            );
+            let resp =
+                overload::shed_if_all_overloaded(&non_dp_workers, model_id).unwrap_or_else(|| {
+                    error::service_unavailable(
+                        "no_available_workers",
+                        "All workers are unavailable (circuit breaker open or unhealthy)",
+                    )
+                });
             record_pre_send_error(&resp);
             return resp;
         }
@@ -807,6 +823,15 @@ impl Router {
             policy.name(),
         );
         let worker = available[idx].clone();
+
+        // Same dispatch-time re-check the regular path takes. A transcription
+        // occupies its worker for far longer than a chat completion, so a
+        // report landing in the selection→dispatch window is the one case where
+        // dispatching anyway is measurably worse.
+        if let Some(resp) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
+            record_pre_send_error(&resp);
+            return resp;
+        }
 
         // Streamed requests have no rid; the header is the whole sticky key.
         let load_guard = WorkerLoadGuard::with_key(

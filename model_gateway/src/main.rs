@@ -180,6 +180,18 @@ fn parse_usize_in_range(value: &str, max: usize) -> Result<usize, String> {
     }
 }
 
+/// Parse a ratio in `(0.0, 1.0]`. Zero is excluded because a `>=` threshold of
+/// 0.0 would mark every worker overloaded unconditionally.
+fn parse_unit_fraction(value: &str) -> Result<f64, String> {
+    match value.parse::<f64>() {
+        Ok(v) if v > 0.0 && v <= 1.0 => Ok(v),
+        Ok(_) => Err(format!(
+            "invalid value '{value}'; expected a fraction in (0.0, 1.0]"
+        )),
+        Err(err) => Err(format!("invalid value '{value}': {err}")),
+    }
+}
+
 fn parse_job_queue_capacity(value: &str) -> Result<usize, String> {
     parse_usize_in_range(value, 1_000_000)
 }
@@ -265,6 +277,33 @@ struct CliArgs {
     /// regardless of spread. Best set high (e.g. 0.9). >= 1.0 disables it.
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     overload_token_usage_threshold: f32,
+
+    /// Queued-request count at or above which a worker is considered
+    /// overloaded and excluded from routing until the signal recovers; when
+    /// every worker is overloaded, requests are shed immediately rather than
+    /// queued. Unset disables overload protection.
+    ///
+    /// Queued (waiting) requests, summed across DP ranks. Must be >= 1: the
+    /// comparison is inclusive, so 0 would veto every worker unconditionally.
+    #[arg(long, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
+    worker_overload_waiting_requests: Option<usize>,
+
+    /// KV-cache token usage at or above which a worker is considered
+    /// overloaded and excluded from routing until the signal recovers; when
+    /// every worker is overloaded, requests are shed immediately rather than
+    /// queued. Unset disables overload protection.
+    ///
+    /// Mean KV-cache token usage across DP ranks, the same signal
+    /// `--balance-token-usage-threshold` reads, applied as an absolute
+    /// per-worker ceiling rather than a fleet-relative spread. Backend must
+    /// report token_usage. Must be in (0.0, 1.0]: the comparison is inclusive,
+    /// so 0.0 would veto every worker unconditionally.
+    ///
+    /// Distinct from `--overload-token-usage-threshold`, which only de-ranks
+    /// the hottest backend within cache-aware affinity; this flag removes the
+    /// worker from routing entirely and sheds when every worker crosses it.
+    #[arg(long, value_parser = parse_unit_fraction, help_heading = "Routing Policy")]
+    worker_overload_token_usage: Option<f64>,
 
     /// Anti-hotspot decay: de-rank cache-affine candidates by their
     /// waiting-prefill backlog (overlap score divided by 1 + overlap_decay
@@ -1716,6 +1755,8 @@ impl CliArgs {
             .job_queue_capacity(self.job_queue_capacity)
             .job_queue_concurrency(self.job_queue_concurrency)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
+            .worker_overload_token_usage(self.worker_overload_token_usage)
             .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
             .kv_indexer_max_entries(self.kv_indexer_max_entries)
             .engine_metrics(self.engine_metrics)
@@ -2301,6 +2342,86 @@ mod tests {
             server_config.router_config.engine_metrics,
             "engine_metrics must survive into ServerConfig via to_server_config"
         );
+    }
+
+    /// The overload thresholds must reach `RouterConfig` and survive nesting
+    /// into `ServerConfig.router_config` — the consumer (load monitor) reads
+    /// them off `RouterConfig`. Two-path config-plumbing guard.
+    #[test]
+    fn worker_overload_thresholds_flow_into_both_configs() {
+        let cli = cli_args_from(&[
+            "--worker-overload-waiting-requests",
+            "64",
+            "--worker-overload-token-usage",
+            "0.9",
+        ]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(
+            router_config.worker_overload_waiting_requests,
+            Some(64),
+            "worker_overload_waiting_requests must reach RouterConfig via to_router_config"
+        );
+        assert_eq!(
+            router_config.worker_overload_token_usage,
+            Some(0.9),
+            "worker_overload_token_usage must reach RouterConfig via to_router_config"
+        );
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(
+            server_config.router_config.worker_overload_waiting_requests,
+            Some(64),
+            "worker_overload_waiting_requests must survive into ServerConfig"
+        );
+        assert_eq!(
+            server_config.router_config.worker_overload_token_usage,
+            Some(0.9),
+            "worker_overload_token_usage must survive into ServerConfig"
+        );
+    }
+
+    /// Unset means off on both paths: the feature must be byte-identical to
+    /// pre-feature behavior until an operator opts in.
+    #[test]
+    fn worker_overload_thresholds_default_to_unset_in_both_configs() {
+        let cli = cli_args_from(&[]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.worker_overload_waiting_requests, None);
+        assert_eq!(router_config.worker_overload_token_usage, None);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(
+            server_config.router_config.worker_overload_waiting_requests,
+            None
+        );
+        assert_eq!(
+            server_config.router_config.worker_overload_token_usage,
+            None
+        );
+    }
+
+    /// Both thresholds are `>=` comparisons, so the excluded ends of their
+    /// ranges would veto every worker unconditionally. Reject them at parse
+    /// time rather than letting a typo shed all traffic.
+    #[test]
+    fn degenerate_worker_overload_thresholds_are_rejected_at_parse_time() {
+        for argv in [
+            vec!["smg", "--worker-overload-waiting-requests", "0"],
+            vec!["smg", "--worker-overload-token-usage", "0"],
+            vec!["smg", "--worker-overload-token-usage", "1.5"],
+            vec!["smg", "--worker-overload-token-usage", "-0.5"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{argv:?} must be rejected at parse time"
+            );
+        }
+
+        // The inclusive ends of the accepted ranges must still parse.
+        assert!(Cli::try_parse_from(["smg", "--worker-overload-waiting-requests", "1"]).is_ok());
+        assert!(Cli::try_parse_from(["smg", "--worker-overload-token-usage", "1.0"]).is_ok());
     }
 
     /// Cache-index flags must reach the cache_aware policy variant and the

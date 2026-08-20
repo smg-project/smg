@@ -263,6 +263,16 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn worker_overload_waiting_requests(mut self, threshold: Option<usize>) -> Self {
+        self.config.worker_overload_waiting_requests = threshold;
+        self
+    }
+
+    pub fn worker_overload_token_usage(mut self, threshold: Option<f64>) -> Self {
+        self.config.worker_overload_token_usage = threshold;
+        self
+    }
+
     pub fn kv_indexer_ttl_secs(mut self, ttl: Option<u64>) -> Self {
         self.config.kv_indexer_ttl_secs = ttl;
         self

@@ -753,6 +753,27 @@ impl ConfigValidator {
             });
         }
 
+        // Overload thresholds are `>=` comparisons, so the excluded ends of
+        // these ranges are exactly the values that would veto every worker
+        // unconditionally. Mirrors the CLI parsers for the config-file and
+        // bindings paths.
+        if config.worker_overload_waiting_requests == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "worker_overload_waiting_requests".to_string(),
+                value: "0".to_string(),
+                reason: "Must be >= 1 (0 would mark every worker overloaded)".to_string(),
+            });
+        }
+        if let Some(threshold) = config.worker_overload_token_usage {
+            if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "worker_overload_token_usage".to_string(),
+                    value: threshold.to_string(),
+                    reason: "Must be a fraction in (0.0, 1.0]".to_string(),
+                });
+            }
+        }
+
         // The body-limit layer rejects payloads above max_payload_size before
         // the streaming threshold is consulted, so a threshold at or above it
         // could never activate.
@@ -2106,6 +2127,44 @@ mod tests {
         config.health_check_port = Some(8081);
         assert!(ConfigValidator::validate(&config).is_ok());
         config.health_check_port = None;
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// The CLI parsers reject these, but TOML/JSON and the Python bindings
+    /// reach `RouterConfig` without going through clap.
+    #[test]
+    fn test_reject_degenerate_worker_overload_thresholds() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+
+        // Unset is the default and always valid.
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.worker_overload_waiting_requests = Some(0);
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "worker_overload_waiting_requests"
+        ));
+        config.worker_overload_waiting_requests = Some(1);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        for bad in [0.0, -0.1, 1.5, f64::NAN] {
+            config.worker_overload_token_usage = Some(bad);
+            assert!(
+                matches!(
+                    ConfigValidator::validate(&config),
+                    Err(ConfigError::InvalidValue { ref field, .. })
+                        if field == "worker_overload_token_usage"
+                ),
+                "{bad} must be rejected"
+            );
+        }
+        config.worker_overload_token_usage = Some(1.0);
         assert!(ConfigValidator::validate(&config).is_ok());
     }
 }

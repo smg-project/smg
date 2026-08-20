@@ -13,6 +13,8 @@
 //!   helpers shared across the chat / responses / messages routes
 //! - [`realtime`] — Realtime API transport (WS/WebRTC/REST relay +
 //!   session registry) shared by the OpenAI and HTTP routers
+//! - [`overload`] — shed responses for the absolute worker-overload
+//!   guard, shared by the HTTP and gRPC selection paths
 //! - [`worker_selection`] — per-request worker-selection helpers used
 //!   by every routing path (regular, PD, fallback, external provider)
 //! - [`retry`] — generic async retry executor + backoff calculator,
@@ -25,6 +27,7 @@
 pub mod header_utils;
 pub mod mcp_utils;
 pub mod openai_bridge;
+pub mod overload;
 pub mod persistence_utils;
 pub mod realtime;
 pub mod retry;

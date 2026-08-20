@@ -570,6 +570,47 @@ class TestParseRouterArgs:
         assert defaults.cache_index == "tree"
         assert defaults.cache_ttl_secs == 180
 
+    def test_parse_worker_overload_args(self):
+        """Both overload flags round-trip, and both default to unset.
+
+        The argparse names are built from an f-string prefix, so a typo or a
+        dest/field mismatch would leave the field at its default and silently
+        disable the feature from Python -- `from_cli_args` skips keys it cannot
+        find.
+        """
+        router_args = parse_router_args(
+            [
+                "--worker-overload-waiting-requests",
+                "64",
+                "--worker-overload-token-usage",
+                "0.9",
+            ]
+        )
+        assert router_args.worker_overload_waiting_requests == 64
+        assert router_args.worker_overload_token_usage == pytest.approx(0.9)
+
+        defaults = parse_router_args([])
+        assert defaults.worker_overload_waiting_requests is None
+        assert defaults.worker_overload_token_usage is None
+
+    def test_prefixed_worker_overload_args(self):
+        """The --router-prefixed aliases reach the same fields."""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(
+            [
+                "--router-worker-overload-waiting-requests",
+                "8",
+                "--router-worker-overload-token-usage",
+                "0.75",
+            ]
+        )
+
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+
+        assert router_args.worker_overload_waiting_requests == 8
+        assert router_args.worker_overload_token_usage == pytest.approx(0.75)
+
     def test_parse_pd_args(self):
         """Test parsing PD disaggregated mode arguments."""
         args = [
@@ -1327,6 +1368,8 @@ class TestRouterArgsFieldOrder:
         "cache_ttl_secs",
         "job_queue_capacity",
         "job_queue_concurrency",
+        "worker_overload_waiting_requests",
+        "worker_overload_token_usage",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1355,6 +1398,8 @@ class TestRouterArgsFieldOrder:
             "cache_boundaries",
             "cache_index",
             "cache_ttl_secs",
+            "worker_overload_waiting_requests",
+            "worker_overload_token_usage",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

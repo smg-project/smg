@@ -14,7 +14,10 @@
 
 use std::{
     collections::{BTreeSet, HashSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
@@ -123,6 +126,19 @@ pub struct WorkerRegistry {
     /// Only held during the in-memory model index diff (no I/O, microseconds).
     worker_mutation_locks: Arc<DashMap<WorkerId, Arc<parking_lot::Mutex<()>>>>,
 
+    /// Count of workers currently flagged overloaded, per model-index key.
+    /// Moved only on flag transitions and on registry membership changes, so
+    /// reading it costs one map probe and no worker walk.
+    model_overloaded: Arc<DashMap<String, AtomicUsize>>,
+
+    /// Serializes overload *edges* so a flag flip and its counter adjustment
+    /// land as one step. Two group loops flipping the same worker in opposite
+    /// directions would otherwise be free to apply their deltas in the reverse
+    /// order and leave the counter disagreeing with the flag. Never taken when
+    /// the verdict is unchanged, which is every poll but the crossing ones, and
+    /// never taken on a request path.
+    overload_transitions: Arc<parking_lot::Mutex<()>>,
+
     /// Per-model retry config (last write wins).
     /// Updated when a worker with non-empty retry overrides registers.
     /// Cleaned up when the last worker for a model is removed.
@@ -172,6 +188,8 @@ impl WorkerRegistry {
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
             worker_mutation_locks: Arc::new(DashMap::new()),
+            model_overloaded: Arc::new(DashMap::new()),
+            overload_transitions: Arc::new(parking_lot::Mutex::new(())),
             model_retry_configs: Arc::new(DashMap::new()),
             worker_origins: Arc::new(DashMap::new()),
             // Sized for fleet-scale bursts (startup registration, probe
@@ -359,6 +377,131 @@ impl WorkerRegistry {
                     .map(|workers| Arc::clone(&workers))
             })
             .unwrap_or_else(|| Arc::from(Self::EMPTY_WORKERS))
+    }
+
+    // ── Overload veto ──────────────────────────────────────────────────
+
+    /// Apply the absolute overload veto to `worker`, returning `true` when the
+    /// flag transitioned.
+    ///
+    /// The only sanctioned writer of [`Worker::set_overloaded`]: per-model
+    /// counters and the `smg_workers_overloaded` gauge move exactly once per
+    /// edge, which is what keeps the cost proportional to the load-report rate
+    /// rather than to request rate.
+    ///
+    /// Writes through a handle the registry no longer holds are dropped. The
+    /// monitor snapshots `Arc`s at tick start and writes its verdict after a
+    /// multi-second fetch await, by which time the worker may have been removed
+    /// or replaced; attributing that write to `worker`'s own model card would
+    /// move a counter for a worker no reset path can ever reach again.
+    pub fn set_worker_overloaded(&self, worker: &Arc<dyn Worker>, overloaded: bool) -> bool {
+        // Lock-free fast path for the common case: the poll re-asserted a
+        // verdict the worker already carries, so there is no edge to record.
+        if worker.is_overloaded() == overloaded {
+            return false;
+        }
+        // Allocate the keys before taking the edge lock: the invariant it
+        // protects is "flag flip and counter delta land together", which does
+        // not need the string clones or the gauge publish inside it.
+        let model_ids = Self::worker_model_ids(worker);
+        let mut updates = Vec::with_capacity(model_ids.len());
+        {
+            let _edge = self.overload_transitions.lock();
+            if !self.is_current_handle(worker) {
+                return false;
+            }
+            if !worker.set_overloaded(overloaded) {
+                return false;
+            }
+            for model_id in model_ids {
+                let updated = self.adjust_model_overloaded(&model_id, overloaded);
+                updates.push((model_id, updated));
+            }
+        }
+        // Gauge publish and counter GC reach into the metrics recorder and
+        // re-lock a `model_overloaded` shard; neither belongs under a
+        // registry-wide mutex that every group loop's edges serialize on.
+        for (model_id, updated) in updates {
+            Metrics::set_workers_overloaded(&model_id, updated);
+            if updated == 0 {
+                self.model_overloaded
+                    .remove_if(&model_id, |_, count| count.load(Ordering::Acquire) == 0);
+            }
+        }
+        true
+    }
+
+    /// Whether `worker` is the `Arc` the registry currently holds for its URL.
+    ///
+    /// The identity check is by pointer, not by URL: a `replace()` keeps the URL
+    /// and the shared runtime but installs a new worker object with a possibly
+    /// different model card, and the replaced handle must not be allowed to
+    /// attribute a counter move to the model set it used to carry.
+    fn is_current_handle(&self, worker: &Arc<dyn Worker>) -> bool {
+        let Some(worker_id) = self.url_to_id.get(worker.url()).map(|id| id.clone()) else {
+            return false;
+        };
+        self.workers
+            .get(&worker_id)
+            .is_some_and(|current| Arc::ptr_eq(current.value(), worker))
+    }
+
+    /// Clear the veto on every registered worker, returning how many were
+    /// flagged. Used by the load monitor's reset paths, where the feed that
+    /// would otherwise clear the flags is itself being torn down.
+    pub fn clear_all_overload_flags(&self) -> usize {
+        let workers: Vec<Arc<dyn Worker>> = self
+            .workers
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .collect();
+        workers
+            .iter()
+            .filter(|worker| self.set_worker_overloaded(worker, false))
+            .count()
+    }
+
+    /// Workers of `model_id` currently flagged overloaded. O(1).
+    pub fn overloaded_worker_count(&self, model_id: &str) -> usize {
+        if let Some(count) = self.model_overloaded.get(model_id) {
+            return count.load(Ordering::Acquire);
+        }
+        self.model_alias_index
+            .get(model_id)
+            .and_then(|canonical_id| {
+                self.model_overloaded
+                    .get(canonical_id.as_ref())
+                    .map(|count| count.load(Ordering::Acquire))
+            })
+            .unwrap_or(0)
+    }
+
+    /// Move one worker in or out of `model_id`'s overloaded count, returning the
+    /// updated count. Caller publishes the gauge and GCs the entry outside the
+    /// edge lock.
+    ///
+    /// The counter feeds `smg_workers_overloaded{model}` only. The shed verdict
+    /// itself is a walk of the caller's candidate pool
+    /// ([`crate::routers::common::overload::all_overloaded`]), because every
+    /// selection site narrows by worker type and connection mode and a
+    /// per-model counter cannot describe a sub-pool.
+    fn adjust_model_overloaded(&self, model_id: &str, overloaded: bool) -> usize {
+        let entry = self
+            .model_overloaded
+            .entry(model_id.to_string())
+            .or_default();
+        if overloaded {
+            entry.fetch_add(1, Ordering::AcqRel) + 1
+        } else {
+            // Saturating: a double-clear must never wrap the counter into a
+            // permanent all-overloaded verdict for the model.
+            entry
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_sub(1))
+                })
+                .unwrap_or(0)
+                .saturating_sub(1)
+        }
     }
 
     /// Resolve an alias to its canonical model ID without copying the string.
@@ -897,6 +1040,16 @@ impl WorkerRegistry {
             return false;
         }
 
+        // Release the overload verdict while `old_worker` is still the handle
+        // this registry holds, i.e. while the counter keys derived from its
+        // model card are the ones the increment used. The replacement inherits
+        // the shared runtime below, so a verdict left set here would be carried
+        // onto a possibly different model set with no matching counter move,
+        // and the monitor's `Replaced` eviction — which clears through the old
+        // handle — could not put it back. The next poll re-derives the verdict
+        // for the URL either way.
+        self.set_worker_overloaded(&old_worker, false);
+
         if !new_worker.inherit_shared_state_from(&*old_worker) {
             tracing::warn!(
                 worker_id = %worker_id.as_str(),
@@ -913,7 +1066,9 @@ impl WorkerRegistry {
         // against the new worker's connect.
         old_worker.abort_background_tasks();
 
-        // Diff model indexes: remove stale, add new
+        // Diff model indexes: remove stale, add new. No overload bookkeeping
+        // here — the verdict was released above, so there is nothing to carry
+        // across the membership change.
         for removed_model in old_models.difference(&new_models) {
             self.remove_worker_from_model_index(removed_model, old_worker.url());
             // Mirror `remove()`: drop any per-model retry override when
@@ -1167,6 +1322,18 @@ impl WorkerRegistry {
             }
         }
 
+        // Release the overload count before the worker leaves `self.workers`:
+        // `set_worker_overloaded` ignores writes through a handle the registry
+        // no longer holds, so clearing after the removal would leak the count
+        // rather than release it. Clearing rather than merely decrementing also
+        // makes the monitor's `Removed` eviction a no-op instead of a second
+        // decrement.
+        if let Some(entry) = self.workers.get(worker_id) {
+            let worker = Arc::clone(entry.value());
+            drop(entry);
+            self.set_worker_overloaded(&worker, false);
+        }
+
         if let Some((_, worker)) = self.workers.remove(worker_id) {
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
@@ -1408,6 +1575,10 @@ impl WorkerRegistry {
         self.workers.insert(worker_id.clone(), worker.clone());
 
         // Update model index for O(1) lookups using copy-on-write.
+        // No overload bookkeeping here: a freshly built `WorkerRuntime` is never
+        // vetoed, so registration has nothing to carry. Adding a defensive `+1`
+        // would only risk double-counting against a concurrent flip, and an
+        // over-count is the one direction that can shed a servable request.
         for model_id in Self::worker_model_ids(&worker) {
             self.add_worker_to_model_index(&model_id, worker.clone());
             self.rebuild_hash_ring(&model_id);
@@ -3717,5 +3888,199 @@ mod tests {
             worker.zmq_connect_abort.load_full().is_none(),
             "replacement must abort the replaced worker's handshake driver"
         );
+    }
+
+    // ── Overload veto ──────────────────────────────────────────────────
+
+    fn overload_worker(url: &str, model_id: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(model_id))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    /// The counters and the gauge must move on edges only, so a repeated
+    /// verdict from the same poll cannot inflate them.
+    #[test]
+    fn overload_counters_move_only_on_transitions() {
+        let registry = WorkerRegistry::new();
+        let a = overload_worker("http://127.0.0.1:9401", "m");
+        let b = overload_worker("http://127.0.0.1:9402", "m");
+        registry.register(Arc::clone(&a)).unwrap();
+        registry.register(Arc::clone(&b)).unwrap();
+
+        assert_eq!(registry.overloaded_worker_count("m"), 0);
+
+        assert!(
+            registry.set_worker_overloaded(&a, true),
+            "first set is an edge"
+        );
+        assert!(
+            !registry.set_worker_overloaded(&a, true),
+            "re-asserting the same verdict is not an edge"
+        );
+        assert_eq!(registry.overloaded_worker_count("m"), 1);
+
+        registry.set_worker_overloaded(&b, true);
+        assert_eq!(registry.overloaded_worker_count("m"), 2);
+
+        // Recovery re-admits.
+        assert!(registry.set_worker_overloaded(&a, false));
+        assert!(!registry.set_worker_overloaded(&a, false));
+        assert_eq!(registry.overloaded_worker_count("m"), 1);
+        assert!(a.is_available(), "a recovered worker is routable again");
+    }
+
+    /// A model with no workers has nothing flagged — the shed helper reads
+    /// "empty pool", which its callers answer with a 404, not a shed.
+    #[test]
+    fn empty_model_has_no_overloaded_workers() {
+        let registry = WorkerRegistry::new();
+        assert_eq!(registry.overloaded_worker_count("nobody"), 0);
+    }
+
+    /// Removing a flagged worker must give its count back, or the model would
+    /// stay stuck at "all overloaded" with live workers left.
+    #[test]
+    fn removing_a_flagged_worker_releases_its_count() {
+        let registry = WorkerRegistry::new();
+        let a = overload_worker("http://127.0.0.1:9411", "m");
+        let b = overload_worker("http://127.0.0.1:9412", "m");
+        let a_id = registry.register(Arc::clone(&a)).unwrap();
+        registry.register(Arc::clone(&b)).unwrap();
+        registry.set_worker_overloaded(&a, true);
+        registry.set_worker_overloaded(&b, true);
+        assert_eq!(registry.overloaded_worker_count("m"), 2);
+
+        registry.remove(&a_id);
+
+        // b is still flagged, so the model is still shedding — but on one
+        // worker's count, not two.
+        assert_eq!(registry.overloaded_worker_count("m"), 1);
+
+        registry.set_worker_overloaded(&b, false);
+        assert_eq!(registry.overloaded_worker_count("m"), 0);
+    }
+
+    /// The monitor snapshots worker `Arc`s at tick start and writes its verdict
+    /// after a multi-second fetch await. A worker removed inside that window
+    /// must not be able to move the live model's counter through its detached
+    /// handle: nothing would ever decrement it again, since every reset path
+    /// walks the registry's own worker map.
+    #[test]
+    fn a_removed_worker_cannot_move_the_counter_through_a_stale_handle() {
+        let registry = WorkerRegistry::new();
+        let a = overload_worker("http://127.0.0.1:9421", "m");
+        let b = overload_worker("http://127.0.0.1:9422", "m");
+        let a_id = registry.register(Arc::clone(&a)).unwrap();
+        registry.register(Arc::clone(&b)).unwrap();
+
+        registry.remove(&a_id);
+        assert!(
+            !registry.set_worker_overloaded(&a, true),
+            "a detached handle records no edge"
+        );
+        assert_eq!(registry.overloaded_worker_count("m"), 0);
+
+        // And the same in the clearing direction, which would otherwise
+        // under-count a live worker's flag.
+        registry.set_worker_overloaded(&b, true);
+        assert!(!registry.set_worker_overloaded(&a, false));
+        assert_eq!(registry.overloaded_worker_count("m"), 1);
+    }
+
+    /// The counter is written from the monitor's per-report loop, which runs
+    /// concurrently across groups. Flipping the same worker from many threads
+    /// must leave the count consistent with the flag.
+    #[test]
+    fn overload_counter_is_consistent_under_concurrent_transitions() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| {
+                let w = overload_worker(&format!("http://127.0.0.1:{}", 9500 + i), "m");
+                registry.register(Arc::clone(&w)).unwrap();
+                w
+            })
+            .collect();
+
+        let mut handles = Vec::new();
+        for worker in &workers {
+            for _ in 0..4 {
+                let registry = Arc::clone(&registry);
+                let worker = Arc::clone(worker);
+                handles.push(std::thread::spawn(move || {
+                    for i in 0..200 {
+                        registry.set_worker_overloaded(&worker, i % 2 == 0);
+                    }
+                }));
+            }
+        }
+        for handle in handles {
+            handle.join().expect("worker flip thread");
+        }
+
+        // Whatever the interleaving settled on, the counter must equal the
+        // number of workers actually carrying the flag.
+        let flagged = workers.iter().filter(|w| w.is_overloaded()).count();
+        assert_eq!(registry.overloaded_worker_count("m"), flagged);
+
+        for worker in &workers {
+            registry.set_worker_overloaded(worker, false);
+        }
+        assert_eq!(registry.overloaded_worker_count("m"), 0);
+    }
+
+    /// A same-URL replacement shares its runtime with the worker it replaces,
+    /// so a verdict left set would be carried onto a possibly different model
+    /// set — and the monitor's `Replaced` eviction, which clears through the
+    /// *old* handle, could not put the counter back. The verdict is therefore
+    /// released before the handover and re-derived by the next poll.
+    #[test]
+    fn replacement_releases_the_verdict_and_leaves_no_counter_behind() {
+        let registry = WorkerRegistry::new();
+        let original = overload_worker("http://127.0.0.1:9601", "old");
+        let id = registry.register(Arc::clone(&original)).unwrap();
+        registry.set_worker_overloaded(&original, true);
+        assert_eq!(registry.overloaded_worker_count("old"), 1);
+
+        let replacement = overload_worker("http://127.0.0.1:9601", "new");
+        assert!(registry.replace(&id, Arc::clone(&replacement)));
+
+        assert!(
+            !replacement.is_overloaded(),
+            "the replacement starts unvetoed and is routable until its next poll"
+        );
+        assert_eq!(registry.overloaded_worker_count("old"), 0);
+        assert_eq!(registry.overloaded_worker_count("new"), 0);
+
+        // The monitor's `Replaced` handler clears through the old handle. That
+        // handle is detached now, so it must be a no-op rather than a second
+        // decrement against a model it no longer belongs to.
+        registry.set_worker_overloaded(&replacement, true);
+        assert!(!registry.set_worker_overloaded(&original, false));
+        assert_eq!(registry.overloaded_worker_count("new"), 1);
+        assert_eq!(registry.overloaded_worker_count("old"), 0);
+    }
+
+    #[test]
+    fn clear_all_overload_flags_resets_every_model() {
+        let registry = WorkerRegistry::new();
+        let a = overload_worker("http://127.0.0.1:9701", "m1");
+        let b = overload_worker("http://127.0.0.1:9702", "m2");
+        registry.register(Arc::clone(&a)).unwrap();
+        registry.register(Arc::clone(&b)).unwrap();
+        registry.set_worker_overloaded(&a, true);
+        registry.set_worker_overloaded(&b, true);
+
+        assert_eq!(registry.clear_all_overload_flags(), 2);
+
+        assert!(!a.is_overloaded());
+        assert!(!b.is_overloaded());
+        assert_eq!(registry.overloaded_worker_count("m1"), 0);
+        assert_eq!(registry.overloaded_worker_count("m2"), 0);
     }
 }

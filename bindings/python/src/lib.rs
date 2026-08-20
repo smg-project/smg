@@ -522,6 +522,8 @@ struct Router {
     cache_ttl_secs: u64,
     job_queue_capacity: usize,
     job_queue_concurrency: usize,
+    worker_overload_waiting_requests: Option<usize>,
+    worker_overload_token_usage: Option<f64>,
 }
 
 impl Router {
@@ -833,6 +835,8 @@ impl Router {
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .job_queue_capacity(self.job_queue_capacity)
             .job_queue_concurrency(self.job_queue_concurrency)
+            .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
+            .worker_overload_token_usage(self.worker_overload_token_usage)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
@@ -1071,6 +1075,8 @@ impl Router {
         cache_ttl_secs = 180,
         job_queue_capacity = 1000,
         job_queue_concurrency = 200,
+        worker_overload_waiting_requests = None,
+        worker_overload_token_usage = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1217,6 +1223,8 @@ impl Router {
         cache_ttl_secs: u64,
         job_queue_capacity: usize,
         job_queue_concurrency: usize,
+        worker_overload_waiting_requests: Option<usize>,
+        worker_overload_token_usage: Option<f64>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1377,6 +1385,8 @@ impl Router {
             cache_ttl_secs,
             job_queue_capacity,
             job_queue_concurrency,
+            worker_overload_waiting_requests,
+            worker_overload_token_usage,
         })
     }
 

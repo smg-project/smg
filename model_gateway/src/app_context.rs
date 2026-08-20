@@ -26,7 +26,7 @@ use crate::{
         router_manager::RouterManager,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    worker::{KvEventMonitor, WorkerMonitor, WorkerRegistry, WorkerService},
+    worker::{KvEventMonitor, OverloadThresholds, WorkerMonitor, WorkerRegistry, WorkerService},
     workflow::{JobQueue, WorkflowEngines},
 };
 
@@ -639,6 +639,10 @@ impl AppContextBuilder {
             client.clone(),
             config.load_monitor_interval_secs,
             config.engine_metrics,
+            OverloadThresholds {
+                waiting_requests: config.worker_overload_waiting_requests,
+                token_usage: config.worker_overload_token_usage,
+            },
         ));
         // Wire the backend load-snapshot feed into every policy that consumes
         // it; the monitor itself only polls while some policy reports needing

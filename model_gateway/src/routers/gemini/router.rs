@@ -15,7 +15,7 @@ use crate::{
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
     routers::{
-        common::retry::{is_retryable_status, RetryExecutor},
+        common::retry::{is_retryable_response, RetryExecutor},
         RouterTrait,
     },
 };
@@ -105,7 +105,7 @@ impl RouterTrait for GeminiRouter {
                     driver::execute(&mut ctx).await
                 }
             },
-            |res, _attempt| is_retryable_status(res.status()),
+            |res, _attempt| is_retryable_response(res),
             |_delay, _attempt| {
                 // TODO: record retry metrics when Gemini metrics are added
             },

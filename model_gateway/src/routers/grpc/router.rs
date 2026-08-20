@@ -41,7 +41,7 @@ use crate::{
     middleware::TenantRequestMeta,
     observability::metrics::{metrics_labels, Metrics},
     routers::{
-        common::retry::{is_retryable_status, RetryExecutor},
+        common::retry::{is_retryable_response, RetryExecutor},
         error, RouterTrait,
     },
     worker::{WorkerRegistry, WorkerType},
@@ -607,7 +607,7 @@ impl GrpcRouter {
                 if Self::reservation_denied(&rate_limit_cell) {
                     return false;
                 }
-                is_retryable_status(res.status())
+                is_retryable_response(res)
             },
             // On backoff: record retry metrics
             |delay, attempt| {
@@ -678,7 +678,7 @@ impl GrpcRouter {
                 if Self::reservation_denied(&rate_limit_cell) {
                     return false;
                 }
-                is_retryable_status(res.status())
+                is_retryable_response(res)
             },
             // On backoff: record retry metrics
             |delay, attempt| {
@@ -845,7 +845,7 @@ impl GrpcRouter {
                 if Self::reservation_denied(&rate_limit_cell) {
                     return false;
                 }
-                is_retryable_status(res.status())
+                is_retryable_response(res)
             },
             |delay, attempt| {
                 self.record_retry(metrics_labels::ENDPOINT_MESSAGES);
@@ -913,7 +913,7 @@ impl GrpcRouter {
                 if Self::reservation_denied(&rate_limit_cell) {
                     return false;
                 }
-                is_retryable_status(res.status())
+                is_retryable_response(res)
             },
             |delay, attempt| {
                 self.record_retry(metrics_labels::ENDPOINT_COMPLETIONS);

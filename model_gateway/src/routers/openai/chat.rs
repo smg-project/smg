@@ -25,7 +25,7 @@ use crate::{
     routers::{
         common::{
             header_utils::{apply_provider_headers, extract_auth_header},
-            retry::{is_retryable_status, RetryExecutor},
+            retry::{is_retryable_response, RetryExecutor},
             sse::SSE_CHANNEL_BUFFER,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
@@ -240,7 +240,7 @@ pub(super) async fn route_chat(
                 }
             }
         },
-        |res, _attempt| is_retryable_status(res.status()),
+        |res, _attempt| is_retryable_response(res),
         |delay, attempt| {
             Metrics::record_worker_retry(
                 metrics_labels::BACKEND_EXTERNAL,

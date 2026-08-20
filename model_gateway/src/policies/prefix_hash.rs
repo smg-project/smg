@@ -204,7 +204,7 @@ impl PrefixHashPolicy {
         workers
             .iter()
             .enumerate()
-            .filter(|(_, w)| w.is_healthy())
+            .filter(|(_, w)| w.is_healthy_and_eligible())
             .min_by_key(|(_, w)| w.load())
             .map(|(idx, _)| idx)
     }
@@ -244,7 +244,7 @@ impl PrefixHashPolicy {
         let healthy_workers: Vec<(usize, &Arc<dyn Worker>)> = workers
             .iter()
             .enumerate()
-            .filter(|(_, w)| w.is_healthy())
+            .filter(|(_, w)| w.is_healthy_and_eligible())
             .collect();
 
         if healthy_workers.is_empty() {
@@ -427,6 +427,35 @@ mod tests {
             let (result, _, _) = policy.select_worker_impl(&workers, &info);
             assert_eq!(result, Some(first_idx));
         }
+    }
+
+    /// The ring lookup routes on `is_healthy_and_eligible()`, so the absolute
+    /// overload veto must move a key off its ring owner and back on recovery.
+    #[test]
+    fn overloaded_worker_is_skipped_by_the_ring_lookup() {
+        let policy = PrefixHashPolicy::with_defaults();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+
+        let tokens: Vec<u32> = vec![11, 22, 33, 44, 55, 66, 77, 88];
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(ring),
+            ..Default::default()
+        };
+
+        let owner = policy.select_worker_impl(&workers, &info).0.unwrap();
+
+        workers[owner].set_overloaded(true);
+        let respilled = policy.select_worker_impl(&workers, &info).0.unwrap();
+        assert_ne!(respilled, owner, "a vetoed ring owner must not be selected");
+
+        workers[owner].set_overloaded(false);
+        assert_eq!(
+            policy.select_worker_impl(&workers, &info).0,
+            Some(owner),
+            "recovery re-admits the ring owner"
+        );
     }
 
     #[test]

@@ -443,22 +443,48 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Record a request outcome against the circuit breaker.
     fn record_circuit_breaker_outcome(&self, success: bool);
 
-    /// Check if the worker is available (healthy + circuit closed/half-open)
+    /// Check if the worker is available (healthy + circuit closed/half-open +
+    /// not vetoed by the absolute overload guard).
     fn is_available(&self) -> bool {
-        self.is_healthy() && self.circuit_breaker_can_execute()
+        self.is_healthy() && self.circuit_breaker_can_execute() && !self.is_overloaded()
+    }
+
+    /// [`Self::is_healthy`] fused with the overload veto. For the hash policies,
+    /// which route on health alone and never consult the circuit breaker;
+    /// `BasicWorker` overrides it to read both under a single runtime guard.
+    fn is_healthy_and_eligible(&self) -> bool {
+        self.is_healthy() && !self.is_overloaded()
+    }
+
+    /// Whether the absolute overload guard currently vetoes this worker.
+    ///
+    /// Written only by the load monitor, once per ingested load report, and
+    /// always `false` while overload protection is unconfigured.
+    fn is_overloaded(&self) -> bool {
+        false
+    }
+
+    /// Set the overload veto, returning `true` when the flag actually changed.
+    ///
+    /// Route writes through [`WorkerRegistry::set_worker_overloaded`] instead of
+    /// calling this directly: the per-model counters and the
+    /// `smg_workers_overloaded` gauge move only on transitions.
+    fn set_overloaded(&self, _overloaded: bool) -> bool {
+        false
     }
 
     /// One-shot routing snapshot for the per-request O(workers) selection loops:
-    /// reads status, load and processed together so the hot path takes one
-    /// `ArcSwap` guard per backing cell per worker instead of one per accessor
-    /// (that guard traffic is a large share of routing CPU at scale). `BasicWorker`
-    /// overrides this to share the runtime guard.
+    /// reads status, load, processed and the overload veto together so the hot
+    /// path takes one `ArcSwap` guard per backing cell per worker instead of one
+    /// per accessor (that guard traffic is a large share of routing CPU at
+    /// scale). `BasicWorker` overrides this to share the runtime guard.
     fn routing_state(&self) -> RoutingState {
         RoutingState {
             healthy: self.is_healthy(),
             can_execute: self.circuit_breaker_can_execute(),
             load: self.load(),
             processed: self.processed_requests(),
+            overloaded: self.is_overloaded(),
         }
     }
 
@@ -976,6 +1002,17 @@ pub struct RoutingState {
     pub load: usize,
     /// Lifetime processed-request count (min-load tie-break).
     pub processed: usize,
+    /// Absolute overload veto, set by the load monitor at ingestion time.
+    pub overloaded: bool,
+}
+
+impl RoutingState {
+    /// The full routing eligibility test. Costs nothing beyond the reads the
+    /// gather pass already performed: every field rides the one guard
+    /// [`Worker::routing_state`] took.
+    pub const fn eligible(self) -> bool {
+        self.healthy && self.can_execute && !self.overloaded
+    }
 }
 
 /// Shared mutable worker state preserved across same-URL replacements.
@@ -989,6 +1026,10 @@ pub struct WorkerRuntime {
     processed_counter: AtomicUsize,
     worker_routing_key_load: WorkerRoutingKeyLoad,
     revision: AtomicU64,
+    /// Absolute overload veto. Lives here rather than in the load-snapshot map
+    /// so selection reads it under the guard it already holds, and so a
+    /// same-URL replacement inherits it with the rest of the shared runtime.
+    overloaded: AtomicBool,
 }
 
 impl WorkerRuntime {
@@ -1002,6 +1043,7 @@ impl WorkerRuntime {
             processed_counter: AtomicUsize::new(0),
             worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
             revision: AtomicU64::new(0),
+            overloaded: AtomicBool::new(false),
         }
     }
 
@@ -1099,6 +1141,18 @@ impl WorkerRuntime {
 
     pub fn increment_processed(&self) {
         self.processed_counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── Overload veto ───────────────────────────────────────────────
+
+    pub fn is_overloaded(&self) -> bool {
+        self.overloaded.load(Ordering::Relaxed)
+    }
+
+    /// Returns `true` when the flag transitioned, so the caller can move the
+    /// per-model counters and gauge exactly once per edge.
+    pub fn set_overloaded(&self, overloaded: bool) -> bool {
+        self.overloaded.swap(overloaded, Ordering::Relaxed) != overloaded
     }
 }
 
@@ -1428,16 +1482,39 @@ impl Worker for BasicWorker {
         self.circuit_breaker.load().can_execute()
     }
 
+    fn is_overloaded(&self) -> bool {
+        self.runtime.load().is_overloaded()
+    }
+
+    fn set_overloaded(&self, overloaded: bool) -> bool {
+        self.runtime.load().set_overloaded(overloaded)
+    }
+
+    fn is_available(&self) -> bool {
+        // Same two guards the pre-veto version took (`is_healthy` +
+        // `circuit_breaker_can_execute`): the veto rides the runtime guard.
+        let rt = self.runtime.load();
+        rt.status() == WorkerStatus::Ready
+            && !rt.is_overloaded()
+            && self.circuit_breaker.load().can_execute()
+    }
+
+    fn is_healthy_and_eligible(&self) -> bool {
+        let rt = self.runtime.load();
+        rt.status() == WorkerStatus::Ready && !rt.is_overloaded()
+    }
+
     fn routing_state(&self) -> RoutingState {
-        // One runtime guard covers status + load + processed (all live in
-        // `self.runtime`); the circuit breaker is a separate ArcSwap, so it needs
-        // its own guard.
+        // One runtime guard covers status + load + processed + the overload veto
+        // (all live in `self.runtime`); the circuit breaker is a separate
+        // ArcSwap, so it needs its own guard.
         let rt = self.runtime.load();
         RoutingState {
             healthy: rt.status() == WorkerStatus::Ready,
             can_execute: self.circuit_breaker.load().can_execute(),
             load: rt.load(),
             processed: rt.processed_requests(),
+            overloaded: rt.is_overloaded(),
         }
     }
 

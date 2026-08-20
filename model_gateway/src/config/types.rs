@@ -93,6 +93,21 @@ pub struct RouterConfig {
     pub job_queue_concurrency: usize,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// Queued-request count at or above which a worker is considered
+    /// overloaded and excluded from routing until the signal recovers; when all
+    /// workers are overloaded, requests are shed immediately rather than
+    /// queued. Evaluated once per ingested load report, never per request.
+    /// `None` (default) disables this signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_overload_waiting_requests: Option<usize>,
+    /// KV-cache token usage (0.0-1.0, averaged across DP ranks) at or above
+    /// which a worker is considered overloaded — the same signal
+    /// `balance_token_usage_threshold` reads, applied as an absolute per-worker
+    /// ceiling instead of a fleet-relative spread. `None` (default) disables
+    /// this signal; with both signals unset, overload protection is off and
+    /// routing behaves exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_overload_token_usage: Option<f64>,
     /// TTL in seconds for entries in the event-driven cache-aware positional
     /// indexer: entries neither stored to nor read by a query within this
     /// window are evicted by a periodic background prune. Bounds index growth
@@ -1024,6 +1039,8 @@ impl Default for RouterConfig {
             job_queue_capacity: default_job_queue_capacity(),
             job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
+            worker_overload_waiting_requests: None,
+            worker_overload_token_usage: None,
             kv_indexer_ttl_secs: None,
             kv_indexer_max_entries: None,
             engine_metrics: false,

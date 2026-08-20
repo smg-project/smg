@@ -13,7 +13,10 @@ use openai_protocol::models::ListModelsResponse;
 
 use crate::{
     routers::{
-        common::header_utils::{apply_provider_headers, extract_auth_header},
+        common::{
+            header_utils::{apply_provider_headers, extract_auth_header},
+            overload,
+        },
         error,
     },
     worker::{ConnectionMode, ProviderType, RuntimeType, Worker, WorkerRegistry, WorkerType},
@@ -83,6 +86,17 @@ impl<'a> WorkerSelector<'a> {
             return Ok(worker);
         }
 
+        // Shed before the refresh, not after. Refresh-on-miss is the expensive
+        // branch — a second registry walk plus a `/v1/models` fan-out under a
+        // 5 s timeout — and a fleet whose every worker is vetoed will not be
+        // un-vetoed by re-reading model lists. Without this, saturation turns
+        // each of these requests into three registry walks and up to 5 s of
+        // network wait to reach a 503 that carries neither the shed error code
+        // nor the shed counter.
+        if let Some(shed) = self.shed_if_all_overloaded(req) {
+            return Err(shed);
+        }
+
         tracing::debug!(
             model = req.model_id,
             "No worker found, refreshing external worker models"
@@ -130,6 +144,32 @@ impl<'a> WorkerSelector<'a> {
             .filter(|w| w.supports_model(req.model_id))
             .filter(|w| !req.require_realtime_capable || w.is_realtime_capable())
             .min_by_key(|w| w.load())
+    }
+
+    /// Shed when every worker this request could have selected is vetoed.
+    ///
+    /// Rebuilds the pool `find_best_worker` walked — same type, transport,
+    /// runtime, provider, model-support and realtime filters — minus the
+    /// `is_available()` veto that emptied it, so the verdict describes exactly
+    /// what selection saw. Runs only on the miss path.
+    fn shed_if_all_overloaded(&self, req: &SelectWorkerRequest<'_>) -> Option<Response> {
+        let workers = self.registry.get_workers_filtered(
+            None,
+            req.worker_type,
+            req.connection_mode,
+            req.runtime_type,
+            false,
+        );
+        let candidates = match &req.provider {
+            Some(provider) => filter_by_provider(workers, provider),
+            None => workers,
+        };
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .filter(|w| w.supports_model(req.model_id))
+            .filter(|w| !req.require_realtime_capable || w.is_realtime_capable())
+            .collect();
+        overload::shed_if_all_overloaded(&candidates, req.model_id)
     }
 
     /// Check if any healthy worker supports the model (regardless of circuit breaker).

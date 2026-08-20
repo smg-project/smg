@@ -74,7 +74,7 @@ impl ConsistentHashingPolicy {
         let healthy_url_to_idx: std::collections::HashMap<&str, usize> = workers
             .iter()
             .enumerate()
-            .filter(|(_, w)| w.is_healthy())
+            .filter(|(_, w)| w.is_healthy_and_eligible())
             .map(|(i, w)| (w.url(), i))
             .collect();
 
@@ -133,7 +133,7 @@ impl ConsistentHashingPolicy {
         // O(1) parse + O(1) bounds check + O(1) health check
         if let Some(idx_str) = target_worker {
             if let Ok(idx) = idx_str.parse::<usize>() {
-                if idx < workers.len() && workers[idx].is_healthy() {
+                if idx < workers.len() && workers[idx].is_healthy_and_eligible() {
                     return (Some(idx), Branch::TargetWorkerHit);
                 }
             }
@@ -165,7 +165,10 @@ impl ConsistentHashingPolicy {
         }
 
         // Fallback: random selection (truly anonymous client)
-        let healthy_count = workers.iter().filter(|w| w.is_healthy()).count();
+        let healthy_count = workers
+            .iter()
+            .filter(|w| w.is_healthy_and_eligible())
+            .count();
         if healthy_count == 0 {
             return (None, Branch::NoHealthyWorkers);
         }
@@ -174,7 +177,7 @@ impl ConsistentHashingPolicy {
         let idx = workers
             .iter()
             .enumerate()
-            .filter(|(_, w)| w.is_healthy())
+            .filter(|(_, w)| w.is_healthy_and_eligible())
             .nth(random_healthy_idx)
             .map(|(i, _)| i);
 
@@ -237,6 +240,54 @@ mod tests {
                 ) as Arc<dyn Worker>
             })
             .collect()
+    }
+
+    /// Every consistent-hashing entry point gathers on
+    /// `is_healthy_and_eligible()`, so a vetoed worker must drop out of the
+    /// ring, out of an explicit target-worker probe, and out of the random
+    /// fallback alike.
+    #[test]
+    fn overloaded_worker_is_skipped_by_every_selection_path() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        let headers = headers_with_routing_key("user-veto");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let owner = policy.select_worker_impl(&workers, &info).0.unwrap();
+
+        workers[owner].set_overloaded(true);
+        let respilled = policy.select_worker_impl(&workers, &info).0.unwrap();
+        assert_ne!(respilled, owner, "the ring must skip a vetoed worker");
+
+        // Explicit target-worker probe: an operator pin does not beat the veto.
+        let target = headers_with_target_worker(owner);
+        let targeted_info = SelectWorkerInfo {
+            headers: Some(&target),
+            ..Default::default()
+        };
+        assert_ne!(
+            policy.select_worker_impl(&workers, &targeted_info).0,
+            Some(owner)
+        );
+
+        // Random fallback: no routing key at all.
+        let fallback_info = SelectWorkerInfo::default();
+        for _ in 0..32 {
+            assert_ne!(
+                policy.select_worker_impl(&workers, &fallback_info).0,
+                Some(owner)
+            );
+        }
+
+        workers[owner].set_overloaded(false);
+        assert_eq!(
+            policy.select_worker_impl(&workers, &info).0,
+            Some(owner),
+            "recovery re-admits the ring owner"
+        );
     }
 
     #[test]

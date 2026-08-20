@@ -35,8 +35,8 @@ use crate::{
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     routers::{
         common::{
-            header_utils,
-            retry::{is_retryable_status, RetryExecutor},
+            header_utils, overload,
+            retry::{is_retryable_response, is_retryable_status, RetryExecutor},
             sse::{SseEncoder, SSE_CHANNEL_BUFFER},
         },
         error,
@@ -46,6 +46,20 @@ use crate::{
     },
     worker::{HashRing, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
+
+/// Why PD pair selection produced nothing.
+///
+/// Split so the overload shed keeps its own error code, message and counter
+/// instead of being reworded as a circuit-breaker failure by
+/// [`PDRouter::handle_server_selection_error`].
+#[derive(Debug)]
+enum PdSelectionFailure {
+    /// Every worker on one leg is vetoed: a ready-made, already-counted 503.
+    Shed(Response),
+    /// The pre-existing string: no workers configured, all unhealthy or
+    /// circuit-broken, or the policy declined.
+    Unavailable(String),
+}
 
 #[derive(Debug)]
 pub struct PDRouter {
@@ -175,12 +189,35 @@ impl PDRouter {
         })
     }
 
-    fn handle_server_selection_error(error: String) -> Response {
-        error!("Failed to select PD pair error={}", error);
-        error::service_unavailable(
-            "server_selection_failed",
-            format!("No available servers: {error}"),
-        )
+    fn handle_server_selection_error(failure: PdSelectionFailure) -> Response {
+        match failure {
+            // Already a decision-logged 503 with the overload error code and
+            // counter; re-describing it as a circuit-breaker/health failure is
+            // exactly the misdiagnosis this path used to hand operators.
+            PdSelectionFailure::Shed(shed) => shed,
+            PdSelectionFailure::Unavailable(error) => {
+                error!("Failed to select PD pair error={}", error);
+                error::service_unavailable(
+                    "server_selection_failed",
+                    format!("No available servers: {error}"),
+                )
+            }
+        }
+    }
+
+    /// Classify one leg's selection miss. `candidates` is the leg pool before
+    /// the `is_available()` filter, so the verdict describes the pool that
+    /// actually emptied rather than the model's whole registry entry — a
+    /// saturated prefill leg leaves the decode workers unflagged.
+    fn leg_failure(
+        candidates: &[Arc<dyn Worker>],
+        model_id: &str,
+        error: String,
+    ) -> PdSelectionFailure {
+        match overload::shed_if_all_overloaded(candidates, model_id) {
+            Some(shed) => PdSelectionFailure::Shed(shed),
+            None => PdSelectionFailure::Unavailable(error),
+        }
     }
 
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
@@ -340,8 +377,8 @@ impl PDRouter {
                             .await
                         {
                             Ok(pair) => pair,
-                            Err(e) => {
-                                return Self::handle_server_selection_error(e);
+                            Err(failure) => {
+                                return Self::handle_server_selection_error(failure);
                             }
                         };
 
@@ -469,7 +506,7 @@ impl PDRouter {
                     }
                 }
             },
-            |res, _attempt| is_retryable_status(res.status()),
+            |res, _attempt| is_retryable_response(res),
             |delay, attempt| {
                 // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
                 Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
@@ -635,6 +672,14 @@ impl PDRouter {
             .rid_key
             .as_deref()
             .or_else(|| self.policy_registry.sticky_header_key(headers));
+        // Dispatch-time re-check of both legs, the same one the regular HTTP
+        // and gRPC paths take just before their load guards.
+        if let Some(shed) = overload::shed_if_worker_overloaded(prefill.as_ref(), context.model_id)
+            .or_else(|| overload::shed_if_worker_overloaded(decode.as_ref(), context.model_id))
+        {
+            return shed;
+        }
+
         let load_guards = vec![
             WorkerLoadGuard::with_key(prefill.clone(), effective_key),
             WorkerLoadGuard::with_key(decode.clone(), effective_key),
@@ -831,7 +876,7 @@ impl PDRouter {
         rid_key: Option<&str>,
         model_id: &str,
         headers: Option<&HeaderMap>,
-    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
+    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), PdSelectionFailure> {
         debug!("Selecting PD pair: model_id={:?}", model_id);
 
         let is_unknown_model = model_id == UNKNOWN_MODEL_ID;
@@ -874,29 +919,33 @@ impl PDRouter {
         // Get cached hash ring for consistent hashing
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
-        let prefill = self.pick_worker_by_policy_arc(
-            &prefill_workers,
-            &prefill_policy,
-            request_text,
-            tokens,
-            rid_key,
-            headers,
-            hash_ring.clone(),
-            "prefill",
-            crate::policies::WorkerLeg::Prefill,
-        )?;
+        let prefill = self
+            .pick_worker_by_policy_arc(
+                &prefill_workers,
+                &prefill_policy,
+                request_text,
+                tokens,
+                rid_key,
+                headers,
+                hash_ring.clone(),
+                "prefill",
+                crate::policies::WorkerLeg::Prefill,
+            )
+            .map_err(|e| Self::leg_failure(&prefill_workers, model_id, e))?;
 
-        let decode = self.pick_worker_by_policy_arc(
-            &decode_workers,
-            &decode_policy,
-            request_text,
-            tokens,
-            rid_key,
-            headers,
-            hash_ring,
-            "decode",
-            crate::policies::WorkerLeg::Decode,
-        )?;
+        let decode = self
+            .pick_worker_by_policy_arc(
+                &decode_workers,
+                &decode_policy,
+                request_text,
+                tokens,
+                rid_key,
+                headers,
+                hash_ring,
+                "decode",
+                crate::policies::WorkerLeg::Decode,
+            )
+            .map_err(|e| Self::leg_failure(&decode_workers, model_id, e))?;
 
         // Record worker selection metrics (Layer 3)
         let model = model_id;
@@ -1355,7 +1404,11 @@ impl RouterTrait for PDRouter {
             .await
         {
             Ok(pair) => pair,
-            Err(e) => {
+            // A deep probe that generates gets the same answer routing does:
+            // an all-vetoed fleet fails the probe, exactly as an all-circuit-
+            // broken one already did.
+            Err(PdSelectionFailure::Shed(shed)) => return shed,
+            Err(PdSelectionFailure::Unavailable(e)) => {
                 return error::service_unavailable(
                     "no_healthy_worker_pair",
                     format!("No healthy worker pair available: {e}"),
@@ -1801,7 +1854,14 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("No prefill workers available"));
+        // No workers at all is the pre-existing unavailable string, not a shed:
+        // an empty pool has nothing to be overloaded.
+        match result.unwrap_err() {
+            PdSelectionFailure::Unavailable(error) => {
+                assert!(error.contains("No prefill workers available"));
+            }
+            PdSelectionFailure::Shed(_) => panic!("an empty fleet is not an overload shed"),
+        }
     }
 
     #[test]

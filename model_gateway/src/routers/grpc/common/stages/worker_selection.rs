@@ -14,6 +14,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
+        common::overload,
         error,
         grpc::{
             context::{EncodeWorkerAssignment, RequestContext, WorkerSelection},
@@ -107,15 +108,7 @@ impl PipelineStage for WorkerSelectionStage {
             WorkerSelectionMode::Regular => {
                 match self.select_single_worker(model_id, text, tokens, headers, rid_key) {
                     Some(w) => WorkerSelection::Single { worker: w },
-                    None => {
-                        error!(
-                            function = "WorkerSelectionStage::execute",
-                            mode = "Regular",
-                            model_id = %model_id,
-                            "No available workers for model"
-                        );
-                        return Err(error::model_not_found(model_id));
-                    }
+                    None => return Err(self.selection_failure(model_id)),
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
@@ -126,15 +119,7 @@ impl PipelineStage for WorkerSelectionStage {
                         decode,
                         runtime_type,
                     },
-                    None => {
-                        error!(
-                            function = "WorkerSelectionStage::execute",
-                            mode = "PrefillDecode",
-                            model_id = %model_id,
-                            "No available PD worker pairs for model"
-                        );
-                        return Err(error::model_not_found(model_id));
-                    }
+                    None => return Err(self.selection_failure(model_id)),
                 }
             }
             WorkerSelectionMode::EncodePrefillDecode => {
@@ -172,15 +157,7 @@ impl PipelineStage for WorkerSelectionStage {
                             runtime_type,
                         }
                     }
-                    None => {
-                        error!(
-                            function = "WorkerSelectionStage::execute",
-                            mode = "EncodePrefillDecode",
-                            model_id = %model_id,
-                            "No available encode/prefill/decode worker set for model"
-                        );
-                        return Err(error::model_not_found(model_id));
-                    }
+                    None => return Err(self.selection_failure(model_id)),
                 }
             }
         };
@@ -226,6 +203,69 @@ fn selection_runtime(workers: &WorkerSelection) -> RuntimeType {
 }
 
 impl WorkerSelectionStage {
+    /// Response for a selection that produced nothing.
+    ///
+    /// An all-overloaded pool sheds with the same 503 `no_available_workers`
+    /// the HTTP router uses: the fleet is under pressure, not absent, and 404
+    /// would both misdescribe it and skip the retry path.
+    ///
+    /// The verdict is taken per leg, from the pool that leg selected over. A
+    /// whole-model predicate cannot express this: veto every prefill worker and
+    /// the model's decode workers are still unflagged, so "all workers for the
+    /// model are overloaded" is false exactly when the PD pair became
+    /// unselectable. Rebuilding the leg pools costs one registry walk each on a
+    /// path that has already failed.
+    ///
+    /// A shed is a designed load-shedding outcome that happens at full request
+    /// rate; it logs one `debug!` line inside the shed helper. The `error!`
+    /// below is reserved for what it was written for — a model with no workers
+    /// at all, which is a misconfiguration and rare.
+    fn selection_failure(&self, model_id: &str) -> Response {
+        let legs: &[WorkerType] = match self.mode {
+            WorkerSelectionMode::Regular => &[WorkerType::Regular],
+            WorkerSelectionMode::PrefillDecode => &[WorkerType::Prefill, WorkerType::Decode],
+            WorkerSelectionMode::EncodePrefillDecode => {
+                &[WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode]
+            }
+        };
+        for leg in legs {
+            let candidates = self.leg_candidates(model_id, *leg);
+            if let Some(shed) = overload::shed_if_all_overloaded(&candidates, model_id) {
+                return shed;
+            }
+        }
+        error!(
+            function = "WorkerSelectionStage::execute",
+            mode = ?self.mode,
+            model_id = %model_id,
+            "No available workers for model"
+        );
+        error::model_not_found(model_id)
+    }
+
+    /// The pool one leg selected over, *before* the `is_available()` filter,
+    /// under the same worker-type and transport rules selection applied.
+    /// Failure path only.
+    fn leg_candidates(&self, model_id: &str, worker_type: WorkerType) -> Vec<Arc<dyn Worker>> {
+        // The wildcard model selects across every model, so its candidate pool
+        // is the unfiltered one — not the `unknown` model-index entry.
+        let model_filter = if model_id == UNKNOWN_MODEL_ID {
+            None
+        } else {
+            Some(model_id)
+        };
+        self.worker_registry
+            .get_workers_filtered(model_filter, Some(worker_type), None, None, false)
+            .into_iter()
+            .filter(|w| match worker_type {
+                // Regular selection takes either gRPC-pipeline transport; the
+                // disaggregated legs are gRPC-only (no KV rendezvous on ZMQ).
+                WorkerType::Regular => w.connection_mode().uses_grpc_pipeline(),
+                _ => *w.connection_mode() == ConnectionMode::Grpc,
+            })
+            .collect()
+    }
+
     fn select_single_worker(
         &self,
         model_id: &str,
@@ -705,12 +745,14 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use std::collections::HashMap;
 
+    use axum::http::StatusCode;
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
     use crate::{
         config::types::PolicyConfig,
         policies::PolicyFactory,
+        routers::common::retry::is_retryable_response,
         worker::{BasicWorkerBuilder, ConnectionMode, ModelCard},
     };
 
@@ -805,6 +847,65 @@ mod tests {
             *decode_hits.entry(decode.url().to_string()).or_default() += 1;
         }
         (prefill_hits, decode_hits)
+    }
+
+    /// A saturated prefill leg is a pressure condition, not model absence.
+    ///
+    /// The model's decode workers stay unflagged, so a whole-model shed
+    /// predicate reads "not all overloaded" and the request would fall through
+    /// to 404 — the exact answer this feature exists to replace, and worse than
+    /// the pre-feature behaviour where the prefill worker still served.
+    #[test]
+    fn a_fully_vetoed_prefill_leg_sheds_rather_than_404s() {
+        let model_id = "test-model-prefill-veto";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let (prefill_urls, _) = register_pd_workers(&worker_registry, model_id, 4);
+
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::PrefillDecode,
+        );
+        assert!(stage
+            .select_pd_pair(model_id, None, None, None, None)
+            .is_some());
+
+        for url in &prefill_urls {
+            let worker = worker_registry.get_by_url(url).expect("registered");
+            worker_registry.set_worker_overloaded(&worker, true);
+        }
+
+        assert!(
+            stage
+                .select_pd_pair(model_id, None, None, None, None)
+                .is_none(),
+            "the veto empties the prefill pool"
+        );
+        let response = stage.selection_failure(model_id);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
+        assert!(
+            !is_retryable_response(&response),
+            "a shed must be terminal for the retry layer"
+        );
+    }
+
+    /// A model nobody serves is still a 404 — the shed must not swallow real
+    /// misconfiguration.
+    #[test]
+    fn an_unserved_model_still_reports_not_found() {
+        let stage = WorkerSelectionStage::new(
+            Arc::new(WorkerRegistry::new()),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::PrefillDecode,
+        );
+        assert_eq!(
+            stage.selection_failure("nobody").status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]
@@ -978,5 +1079,74 @@ mod tests {
                 .unwrap();
             assert_eq!(again.url(), first.url(), "follow-up must pin by rid key");
         }
+    }
+
+    /// The gRPC transport must shed an all-overloaded model with the same 503
+    /// `no_available_workers` the HTTP router uses. Its usual empty-pool answer
+    /// is a 404, which would both misreport pressure as model absence and skip
+    /// the retry path (404 is not retryable).
+    #[test]
+    fn grpc_all_overloaded_sheds_503_instead_of_404() {
+        use crate::routers::error::extract_error_code_from_response;
+
+        let model_id = "test-model-overload-shed";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let mut workers = Vec::new();
+        for i in 0..2 {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{}", 8400 + i))
+                    .model(ModelCard::new(model_id))
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .health_config(no_health_check())
+                    .build(),
+            );
+            worker_registry.register(Arc::clone(&worker)).unwrap();
+            workers.push(worker);
+        }
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            policy_registry,
+            WorkerSelectionMode::Regular,
+        );
+
+        assert!(stage
+            .select_single_worker(model_id, None, None, None, None)
+            .is_some());
+
+        worker_registry.set_worker_overloaded(&workers[0], true);
+        assert!(
+            stage
+                .select_single_worker(model_id, None, None, None, None)
+                .is_some(),
+            "one eligible worker left still serves"
+        );
+
+        worker_registry.set_worker_overloaded(&workers[1], true);
+        assert!(
+            stage
+                .select_single_worker(model_id, None, None, None, None)
+                .is_none(),
+            "the veto empties the candidate pool"
+        );
+
+        let response = stage.selection_failure(model_id);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
+
+        // Recovery re-admits, and the failure response goes back to 404 for a
+        // genuinely absent model.
+        worker_registry.set_worker_overloaded(&workers[0], false);
+        assert!(stage
+            .select_single_worker(model_id, None, None, None, None)
+            .is_some());
+        assert_eq!(
+            stage.selection_failure("no-such-model").status(),
+            StatusCode::NOT_FOUND
+        );
     }
 }

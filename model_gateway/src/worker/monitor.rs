@@ -67,7 +67,9 @@ use tracing::{debug, info, warn};
 use crate::{
     observability::metrics::Metrics,
     policies::PolicyRegistry,
-    worker::{event::WorkerEvent, ConnectionMode, Worker, WorkerRegistry},
+    worker::{
+        event::WorkerEvent, overload::OverloadThresholds, ConnectionMode, Worker, WorkerRegistry,
+    },
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -224,6 +226,10 @@ pub struct WorkerMonitor {
     /// When set, poll loads and re-export `smg_engine_*` gauges even if no
     /// load-aware routing policy is active (`--engine-metrics`).
     engine_metrics: bool,
+    /// Absolute per-worker overload thresholds. When enabled, every ingested
+    /// load report is scored once here and the verdict latched onto the worker,
+    /// which is what keeps selection free of any per-request predicate.
+    overload: OverloadThresholds,
     load_tx: watch::Sender<HashMap<String, WorkerLoadResponse>>,
     load_rx: watch::Receiver<HashMap<String, WorkerLoadResponse>>,
     /// Worker URLs that answered definitively that they do not serve
@@ -255,6 +261,7 @@ impl WorkerMonitor {
         client: reqwest::Client,
         default_interval_secs: u64,
         engine_metrics: bool,
+        overload: OverloadThresholds,
     ) -> Self {
         let (load_tx, load_rx) = watch::channel(HashMap::new());
         Self {
@@ -264,6 +271,7 @@ impl WorkerMonitor {
             client,
             default_interval: Duration::from_secs(default_interval_secs.max(1)),
             engine_metrics,
+            overload,
             load_tx,
             load_rx,
             native_loads_absent: Arc::new(DashSet::new()),
@@ -357,6 +365,21 @@ impl WorkerMonitor {
         self.load_tx.send_modify(|map| map.clear());
         self.worker_load_manager.clear();
         self.native_loads_absent.clear();
+        // Same reset rule for the overload vetoes: the feed that would clear
+        // them is being torn down, so nothing else would. Fail open, but say so
+        // — on the lag-recovery path this is the fleet going un-vetoed for up to
+        // one poll interval, and the gauge dropping to zero is otherwise
+        // indistinguishable from a genuine recovery.
+        if self.overload.is_enabled() {
+            let cleared = self.worker_registry.clear_all_overload_flags();
+            if cleared > 0 {
+                warn!(
+                    vetoes_cleared = cleared,
+                    "Overload vetoes cleared with the load feed; every worker is routable again \
+                     until its next poll"
+                );
+            }
+        }
     }
 
     /// Recompute the polling state for every currently-known group.
@@ -458,6 +481,10 @@ impl WorkerMonitor {
     /// re-export is on, since metrics-rs cannot delete series.
     fn evict_worker_loads(&self, worker: &Arc<dyn Worker>) {
         let url = worker.url();
+        // A worker with no load feed has no overload verdict: leaving the flag
+        // set would strand it out of routing until it happened to be polled
+        // again, which for a non-`Ready` worker never happens.
+        self.worker_registry.set_worker_overloaded(worker, false);
         self.load_tx.send_modify(|map| {
             map.remove(url);
         });
@@ -871,12 +898,15 @@ async fn group_monitor_loop(
             return;
         };
 
-        // Poll when a load-aware policy needs the data OR engine-metrics
-        // re-export is on; the latter decouples observability from routing.
+        // Poll when a load-aware policy needs the data, when engine-metrics
+        // re-export is on, or when overload protection is configured. The last
+        // two decouple the poll from routing policy: overload vetoes apply
+        // under every policy, including ones that never read loads.
         let load_aware_policies = monitor.policy_registry.get_all_load_aware_policies();
         let routing_needs_load = !load_aware_policies.is_empty()
             || monitor.policy_registry.get_dp_rank_policy().is_some();
-        if !routing_needs_load && !monitor.engine_metrics {
+        let overload = monitor.overload;
+        if !routing_needs_load && !monitor.engine_metrics && !overload.is_enabled() {
             debug!("No load-aware policies and engine metrics off, skipping load fetch for group {group_key}");
             drop(monitor);
             continue;
@@ -924,7 +954,7 @@ async fn group_monitor_loop(
                             WorkerMonitor::fetch_backend_load(&worker).await
                         }
                     };
-                    (worker.url().to_string(), response)
+                    (worker, response)
                 }
             })
             .collect();
@@ -934,7 +964,21 @@ async fn group_monitor_loop(
         let mut group_loads: HashMap<String, WorkerLoadResponse> = HashMap::new();
         let mut group_dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
         let mut dp_evict: Vec<String> = Vec::new();
-        for (url, response) in results {
+        for (worker, response) in results {
+            let url = worker.url().to_string();
+            // The overload predicate runs exactly here, once per report: O(1)
+            // per worker per poll interval, and never on a request path. A
+            // worker whose fetch failed has no fresh signal, so it is treated
+            // as not overloaded — the same "absent means no opinion" rule the
+            // watch-map consumers follow.
+            if overload.is_enabled() {
+                let verdict = response
+                    .as_ref()
+                    .is_some_and(|load| overload.is_overloaded(load));
+                monitor
+                    .worker_registry
+                    .set_worker_overloaded(&worker, verdict);
+            }
             if let Some(load) = response {
                 // Only feed the DP-rank cache from responses that carry real
                 // absolute per-rank token counts. Ratio-only snapshots,
@@ -1120,6 +1164,7 @@ mod worker_monitor_tests {
             reqwest::Client::new(),
             5,
             false,
+            OverloadThresholds::default(),
         ));
         (registry, monitor)
     }
@@ -1568,6 +1613,13 @@ mod native_loads_tests {
     }
 
     fn monitor_with_policy(config: PolicyConfig) -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
+        monitor_with(config, OverloadThresholds::default())
+    }
+
+    fn monitor_with(
+        config: PolicyConfig,
+        overload: OverloadThresholds,
+    ) -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
         let registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(config));
         let monitor = Arc::new(WorkerMonitor::new(
@@ -1576,8 +1628,188 @@ mod native_loads_tests {
             reqwest::Client::new(),
             1,
             false,
+            overload,
         ));
         (registry, monitor)
+    }
+
+    /// Poll `condition` until it holds or the timeout expires. The group loop
+    /// writes the flag out of band, so there is nothing to await directly.
+    async fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
+    }
+
+    /// `NATIVE_BODY` reports 4 waiting requests, so a threshold of 4 vetoes and
+    /// a threshold of 5 does not — the ingestion path must latch the verdict on
+    /// the worker itself, under a policy (round-robin) that reads no loads at
+    /// all.
+    #[tokio::test]
+    async fn load_ingestion_flags_worker_over_waiting_threshold() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let (registry, monitor) = monitor_with(
+            PolicyConfig::RoundRobin,
+            OverloadThresholds {
+                waiting_requests: Some(4),
+                token_usage: None,
+            },
+        );
+        let worker = vllm_worker(&stub.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+
+        wait_until("worker to be flagged overloaded", || worker.is_overloaded()).await;
+        assert_eq!(registry.overloaded_worker_count("a"), 1);
+        assert!(
+            !worker.is_available(),
+            "an overloaded worker is not routable"
+        );
+    }
+
+    /// A worker with real queueing that stays under the threshold must keep
+    /// serving: the veto is absolute, not comparative.
+    #[tokio::test]
+    async fn busy_worker_under_threshold_stays_eligible() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let (registry, monitor) = monitor_with(
+            PolicyConfig::RoundRobin,
+            OverloadThresholds {
+                waiting_requests: Some(5),
+                token_usage: None,
+            },
+        );
+        let worker = vllm_worker(&stub.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+
+        // Wait for the feed to actually land, then assert the verdict.
+        let mut rx = monitor.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !rx.borrow().contains_key(&stub.url) {
+                rx.changed().await.expect("watch sender alive");
+            }
+        })
+        .await
+        .expect("load feed must reach the watch channel");
+
+        assert!(!worker.is_overloaded());
+        assert!(worker.is_available());
+        assert_eq!(registry.overloaded_worker_count("a"), 0);
+    }
+
+    /// Overload protection alone must open the poll gate: without it the
+    /// feature would silently never engage under a load-blind policy.
+    #[tokio::test]
+    async fn overload_thresholds_alone_start_load_polling() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let (registry, monitor) = monitor_with(
+            PolicyConfig::RoundRobin,
+            OverloadThresholds {
+                waiting_requests: None,
+                token_usage: Some(0.2),
+            },
+        );
+        let worker = vllm_worker(&stub.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+
+        wait_until("the engine to be polled", || {
+            stub.probes.load(Ordering::SeqCst) > 0
+        })
+        .await;
+        wait_until("token usage 0.25 to trip the 0.2 ceiling", || {
+            worker.is_overloaded()
+        })
+        .await;
+    }
+
+    /// With both thresholds unset the feature is off: an engine reporting a
+    /// load that would trip either signal must still leave the flag, the
+    /// counters and every routing verdict exactly where they were.
+    #[tokio::test]
+    async fn unconfigured_thresholds_never_write_the_flag() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        // cache_aware with overlap_decay on, so loads are polled and ingested
+        // for reasons unrelated to overload protection.
+        let (registry, monitor) = monitor_with(
+            cache_aware_policy_config(1.0),
+            OverloadThresholds::default(),
+        );
+        let worker = vllm_worker(&stub.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+
+        let mut rx = monitor.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !rx.borrow().contains_key(&stub.url) {
+                rx.changed().await.expect("watch sender alive");
+            }
+        })
+        .await
+        .expect("load feed must reach the watch channel");
+        // A second tick, so this is not just "the first poll had not landed".
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        assert!(!worker.is_overloaded());
+        assert!(worker.is_available());
+        assert_eq!(registry.overloaded_worker_count("a"), 0);
+    }
+
+    /// A worker whose feed goes away has no verdict at all, so it must be
+    /// re-admitted rather than stranded out of routing forever.
+    #[tokio::test]
+    async fn losing_the_load_feed_clears_the_veto() {
+        let (registry, monitor) = monitor_with(
+            PolicyConfig::RoundRobin,
+            OverloadThresholds {
+                waiting_requests: Some(1),
+                token_usage: None,
+            },
+        );
+        // Never-registered address: every fetch fails, so the report is absent.
+        let worker = vllm_worker("http://127.0.0.1:1");
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        registry.set_worker_overloaded(&worker, true);
+        assert_eq!(registry.overloaded_worker_count("a"), 1);
+
+        monitor.start_event_loop();
+        wait_until("the absent feed to clear the veto", || {
+            !worker.is_overloaded()
+        })
+        .await;
+        assert_eq!(registry.overloaded_worker_count("a"), 0);
+    }
+
+    /// `stop_all_groups` tears down the only writer that could clear the flag,
+    /// so it must clear it itself — same rule the load snapshot follows.
+    #[tokio::test]
+    async fn stop_all_groups_clears_overload_flags() {
+        let (registry, monitor) = monitor_with(
+            PolicyConfig::RoundRobin,
+            OverloadThresholds {
+                waiting_requests: Some(1),
+                token_usage: None,
+            },
+        );
+        let worker = vllm_worker("http://127.0.0.1:1");
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        registry.set_worker_overloaded(&worker, true);
+
+        monitor.stop_all_groups();
+
+        assert!(!worker.is_overloaded());
+        assert_eq!(registry.overloaded_worker_count("a"), 0);
     }
 
     #[tokio::test]

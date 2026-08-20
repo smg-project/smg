@@ -31,8 +31,8 @@ use smg::{
     policies::PolicyRegistry,
     routers::{router_manager::RouterManager, RouterFactory, RouterTrait},
     worker::{
-        BasicWorkerBuilder, ModelCard, RuntimeType, Worker, WorkerMonitor, WorkerRegistry,
-        WorkerType,
+        BasicWorkerBuilder, ModelCard, OverloadThresholds, RuntimeType, Worker, WorkerMonitor,
+        WorkerRegistry, WorkerType,
     },
     workflow::Job,
 };
@@ -362,6 +362,7 @@ async fn build_test_app_context(
         client.clone(),
         config.load_monitor_interval_secs,
         config.engine_metrics,
+        OverloadThresholds::default(),
     )));
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
