@@ -434,7 +434,7 @@ impl StreamingProcessor {
 
                     // Process tokens through stop decoder
                     let (chunk_text, should_stop) =
-                        Self::process_chunk_tokens(stop_decoder, chunk.token_ids());
+                        Self::process_chunk_tokens(stop_decoder, chunk.token_ids())?;
 
                     if should_stop {
                         // Stop-decoder match takes precedence: pin "stop" even if
@@ -1334,34 +1334,36 @@ impl StreamingProcessor {
     }
 
     /// Process a chunk of tokens through the stop decoder
+    ///
+    /// Decode errors are propagated instead of being treated as `Held`:
+    /// swallowing them would drop the affected text while any configured
+    /// stop sequence silently stops matching, letting the stream run on
+    /// with missing output.
     fn process_chunk_tokens(
         stop_decoder: &mut StopSequenceDecoder,
         token_ids: &[u32],
-    ) -> (String, bool) {
+    ) -> Result<(String, bool), String> {
         let mut chunk_text = String::new();
 
         for &token_id in token_ids {
-            match stop_decoder.process_token(token_id).unwrap_or_else(|e| {
-                debug!(
-                    "Error processing token {}: {}. Treating as Held.",
-                    token_id, e
-                );
-                SequenceDecoderOutput::Held
-            }) {
+            match stop_decoder
+                .process_token(token_id)
+                .map_err(|e| format!("Stop decoder failed to process token {token_id}: {e}"))?
+            {
                 SequenceDecoderOutput::Text(text) => {
                     chunk_text.push_str(&text);
                 }
                 SequenceDecoderOutput::StoppedWithText(text) => {
                     chunk_text.push_str(&text);
-                    return (chunk_text, true);
+                    return Ok((chunk_text, true));
                 }
                 SequenceDecoderOutput::Stopped => {
-                    return (chunk_text, true);
+                    return Ok((chunk_text, true));
                 }
                 SequenceDecoderOutput::Held => {}
             }
         }
-        (chunk_text, false)
+        Ok((chunk_text, false))
     }
 
     /// Helper: Process reasoning content in streaming mode
@@ -2045,7 +2047,7 @@ impl StreamingProcessor {
                     completion_tokens.record_chunk(&chunk);
 
                     let (chunk_text, should_stop) =
-                        Self::process_chunk_tokens(&mut stop_decoder, chunk.token_ids());
+                        Self::process_chunk_tokens(&mut stop_decoder, chunk.token_ids())?;
 
                     if should_stop {
                         // Stop-decoder match takes precedence over the engine's
@@ -2896,7 +2898,7 @@ impl StreamingProcessor {
                     });
 
                     let (decoded_text, stopped) =
-                        Self::process_chunk_tokens(stop_decoder, chunk.token_ids());
+                        Self::process_chunk_tokens(stop_decoder, chunk.token_ids())?;
                     chunk_text.clear();
                     chunk_text.push_str(&decoded_text);
 
@@ -3233,5 +3235,77 @@ mod tests {
                 .and_then(|details| details.reasoning_tokens),
             Some(3)
         );
+    }
+
+    /// Tokenizer whose decode always fails, simulating a broken deployment
+    /// (corrupt or mismatched tokenizer files).
+    struct FailingTokenizer {
+        special_tokens: llm_tokenizer::SpecialTokens,
+    }
+
+    impl llm_tokenizer::Encoder for FailingTokenizer {
+        fn encode(
+            &self,
+            _input: &str,
+            _add_special_tokens: bool,
+        ) -> anyhow::Result<llm_tokenizer::Encoding> {
+            Err(anyhow::anyhow!("encode is not supported"))
+        }
+
+        fn encode_batch(
+            &self,
+            _inputs: &[&str],
+            _add_special_tokens: bool,
+        ) -> anyhow::Result<Vec<llm_tokenizer::Encoding>> {
+            Err(anyhow::anyhow!("encode_batch is not supported"))
+        }
+    }
+
+    impl llm_tokenizer::Decoder for FailingTokenizer {
+        fn decode(
+            &self,
+            _token_ids: &[u32],
+            _skip_special_tokens: bool,
+        ) -> anyhow::Result<String> {
+            Err(anyhow::anyhow!("tokenizer decode failed"))
+        }
+    }
+
+    impl Tokenizer for FailingTokenizer {
+        fn vocab_size(&self) -> usize {
+            0
+        }
+
+        fn get_special_tokens(&self) -> &llm_tokenizer::SpecialTokens {
+            &self.special_tokens
+        }
+
+        fn token_to_id(&self, _token: &str) -> Option<u32> {
+            None
+        }
+
+        fn id_to_token(&self, _id: u32) -> Option<String> {
+            None
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn process_chunk_tokens_propagates_decode_errors() {
+        // A decode error must surface instead of being swallowed as `Held`,
+        // which would drop the text and let a configured stop silently miss.
+        let tokenizer = Arc::new(FailingTokenizer {
+            special_tokens: llm_tokenizer::SpecialTokens::default(),
+        });
+        let config = llm_tokenizer::StopSequenceConfig::default().with_stop_sequence("STOP");
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        let result = StreamingProcessor::process_chunk_tokens(&mut decoder, &[1, 2]);
+
+        let err = result.expect_err("decode failure must propagate");
+        assert!(err.contains("Stop decoder failed to process token"));
     }
 }
