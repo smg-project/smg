@@ -43,7 +43,7 @@ fi
 
 # Install SGLang with all dependencies
 echo "Installing SGLang..."
-uv pip install --prerelease=allow "sglang[all]==0.5.16"
+uv pip install --prerelease=allow "sglang[all]==0.5.17"
 
 # Install flashinfer-jit-cache: sglang bundles flashinfer_python but only for attention ops.
 # Multi-GPU models need trtllm_comm kernels (fused allreduce + layernorm) which FlashInfer
