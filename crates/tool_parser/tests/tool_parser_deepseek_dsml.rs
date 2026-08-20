@@ -371,6 +371,27 @@ async fn test_deepseek_v4_complete_mixed_types() {
     assert_eq!(args["enabled"], true);
 }
 
+#[tokio::test]
+async fn test_deepseek_v4_complete_with_tools_omits_invalid_calls() {
+    let parser = DeepSeekDsmlParser::v4();
+    let tools = create_test_tools();
+    let input = concat!(
+        "Visible answer.\n\n",
+        "<｜DSML｜tool_calls>\n",
+        "<｜DSML｜invoke name=\"not_supplied\">{\"value\":1}</｜DSML｜invoke>\n",
+        "<｜DSML｜invoke name=\"get_weather\">{not-json}</｜DSML｜invoke>\n",
+        "</｜DSML｜tool_calls>",
+        "Ordinary trailing answer.",
+    );
+
+    let (normal_text, calls) = parser
+        .parse_complete_with_tools(input, &tools)
+        .await
+        .unwrap();
+    assert_eq!(normal_text, "Visible answer.Ordinary trailing answer.");
+    assert!(calls.is_empty());
+}
+
 #[test]
 fn test_deepseek_v4_format_detection() {
     let parser = DeepSeekDsmlParser::v4();
@@ -378,22 +399,23 @@ fn test_deepseek_v4_format_detection() {
     assert!(parser.has_tool_markers("<｜DSML｜tool_calls>"));
     assert!(parser.has_tool_markers("text <｜DSML｜tool_calls> marker"));
 
-    // V4 parser must NOT fire on the V3.2 block name.
-    assert!(!parser.has_tool_markers("<｜DSML｜function_calls>"));
+    // Any DSML sentinel is structural and must not leak as ordinary content,
+    // even when the block name is malformed for the selected model family.
+    assert!(parser.has_tool_markers("<｜DSML｜function_calls>"));
     assert!(!parser.has_tool_markers("plain text"));
 }
 
 #[test]
 fn test_deepseek_v32_does_not_match_v4_block() {
-    // Guardrail: a V3.2 parser must NOT treat a V4-shaped payload as a tool call.
+    // A cross-variant sentinel is structural even though it cannot form a call.
     let parser = DeepSeekDsmlParser::v32();
-    assert!(!parser.has_tool_markers("<｜DSML｜tool_calls>"));
+    assert!(parser.has_tool_markers("<｜DSML｜tool_calls>"));
 }
 
 #[tokio::test]
-async fn test_deepseek_v4_cross_variant_payload_passthrough() {
-    // A V4 parser given a V3.2-shaped payload must not parse calls; the input
-    // should flow through as normal text (has_tool_markers returns false).
+async fn test_deepseek_v4_cross_variant_payload_is_not_a_call() {
+    // A V4 parser given a V3.2-shaped payload must not parse calls or expose
+    // the foreign DSML framing as normal content.
     let parser = DeepSeekDsmlParser::v4();
     let v32_input = concat!(
         "<｜DSML｜function_calls>\n",
@@ -404,7 +426,7 @@ async fn test_deepseek_v4_cross_variant_payload_passthrough() {
     );
     let (normal_text, tools) = parser.parse_complete(v32_input).await.unwrap();
     assert!(tools.is_empty(), "V4 parser must not parse V3.2 block");
-    assert_eq!(normal_text, v32_input);
+    assert!(normal_text.is_empty());
 }
 
 #[tokio::test]
@@ -440,6 +462,7 @@ async fn test_deepseek_v4_streaming_single_tool() {
 
     assert!(found_name, "Should have found tool name during streaming");
     assert!(!collected_args.is_empty(), "Should have streamed arguments");
+    assert_eq!(parser.completed_tool_call_count(), Some(1));
 }
 
 #[tokio::test]
@@ -531,6 +554,57 @@ async fn test_deepseek_dsml_v4_streaming_strips_eos_from_partial_parameter() {
         !collected_args.contains("<｜end▁of▁sentence｜>"),
         "EOS must not leak into V4 streamed argument bytes, got: {collected_args:?}"
     );
+    assert_eq!(parser.completed_tool_call_count(), Some(0));
+}
+
+#[tokio::test]
+async fn test_deepseek_dsml_v4_terminal_invalid_call_is_not_complete() {
+    let tools = create_test_tools();
+    let mut parser = DeepSeekDsmlParser::v4();
+    let result = parser
+        .parse_incremental(
+            concat!(
+                "Visible answer.\n\n",
+                "<｜DSML｜tool_calls>",
+                "<｜DSML｜invoke name=\"get_weather\">{not-json}</｜DSML｜invoke>",
+                "</｜DSML｜tool_calls>",
+                "Ordinary trailing answer.",
+            ),
+            &tools,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.normal_text,
+        "Visible answer.Ordinary trailing answer."
+    );
+    assert!(result.calls.is_empty());
+    assert_eq!(parser.completed_tool_call_count(), Some(0));
+}
+
+#[tokio::test]
+async fn test_deepseek_dsml_v4_terminal_partial_preserves_only_prefix_text() {
+    let tools = create_test_tools();
+    let mut parser = DeepSeekDsmlParser::v4();
+    let result = parser
+        .parse_incremental(
+            concat!(
+                "Visible answer.\n\n",
+                "<｜DSML｜tool_calls>",
+                "<｜DSML｜invoke name=\"get_weather\">",
+                "<｜DSML｜parameter name=\"city\" string=\"true\">Ber",
+            ),
+            &tools,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.normal_text, "Visible answer.");
+    assert_eq!(parser.completed_tool_call_count(), Some(0));
+
+    let terminal = parser.finish_incremental();
+    assert!(terminal.normal_text.is_empty());
+    assert!(terminal.calls.is_empty());
 }
 
 /// A malformed complete invoke with `name=""` must not stall the buffer.
@@ -674,8 +748,8 @@ async fn test_deepseek_dsml_v4_streaming_bpe_chunked_opener() {
         "argument bytes must be emitted, got: {collected_args:?}"
     );
     assert!(
-        !normal_text.contains("<｜DSML｜"),
-        "DSML sentinel must not leak into normal_text, got: {normal_text:?}"
+        normal_text.is_empty(),
+        "DSML framing and its leading whitespace must not leak into normal_text, got: {normal_text:?}"
     );
 }
 
