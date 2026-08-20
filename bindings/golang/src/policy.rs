@@ -177,6 +177,10 @@ impl Worker for GrpcWorker {
         self.routing_key_load.value()
     }
 
+    fn routing_key_inflight(&self, routing_key: &str) -> usize {
+        self.routing_key_load.key_inflight(routing_key)
+    }
+
     fn increment_routing_key_load(&self, routing_key: &str) {
         self.routing_key_load.increment(routing_key);
     }

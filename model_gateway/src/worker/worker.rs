@@ -235,6 +235,13 @@ impl WorkerRoutingKeyLoad {
         self.active_routing_keys.len()
     }
 
+    /// In-flight requests for one routing key.
+    pub fn key_inflight(&self, routing_key: &str) -> usize {
+        self.active_routing_keys
+            .get(routing_key)
+            .map_or(0, |count| *count)
+    }
+
     pub fn increment(&self, routing_key: &str) {
         *self
             .active_routing_keys
@@ -377,6 +384,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Get the current routing-key load cardinality.
     fn routing_key_load(&self) -> usize;
+
+    /// In-flight requests for one routing key on this worker.
+    fn routing_key_inflight(&self, routing_key: &str) -> usize;
 
     /// Increment the routing-key load tracker for an active key.
     fn increment_routing_key_load(&self, routing_key: &str);
@@ -1069,6 +1079,10 @@ impl WorkerRuntime {
         self.worker_routing_key_load.value()
     }
 
+    pub fn routing_key_inflight(&self, routing_key: &str) -> usize {
+        self.worker_routing_key_load.key_inflight(routing_key)
+    }
+
     pub fn increment_routing_key_load(&self, routing_key: &str) {
         self.worker_routing_key_load.increment(routing_key);
     }
@@ -1380,6 +1394,10 @@ impl Worker for BasicWorker {
 
     fn routing_key_load(&self) -> usize {
         self.runtime.load().routing_key_load()
+    }
+
+    fn routing_key_inflight(&self, routing_key: &str) -> usize {
+        self.runtime.load().routing_key_inflight(routing_key)
     }
 
     fn increment_routing_key_load(&self, routing_key: &str) {

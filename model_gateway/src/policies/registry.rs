@@ -86,10 +86,10 @@ pub struct PolicyRegistry {
     routing_key_headers: Arc<Vec<HeaderName>>,
 }
 
-/// A pinned worker at or over this many router-local in-flight requests (all
-/// traffic on that worker, not just this key; counted per router replica, so
-/// the effective fleet threshold multiplies with replica count) is bypassed
-/// and the request reassigned.
+/// A sticky key with this many of its own requests already in flight on its
+/// pinned worker (router-local, counted per replica) is bypassed and the
+/// request reassigned. Guards one conversation stacking onto its pin; total
+/// worker load is not a respill trigger.
 const STICKY_INFLIGHT_CAP: usize = 2;
 
 /// `conv_t2_r1` -> `conv`: strip one trailing `_r<n>` retry suffix, then one
@@ -259,6 +259,9 @@ impl PolicyRegistry {
     ) -> Option<usize> {
         Metrics::record_routing_key_source(source);
 
+        // Keyed-load guards track the un-namespaced key on each worker.
+        let load_key = key;
+
         // PD legs namespace so prefill and decode stick independently.
         let namespaced;
         let key = if info.leg == WorkerLeg::Single {
@@ -268,7 +271,8 @@ impl PolicyRegistry {
             &namespaced
         };
 
-        let over_cap = |idx: usize| workers[idx].load() >= STICKY_INFLIGHT_CAP;
+        let over_cap =
+            |idx: usize| workers[idx].routing_key_inflight(load_key) >= STICKY_INFLIGHT_CAP;
         let finish = |result: Option<usize>, branch: ExecutionBranch| {
             Metrics::record_worker_manual_policy_branch(branch.as_str());
             Metrics::set_manual_policy_cache_entries(sticky.map_len());
@@ -935,7 +939,7 @@ mod tests {
     use super::*;
     use crate::{
         policies::{CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
-        worker::{BasicWorkerBuilder, Worker, WorkerType},
+        worker::{BasicWorkerBuilder, Worker, WorkerLoadGuard, WorkerType},
     };
 
     fn no_health_check() -> HealthCheckConfig {
@@ -1464,14 +1468,16 @@ mod tests {
         let pinned = reg.select_worker(&policy, &workers, &info).unwrap();
         assert_eq!(reg.select_worker(&policy, &workers, &info), Some(pinned));
 
-        // At the cap (2 in-flight) the key reassigns to the idle worker and
-        // the pin follows it, even after the original drains.
-        workers[pinned].increment_load();
-        workers[pinned].increment_load();
+        // At the cap (2 of this key in flight on its pin) the key reassigns
+        // to the idle worker and the pin follows it, even after the original
+        // drains.
+        let guards = [
+            WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convA")),
+            WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convA")),
+        ];
         let respilled = reg.select_worker(&policy, &workers, &info).unwrap();
         assert_ne!(respilled, pinned);
-        workers[pinned].decrement_load();
-        workers[pinned].decrement_load();
+        drop(guards);
         assert_eq!(reg.select_worker(&policy, &workers, &info), Some(respilled));
     }
 
@@ -1492,20 +1498,18 @@ mod tests {
         };
 
         let pinned = reg.select_worker(&policy, &workers, &info).unwrap();
-        // Saturate BOTH workers: the reassignment cannot strictly improve
-        // (every pick is at the cap), so the request dispatches wherever the
-        // policy says but the pin must survive.
+        // Saturate BOTH workers with this key: the reassignment cannot
+        // strictly improve (every pick is at the key cap), so the request
+        // dispatches wherever the policy says but the pin must survive.
+        let mut guards = Vec::new();
         for w in &workers {
-            w.increment_load();
-            w.increment_load();
+            guards.push(WorkerLoadGuard::with_key(w.clone(), Some("convB")));
+            guards.push(WorkerLoadGuard::with_key(w.clone(), Some("convB")));
         }
         for _ in 0..4 {
             reg.select_worker(&policy, &workers, &info).unwrap();
         }
-        for w in &workers {
-            w.decrement_load();
-            w.decrement_load();
-        }
+        drop(guards);
         assert_eq!(
             reg.select_worker(&policy, &workers, &info),
             Some(pinned),
@@ -1530,13 +1534,97 @@ mod tests {
         };
 
         let pinned = reg.select_worker(&policy, &workers, &info).unwrap();
-        workers[pinned].increment_load();
-        workers[pinned].increment_load();
+        let guards = [
+            WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convC")),
+            WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convC")),
+        ];
         let respilled = reg.select_worker(&policy, &workers, &info).unwrap();
         assert_ne!(respilled, pinned);
-        workers[pinned].decrement_load();
-        workers[pinned].decrement_load();
+        drop(guards);
         assert_eq!(reg.select_worker(&policy, &workers, &info), Some(respilled));
+    }
+
+    #[test]
+    #[traced_test]
+    fn busy_worker_does_not_respill_idle_key() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let info = SelectWorkerInfo {
+            rid_key: Some("convD"),
+            ..Default::default()
+        };
+
+        let pinned = reg.select_worker(&policy, &workers, &info).unwrap();
+        // Unrelated traffic on the pin, total load far past the cap: the
+        // returning key has nothing in flight and must keep its pin.
+        let _unrelated = [
+            WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convZ")),
+            WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convZ")),
+            WorkerLoadGuard::new(workers[pinned].clone(), None),
+            WorkerLoadGuard::new(workers[pinned].clone(), None),
+        ];
+        assert_eq!(reg.select_worker(&policy, &workers, &info), Some(pinned));
+        assert!(logs_contain("occupied_hit"));
+        assert!(!logs_contain("cap_respill"));
+    }
+
+    #[test]
+    #[traced_test]
+    fn two_inflight_same_key_respill_the_third() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let info = SelectWorkerInfo {
+            rid_key: Some("convE"),
+            ..Default::default()
+        };
+
+        let pinned = reg.select_worker(&policy, &workers, &info).unwrap();
+        let _g1 = WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convE"));
+        let _g2 = WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convE"));
+        assert_ne!(reg.select_worker(&policy, &workers, &info), Some(pinned));
+        assert!(logs_contain("cap_respill"));
+    }
+
+    #[test]
+    #[traced_test]
+    fn cap_lifts_when_key_inflight_drains() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        // Single worker: the respill has nowhere to go, so the branch flips
+        // purely on the key's in-flight count.
+        let workers = vec![worker("http://w1", WorkerType::Regular)];
+        let info = SelectWorkerInfo {
+            rid_key: Some("convF"),
+            ..Default::default()
+        };
+
+        assert_eq!(reg.select_worker(&policy, &workers, &info), Some(0));
+        let guards = [
+            WorkerLoadGuard::with_key(workers[0].clone(), Some("convF")),
+            WorkerLoadGuard::with_key(workers[0].clone(), Some("convF")),
+        ];
+        assert_eq!(reg.select_worker(&policy, &workers, &info), Some(0));
+        assert!(logs_contain("cap_respill"));
+        drop(guards);
+        assert_eq!(reg.select_worker(&policy, &workers, &info), Some(0));
+        assert!(logs_contain("occupied_hit"));
     }
 
     #[test]
