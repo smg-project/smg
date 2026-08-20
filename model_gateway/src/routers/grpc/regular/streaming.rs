@@ -2388,74 +2388,127 @@ impl StreamingProcessor {
             }
         }
 
-        // Phase 3: Flush unstreamed tool args from the incremental parser
-        if let Some(ref parser) = streaming_tool_parser {
-            if let Some(unstreamed_items) = parser.get_unstreamed_tool_args() {
-                for tool_call_item in unstreamed_items {
-                    has_tool_calls = true;
-
-                    if let Some(ref name) = tool_call_item.name {
-                        // Close text block if open before starting tool block
-                        if text_block_open {
-                            Self::send_messages_event(
-                                tx,
-                                &mut sse_buffer,
-                                &MessageStreamEvent::ContentBlockStop {
-                                    index: current_block_index,
-                                },
-                            )
-                            .await?;
-                            text_block_open = false;
-                            current_block_index += 1;
-                        }
-                        if tool_block_open {
-                            Self::send_messages_event(
-                                tx,
-                                &mut sse_buffer,
-                                &MessageStreamEvent::ContentBlockStop {
-                                    index: current_block_index,
-                                },
-                            )
-                            .await?;
-                            current_block_index += 1;
-                        }
-
-                        let tool_call_id = utils::generate_tool_call_id(
-                            model,
-                            name,
-                            tool_call_item.tool_index,
-                            history_tool_calls_count,
-                        );
-                        Self::send_messages_event(
-                            tx,
-                            &mut sse_buffer,
-                            &MessageStreamEvent::ContentBlockStart {
-                                index: current_block_index,
-                                content_block: ContentBlock::ToolUse {
-                                    id: message_utils::anthropic_tool_use_id(&tool_call_id),
-                                    name: name.clone(),
-                                    input: Value::Object(serde_json::Map::new()),
-                                },
-                            },
-                        )
-                        .await?;
-                        tool_block_open = true;
-                    }
-
-                    if !tool_call_item.parameters.is_empty() {
-                        Self::send_messages_event(
-                            tx,
-                            &mut sse_buffer,
-                            &MessageStreamEvent::ContentBlockDelta {
-                                index: current_block_index,
-                                delta: ContentBlockDelta::InputJsonDelta {
-                                    partial_json: tool_call_item.parameters,
-                                },
-                            },
-                        )
-                        .await?;
-                    }
+        // Phase 3: Finalize the incremental parser — flush held-back text,
+        // emit finalized/unstreamed tool args, then reconcile has_tool_calls
+        // with the count of completed valid calls so an all-invalid stream
+        // does not pin stop_reason to "tool_use".
+        if let Some(ref mut parser) = streaming_tool_parser {
+            let finalized = parser.finish_incremental();
+            if !finalized.normal_text.is_empty() {
+                if tool_block_open {
+                    Self::send_messages_event(
+                        tx,
+                        &mut sse_buffer,
+                        &MessageStreamEvent::ContentBlockStop {
+                            index: current_block_index,
+                        },
+                    )
+                    .await?;
+                    tool_block_open = false;
+                    current_block_index += 1;
                 }
+                if !text_block_open {
+                    Self::send_messages_event(
+                        tx,
+                        &mut sse_buffer,
+                        &MessageStreamEvent::ContentBlockStart {
+                            index: current_block_index,
+                            content_block: ContentBlock::Text {
+                                text: String::new(),
+                                citations: None,
+                            },
+                        },
+                    )
+                    .await?;
+                    text_block_open = true;
+                }
+                Self::send_messages_event(
+                    tx,
+                    &mut sse_buffer,
+                    &MessageStreamEvent::ContentBlockDelta {
+                        index: current_block_index,
+                        delta: ContentBlockDelta::TextDelta {
+                            text: finalized.normal_text,
+                        },
+                    },
+                )
+                .await?;
+            }
+
+            let terminal_items = finalized.calls.into_iter().chain(
+                parser.get_unstreamed_tool_args().into_iter().flatten(),
+            );
+            for tool_call_item in terminal_items {
+                has_tool_calls = true;
+
+                if let Some(ref name) = tool_call_item.name {
+                    // Close text block if open before starting tool block
+                    if text_block_open {
+                        Self::send_messages_event(
+                            tx,
+                            &mut sse_buffer,
+                            &MessageStreamEvent::ContentBlockStop {
+                                index: current_block_index,
+                            },
+                        )
+                        .await?;
+                        text_block_open = false;
+                        current_block_index += 1;
+                    }
+                    if tool_block_open {
+                        Self::send_messages_event(
+                            tx,
+                            &mut sse_buffer,
+                            &MessageStreamEvent::ContentBlockStop {
+                                index: current_block_index,
+                            },
+                        )
+                        .await?;
+                        current_block_index += 1;
+                    }
+
+                    let tool_call_id = utils::generate_tool_call_id(
+                        model,
+                        name,
+                        tool_call_item.tool_index,
+                        history_tool_calls_count,
+                    );
+                    Self::send_messages_event(
+                        tx,
+                        &mut sse_buffer,
+                        &MessageStreamEvent::ContentBlockStart {
+                            index: current_block_index,
+                            content_block: ContentBlock::ToolUse {
+                                id: message_utils::anthropic_tool_use_id(&tool_call_id),
+                                name: name.clone(),
+                                input: Value::Object(serde_json::Map::new()),
+                            },
+                        },
+                    )
+                    .await?;
+                    tool_block_open = true;
+                }
+
+                if !tool_call_item.parameters.is_empty() {
+                    Self::send_messages_event(
+                        tx,
+                        &mut sse_buffer,
+                        &MessageStreamEvent::ContentBlockDelta {
+                            index: current_block_index,
+                            delta: ContentBlockDelta::InputJsonDelta {
+                                partial_json: tool_call_item.parameters,
+                            },
+                        },
+                    )
+                    .await?;
+                }
+            }
+
+            // Provisional deltas from a complete-but-invalid call were
+            // skipped by the parser; if no call actually completed, degrade
+            // the terminal stop_reason from "tool_use" to "end_turn".
+            if let Some(completed_call_count) = parser.completed_tool_call_count() {
+                has_tool_calls = completed_call_count > 0;
             }
         }
 
