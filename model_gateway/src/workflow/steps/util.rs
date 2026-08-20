@@ -141,29 +141,37 @@ async fn grpc_transport_reachable(grpc_url: &str, timeout_secs: u64) -> Result<(
 ///
 /// The per-runtime fan-out is gated behind a single transport probe so an
 /// unreachable endpoint costs one connect rather than five.
+/// `timeout_secs` bounds the gate and fan-out together, not each phase.
 pub(crate) async fn try_grpc_reachable(url: &str, timeout_secs: u64) -> Result<(), String> {
     let grpc_url = grpc_reachable_url(url)?;
+    let timeout = Duration::from_secs(timeout_secs);
 
-    grpc_transport_reachable(&grpc_url, timeout_secs).await?;
+    let reachability = Box::pin(async {
+        grpc_transport_reachable(&grpc_url, timeout_secs).await?;
 
-    let (sglang, vllm, trtllm, mlx, tokenspeed) = tokio::join!(
-        do_grpc_health_check(&grpc_url, timeout_secs, "sglang"),
-        do_grpc_health_check(&grpc_url, timeout_secs, "vllm"),
-        do_grpc_health_check(&grpc_url, timeout_secs, "trtllm"),
-        do_grpc_health_check(&grpc_url, timeout_secs, "mlx"),
-        do_grpc_health_check(&grpc_url, timeout_secs, "tokenspeed"),
-    );
+        let (sglang, vllm, trtllm, mlx, tokenspeed) = tokio::join!(
+            do_grpc_health_check(&grpc_url, timeout_secs, "sglang"),
+            do_grpc_health_check(&grpc_url, timeout_secs, "vllm"),
+            do_grpc_health_check(&grpc_url, timeout_secs, "trtllm"),
+            do_grpc_health_check(&grpc_url, timeout_secs, "mlx"),
+            do_grpc_health_check(&grpc_url, timeout_secs, "tokenspeed"),
+        );
 
-    match (sglang, vllm, trtllm, mlx, tokenspeed) {
-        (Ok(()), _, _, _, _)
-        | (_, Ok(()), _, _, _)
-        | (_, _, Ok(()), _, _)
-        | (_, _, _, Ok(()), _)
-        | (_, _, _, _, Ok(())) => Ok(()),
-        (Err(e1), Err(e2), Err(e3), Err(e4), Err(e5)) => Err(format!(
-            "gRPC not reachable (tried sglang, vllm, trtllm, mlx, tokenspeed): sglang={e1}, vllm={e2}, trtllm={e3}, mlx={e4}, tokenspeed={e5}",
-        )),
-    }
+        match (sglang, vllm, trtllm, mlx, tokenspeed) {
+            (Ok(()), _, _, _, _)
+            | (_, Ok(()), _, _, _)
+            | (_, _, Ok(()), _, _)
+            | (_, _, _, Ok(()), _)
+            | (_, _, _, _, Ok(())) => Ok(()),
+            (Err(e1), Err(e2), Err(e3), Err(e4), Err(e5)) => Err(format!(
+                "gRPC not reachable (tried sglang, vllm, trtllm, mlx, tokenspeed): sglang={e1}, vllm={e2}, trtllm={e3}, mlx={e4}, tokenspeed={e5}",
+            )),
+        }
+    });
+
+    tokio::time::timeout(timeout, reachability)
+        .await
+        .map_err(|_| "gRPC reachability timeout".to_string())?
 }
 
 #[cfg(test)]
