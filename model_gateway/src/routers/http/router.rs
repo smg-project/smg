@@ -267,7 +267,7 @@ impl Router {
                 request_text: text,
                 tokens,
                 headers,
-                routing_key: header_utils::extract_routing_key_hint(headers),
+                routing_key: self.policy_registry.resolve_routing_key(headers),
                 rid_key,
                 hash_ring,
                 leg: crate::policies::WorkerLeg::Single,
@@ -508,7 +508,7 @@ impl Router {
         // rid-derived first, header fallback.
         let load_guard = WorkerLoadGuard::with_key(
             worker.clone(),
-            rid_key.or_else(|| header_utils::extract_routing_key_hint(headers)),
+            rid_key.or_else(|| self.policy_registry.sticky_header_key(headers)),
         );
 
         // Note: Using borrowed reference avoids heap allocation
@@ -784,7 +784,7 @@ impl Router {
                 request_text: text.as_deref(),
                 tokens: hinted_tokens.as_deref(),
                 headers,
-                routing_key: header_utils::extract_routing_key_hint(headers),
+                routing_key: self.policy_registry.resolve_routing_key(headers),
                 rid_key: None,
                 hash_ring,
                 leg: crate::policies::WorkerLeg::Single,
@@ -808,7 +808,11 @@ impl Router {
         );
         let worker = available[idx].clone();
 
-        let load_guard = WorkerLoadGuard::new(worker.clone(), headers);
+        // Streamed requests have no rid; the header is the whole sticky key.
+        let load_guard = WorkerLoadGuard::with_key(
+            worker.clone(),
+            self.policy_registry.sticky_header_key(headers),
+        );
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -1610,7 +1614,10 @@ impl Router {
             "false",
         );
 
-        let load_guard = WorkerLoadGuard::new(worker.clone(), Some(req.headers()));
+        let load_guard = WorkerLoadGuard::with_key(
+            worker.clone(),
+            self.policy_registry.sticky_header_key(Some(req.headers())),
+        );
         events::RequestSentEvent { url: worker.url() }.emit();
 
         let (parts, body) = req.into_parts();

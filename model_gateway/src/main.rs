@@ -337,8 +337,8 @@ struct CliArgs {
     /// Sticky sessions: route every request of a conversation to the same
     /// worker, on any policy. The key is derived from the request body's rid
     /// with per-turn/per-retry suffixes stripped (conv_t2_r1 -> conv),
-    /// falling back to X-SMG-Routing-Key when no rid is present;
-    /// raw-streamed requests carry no readable rid and use the header only.
+    /// falling back to the routing-key headers when no rid is present;
+    /// raw-streamed requests carry no readable rid and use the headers only.
     /// Reuses the manual eviction/idle/assignment knobs for the sticky map
     #[arg(
         long,
@@ -347,6 +347,13 @@ struct CliArgs {
         help_heading = "Routing Policy"
     )]
     routing_key_override: bool,
+
+    /// Ordered header names checked for the routing key; the first header
+    /// present with a valid value wins. Header keys get the same
+    /// per-turn/per-retry suffix stripping as rid-derived keys when the
+    /// override is enabled
+    #[arg(long, num_args = 0.., default_value = "x-smg-routing-key", value_parser = parse_routing_key_header, help_heading = "Routing Policy")]
+    routing_key_headers: Vec<String>,
 
     /// Enable IGW (Inference Gateway) mode for multi-model support
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
@@ -994,6 +1001,14 @@ enum OracleConnectSource {
 fn parse_model_id_from(s: &str) -> Result<String, String> {
     ModelIdSource::parse(s)?;
     Ok(s.to_string())
+}
+
+/// Validate `--routing-key-headers` values at CLI parse time; names are
+/// normalized to lowercase.
+fn parse_routing_key_header(s: &str) -> Result<String, String> {
+    http::header::HeaderName::try_from(s)
+        .map(|name| name.as_str().to_string())
+        .map_err(|e| format!("Invalid header name '{s}': {e}"))
 }
 
 /// Validate `--model-alias` value at CLI parse time (format: alias=canonical).
@@ -1720,6 +1735,7 @@ impl CliArgs {
                     self.assignment_mode.as_deref(),
                     ManualAssignmentMode::Delegate,
                 ),
+                headers: self.routing_key_headers.clone(),
             })
             .retries(!self.disable_retries)
             .upstream_http2(self.upstream_http2)
@@ -2039,6 +2055,34 @@ mod tests {
 
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert!(!defaults.routing_key_override.enabled);
+        assert_eq!(
+            defaults.routing_key_override.headers,
+            vec!["x-smg-routing-key".to_string()]
+        );
+    }
+
+    #[test]
+    fn routing_key_headers_flow_into_router_config() {
+        // Space-separated list, order preserved; names normalize to lowercase.
+        let config = cli_args_from(&[
+            "--routing-key-headers",
+            "X-Routing-Key",
+            "x-smg-routing-key",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        assert_eq!(
+            config.routing_key_override.headers,
+            vec!["x-routing-key".to_string(), "x-smg-routing-key".to_string()]
+        );
+
+        for bad in ["has space", "bad\u{7f}name", ""] {
+            let argv = ["smg", "--routing-key-headers", bad];
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "--routing-key-headers {bad:?} should be rejected"
+            );
+        }
     }
 
     #[test]

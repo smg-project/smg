@@ -14,7 +14,6 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
-        common::header_utils::extract_routing_key_hint,
         error,
         grpc::{
             context::{EncodeWorkerAssignment, RequestContext, WorkerSelection},
@@ -96,9 +95,11 @@ impl PipelineStage for WorkerSelectionStage {
             .policy_registry
             .derive_rid_key(ctx.input.request_type.rid())
             .map(str::to_string);
-        ctx.state.sticky_key = rid_key
-            .clone()
-            .or_else(|| extract_routing_key_hint(headers).map(str::to_string));
+        ctx.state.sticky_key = rid_key.clone().or_else(|| {
+            self.policy_registry
+                .sticky_header_key(headers)
+                .map(str::to_string)
+        });
         let rid_key = rid_key.as_deref();
 
         let model_id = ctx.input.model_id.as_str();
@@ -275,7 +276,7 @@ impl WorkerSelectionStage {
                 request_text: text,
                 tokens,
                 headers,
-                routing_key: None,
+                routing_key: self.policy_registry.resolve_routing_key(headers),
                 rid_key,
                 hash_ring,
                 leg: WorkerLeg::Single,
@@ -402,7 +403,7 @@ impl WorkerSelectionStage {
             request_text: text,
             tokens,
             headers,
-            routing_key: None,
+            routing_key: self.policy_registry.resolve_routing_key(headers),
             rid_key,
             hash_ring,
             leg: WorkerLeg::Prefill,
@@ -582,7 +583,7 @@ impl WorkerSelectionStage {
             request_text: text,
             tokens,
             headers,
-            routing_key: None,
+            routing_key: self.policy_registry.resolve_routing_key(headers),
             rid_key,
             hash_ring: hash_ring.clone(),
             leg: WorkerLeg::Prefill,

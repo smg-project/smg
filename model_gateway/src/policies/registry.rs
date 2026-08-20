@@ -4,6 +4,7 @@ use std::{
 };
 
 use dashmap::DashMap;
+use http::{header::HeaderName, HeaderMap};
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
@@ -25,7 +26,7 @@ use crate::{
     observability::metrics::Metrics,
     policies::cache_aware::LoadReceiver,
     routers::common::header_utils::{
-        extract_routing_key_hint, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
+        extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
     },
     worker::{KvEventMonitor, Worker},
 };
@@ -78,6 +79,11 @@ pub struct PolicyRegistry {
     /// override is enabled; consulted (instead of the configured policy) for keyed
     /// requests via [`PolicyRegistry::select_worker`].
     routing_key_sticky: Option<Arc<ManualPolicy>>,
+
+    /// Ordered routing-key header names, parsed once from
+    /// `routing_key_override.headers`; the first header present with a valid
+    /// value wins.
+    routing_key_headers: Arc<Vec<HeaderName>>,
 }
 
 /// A pinned worker at or over this many router-local in-flight requests (all
@@ -128,6 +134,19 @@ impl PolicyRegistry {
                 assignment_mode: routing_key_override.assignment_mode,
             }))
         });
+        // ConfigValidator rejects invalid names at startup; skipping here
+        // covers direct construction.
+        let routing_key_headers = routing_key_override
+            .headers
+            .iter()
+            .filter_map(|name| match HeaderName::try_from(name.as_str()) {
+                Ok(parsed) => Some(parsed),
+                Err(_) => {
+                    warn!("Ignoring invalid routing-key header name: {name:?}");
+                    None
+                }
+            })
+            .collect();
         Self {
             model_policies: Arc::new(DashMap::new()),
             model_worker_counts: Arc::new(DashMap::new()),
@@ -141,6 +160,7 @@ impl PolicyRegistry {
             mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
             routing_key_sticky,
+            routing_key_headers: Arc::new(routing_key_headers),
         }
     }
 
@@ -157,15 +177,52 @@ impl PolicyRegistry {
         (!key.is_empty() && key.len() <= ROUTING_KEY_HINT_MAX_BYTES).then_some(key)
     }
 
-    /// Resolve the effective sticky key: the rid-derived key wins, the header
-    /// is the fallback when no rid is present. Header keys go through the
-    /// same validated extraction the policies use.
-    fn effective_sticky_key<'a>(info: &SelectWorkerInfo<'a>) -> Option<(&'a str, &'static str)> {
-        info.rid_key.map(|k| (k, "rid")).or_else(|| {
-            info.routing_key
-                .or_else(|| extract_routing_key_hint(info.headers))
-                .map(|k| (k, "header"))
+    /// Resolve the routing key from the configured header names: the first
+    /// header present with a valid value (non-empty UTF-8 within the byte
+    /// cap) wins.
+    pub fn resolve_routing_key<'a>(&self, headers: Option<&'a HeaderMap>) -> Option<&'a str> {
+        self.routing_key_headers
+            .iter()
+            .find_map(|name| extract_routing_key_hint_named(headers, name))
+    }
+
+    /// A key that is nothing but suffix keys as itself, like the rid path.
+    fn strip_header_key(raw: &str) -> &str {
+        let stripped = strip_lineage_suffixes(raw);
+        if stripped.is_empty() {
+            raw
+        } else {
+            stripped
+        }
+    }
+
+    /// The header-derived sticky key: the resolved routing key,
+    /// lineage-stripped when the override is enabled (matching selection),
+    /// raw otherwise.
+    pub fn sticky_header_key<'a>(&self, headers: Option<&'a HeaderMap>) -> Option<&'a str> {
+        let raw = self.resolve_routing_key(headers)?;
+        Some(if self.routing_key_sticky.is_some() {
+            Self::strip_header_key(raw)
+        } else {
+            raw
         })
+    }
+
+    /// Resolve the effective sticky key: the rid-derived key wins, the
+    /// configured routing-key headers are the fallback when no rid is
+    /// present. Header keys get the same lineage stripping as rid keys, so a
+    /// proxy forwarding `conv_t2` as a header pins the entry `conv`.
+    fn effective_sticky_key<'a>(
+        &self,
+        info: &SelectWorkerInfo<'a>,
+    ) -> Option<(&'a str, &'static str)> {
+        if let Some(key) = info.rid_key {
+            return Some((key, "rid"));
+        }
+        let raw = info
+            .routing_key
+            .or_else(|| self.resolve_routing_key(info.headers))?;
+        Some((Self::strip_header_key(raw), "header"))
     }
 
     /// Select a worker, applying the sticky routing-key override when it is
@@ -181,7 +238,7 @@ impl PolicyRegistry {
     ) -> Option<usize> {
         if let Some(sticky) = self.routing_key_sticky.as_ref() {
             if Self::routing_key_override_applies(policy.name()) {
-                if let Some((key, source)) = Self::effective_sticky_key(info) {
+                if let Some((key, source)) = self.effective_sticky_key(info) {
                     return Self::select_sticky(sticky, policy, workers, info, key, source);
                 }
             }
@@ -215,6 +272,14 @@ impl PolicyRegistry {
         let finish = |result: Option<usize>, branch: ExecutionBranch| {
             Metrics::record_worker_manual_policy_branch(branch.as_str());
             Metrics::set_manual_policy_cache_entries(sticky.map_len());
+            debug!(
+                source,
+                key,
+                branch = branch.as_str(),
+                worker = result.map_or("none", |idx| workers[idx].url()),
+                model_id = result.map_or("none", |idx| workers[idx].model_id()),
+                "Sticky routing decision"
+            );
             result
         };
 
@@ -264,7 +329,7 @@ impl PolicyRegistry {
         finish(Some(idx), branch)
     }
 
-    /// Policies that already honor `X-SMG-Routing-Key` keep their own handling; all
+    /// Policies that already honor the routing key keep their own handling; all
     /// others (cache_aware, least_load, prefix_hash, ...) get the sticky override.
     fn routing_key_override_applies(name: &str) -> bool {
         !matches!(name, "manual" | "consistent_hashing")
@@ -648,15 +713,15 @@ impl PolicyRegistry {
     /// select that policy. A routing hint lifts the requirement — with a
     /// valid `x-smg-routing-tokens` the buffered path never extracts text
     /// either (the hint wins over body-derived routing), and a valid
-    /// `x-smg-routing-key` under the sticky override supersedes the policy
+    /// routing-key header under the sticky override supersedes the policy
     /// before it reads text. Hints are validated by the same extractors
     /// selection uses, so malformed or over-cap values lift nothing.
-    pub fn any_policy_needs_request_text(&self, headers: Option<&http::HeaderMap>) -> bool {
+    pub fn any_policy_needs_request_text(&self, headers: Option<&HeaderMap>) -> bool {
         if parse_routing_tokens_hint(headers).is_some() {
             return false;
         }
         let keyed_override =
-            self.routing_key_sticky.is_some() && extract_routing_key_hint(headers).is_some();
+            self.routing_key_sticky.is_some() && self.resolve_routing_key(headers).is_some();
         let needs_text = |policy: &Arc<dyn LoadBalancingPolicy>| {
             policy.needs_request_text()
                 && !(keyed_override && Self::routing_key_override_applies(policy.name()))
@@ -865,6 +930,7 @@ impl std::fmt::Debug for PolicyRegistry {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::HealthCheckConfig;
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::{
@@ -895,8 +961,8 @@ mod tests {
         }))
     }
 
-    fn headers_with_key(key: &str) -> http::HeaderMap {
-        let mut h = http::HeaderMap::new();
+    fn headers_with_key(key: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
         h.insert("x-smg-routing-key", key.parse().unwrap());
         h
     }
@@ -976,8 +1042,8 @@ mod tests {
         }
     }
 
-    fn headers_with_tokens(value: &str) -> http::HeaderMap {
-        let mut h = http::HeaderMap::new();
+    fn headers_with_tokens(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
         h.insert("x-smg-routing-tokens", value.parse().unwrap());
         h
     }
@@ -1046,6 +1112,156 @@ mod tests {
         let a = reg.select_worker(&policy, &workers, &info).unwrap();
         let b = reg.select_worker(&policy, &workers, &info).unwrap();
         assert_ne!(a, b);
+    }
+
+    fn override_with_headers(names: &[&str]) -> RoutingKeyOverrideConfig {
+        RoutingKeyOverrideConfig {
+            enabled: true,
+            headers: names.iter().map(|n| n.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn headers_with(name: &str, key: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(HeaderName::try_from(name).unwrap(), key.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn resolve_routing_key_first_present_and_valid_wins() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            override_with_headers(&["x-routing-key", "x-smg-routing-key"]),
+        );
+
+        let mut both = headers_with("x-routing-key", "primary");
+        both.insert("x-smg-routing-key", "legacy".parse().unwrap());
+        assert_eq!(reg.resolve_routing_key(Some(&both)), Some("primary"));
+
+        let legacy_only = headers_with_key("legacy");
+        assert_eq!(reg.resolve_routing_key(Some(&legacy_only)), Some("legacy"));
+
+        // An invalid value under the first name falls through to the next.
+        let mut over_cap_first = headers_with("x-routing-key", &"k".repeat(129));
+        over_cap_first.insert("x-smg-routing-key", "legacy".parse().unwrap());
+        assert_eq!(
+            reg.resolve_routing_key(Some(&over_cap_first)),
+            Some("legacy")
+        );
+
+        assert_eq!(reg.resolve_routing_key(None), None);
+    }
+
+    #[test]
+    fn default_headers_ignore_unconfigured_names() {
+        let reg = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
+        assert_eq!(
+            reg.resolve_routing_key(Some(&headers_with("x-routing-key", "primary"))),
+            None
+        );
+        assert_eq!(
+            reg.resolve_routing_key(Some(&headers_with_key("legacy"))),
+            Some("legacy")
+        );
+    }
+
+    #[test]
+    fn invalid_configured_header_names_are_skipped() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            override_with_headers(&["not a header", "x-routing-key"]),
+        );
+        assert_eq!(
+            reg.resolve_routing_key(Some(&headers_with("x-routing-key", "primary"))),
+            Some("primary")
+        );
+    }
+
+    #[test]
+    fn header_keys_share_rid_lineage_stripping() {
+        let reg = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
+        assert_eq!(
+            reg.sticky_header_key(Some(&headers_with_key("conv_t2"))),
+            Some("conv")
+        );
+        assert_eq!(
+            reg.sticky_header_key(Some(&headers_with_key("conv_t2_r1"))),
+            Some("conv")
+        );
+        // A key that is nothing but suffix keys as itself.
+        assert_eq!(
+            reg.sticky_header_key(Some(&headers_with_key("_t1"))),
+            Some("_t1")
+        );
+
+        // Override disabled: raw key, no stripping.
+        let disabled = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        assert_eq!(
+            disabled.sticky_header_key(Some(&headers_with_key("conv_t2"))),
+            Some("conv_t2")
+        );
+    }
+
+    #[test]
+    fn header_turns_pin_the_same_sticky_entry() {
+        let reg = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+            worker("http://w3", WorkerType::Regular),
+        ];
+        let t1 = headers_with_key("conv_t1");
+        let info_t1 = SelectWorkerInfo {
+            headers: Some(&t1),
+            ..Default::default()
+        };
+        let first = reg.select_worker(&policy, &workers, &info_t1).unwrap();
+        let t2 = headers_with_key("conv_t2");
+        let info_t2 = SelectWorkerInfo {
+            headers: Some(&t2),
+            ..Default::default()
+        };
+        for _ in 0..5 {
+            assert_eq!(reg.select_worker(&policy, &workers, &info_t2), Some(first));
+        }
+    }
+
+    #[test]
+    fn alternate_header_routes_stickily() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            override_with_headers(&["x-routing-key", "x-smg-routing-key"]),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+            worker("http://w3", WorkerType::Regular),
+        ];
+        let headers = headers_with("x-routing-key", "session-A");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let first = reg.select_worker(&policy, &workers, &info).unwrap();
+        for _ in 0..5 {
+            assert_eq!(reg.select_worker(&policy, &workers, &info), Some(first));
+        }
+    }
+
+    #[test]
+    fn alternate_header_lifts_text_gate() {
+        let reg = PolicyRegistry::with_override(
+            cache_aware_config(),
+            override_with_headers(&["x-routing-key", "x-smg-routing-key"]),
+        );
+        assert!(
+            !reg.any_policy_needs_request_text(Some(&headers_with("x-routing-key", "session-A")))
+        );
+        // A name outside the configured list lifts nothing.
+        assert!(reg.any_policy_needs_request_text(Some(&headers_with("x-other-key", "session-A"))));
     }
 
     fn rid_override(assignment_mode: ManualAssignmentMode) -> RoutingKeyOverrideConfig {
@@ -1204,6 +1420,29 @@ mod tests {
             reg.select_worker(&policy, &workers, &keyed_turn2),
             Some(seeded)
         );
+    }
+
+    #[test]
+    #[traced_test]
+    fn sticky_selection_emits_decision_line_per_request() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let info = SelectWorkerInfo {
+            rid_key: Some("conv1"),
+            ..Default::default()
+        };
+        reg.select_worker(&policy, &workers, &info).unwrap();
+        assert!(logs_contain("Sticky routing decision"));
+        assert!(logs_contain("vacant"));
+        reg.select_worker(&policy, &workers, &info).unwrap();
+        assert!(logs_contain("occupied_hit"));
     }
 
     #[test]
