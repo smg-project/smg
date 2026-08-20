@@ -64,6 +64,7 @@ pub fn create_test_app(
         client.clone(),
         router_config.load_monitor_interval_secs,
         router_config.engine_metrics,
+        router_config.disable_load_monitoring,
     )));
 
     // Create empty OnceLock for worker job queue and workflow engines

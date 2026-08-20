@@ -172,6 +172,9 @@ mod tests {
             tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
             wasm_manager: None,
+            worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
+                &router_config,
+            )),
             worker_service: Arc::new(WorkerService::new(registry, job_queue, router_config)),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,

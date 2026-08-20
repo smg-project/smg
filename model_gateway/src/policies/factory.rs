@@ -101,11 +101,13 @@ impl PolicyFactory {
                 prefix_token_count,
                 load_factor,
                 balance_abs_threshold,
+                cache_boundaries,
             } => {
                 let config = PrefixHashConfig {
                     prefix_token_count: *prefix_token_count,
                     load_factor: *load_factor,
                     balance_abs_threshold: *balance_abs_threshold,
+                    cache_boundaries: cache_boundaries.clone(),
                 };
                 Arc::new(PrefixHashPolicy::new(config))
             }
@@ -190,6 +192,7 @@ mod tests {
             prefix_token_count: 100,
             load_factor: 0.8,
             balance_abs_threshold: 10,
+            cache_boundaries: vec![2048, 8192],
         });
         assert_eq!(policy.name(), "prefix_hash");
     }

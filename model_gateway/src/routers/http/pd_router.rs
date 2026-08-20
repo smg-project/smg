@@ -35,8 +35,9 @@ use crate::{
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     routers::{
         common::{
-            header_utils,
-            retry::{is_retryable_status, RetryExecutor},
+            attach_sized_body, header_utils, overload,
+            request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
+            retry::{is_retryable_response, RetryExecutor},
             sse::{SseEncoder, SSE_CHANNEL_BUFFER},
         },
         error,
@@ -46,6 +47,22 @@ use crate::{
     },
     worker::{HashRing, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
+
+/// Why PD pair selection produced nothing.
+///
+/// Split so the overload shed keeps its own error code, message and counter
+/// instead of being reworded as a circuit-breaker failure by
+/// [`PDRouter::handle_server_selection_error`].
+type PdPair = (Arc<dyn Worker>, Arc<dyn Worker>);
+
+#[derive(Debug)]
+enum PdSelectionFailure {
+    /// Every worker on one leg is vetoed: a ready-made, already-counted 503.
+    Shed(Response),
+    /// The pre-existing string: no workers configured, all unhealthy or
+    /// circuit-broken, or the policy declined.
+    Unavailable(String),
+}
 
 #[derive(Debug)]
 pub struct PDRouter {
@@ -62,9 +79,6 @@ struct PDRequestContext<'a> {
     batch_size: Option<usize>,
     is_stream: bool,
     return_logprob: bool,
-    request_text: Option<String>,
-    routing_tokens: Option<Vec<u32>>,
-    rid_key: Option<String>,
     model_id: &'a str,
     headers: Option<HeaderMap>,
 }
@@ -175,12 +189,35 @@ impl PDRouter {
         })
     }
 
-    fn handle_server_selection_error(error: String) -> Response {
-        error!("Failed to select PD pair error={}", error);
-        error::service_unavailable(
-            "server_selection_failed",
-            format!("No available servers: {error}"),
-        )
+    fn handle_server_selection_error(failure: PdSelectionFailure) -> Response {
+        match failure {
+            // Already a decision-logged 503 with the overload error code and
+            // counter; re-describing it as a circuit-breaker/health failure is
+            // exactly the misdiagnosis this path used to hand operators.
+            PdSelectionFailure::Shed(shed) => shed,
+            PdSelectionFailure::Unavailable(error) => {
+                error!("Failed to select PD pair error={}", error);
+                error::service_unavailable(
+                    "server_selection_failed",
+                    format!("No available servers: {error}"),
+                )
+            }
+        }
+    }
+
+    /// Classify one leg's selection miss. `candidates` is the leg pool before
+    /// the `is_available()` filter, so the verdict describes the pool that
+    /// actually emptied rather than the model's whole registry entry — a
+    /// saturated prefill leg leaves the decode workers unflagged.
+    fn leg_failure(
+        candidates: &[Arc<dyn Worker>],
+        model_id: &str,
+        error: String,
+    ) -> PdSelectionFailure {
+        match overload::shed_if_all_overloaded(candidates, model_id) {
+            Some(shed) => PdSelectionFailure::Shed(shed),
+            None => PdSelectionFailure::Unavailable(error),
+        }
     }
 
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
@@ -285,10 +322,11 @@ impl PDRouter {
         }
     }
 
-    async fn execute_dual_dispatch<T: Serialize + Clone>(
+    async fn execute_dual_dispatch<T: Serialize>(
         &self,
         headers: Option<&HeaderMap>,
-        original_request: &T,
+        original_request: T,
+        routing: RoutingDerivatives,
         mut context: PDRequestContext<'_>,
     ) -> Response {
         let start_time = Instant::now();
@@ -311,9 +349,6 @@ impl PDRouter {
             endpoint,
             bool_to_static_str(context.is_stream),
         );
-        // Clone request once outside the retry loop, then use Arc to share across attempts
-        // This avoids O(retries) clones by sharing the same data
-        let shared_request = Arc::new(original_request.clone());
 
         // Use per-model retry config if set by a worker, otherwise fall back to router default.
         let per_model_retry_config = self.worker_registry.get_retry_config(model);
@@ -321,167 +356,62 @@ impl PDRouter {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
-        let response = RetryExecutor::execute_response_with_retry(
-            retry_config,
-            {
-                move |attempt: u32| {
-                    // Clone Arc (cheap reference count increment) instead of cloning the entire request
-                    let shared_request = Arc::clone(&shared_request);
-                    let context = context.clone();
-                    async move {
-                        let (prefill, decode) = match self
-                            .select_pd_pair(
-                                context.request_text.as_deref(),
-                                context.routing_tokens.as_deref(),
-                                context.rid_key.as_deref(),
-                                context.model_id,
-                                context.headers.as_ref(),
-                            )
-                            .await
-                        {
-                            Ok(pair) => pair,
-                            Err(e) => {
-                                return Self::handle_server_selection_error(e);
-                            }
-                        };
+        // The lease owns the parsed request and its routing derivatives for
+        // the dispatch phase; its release point encodes the retry policy.
+        let lease = RequestLease::new(
+            original_request,
+            routing,
+            ReleasePoint::from_retry_config(retry_config),
+        );
 
-                        debug!(
-                            "PD retry attempt {} using prefill={} decode={}",
-                            attempt,
-                            prefill.url(),
-                            decode.url()
-                        );
-
-                        let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
-                        // The prefill and decode workers only know the
-                        // canonical name, so forward that, not the alias the
-                        // client sent.
-                        super::set_request_model(&mut json_request, model);
-
-                        json_request = match Self::inject_bootstrap_into_value(
-                            json_request,
-                            prefill.as_ref(),
-                            context.batch_size,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                Metrics::record_pd_bootstrap_failure();
-                                return Self::handle_serialization_error(e);
-                            }
-                        };
-
-                        let mut prefill_json_request = json_request.clone();
-                        let mut decode_json_request = json_request;
-
-                        let mut prefill_rank = prefill.dp_rank().map(|rank| rank as isize);
-                        let mut decode_rank = decode.dp_rank().map(|rank| rank as isize);
-
-                        let dp_rank_policy_opt = self.policy_registry.get_dp_rank_policy();
-                        if let Some(dp_rank_policy) = dp_rank_policy_opt.as_ref() {
-                            let estimated_cost: isize = match (
-                                context.routing_tokens.as_deref(),
-                                context.request_text.as_ref(),
-                            ) {
-                                (Some(tokens), _) => (tokens.len() as isize).max(1),
-                                (None, Some(text)) => {
-                                    // Calculate token count using a simple heuristic
-                                    // In a real implementation, we would use the tokenizer
-                                    // For now, use a simple words-to-tokens ratio
-                                    let word_count = text.split_whitespace().count();
-                                    // Assume average 1.3 tokens per word
-                                    let token_count = (word_count as f64 * 1.3).ceil() as isize;
-                                    token_count.max(1)
-                                }
-                                (None, None) => 1, // Use at least 1 to avoid no-op
-                            };
-                            let policy_prefill_rank =
-                                dp_rank_policy.select_dp_rank(prefill.as_ref(), estimated_cost);
-                            let policy_decode_rank =
-                                dp_rank_policy.select_dp_rank(decode.as_ref(), estimated_cost);
-                            if let Some(rank) = policy_prefill_rank {
-                                prefill_rank = Some(rank);
-                            }
-                            if let Some(rank) = policy_decode_rank {
-                                decode_rank = Some(rank);
-                            }
-                        }
-
-                        if let Some(p_rank) = prefill_rank {
-                            Self::inject_dp_rank_to_json(
-                                &mut prefill_json_request,
-                                p_rank,
-                                "routed_dp_rank",
-                            );
-                            Self::inject_dp_rank_to_json(
-                                &mut decode_json_request,
-                                p_rank,
-                                "disagg_prefill_dp_rank",
-                            );
-                        }
-                        if let Some(d_rank) = decode_rank {
-                            Self::inject_dp_rank_to_json(
-                                &mut decode_json_request,
-                                d_rank,
-                                "routed_dp_rank",
-                            );
-                        }
-                        if prefill_rank.is_some() || decode_rank.is_some() {
-                            debug!(
-                                "PD selected DP ranks prefill={:?} decode={:?}",
-                                prefill_rank, decode_rank
-                            );
-                        }
-
-                        let response = self
-                            .execute_dual_dispatch_internal(
-                                headers,
-                                prefill_json_request,
-                                decode_json_request,
-                                context,
-                                Arc::clone(&prefill),
-                                Arc::clone(&decode),
-                            )
-                            .await;
-
-                        let status = response.status();
-                        prefill.record_outcome(status.as_u16());
-                        decode.record_outcome(status.as_u16());
-
-                        // Record worker errors for server errors (5xx)
-                        if status.is_server_error() {
-                            let error_type = error_type_from_status(status);
-                            Metrics::record_worker_error(
-                                metrics_labels::WORKER_PREFILL,
-                                metrics_labels::CONNECTION_HTTP,
-                                error_type,
-                            );
-                            Metrics::record_worker_error(
-                                metrics_labels::WORKER_DECODE,
-                                metrics_labels::CONNECTION_HTTP,
-                                error_type,
-                            );
-                        }
-
-                        response
-                    }
-                }
-            },
-            |res, _attempt| is_retryable_status(res.status()),
-            |delay, attempt| {
-                // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
-                Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
-                Metrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
-                Metrics::record_worker_retry_backoff(attempt, delay);
-            },
-            || {
+        let response = if lease.release_point() == ReleasePoint::AfterDispatch {
+            // Retries disabled: one dispatch; the lease frees the parsed
+            // request as soon as its serialized legs exist.
+            let res = self
+                .execute_dual_dispatch_attempt(0, headers, &lease, context)
+                .await;
+            // Mirror the retry executor's exhaustion accounting for a
+            // retryable response that gets no retry.
+            if is_retryable_response(&res) {
                 Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
                 Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
-            },
-        )
-        .await;
+            }
+            res
+        } else {
+            // The lease keeps the request alive for replay until the retry
+            // window closes (first non-retryable response).
+            let lease = &lease;
+            RetryExecutor::execute_response_with_retry(
+                retry_config,
+                {
+                    move |attempt: u32| {
+                        let context = context.clone();
+                        async move {
+                            self.execute_dual_dispatch_attempt(attempt, headers, lease, context)
+                                .await
+                        }
+                    }
+                },
+                |res, _attempt| is_retryable_response(res),
+                |delay, attempt| {
+                    // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
+                    Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
+                    Metrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
+                    Metrics::record_worker_retry_backoff(attempt, delay);
+                },
+                || {
+                    Metrics::record_worker_retries_exhausted(
+                        metrics_labels::WORKER_PREFILL,
+                        endpoint,
+                    );
+                    Metrics::record_worker_retries_exhausted(
+                        metrics_labels::WORKER_DECODE,
+                        endpoint,
+                    );
+                },
+            )
+            .await
+        };
 
         // Record Layer 2 metrics
         let duration = start_time.elapsed();
@@ -494,7 +424,7 @@ impl PDRouter {
                 endpoint,
                 duration,
             );
-        } else if !is_retryable_status(response.status()) {
+        } else if !is_retryable_response(&response) {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_PD,
@@ -502,6 +432,175 @@ impl PDRouter {
                 model,
                 endpoint,
                 error_type_from_status(response.status()),
+            );
+        }
+
+        response
+    }
+
+    /// One PD dispatch attempt: select the pair, lease-serialize the
+    /// per-leg bodies, dispatch, and record per-attempt worker outcomes.
+    async fn execute_dual_dispatch_attempt<T: Serialize>(
+        &self,
+        attempt: u32,
+        headers: Option<&HeaderMap>,
+        lease: &RequestLease<T>,
+        context: PDRequestContext<'_>,
+    ) -> Response {
+        let selected = lease.with_view(|view| {
+            self.select_pd_pair(
+                view.text,
+                view.tokens,
+                view.rid_key,
+                context.model_id,
+                context.headers.as_ref(),
+            )
+        });
+        let (prefill, decode) = match selected {
+            Ok(pair) => pair,
+            Err(e) => {
+                return Self::handle_server_selection_error(*e);
+            }
+        };
+
+        debug!(
+            "PD retry attempt {} using prefill={} decode={}",
+            attempt,
+            prefill.url(),
+            decode.url()
+        );
+
+        // Dispatch-time re-check of both legs, the same one the regular HTTP
+        // and gRPC paths take just before their load guards.
+        if let Some(shed) = overload::shed_if_worker_overloaded(prefill.as_ref(), context.model_id)
+            .or_else(|| overload::shed_if_worker_overloaded(decode.as_ref(), context.model_id))
+        {
+            return shed;
+        }
+
+        // Keyed-load accounting uses the same effective key as selection:
+        // rid-derived first, header fallback. Built before the lease releases.
+        let load_guards = lease.with_view(|view| {
+            let key = view
+                .rid_key
+                .or_else(|| self.policy_registry.sticky_header_key(headers));
+            vec![
+                WorkerLoadGuard::with_key(prefill.clone(), key),
+                WorkerLoadGuard::with_key(decode.clone(), key),
+            ]
+        });
+
+        let legs = lease.serialize_legs_with(|view| -> Result<(Vec<u8>, Vec<u8>), Box<Response>> {
+            let mut json_request = serde_json::to_value(view.request)
+                .map_err(|e| Box::new(Self::handle_serialization_error(e)))?;
+            // The prefill and decode workers only know the canonical name, so
+            // forward that, not the alias the client sent.
+            super::set_request_model(&mut json_request, context.model_id);
+
+            json_request = Self::inject_bootstrap_into_value(
+                json_request,
+                prefill.as_ref(),
+                context.batch_size,
+            )
+            .map_err(|e| {
+                Metrics::record_pd_bootstrap_failure();
+                Self::handle_serialization_error(e)
+            })?;
+
+            let mut prefill_json_request = json_request.clone();
+            let mut decode_json_request = json_request;
+
+            let mut prefill_rank = prefill.dp_rank().map(|rank| rank as isize);
+            let mut decode_rank = decode.dp_rank().map(|rank| rank as isize);
+
+            let dp_rank_policy_opt = self.policy_registry.get_dp_rank_policy();
+            if let Some(dp_rank_policy) = dp_rank_policy_opt.as_ref() {
+                let estimated_cost: isize = match (view.tokens, view.text) {
+                    (Some(tokens), _) => (tokens.len() as isize).max(1),
+                    (None, Some(text)) => {
+                        // Calculate token count using a simple heuristic
+                        // In a real implementation, we would use the tokenizer
+                        // For now, use a simple words-to-tokens ratio
+                        let word_count = text.split_whitespace().count();
+                        // Assume average 1.3 tokens per word
+                        let token_count = (word_count as f64 * 1.3).ceil() as isize;
+                        token_count.max(1)
+                    }
+                    (None, None) => 1, // Use at least 1 to avoid no-op
+                };
+                let policy_prefill_rank =
+                    dp_rank_policy.select_dp_rank(prefill.as_ref(), estimated_cost);
+                let policy_decode_rank =
+                    dp_rank_policy.select_dp_rank(decode.as_ref(), estimated_cost);
+                if let Some(rank) = policy_prefill_rank {
+                    prefill_rank = Some(rank);
+                }
+                if let Some(rank) = policy_decode_rank {
+                    decode_rank = Some(rank);
+                }
+            }
+
+            if let Some(p_rank) = prefill_rank {
+                Self::inject_dp_rank_to_json(&mut prefill_json_request, p_rank, "routed_dp_rank");
+                Self::inject_dp_rank_to_json(
+                    &mut decode_json_request,
+                    p_rank,
+                    "disagg_prefill_dp_rank",
+                );
+            }
+            if let Some(d_rank) = decode_rank {
+                Self::inject_dp_rank_to_json(&mut decode_json_request, d_rank, "routed_dp_rank");
+            }
+            if prefill_rank.is_some() || decode_rank.is_some() {
+                debug!(
+                    "PD selected DP ranks prefill={:?} decode={:?}",
+                    prefill_rank, decode_rank
+                );
+            }
+
+            Ok((
+                serde_json::to_vec(&prefill_json_request)
+                    .map_err(|e| Box::new(Self::handle_serialization_error(e)))?,
+                serde_json::to_vec(&decode_json_request)
+                    .map_err(|e| Box::new(Self::handle_serialization_error(e)))?,
+            ))
+        });
+        let (prefill_body, decode_body) = match legs {
+            Ok(pair) => pair,
+            Err(response) => return *response,
+        };
+        // The serialized legs are all dispatch needs; the lease frees the
+        // parsed request and its routing derivatives now when retries are
+        // disabled.
+        lease.release_dispatch();
+
+        let response = self
+            .execute_dual_dispatch_internal(
+                headers,
+                (prefill_body, decode_body),
+                context,
+                Arc::clone(&prefill),
+                Arc::clone(&decode),
+                load_guards,
+            )
+            .await;
+
+        let status = response.status();
+        prefill.record_outcome(status.as_u16());
+        decode.record_outcome(status.as_u16());
+
+        // Record worker errors for server errors (5xx)
+        if status.is_server_error() {
+            let error_type = error_type_from_status(status);
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_PREFILL,
+                metrics_labels::CONNECTION_HTTP,
+                error_type,
+            );
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_DECODE,
+                metrics_labels::CONNECTION_HTTP,
+                error_type,
             );
         }
 
@@ -625,20 +724,13 @@ impl PDRouter {
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
-        prefill_json_request: Value,
-        decode_json_request: Value,
+        leg_bodies: (Bytes, Bytes),
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        load_guards: Vec<WorkerLoadGuard>,
     ) -> Response {
-        let effective_key = context
-            .rid_key
-            .as_deref()
-            .or_else(|| self.policy_registry.sticky_header_key(headers));
-        let load_guards = vec![
-            WorkerLoadGuard::with_key(prefill.clone(), effective_key),
-            WorkerLoadGuard::with_key(decode.clone(), effective_key),
-        ];
+        let (prefill_body, decode_body) = leg_bodies;
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -649,7 +741,7 @@ impl PDRouter {
             &self.client,
             prefill.as_ref(),
             context.route,
-            &prefill_json_request,
+            prefill_body,
             headers,
             false,
         );
@@ -657,7 +749,7 @@ impl PDRouter {
             &self.client,
             decode.as_ref(),
             context.route,
-            &decode_json_request,
+            decode_body,
             headers,
             false,
         );
@@ -820,18 +912,14 @@ impl PDRouter {
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
     }
 
-    #[expect(
-        clippy::unused_async,
-        reason = "async for API consistency; callers await uniformly"
-    )]
-    async fn select_pd_pair(
+    fn select_pd_pair(
         &self,
         request_text: Option<&str>,
         tokens: Option<&[u32]>,
         rid_key: Option<&str>,
         model_id: &str,
         headers: Option<&HeaderMap>,
-    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
+    ) -> Result<PdPair, Box<PdSelectionFailure>> {
         debug!("Selecting PD pair: model_id={:?}", model_id);
 
         let is_unknown_model = model_id == UNKNOWN_MODEL_ID;
@@ -874,29 +962,33 @@ impl PDRouter {
         // Get cached hash ring for consistent hashing
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
-        let prefill = self.pick_worker_by_policy_arc(
-            &prefill_workers,
-            &prefill_policy,
-            request_text,
-            tokens,
-            rid_key,
-            headers,
-            hash_ring.clone(),
-            "prefill",
-            crate::policies::WorkerLeg::Prefill,
-        )?;
+        let prefill = self
+            .pick_worker_by_policy_arc(
+                &prefill_workers,
+                &prefill_policy,
+                request_text,
+                tokens,
+                rid_key,
+                headers,
+                hash_ring.clone(),
+                "prefill",
+                crate::policies::WorkerLeg::Prefill,
+            )
+            .map_err(|e| Box::new(Self::leg_failure(&prefill_workers, model_id, e)))?;
 
-        let decode = self.pick_worker_by_policy_arc(
-            &decode_workers,
-            &decode_policy,
-            request_text,
-            tokens,
-            rid_key,
-            headers,
-            hash_ring,
-            "decode",
-            crate::policies::WorkerLeg::Decode,
-        )?;
+        let decode = self
+            .pick_worker_by_policy_arc(
+                &decode_workers,
+                &decode_policy,
+                request_text,
+                tokens,
+                rid_key,
+                headers,
+                hash_ring,
+                "decode",
+                crate::policies::WorkerLeg::Decode,
+            )
+            .map_err(|e| Box::new(Self::leg_failure(&decode_workers, model_id, e)))?;
 
         // Record worker selection metrics (Layer 3)
         let model = model_id;
@@ -1201,12 +1293,17 @@ impl PDRouter {
         client: &Client,
         worker: &dyn Worker,
         route: &'static str,
-        json_request: &Value,
+        body: Bytes,
         headers: Option<&HeaderMap>,
         connection_close: bool,
     ) -> reqwest::RequestBuilder {
         let endpoint_url = worker.endpoint_url(route);
-        let mut request = client.post(endpoint_url).json(json_request);
+        let mut request = attach_sized_body(
+            client
+                .post(endpoint_url)
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            body,
+        );
         if connection_close {
             request = request.header("Connection", "close");
         }
@@ -1350,17 +1447,21 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self
-            .select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None)
-            .await
+        let (prefill, decode) = match self.select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None)
         {
             Ok(pair) => pair,
-            Err(e) => {
-                return error::service_unavailable(
-                    "no_healthy_worker_pair",
-                    format!("No healthy worker pair available: {e}"),
-                );
-            }
+            // A deep probe that generates gets the same answer routing does:
+            // an all-vetoed fleet fails the probe, exactly as an all-circuit-
+            // broken one already did.
+            Err(failure) => match *failure {
+                PdSelectionFailure::Shed(shed) => return shed,
+                PdSelectionFailure::Unavailable(e) => {
+                    return error::service_unavailable(
+                        "no_healthy_worker_pair",
+                        format!("No healthy worker pair available: {e}"),
+                    );
+                }
+            },
         };
 
         let prefill_url = format!("{}/health_generate", prefill.url());
@@ -1445,7 +1546,7 @@ impl RouterTrait for PDRouter {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &GenerateRequest,
+        body: GenerateRequest,
         model_id: &str,
     ) -> Response {
         let is_stream = body.stream;
@@ -1460,31 +1561,34 @@ impl RouterTrait for PDRouter {
             (None, None)
         };
 
-        let batch_size = Self::get_generate_batch_size(body);
+        let batch_size = Self::get_generate_batch_size(&body);
 
+        let routing = RoutingDerivatives {
+            tokens: routing_tokens,
+            text: request_text,
+            rid_key: self
+                .policy_registry
+                .derive_rid_key(body.rid())
+                .map(str::to_string),
+        };
         let context = PDRequestContext {
             route: "/generate",
             batch_size,
             is_stream,
             return_logprob,
-            request_text,
-            routing_tokens,
-            rid_key: self
-                .policy_registry
-                .derive_rid_key(body.rid())
-                .map(str::to_string),
             model_id,
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, routing, context)
+            .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &ChatCompletionRequest,
+        body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
         let is_stream = body.stream;
@@ -1497,31 +1601,34 @@ impl RouterTrait for PDRouter {
         };
 
         // Calculate batch size
-        let batch_size = Self::get_chat_batch_size(body);
+        let batch_size = Self::get_chat_batch_size(&body);
 
+        let routing = RoutingDerivatives {
+            tokens: None,
+            text: request_text,
+            rid_key: self
+                .policy_registry
+                .derive_rid_key(body.rid())
+                .map(str::to_string),
+        };
         let context = PDRequestContext {
             route: "/v1/chat/completions",
             batch_size,
             is_stream,
             return_logprob,
-            request_text,
-            routing_tokens: None,
-            rid_key: self
-                .policy_registry
-                .derive_rid_key(body.rid())
-                .map(str::to_string),
             model_id,
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, routing, context)
+            .await
     }
 
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &CompletionRequest,
+        body: CompletionRequest,
         model_id: &str,
     ) -> Response {
         let is_stream = body.stream;
@@ -1537,31 +1644,34 @@ impl RouterTrait for PDRouter {
         };
 
         // Calculate batch size
-        let batch_size = Self::get_completion_batch_size(body);
+        let batch_size = Self::get_completion_batch_size(&body);
 
+        let routing = RoutingDerivatives {
+            tokens: None,
+            text: request_text,
+            rid_key: self
+                .policy_registry
+                .derive_rid_key(body.rid())
+                .map(str::to_string),
+        };
         let context = PDRequestContext {
             route: "/v1/completions",
             batch_size,
             is_stream,
             return_logprob,
-            request_text,
-            routing_tokens: None,
-            rid_key: self
-                .policy_registry
-                .derive_rid_key(body.rid())
-                .map(str::to_string),
             model_id,
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, routing, context)
+            .await
     }
 
     async fn route_rerank(
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &RerankRequest,
+        body: RerankRequest,
         model_id: &str,
     ) -> Response {
         // Extract text for cache-aware routing
@@ -1571,22 +1681,25 @@ impl RouterTrait for PDRouter {
             None
         };
 
+        let routing = RoutingDerivatives {
+            tokens: None,
+            text: req_text,
+            rid_key: self
+                .policy_registry
+                .derive_rid_key(body.rid())
+                .map(str::to_string),
+        };
         let context = PDRequestContext {
             route: "/v1/rerank",
             batch_size: None,
             is_stream: false,
             return_logprob: false,
-            request_text: req_text,
-            routing_tokens: None,
-            rid_key: self
-                .policy_registry
-                .derive_rid_key(body.rid())
-                .map(str::to_string),
             model_id,
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, routing, context)
+            .await
     }
 
     fn router_type(&self) -> &'static str {
@@ -1717,7 +1830,7 @@ mod tests {
                 &router.client,
                 &worker,
                 "/generate",
-                &json!({"text": "hello"}),
+                Bytes::from(r#"{"text":"hello"}"#),
                 None,
                 false,
             )
@@ -1753,9 +1866,7 @@ mod tests {
             .worker_registry
             .register_or_replace(Arc::from(decode_worker));
 
-        let result = router
-            .select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None)
-            .await;
+        let result = router.select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None);
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -1781,14 +1892,12 @@ mod tests {
 
         let (prefill, decode) = router
             .select_pd_pair(None, None, None, "GLM-5.2-Coding", None)
-            .await
             .expect("alias should select a PD pair");
         assert_eq!(prefill.url(), "http://prefill");
         assert_eq!(decode.url(), "http://decode");
 
         assert!(router
             .select_pd_pair(None, None, None, "GLM-5.2-Unknown", None)
-            .await
             .is_err());
     }
 
@@ -1796,12 +1905,17 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router
-            .select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None)
-            .await;
+        let result = router.select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None);
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("No prefill workers available"));
+        // No workers at all is the pre-existing unavailable string, not a shed:
+        // an empty pool has nothing to be overloaded.
+        match *result.unwrap_err() {
+            PdSelectionFailure::Unavailable(error) => {
+                assert!(error.contains("No prefill workers available"));
+            }
+            PdSelectionFailure::Shed(_) => panic!("an empty fleet is not an overload shed"),
+        }
     }
 
     #[test]
@@ -1856,9 +1970,6 @@ mod tests {
             batch_size: None,
             is_stream: true,
             return_logprob: false,
-            request_text: None,
-            routing_tokens: None,
-            rid_key: None,
             model_id: UNKNOWN_MODEL_ID,
             headers: None,
         };
@@ -1886,6 +1997,69 @@ mod tests {
         assert!(
             parsed.get("error").is_some(),
             "parsed SSE payload must contain an `error` field: {parsed}"
+        );
+    }
+
+    /// PD twin of the regular router's release test: with retries disabled
+    /// the lease must free the parsed request once the serialized legs
+    /// exist, before either upstream leg answers. The decode stub refuses to
+    /// respond until the probe's only remaining holder is the test itself.
+    #[tokio::test]
+    async fn pd_disabled_retries_release_parsed_request_before_upstream_responds() {
+        use std::sync::atomic::Ordering;
+
+        use crate::routers::common::request_lease::test_probe::{
+            spawn_immediate_stub, spawn_release_gated_stub, DropProbeRequest,
+        };
+
+        let probe = Arc::new(());
+        let prefill_url = spawn_immediate_stub().await;
+        let (decode_url, released) = spawn_release_gated_stub(Arc::downgrade(&probe)).await;
+
+        let router = create_test_pd_router();
+        let router = PDRouter {
+            retry_config: RetryConfig {
+                max_retries: 1,
+                ..Default::default()
+            },
+            ..router
+        };
+        router
+            .worker_registry
+            .register_or_replace(Arc::from(create_test_worker(
+                prefill_url,
+                WorkerType::Prefill,
+                true,
+            )));
+        router
+            .worker_registry
+            .register_or_replace(Arc::from(create_test_worker(
+                decode_url,
+                WorkerType::Decode,
+                true,
+            )));
+
+        let context = PDRequestContext {
+            route: "/generate",
+            batch_size: None,
+            is_stream: false,
+            return_logprob: false,
+            model_id: UNKNOWN_MODEL_ID,
+            headers: None,
+        };
+        let request = DropProbeRequest {
+            text: "hello".to_string(),
+            _probe: Arc::clone(&probe),
+        };
+
+        let response = router
+            .execute_dual_dispatch(None, request, RoutingDerivatives::default(), context)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the parsed request must be freed before the decode leg answers"
         );
     }
 

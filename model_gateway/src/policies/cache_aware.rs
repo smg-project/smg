@@ -995,10 +995,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let request_tokens = info.tokens;
 
         // Single O(workers) gather: read each worker once via routing_state()
-        // (status + load + processed under one ArcSwap guard), replacing the
-        // former separate passes whose per-worker guard traffic dominated routing
-        // CPU at scale. Collects healthy indices, the load sum (for the
-        // per-request pressure gate), and the min-load index.
+        // (status + load + processed + overload veto under one ArcSwap guard),
+        // replacing the former separate passes whose per-worker guard traffic
+        // dominated routing CPU at scale. Collects eligible indices, the load
+        // sum (for the per-request pressure gate), and the min-load index.
         let mut healthy_indices: Vec<usize> = Vec::with_capacity(workers.len());
         let mut load_sum = 0usize;
         // Min-load worker, (load, processed_requests, idx) tie-break (#1714);
@@ -1007,7 +1007,9 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let mut min_load_idx: Option<usize> = None;
         for (idx, worker) in workers.iter().enumerate() {
             let state = worker.routing_state();
-            if state.healthy && state.can_execute {
+            // The overload veto costs nothing here: `state` is the word this
+            // pass already loaded for health, circuit breaker and load.
+            if state.eligible() {
                 healthy_indices.push(idx);
                 load_sum += state.load;
                 let key = (state.load, state.processed, idx);
@@ -2035,6 +2037,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx1, idx3);
+    }
+
+    /// `RoutingState::overloaded` has exactly one production reader — the fused
+    /// gather below `select_worker`. Without this test nothing would fail if
+    /// `state.eligible()` were reverted to health + circuit breaker, or if
+    /// `BasicWorker::routing_state` stopped populating the field.
+    #[test]
+    fn overloaded_worker_is_vetoed_by_the_fused_gather() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(WorkerType::Regular)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+
+        let info = SelectWorkerInfo {
+            request_text: Some("a stable prefix that pins one worker"),
+            ..Default::default()
+        };
+        let owner = policy.select_worker(&workers, &info).unwrap();
+        assert_eq!(
+            policy.select_worker(&workers, &info),
+            Some(owner),
+            "cache affinity holds while the worker is eligible"
+        );
+
+        workers[owner].set_overloaded(true);
+        assert_ne!(
+            policy.select_worker(&workers, &info),
+            Some(owner),
+            "affinity must not outrank the absolute veto"
+        );
+
+        // Every worker vetoed leaves nothing to select.
+        for worker in &workers {
+            worker.set_overloaded(true);
+        }
+        assert_eq!(policy.select_worker(&workers, &info), None);
+
+        for worker in &workers {
+            worker.set_overloaded(false);
+        }
+        assert!(policy.select_worker(&workers, &info).is_some());
     }
 
     #[test]

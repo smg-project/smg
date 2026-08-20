@@ -84,8 +84,44 @@ pub struct RouterConfig {
     #[serde(default)]
     pub worker_startup_delay_secs: u64,
     pub worker_startup_check_interval_secs: u64,
+    /// Control-plane job queue: max pending jobs. Size to fleet scale so a
+    /// discovery reconcile pass can enqueue every worker without blocking.
+    #[serde(default = "default_job_queue_capacity")]
+    pub job_queue_capacity: usize,
+    /// Control-plane job queue: max jobs dispatched concurrently.
+    #[serde(default = "default_job_queue_concurrency")]
+    pub job_queue_concurrency: usize,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// Restore the conditional load-monitor poll gate: only poll worker groups
+    /// when a load-aware routing policy, `engine_metrics`, or overload
+    /// protection needs the data. Default `false` — the monitor polls every
+    /// group unconditionally from registration onward. A load-aware policy is
+    /// always fed regardless of this flag.
+    #[serde(default)]
+    pub disable_load_monitoring: bool,
+    /// Enable absolute worker overload protection with the gateway default of
+    /// `worker_overload_token_usage = 0.9` (KV token usage is engine-universal;
+    /// a waiting-requests default would be workload-dependent, so that signal
+    /// stays unset). Redundant when either explicit threshold below is set —
+    /// those enable protection on their own, exactly as before this flag.
+    #[serde(default)]
+    pub worker_overload_protection: bool,
+    /// Queued-request count at or above which a worker is considered
+    /// overloaded and excluded from routing until the signal recovers; when all
+    /// workers are overloaded, requests are shed immediately rather than
+    /// queued. Evaluated once per ingested load report, never per request.
+    /// `None` (default) disables this signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_overload_waiting_requests: Option<usize>,
+    /// KV-cache token usage (0.0-1.0, averaged across DP ranks) at or above
+    /// which a worker is considered overloaded — the same signal
+    /// `balance_token_usage_threshold` reads, applied as an absolute per-worker
+    /// ceiling instead of a fleet-relative spread. `None` (default) disables
+    /// this signal; with both signals unset, overload protection is off and
+    /// routing behaves exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_overload_token_usage: Option<f64>,
     /// TTL in seconds for entries in the event-driven cache-aware positional
     /// indexer: entries neither stored to nor read by a query within this
     /// window are evicted by a periodic background prune. Bounds index growth
@@ -221,10 +257,11 @@ pub struct RouterConfig {
     /// PEM format, loaded from ca_cert_paths during config creation
     #[serde(default)]
     pub ca_certificates: Vec<Vec<u8>>,
-    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext),
-    /// multiplexing every request to a worker over one connection instead of
-    /// one TCP connection per in-flight request. Requires every HTTP worker
-    /// to serve HTTP/2 without an upgrade handshake.
+    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext) on all
+    /// engine-directed connections — request dispatch and health/probe traffic
+    /// alike — multiplexing every request to a worker over one connection
+    /// instead of one TCP connection per in-flight request. Requires every
+    /// HTTP worker to serve HTTP/2 without an upgrade handshake.
     #[serde(default)]
     pub upstream_http2: bool,
     /// Loaded from mcp_config_path during config creation
@@ -289,6 +326,14 @@ pub struct TokenizerCacheConfig {
 
 fn default_load_monitor_interval_secs() -> u64 {
     10
+}
+
+fn default_job_queue_capacity() -> usize {
+    1000
+}
+
+fn default_job_queue_concurrency() -> usize {
+    200
 }
 
 fn default_enable_l0() -> bool {
@@ -702,6 +747,11 @@ pub enum PolicyConfig {
         /// before it counts as overloaded (default: 10)
         #[serde(default = "default_prefix_hash_balance_abs_threshold")]
         balance_abs_threshold: usize,
+        /// Resolved copy of `RouterConfig::cache_boundaries`: ascending token
+        /// positions; requests hash at the deepest boundary they reach.
+        /// Empty = hash at `prefix_token_count` only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cache_boundaries: Vec<usize>,
     },
 }
 
@@ -1001,7 +1051,13 @@ impl Default for RouterConfig {
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_delay_secs: 0,
             worker_startup_check_interval_secs: 30,
+            job_queue_capacity: default_job_queue_capacity(),
+            job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
+            disable_load_monitoring: false,
+            worker_overload_protection: false,
+            worker_overload_waiting_requests: None,
+            worker_overload_token_usage: None,
             kv_indexer_ttl_secs: None,
             kv_indexer_max_entries: None,
             engine_metrics: false,
@@ -1260,6 +1316,44 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.stream_request_bodies_over, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_job_queue_sizing_serde_default_and_roundtrip() {
+        // Config files predating the fields deserialize to today's values.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("job_queue_capacity").unwrap();
+        obj.remove("job_queue_concurrency").unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.job_queue_capacity, 1000);
+        assert_eq!(without.job_queue_concurrency, 200);
+
+        // When set, the values round-trip.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .job_queue_capacity(20_000)
+            .job_queue_concurrency(500)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.job_queue_capacity, 20_000);
+        assert_eq!(with.job_queue_concurrency, 500);
+    }
+
+    #[test]
+    fn test_job_queue_sizing_rejects_zero() {
+        // Config-file values bypass the CLI parsers, so validation is the
+        // backstop against a zero-capacity channel panic at startup and
+        // mirrors the CLI upper bounds.
+        for (capacity, concurrency) in [(0, 200), (1000, 0), (1_000_001, 200), (1000, 100_001)] {
+            let config = RouterConfig::builder()
+                .regular_mode(vec![])
+                .job_queue_capacity(capacity)
+                .job_queue_concurrency(concurrency)
+                .build_unchecked();
+            assert!(config.validate().is_err());
+        }
     }
 
     #[test]

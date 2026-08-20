@@ -246,6 +246,18 @@ jobs:
           pip install ./crates/grpc_client/python
           pytest -q grpc_servicer/tests
 
+      # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
+      # ZMQ/EPD command builders, ZMQ-lane collection filter). --noconftest keeps
+      # e2e_test/conftest.py — which needs the generated smg_client types and a
+      # live backend — out of the picture; PYTHONPATH replaces the sys.path setup
+      # it would otherwise do.
+      - name: Run e2e harness unit tests
+        env:
+          PYTHONPATH: e2e_test
+        run: |
+          pip install ./e2e_test
+          pytest -q --noconftest e2e_test/infra e2e_test/fixtures
+
   unit-tests:
     needs: [detect-changes]
     if: >-
@@ -448,6 +460,10 @@ jobs:
               - 'crates/reasoning_parser/**'
               - 'crates/multimodal/**'
               - 'crates/grpc_client/**'
+              # The ZMQ wire crates drive the e2e-*-chat-zmq* lanes, which gate
+              # on this filter.
+              - 'crates/engine_zmq_client/**'
+              - 'crates/mock_worker/**'
               - 'grpc_servicer/**'
               - 'e2e_test/chat_completions/**'
               - 'e2e_test/router/**'
@@ -1132,7 +1148,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-zmq, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: k8s-runner-cpu
     permissions: {}
@@ -1148,6 +1164,7 @@ jobs:
                 "${{ needs.benchmarks.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat-zmq.result }}" == "failure" || \
+                "${{ needs.e2e-2gpu-chat-zmq-dp.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-completions.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-embeddings.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-gateway.result }}" == "failure" || \

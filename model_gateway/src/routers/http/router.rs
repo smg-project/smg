@@ -53,12 +53,13 @@ use crate::{
     policies::{PolicyRegistry, SelectWorkerInfo},
     routers::{
         common::{
-            header_utils,
+            attach_sized_body, header_utils, overload,
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
-            retry::{is_retryable_status, RetryExecutor},
+            request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
+            retry::{is_retryable_response, is_retryable_status, RetryExecutor},
             sse::SSE_CHANNEL_BUFFER,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
@@ -348,10 +349,10 @@ impl Router {
         }
     }
 
-    pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
+    pub async fn route_typed_request<T: GenerationRequest + serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
-        typed_req: &T,
+        typed_req: T,
         route: &'static str,
         model_id: &str,
     ) -> Response {
@@ -369,7 +370,10 @@ impl Router {
         let text = routing_tokens
             .is_none()
             .then(|| typed_req.extract_text_for_routing());
-        let rid_key = self.policy_registry.derive_rid_key(typed_req.rid());
+        let rid_key = self
+            .policy_registry
+            .derive_rid_key(typed_req.rid())
+            .map(str::to_string);
         // Resolve once, here, so every registry, policy and metrics lookup
         // below is keyed by the canonical model ID. Only `get_by_model`
         // understands aliases; retry configs, hash rings and policies do not,
@@ -395,47 +399,87 @@ impl Router {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
-        let response = RetryExecutor::execute_response_with_retry(
-            retry_config,
-            // operation per attempt
-            |_: u32| async {
-                let res = self
-                    .route_typed_request_once(
-                        headers,
-                        typed_req,
-                        route,
-                        model_id,
-                        canonical_model.as_deref(),
-                        is_stream,
-                        text.as_deref(),
-                        routing_tokens.as_deref(),
-                        rid_key,
-                    )
-                    .await;
-
-                // Need to be outside `route_typed_request_once` because that function has multiple return paths
-                Metrics::record_router_upstream_response(
-                    metrics_labels::ROUTER_HTTP,
-                    res.status().as_u16(),
-                    extract_error_code_from_response(&res),
-                );
-
-                res
+        // The lease owns the parsed request and its routing derivatives for
+        // the dispatch phase; its release point encodes the retry policy.
+        let lease = RequestLease::new(
+            typed_req,
+            RoutingDerivatives {
+                tokens: routing_tokens,
+                text,
+                rid_key,
             },
-            // should_retry predicate
-            |res, _attempt| is_retryable_status(res.status()),
-            // on_backoff hook
-            |delay, attempt| {
-                // Layer 3 worker metrics
-                Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
-                Metrics::record_worker_retry_backoff(attempt, delay);
-            },
-            // on_exhausted hook
-            || {
+            ReleasePoint::from_retry_config(retry_config),
+        );
+
+        let response = if lease.release_point() == ReleasePoint::AfterDispatch {
+            // Retries disabled: one dispatch; the lease frees the parsed
+            // request the moment the upstream bytes are serialized.
+            let res = self
+                .route_typed_request_once(
+                    headers,
+                    &lease,
+                    route,
+                    model_id,
+                    canonical_model.as_deref(),
+                    is_stream,
+                )
+                .await;
+            Metrics::record_router_upstream_response(
+                metrics_labels::ROUTER_HTTP,
+                res.status().as_u16(),
+                extract_error_code_from_response(&res),
+            );
+            // Mirror the retry executor's exhaustion accounting for a
+            // retryable response that gets no retry.
+            if is_retryable_response(&res) {
                 Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
-            },
-        )
-        .await;
+            }
+            res
+        } else {
+            RetryExecutor::execute_response_with_retry(
+                retry_config,
+                // operation per attempt; the lease keeps the request alive
+                // for replay until the retry window closes (first
+                // non-retryable response).
+                |_: u32| async {
+                    let res = self
+                        .route_typed_request_once(
+                            headers,
+                            &lease,
+                            route,
+                            model_id,
+                            canonical_model.as_deref(),
+                            is_stream,
+                        )
+                        .await;
+
+                    // Need to be outside `route_typed_request_once` because that function has multiple return paths
+                    Metrics::record_router_upstream_response(
+                        metrics_labels::ROUTER_HTTP,
+                        res.status().as_u16(),
+                        extract_error_code_from_response(&res),
+                    );
+
+                    res
+                },
+                // should_retry predicate
+                |res, _attempt| is_retryable_response(res),
+                // on_backoff hook
+                |delay, attempt| {
+                    // Layer 3 worker metrics
+                    Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+                    Metrics::record_worker_retry_backoff(attempt, delay);
+                },
+                // on_exhausted hook
+                || {
+                    Metrics::record_worker_retries_exhausted(
+                        metrics_labels::WORKER_REGULAR,
+                        endpoint,
+                    );
+                },
+            )
+            .await
+        };
 
         if response.status().is_success() {
             let duration = start.elapsed();
@@ -447,7 +491,7 @@ impl Router {
                 endpoint,
                 duration,
             );
-        } else if !is_retryable_status(response.status()) {
+        } else if !is_retryable_response(&response) {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_REGULAR,
@@ -461,23 +505,18 @@ impl Router {
         response
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "per-attempt state threaded from route_typed_request; a struct would only move the arity"
-    )]
-    async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
+    async fn route_typed_request_once<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
-        typed_req: &T,
+        lease: &RequestLease<T>,
         route: &'static str,
         model_id: &str,
         canonical_model: Option<&str>,
         is_stream: bool,
-        text: Option<&str>,
-        tokens: Option<&[u32]>,
-        rid_key: Option<&str>,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, text, tokens, headers, rid_key) {
+        let worker = match lease.with_view(|view| {
+            self.select_worker_for_model(model_id, view.text, view.tokens, headers, view.rid_key)
+        }) {
             Some(w) => w,
             None => {
                 // Distinguish "no workers for this model" from "workers exist but unavailable"
@@ -493,8 +532,14 @@ impl Router {
                     None,
                     false,
                 );
+                // `total` is exactly the pool selection drew from, wildcard
+                // model included — classifying from it rather than from the
+                // model index is what makes the shed fire for a model-less
+                // `/generate` and for a model that is also served over gRPC.
                 return if total.is_empty() {
                     error::model_not_found(model_id)
+                } else if let Some(shed) = overload::shed_if_all_overloaded(&total, model_id) {
+                    shed
                 } else {
                     error::service_unavailable(
                         "no_available_workers",
@@ -504,12 +549,22 @@ impl Router {
             }
         };
 
+        // Dispatch-time re-check of the one chosen worker: O(1), and the only
+        // thing that closes the window between selection and dispatch in which
+        // a load report can flip the veto.
+        if let Some(shed) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
+            return shed;
+        }
+
         // Keyed-load accounting uses the same effective key as selection:
         // rid-derived first, header fallback.
-        let load_guard = WorkerLoadGuard::with_key(
-            worker.clone(),
-            rid_key.or_else(|| self.policy_registry.sticky_header_key(headers)),
-        );
+        let load_guard = lease.with_view(|view| {
+            WorkerLoadGuard::with_key(
+                worker.clone(),
+                view.rid_key
+                    .or_else(|| self.policy_registry.sticky_header_key(headers)),
+            )
+        });
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -517,17 +572,33 @@ impl Router {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        let response = self
-            .send_typed_request(
-                headers,
-                typed_req,
-                route,
-                canonical_model,
-                worker.as_ref(),
-                is_stream,
-                load_guard,
-            )
-            .await;
+        let response = match lease.serialize_with(|view| {
+            serialize_request_body(view.request, canonical_model, worker.as_ref())
+        }) {
+            Ok(body) => {
+                // Past this point dispatch needs only the serialized bytes;
+                // the lease frees the parsed request and its routing
+                // derivatives now when retries are disabled.
+                lease.release_dispatch();
+                self.send_serialized_request(
+                    headers,
+                    body,
+                    route,
+                    worker.as_ref(),
+                    is_stream,
+                    load_guard,
+                )
+                .await
+            }
+            Err(RequestBodyError::Serialize(e)) => error::bad_request(
+                "serialization_failed",
+                format!("Failed to serialize request body: {e}"),
+            ),
+            Err(RequestBodyError::Prepare(e)) => error::bad_request(
+                "request_preparation_failed",
+                format!("Failed to prepare request: {e}"),
+            ),
+        };
 
         events::RequestReceivedEvent {}.emit();
 
@@ -714,7 +785,9 @@ impl Router {
                 rstatus.as_u16(),
                 extract_error_code_from_response(response),
             );
-            if !is_retryable_status(rstatus) {
+            // Response-aware: a terminal shed carries a retryable status but
+            // must still count as a router error.
+            if !is_retryable_response(response) {
                 Metrics::record_router_error(
                     metrics_labels::ROUTER_HTTP,
                     metrics_labels::BACKEND_REGULAR,
@@ -767,10 +840,13 @@ impl Router {
             .cloned()
             .collect();
         if available.is_empty() {
-            let resp = error::service_unavailable(
-                "no_available_workers",
-                "All workers are unavailable (circuit breaker open or unhealthy)",
-            );
+            let resp =
+                overload::shed_if_all_overloaded(&non_dp_workers, model_id).unwrap_or_else(|| {
+                    error::service_unavailable(
+                        "no_available_workers",
+                        "All workers are unavailable (circuit breaker open or unhealthy)",
+                    )
+                });
             record_pre_send_error(&resp);
             return resp;
         }
@@ -807,6 +883,15 @@ impl Router {
             policy.name(),
         );
         let worker = available[idx].clone();
+
+        // Same dispatch-time re-check the regular path takes. A transcription
+        // occupies its worker for far longer than a chat completion, so a
+        // report landing in the selection→dispatch window is the one case where
+        // dispatching anyway is measurably worse.
+        if let Some(resp) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
+            record_pre_send_error(&resp);
+            return resp;
+        }
 
         // Streamed requests have no rid; the header is the whole sticky key.
         let load_guard = WorkerLoadGuard::with_key(
@@ -1084,21 +1169,14 @@ impl Router {
         Ok(body.freeze())
     }
 
-    // Send typed request directly without conversion.
-    //
-    // `canonical_model` is set only when the client addressed the model by an
-    // alias. The worker was registered under the canonical ID and has never
-    // heard of the alias, so the body it receives carries the canonical name.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "per-request state threaded from route_typed_request_once; a struct would only move the arity"
-    )]
-    async fn send_typed_request<T: serde::Serialize>(
+    // Send an already-serialized request body. The stale-connection resend
+    // guard inside `send_with_stale_conn_retry` shares the body allocation by
+    // refcount, so the bytes live exactly until the response head arrives.
+    async fn send_serialized_request(
         &self,
         headers: Option<&HeaderMap>,
-        typed_req: &T,
+        body: Bytes,
         route: &'static str,
-        canonical_model: Option<&str>,
         worker: &dyn Worker,
         is_stream: bool,
         load_guard: WorkerLoadGuard,
@@ -1106,27 +1184,12 @@ impl Router {
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
 
-        let body = match serialize_request_body(typed_req, canonical_model, worker) {
-            Ok(body) => body,
-            Err(RequestBodyError::Serialize(e)) => {
-                return error::bad_request(
-                    "serialization_failed",
-                    format!("Failed to serialize request body: {e}"),
-                );
-            }
-            Err(RequestBodyError::Prepare(e)) => {
-                return error::bad_request(
-                    "request_preparation_failed",
-                    format!("Failed to prepare request: {e}"),
-                );
-            }
-        };
-
-        let mut request_builder = self
-            .client
-            .post(&endpoint_url)
-            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-            .body(body);
+        let mut request_builder = attach_sized_body(
+            self.client
+                .post(&endpoint_url)
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            body,
+        );
 
         request_builder = header_utils::apply_forwarded_request_headers(
             request_builder,
@@ -1354,7 +1417,7 @@ impl Router {
     /// The worker body read is capped at `max_body_bytes`; a larger body is a
     /// misbehaving worker and yields a 502.
     async fn build_rerank_response(
-        req: &RerankRequest,
+        req: RerankResponseSpec,
         canonical_model: Option<&str>,
         response: Response,
         max_body_bytes: usize,
@@ -1393,8 +1456,8 @@ impl Router {
                 );
             }
         };
-        let model = canonical_model.map_or_else(|| req.model.clone(), ToOwned::to_owned);
-        let mut rerank_response = RerankResponse::new(rerank_results, model, req.rid.clone());
+        let model = canonical_model.map_or(req.model, ToOwned::to_owned);
+        let mut rerank_response = RerankResponse::new(rerank_results, model, req.rid);
         // Sorting is handled by Python worker (serving_rerank.py)
         if let Some(top_k) = req.top_k {
             rerank_response.apply_top_k(top_k);
@@ -1403,6 +1466,26 @@ impl Router {
             rerank_response.drop_documents();
         }
         Json(rerank_response).into_response()
+    }
+}
+
+/// Post-dispatch inputs for the rerank response builder; the request itself
+/// (documents included) is released at dispatch.
+struct RerankResponseSpec {
+    model: String,
+    rid: Option<openai_protocol::common::StringOrArray>,
+    top_k: Option<usize>,
+    return_documents: bool,
+}
+
+impl From<&RerankRequest> for RerankResponseSpec {
+    fn from(req: &RerankRequest) -> Self {
+        Self {
+            model: req.model.clone(),
+            rid: req.rid.clone(),
+            top_k: req.top_k,
+            return_documents: req.return_documents,
+        }
     }
 }
 
@@ -1779,7 +1862,7 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &GenerateRequest,
+        body: GenerateRequest,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/generate", model_id)
@@ -1790,7 +1873,7 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &ChatCompletionRequest,
+        body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
@@ -1801,7 +1884,7 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &CreateMessageRequest,
+        body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/messages", model_id)
@@ -1812,7 +1895,7 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &CompletionRequest,
+        body: CompletionRequest,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/completions", model_id)
@@ -1823,7 +1906,7 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &ResponsesRequest,
+        body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/responses", model_id)
@@ -1839,7 +1922,7 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &EmbeddingRequest,
+        body: EmbeddingRequest,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/embeddings", model_id)
@@ -1850,7 +1933,7 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &ClassifyRequest,
+        body: ClassifyRequest,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/classify", model_id)
@@ -1879,16 +1962,17 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        body: &RerankRequest,
+        body: RerankRequest,
         model_id: &str,
     ) -> Response {
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
+        let response_spec = RerankResponseSpec::from(&body);
         let response = self
             .route_typed_request(headers, body, "/v1/rerank", model_id)
             .await;
         if response.status().is_success() {
             Self::build_rerank_response(
-                body,
+                response_spec,
                 canonical_model.as_deref(),
                 response,
                 self.max_payload_size,
@@ -2039,6 +2123,7 @@ mod tests {
     use crate::{
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
         policies::CacheAwarePolicy,
+        routers::common::request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
         worker::BasicWorkerBuilder,
     };
 
@@ -2228,7 +2313,9 @@ mod tests {
         let limit = body.len();
         let upstream = Response::new(Body::from(body));
 
-        let response = Router::build_rerank_response(&req, None, upstream, limit).await;
+        let response =
+            Router::build_rerank_response(RerankResponseSpec::from(&req), None, upstream, limit)
+                .await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -2245,7 +2332,9 @@ mod tests {
         let limit = body.len() - 1;
         let upstream = Response::new(Body::from(body));
 
-        let response = Router::build_rerank_response(&req, None, upstream, limit).await;
+        let response =
+            Router::build_rerank_response(RerankResponseSpec::from(&req), None, upstream, limit)
+                .await;
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -2790,6 +2879,96 @@ mod tests {
             .route_streaming_request(req, "/generate")
             .await
             .is_err());
+    }
+
+    /// With retries disabled the parsed request must be freed at dispatch:
+    /// the upstream stub refuses to answer until the probe's only remaining
+    /// holder is the test itself.
+    #[tokio::test]
+    async fn disabled_retries_release_parsed_request_before_upstream_responds() {
+        let probe = Arc::new(());
+        let (url, released) = spawn_release_gated_stub(Arc::downgrade(&probe)).await;
+        let mut router =
+            streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        router.retry_config = RetryConfig {
+            max_retries: 1,
+            ..Default::default()
+        };
+
+        let req = DropProbeRequest {
+            text: "hello".to_string(),
+            _probe: Arc::clone(&probe),
+        };
+        let response = router
+            .route_typed_request(None, req, "/generate", crate::worker::UNKNOWN_MODEL_ID)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            released.load(AtomicOrdering::SeqCst),
+            "the parsed request must be freed before the upstream answers"
+        );
+    }
+
+    /// With retries enabled the request must survive for replay: a 503 on the
+    /// first attempt is retried with an identical body.
+    #[tokio::test]
+    async fn enabled_retries_replay_an_identical_body() {
+        use tokio::sync::Mutex;
+
+        let bodies: Arc<Mutex<Vec<Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&bodies);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(move |body: Bytes| {
+                let sink = Arc::clone(&sink);
+                let hits = Arc::clone(&hits_clone);
+                async move {
+                    sink.lock().await.push(body);
+                    if hits.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                        (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response()
+                    } else {
+                        (StatusCode::OK, "{}").into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker(&format!("http://{addr}"))],
+        );
+        router.retry_config = RetryConfig {
+            max_retries: 2,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 2,
+            ..Default::default()
+        };
+
+        let req = DropProbeRequest {
+            text: "replay me".to_string(),
+            _probe: Arc::new(()),
+        };
+        let response = router
+            .route_typed_request(None, req, "/generate", crate::worker::UNKNOWN_MODEL_ID)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies.len(), 2, "503 then 200 must mean two attempts");
+        assert_eq!(bodies[0], bodies[1], "the retry must replay the same body");
     }
 
     #[tokio::test]

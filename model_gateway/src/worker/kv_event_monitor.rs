@@ -86,7 +86,7 @@ enum StreamResult {
     /// Stream closed normally (server-side).
     Ended,
     /// Stream produced an error.
-    Error(String),
+    Error(tonic::Status),
     /// Detected a gap in sequence numbers.
     GapDetected { expected: u64, received: u64 },
 }
@@ -510,6 +510,17 @@ impl KvEventMonitor {
                         indexer.remove_worker(worker_id, worker_blocks);
                         return;
                     }
+                    if e.code() == tonic::Code::OutOfRange {
+                        warn!(
+                            worker_url = %worker_url,
+                            last_seq = last_seq,
+                            "KV event replay cursor expired; clearing worker state and requesting a current snapshot"
+                        );
+                        indexer.apply_cleared(worker_id, &mut worker_blocks);
+                        last_seq = 0;
+                        reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
+                        continue;
+                    }
                     warn!(
                         worker_url = %worker_url,
                         error = %e,
@@ -562,6 +573,18 @@ impl KvEventMonitor {
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
                 }
                 StreamResult::Error(e) => {
+                    if e.code() == tonic::Code::DataLoss {
+                        warn!(
+                            worker_url = %worker_url,
+                            error = %e,
+                            last_seq = last_seq,
+                            "KV event subscriber fell behind; clearing worker state and requesting a current snapshot"
+                        );
+                        indexer.apply_cleared(worker_id, &mut worker_blocks);
+                        last_seq = 0;
+                        reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
+                        continue;
+                    }
                     warn!(
                         worker_url = %worker_url,
                         error = %e,
@@ -610,7 +633,7 @@ impl KvEventMonitor {
         while let Some(result) = stream.next().await {
             let batch = match result {
                 Ok(batch) => batch,
-                Err(e) => return StreamResult::Error(e.to_string()),
+                Err(e) => return StreamResult::Error(e),
             };
 
             // Skip stale/duplicate batches (can occur after reconnect replay).

@@ -215,12 +215,17 @@ impl Default for BucketConfig {
     }
 }
 
-/// Helper function to filter healthy workers and return their indices
+/// Helper function to filter routable workers and return their indices.
+///
+/// [`Worker::is_available`] folds the absolute overload veto into the health +
+/// circuit-breaker test it already performed, under the same guards and with
+/// the same short-circuit order — the veto is one more test on a word already
+/// in hand, never a second walk.
 pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usize> {
     workers
         .iter()
         .enumerate()
-        .filter(|(_, w)| w.is_healthy() && w.circuit_breaker_can_execute())
+        .filter(|(_, w)| w.is_available())
         .map(|(idx, _)| idx)
         .collect()
 }
@@ -376,6 +381,35 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// The overload veto rides the same eligibility filter every walking policy
+    /// uses, so flagging a worker removes it everywhere at once — and clearing
+    /// the flag re-admits it.
+    #[test]
+    fn get_healthy_worker_indices_honors_the_overload_veto() {
+        let workers: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|i| {
+                Arc::new(
+                    BasicWorkerBuilder::new(format!("http://w{i}:8000"))
+                        .worker_type(WorkerType::Regular)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+
+        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
+
+        // A busy worker is still eligible: load alone is not the veto.
+        let _guard = crate::worker::WorkerLoadGuard::new(Arc::clone(&workers[1]), None);
+        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
+
+        workers[1].set_overloaded(true);
+        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 2]);
+
+        workers[1].set_overloaded(false);
+        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
     }
 
     #[test]

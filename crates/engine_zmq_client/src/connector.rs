@@ -618,6 +618,14 @@ const ENGINE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// removed: without it a killed engine hangs its requests forever.
 const ENGINE_SILENCE_DEATH_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Consecutive undecodable output messages tolerated before the client is
+/// declared dead. One corrupt message is survivable, but an engine whose wire
+/// schema this client cannot read never recovers: every dropped batch strands
+/// the requests it carried, and the silence watchdog never fires because other
+/// traffic keeps arriving. Failing those requests is strictly better than
+/// hanging them.
+const MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 3;
+
 /// Route decoded outputs to per-request streams and forward auto-abort requests
 /// to their engines. Runs until the output channel closes or the engine dies.
 async fn run_dispatcher<P: EngineProtocol>(
@@ -625,11 +633,13 @@ async fn run_dispatcher<P: EngineProtocol>(
     mut abort_rx: mpsc::UnboundedReceiver<(EngineId, String)>,
     inner: Arc<ClientInner<P>>,
 ) {
+    let mut consecutive_decode_errors = 0;
     loop {
         tokio::select! {
             output = out_rx.recv() => {
                 match output {
                     Some(Ok(batch)) => {
+                        consecutive_decode_errors = 0;
                         if let Some(load) = batch.load {
                             inner.routing.lock().load.insert(batch.engine_index, load);
                         }
@@ -658,7 +668,20 @@ async fn run_dispatcher<P: EngineProtocol>(
                             inner.routing.lock().inflight.clear();
                             return;
                         }
-                        // A per-message decode error is non-fatal; keep going.
+                        // A single decode error is non-fatal; a run of them means
+                        // this client cannot read the engine, so fail rather than
+                        // silently drop every output the requests are waiting for.
+                        consecutive_decode_errors += 1;
+                        if consecutive_decode_errors >= MAX_CONSECUTIVE_DECODE_ERRORS {
+                            warn!(
+                                %error,
+                                consecutive_decode_errors,
+                                "engine output undecodable repeatedly; failing all in-flight requests"
+                            );
+                            inner.registry.lock().fail_all(Arc::new(error));
+                            inner.routing.lock().inflight.clear();
+                            return;
+                        }
                         warn!(%error, "ignoring undecodable engine output");
                     }
                     None => break,
@@ -1339,6 +1362,31 @@ mod tests {
         assert!(matches!(result, Err(Error::Shared(_))));
     }
 
+    #[tokio::test]
+    async fn persistent_decode_errors_fail_inflight_requests() {
+        let (client, mut engine, _ns) = connect().await;
+        let mut stream = client
+            .submit(EngineCoreRequest {
+                request_id: "r".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine.recv_request().await.unwrap();
+
+        // One bad message is tolerated; a run of them is a schema mismatch the
+        // client cannot recover from, so the request fails instead of hanging.
+        for _ in 0..MAX_CONSECUTIVE_DECODE_ERRORS {
+            engine
+                .send_output(vec![Bytes::from_static(b"\xc1")])
+                .await
+                .unwrap();
+        }
+
+        let result = stream.next().await.expect("an error item");
+        assert!(matches!(result, Err(Error::Shared(_))), "{result:?}");
+    }
+
     /// The generic connector drives the TokenSpeed protocol over the same shared
     /// transport: it frames a tagged `TokenizedGenerateReqInput` and streams
     /// `BatchTokenIDOutSlim` batches back until a finish reason is seen.
@@ -1515,7 +1563,7 @@ mod tests {
                     exclude_engine_index,
                 } => {
                     // No rank is excluded: the whole group shares one wave.
-                    assert_eq!(exclude_engine_index, u32::MAX);
+                    assert_eq!(exclude_engine_index, None);
                     return wave;
                 }
                 EngineInbound::Add(_) => continue,

@@ -26,8 +26,8 @@ use tokio::{
 };
 
 use super::{
-    event::WorkerConnected, CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult,
-    UNKNOWN_MODEL_ID,
+    event::WorkerConnected, overload::OverloadThresholds, CircuitBreaker, ResolvedResilience,
+    WorkerError, WorkerResult, UNKNOWN_MODEL_ID,
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
@@ -40,20 +40,21 @@ use crate::{
 /// Default HTTP client timeout for worker requests (in seconds)
 pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
 
-/// Per-worker HTTP client with an isolated connection pool, materialized on
-/// first use.
+/// A worker's HTTP client handle, materialized on first use.
 ///
-/// A worker whose connection mode never speaks HTTP (ZMQ: local health check,
-/// admin ops rejected up front) would otherwise pay for a connector and idle
-/// pool it can never use, so the fallback client is built only when a caller
-/// actually asks for it.
+/// Registration hands in a shared client from the worker client cache. A
+/// worker built without one whose connection mode never speaks HTTP (ZMQ:
+/// local health check, admin ops rejected up front) would otherwise pay for a
+/// connector and idle pool it can never use, so the fallback client is built
+/// only when a caller actually asks for it.
 pub struct LazyHttpClient {
-    cell: OnceLock<reqwest::Client>,
+    cell: OnceLock<Arc<reqwest::Client>>,
 }
 
 impl LazyHttpClient {
     /// Wrap an already-built client (the registration paths hand one in).
-    pub fn ready(client: reqwest::Client) -> Self {
+    /// The strong handle is what keeps the client's cache entry alive.
+    pub fn ready(client: Arc<reqwest::Client>) -> Self {
         let cell = OnceLock::new();
         let _ = cell.set(client);
         Self { cell }
@@ -74,19 +75,32 @@ impl LazyHttpClient {
 
     /// The client, building the default one on first use.
     pub fn client(&self) -> &reqwest::Client {
+        self.init()
+    }
+
+    /// A strong handle to the client if one was materialized, for a
+    /// replacement worker to adopt. Never forces the lazy cell: a worker
+    /// that never spoke HTTP hands its replacement a still-deferred slot.
+    pub fn handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
+        self.cell.get().map(Arc::clone)
+    }
+
+    fn init(&self) -> &Arc<reqwest::Client> {
         self.cell.get_or_init(|| {
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(DEFAULT_WORKER_HTTP_TIMEOUT_SECS))
-                .pool_max_idle_per_host(8)
-                .build()
-                .unwrap_or_else(|e| {
-                    tracing::warn!(
-                        error = %e,
-                        "failed to build the default per-worker HTTP client; \
-                         falling back to reqwest defaults (no request timeout)"
-                    );
-                    reqwest::Client::new()
-                })
+            Arc::new(
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(DEFAULT_WORKER_HTTP_TIMEOUT_SECS))
+                    .pool_max_idle_per_host(8)
+                    .build()
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to build the default per-worker HTTP client; \
+                             falling back to reqwest defaults (no request timeout)"
+                        );
+                        reqwest::Client::new()
+                    }),
+            )
         })
     }
 }
@@ -443,22 +457,48 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Record a request outcome against the circuit breaker.
     fn record_circuit_breaker_outcome(&self, success: bool);
 
-    /// Check if the worker is available (healthy + circuit closed/half-open)
+    /// Check if the worker is available (healthy + circuit closed/half-open +
+    /// not vetoed by the absolute overload guard).
     fn is_available(&self) -> bool {
-        self.is_healthy() && self.circuit_breaker_can_execute()
+        self.is_healthy() && self.circuit_breaker_can_execute() && !self.is_overloaded()
+    }
+
+    /// [`Self::is_healthy`] fused with the overload veto. For the hash policies,
+    /// which route on health alone and never consult the circuit breaker;
+    /// `BasicWorker` overrides it to read both under a single runtime guard.
+    fn is_healthy_and_eligible(&self) -> bool {
+        self.is_healthy() && !self.is_overloaded()
+    }
+
+    /// Whether the absolute overload guard currently vetoes this worker.
+    ///
+    /// Written only by the load monitor, once per ingested load report, and
+    /// always `false` while overload protection is unconfigured.
+    fn is_overloaded(&self) -> bool {
+        false
+    }
+
+    /// Set the overload veto, returning `true` when the flag actually changed.
+    ///
+    /// Route writes through [`WorkerRegistry::set_worker_overloaded`] instead of
+    /// calling this directly: the per-model counters and the
+    /// `smg_workers_overloaded` gauge move only on transitions.
+    fn set_overloaded(&self, _overloaded: bool) -> bool {
+        false
     }
 
     /// One-shot routing snapshot for the per-request O(workers) selection loops:
-    /// reads status, load and processed together so the hot path takes one
-    /// `ArcSwap` guard per backing cell per worker instead of one per accessor
-    /// (that guard traffic is a large share of routing CPU at scale). `BasicWorker`
-    /// overrides this to share the runtime guard.
+    /// reads status, load, processed and the overload veto together so the hot
+    /// path takes one `ArcSwap` guard per backing cell per worker instead of one
+    /// per accessor (that guard traffic is a large share of routing CPU at
+    /// scale). `BasicWorker` overrides this to share the runtime guard.
     fn routing_state(&self) -> RoutingState {
         RoutingState {
             healthy: self.is_healthy(),
             can_execute: self.circuit_breaker_can_execute(),
             load: self.load(),
             processed: self.processed_requests(),
+            overloaded: self.is_overloaded(),
         }
     }
 
@@ -494,6 +534,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Get the per-worker HTTP client.
     fn http_client(&self) -> &reqwest::Client;
+
+    /// Strong handle to the worker's HTTP client, if one was materialized.
+    /// Must not force a deferred client into existence; cache-fed workers
+    /// return the shared handle so a replacement worker keeps the cache
+    /// entry alive.
+    fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>>;
 
     // ── Metadata convenience delegates ──────────────────────────────
     //
@@ -809,6 +855,11 @@ pub struct WorkerMetadata {
     pub health_config: HealthCheckConfig,
     /// Health check endpoint path (internal-only, from router config).
     pub health_endpoint: String,
+    /// Effective absolute overload thresholds (per signal: `spec.overload`
+    /// override, else gateway default). Resolved once at registration; the
+    /// load monitor's ingestion predicate scores every report against these,
+    /// so nothing on a request path re-resolves them.
+    pub overload: OverloadThresholds,
 }
 
 impl WorkerMetadata {
@@ -976,6 +1027,17 @@ pub struct RoutingState {
     pub load: usize,
     /// Lifetime processed-request count (min-load tie-break).
     pub processed: usize,
+    /// Absolute overload veto, set by the load monitor at ingestion time.
+    pub overloaded: bool,
+}
+
+impl RoutingState {
+    /// The full routing eligibility test. Costs nothing beyond the reads the
+    /// gather pass already performed: every field rides the one guard
+    /// [`Worker::routing_state`] took.
+    pub const fn eligible(self) -> bool {
+        self.healthy && self.can_execute && !self.overloaded
+    }
 }
 
 /// Shared mutable worker state preserved across same-URL replacements.
@@ -989,6 +1051,10 @@ pub struct WorkerRuntime {
     processed_counter: AtomicUsize,
     worker_routing_key_load: WorkerRoutingKeyLoad,
     revision: AtomicU64,
+    /// Absolute overload veto. Lives here rather than in the load-snapshot map
+    /// so selection reads it under the guard it already holds, and so a
+    /// same-URL replacement inherits it with the rest of the shared runtime.
+    overloaded: AtomicBool,
 }
 
 impl WorkerRuntime {
@@ -1002,6 +1068,7 @@ impl WorkerRuntime {
             processed_counter: AtomicUsize::new(0),
             worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
             revision: AtomicU64::new(0),
+            overloaded: AtomicBool::new(false),
         }
     }
 
@@ -1100,6 +1167,16 @@ impl WorkerRuntime {
     pub fn increment_processed(&self) {
         self.processed_counter.fetch_add(1, Ordering::Relaxed);
     }
+
+    pub fn is_overloaded(&self) -> bool {
+        self.overloaded.load(Ordering::Relaxed)
+    }
+
+    /// Returns `true` when the flag transitioned, so the caller can move the
+    /// per-model counters and gauge exactly once per edge.
+    pub fn set_overloaded(&self, overloaded: bool) -> bool {
+        self.overloaded.swap(overloaded, Ordering::Relaxed) != overloaded
+    }
 }
 
 /// Basic worker implementation
@@ -1130,8 +1207,8 @@ pub struct BasicWorker {
     /// When not `Wildcard`, overrides metadata.models for routing decisions.
     /// Uses `ArcSwap` for lock-free reads on the hot path (`supports_model`).
     pub models_override: Arc<ArcSwap<WorkerModels>>,
-    /// Per-worker HTTP client with isolated connection pool, built on first
-    /// use (see [`LazyHttpClient`]).
+    /// Worker-directed HTTP client, shared across same-config workers, built
+    /// on first use (see [`LazyHttpClient`]).
     pub http_client: Arc<LazyHttpClient>,
     /// Resolved resilience config (retry + circuit breaker settings).
     pub resilience: ResolvedResilience,
@@ -1428,16 +1505,39 @@ impl Worker for BasicWorker {
         self.circuit_breaker.load().can_execute()
     }
 
+    fn is_overloaded(&self) -> bool {
+        self.runtime.load().is_overloaded()
+    }
+
+    fn set_overloaded(&self, overloaded: bool) -> bool {
+        self.runtime.load().set_overloaded(overloaded)
+    }
+
+    fn is_available(&self) -> bool {
+        // Same two guards the pre-veto version took (`is_healthy` +
+        // `circuit_breaker_can_execute`): the veto rides the runtime guard.
+        let rt = self.runtime.load();
+        rt.status() == WorkerStatus::Ready
+            && !rt.is_overloaded()
+            && self.circuit_breaker.load().can_execute()
+    }
+
+    fn is_healthy_and_eligible(&self) -> bool {
+        let rt = self.runtime.load();
+        rt.status() == WorkerStatus::Ready && !rt.is_overloaded()
+    }
+
     fn routing_state(&self) -> RoutingState {
-        // One runtime guard covers status + load + processed (all live in
-        // `self.runtime`); the circuit breaker is a separate ArcSwap, so it needs
-        // its own guard.
+        // One runtime guard covers status + load + processed + the overload veto
+        // (all live in `self.runtime`); the circuit breaker is a separate
+        // ArcSwap, so it needs its own guard.
         let rt = self.runtime.load();
         RoutingState {
             healthy: rt.status() == WorkerStatus::Ready,
             can_execute: self.circuit_breaker.load().can_execute(),
             load: rt.load(),
             processed: rt.processed_requests(),
+            overloaded: rt.is_overloaded(),
         }
     }
 
@@ -1451,6 +1551,10 @@ impl Worker for BasicWorker {
 
     fn http_client(&self) -> &reqwest::Client {
         self.http_client.client()
+    }
+
+    fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
+        self.http_client.handle_if_initialized()
     }
 
     fn supports_model(&self, model_id: &str) -> bool {
@@ -2594,6 +2698,7 @@ mod tests {
             spec: Arc::new(WorkerSpec::new("http://test:8080")),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
+            overload: OverloadThresholds::default(),
         };
 
         // Empty models list should accept any model
@@ -2617,6 +2722,7 @@ mod tests {
             spec: Arc::new(spec),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
+            overload: OverloadThresholds::default(),
         };
 
         // Find by primary ID

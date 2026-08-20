@@ -13,7 +13,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     path::Path,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -85,6 +85,10 @@ struct ZmqConnectionMeta {
     /// EOS ids attached to every vLLM request (the engine can't stop at EOS
     /// without them).
     eos: EosTokenIds,
+    /// Tokenizer-derived EOS ids, adopted once when `eos` came back empty
+    /// (the model id is a repo id, not a local directory). Lives here rather
+    /// than on the client so every clone shares the one adoption.
+    tokenizer_eos: OnceLock<EosTokenIds>,
 }
 
 /// The model's EOS stop set, resolved from its local directory. EngineCore
@@ -102,6 +106,20 @@ pub struct EosTokenIds {
 impl EosTokenIds {
     pub fn new(primary: Option<u32>, extra: Vec<u32>) -> Self {
         Self { primary, extra }
+    }
+
+    /// Build from the tokenizer's merged EOS set (same ordering as
+    /// [`Self::from_model_dir`]: config first, generation config after).
+    fn from_ids(ids: &[u32]) -> Self {
+        let mut ids = ids.iter().copied();
+        Self {
+            primary: ids.next(),
+            extra: ids.collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.primary.is_none() && self.extra.is_empty()
     }
 
     /// Resolve from `config.json` + `generation_config.json` in a local model
@@ -224,6 +242,9 @@ fn derive_handshake_port(path: &str) -> u16 {
 /// band), so setting the override to that value pairs a bare
 /// `ts serve --headless` with a manually registered worker.
 /// Returns `(handshake, input, output)`.
+///
+/// [`zmq_handshake_address`] exposes just the handshake half, for the
+/// registration-time validation of that address.
 fn zmq_socket_addresses(
     base_url: &str,
     handshake_override: Option<&str>,
@@ -246,6 +267,19 @@ fn zmq_socket_addresses(
     let input = format!("ipc://{path}-in.sock");
     let output = format!("ipc://{path}-out.sock");
     Ok((handshake, input, output))
+}
+
+/// The TCP handshake address a ZMQ worker will bind.
+///
+/// Carries [`zmq_socket_addresses`]'s error verbatim rather than flattening it
+/// to "no address": an unusable `ipc://` base or a non-`tcp://` override is a
+/// misconfiguration registration must reject, not a value to skip past and
+/// rediscover at every later connect attempt.
+pub(crate) fn zmq_handshake_address(
+    base_url: &str,
+    handshake_override: Option<&str>,
+) -> Result<String, String> {
+    zmq_socket_addresses(base_url, handshake_override).map(|(handshake, _, _)| handshake)
 }
 
 /// Create the parent directory for a worker's `ipc://` sockets. Kept off the
@@ -450,8 +484,38 @@ impl ZmqEngineClient {
         };
         Ok(Self {
             backend,
-            meta: Arc::new(ZmqConnectionMeta { model_id, eos }),
+            meta: Arc::new(ZmqConnectionMeta {
+                model_id,
+                eos,
+                tokenizer_eos: OnceLock::new(),
+            }),
         })
+    }
+
+    /// Adopt the tokenizer's EOS ids when the connect-time model-dir lookup
+    /// found none (the worker's model id is a repo id, not a local path).
+    ///
+    /// Without this the primary EOS id would only ride `stop_token_ids`, and
+    /// an EOS finish would be reported as `matched_stop = <eos id>` — so the
+    /// same model would answer differently depending on whether its files
+    /// happen to be local.
+    pub(crate) fn adopt_tokenizer_eos(&self, tokenizer: Option<&Arc<dyn Tokenizer>>) {
+        if !self.meta.eos.is_empty() || self.meta.tokenizer_eos.get().is_some() {
+            return;
+        }
+        let Some(ids) = tokenizer
+            .map(|t| t.eos_token_ids())
+            .filter(|ids| !ids.is_empty())
+        else {
+            return;
+        };
+        let _ = self.meta.tokenizer_eos.set(EosTokenIds::from_ids(ids));
+    }
+
+    /// The EOS set attached to requests: the connect-time set, or the adopted
+    /// tokenizer set when that one was empty.
+    fn effective_eos(&self) -> &EosTokenIds {
+        self.meta.tokenizer_eos.get().unwrap_or(&self.meta.eos)
     }
 
     /// The wire protocol chosen at connect time.
@@ -519,7 +583,7 @@ impl ZmqEngineClient {
                 let mut streams = SelectAll::new();
                 for (index, sub) in fan_out_requests(*req).into_iter().enumerate() {
                     let request =
-                        translate_request(sub, max_model_len, model_dtype, &self.meta.eos)
+                        translate_request(sub, max_model_len, model_dtype, self.effective_eos())
                             .map_err(tonic::Status::invalid_argument)?;
                     // The engine returns the sampled/prompt token's logprob
                     // plus the requested ranked candidates per position; carry
@@ -834,6 +898,44 @@ impl StreamState {
     }
 }
 
+/// The per-dialect half of a ZMQ generate stream: the wire stream, the parked
+/// terminal `Complete`, and the mapping from one wire output to a vLLM-proto
+/// response. [`poll_mapped`] writes the `Stream` machinery once for every
+/// dialect that implements this.
+trait MappedGenerateStream {
+    /// One tick of engine output on this dialect's wire.
+    type Output;
+    /// The wire stream carrying those ticks.
+    type Inner: Stream<Item = Result<Self::Output, engine_zmq_client::Error>> + Unpin;
+
+    fn inner(&mut self) -> &mut Self::Inner;
+
+    /// Terminal `Complete` held back when the finish tick also carried new
+    /// tokens; yielded before the wire stream is polled again.
+    fn pending(&mut self) -> &mut Option<vllm::GenerateResponse>;
+
+    fn map_output(&mut self, output: Self::Output)
+        -> Result<vllm::GenerateResponse, tonic::Status>;
+}
+
+/// `Stream::poll_next` for any [`MappedGenerateStream`]: drain the parked
+/// `Complete` first, otherwise poll the wire and map the tick.
+fn poll_mapped<S: MappedGenerateStream>(
+    stream: &mut S,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<Option<Result<vllm::GenerateResponse, tonic::Status>>> {
+    use std::task::Poll;
+    if let Some(pending) = stream.pending().take() {
+        return Poll::Ready(Some(Ok(pending)));
+    }
+    match std::pin::Pin::new(stream.inner()).poll_next(cx) {
+        Poll::Ready(Some(Ok(output))) => Poll::Ready(Some(stream.map_output(output))),
+        Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(zmq_status(error)))),
+        Poll::Ready(None) => Poll::Ready(None),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
 /// Streaming generate output for one vLLM EngineCore sub-request, mapping each
 /// `EngineCoreOutput` to a vLLM-proto `GenerateResponse` (chunks until the
 /// terminal output, then a complete), tagged with this sub's choice `index`.
@@ -878,6 +980,61 @@ impl VllmGenerateStream {
             input_logprobs_emitted: false,
             pending: None,
         }
+    }
+
+    /// Attach the accumulated prompt logprobs: once on the first token-bearing
+    /// chunk (the proto puts them in the first chunk only) and on every
+    /// `Complete`, including one parked in `pending`. Prefill precedes the
+    /// first sampled token, so the set is whole by the time a chunk carries
+    /// tokens.
+    fn attach_input_logprobs(&mut self, response: &mut vllm::GenerateResponse) {
+        if self.state.prompt_logprobs.is_empty() {
+            return;
+        }
+        // Built per attachment site rather than up front: with
+        // `prompt_logprobs` requested this runs on every decode tick, and the
+        // common tick (a later chunk) attaches nothing.
+        let state = &self.state;
+        let build = || vllm::InputLogProbs {
+            token_logprobs: state.prompt_logprobs.clone(),
+            token_ids: state.prompt_token_ids.clone(),
+            top_logprobs: state.prompt_top_logprobs.clone(),
+        };
+        if let Some(vllm::generate_response::Response::Complete(parked)) = self
+            .pending
+            .as_mut()
+            .and_then(|pending| pending.response.as_mut())
+        {
+            parked.input_logprobs = Some(build());
+        }
+        match response.response.as_mut() {
+            Some(vllm::generate_response::Response::Chunk(chunk))
+                if !self.input_logprobs_emitted && !chunk.token_ids.is_empty() =>
+            {
+                chunk.input_logprobs = Some(build());
+                self.input_logprobs_emitted = true;
+            }
+            // Later chunks never repeat them (the proto carries them in the
+            // first chunk only), and neither do token-less prefill chunks.
+            Some(vllm::generate_response::Response::Chunk(_)) => {}
+            Some(vllm::generate_response::Response::Complete(complete)) => {
+                complete.input_logprobs = Some(build());
+            }
+            None => {}
+        }
+    }
+}
+
+impl MappedGenerateStream for VllmGenerateStream {
+    type Output = EngineCoreOutput;
+    type Inner = EngineCoreStream;
+
+    fn inner(&mut self) -> &mut Self::Inner {
+        &mut self.inner
+    }
+
+    fn pending(&mut self) -> &mut Option<vllm::GenerateResponse> {
+        &mut self.pending
     }
 
     fn map_output(
@@ -981,48 +1138,6 @@ impl VllmGenerateStream {
         self.attach_input_logprobs(&mut response);
         Ok(response)
     }
-
-    /// Attach the accumulated prompt logprobs: once on the first token-bearing
-    /// chunk (the proto puts them in the first chunk only) and on every
-    /// `Complete`, including one parked in `pending`. Prefill precedes the
-    /// first sampled token, so the set is whole by the time a chunk carries
-    /// tokens.
-    fn attach_input_logprobs(&mut self, response: &mut vllm::GenerateResponse) {
-        if self.state.prompt_logprobs.is_empty() {
-            return;
-        }
-        // Built per attachment site rather than up front: with
-        // `prompt_logprobs` requested this runs on every decode tick, and the
-        // common tick (a later chunk) attaches nothing.
-        let state = &self.state;
-        let build = || vllm::InputLogProbs {
-            token_logprobs: state.prompt_logprobs.clone(),
-            token_ids: state.prompt_token_ids.clone(),
-            top_logprobs: state.prompt_top_logprobs.clone(),
-        };
-        if let Some(vllm::generate_response::Response::Complete(parked)) = self
-            .pending
-            .as_mut()
-            .and_then(|pending| pending.response.as_mut())
-        {
-            parked.input_logprobs = Some(build());
-        }
-        match response.response.as_mut() {
-            Some(vllm::generate_response::Response::Chunk(chunk))
-                if !self.input_logprobs_emitted && !chunk.token_ids.is_empty() =>
-            {
-                chunk.input_logprobs = Some(build());
-                self.input_logprobs_emitted = true;
-            }
-            // Later chunks never repeat them (the proto carries them in the
-            // first chunk only), and neither do token-less prefill chunks.
-            Some(vllm::generate_response::Response::Chunk(_)) => {}
-            Some(vllm::generate_response::Response::Complete(complete)) => {
-                complete.input_logprobs = Some(build());
-            }
-            None => {}
-        }
-    }
 }
 
 impl Stream for VllmGenerateStream {
@@ -1032,17 +1147,7 @@ impl Stream for VllmGenerateStream {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        use std::task::Poll;
-        let this = self.get_mut();
-        if let Some(pending) = this.pending.take() {
-            return Poll::Ready(Some(Ok(pending)));
-        }
-        match std::pin::Pin::new(&mut this.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(output))) => Poll::Ready(Some(this.map_output(output))),
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(zmq_status(error)))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
+        poll_mapped(self.get_mut(), cx)
     }
 }
 
@@ -1069,6 +1174,19 @@ impl TokenSpeedGenerateStream {
             index,
             pending: None,
         }
+    }
+}
+
+impl MappedGenerateStream for TokenSpeedGenerateStream {
+    type Output = TokenSpeedOutput;
+    type Inner = TokenSpeedStream;
+
+    fn inner(&mut self) -> &mut Self::Inner {
+        &mut self.inner
+    }
+
+    fn pending(&mut self) -> &mut Option<vllm::GenerateResponse> {
+        &mut self.pending
     }
 
     fn map_output(
@@ -1137,17 +1255,7 @@ impl Stream for TokenSpeedGenerateStream {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        use std::task::Poll;
-        let this = self.get_mut();
-        if let Some(pending) = this.pending.take() {
-            return Poll::Ready(Some(Ok(pending)));
-        }
-        match std::pin::Pin::new(&mut this.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(output))) => Poll::Ready(Some(this.map_output(output))),
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(zmq_status(error)))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
+        poll_mapped(self.get_mut(), cx)
     }
 }
 
@@ -1658,6 +1766,54 @@ mod tests {
         let mut req = eos_request(vec![999], false);
         fold_tokenizer_eos_backstop(&mut req, Some(&tokenizer));
         assert_eq!(eos_stop_ids(&req), &[999]);
+    }
+
+    /// A connected client over a throwaway ipc endpoint. The mock engine is
+    /// dropped on return: these tests only inspect request-side EOS state.
+    async fn connected_client(dir: &Path, prefix: &str, eos: EosTokenIds) -> ZmqEngineClient {
+        let ep = |name: &str| format!("ipc://{}", dir.join(format!("{prefix}-{name}")).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "org/repo".to_string(),
+                eos,
+                RuntimeType::Vllm,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        engine.expect("mock engine");
+        client.expect("adapter connect")
+    }
+
+    #[tokio::test]
+    async fn tokenizer_eos_is_adopted_when_the_model_dir_is_not_local() {
+        // MockTokenizer's EOS set is {999}. With no local model dir the
+        // connect-time set is empty, so the primary id must come from the
+        // tokenizer — otherwise EOS rides `stop_token_ids` alone and an EOS
+        // finish is reported as `matched_stop = 999`.
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+
+        let client = connected_client(dir.path(), "empty", EosTokenIds::default()).await;
+        assert_eq!(client.effective_eos(), &EosTokenIds::default());
+        client.adopt_tokenizer_eos(Some(&tokenizer));
+        assert_eq!(client.effective_eos(), &EosTokenIds::new(Some(999), vec![]));
+
+        // A connect-time set resolved from a local model dir wins: adoption is
+        // a backstop, not an override.
+        let resolved = EosTokenIds::new(Some(5), vec![7]);
+        let client = connected_client(dir.path(), "resolved", resolved.clone()).await;
+        client.adopt_tokenizer_eos(Some(&tokenizer));
+        assert_eq!(client.effective_eos(), &resolved);
     }
 
     #[test]

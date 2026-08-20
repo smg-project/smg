@@ -2,7 +2,7 @@ name: Release SMG+TRTLLM Docker Image
 
 run-name: >-
   SMG+TRTLLM |
-  ${{ github.event_name == 'push' && '3-version matrix' || format('base={0}', inputs.base_image_ref || 'nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22') }} |
+  ${{ github.event_name == 'push' && '3-version matrix' || format('base={0}', inputs.base_image_ref || 'nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24') }} |
   engine=${{ inputs.trtllm_commit || 'latest' }} |
   smg=${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.9.0' }} |
   ${{ github.event_name == 'pull_request' && 'dry-run |' || '' }}
@@ -23,8 +23,8 @@ on:
   workflow_dispatch:
     inputs:
       base_image_ref:
-        description: 'Base image (e.g. nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22). Empty = build from source.'
-        default: 'nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22'
+        description: 'Base image (e.g. nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24). Empty = build from source.'
+        default: 'nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24'
         required: false
         type: string
       trtllm_repo:
@@ -60,7 +60,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        base_image: ${{ github.event_name == 'push' && fromJSON('["nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22","nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc21","nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc20"]') || fromJSON(format('["{0}"]', inputs.base_image_ref || 'nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22')) }}
+        base_image: ${{ github.event_name == 'push' && fromJSON('["nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24","nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc23","nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22"]') || fromJSON(format('["{0}"]', inputs.base_image_ref || 'nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24')) }}
     uses: ./.github/workflows/_build-engine-image.yml
     with:
       engine: trtllm

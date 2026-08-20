@@ -9,6 +9,7 @@ use tracing::error;
 use super::PipelineStage;
 use crate::{
     routers::{
+        common::overload,
         error,
         grpc::{
             backend_client::BackendClient,
@@ -35,14 +36,41 @@ impl PipelineStage for ClientAcquisitionStage {
             )
         })?;
 
+        // Dispatch-time re-check: one relaxed atomic read per already-chosen
+        // worker, closing the window between selection and dispatch in which a
+        // load report can flip the veto.
+        let model_id = ctx.input.model_id.as_str();
         let clients = match workers {
             WorkerSelection::Single { worker } => {
+                if let Some(shed) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
+                    return Err(shed);
+                }
                 let client = get_backend_client_from_worker(worker).await?;
                 ClientSelection::Single { client }
             }
             WorkerSelection::Disaggregated {
-                prefill, decode, ..
+                encode_assignments,
+                prefill,
+                decode,
+                ..
             } => {
+                // Every assigned leg, encode included: an encode worker is
+                // vetoed at selection through the same filter, so leaving it out
+                // of the re-check would be the one dispatch path that can send
+                // to a worker known to be over the ceiling.
+                if let Some(shed) = overload::shed_if_worker_overloaded(prefill.as_ref(), model_id)
+                    .or_else(|| overload::shed_if_worker_overloaded(decode.as_ref(), model_id))
+                    .or_else(|| {
+                        encode_assignments.iter().flatten().find_map(|assignment| {
+                            overload::shed_if_worker_overloaded(
+                                assignment.worker.as_ref(),
+                                model_id,
+                            )
+                        })
+                    })
+                {
+                    return Err(shed);
+                }
                 let prefill_client = get_backend_client_from_worker(prefill).await?;
                 let decode_client = get_backend_client_from_worker(decode).await?;
 

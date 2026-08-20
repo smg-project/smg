@@ -217,7 +217,7 @@ async fn denial_returns_429_with_retry_after() {
     let request = generate_request();
 
     let first = router
-        .route_generate(None, &fresh_tenant(), &request, MODEL)
+        .route_generate(None, &fresh_tenant(), request.clone(), MODEL)
         .await;
     assert_eq!(first.status(), http::StatusCode::OK);
 
@@ -226,7 +226,7 @@ async fn denial_returns_429_with_retry_after() {
     // second 2-token reserve, but well within the 6-token capacity, so this
     // is a genuine "wait and retry" denial, not an impossible one.
     let second = router
-        .route_generate(None, &fresh_tenant(), &request, MODEL)
+        .route_generate(None, &fresh_tenant(), request, MODEL)
         .await;
     assert_eq!(second.status(), http::StatusCode::TOO_MANY_REQUESTS);
     assert!(
@@ -247,7 +247,7 @@ async fn impossible_request_denies_without_retry_after() {
 
     let request = generate_request();
     let response = router
-        .route_generate(None, &fresh_tenant(), &request, MODEL)
+        .route_generate(None, &fresh_tenant(), request, MODEL)
         .await;
 
     assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
@@ -278,7 +278,7 @@ async fn non_streaming_settle_uses_real_usage_not_just_the_estimate() {
     let request = generate_request();
 
     let first = router
-        .route_generate(None, &fresh_tenant(), &request, MODEL)
+        .route_generate(None, &fresh_tenant(), request.clone(), MODEL)
         .await;
     assert_eq!(
         first.status(),
@@ -287,7 +287,7 @@ async fn non_streaming_settle_uses_real_usage_not_just_the_estimate() {
     );
 
     let second = router
-        .route_generate(None, &fresh_tenant(), &request, MODEL)
+        .route_generate(None, &fresh_tenant(), request, MODEL)
         .await;
     assert_eq!(
         second.status(),
@@ -307,7 +307,7 @@ async fn feature_disabled_is_a_no_op() {
 
     let request = generate_request();
     let response = router
-        .route_generate(None, &fresh_tenant(), &request, MODEL)
+        .route_generate(None, &fresh_tenant(), request, MODEL)
         .await;
 
     assert_eq!(response.status(), http::StatusCode::OK);
@@ -345,7 +345,7 @@ async fn completion_denial_reaches_the_client() {
 
     let request = completion_request();
     let response = router
-        .route_completion(None, &fresh_tenant(), &request, MODEL)
+        .route_completion(None, &fresh_tenant(), request, MODEL)
         .await;
 
     assert_eq!(

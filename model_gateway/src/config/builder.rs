@@ -248,8 +248,38 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn job_queue_capacity(mut self, capacity: usize) -> Self {
+        self.config.job_queue_capacity = capacity;
+        self
+    }
+
+    pub fn job_queue_concurrency(mut self, concurrency: usize) -> Self {
+        self.config.job_queue_concurrency = concurrency;
+        self
+    }
+
     pub fn load_monitor_interval_secs(mut self, interval: u64) -> Self {
         self.config.load_monitor_interval_secs = interval;
+        self
+    }
+
+    pub fn disable_load_monitoring(mut self, disabled: bool) -> Self {
+        self.config.disable_load_monitoring = disabled;
+        self
+    }
+
+    pub fn worker_overload_protection(mut self, enabled: bool) -> Self {
+        self.config.worker_overload_protection = enabled;
+        self
+    }
+
+    pub fn worker_overload_waiting_requests(mut self, threshold: Option<usize>) -> Self {
+        self.config.worker_overload_waiting_requests = threshold;
+        self
+    }
+
+    pub fn worker_overload_token_usage(mut self, threshold: Option<f64>) -> Self {
+        self.config.worker_overload_token_usage = threshold;
         self
     }
 

@@ -32,7 +32,7 @@ use smg::{
         circuit_breaker::{CircuitBreaker, CircuitState},
         resilience::ResolvedResilience,
         worker::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
-        ConnectionMode, Worker, WorkerResult, WorkerType,
+        ConnectionMode, OverloadThresholds, Worker, WorkerResult, WorkerType,
     },
 };
 use smg_grpc_client::sglang_scheduler::{SglangGenerateRequestOptions, SglangSchedulerClient};
@@ -60,7 +60,7 @@ pub struct GrpcWorker {
     pub(crate) metadata: WorkerMetadata,
     pub(crate) routing_key_load: WorkerRoutingKeyLoad,
     pub(crate) api_key: Option<String>,
-    pub(crate) http_client: reqwest::Client,
+    pub(crate) http_client: Arc<reqwest::Client>,
     pub(crate) resilience: ResolvedResilience,
 }
 
@@ -74,6 +74,7 @@ impl GrpcWorker {
             spec: Arc::new(spec),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
+            overload: OverloadThresholds::default(),
         };
         Self {
             client,
@@ -85,7 +86,7 @@ impl GrpcWorker {
             circuit_breaker: CircuitBreaker::new(),
             metadata,
             api_key: None,
-            http_client: reqwest::Client::new(),
+            http_client: Arc::new(reqwest::Client::new()),
             resilience: ResolvedResilience::default(),
         }
     }
@@ -219,6 +220,10 @@ impl Worker for GrpcWorker {
 
     fn http_client(&self) -> &reqwest::Client {
         &self.http_client
+    }
+
+    fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
+        Some(Arc::clone(&self.http_client))
     }
 
     async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>> {

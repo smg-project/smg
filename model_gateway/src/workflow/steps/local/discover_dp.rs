@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use openai_protocol::worker::WorkerSpec;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
@@ -49,7 +50,15 @@ pub fn dp_info_from_labels(labels: &HashMap<String, String>) -> Result<DpInfo, S
         .filter(|&n| n > 0)
         .ok_or_else(|| "no positive dp_size in discovered metadata".to_string())?;
 
-    let model_id = labels
+    Ok(DpInfo {
+        dp_size,
+        model_id: model_id_from_labels(labels),
+    })
+}
+
+/// Best-effort model identity from discovered metadata labels.
+fn model_id_from_labels(labels: &HashMap<String, String>) -> String {
+    labels
         .get("model_id")
         .or_else(|| labels.get("served_model_name"))
         .filter(|s| !s.is_empty())
@@ -60,9 +69,19 @@ pub fn dp_info_from_labels(labels: &HashMap<String, String>) -> Result<DpInfo, S
                 .and_then(|p| p.split('/').rfind(|s| !s.is_empty()))
                 .map(str::to_string)
         })
-        .unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string());
+        .unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string())
+}
 
-    Ok(DpInfo { dp_size, model_id })
+/// DP info for a ZMQ worker. There is nothing to discover — the engines dial
+/// in later and EngineCore serves no metadata endpoint — so the spec's own
+/// `dp_size` (a grouped worker: one socket set, N engines) is the answer.
+/// Reporting it keeps a ZMQ worker registrable under `--dp-aware`, where an
+/// absent `dp_info` used to fail create_worker with an internal error.
+fn zmq_dp_info(config: &WorkerSpec, labels: &HashMap<String, String>) -> DpInfo {
+    DpInfo {
+        dp_size: config.dp_size.unwrap_or(1).max(1),
+        model_id: model_id_from_labels(labels),
+    }
 }
 
 /// Step 2b: Discover DP (Data Parallel) information (only for DP-aware workers).
@@ -103,6 +122,11 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
                     step_id: StepId::new("discover_dp_info"),
                     message: format!("Failed to get DP info for {}: {e}", config.url),
                 })?,
+            // A ZMQ worker has no metadata endpoint to discover from: its DP
+            // shape is the spec's own `dp_size` (a grouped worker awaiting N
+            // engines on one socket set). Report it so create_worker can
+            // validate the shape instead of failing on a missing dp_info.
+            Some(ConnectionMode::Zmq) => zmq_dp_info(config, &context.data.discovered_labels),
             _ => {
                 // HTTP DP discovery uses SGLang's /server_info which exposes
                 // dp_size — other runtimes don't expose DP info this way
@@ -171,6 +195,23 @@ mod tests {
     fn dp_info_from_labels_unknown_model_when_absent() {
         let info = dp_info_from_labels(&labels(&[("dp_size", "2")])).unwrap();
         assert_eq!(info.model_id, UNKNOWN_MODEL_ID);
+    }
+
+    #[test]
+    fn zmq_dp_info_uses_the_spec_dp_size() {
+        // Nothing to discover over ZMQ: an ungrouped worker is dp_size 1 and a
+        // grouped one reports its spec size, so create_worker gets a dp_info
+        // to validate under --dp-aware instead of an internal error.
+        let mut spec = WorkerSpec::new("ipc:///tmp/smg-zmq/engine.ipc");
+        let info = zmq_dp_info(&spec, &labels(&[("model_id", "m")]));
+        assert_eq!(info.dp_size, 1);
+        assert_eq!(info.model_id, "m");
+
+        spec.dp_size = Some(4);
+        assert_eq!(zmq_dp_info(&spec, &HashMap::new()).dp_size, 4);
+
+        spec.dp_size = Some(0);
+        assert_eq!(zmq_dp_info(&spec, &HashMap::new()).dp_size, 1);
     }
 
     #[test]

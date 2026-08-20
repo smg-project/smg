@@ -723,7 +723,17 @@ impl JobQueue {
         }
     }
 
-    /// Cleanup old job statuses (TTL 5 minutes)
+    /// A status is reclaimed only once terminal and older than the TTL.
+    /// Pending/processing entries are the reconciler's in-flight guard: a
+    /// long registration wave holds jobs in those states well past any
+    /// fixed TTL, and purging them makes every discovery pass resubmit
+    /// duplicate jobs for workers already mid-registration.
+    fn status_expired(status: &JobStatus, now: u64, ttl: u64) -> bool {
+        !matches!(status.status.as_str(), "pending" | "processing")
+            && now.saturating_sub(status.timestamp) >= ttl
+    }
+
+    /// Cleanup old terminal job statuses (TTL 5 minutes)
     async fn cleanup_old_statuses(status_map: Arc<DashMap<String, JobStatus>>) {
         const CLEANUP_INTERVAL: Duration = Duration::from_secs(60); // Run every minute
         const STATUS_TTL: u64 = 300; // 5 minutes in seconds
@@ -736,8 +746,7 @@ impl JobQueue {
                 .unwrap_or_default()
                 .as_secs();
 
-            // Remove statuses older than TTL
-            status_map.retain(|_key, value| now - value.timestamp < STATUS_TTL);
+            status_map.retain(|_key, value| !Self::status_expired(value, now, STATUS_TTL));
 
             debug!(
                 "Cleaned up old job statuses, remaining: {}",
@@ -889,6 +898,56 @@ mod tests {
             spec_for("ipc:///tmp/smg/engine", &config).runtime_type,
             default_runtime
         );
+    }
+
+    /// Pending/processing statuses are the discovery reconciler's in-flight
+    /// guard: purging them mid-wave makes every pass resubmit duplicate jobs
+    /// for workers still registering, multiplying the wave's work.
+    #[test]
+    fn cleanup_never_expires_in_flight_statuses() {
+        let pending = JobStatus::pending("AddWorker", "http://w:8000");
+        let processing = JobStatus::processing("AddWorker", "http://w:8000");
+        let far_future = pending.timestamp + 100_000;
+
+        assert!(!JobQueue::status_expired(&pending, far_future, 300));
+        assert!(!JobQueue::status_expired(&processing, far_future, 300));
+    }
+
+    /// Terminal statuses still age out so a failed worker retries on a later
+    /// reconcile pass and the map stays bounded.
+    #[test]
+    fn cleanup_expires_terminal_statuses_after_the_ttl() {
+        let failed = JobStatus::failed("AddWorker", "http://w:8000", "boom".to_string());
+
+        assert!(!JobQueue::status_expired(
+            &failed,
+            failed.timestamp + 299,
+            300
+        ));
+        assert!(JobQueue::status_expired(
+            &failed,
+            failed.timestamp + 300,
+            300
+        ));
+    }
+
+    /// The queue channel and dispatch semaphore are sized from the config,
+    /// not hardcoded.
+    #[tokio::test]
+    async fn queue_sizing_comes_from_the_config() {
+        let context: Weak<AppContext> = Weak::new();
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                queue_capacity: 7,
+                max_concurrent_jobs: 3,
+            },
+            context,
+        );
+
+        assert_eq!(queue.tx.max_capacity(), 7);
+        let (queue_depth, available_permits) = queue.get_load_info();
+        assert_eq!(queue_depth, 0);
+        assert_eq!(available_permits, 3);
     }
 
     /// The connection budget scales with the health-check success threshold,

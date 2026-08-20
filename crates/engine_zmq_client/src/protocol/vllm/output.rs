@@ -13,7 +13,7 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use crate::{
-    codec::{decode_msgpack, OpaqueValue},
+    codec::{decode_msgpack, deserialize_tolerant_seq, OpaqueValue, TrailingTolerant},
     error::{Error, Result},
     protocol::vllm::{
         logprobs::{Logprobs, WireLogprobs},
@@ -89,6 +89,11 @@ pub struct EngineCoreOutput {
     pub routed_experts: Option<OpaqueValue>,
     /// Number of NaNs seen in logits. Values above zero indicate corruption.
     pub num_nans_in_logits: u32,
+    /// Multimodal hashes the engine's receiver cache missed, so the frontend
+    /// resends those inputs.
+    pub mm_cache_miss_hashes: Option<Vec<String>>,
+    /// Updated sampling mask (untyped for now).
+    pub new_sampling_mask: Option<OpaqueValue>,
 }
 
 impl EngineCoreOutput {
@@ -120,6 +125,8 @@ impl Serialize for EngineCoreOutput {
             prefill_stats: self.prefill_stats.as_ref(),
             routed_experts: self.routed_experts.as_ref(),
             num_nans_in_logits: self.num_nans_in_logits,
+            mm_cache_miss_hashes: self.mm_cache_miss_hashes.as_deref(),
+            new_sampling_mask: self.new_sampling_mask.as_ref(),
         }
         .serialize(serializer)
     }
@@ -167,6 +174,13 @@ struct WireEngineCoreOutput {
     routed_experts: Option<OpaqueValue>,
     #[serde(default)]
     num_nans_in_logits: u32,
+    /// Multimodal hashes the engine's receiver cache missed, so the frontend
+    /// resends those inputs.
+    #[serde(default)]
+    mm_cache_miss_hashes: Option<Vec<String>>,
+    /// Updated sampling mask (untyped for now).
+    #[serde(default)]
+    new_sampling_mask: Option<OpaqueValue>,
 }
 
 impl WireEngineCoreOutput {
@@ -193,6 +207,8 @@ impl WireEngineCoreOutput {
             prefill_stats: self.prefill_stats,
             routed_experts: self.routed_experts,
             num_nans_in_logits: self.num_nans_in_logits,
+            mm_cache_miss_hashes: self.mm_cache_miss_hashes,
+            new_sampling_mask: self.new_sampling_mask,
         })
     }
 }
@@ -215,6 +231,8 @@ struct WireEngineCoreOutputRef<'a> {
     prefill_stats: Option<&'a PrefillStats>,
     routed_experts: Option<&'a OpaqueValue>,
     num_nans_in_logits: u32,
+    mm_cache_miss_hashes: Option<&'a [String]>,
+    new_sampling_mask: Option<&'a OpaqueValue>,
 }
 
 /// Raw Python/msgpack engine-core output envelope. Mirrors Python
@@ -224,7 +242,7 @@ struct WireEngineCoreOutputs {
     #[serde(default)]
     engine_index: u32,
     /// Outputs grouped for this client in the current engine tick.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_tolerant_seq")]
     outputs: Vec<WireEngineCoreOutput>,
     #[serde(default)]
     scheduler_stats: Option<Box<SchedulerStats>>,
@@ -451,7 +469,11 @@ pub fn decode_engine_core_outputs(frames: &[Bytes]) -> Result<EngineCoreOutputs>
         message: "missing output frame".to_string(),
     })?;
 
-    decode_msgpack::<WireEngineCoreOutputs>(first_frame)?.into_semantic(frames)
+    // Decoded through `TrailingTolerant` so an envelope a newer engine grew
+    // past this struct still yields the fields this client knows.
+    decode_msgpack::<TrailingTolerant<WireEngineCoreOutputs>>(first_frame)?
+        .0
+        .into_semantic(frames)
 }
 
 #[cfg(test)]
@@ -459,7 +481,7 @@ mod tests {
     use super::*;
     use crate::{
         codec::{
-            encode_msgpack,
+            decode_value, encode_msgpack,
             tensor::{WireArrayData, WireNdArray},
         },
         protocol::vllm::logprobs::{PositionLogprobs, TokenLogprob},
@@ -643,6 +665,48 @@ mod tests {
         };
         let error = wire.into_semantic(&[]).unwrap_err();
         assert!(error.to_string().contains("invalid wire shape"), "{error}");
+    }
+
+    /// The positional array a value encodes to.
+    fn wire_array<T: Serialize + std::fmt::Debug>(value: &T) -> Vec<rmpv::Value> {
+        match decode_value(&encode_msgpack(value).unwrap()).unwrap() {
+            rmpv::Value::Array(array) => array,
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    fn encode_value(value: &rmpv::Value) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, value).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn decode_tolerates_wire_arrays_longer_than_the_struct() {
+        // A newer engine appends fields to both the envelope and each output;
+        // the elements this client knows must still decode.
+        let mut output = wire_array(&EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![7],
+            mm_cache_miss_hashes: Some(vec!["hash-1".to_string()]),
+            ..Default::default()
+        });
+        output.push(rmpv::Value::from("appended by a newer engine"));
+
+        let mut envelope = wire_array(&batch(Vec::new()));
+        envelope[1] = rmpv::Value::Array(vec![rmpv::Value::Array(output)]);
+        envelope.push(rmpv::Value::from(true));
+
+        let frame = Bytes::from(encode_value(&rmpv::Value::Array(envelope)));
+        let decoded = decode_engine_core_outputs(&[frame])
+            .unwrap()
+            .into_request_batch()
+            .expect("request batch");
+        assert_eq!(decoded.outputs[0].new_token_ids, vec![7]);
+        assert_eq!(
+            decoded.outputs[0].mm_cache_miss_hashes,
+            Some(vec!["hash-1".to_string()])
+        );
     }
 
     #[test]

@@ -1455,6 +1455,95 @@ mod tests {
         assert!(logs_contain("occupied_hit"));
     }
 
+    /// An overloaded pin must respill through the existing reassignment path.
+    ///
+    /// Every router hands `select_worker` a slice already filtered by
+    /// `is_available()`, so a vetoed worker is simply absent from the
+    /// candidates — the pin resolves to nothing and takes the same
+    /// `occupied_miss` respill a stale pin takes. The test mirrors that call
+    /// shape rather than passing a raw pool no router builds.
+    #[test]
+    #[traced_test]
+    fn overloaded_sticky_pin_respills_through_the_stale_path() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let fleet = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let available = |fleet: &[Arc<dyn Worker>]| -> Vec<Arc<dyn Worker>> {
+            fleet.iter().filter(|w| w.is_available()).cloned().collect()
+        };
+        let info = SelectWorkerInfo {
+            rid_key: Some("convOverload"),
+            ..Default::default()
+        };
+
+        let workers = available(&fleet);
+        let pinned_url = {
+            let idx = reg.select_worker(&policy, &workers, &info).unwrap();
+            assert_eq!(
+                reg.select_worker(&policy, &workers, &info),
+                Some(idx),
+                "the pin holds while the worker is eligible"
+            );
+            workers[idx].url().to_string()
+        };
+
+        fleet
+            .iter()
+            .find(|w| w.url() == pinned_url)
+            .unwrap()
+            .set_overloaded(true);
+        let workers = available(&fleet);
+        assert_eq!(workers.len(), 1, "the veto removes the pinned worker");
+        let respilled = reg.select_worker(&policy, &workers, &info).unwrap();
+        assert_ne!(
+            workers[respilled].url(),
+            pinned_url,
+            "an overloaded pin must be abandoned"
+        );
+        assert!(logs_contain("occupied_miss"));
+
+        // Recovery re-admits the worker as a candidate; the pin now follows the
+        // respill target, so only eligibility is asserted here.
+        fleet
+            .iter()
+            .find(|w| w.url() == pinned_url)
+            .unwrap()
+            .set_overloaded(false);
+        let workers = available(&fleet);
+        assert!(reg.select_worker(&policy, &workers, &info).is_some());
+    }
+
+    /// Every worker vetoed leaves the sticky selector with nothing to pin.
+    #[test]
+    #[traced_test]
+    fn all_overloaded_leaves_sticky_selection_empty() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        for w in &workers {
+            w.set_overloaded(true);
+        }
+        let info = SelectWorkerInfo {
+            rid_key: Some("convShed"),
+            ..Default::default()
+        };
+
+        assert_eq!(reg.select_worker(&policy, &workers, &info), None);
+        assert!(logs_contain("no_healthy_workers"));
+    }
+
     #[test]
     fn cap_respill_reassigns_and_pin_follows_strict_improvement() {
         let reg = PolicyRegistry::with_override(

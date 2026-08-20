@@ -11,6 +11,7 @@ pub mod kv_event_monitor;
 pub mod manager;
 pub mod metrics_aggregator;
 pub mod monitor;
+pub mod overload;
 pub mod registry;
 pub mod resilience;
 pub mod sampling_defaults;
@@ -30,7 +31,7 @@ pub use capacity::{CapacitySource, CapacityTrackerSettings, WorkerCapacity};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 pub use error::{WorkerError, WorkerResult};
 pub use hash_ring::HashRing;
-pub use http_client::build_worker_http_client;
+pub use http_client::WorkerHttpClientCache;
 pub use kv_event_monitor::KvEventMonitor;
 pub use manager::WorkerManager;
 pub use monitor::{WorkerLoadManager, WorkerMonitor};
@@ -41,6 +42,7 @@ pub use openai_protocol::{
     model_type::{Endpoint, ModelType},
     worker::{ProviderType, WorkerGroupKey},
 };
+pub use overload::OverloadThresholds;
 pub use registry::{WorkerOrigin, WorkerRegistry};
 pub use resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_STATUS_CODES};
 pub use sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL;
