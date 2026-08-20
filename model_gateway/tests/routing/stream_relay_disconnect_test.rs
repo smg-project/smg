@@ -133,12 +133,7 @@ async fn chat_relay_closes_upstream_when_client_disconnects_during_prefill() {
     let router = http_router_for(&upstream_url).await;
 
     let response = router
-        .route_chat(
-            None,
-            &tenant_meta(),
-            &streaming_chat_request(),
-            "mock-model",
-        )
+        .route_chat(None, &tenant_meta(), streaming_chat_request(), "mock-model")
         .await;
     assert_eq!(response.status(), 200);
 
@@ -160,12 +155,7 @@ async fn chat_relay_closes_upstream_when_client_disconnects_mid_stream() {
     let router = http_router_for(&upstream_url).await;
 
     let response = router
-        .route_chat(
-            None,
-            &tenant_meta(),
-            &streaming_chat_request(),
-            "mock-model",
-        )
+        .route_chat(None, &tenant_meta(), streaming_chat_request(), "mock-model")
         .await;
     assert_eq!(response.status(), 200);
 

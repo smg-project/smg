@@ -140,14 +140,14 @@ async fn grpc_completion_accepts_prompt_arrays_in_every_mode() {
 
         let scalar = completion_request(serde_json::json!("Hello world"));
         let scalar_response = router
-            .route_completion(None, &tenant_meta, &scalar, MODEL)
+            .route_completion(None, &tenant_meta, scalar, MODEL)
             .await;
         let scalar_status = scalar_response.status();
         let scalar_code = extract_error_code_from_response(&scalar_response).to_string();
 
         let array = completion_request(serde_json::json!(["Hello world", "Hello test"]));
         let array_response = router
-            .route_completion(None, &tenant_meta, &array, MODEL)
+            .route_completion(None, &tenant_meta, array, MODEL)
             .await;
 
         assert_ne!(

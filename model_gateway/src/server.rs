@@ -151,11 +151,12 @@ async fn generate(
     cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<GenerateRequest>,
 ) -> Response {
+    let model = body.model.clone();
     cancel
         .guard(
             state
                 .router
-                .route_generate(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_generate(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -167,11 +168,12 @@ async fn v1_chat_completions(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
+    let model = body.model.clone();
     cancel
         .guard(
             state
                 .router
-                .route_chat(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_chat(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -183,11 +185,12 @@ async fn v1_completions(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CompletionRequest>,
 ) -> Response {
+    let model = body.model.clone();
     cancel
         .guard(
             state
                 .router
-                .route_completion(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_completion(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -199,11 +202,12 @@ async fn rerank(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<RerankRequest>,
 ) -> Response {
+    let model = body.model.clone();
     cancel
         .guard(
             state
                 .router
-                .route_rerank(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_rerank(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -216,13 +220,13 @@ async fn v1_rerank(
     Json(body): Json<V1RerankReqInput>,
 ) -> Response {
     let rerank_body: RerankRequest = body.into();
+    let model = rerank_body.model.clone();
     cancel
-        .guard(state.router.route_rerank(
-            Some(&headers),
-            &tenant_meta,
-            &rerank_body,
-            &rerank_body.model,
-        ))
+        .guard(
+            state
+                .router
+                .route_rerank(Some(&headers), &tenant_meta, rerank_body, &model),
+        )
         .await
 }
 
@@ -233,11 +237,12 @@ async fn v1_responses(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<ResponsesRequest>,
 ) -> Response {
+    let model = body.model.clone();
     cancel
         .guard(
             state
                 .router
-                .route_responses(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_responses(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -249,13 +254,14 @@ async fn v1_interactions(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<InteractionsRequest>,
 ) -> Response {
-    let model_id = body.model.as_deref().or(body.agent.as_deref());
+    let model_id = body.model.clone().or_else(|| body.agent.clone());
     cancel
-        .guard(
-            state
-                .router
-                .route_interactions(Some(&headers), &tenant_meta, &body, model_id),
-        )
+        .guard(state.router.route_interactions(
+            Some(&headers),
+            &tenant_meta,
+            body,
+            model_id.as_deref(),
+        ))
         .await
 }
 
@@ -266,11 +272,12 @@ async fn v1_embeddings(
     cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<EmbeddingRequest>,
 ) -> Response {
+    let model = body.model.clone();
     cancel
         .guard(
             state
                 .router
-                .route_embeddings(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_embeddings(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -282,11 +289,12 @@ async fn v1_messages(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CreateMessageRequest>,
 ) -> Response {
+    let model = body.model.clone();
     cancel
         .guard(
             state
                 .router
-                .route_messages(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_messages(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -298,11 +306,12 @@ async fn v1_classify(
     cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<ClassifyRequest>,
 ) -> Response {
+    let model = body.model.clone();
     cancel
         .guard(
             state
                 .router
-                .route_classify(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_classify(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }

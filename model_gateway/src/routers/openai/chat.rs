@@ -47,7 +47,7 @@ pub(super) async fn route_chat(
     deps: &ChatRouterContext<'_>,
     headers: Option<&HeaderMap>,
     tenant_meta: &TenantRequestMeta,
-    body: &ChatCompletionRequest,
+    body: ChatCompletionRequest,
     model_id: &str,
 ) -> Response {
     let start = Instant::now();
@@ -87,7 +87,7 @@ pub(super) async fn route_chat(
         }
     };
 
-    let mut payload = match to_value(body) {
+    let mut payload = match to_value(&body) {
         Ok(v) => v,
         Err(e) => {
             Metrics::record_router_error(
@@ -122,7 +122,7 @@ pub(super) async fn route_chat(
     }
 
     let mut ctx = RequestContext::for_chat(
-        Arc::new(body.clone()),
+        Arc::new(body),
         headers.cloned(),
         Some(model_id.to_string()),
         ComponentRefs::Shared(Arc::clone(deps.shared_components)),

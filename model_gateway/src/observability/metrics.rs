@@ -265,6 +265,10 @@ pub(crate) fn init_metrics() {
         "smg_router_upstream_responses_total",
         "Upstream backend HTTP responses by router_type, status_code, error_code"
     );
+    describe_counter!(
+        "smg_router_request_buffers_released_early_bytes_total",
+        "Serialized size of request buffers freed at dispatch instead of response completion (retries disabled)"
+    );
 
     // Layer 2: Router inference metrics (gRPC only)
     describe_histogram!(
@@ -996,6 +1000,12 @@ impl Metrics {
             "router_type" => router_type
         )
         .increment(1);
+    }
+
+    /// Record request buffers freed at dispatch (retries disabled), sized by
+    /// the serialized upstream body.
+    pub fn record_request_buffers_released_early(bytes: usize) {
+        counter!("smg_router_request_buffers_released_early_bytes_total").increment(bytes as u64);
     }
 
     /// Record upstream backend response.

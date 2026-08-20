@@ -200,7 +200,7 @@ async fn non_streaming_generate_over_zmq() {
     let router = build_router(&fixture, 1).await;
 
     let response = router
-        .route_generate(None, &test_meta(), &generate_request(false), MODEL)
+        .route_generate(None, &test_meta(), generate_request(false), MODEL)
         .await;
     assert_eq!(response.status(), http::StatusCode::OK);
 
@@ -231,7 +231,7 @@ async fn streaming_generate_over_zmq() {
     let router = build_router(&fixture, 1).await;
 
     let response = router
-        .route_generate(None, &test_meta(), &generate_request(true), MODEL)
+        .route_generate(None, &test_meta(), generate_request(true), MODEL)
         .await;
     assert_eq!(response.status(), http::StatusCode::OK);
 
@@ -267,8 +267,8 @@ async fn concurrent_requests_share_one_zmq_transport() {
     let (first_meta, second_meta) = (test_meta(), test_meta());
     let (first_request, second_request) = (generate_request(false), generate_request(false));
     let (first, second) = tokio::join!(
-        router.route_generate(None, &first_meta, &first_request, MODEL),
-        router.route_generate(None, &second_meta, &second_request, MODEL),
+        router.route_generate(None, &first_meta, first_request, MODEL),
+        router.route_generate(None, &second_meta, second_request, MODEL),
     );
     assert_eq!(first.status(), http::StatusCode::OK);
     assert_eq!(second.status(), http::StatusCode::OK);
@@ -285,7 +285,7 @@ async fn grouped_zmq_worker_serves_requests_from_either_rank() {
 
     for _ in 0..4 {
         let response = router
-            .route_generate(None, &test_meta(), &generate_request(false), MODEL)
+            .route_generate(None, &test_meta(), generate_request(false), MODEL)
             .await;
         assert_eq!(response.status(), http::StatusCode::OK);
     }

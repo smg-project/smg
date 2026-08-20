@@ -536,10 +536,10 @@ impl GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &ChatCompletionRequest,
+        body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        if let Err(response) = super::validate_text_only_output(body) {
+        if let Err(response) = super::validate_text_only_output(&body) {
             return *response;
         }
 
@@ -567,7 +567,7 @@ impl GrpcRouter {
         // would no-op and otherwise leave the alias sitting in the body for
         // response metadata and parser selection to read.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
-        let mut canonical_body = body.clone();
+        let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
         let request = Arc::new(canonical_body);
         let headers_cloned = headers.cloned();
@@ -630,7 +630,7 @@ impl GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &GenerateRequest,
+        body: GenerateRequest,
         model_id: &str,
     ) -> Response {
         debug!("Processing generate request for model: {}", model_id);
@@ -639,7 +639,7 @@ impl GrpcRouter {
         // front -- see `resolve_canonical_model_id`'s doc comment. Rewrite
         // the body's `model` field to match; see `route_chat_impl`.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
-        let mut canonical_body = body.clone();
+        let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
         let request = Arc::new(canonical_body);
         let headers_cloned = headers.cloned();
@@ -703,7 +703,7 @@ impl GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &ResponsesRequest,
+        body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
         let (Some(responses_context), Some(harmony_responses_context)) =
@@ -722,7 +722,7 @@ impl GrpcRouter {
         }
 
         let (body, canonical_model_id) =
-            canonicalize_responses_request(&self.worker_registry, body, model_id);
+            canonicalize_responses_request(&self.worker_registry, &body, model_id);
         let model_id = canonical_model_id.as_ref();
 
         // Choose implementation based on Harmony model detection (checks worker metadata)
@@ -774,7 +774,7 @@ impl GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &EmbeddingRequest,
+        body: EmbeddingRequest,
         model_id: &str,
     ) -> Response {
         let Some(embedding_pipeline) = self.embedding_pipeline.as_ref() else {
@@ -784,7 +784,7 @@ impl GrpcRouter {
 
         embedding_pipeline
             .execute_embeddings(
-                Arc::new(body.clone()),
+                Arc::new(body),
                 headers.cloned(),
                 model_id.to_string(),
                 self.shared_components.clone(),
@@ -798,7 +798,7 @@ impl GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &CreateMessageRequest,
+        body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
         debug!("Processing messages request for model: {}", model_id);
@@ -807,7 +807,7 @@ impl GrpcRouter {
         // front -- see `resolve_canonical_model_id`'s doc comment. Rewrite
         // the body's `model` field to match; see `route_chat_impl`.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
-        let mut canonical_body = body.clone();
+        let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
         let request = Arc::new(canonical_body);
         let headers_cloned = headers.cloned();
@@ -866,7 +866,7 @@ impl GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &CompletionRequest,
+        body: CompletionRequest,
         model_id: &str,
     ) -> Response {
         debug!("Processing completion request for model: {}", model_id);
@@ -875,7 +875,7 @@ impl GrpcRouter {
         // doc comment. Rewrite the body's `model` field to match; see
         // `route_chat_impl`.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
-        let mut canonical_body = body.clone();
+        let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
         let request = Arc::new(canonical_body);
         let headers_cloned = headers.cloned();
@@ -934,7 +934,7 @@ impl GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &ClassifyRequest,
+        body: ClassifyRequest,
         model_id: &str,
     ) -> Response {
         let Some(classify_pipeline) = self.classify_pipeline.as_ref() else {
@@ -944,7 +944,7 @@ impl GrpcRouter {
 
         classify_pipeline
             .execute_classify(
-                Arc::new(body.clone()),
+                Arc::new(body),
                 headers.cloned(),
                 model_id.to_string(),
                 self.shared_components.clone(),
@@ -994,7 +994,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &GenerateRequest,
+        body: GenerateRequest,
         model_id: &str,
     ) -> Response {
         self.route_generate_impl(headers, tenant_meta, body, model_id)
@@ -1005,7 +1005,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &ChatCompletionRequest,
+        body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
         self.route_chat_impl(headers, tenant_meta, body, model_id)
@@ -1016,7 +1016,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &ResponsesRequest,
+        body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
         self.route_responses_impl(headers, tenant_meta, body, model_id)
@@ -1034,7 +1034,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &EmbeddingRequest,
+        body: EmbeddingRequest,
         model_id: &str,
     ) -> Response {
         self.route_embeddings_impl(headers, tenant_meta, body, model_id)
@@ -1045,7 +1045,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &ClassifyRequest,
+        body: ClassifyRequest,
         model_id: &str,
     ) -> Response {
         self.route_classify_impl(headers, tenant_meta, body, model_id)
@@ -1134,7 +1134,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &CompletionRequest,
+        body: CompletionRequest,
         model_id: &str,
     ) -> Response {
         self.route_completion_impl(headers, tenant_meta, body, model_id)
@@ -1145,7 +1145,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &CreateMessageRequest,
+        body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
         self.route_messages_impl(headers, tenant_meta, body, model_id)
@@ -1545,7 +1545,7 @@ mod pd_tests {
 
         let request = responses_request("missing-model");
         let response = router
-            .route_responses(None, &tenant_meta, &request, "missing-model")
+            .route_responses(None, &tenant_meta, request.clone(), "missing-model")
             .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
@@ -1562,7 +1562,7 @@ mod pd_tests {
 
         let request = responses_request("missing-model");
         let response = router
-            .route_responses(None, &tenant_meta, &request, "missing-model")
+            .route_responses(None, &tenant_meta, request.clone(), "missing-model")
             .await;
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 
