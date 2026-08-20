@@ -29,6 +29,7 @@ repos:
         args: ['-L', 'cann,thi,makro,wil,rouge,PRIS,hel,te,ans,ser,wit,WIT,implementors,caf,nin,Nin,doubleclick,allocatedp']
         exclude: |
           (?x)^(
+            Cargo\.lock|
             src/proto/.*\.proto$|
             src/mesh/proto/.*\.proto$|
             src/tokenizer/chat_template\.rs|
