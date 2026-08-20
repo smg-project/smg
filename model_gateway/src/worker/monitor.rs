@@ -365,11 +365,9 @@ impl WorkerMonitor {
         self.load_tx.send_modify(|map| map.clear());
         self.worker_load_manager.clear();
         self.native_loads_absent.clear();
-        // Same reset rule for the overload vetoes: the feed that would clear
-        // them is being torn down, so nothing else would. Fail open, but say so
-        // — on the lag-recovery path this is the fleet going un-vetoed for up to
-        // one poll interval, and the gauge dropping to zero is otherwise
-        // indistinguishable from a genuine recovery.
+        // The feed that would clear the vetoes is being torn down: fail open,
+        // but say so — a wiped gauge is otherwise indistinguishable from a
+        // genuine recovery.
         if self.overload.is_enabled() {
             let cleared = self.worker_registry.clear_all_overload_flags();
             if cleared > 0 {
@@ -481,9 +479,8 @@ impl WorkerMonitor {
     /// re-export is on, since metrics-rs cannot delete series.
     fn evict_worker_loads(&self, worker: &Arc<dyn Worker>) {
         let url = worker.url();
-        // A worker with no load feed has no overload verdict: leaving the flag
-        // set would strand it out of routing until it happened to be polled
-        // again, which for a non-`Ready` worker never happens.
+        // No load feed, no verdict: a flag left set would strand the worker
+        // out of routing with nothing to ever clear it.
         self.worker_registry.set_worker_overloaded(worker, false);
         self.load_tx.send_modify(|map| {
             map.remove(url);
@@ -966,11 +963,9 @@ async fn group_monitor_loop(
         let mut dp_evict: Vec<String> = Vec::new();
         for (worker, response) in results {
             let url = worker.url().to_string();
-            // The overload predicate runs exactly here, once per report: O(1)
-            // per worker per poll interval, and never on a request path. A
-            // worker whose fetch failed has no fresh signal, so it is treated
-            // as not overloaded — the same "absent means no opinion" rule the
-            // watch-map consumers follow.
+            // The overload predicate runs exactly here, once per report, never
+            // on a request path. A failed fetch means no fresh signal, which
+            // clears the flag — absent means no opinion.
             if overload.is_enabled() {
                 let verdict = response
                     .as_ref()

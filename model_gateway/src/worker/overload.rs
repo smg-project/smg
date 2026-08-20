@@ -1,10 +1,7 @@
 //! Absolute per-worker overload protection.
 //!
-//! The predicate below is evaluated exactly once per ingested load report (see
-//! `WorkerMonitor`'s group loop), never per request. Its verdict is latched into
-//! the worker's routing state, where selection reads it for free: every gather
-//! pass already loads that word for health, circuit-breaker and load, so the
-//! veto is one more test on a value already in hand.
+//! The predicate is evaluated once per ingested load report, never per request;
+//! the verdict is latched into routing state, which selection already reads.
 
 use openai_protocol::worker::WorkerLoadResponse;
 

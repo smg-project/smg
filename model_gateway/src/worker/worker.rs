@@ -1143,8 +1143,6 @@ impl WorkerRuntime {
         self.processed_counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    // ── Overload veto ───────────────────────────────────────────────
-
     pub fn is_overloaded(&self) -> bool {
         self.overloaded.load(Ordering::Relaxed)
     }

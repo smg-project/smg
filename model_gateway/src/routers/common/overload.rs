@@ -1,17 +1,10 @@
-//! Shed responses for the absolute worker-overload guard.
-//!
-//! Both helpers run only after routing has already failed to produce a worker,
-//! so nothing here is on the path of a served request. Their whole job is to
-//! turn "the pool emptied because every worker is vetoed" into the immediate
-//! 503 both transports use for `no_available_workers`, instead of the
-//! circuit-breaker wording (HTTP) or a misleading 404 (gRPC).
+//! Shed responses for the absolute worker-overload guard. Failure paths only —
+//! nothing here runs for a served request.
 //!
 //! The verdict is taken from the candidate pool the caller selected over, never
-//! from the model index: every selection site narrows by worker type and
-//! connection mode first, so a whole-model predicate would miss exactly the
-//! cases that matter — a saturated PD prefill leg, one transport of a
-//! mixed-transport model, or the model-less `/generate` wildcard, which selects
-//! across every model and has no model-index entry of its own.
+//! from the model index: selection narrows by worker type and transport first,
+//! and a whole-model predicate would miss a saturated PD leg, a mixed-transport
+//! model, or the model-less wildcard.
 
 use std::sync::Arc;
 
@@ -54,15 +47,10 @@ pub fn shed_if_all_overloaded(candidates: &[Arc<dyn Worker>], model_id: &str) ->
     ))
 }
 
-/// The dispatch-time re-check: one relaxed atomic read on the single worker
-/// already chosen, covering the window between selection and dispatch in which
-/// a load report can land.
-///
-/// Deliberately sheds rather than re-selecting. The flag moves once per
-/// `load_monitor_interval_secs`, so a flip landing inside one selection→dispatch
-/// gap is rare enough that the simpler answer costs nothing in aggregate — and
-/// unlike the selection shed, this one says only what it knows: *this* worker
-/// went over, not the fleet.
+/// Dispatch-time re-check: one atomic read on the already-chosen worker,
+/// covering the selection→dispatch window. Deliberately sheds rather than
+/// re-selecting — the flag moves at the poll interval, so the window is rare —
+/// and reports only what it knows: this worker went over, not the fleet.
 pub fn shed_if_worker_overloaded(worker: &dyn Worker, model_id: &str) -> Option<Response> {
     if !worker.is_overloaded() {
         return None;
@@ -76,14 +64,9 @@ pub fn shed_if_worker_overloaded(worker: &dyn Worker, model_id: &str) -> Option<
     ))
 }
 
-/// One decision line, one counter, one response.
-///
-/// The response is marked non-retryable: the condition it reports clears at the
-/// load-poll interval, so the retry layer's backoff window cannot outlive it,
-/// and retrying would re-run the entire pipeline (rate limiting included) five
-/// more times to reach the same 503 ~400 ms later. Marking it terminal is also
-/// what makes `smg_worker_overload_shed_total` count sheds per request rather
-/// than per attempt.
+/// One decision line, one counter, one response — marked non-retryable: the
+/// veto clears at the poll interval, which no backoff window outlives, and a
+/// terminal shed is what keeps the counter per-request rather than per-attempt.
 fn shed(branch: &'static str, stage: &'static str, worker: &str, message: String) -> Response {
     Metrics::record_worker_overload_shed(stage);
     debug!(branch, stage, worker, "Overload shed");

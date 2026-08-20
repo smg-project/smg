@@ -121,54 +121,47 @@ impl<'a> WorkerSelector<'a> {
         })
     }
 
-    fn get_candidates(&self, req: &SelectWorkerRequest<'_>) -> Vec<Arc<dyn Worker>> {
+    /// The pool selection walks. `require_available` adds the `is_available()`
+    /// veto; the shed path takes the same pool without it, so the shed verdict
+    /// always describes exactly what selection saw.
+    fn candidate_pool(
+        &self,
+        req: &SelectWorkerRequest<'_>,
+        require_available: bool,
+    ) -> Vec<Arc<dyn Worker>> {
         let workers = self.registry.get_workers_filtered(
             None, // model_id index lookup not used — we filter via supports_model
             req.worker_type,
             req.connection_mode,
             req.runtime_type,
-            false, // we filter availability ourselves for consistent behavior
-        );
-
-        let candidates: Vec<_> = workers.into_iter().filter(|w| w.is_available()).collect();
-
-        match &req.provider {
-            Some(provider) => filter_by_provider(candidates, provider),
-            None => candidates,
-        }
-    }
-
-    fn find_best_worker(&self, req: &SelectWorkerRequest<'_>) -> Option<Arc<dyn Worker>> {
-        self.get_candidates(req)
-            .into_iter()
-            .filter(|w| w.supports_model(req.model_id))
-            .filter(|w| !req.require_realtime_capable || w.is_realtime_capable())
-            .min_by_key(|w| w.load())
-    }
-
-    /// Shed when every worker this request could have selected is vetoed.
-    ///
-    /// Rebuilds the pool `find_best_worker` walked — same type, transport,
-    /// runtime, provider, model-support and realtime filters — minus the
-    /// `is_available()` veto that emptied it, so the verdict describes exactly
-    /// what selection saw. Runs only on the miss path.
-    fn shed_if_all_overloaded(&self, req: &SelectWorkerRequest<'_>) -> Option<Response> {
-        let workers = self.registry.get_workers_filtered(
-            None,
-            req.worker_type,
-            req.connection_mode,
-            req.runtime_type,
             false,
         );
+        let workers: Vec<_> = if require_available {
+            workers.into_iter().filter(|w| w.is_available()).collect()
+        } else {
+            workers
+        };
         let candidates = match &req.provider {
             Some(provider) => filter_by_provider(workers, provider),
             None => workers,
         };
-        let candidates: Vec<_> = candidates
+        candidates
             .into_iter()
             .filter(|w| w.supports_model(req.model_id))
             .filter(|w| !req.require_realtime_capable || w.is_realtime_capable())
-            .collect();
+            .collect()
+    }
+
+    fn find_best_worker(&self, req: &SelectWorkerRequest<'_>) -> Option<Arc<dyn Worker>> {
+        self.candidate_pool(req, true)
+            .into_iter()
+            .min_by_key(|w| w.load())
+    }
+
+    /// Shed when every worker this request could have selected is vetoed.
+    /// Runs only on the miss path.
+    fn shed_if_all_overloaded(&self, req: &SelectWorkerRequest<'_>) -> Option<Response> {
+        let candidates = self.candidate_pool(req, false);
         overload::shed_if_all_overloaded(&candidates, req.model_id)
     }
 

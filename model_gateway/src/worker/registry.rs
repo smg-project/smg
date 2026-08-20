@@ -379,30 +379,26 @@ impl WorkerRegistry {
             .unwrap_or_else(|| Arc::from(Self::EMPTY_WORKERS))
     }
 
-    // ── Overload veto ──────────────────────────────────────────────────
-
     /// Apply the absolute overload veto to `worker`, returning `true` when the
-    /// flag transitioned.
+    /// flag transitioned. The only sanctioned writer of
+    /// [`Worker::set_overloaded`]: counters and gauge move once per edge.
     ///
-    /// The only sanctioned writer of [`Worker::set_overloaded`]: per-model
-    /// counters and the `smg_workers_overloaded` gauge move exactly once per
-    /// edge, which is what keeps the cost proportional to the load-report rate
-    /// rather than to request rate.
-    ///
-    /// Writes through a handle the registry no longer holds are dropped. The
-    /// monitor snapshots `Arc`s at tick start and writes its verdict after a
-    /// multi-second fetch await, by which time the worker may have been removed
-    /// or replaced; attributing that write to `worker`'s own model card would
-    /// move a counter for a worker no reset path can ever reach again.
+    /// Writes through a handle the registry no longer holds are dropped — the
+    /// monitor writes its verdict after a multi-second fetch await, by which
+    /// time the worker may have been removed or replaced, and a stale write
+    /// would move a counter no reset path can reach again.
     pub fn set_worker_overloaded(&self, worker: &Arc<dyn Worker>, overloaded: bool) -> bool {
         // Lock-free fast path for the common case: the poll re-asserted a
         // verdict the worker already carries, so there is no edge to record.
         if worker.is_overloaded() == overloaded {
             return false;
         }
-        // Allocate the keys before taking the edge lock: the invariant it
-        // protects is "flag flip and counter delta land together", which does
-        // not need the string clones or the gauge publish inside it.
+        // Allocate the keys before taking the edge lock; only the flag flip,
+        // the counter deltas and the gauge publish go inside it. The publish
+        // must share the critical section: published after release, two edges
+        // on one model can land their gauge writes in the reverse order and
+        // pin a stale value until the next transition. Counter GC re-locks a
+        // `model_overloaded` shard, so it stays outside.
         let model_ids = Self::worker_model_ids(worker);
         let mut updates = Vec::with_capacity(model_ids.len());
         {
@@ -415,14 +411,11 @@ impl WorkerRegistry {
             }
             for model_id in model_ids {
                 let updated = self.adjust_model_overloaded(&model_id, overloaded);
+                Metrics::set_workers_overloaded(&model_id, updated);
                 updates.push((model_id, updated));
             }
         }
-        // Gauge publish and counter GC reach into the metrics recorder and
-        // re-lock a `model_overloaded` shard; neither belongs under a
-        // registry-wide mutex that every group loop's edges serialize on.
         for (model_id, updated) in updates {
-            Metrics::set_workers_overloaded(&model_id, updated);
             if updated == 0 {
                 self.model_overloaded
                     .remove_if(&model_id, |_, count| count.load(Ordering::Acquire) == 0);
@@ -476,15 +469,10 @@ impl WorkerRegistry {
             .unwrap_or(0)
     }
 
-    /// Move one worker in or out of `model_id`'s overloaded count, returning the
-    /// updated count. Caller publishes the gauge and GCs the entry outside the
-    /// edge lock.
-    ///
-    /// The counter feeds `smg_workers_overloaded{model}` only. The shed verdict
-    /// itself is a walk of the caller's candidate pool
-    /// ([`crate::routers::common::overload::all_overloaded`]), because every
-    /// selection site narrows by worker type and connection mode and a
-    /// per-model counter cannot describe a sub-pool.
+    /// Move one worker in or out of `model_id`'s overloaded count, returning
+    /// the updated count. Feeds the gauge only — the shed verdict walks the
+    /// caller's candidate pool, since a per-model counter cannot describe a
+    /// type/transport-narrowed sub-pool.
     fn adjust_model_overloaded(&self, model_id: &str, overloaded: bool) -> usize {
         let entry = self
             .model_overloaded
@@ -1040,14 +1028,10 @@ impl WorkerRegistry {
             return false;
         }
 
-        // Release the overload verdict while `old_worker` is still the handle
-        // this registry holds, i.e. while the counter keys derived from its
-        // model card are the ones the increment used. The replacement inherits
-        // the shared runtime below, so a verdict left set here would be carried
-        // onto a possibly different model set with no matching counter move,
-        // and the monitor's `Replaced` eviction — which clears through the old
-        // handle — could not put it back. The next poll re-derives the verdict
-        // for the URL either way.
+        // Release the verdict while `old_worker` is still the current handle:
+        // the replacement inherits the shared runtime, and a flag carried onto
+        // a possibly different model set would leak its counter. The next poll
+        // re-derives the verdict for the URL.
         self.set_worker_overloaded(&old_worker, false);
 
         if !new_worker.inherit_shared_state_from(&*old_worker) {
@@ -1066,9 +1050,7 @@ impl WorkerRegistry {
         // against the new worker's connect.
         old_worker.abort_background_tasks();
 
-        // Diff model indexes: remove stale, add new. No overload bookkeeping
-        // here — the verdict was released above, so there is nothing to carry
-        // across the membership change.
+        // Diff model indexes: remove stale, add new.
         for removed_model in old_models.difference(&new_models) {
             self.remove_worker_from_model_index(removed_model, old_worker.url());
             // Mirror `remove()`: drop any per-model retry override when
@@ -1322,12 +1304,8 @@ impl WorkerRegistry {
             }
         }
 
-        // Release the overload count before the worker leaves `self.workers`:
-        // `set_worker_overloaded` ignores writes through a handle the registry
-        // no longer holds, so clearing after the removal would leak the count
-        // rather than release it. Clearing rather than merely decrementing also
-        // makes the monitor's `Removed` eviction a no-op instead of a second
-        // decrement.
+        // Release the overload count before the worker leaves `self.workers` —
+        // stale-handle writes are dropped, so clearing afterwards would leak it.
         if let Some(entry) = self.workers.get(worker_id) {
             let worker = Arc::clone(entry.value());
             drop(entry);
@@ -1575,10 +1553,6 @@ impl WorkerRegistry {
         self.workers.insert(worker_id.clone(), worker.clone());
 
         // Update model index for O(1) lookups using copy-on-write.
-        // No overload bookkeeping here: a freshly built `WorkerRuntime` is never
-        // vetoed, so registration has nothing to carry. Adding a defensive `+1`
-        // would only risk double-counting against a concurrent flip, and an
-        // over-count is the one direction that can shed a servable request.
         for model_id in Self::worker_model_ids(&worker) {
             self.add_worker_to_model_index(&model_id, worker.clone());
             self.rebuild_hash_ring(&model_id);
@@ -3889,8 +3863,6 @@ mod tests {
             "replacement must abort the replaced worker's handshake driver"
         );
     }
-
-    // ── Overload veto ──────────────────────────────────────────────────
 
     fn overload_worker(url: &str, model_id: &str) -> Arc<dyn Worker> {
         Arc::new(

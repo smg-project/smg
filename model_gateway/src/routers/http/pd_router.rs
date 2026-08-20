@@ -36,7 +36,7 @@ use crate::{
     routers::{
         common::{
             header_utils, overload,
-            retry::{is_retryable_response, is_retryable_status, RetryExecutor},
+            retry::{is_retryable_response, RetryExecutor},
             sse::{SseEncoder, SSE_CHANNEL_BUFFER},
         },
         error,
@@ -531,7 +531,7 @@ impl PDRouter {
                 endpoint,
                 duration,
             );
-        } else if !is_retryable_status(response.status()) {
+        } else if !is_retryable_response(&response) {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_PD,

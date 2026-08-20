@@ -108,7 +108,7 @@ impl PipelineStage for WorkerSelectionStage {
             WorkerSelectionMode::Regular => {
                 match self.select_single_worker(model_id, text, tokens, headers, rid_key) {
                     Some(w) => WorkerSelection::Single { worker: w },
-                    None => return Err(self.selection_failure(model_id)),
+                    None => return Err(self.selection_failure(model_id, &[WorkerType::Regular])),
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
@@ -119,7 +119,12 @@ impl PipelineStage for WorkerSelectionStage {
                         decode,
                         runtime_type,
                     },
-                    None => return Err(self.selection_failure(model_id)),
+                    None => {
+                        return Err(self.selection_failure(
+                            model_id,
+                            &[WorkerType::Prefill, WorkerType::Decode],
+                        ))
+                    }
                 }
             }
             WorkerSelectionMode::EncodePrefillDecode => {
@@ -157,7 +162,17 @@ impl PipelineStage for WorkerSelectionStage {
                             runtime_type,
                         }
                     }
-                    None => return Err(self.selection_failure(model_id)),
+                    None => {
+                        // Encode is a demanded leg only when the request
+                        // carries encode items; an idle-but-vetoed encode pool
+                        // must not shed a text-only request.
+                        let legs: &[WorkerType] = if encode_item_hashes.is_empty() {
+                            &[WorkerType::Prefill, WorkerType::Decode]
+                        } else {
+                            &[WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode]
+                        };
+                        return Err(self.selection_failure(model_id, legs));
+                    }
                 }
             }
         };
@@ -203,31 +218,15 @@ fn selection_runtime(workers: &WorkerSelection) -> RuntimeType {
 }
 
 impl WorkerSelectionStage {
-    /// Response for a selection that produced nothing.
+    /// Response for a selection that produced nothing: a 503 shed when a leg's
+    /// whole candidate pool is vetoed, the existing 404 otherwise.
     ///
-    /// An all-overloaded pool sheds with the same 503 `no_available_workers`
-    /// the HTTP router uses: the fleet is under pressure, not absent, and 404
-    /// would both misdescribe it and skip the retry path.
-    ///
-    /// The verdict is taken per leg, from the pool that leg selected over. A
-    /// whole-model predicate cannot express this: veto every prefill worker and
-    /// the model's decode workers are still unflagged, so "all workers for the
-    /// model are overloaded" is false exactly when the PD pair became
-    /// unselectable. Rebuilding the leg pools costs one registry walk each on a
-    /// path that has already failed.
-    ///
-    /// A shed is a designed load-shedding outcome that happens at full request
-    /// rate; it logs one `debug!` line inside the shed helper. The `error!`
-    /// below is reserved for what it was written for — a model with no workers
-    /// at all, which is a misconfiguration and rare.
-    fn selection_failure(&self, model_id: &str) -> Response {
-        let legs: &[WorkerType] = match self.mode {
-            WorkerSelectionMode::Regular => &[WorkerType::Regular],
-            WorkerSelectionMode::PrefillDecode => &[WorkerType::Prefill, WorkerType::Decode],
-            WorkerSelectionMode::EncodePrefillDecode => {
-                &[WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode]
-            }
-        };
+    /// `legs` must be exactly the legs this selection demanded — the verdict is
+    /// per leg because a whole-model predicate is false exactly when one
+    /// saturated leg made the set unselectable, and an undemanded leg (EPD
+    /// without encode items) must not be able to shed a request that never
+    /// needed it.
+    fn selection_failure(&self, model_id: &str, legs: &[WorkerType]) -> Response {
         for leg in legs {
             let candidates = self.leg_candidates(model_id, *leg);
             if let Some(shed) = overload::shed_if_all_overloaded(&candidates, model_id) {
@@ -881,7 +880,8 @@ mod tests {
                 .is_none(),
             "the veto empties the prefill pool"
         );
-        let response = stage.selection_failure(model_id);
+        let response =
+            stage.selection_failure(model_id, &[WorkerType::Prefill, WorkerType::Decode]);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             error::extract_error_code_from_response(&response),
@@ -891,6 +891,44 @@ mod tests {
             !is_retryable_response(&response),
             "a shed must be terminal for the retry layer"
         );
+    }
+
+    /// An undemanded leg cannot shed: a text-only EPD request that fails for a
+    /// non-overload reason must not 503 just because the (unused) encode pool
+    /// is saturated.
+    #[test]
+    fn an_undemanded_encode_leg_cannot_shed() {
+        let model_id = "test-model-encode-veto";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let encode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:8460")
+                .model(ModelCard::new(model_id))
+                .worker_type(WorkerType::Encode)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .build(),
+        );
+        worker_registry.register(Arc::clone(&encode)).unwrap();
+        worker_registry.set_worker_overloaded(&encode, true);
+
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::EncodePrefillDecode,
+        );
+
+        // No prefill/decode workers registered: with encode undemanded this is
+        // model absence (404), not pressure.
+        let text_only =
+            stage.selection_failure(model_id, &[WorkerType::Prefill, WorkerType::Decode]);
+        assert_eq!(text_only.status(), StatusCode::NOT_FOUND);
+
+        // With encode demanded, the saturated encode pool is a shed.
+        let with_encode = stage.selection_failure(
+            model_id,
+            &[WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode],
+        );
+        assert_eq!(with_encode.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// A model nobody serves is still a 404 — the shed must not swallow real
@@ -903,7 +941,9 @@ mod tests {
             WorkerSelectionMode::PrefillDecode,
         );
         assert_eq!(
-            stage.selection_failure("nobody").status(),
+            stage
+                .selection_failure("nobody", &[WorkerType::Prefill, WorkerType::Decode])
+                .status(),
             StatusCode::NOT_FOUND
         );
     }
@@ -1131,7 +1171,7 @@ mod tests {
             "the veto empties the candidate pool"
         );
 
-        let response = stage.selection_failure(model_id);
+        let response = stage.selection_failure(model_id, &[WorkerType::Regular]);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             extract_error_code_from_response(&response),
@@ -1145,7 +1185,9 @@ mod tests {
             .select_single_worker(model_id, None, None, None, None)
             .is_some());
         assert_eq!(
-            stage.selection_failure("no-such-model").status(),
+            stage
+                .selection_failure("no-such-model", &[WorkerType::Regular])
+                .status(),
             StatusCode::NOT_FOUND
         );
     }

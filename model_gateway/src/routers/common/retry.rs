@@ -20,13 +20,9 @@ pub fn is_retryable_status(status: StatusCode) -> bool {
 }
 
 /// Response extension marking a response terminal for the retry layer
-/// regardless of its status code.
-///
-/// Exists for outcomes whose cause provably cannot clear inside a backoff
-/// window, where a retry only re-runs the whole pipeline and adds wall clock
-/// to a failure the client is going to get anyway. The load-shed 503 is the
-/// case that motivated it: the veto it reports moves at the load-poll interval
-/// (seconds), not at the retry interval (tens of milliseconds).
+/// regardless of its status code — for outcomes whose cause cannot clear
+/// inside a backoff window (the load-shed 503: its veto moves at the poll
+/// interval, not the retry interval).
 #[derive(Debug, Clone, Copy)]
 pub struct NonRetryable;
 

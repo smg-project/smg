@@ -447,7 +447,7 @@ impl Router {
                 endpoint,
                 duration,
             );
-        } else if !is_retryable_status(response.status()) {
+        } else if !is_retryable_response(&response) {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_REGULAR,
@@ -727,7 +727,9 @@ impl Router {
                 rstatus.as_u16(),
                 extract_error_code_from_response(response),
             );
-            if !is_retryable_status(rstatus) {
+            // Response-aware: a terminal shed carries a retryable status but
+            // must still count as a router error.
+            if !is_retryable_response(response) {
                 Metrics::record_router_error(
                     metrics_labels::ROUTER_HTTP,
                     metrics_labels::BACKEND_REGULAR,
