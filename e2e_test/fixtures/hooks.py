@@ -270,7 +270,9 @@ def _filter_env_items(
 def _enforce_selection_floor(selected_count: int) -> None:
     """Fail the session when fewer tests survived selection than the floor.
 
-    ``E2E_MIN_SELECTED`` (integer) arms the check; unset or blank disables it.
+    ``E2E_MIN_SELECTED`` (non-negative integer) arms the check; unset or blank
+    disables it. A non-integer or negative value is rejected loudly rather than
+    treated as "no floor", so a lane typo cannot quietly drop the guardrail.
     A violation aborts the run via ``pytest.exit`` so the CI log shows a
     loud ``!!! Exit !!!`` banner instead of a quietly shrunken suite.
     """
@@ -284,9 +286,16 @@ def _enforce_selection_floor(selected_count: int) -> None:
             f"e2e selection: E2E_MIN_SELECTED={raw!r} is not an integer",
             returncode=1,
         )
+    if floor < 0:
+        pytest.exit(
+            f"e2e selection: E2E_MIN_SELECTED={raw!r} must be non-negative; a "
+            f"negative floor would silently disable the check",
+            returncode=1,
+        )
     if selected_count < floor:
         pytest.exit(
-            f"e2e selection: only {selected_count} tests selected, below the "
+            f"e2e selection: only {selected_count} "
+            f"{'test' if selected_count == 1 else 'tests'} selected, below the "
             f"E2E_MIN_SELECTED floor of {floor}. The E2E_ENGINE/E2E_VENDOR/"
             f"E2E_GPU_TIER env filter in e2e_test/fixtures/hooks.py is the "
             f"likely cause (marker drift or a lane env-var typo).",

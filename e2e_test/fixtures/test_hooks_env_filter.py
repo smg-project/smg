@@ -233,9 +233,16 @@ def test_floor_fails_below(monkeypatch):
     with pytest.raises(pytest.exit.Exception) as excinfo:
         hooks._enforce_selection_floor(1)
     msg = str(excinfo.value)
-    assert "only 1 tests selected" in msg
+    assert "only 1 test selected" in msg  # singular for a one-test selection
     assert "floor of 5" in msg
     assert "E2E_ENGINE" in msg  # points at the env filter as the likely cause
+
+
+def test_floor_message_pluralizes_above_one(monkeypatch):
+    monkeypatch.setenv("E2E_MIN_SELECTED", "5")
+    with pytest.raises(pytest.exit.Exception) as excinfo:
+        hooks._enforce_selection_floor(2)
+    assert "only 2 tests selected" in str(excinfo.value)
 
 
 def test_floor_rejects_non_integer(monkeypatch):
@@ -243,6 +250,20 @@ def test_floor_rejects_non_integer(monkeypatch):
     with pytest.raises(pytest.exit.Exception) as excinfo:
         hooks._enforce_selection_floor(100)
     assert "not an integer" in str(excinfo.value)
+
+
+def test_floor_rejects_negative(monkeypatch):
+    """A negative floor can never trip, so take it as a typo, not "no floor"."""
+    monkeypatch.setenv("E2E_MIN_SELECTED", "-1")
+    with pytest.raises(pytest.exit.Exception) as excinfo:
+        hooks._enforce_selection_floor(0)
+    assert "must be non-negative" in str(excinfo.value)
+
+
+def test_floor_zero_is_armed_but_unbreakable(monkeypatch):
+    """Zero is a legal floor: explicitly armed, and no selection can fall under it."""
+    monkeypatch.setenv("E2E_MIN_SELECTED", "0")
+    hooks._enforce_selection_floor(0)
 
 
 def test_floor_enforced_from_collection_hook(monkeypatch):
