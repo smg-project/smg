@@ -581,6 +581,26 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         scheduler zmq channel; each reply carries ``num_reqs`` (running +
         waiting), ``num_waiting_reqs``, and ``num_pages`` (KV pages in use).
         """
+        # The EPD encode loop has no control-message dispatch: a GetLoadReqInput
+        # forwarded over the scheduler channel is submitted to the encode worker
+        # as if it were an encode request and kills the scheduler. Mirror the
+        # shallow health probe above — answer with an empty, well-formed
+        # response so a frontend polling loads on an encode worker reads "no
+        # scheduler load" instead of crashing the engine. Prefill/decode loops
+        # dispatch GetLoadReqInput correctly and keep reporting real loads.
+        if getattr(self.server_args, "disaggregation_mode", "null") == "encode":
+            return tokenspeed_scheduler_pb2.GetLoadsResponse(
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                version="tokenspeed",
+                dp_rank_count=0,
+                loads=[],
+                aggregate=tokenspeed_scheduler_pb2.AggregateMetrics(
+                    total_running_reqs=0,
+                    total_waiting_reqs=0,
+                    total_reqs=0,
+                    avg_token_usage=0.0,
+                ),
+            )
         try:
             load_outputs = await asyncio.wait_for(
                 self.async_llm.get_load(), timeout=HEALTH_CHECK_TIMEOUT
