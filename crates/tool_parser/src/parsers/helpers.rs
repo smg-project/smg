@@ -145,6 +145,56 @@ pub fn take_unstreamed_normal_text(buffer: &mut String, current_tool_id: i32) ->
     }
 }
 
+/// The mutable parser state `handle_json_tool_streaming` threads through the
+/// JSON-tool streaming flow. Grouping it keeps call sites transposition-safe
+/// and lets the drain path recurse without re-listing nine arguments.
+pub(crate) struct JsonToolStreamState<'a> {
+    pub partial_json: &'a mut crate::partial_json::PartialJson,
+    pub tool_indices: &'a HashMap<String, usize>,
+    pub buffer: &'a mut String,
+    pub current_tool_id: &'a mut i32,
+    pub current_tool_name_sent: &'a mut bool,
+    pub streamed_args_for_tool: &'a mut Vec<String>,
+    pub prev_tool_call_arr: &'a mut Vec<Value>,
+}
+
+/// After a non-tool JSON value was emitted as content, re-parse any adjacent
+/// JSON value left in the buffer instead of stranding it: a declared tool
+/// call trailing the emitted value in the same (possibly final) chunk must
+/// become tool-call deltas, not an end-of-stream text flush. Separator
+/// characters between adjacent values join the emitted text; a
+/// non-JSON-looking tail (e.g. a partial marker) stays buffered for later
+/// chunks, as before. Runs only on the cold bail-out paths; recursion is
+/// bounded by the number of adjacent complete values in one chunk.
+fn drain_adjacent_values(
+    mut normal_text: String,
+    state: &mut JsonToolStreamState<'_>,
+) -> ParserResult<StreamingParseResult> {
+    let json_start = state
+        .buffer
+        .char_indices()
+        .find(|(_, c)| !c.is_whitespace() && *c != ',' && *c != ';')
+        .map(|(i, _)| i)
+        .unwrap_or(state.buffer.len());
+    if !state.buffer[json_start..].starts_with('{') && !state.buffer[json_start..].starts_with('[')
+    {
+        return Ok(StreamingParseResult {
+            normal_text,
+            calls: vec![],
+        });
+    }
+    // Separators between adjacent values belong to the emitted text.
+    normal_text.push_str(&state.buffer[..json_start]);
+    let remainder = state.buffer.split_off(json_start);
+    *state.buffer = remainder;
+    // One bounded copy: the flow reads `current_text` while mutating the
+    // buffer, so they cannot alias.
+    let text = state.buffer.clone();
+    let mut follow = handle_json_tool_streaming(&text, 0, state)?;
+    follow.normal_text = format!("{normal_text}{}", follow.normal_text);
+    Ok(follow)
+}
+
 /// Check if a buffer ends with a partial occurrence of a token
 /// Returns Some(length) if there's a partial match, None otherwise
 pub fn ends_with_partial_token(buffer: &str, token: &str) -> Option<usize> {
@@ -253,17 +303,10 @@ pub fn normalize_tool_call_fields(obj: Value) -> Value {
 /// name then arguments, advance the buffer) for the JSON, Llama, Mistral, and Qwen
 /// parsers. `start_idx` is where JSON begins in `current_text`; `current_tool_id ==
 /// -1` means no active tool.
-#[expect(clippy::too_many_arguments)]
 pub(crate) fn handle_json_tool_streaming(
     current_text: &str,
     start_idx: usize,
-    partial_json: &mut crate::partial_json::PartialJson,
-    tool_indices: &HashMap<String, usize>,
-    buffer: &mut String,
-    current_tool_id: &mut i32,
-    current_tool_name_sent: &mut bool,
-    streamed_args_for_tool: &mut Vec<String>,
-    prev_tool_call_arr: &mut Vec<Value>,
+    state: &mut JsonToolStreamState<'_>,
 ) -> ParserResult<StreamingParseResult> {
     // Check if we have content to parse
     if start_idx >= current_text.len() {
@@ -273,12 +316,15 @@ pub(crate) fn handle_json_tool_streaming(
     // Extract JSON string from current position
     let json_str = &current_text[start_idx..];
 
-    // When current_tool_name_sent is false, don't allow partial strings to avoid
+    // When state.current_tool_name_sent is false, don't allow partial strings to avoid
     // parsing incomplete tool names as empty strings
-    let allow_partial_strings = *current_tool_name_sent;
+    let allow_partial_strings = *state.current_tool_name_sent;
 
     // Parse partial JSON
-    let (obj, end_idx) = match partial_json.parse_value(json_str, allow_partial_strings) {
+    let (obj, end_idx) = match state
+        .partial_json
+        .parse_value(json_str, allow_partial_strings)
+    {
         Ok(result) => result,
         Err(_) => {
             return Ok(StreamingParseResult::default());
@@ -304,11 +350,11 @@ pub(crate) fn handle_json_tool_streaming(
 
     // Validate tool name if present
     if let Some(name) = current_tool_call.get("name").and_then(|v| v.as_str()) {
-        if !tool_indices.contains_key(name) {
+        if !state.tool_indices.contains_key(name) {
             // The name string is complete (partial strings are disallowed
             // until the name has been sent), so this JSON can never become a
             // declared tool call. Surface the buffered text as normal content
-            // instead of dropping it: silently clearing the buffer here is
+            // instead of dropping it: silently clearing the state.buffer here is
             // how streams ended up empty while the non-streaming path
             // returned the same text as content. Any remainder of the JSON
             // still arriving flows through as normal text on later chunks.
@@ -316,17 +362,22 @@ pub(crate) fn handle_json_tool_streaming(
                 "Undeclared tool name '{}' - emitting buffered text as content",
                 name
             );
-            let normal_text = current_text.to_string();
+            // Emit the undeclared call (with any marker prefix) as content;
+            // the tail may hold a declared call and gets drained below.
+            let consumed = if is_complete {
+                start_idx + safe_end_idx
+            } else {
+                current_text.len()
+            };
+            let normal_text = current_text[..consumed].to_string();
             reset_current_tool_state(
-                buffer,
-                current_tool_name_sent,
-                streamed_args_for_tool,
-                prev_tool_call_arr,
+                state.buffer,
+                state.current_tool_name_sent,
+                state.streamed_args_for_tool,
+                state.prev_tool_call_arr,
             );
-            return Ok(StreamingParseResult {
-                normal_text,
-                calls: vec![],
-            });
+            *state.buffer = current_text[consumed..].to_string();
+            return drain_adjacent_values(normal_text, state);
         }
     } else if is_complete {
         // A complete JSON value with no tool name is definitively not a tool
@@ -335,32 +386,33 @@ pub(crate) fn handle_json_tool_streaming(
         // further parsing.
         let consumed = start_idx + safe_end_idx;
         let normal_text = current_text[..consumed].to_string();
-        *buffer = current_text[consumed..].to_string();
-        return Ok(StreamingParseResult {
-            normal_text,
-            calls: vec![],
-        });
+        *state.buffer = current_text[consumed..].to_string();
+        return drain_adjacent_values(normal_text, state);
     }
 
     let mut result = StreamingParseResult::default();
 
     // Case 1: Handle tool name streaming
-    if !*current_tool_name_sent {
+    if !*state.current_tool_name_sent {
         if let Some(function_name) = current_tool_call.get("name").and_then(|v| v.as_str()) {
-            if tool_indices.contains_key(function_name) {
+            if state.tool_indices.contains_key(function_name) {
                 // Initialize if first tool
-                if *current_tool_id == -1 {
-                    *current_tool_id = 0;
-                    streamed_args_for_tool.push(String::new());
-                } else if *current_tool_id as usize >= streamed_args_for_tool.len() {
+                if *state.current_tool_id == -1 {
+                    *state.current_tool_id = 0;
+                    state.streamed_args_for_tool.push(String::new());
+                } else if *state.current_tool_id as usize >= state.streamed_args_for_tool.len() {
                     // Ensure capacity for subsequent tools
-                    ensure_capacity(*current_tool_id, prev_tool_call_arr, streamed_args_for_tool);
+                    ensure_capacity(
+                        *state.current_tool_id,
+                        state.prev_tool_call_arr,
+                        state.streamed_args_for_tool,
+                    );
                 }
 
                 // Send tool name with empty parameters
-                *current_tool_name_sent = true;
+                *state.current_tool_name_sent = true;
                 result.calls.push(ToolCallItem {
-                    tool_index: *current_tool_id as usize,
+                    tool_index: *state.current_tool_id as usize,
                     name: Some(function_name.to_string()),
                     parameters: String::new(),
                 });
@@ -369,8 +421,9 @@ pub(crate) fn handle_json_tool_streaming(
     }
     // Case 2: Handle streaming arguments
     else if let Some(cur_arguments) = current_tool_call.get("arguments") {
-        let tool_id = *current_tool_id as usize;
-        let sent = streamed_args_for_tool
+        let tool_id = *state.current_tool_id as usize;
+        let sent = state
+            .streamed_args_for_tool
             .get(tool_id)
             .map(|s| s.len())
             .unwrap_or(0);
@@ -378,8 +431,8 @@ pub(crate) fn handle_json_tool_streaming(
             .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
 
         // Get prev_arguments (matches Python's structure)
-        let prev_arguments = if tool_id < prev_tool_call_arr.len() {
-            prev_tool_call_arr[tool_id].get("arguments")
+        let prev_arguments = if tool_id < state.prev_tool_call_arr.len() {
+            state.prev_tool_call_arr[tool_id].get("arguments")
         } else {
             None
         };
@@ -412,8 +465,8 @@ pub(crate) fn handle_json_tool_streaming(
         // Send diff if present
         if let Some(diff) = argument_diff {
             if !diff.is_empty() {
-                if tool_id < streamed_args_for_tool.len() {
-                    streamed_args_for_tool[tool_id].push_str(&diff);
+                if tool_id < state.streamed_args_for_tool.len() {
+                    state.streamed_args_for_tool[tool_id].push_str(&diff);
                 }
                 result.calls.push(ToolCallItem {
                     tool_index: tool_id,
@@ -423,20 +476,24 @@ pub(crate) fn handle_json_tool_streaming(
             }
         }
 
-        // Update prev_tool_call_arr with current state
-        if *current_tool_id >= 0 {
-            ensure_capacity(*current_tool_id, prev_tool_call_arr, streamed_args_for_tool);
+        // Update state.prev_tool_call_arr with current state
+        if *state.current_tool_id >= 0 {
+            ensure_capacity(
+                *state.current_tool_id,
+                state.prev_tool_call_arr,
+                state.streamed_args_for_tool,
+            );
 
-            if tool_id < prev_tool_call_arr.len() {
-                prev_tool_call_arr[tool_id] = current_tool_call;
+            if tool_id < state.prev_tool_call_arr.len() {
+                state.prev_tool_call_arr[tool_id] = current_tool_call;
             }
         }
 
         // If complete, advance to next tool
         if is_complete {
-            *buffer = current_text[start_idx + end_idx..].to_string();
-            *current_tool_name_sent = false;
-            *current_tool_id += 1;
+            *state.buffer = current_text[start_idx + end_idx..].to_string();
+            *state.current_tool_name_sent = false;
+            *state.current_tool_id += 1;
         }
     }
 

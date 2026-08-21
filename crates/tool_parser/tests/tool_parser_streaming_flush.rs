@@ -167,7 +167,7 @@ async fn test_llama_streaming_valid_tool_call_still_works() {
     let mut parser = LlamaParser::new();
     let chunks = [
         r#"{"name": "get_we"#,
-        r#"ather", "parameters"#,
+        r#"ather", "parameters"#, // codespell:ignore ather
         r#"": {"city": "Tokyo"}}"#,
     ];
 
@@ -202,7 +202,7 @@ async fn test_llama_streaming_partial_declared_name_keeps_buffering() {
     assert!(result.calls.is_empty());
 
     let result = parser
-        .parse_incremental(r#"ather", "parameters": {"city": "Paris"}}"#, &tools)
+        .parse_incremental(r#"ather", "parameters": {"city": "Paris"}}"#, &tools) // codespell:ignore ather
         .await
         .unwrap();
     let mut calls = result.calls;
@@ -380,5 +380,60 @@ async fn test_flush_empty_after_reset() {
         parser.take_unstreamed_normal_text(),
         "",
         "reset must clear the streaming buffer"
+    );
+}
+
+// ============================================================================
+// Property 4: adjacent values in one chunk — a declared tool call trailing a
+// non-tool JSON value must become tool-call deltas, never stranded text
+// ============================================================================
+
+#[tokio::test]
+async fn test_json_adjacent_non_tool_then_declared_call_in_final_chunk() {
+    let mut parser = JsonParser::new();
+    let (normal_text, calls) = stream_chunks(
+        &mut parser,
+        &[r#"{"note": "checking"} {"name": "get_weather", "arguments": {"city": "Tokyo"}}"#],
+    )
+    .await;
+
+    assert!(
+        normal_text.contains(r#"{"note": "checking"}"#),
+        "leading non-tool JSON must surface as content, got {normal_text:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.name.as_deref() == Some("get_weather")),
+        "trailing declared call must be announced as a tool call, got {calls:?}"
+    );
+    assert_eq!(
+        parser.take_unstreamed_normal_text(),
+        "",
+        "nothing may be stranded for the end-of-stream flush"
+    );
+}
+
+#[tokio::test]
+async fn test_json_undeclared_then_declared_call_in_final_chunk() {
+    let mut parser = JsonParser::new();
+    let (normal_text, calls) = stream_chunks(
+        &mut parser,
+        &[concat!(
+            r#"{"name": "bogus_tool", "arguments": {}}"#,
+            r#"{"name": "get_weather", "arguments": {"city": "Paris"}}"#
+        )],
+    )
+    .await;
+
+    assert!(
+        normal_text.contains("bogus_tool"),
+        "undeclared call must surface as content, got {normal_text:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.name.as_deref() == Some("get_weather")),
+        "declared call after an undeclared one must still parse, got {calls:?}"
     );
 }

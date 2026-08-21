@@ -53,7 +53,7 @@ pub trait ToolParser: Send + Sync {
     /// tool call (a bare `{` prefix, a partial start marker, or tool JSON
     /// that never completed) must be surfaced as normal content instead of
     /// being silently dropped — mirroring the non-streaming fallback that
-    /// returns unparseable tool text verbatim. Parsers that announced a tool
+    /// returns unparsable tool text verbatim. Parsers that announced a tool
     /// call from the buffered text return an empty string (the remaining
     /// arguments are recovered via `get_unstreamed_tool_args`).
     ///

@@ -295,13 +295,15 @@ impl ToolParser for CohereParser {
                     let result = helpers::handle_json_tool_streaming(
                         &json_content,
                         0,
-                        &mut self.partial_json,
-                        &tool_indices,
-                        &mut temp_buffer,
-                        &mut self.current_tool_id,
-                        &mut self.current_tool_name_sent,
-                        &mut self.streamed_args_for_tool,
-                        &mut self.prev_tool_call_arr,
+                        &mut helpers::JsonToolStreamState {
+                            partial_json: &mut self.partial_json,
+                            tool_indices: &tool_indices,
+                            buffer: &mut temp_buffer,
+                            current_tool_id: &mut self.current_tool_id,
+                            current_tool_name_sent: &mut self.current_tool_name_sent,
+                            streamed_args_for_tool: &mut self.streamed_args_for_tool,
+                            prev_tool_call_arr: &mut self.prev_tool_call_arr,
+                        },
                     )?;
 
                     // Move past END_ACTION and switch back to Text state
