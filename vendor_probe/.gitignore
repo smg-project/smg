@@ -1,3 +1,11 @@
+# Raw recordings and diff outputs stay OUT of git (tens of MB per run; the
+# durable copies live on vendor-truth-<date> release assets). The distilled
+# baselines/ tree IS tracked — it is the ground truth the conformance suite
+# and compat gate run against.
 results/
+compat/
 __pycache__/
 *.pyc
+# The repo-root .gitignore blanket-ignores *.jsonl (benchmark outputs); the
+# baseline distillations are jsonl and MUST be tracked — re-include them.
+!baselines/**
