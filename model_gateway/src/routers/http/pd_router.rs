@@ -15,7 +15,9 @@ use openai_protocol::{
     common::{GenerationRequest, InputIds, StringOrArray},
     completion::CompletionRequest,
     generate::GenerateRequest,
+    messages::CreateMessageRequest,
     rerank::RerankRequest,
+    responses::ResponsesRequest,
 };
 use reqwest::Client;
 use serde::Serialize;
@@ -1624,6 +1626,78 @@ impl RouterTrait for PDRouter {
             .await
     }
 
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: CreateMessageRequest,
+        model_id: &str,
+    ) -> Response {
+        let is_stream = body.stream.unwrap_or(false);
+
+        let request_text = if self.policies_need_request_text() {
+            Some(body.extract_text_for_routing())
+        } else {
+            None
+        };
+
+        let routing = RoutingDerivatives {
+            tokens: None,
+            text: request_text,
+            rid_key: self
+                .policy_registry
+                .derive_rid_key(body.rid())
+                .map(str::to_string),
+        };
+        let context = PDRequestContext {
+            route: "/v1/messages",
+            batch_size: None,
+            is_stream,
+            return_logprob: false,
+            model_id,
+            headers: headers.cloned(),
+        };
+
+        self.execute_dual_dispatch(headers, body, routing, context)
+            .await
+    }
+
+    async fn route_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: ResponsesRequest,
+        model_id: &str,
+    ) -> Response {
+        let is_stream = body.stream.unwrap_or(false);
+
+        let request_text = if self.policies_need_request_text() {
+            Some(body.extract_text_for_routing())
+        } else {
+            None
+        };
+
+        let routing = RoutingDerivatives {
+            tokens: None,
+            text: request_text,
+            rid_key: self
+                .policy_registry
+                .derive_rid_key(body.rid())
+                .map(str::to_string),
+        };
+        let context = PDRequestContext {
+            route: "/v1/responses",
+            batch_size: None,
+            is_stream,
+            return_logprob: false,
+            model_id,
+            headers: headers.cloned(),
+        };
+
+        self.execute_dual_dispatch(headers, body, routing, context)
+            .await
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
@@ -1714,6 +1788,7 @@ mod tests {
     use super::*;
     use crate::{
         config::PolicyConfig,
+        tenant::TenantKey,
         worker::{BasicWorkerBuilder, WorkerType},
     };
 
@@ -1916,6 +1991,37 @@ mod tests {
             }
             PdSelectionFailure::Shed(_) => panic!("an empty fleet is not an overload shed"),
         }
+    }
+
+    #[tokio::test]
+    async fn messages_and_responses_endpoints_dispatch_through_pd() {
+        let router = create_test_pd_router();
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let messages: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid messages request");
+        let response = router
+            .route_messages(None, &tenant, messages, UNKNOWN_MODEL_ID)
+            .await;
+        // The endpoint reaches PD selection (and fails on the empty fleet)
+        // instead of falling through to the trait's 501 default.
+        assert_ne!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let responses: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hi",
+        }))
+        .expect("valid responses request");
+        let response = router
+            .route_responses(None, &tenant, responses, UNKNOWN_MODEL_ID)
+            .await;
+        assert_ne!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
