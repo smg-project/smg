@@ -412,15 +412,25 @@ class Gateway:
             },
         )
 
-    def list_workers(self, timeout: float = 5.0) -> list[WorkerInfo]:
-        """List all workers connected to the gateway."""
+    def list_workers(self, timeout: float = 5.0, strict: bool = False) -> list[WorkerInfo]:
+        """List all workers connected to the gateway.
+
+        With ``strict=True``, request failures and non-200 responses raise
+        instead of degrading to ``[]`` — required when an empty list is the
+        assertion target (e.g. "worker was removed"), where a swallowed error
+        would pass vacuously.
+        """
         try:
             resp = httpx.get(f"{self.base_url}/workers", timeout=timeout)
             if resp.status_code == 200:
                 data = resp.json()
                 return [self._worker_from_api_response(w) for w in data.get("workers", [])]
+            if strict:
+                raise RuntimeError(f"GET /workers returned {resp.status_code}: {resp.text}")
             return []
         except (httpx.RequestError, httpx.TimeoutException):
+            if strict:
+                raise
             return []
 
     def add_worker(

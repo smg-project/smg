@@ -168,6 +168,9 @@ class TestIGWMode:
                     time.sleep(1.0)
                     remaining_urls = [w.url for w in gateway.list_workers()]
 
+                # Authoritative final read: strict, so a failed /workers call
+                # cannot masquerade as "no workers left".
+                remaining_urls = [w.url for w in gateway.list_workers(strict=True)]
                 assert http_worker.base_url not in remaining_urls, (
                     f"Worker {http_worker.base_url} still listed after removal: {remaining_urls}"
                 )
