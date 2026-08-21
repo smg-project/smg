@@ -17,10 +17,30 @@ Only `.github/workflows/vendor-probe.yml` runs it.
 
 ```
 vendor_probe/
-  probes/openai_responses.py     # ~225 probes, plain data (list of dicts)
-  probes/anthropic_messages.py   # ~163 probes, plain data
+  probes/openai_responses.py     # curated tier: ~225 probes, plain data
+  probes/anthropic_messages.py   # curated tier: ~163 probes, plain data
+  genmatrix.py                   # generated tier: ~6.5K OpenAI / ~5.1K Anthropic
   runner.py                      # async httpx runner + provider adapters
 ```
+
+Two tiers. The **curated** tier encodes semantic intent and dependency chains
+(tool loops, background polling, conversation CRUD). The **generated** tier is a
+deterministic expansion of axis specs grounded in
+`crates/protocols/src/{responses,messages}.rs` — five strategies, in
+budget-priority order:
+
+| strategy | category | what it records |
+|----------|----------|-----------------|
+| field mutations | `gen-mutation` | exact 4xx envelope per field path (wrong type / null / empty / unknown enum / unknown sibling) |
+| pairwise | `gen-pairwise` | greedy pairwise covering array over all interacting axes (seeded RNG) |
+| full cartesian | `gen-3wise` | full product over the most-interacting axis family (⊇ full 3-wise); constraint-pruned so every combo is a valid request |
+| boundary sweeps | `gen-boundary` | numeric ranges + length limits at {below-min, min, min+ε, typical, max, above-max} |
+| content shapes | `gen-content` | system-form × turn-count × content-block combos |
+
+`python -m vendor_probe.genmatrix` prints per-strategy counts and runs the
+constraint checker (unique ids, serializable bodies, cross-field validity).
+`summary.json` reports `fingerprint_clusters` per category — how many distinct
+behaviors the probes collapsed into, i.e. what the volume actually bought.
 
 Each probe is a dict: `id`, `category`, `endpoint`, `method`, `body`, `stream`,
 `depends_on`, `expect` (`ok|error`), `headers` (extra/override), `poll`, `note`.
@@ -64,8 +84,21 @@ python -m vendor_probe.runner --provider openai --filter 'fntool|stream' --out /
 | `ANTH_PROBE_EXPENSIVE` | — | `=1` to opt into the ~200K context-overflow probe |
 | `*_BASE_URL`, `SMG_BASE_URL`, `SMG_API_KEY` | vendor hosts | replay targets |
 
-Flags: `--concurrency` (4), `--timeout`, `--stream-timeout`, `--max-retries` (3),
-`--model`, `--model-classic`, `--filter <regex>`.
+Flags: `--tier curated|generated|all` (curated), `--budget N` (generated-tier
+truncation by strategy priority; 0 = unlimited), `--max-probes N` (post-filter
+cap), `--concurrency` (4; generated runs want 24), `--timeout`,
+`--stream-timeout`, `--max-retries` (3), `--model`, `--model-classic`,
+`--filter <regex>`.
+
+```bash
+# generated-tier smoke run (500 probes) and full dry-run validation
+python -m vendor_probe.runner --provider openai --tier generated --budget 500 --dry-run
+python -m vendor_probe.runner --provider openai --tier all --dry-run
+```
+
+The PR-triggered workflow run stays on the curated tier; `workflow_dispatch`
+defaults to `tier=all` at concurrency 24 (`tier`, `concurrency`, `budget`
+inputs).
 
 ## Dual-target replay (future SMG diff)
 
