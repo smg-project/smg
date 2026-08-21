@@ -67,9 +67,12 @@ class TestPDResponsesHttp:
 
         delta_events = [e for e in events if e.type == "response.output_text.delta"]
         assert len(delta_events) > 0
+        streamed_text = "".join(e.delta for e in delta_events)
+        assert len(streamed_text) > 0
 
         completed_events = [e for e in events if e.type == "response.completed"]
         assert len(completed_events) == 1
+        assert completed_events[0].response.status == "completed"
 
 
 @pytest.mark.engine("sglang", "vllm")
@@ -104,9 +107,12 @@ class TestPDResponsesGrpc:
 
         delta_events = [e for e in events if e.type == "response.output_text.delta"]
         assert len(delta_events) > 0
+        streamed_text = "".join(e.delta for e in delta_events)
+        assert len(streamed_text) > 0
 
         completed_events = [e for e in events if e.type == "response.completed"]
         assert len(completed_events) == 1
+        assert completed_events[0].response.status == "completed"
 
     def test_previous_response_id_chaining(self, model, api_client):
         """Test chaining responses using previous_response_id."""
