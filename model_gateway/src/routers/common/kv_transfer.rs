@@ -6,6 +6,8 @@
 //! PD router both implement that flow; the connector vocabulary lives here
 //! so the two stay in lockstep.
 
+use tracing::warn;
+
 use crate::{
     observability::metrics::metrics_labels,
     worker::{Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
@@ -82,11 +84,24 @@ pub(crate) fn effective_kv_engine_id(
 /// engine behind an unexpanded worker must not be minted for.
 pub(crate) fn connector_mode_for_worker(worker: &dyn Worker) -> KvConnectorMode {
     let meta = worker.metadata();
-    let dp_size = worker
-        .dp_size()
-        .or_else(|| meta.spec.labels.get("dp_size").and_then(|s| s.parse().ok()));
-    let engine_id =
-        effective_kv_engine_id(meta.spec.kv_engine_id.as_deref(), dp_size, worker.dp_rank());
+    let dp_label = meta.spec.labels.get("dp_size");
+    let label_dp = dp_label.and_then(|s| s.parse::<usize>().ok().filter(|v| *v > 0));
+    let engine_id = if worker.dp_size().is_none() && dp_label.is_some() && label_dp.is_none() {
+        // A dp_size label that does not parse as a positive integer means the
+        // DP topology is unknown, not absent. Minting an unsuffixed engine id
+        // could target the wrong engine core, so fail closed: no mint, decode
+        // recomputes the prompt.
+        warn!(
+            worker = %worker.url(),
+            dp_size = ?dp_label,
+            "invalid dp_size label; treating DP topology as unknown and \
+             skipping KV engine-id minting"
+        );
+        None
+    } else {
+        let dp_size = worker.dp_size().or(label_dp);
+        effective_kv_engine_id(meta.spec.kv_engine_id.as_deref(), dp_size, worker.dp_rank())
+    };
     kv_connector_mode(
         meta.spec.kv_connector.as_deref(),
         &meta.spec.bootstrap_host,
@@ -189,6 +204,42 @@ mod tests {
             kv_connector_mode(None, "host", None, None),
             KvConnectorMode::Passthrough
         );
+    }
+
+    #[test]
+    fn invalid_dp_size_label_fails_closed_on_minting() {
+        use crate::worker::{BasicWorkerBuilder, WorkerType};
+
+        let worker = BasicWorkerBuilder::new("http://prefill:8000")
+            .worker_type(WorkerType::Prefill)
+            .kv_connector(MOONCAKE_CONNECTOR)
+            .kv_engine_id("eng")
+            .label("dp_size", "not-a-number")
+            .build();
+        let mode = connector_mode_for_worker(&worker);
+        // Unknown DP topology must not mint an unsuffixed engine id.
+        assert!(matches!(
+            mode,
+            KvConnectorMode::Mooncake {
+                engine_id: None,
+                ..
+            }
+        ));
+
+        let worker = BasicWorkerBuilder::new("http://prefill:8000")
+            .worker_type(WorkerType::Prefill)
+            .kv_connector(MOONCAKE_CONNECTOR)
+            .kv_engine_id("eng")
+            .label("dp_size", "1")
+            .build();
+        let mode = connector_mode_for_worker(&worker);
+        assert!(matches!(
+            mode,
+            KvConnectorMode::Mooncake {
+                engine_id: Some(ref id),
+                ..
+            } if id == "eng"
+        ));
     }
 
     #[test]

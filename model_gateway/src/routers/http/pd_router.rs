@@ -550,7 +550,10 @@ impl PDRouter {
             };
             lease.release_dispatch();
 
-            let response = self
+            // Outcome accounting happens per-leg inside the sequential path:
+            // a prefill-only failure must not feed the decode worker's
+            // circuit breaker (the decode leg was never contacted).
+            return self
                 .execute_sequential_dispatch_internal(
                     headers,
                     (prefill_body, decode_body),
@@ -562,24 +565,6 @@ impl PDRouter {
                     load_guards,
                 )
                 .await;
-
-            let status = response.status();
-            prefill.record_outcome(status.as_u16());
-            decode.record_outcome(status.as_u16());
-            if status.is_server_error() {
-                let error_type = error_type_from_status(status);
-                Metrics::record_worker_error(
-                    metrics_labels::WORKER_PREFILL,
-                    metrics_labels::CONNECTION_HTTP,
-                    error_type,
-                );
-                Metrics::record_worker_error(
-                    metrics_labels::WORKER_DECODE,
-                    metrics_labels::CONNECTION_HTTP,
-                    error_type,
-                );
-            }
-            return response;
         }
 
         let legs = lease.serialize_legs_with(|view| -> Result<(Vec<u8>, Vec<u8>), Box<Response>> {
@@ -1010,71 +995,102 @@ impl PDRouter {
         let headers = Some(&headers_with_trace);
         let runtime = prefill.metadata().spec.runtime_type.as_str();
 
-        events::RequestPDSentEvent {
-            prefill_url: prefill.url(),
-            decode_url: decode.url(),
-        }
-        .emit();
-
-        let dispatch_start = Instant::now();
-        let prefill_request = self.build_post_with_headers(
-            &self.client,
-            prefill.as_ref(),
-            context.route,
-            prefill_body,
-            headers,
-            false,
-        );
-        let prefill_response = match send_with_stale_conn_retry(prefill_request).await {
-            Ok(response) => response,
-            Err(e) => {
-                error!("PD prefill transport error: {e}");
-                return error::bad_gateway(
-                    "prefill_request_failed",
-                    format!("Prefill transport error: {e}"),
-                );
-            }
-        };
-        let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        if !prefill_status.is_success() {
-            error!(
-                "Prefill server returned error status prefill_url={} status={}",
-                prefill.url(),
-                prefill_status
-            );
-            return Self::prefill_error_response(prefill_status, prefill_response).await;
-        }
-        let prefill_bytes = match prefill_response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                error!("Failed to read prefill response: {e}");
-                return error::bad_gateway(
-                    "prefill_read_failed",
-                    format!("Failed to read prefill response: {e}"),
-                );
-            }
-        };
-        Metrics::record_pd_prefill_duration(
-            metrics_labels::BACKEND_PD,
-            context.model_id,
-            runtime,
-            dispatch_start.elapsed(),
-        );
-
-        // Harvest the handoff params the prefill engine returned (NIXL and
-        // opportunistic passthrough; Mooncake returns nothing and is minted).
-        let harvested = serde_json::from_slice::<Value>(&prefill_bytes)
-            .ok()
-            .and_then(|json| json.get("kv_transfer_params").cloned())
-            .filter(|params| !params.is_null());
-
         let mut decode_json = match serde_json::from_slice::<Value>(&decode_body) {
             Ok(json) => json,
             Err(e) => return Self::handle_serialization_error(e),
         };
+        // The KV handoff is single-consumer, so an n>1 fan-out cannot use it —
+        // and without the handoff a prefill leg is pure wasted GPU work plus
+        // serial latency. Skip prefill entirely and let decode own the prompt.
         let relay = Self::sampling_n(&decode_json) <= 1;
         Metrics::record_pd_kv_connector_mode(mode.metrics_label());
+
+        let dispatch_start = Instant::now();
+        let harvested = if relay {
+            events::RequestPDSentEvent {
+                prefill_url: prefill.url(),
+                decode_url: decode.url(),
+            }
+            .emit();
+
+            let prefill_request = self.build_post_with_headers(
+                &self.client,
+                prefill.as_ref(),
+                context.route,
+                prefill_body,
+                headers,
+                false,
+            );
+            let prefill_response = match send_with_stale_conn_retry(prefill_request).await {
+                Ok(response) => response,
+                Err(e) => {
+                    error!("PD prefill transport error: {e}");
+                    Self::record_sequential_leg(
+                        prefill.as_ref(),
+                        metrics_labels::WORKER_PREFILL,
+                        StatusCode::BAD_GATEWAY,
+                    );
+                    return error::bad_gateway(
+                        "prefill_request_failed",
+                        format!("Prefill transport error: {e}"),
+                    );
+                }
+            };
+            let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            if !prefill_status.is_success() {
+                error!(
+                    "Prefill server returned error status prefill_url={} status={}",
+                    prefill.url(),
+                    prefill_status
+                );
+                Self::record_sequential_leg(
+                    prefill.as_ref(),
+                    metrics_labels::WORKER_PREFILL,
+                    prefill_status,
+                );
+                return Self::prefill_error_response(prefill_status, prefill_response).await;
+            }
+            let prefill_bytes = match prefill_response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    error!("Failed to read prefill response: {e}");
+                    Self::record_sequential_leg(
+                        prefill.as_ref(),
+                        metrics_labels::WORKER_PREFILL,
+                        StatusCode::BAD_GATEWAY,
+                    );
+                    return error::bad_gateway(
+                        "prefill_read_failed",
+                        format!("Failed to read prefill response: {e}"),
+                    );
+                }
+            };
+            Self::record_sequential_leg(
+                prefill.as_ref(),
+                metrics_labels::WORKER_PREFILL,
+                prefill_status,
+            );
+            Metrics::record_pd_prefill_duration(
+                metrics_labels::BACKEND_PD,
+                context.model_id,
+                runtime,
+                dispatch_start.elapsed(),
+            );
+
+            // Harvest the handoff params the prefill engine returned (NIXL and
+            // opportunistic passthrough; Mooncake returns nothing and is minted).
+            serde_json::from_slice::<Value>(&prefill_bytes)
+                .ok()
+                .and_then(|json| json.get("kv_transfer_params").cloned())
+                .filter(|params| !params.is_null())
+        } else {
+            debug!(
+                "vLLM PD over HTTP: n>1 fan-out cannot consume a KV handoff; \
+                 dispatching to decode only"
+            );
+            None
+        };
         let decode_params = match (&mode, harvested) {
             // Modern Mooncake: synthesized params under the minted transfer_id
             (
@@ -1131,6 +1147,11 @@ impl PDRouter {
             Ok(response) => response,
             Err(e) => {
                 error!("PD decode transport error: {e}");
+                Self::record_sequential_leg(
+                    decode.as_ref(),
+                    metrics_labels::WORKER_DECODE,
+                    StatusCode::BAD_GATEWAY,
+                );
                 return error::bad_gateway(
                     "decode_request_failed",
                     format!("Decode transport error: {e}"),
@@ -1142,6 +1163,7 @@ impl PDRouter {
 
         let status = StatusCode::from_u16(decode_response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        Self::record_sequential_leg(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
         if !status.is_success() {
             error!(
                 "Decode server returned error status decode_url={} status={}",
@@ -1166,8 +1188,9 @@ impl PDRouter {
             .await
     }
 
-    /// Map a failed prefill response to a client-facing error, preserving the
-    /// upstream status class so retryability classification still works.
+    /// Map a failed prefill response to a client-facing error. The exact
+    /// upstream status is preserved (not classified into a fixed set) so
+    /// retryability and capacity-pushback handling see what the worker sent.
     async fn prefill_error_response(status: StatusCode, response: reqwest::Response) -> Response {
         let message = match response.bytes().await {
             Ok(body) => {
@@ -1184,14 +1207,19 @@ impl PDRouter {
             }
             Err(e) => format!("Prefill server error: {e}"),
         };
-        match status {
-            StatusCode::BAD_REQUEST => error::bad_request("prefill_bad_request", message),
-            StatusCode::NOT_FOUND => error::not_found("prefill_not_found", message),
-            StatusCode::SERVICE_UNAVAILABLE => {
-                error::service_unavailable("prefill_unavailable", message)
-            }
-            StatusCode::BAD_GATEWAY => error::bad_gateway("prefill_bad_gateway", message),
-            _ => error::internal_error("prefill_error", message),
+        error::create_error(status, "prefill_upstream_error", message)
+    }
+
+    /// Per-leg outcome accounting for the sequential path: a leg that was
+    /// never contacted must not feed the other worker's circuit breaker.
+    fn record_sequential_leg(worker: &dyn Worker, role: &'static str, status: StatusCode) {
+        worker.record_outcome(status.as_u16());
+        if status.is_server_error() {
+            Metrics::record_worker_error(
+                role,
+                metrics_labels::CONNECTION_HTTP,
+                error_type_from_status(status),
+            );
         }
     }
 
@@ -2515,6 +2543,58 @@ mod tests {
             Some(&Value::from("eng0"))
         );
         assert_eq!(body.get("bootstrap_room"), None, "no bootstrap on vLLM PD");
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_fanout_skips_the_prefill_leg() {
+        let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
+        let (decode_url, decode_seen) =
+            spawn_recording_stub(r#"{"object":"chat.completion"}"#).await;
+
+        let router = create_test_pd_router();
+        let prefill = BasicWorkerBuilder::new(prefill_url)
+            .worker_type(WorkerType::Prefill)
+            .runtime_type(RuntimeType::Vllm)
+            .kv_connector("NixlConnector")
+            .build();
+        prefill.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        let decode = BasicWorkerBuilder::new(decode_url)
+            .worker_type(WorkerType::Decode)
+            .runtime_type(RuntimeType::Vllm)
+            .build();
+        decode.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        router
+            .worker_registry
+            .register_or_replace(Arc::new(prefill));
+        router.worker_registry.register_or_replace(Arc::new(decode));
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "n": 2,
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request");
+        let response = router
+            .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The single-consumer KV handoff cannot serve an n>1 fan-out, so the
+        // prefill leg is skipped entirely rather than burned for nothing.
+        let prefill_seen = prefill_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(prefill_seen.is_empty(), "prefill leg must not be contacted");
+
+        let decode_seen = decode_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(decode_seen.len(), 1, "exactly one decode request");
+        let (_, body) = &decode_seen[0];
+        assert_eq!(body.get("n"), Some(&Value::from(2)));
+        assert_eq!(body.get("kv_transfer_params"), None);
     }
 
     #[test]
