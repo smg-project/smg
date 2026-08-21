@@ -26,6 +26,19 @@ on:
         description: Optional regex over probe ids
         type: string
         default: ""
+      tier:
+        description: Probe tier (curated = hand-written, generated = genmatrix)
+        type: choice
+        options: [all, curated, generated]
+        default: all
+      concurrency:
+        description: Runner concurrency
+        type: string
+        default: "24"
+      budget:
+        description: Generated-tier probe budget (0 = unlimited)
+        type: string
+        default: "0"
   pull_request:
     paths:
       - vendor_probe/**
@@ -43,11 +56,16 @@ env:
   OPENAI_MODEL: ${{ inputs.openai_model || 'gpt-5-nano' }}
   ANTHROPIC_MODEL: ${{ inputs.anthropic_model || 'claude-haiku-4-5' }}
   PROBE_FILTER: ${{ inputs.probe_filter || '' }}
+  # pull_request runs stay cheap (curated tier, low concurrency); dispatch
+  # defaults to the full generated matrix at concurrency 24
+  PROBE_TIER: ${{ inputs.tier || 'curated' }}
+  PROBE_CONCURRENCY: ${{ inputs.concurrency || '4' }}
+  PROBE_BUDGET: ${{ inputs.budget || '0' }}
 
 jobs:
   probe:
     runs-on: k8s-runner-cpu
-    timeout-minutes: 45
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
         with:
@@ -82,7 +100,15 @@ jobs:
           FILTER_ARG=""
           [ -n "$PROBE_FILTER" ] && FILTER_ARG="--filter $PROBE_FILTER"
           python -m vendor_probe.runner --provider openai \
+            --tier "$PROBE_TIER" --budget "$PROBE_BUDGET" \
+            --concurrency "$PROBE_CONCURRENCY" \
             --out results/openai $FILTER_ARG
+
+      - name: Compress OpenAI results if large
+        if: ${{ always() && (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai') }}
+        run: |
+          f=results/openai/results.jsonl
+          if [ -f "$f" ] && [ "$(stat -c%s "$f")" -gt 52428800 ]; then gzip "$f"; fi
 
       - name: Upload OpenAI artifact
         if: ${{ always() && (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai') }}
@@ -101,7 +127,15 @@ jobs:
           FILTER_ARG=""
           [ -n "$PROBE_FILTER" ] && FILTER_ARG="--filter $PROBE_FILTER"
           python -m vendor_probe.runner --provider anthropic \
+            --tier "$PROBE_TIER" --budget "$PROBE_BUDGET" \
+            --concurrency "$PROBE_CONCURRENCY" \
             --out results/anthropic $FILTER_ARG
+
+      - name: Compress Anthropic results if large
+        if: ${{ always() && (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'anthropic') }}
+        run: |
+          f=results/anthropic/results.jsonl
+          if [ -f "$f" ] && [ "$(stat -c%s "$f")" -gt 52428800 ]; then gzip "$f"; fi
 
       - name: Upload Anthropic artifact
         if: ${{ always() && (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'anthropic') }}
