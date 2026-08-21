@@ -1040,6 +1040,9 @@ class _TestToolChoiceBase:
             assert choice.message.content and choice.message.content.strip(), (
                 "Expected non-empty text content when no tool call was made"
             )
+            assert choice.finish_reason == "stop", (
+                f"Expected finish_reason 'stop', got {choice.finish_reason!r}"
+            )
 
         # --- Scenario 2: prompt that needs no tool ---
         response = api_client.chat.completions.create(
@@ -1056,6 +1059,9 @@ class _TestToolChoiceBase:
         if flaky and choice.message.tool_calls:
             # Weak model spuriously called a tool; it must still be declared/valid.
             self._assert_auto_tool_calls_valid(choice.message.tool_calls, tools)
+            assert choice.finish_reason == "tool_calls", (
+                f"Expected finish_reason 'tool_calls', got {choice.finish_reason!r}"
+            )
         else:
             assert not choice.message.tool_calls, (
                 f"Expected no tool calls for a trivial arithmetic prompt, "
@@ -1138,6 +1144,7 @@ class _TestToolChoiceBase:
                 "clearly needs the declared weather tool"
             )
             assert content.strip(), "Expected non-empty streamed text when no tool call was made"
+            assert finish_reason == "stop", f"Expected finish_reason 'stop', got {finish_reason!r}"
 
         # --- Scenario 2: prompt that needs no tool ---
         content, tool_calls, finish_reason = collect_stream(
@@ -1145,6 +1152,9 @@ class _TestToolChoiceBase:
         )
         if flaky and tool_calls:
             assert_streamed_calls_valid(tool_calls)
+            assert finish_reason == "tool_calls", (
+                f"Expected finish_reason 'tool_calls', got {finish_reason!r}"
+            )
         else:
             assert not tool_calls, (
                 f"Expected no streamed tool calls for a trivial arithmetic prompt, "

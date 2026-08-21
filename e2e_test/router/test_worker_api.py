@@ -159,12 +159,14 @@ class TestIGWMode:
                 logger.info("Removed worker: %s", msg)
 
                 # Poll briefly in case removal is applied asynchronously.
+                # Sample once up front so the assertion below always has a
+                # real observation to report, even if the deadline has already
+                # passed by the time the loop condition is first evaluated.
                 deadline = time.perf_counter() + 15
-                while time.perf_counter() < deadline:
-                    remaining_urls = [w.url for w in gateway.list_workers()]
-                    if http_worker.base_url not in remaining_urls:
-                        break
+                remaining_urls = [w.url for w in gateway.list_workers()]
+                while http_worker.base_url in remaining_urls and time.perf_counter() < deadline:
                     time.sleep(1.0)
+                    remaining_urls = [w.url for w in gateway.list_workers()]
 
                 assert http_worker.base_url not in remaining_urls, (
                     f"Worker {http_worker.base_url} still listed after removal: {remaining_urls}"
