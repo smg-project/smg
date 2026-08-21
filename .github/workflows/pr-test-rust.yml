@@ -1206,7 +1206,7 @@ jobs:
 
           path = ".github/workflows/pr-test-rust.yml"
           src = open(path).read()
-          jobs = re.findall(r"^  (e2e-[a-z0-9-]*):", src, re.M)
+          jobs = re.findall(r"^  (e2e-[a-z0-9_-]*):", src, re.M)
           if not jobs:
               sys.exit("gate-integrity lint: found no e2e-* job definitions; lint is broken")
           fin = re.search(r"^  finish:\n(.*?)(?=^  \S|\Z)", src, re.M | re.S)
@@ -1218,7 +1218,15 @@ jobs:
               sys.exit("gate-integrity lint: finish.needs not found in inline-list form")
           needs = {n.strip() for n in needs_m.group(1).split(",")}
           missing_needs = sorted(j for j in jobs if j not in needs)
-          missing_check = sorted(j for j in jobs if f"needs.{j}.result" not in body)
+          # Search only the failure-check step, not the whole job body — a
+          # comment elsewhere must not satisfy the check.
+          check = re.search(
+              r"- name: Check CI result\n(.*?)(?=^      - name:|\Z)", body, re.M | re.S
+          )
+          if not check:
+              sys.exit("gate-integrity lint: could not locate the 'Check CI result' step")
+          check_body = check.group(1)
+          missing_check = sorted(j for j in jobs if f"needs.{j}.result" not in check_body)
           if missing_needs or missing_check:
               if missing_needs:
                   print(f"e2e jobs missing from finish.needs: {missing_needs}")

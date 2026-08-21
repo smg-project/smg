@@ -1,0 +1,8 @@
+# Custom self-hosted runner labels used by this repo's workflows, so
+# actionlint's runner-label check recognizes them.
+self-hosted-runner:
+  labels:
+    - k8s-runner-cpu
+    - k8s-runner-gpu
+    - 1-gpu-h100
+    - 4-gpu-h100
