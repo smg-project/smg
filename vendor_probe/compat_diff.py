@@ -32,6 +32,20 @@ Usage:
       --vendor results/openai --smg results/smg-openai \
       --provider openai --out compat/openai
 
+Baseline mode diffs a replay against a checked-in distillation (built by
+``vendor_probe.baseline``) instead of raw vendor recordings, and gates on the
+known-divergences allowlist: any divergent cluster whose signature is not
+allowlisted (or that got *worse* than its allowlisted severity) exits 1.
+
+  python -m vendor_probe.compat_diff \
+      --baseline vendor_probe/baselines/2026-08-21/openai \
+      --smg results/smg-openai --provider openai --out compat/openai \
+      --allowlist vendor_probe/baselines/2026-08-21/known_divergences.jsonl
+
+``--write-allowlist FILE`` regenerates the allowlist entries for this provider
+from the current run (grandfathering today's divergences); it replaces only
+this provider's lines and suppresses the failing exit.
+
 Severity ranking (worst first):
   S1  status mismatch (wrong status class; accepting what the vendor rejects
       or rejecting what the vendor accepts)
@@ -44,6 +58,7 @@ Severity ranking (worst first):
 from __future__ import annotations
 
 import argparse
+import datetime
 import gzip
 import json
 import re
@@ -216,7 +231,7 @@ _TERMINAL_EQUIV = {"response.completed", "response.incomplete"}
 
 def collapse_runs(names: list) -> tuple:
     """a b b b c -> (a, b+, c): delta repetition must not read as drift."""
-    out = []
+    out: list = []
     for n in names:
         if out and (out[-1] == n or out[-1] == n + "+"):
             out[-1] = n + "+"
@@ -251,6 +266,213 @@ def vendor_cluster_key(record, provider):
     body = get_body(record)
     paths = tuple(sorted(field_paths(body))) if isinstance(body, (dict, list)) else ()
     return ("json", status, paths)
+
+
+# =============================================================================
+# baseline mode: load a distilled baseline and synthesize vendor-side records
+# =============================================================================
+def skeleton_from_paths(paths):
+    """Rebuild a minimal JSON value whose field-path inventory equals ``paths``.
+
+    Inverse of :func:`field_paths` up to values: every dict key on a path
+    exists, arrays are materialized as single-element lists, leaves become 0.
+    """
+    if not paths:
+        return None
+
+    def node():
+        return {"depth": 0, "children": {}}
+
+    root = node()
+    for path in paths:
+        cur = root
+        for comp in path.split("."):
+            name, depth = comp, 0
+            while name.endswith("[]"):
+                name = name[:-2]
+                depth += 1
+            nxt = cur["children"].setdefault(name, node())
+            nxt["depth"] = max(nxt["depth"], depth)
+            cur = nxt
+
+    def wrap(n):
+        val = build(n)
+        for _ in range(n["depth"]):
+            val = [val]
+        return val
+
+    def build(n):
+        if not n["children"]:
+            return 0
+        if "" in n["children"]:  # leading "[]": the value at this level is a list
+            return wrap(n["children"][""])
+        return {name: wrap(child) for name, child in n["children"].items()}
+
+    return build(root)
+
+
+def load_baseline(dir_path: Path) -> list:
+    path = dir_path / "baseline.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(f"no baseline.jsonl in {dir_path}")
+    with path.open("r", encoding="utf-8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+def synth_vendor_records(baseline_clusters: list) -> dict:
+    """Reconstruct per-probe vendor records that classify() and the cluster
+    key reproduce exactly from the stored signatures/exemplars."""
+    records = {}
+    for c in baseline_clusters:
+        if c["kind"] == "sse":
+            events: list = []
+            for name in c["event_types"]:
+                if name == "[DONE]":
+                    events.append({"event": None, "data": "[DONE]", "parsed": None})
+                else:
+                    # event + parsed.type both set so OpenAI- and
+                    # Anthropic-style event_names() read the same name back.
+                    events.append({"event": name, "data": "", "parsed": {"type": name}})
+            response = {"status": c["status"], "sse_events": events}
+        else:
+            if c.get("exemplar_kind") == "body":
+                body = c.get("exemplar_body")
+            else:
+                body = skeleton_from_paths(c.get("field_paths") or [])
+            response = {"status": c["status"], "body": body}
+        for m in c["members"]:
+            records[m["id"]] = {
+                "probe_id": m["id"],
+                "category": m.get("category"),
+                "expect": m.get("expect"),
+                "recorded": True,
+                "response": response,
+            }
+    return records
+
+
+def baseline_key_index(baseline_clusters: list, records: dict, provider: str) -> dict:
+    """Map the recomputed vendor cluster key -> baseline cluster metadata."""
+    index = {}
+    mismatches = []
+    for c in baseline_clusters:
+        key = vendor_cluster_key(records[c["members"][0]["id"]], provider)
+        stored = tuple(c.get("event_types") or c.get("field_paths") or [])
+        if key[1] != c["status"] or key[2] != stored:
+            mismatches.append(c["cluster_id"])
+        index[key] = c
+    if mismatches:
+        print(
+            f"::warning::baseline signature reconstruction drifted for "
+            f"{len(mismatches)} clusters: {mismatches[:5]}",
+            file=sys.stderr,
+        )
+    return index
+
+
+# =============================================================================
+# regression gate (baseline mode)
+# =============================================================================
+def load_allowlist(path: Path, provider: str) -> dict:
+    """{sig_hash: allowlist entry} for this provider."""
+    allow: dict = {}
+    if not path.exists():
+        return allow
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            if entry.get("provider") == provider:
+                allow[entry["sig_hash"]] = entry
+    return allow
+
+
+def run_gate(clusters, entries, allow: dict, min_coverage: float):
+    """Return (violations, coverage). A violation is a NEW divergent cluster
+    (signature not allowlisted), a severity escalation beyond the allowlisted
+    severity, or replay coverage too low to trust a green result."""
+    violations = []
+    for c in clusters:
+        if c["verdict"] not in ("S1", "S2", "S3", "S4"):
+            continue
+        sig = c.get("sig_hash")
+        allowed = allow.get(sig)
+        if allowed is None:
+            violations.append(
+                {
+                    "kind": "new-divergent-cluster",
+                    "cluster_id": c["cluster_id"],
+                    "sig_hash": sig,
+                    "verdict": c["verdict"],
+                    "size": c["size"],
+                    "categories": c["categories"][:5],
+                    "example_probes": c["example_probes"][:3],
+                }
+            )
+        elif _SEV_RANK[c["verdict"]] < _SEV_RANK.get(allowed.get("verdict"), 99):
+            violations.append(
+                {
+                    "kind": "severity-escalation",
+                    "cluster_id": c["cluster_id"],
+                    "sig_hash": sig,
+                    "verdict": c["verdict"],
+                    "allowlisted_verdict": allowed.get("verdict"),
+                    "size": c["size"],
+                    "example_probes": c["example_probes"][:3],
+                }
+            )
+    uncovered = ("replay-gap", "replay-transport")
+    usable = sum(1 for e in entries if e["class"] not in uncovered)
+    coverage = usable / len(entries) if entries else 0.0
+    if coverage < min_coverage:
+        violations.append(
+            {
+                "kind": "low-replay-coverage",
+                "coverage": round(coverage, 4),
+                "min_coverage": min_coverage,
+                "note": "too few baseline probes produced comparable SMG responses; "
+                "a green gate would be meaningless",
+            }
+        )
+    return violations, coverage
+
+
+def write_allowlist(path: Path, provider: str, clusters, stamp: str):
+    """Write this provider's divergent clusters as allowlist lines, keeping
+    other providers' existing lines. Idempotent."""
+    keep = []
+    if path.exists():
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and json.loads(line).get("provider") != provider:
+                    keep.append(json.loads(line))
+    fresh = [
+        {
+            "provider": provider,
+            "sig_hash": c["sig_hash"],
+            "cluster_id": c["cluster_id"],
+            "verdict": c["verdict"],
+            "s1_kinds": c["s1_kinds"],
+            "size": c["size"],
+            "categories": c["categories"][:5],
+            "example_probes": c["example_probes"][:3],
+            "first_seen": stamp,
+            "note": "",
+        }
+        for c in clusters
+        if c["verdict"] in ("S1", "S2", "S3", "S4") and c.get("sig_hash")
+    ]
+    lines = sorted(
+        keep + fresh,
+        key=lambda e: (e["provider"], _SEV_RANK.get(e["verdict"], 99), e["cluster_id"]),
+    )
+    with path.open("w", encoding="utf-8") as fh:
+        for e in lines:
+            fh.write(json.dumps(e, ensure_ascii=False, sort_keys=True) + "\n")
+    return len(fresh)
 
 
 # =============================================================================
@@ -563,6 +785,7 @@ def aggregate(entries, vendor_records, provider):
         out.append(
             {
                 "cluster_id": f"C{i:03d}",
+                "key": key,
                 "kind": key[0],
                 "vendor_status": key[1],
                 "size": len(c["probes"]),
@@ -594,6 +817,8 @@ def render_report(provider, vendor_dir, smg_dir, entries, clusters):
     a("")
     a(f"- vendor truth: `{vendor_dir}`")
     a(f"- SMG replay:   `{smg_dir}`")
+    if any(c.get("sig_hash") for c in clusters):
+        a("- cluster ids: baseline (stable `Bnnn`, allowlist keys on `sig_hash`)")
     a(f"- probes compared: {len(entries)}")
     a(
         f"- probe verdicts: {n.get('exact', 0)} exact, {n.get('benign', 0)} benign, "
@@ -711,7 +936,13 @@ def render_report(provider, vendor_dir, smg_dir, entries, clusters):
 # =============================================================================
 def main(argv=None):
     ap = argparse.ArgumentParser(description="vendor-vs-SMG structural compat differ")
-    ap.add_argument("--vendor", required=True, help="vendor truth results dir")
+    ap.add_argument("--vendor", default=None, help="vendor truth results dir (raw recordings)")
+    ap.add_argument(
+        "--baseline",
+        default=None,
+        help="checked-in baseline dir (vendor_probe/baselines/<date>/<provider>) "
+        "to diff against instead of raw vendor recordings",
+    )
     ap.add_argument("--smg", required=True, help="SMG replay results dir")
     ap.add_argument(
         "--provider",
@@ -725,14 +956,45 @@ def main(argv=None):
         default=None,
         help="optional JSON file: list of SMG-only field paths documented as extensions",
     )
+    ap.add_argument(
+        "--allowlist",
+        default=None,
+        help="known-divergences jsonl (baseline mode): exit 1 on divergent clusters "
+        "whose sig_hash is not listed, or whose severity got worse",
+    )
+    ap.add_argument(
+        "--write-allowlist",
+        default=None,
+        help="baseline mode: (re)write this provider's allowlist lines from the "
+        "current run (grandfather today's divergences); suppresses the failing exit",
+    )
+    ap.add_argument(
+        "--min-replay-coverage",
+        type=float,
+        default=0.8,
+        help="baseline mode: gate fails when fewer than this fraction of baseline "
+        "probes produced comparable SMG responses",
+    )
     args = ap.parse_args(argv)
 
-    vendor_dir, smg_dir = Path(args.vendor), Path(args.smg)
-    vendor_records = load_results(vendor_dir)
+    if bool(args.vendor) == bool(args.baseline):
+        ap.error("exactly one of --vendor / --baseline is required")
+
+    smg_dir = Path(args.smg)
     smg_records = load_results(smg_dir)
     extension_allowlist = set()
     if args.extensions:
         extension_allowlist = set(json.loads(Path(args.extensions).read_text()))
+
+    key_index = None
+    if args.baseline:
+        vendor_dir = Path(args.baseline)
+        baseline_clusters = load_baseline(vendor_dir)
+        vendor_records = synth_vendor_records(baseline_clusters)
+        key_index = baseline_key_index(baseline_clusters, vendor_records, args.provider)
+    else:
+        vendor_dir = Path(args.vendor)
+        vendor_records = load_results(vendor_dir)
 
     entries = []
     for pid, vrec in vendor_records.items():
@@ -745,6 +1007,14 @@ def main(argv=None):
         )
 
     clusters = aggregate(entries, vendor_records, args.provider)
+    if key_index is not None:
+        # Relabel with the baseline's stable ids so reports and the allowlist
+        # agree across runs.
+        for c in clusters:
+            bc = key_index.get(c["key"])
+            if bc is not None:
+                c["cluster_id"] = bc["cluster_id"]
+                c["sig_hash"] = bc["sig_hash"]
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -754,26 +1024,56 @@ def main(argv=None):
                 e2 = dict(e)
                 e2["cluster_id"] = c["cluster_id"]
                 e2["cluster_verdict"] = c["verdict"]
+                if c.get("sig_hash"):
+                    e2["cluster_sig_hash"] = c["sig_hash"]
                 f.write(json.dumps(e2, ensure_ascii=False) + "\n")
     report = render_report(args.provider, vendor_dir, smg_dir, entries, clusters)
     (out_dir / "report.md").write_text(report)
 
     n = Counter(e["class"] for e in entries)
     cv = Counter(c["verdict"] for c in clusters)
-    print(
-        json.dumps(
-            {
-                "provider": args.provider,
-                "probes_compared": len(entries),
-                "probe_classes": dict(n),
-                "clusters": len(clusters),
-                "cluster_verdicts": dict(cv),
-                "report": str(out_dir / "report.md"),
-            },
-            indent=2,
-        )
-    )
-    return 0
+    summary = {
+        "provider": args.provider,
+        "probes_compared": len(entries),
+        "probe_classes": dict(n),
+        "clusters": len(clusters),
+        "cluster_verdicts": dict(cv),
+        "report": str(out_dir / "report.md"),
+    }
+
+    # --- regression gate (baseline mode only) -----------------------------
+    exit_code = 0
+    if args.baseline and (args.allowlist or args.write_allowlist):
+        if args.write_allowlist:
+            stamp = None
+            manifest_path = vendor_dir / "manifest.json"
+            if manifest_path.exists():
+                stamp = json.loads(manifest_path.read_text()).get("date")
+            if not stamp:
+                stamp = datetime.date.today().isoformat()
+            written = write_allowlist(Path(args.write_allowlist), args.provider, clusters, stamp)
+            summary["allowlist_written"] = written
+        allow = load_allowlist(Path(args.allowlist), args.provider) if args.allowlist else {}
+        violations, coverage = run_gate(clusters, entries, allow, args.min_replay_coverage)
+        gate = {
+            "provider": args.provider,
+            "allowlisted_clusters": len(allow),
+            "divergent_clusters": sum(
+                1 for c in clusters if c["verdict"] in ("S1", "S2", "S3", "S4")
+            ),
+            "replay_coverage": round(coverage, 4),
+            "violations": violations,
+        }
+        (out_dir / "gate.json").write_text(json.dumps(gate, indent=2, ensure_ascii=False))
+        summary["gate"] = {k: gate[k] for k in gate if k != "violations"}
+        summary["gate"]["violations"] = len(violations)
+        if violations and not args.write_allowlist:
+            for v in violations:
+                print(f"GATE VIOLATION: {json.dumps(v, ensure_ascii=False)}", file=sys.stderr)
+            exit_code = 1
+
+    print(json.dumps(summary, indent=2))
+    return exit_code
 
 
 if __name__ == "__main__":

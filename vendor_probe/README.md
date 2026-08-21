@@ -10,8 +10,10 @@ Dual-target by design: the identical probe set replays against an SMG gateway by
 swapping the provider adapter (`smg-openai` / `smg-anthropic`), producing a
 structural diff.
 
-Lives **outside** `e2e_test/` on purpose — no existing CI path filter picks it up.
-Only `.github/workflows/vendor-probe.yml` runs it.
+Lives **outside** `e2e_test/` on purpose: `.github/workflows/vendor-probe.yml`
+runs the recorder, and `vendor_probe/**` feeds the `agentic` change family in
+`pr-test-rust.yml` so the real-engine conformance suite
+(`e2e_test/vendor_compat/`, see below) revalidates probe/baseline changes.
 
 ## Layout
 
@@ -21,6 +23,10 @@ vendor_probe/
   probes/anthropic_messages.py   # curated tier: ~163 probes, plain data
   genmatrix.py                   # generated tier: ~6.5K OpenAI / ~5.1K Anthropic
   runner.py                      # async httpx runner + provider adapters
+  compat_diff.py                 # structural differ (+ --baseline gate mode)
+  baseline.py                    # distills recordings into checked-in baselines
+  baselines/<date>/{openai,anthropic}/   # TRACKED: cluster ground truth
+  baselines/<date>/known_divergences.jsonl  # TRACKED: grandfathered divergences
 ```
 
 Two tiers. The **curated** tier encodes semantic intent and dependency chains
@@ -189,6 +195,102 @@ timestamps, model names, token counts) never registers: body comparison is
 path-based, and envelope comparisons scrub volatile substrings first.
 Outputs: `report.md` (ranked, human) + `diff.jsonl` (one line per probe,
 machine-readable, tagged with cluster id and verdict).
+
+## Checked-in baselines (`baselines/<date>/`)
+
+Raw recordings are tens of MB and stay out of git (`.gitignore`); the durable
+copies live as assets on the `vendor-truth-<date>` GitHub release that full
+`workflow_dispatch` runs publish. What IS tracked is the distillation
+`baseline.py` produces — per vendor fingerprint cluster (the same key
+`compat_diff` aggregates by): the signature (status + sorted field paths or
+run-collapsed SSE event types), a stable `sig_hash`, member probe ids with
+category/expect, and one normalized exemplar. Exemplars are scrubbed exactly
+as `compat_diff` normalizes (ids/timestamps/model names/token counts →
+placeholders, volatile integers → 0); error bodies are kept verbatim (the S4
+envelope comparison needs their values), large 2xx bodies keep only the
+field-path skeleton. Output is fully deterministic (sorted clusters, members,
+keys), ~1.6 MB (OpenAI, 138 clusters) + ~0.7 MB (Anthropic, 26 clusters);
+`manifest.json` pins provenance (probe-set git sha, recording run id, models,
+counts, cost).
+
+```bash
+python -m vendor_probe.baseline \
+    --results results/openai --provider openai \
+    --out vendor_probe/baselines/<date>/openai \
+    --probe-set-sha <sha> --run-id <run> --date <date>
+```
+
+### Baseline diff + regression gate
+
+`compat_diff --baseline` diffs an SMG replay against a baseline dir instead of
+raw vendor recordings — same severity ranking, same report format, plus stable
+cluster ids (`Bnnn`) and a regression gate: with `--allowlist`, any divergent
+cluster whose `sig_hash` is not in `known_divergences.jsonl` — or whose
+severity got worse than allowlisted — exits 1 (plus a replay-coverage floor so
+a dead gateway can't fake green). The checked-in allowlist grandfathers the
+150 divergent clusters present when the baseline was cut (133 OpenAI + 17
+Anthropic); the gate catches *regressions beyond that state*, and
+`--write-allowlist` regenerates a provider's lines after divergences are
+deliberately fixed or accepted.
+
+```bash
+python -m vendor_probe.compat_diff \
+    --baseline vendor_probe/baselines/2026-08-21/openai \
+    --smg results/smg-openai --provider openai --out compat/openai \
+    --allowlist vendor_probe/baselines/2026-08-21/known_divergences.jsonl
+```
+
+### Refreshing the baselines
+
+1. Full recording: dispatch the Vendor Probe workflow (`tier=all`). Healthy
+   runs auto-publish gzipped recordings to the `vendor-truth-<date>` release.
+2. `gh release download vendor-truth-<date>`, run `baseline.py` per provider
+   into `vendor_probe/baselines/<new-date>/` with the new run's provenance.
+3. Replay locally (mock-worker recipe below, or a real stack) and run
+   `compat_diff --baseline ... --write-allowlist` per provider to re-grandfather
+   the then-current divergences into the new `known_divergences.jsonl` —
+   diff it against the old allowlist and account for every entry that
+   appeared or disappeared before committing.
+
+## Real-engine conformance suite (`e2e_test/vendor_compat/`)
+
+The ongoing gate is an e2e suite that replays cluster representatives (up to 3
+member probes per cluster — first/middle/last of the sorted ids — plus
+dependency closure; ~380 requests total) against the PR lane's real gateway +
+engine, and asserts every baseline cluster still holds structurally. One test
+per (surface, cluster); grandfathered divergences xfail; a new divergent
+cluster or a known one getting *worse* fails with a ready-to-paste
+`TO-TRIAGE` allowlist line. It rides the `e2e-1gpu-responses` lane in
+`pr-test-rust.yml` (gated on the `common`/`agentic` change families, which
+include `crates/protocols`, `model_gateway`, and `vendor_probe/**`).
+
+Because that lane runs a real model, content-dependent clusters that a canned
+mock could never adjudicate get compared for real there; structural drift they
+were hiding surfaces as failures to triage — add allowlist entries with a
+`TO-TRIAGE` note rather than silently absorbing them.
+
+Run it against any running SMG (E2E-style env):
+
+```bash
+# lane-style: launch workers + gateway via the e2e harness
+pytest e2e_test/vendor_compat -k openai -s -vv
+
+# knobs
+VENDOR_COMPAT_FULL=1              # replay every baseline member (nightly)
+VENDOR_COMPAT_CONCURRENCY=16
+VENDOR_COMPAT_TIMEOUT=120 VENDOR_COMPAT_STREAM_TIMEOUT=240
+```
+
+The CPU-side logic (representative selection, cluster judgment) is
+unit-tested in `e2e_test/vendor_compat/test_conformance_unit.py`, which runs
+in the harness unit-test job without a GPU.
+
+### CI permission note
+
+The `publish-truth` job in `vendor-probe.yml` carries `contents: write`
+(wider than the workflow's default `contents: read`) to create the
+`vendor-truth-<date>` release and upload assets. It is scoped to that job
+only; the probe job holding the vendor API keys stays read-only.
 
 ## Artifact layout (per provider `--out` dir)
 
