@@ -22,7 +22,7 @@ fi
 # engine-watch workflow files an issue when this drifts) rather than
 # floating against ``main`` — upstream has renamed APIs before and the
 # gRPC servicer broke until we caught up.
-TOKENSPEED_REF="${TOKENSPEED_REF:-04bc08649f3e53e19144ee86564be7c6121c99d2}"
+TOKENSPEED_REF="${TOKENSPEED_REF:-eaf9e503bbfda773a4749500e973c68538247ee2}"
 TOKENSPEED_REPO="${TOKENSPEED_REPO:-https://github.com/lightseekorg/tokenspeed.git}"
 TOKENSPEED_DIR="${TOKENSPEED_DIR:-/tmp/tokenspeed-src}"
 
