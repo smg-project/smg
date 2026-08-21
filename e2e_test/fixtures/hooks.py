@@ -30,6 +30,10 @@ from .markers import resolve_class_marker
 # vendor names — is out of scope for ZMQ.
 _ZMQ_LOCAL_WIRES = frozenset({"grpc", "http"})
 
+# Per-session selection accounting filled in by ``pytest_collection_modifyitems``
+# and printed as one greppable ``e2e selection:`` line after collection.
+_SELECTION_STATS_KEY: pytest.StashKey[dict] = pytest.StashKey()
+
 # ---------------------------------------------------------------------------
 # Marker registration
 # ---------------------------------------------------------------------------
@@ -91,6 +95,12 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "nightly: mark test as a nightly comprehensive benchmark",
     )
+
+    # ``hooks.py`` is not itself a conftest — only the functions conftest.py
+    # re-imports act as hooks — so the collection-summary reporter is
+    # registered here as a plugin object instead.
+    if not config.pluginmanager.has_plugin("e2e_selection_reporter"):
+        config.pluginmanager.register(_SelectionReporter(), "e2e_selection_reporter")
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +230,104 @@ def _filter_tokenspeed_dp_items(
     return kept, deselected
 
 
+def _filter_env_items(
+    items: list[pytest.Item],
+    engine: str | None,
+    vendor: str | None,
+    gpu_tier: str | None,
+) -> tuple[list[pytest.Item], dict[str, list[pytest.Item]]]:
+    """Split items into (selected, deselected-by-reason) for the env filter.
+
+    Each dropped item is attributed to the first filter that rejects it, in
+    ``engine`` → ``vendor`` → ``tier`` order.
+    """
+    selected: list[pytest.Item] = []
+    deselected_by: dict[str, list[pytest.Item]] = {"engine": [], "vendor": [], "tier": []}
+    for item in items:
+        # Filter by engine
+        if engine:
+            engine_marker = _get_marker(item, "engine")
+            if not engine_marker or engine not in engine_marker.args:
+                deselected_by["engine"].append(item)
+                continue
+        # Filter by vendor
+        if vendor:
+            vendor_marker = _get_marker(item, "vendor")
+            if not vendor_marker or vendor not in vendor_marker.args:
+                deselected_by["vendor"].append(item)
+                continue
+        # Filter by GPU tier
+        if gpu_tier is not None:
+            gpu_marker = _get_marker(item, "gpu")
+            gpu_count = gpu_marker.args[0] if gpu_marker else 1
+            if str(gpu_count) != gpu_tier:
+                deselected_by["tier"].append(item)
+                continue
+        selected.append(item)
+    return selected, deselected_by
+
+
+def _enforce_selection_floor(selected_count: int) -> None:
+    """Fail the session when fewer tests survived selection than the floor.
+
+    ``E2E_MIN_SELECTED`` (integer) arms the check; unset or blank disables it.
+    A violation aborts the run via ``pytest.exit`` so the CI log shows a
+    loud ``!!! Exit !!!`` banner instead of a quietly shrunken suite.
+    """
+    raw = (os.environ.get("E2E_MIN_SELECTED") or "").strip()
+    if not raw:
+        return
+    try:
+        floor = int(raw)
+    except ValueError:
+        pytest.exit(
+            f"e2e selection: E2E_MIN_SELECTED={raw!r} is not an integer",
+            returncode=1,
+        )
+    if selected_count < floor:
+        pytest.exit(
+            f"e2e selection: only {selected_count} tests selected, below the "
+            f"E2E_MIN_SELECTED floor of {floor}. The E2E_ENGINE/E2E_VENDOR/"
+            f"E2E_GPU_TIER env filter in e2e_test/fixtures/hooks.py is the "
+            f"likely cause (marker drift or a lane env-var typo).",
+            returncode=1,
+        )
+
+
+def _format_selection_line(stats: dict) -> str:
+    """Render the one-line, greppable ``e2e selection:`` summary."""
+    header = f"e2e selection: engine={stats['engine'] or '-'}"
+    if stats.get("vendor"):
+        header += f" vendor={stats['vendor']}"
+    header += f" tier={stats['tier'] or '-'}"
+    parts = [f"{stats['by_engine']} deselected by engine"]
+    if stats.get("vendor") or stats["by_vendor"]:
+        parts.append(f"{stats['by_vendor']} by vendor")
+    parts.append(f"{stats['by_tier']} by tier")
+    parts.append(f"{stats['by_zmq']} by zmq-dedup")
+    if stats["by_tokenspeed_dp"]:
+        parts.append(f"{stats['by_tokenspeed_dp']} by tokenspeed-dp")
+    return (
+        f"{header}: selected {stats['selected']} of {stats['collected']} collected "
+        f"({', '.join(parts)})"
+    )
+
+
+class _SelectionReporter:
+    """Terminal plugin printing the selection summary after collection.
+
+    Lives on the plugin manager (registered in ``pytest_configure``) because
+    ``hooks.py`` is not a conftest, so a module-level
+    ``pytest_report_collectionfinish`` here would never be discovered.
+    """
+
+    def pytest_report_collectionfinish(self, config: pytest.Config) -> str | None:
+        stats = config.stash.get(_SELECTION_STATS_KEY, None)
+        if not stats:
+            return None
+        return _format_selection_line(stats)
+
+
 def pytest_collection_modifyitems(
     config: pytest.Config,
     items: list[pytest.Item],
@@ -231,6 +339,11 @@ def pytest_collection_modifyitems(
     lane additionally drops the gRPC-only families (PD, EPD, multi-worker) and
     collapses ``grpc``/``http`` twins onto a single ZMQ run.
 
+    Every dropped item is reported through ``pytest_deselected`` (so terminal
+    output shows ``N deselected`` instead of silently running fewer tests than
+    collected) and tallied into the ``e2e selection:`` summary line. When
+    ``E2E_MIN_SELECTED`` is set, a final selection below it aborts the session.
+
     Ordering: items are sorted by ``(backend, model)`` so consecutive
     classes that share a backend cluster together. This is what lets
     ``infra.worker_pool`` reuse a single worker across many test classes
@@ -240,30 +353,31 @@ def pytest_collection_modifyitems(
     vendor = os.environ.get("E2E_VENDOR") or None
     gpu_tier = os.environ.get("E2E_GPU_TIER") or None
 
+    stats = {
+        "engine": engine,
+        "vendor": vendor,
+        "tier": gpu_tier,
+        "collected": len(items),
+        "by_engine": 0,
+        "by_vendor": 0,
+        "by_tier": 0,
+        "by_zmq": 0,
+        "by_tokenspeed_dp": 0,
+    }
+
     if any([engine, vendor, gpu_tier]):
-        selected: list[pytest.Item] = []
-        for item in items:
-            # Filter by engine
-            if engine:
-                engine_marker = _get_marker(item, "engine")
-                if not engine_marker or engine not in engine_marker.args:
-                    continue
-            # Filter by vendor
-            if vendor:
-                vendor_marker = _get_marker(item, "vendor")
-                if not vendor_marker or vendor not in vendor_marker.args:
-                    continue
-            # Filter by GPU tier
-            if gpu_tier is not None:
-                gpu_marker = _get_marker(item, "gpu")
-                gpu_count = gpu_marker.args[0] if gpu_marker else 1
-                if str(gpu_count) != gpu_tier:
-                    continue
-            selected.append(item)
+        selected, deselected_by = _filter_env_items(items, engine, vendor, gpu_tier)
+        stats["by_engine"] = len(deselected_by["engine"])
+        stats["by_vendor"] = len(deselected_by["vendor"])
+        stats["by_tier"] = len(deselected_by["tier"])
+        deselected = deselected_by["engine"] + deselected_by["vendor"] + deselected_by["tier"]
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
         items[:] = selected
 
     if get_connection_mode_override() == ConnectionMode.ZMQ:
         kept, deselected = _filter_zmq_items(items)
+        stats["by_zmq"] = len(deselected)
         if deselected:
             config.hook.pytest_deselected(items=deselected)
             items[:] = kept
@@ -272,11 +386,16 @@ def pytest_collection_modifyitems(
         # run under DP (see _TOKENSPEED_DP_BROKEN_MODELS).
         if get_runtime() == "tokenspeed" and get_zmq_engine_count() > 1:
             kept, deselected = _filter_tokenspeed_dp_items(items)
+            stats["by_tokenspeed_dp"] = len(deselected)
             if deselected:
                 config.hook.pytest_deselected(items=deselected)
                 items[:] = kept
 
+    stats["selected"] = len(items)
+    config.stash[_SELECTION_STATS_KEY] = stats
+
     items.sort(key=_pool_sort_key)
+    _enforce_selection_floor(len(items))
 
 
 def _pool_sort_key(item: pytest.Item) -> tuple:
