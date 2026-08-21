@@ -28,6 +28,7 @@
 //!   responses to clients and parsing upstream SSE byte streams
 
 pub mod header_utils;
+pub(crate) mod kv_transfer;
 pub mod mcp_utils;
 pub mod openai_bridge;
 pub mod overload;
