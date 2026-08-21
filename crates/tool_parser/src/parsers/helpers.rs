@@ -124,6 +124,27 @@ pub fn get_unstreamed_args(
     }])
 }
 
+/// End-of-stream flush: take any text still buffered as a *prospective* tool
+/// call so the caller can emit it as normal content instead of dropping it.
+///
+/// Returns the buffer verbatim when no tool call was ever announced this
+/// request (`current_tool_id == -1`): the buffered text was only ever a
+/// tool-call *candidate* (e.g. a bare `{` prefix or a partial start marker)
+/// that never materialized, so it is content. Once a tool call has been
+/// announced (`current_tool_id >= 0`), the buffered tail is tool-call syntax
+/// (separators, closing brackets, or a partially-streamed call whose
+/// remaining arguments are recovered via [`get_unstreamed_args`]) and is
+/// discarded — matching the non-streaming path, which drops trailing
+/// non-JSON text once tool calls were extracted.
+pub fn take_unstreamed_normal_text(buffer: &mut String, current_tool_id: i32) -> String {
+    let text = std::mem::take(buffer);
+    if current_tool_id == -1 {
+        text
+    } else {
+        String::new()
+    }
+}
+
 /// Check if a buffer ends with a partial occurrence of a token
 /// Returns Some(length) if there's a partial match, None otherwise
 pub fn ends_with_partial_token(buffer: &str, token: &str) -> Option<usize> {
@@ -284,16 +305,41 @@ pub(crate) fn handle_json_tool_streaming(
     // Validate tool name if present
     if let Some(name) = current_tool_call.get("name").and_then(|v| v.as_str()) {
         if !tool_indices.contains_key(name) {
-            // Invalid tool name - skip this tool, preserve indexing for next tool
-            tracing::debug!("Invalid tool name '{}' - skipping", name);
+            // The name string is complete (partial strings are disallowed
+            // until the name has been sent), so this JSON can never become a
+            // declared tool call. Surface the buffered text as normal content
+            // instead of dropping it: silently clearing the buffer here is
+            // how streams ended up empty while the non-streaming path
+            // returned the same text as content. Any remainder of the JSON
+            // still arriving flows through as normal text on later chunks.
+            tracing::debug!(
+                "Undeclared tool name '{}' - emitting buffered text as content",
+                name
+            );
+            let normal_text = current_text.to_string();
             reset_current_tool_state(
                 buffer,
                 current_tool_name_sent,
                 streamed_args_for_tool,
                 prev_tool_call_arr,
             );
-            return Ok(StreamingParseResult::default());
+            return Ok(StreamingParseResult {
+                normal_text,
+                calls: vec![],
+            });
         }
+    } else if is_complete {
+        // A complete JSON value with no tool name is definitively not a tool
+        // call. Emit the consumed text as normal content instead of buffering
+        // it forever (which swallowed the whole stream), keeping any tail for
+        // further parsing.
+        let consumed = start_idx + safe_end_idx;
+        let normal_text = current_text[..consumed].to_string();
+        *buffer = current_text[consumed..].to_string();
+        return Ok(StreamingParseResult {
+            normal_text,
+            calls: vec![],
+        });
     }
 
     let mut result = StreamingParseResult::default();
