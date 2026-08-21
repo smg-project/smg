@@ -78,7 +78,7 @@ fn bench_wasm_middleware_buffering(c: &mut Criterion) {
         router: Arc::new(MockRouter),
         probe_state: ProbeState::new(context.inflight_tracker.clone()),
         context: Arc::new(context),
-        concurrency_queue_tx: None,
+        admission_queue: None,
         router_manager: None,
         mesh_handler: None,
         mesh_adapters: None,

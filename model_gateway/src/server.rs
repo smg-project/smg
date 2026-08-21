@@ -40,7 +40,7 @@ use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::Value;
 use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler};
-use tokio::{signal, spawn, sync::mpsc};
+use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
@@ -48,7 +48,7 @@ use crate::{
     app_context::AppContext,
     config::RouterConfig,
     mesh::MeshAdapters,
-    middleware::{self, AuthConfig, QueuedRequest},
+    middleware::{self, AdmissionQueue, AuthConfig},
     observability::{
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
@@ -77,7 +77,7 @@ use crate::{
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
-    pub concurrency_queue_tx: Option<mpsc::Sender<QueuedRequest>>,
+    pub admission_queue: Option<Arc<AdmissionQueue>>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
     pub mesh_adapters: Option<Arc<MeshAdapters>>,
@@ -1295,34 +1295,27 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         debug!("Started WorkerMonitor event loop");
     }
 
-    let (limiter, processor) = middleware::ConcurrencyLimiter::new(
-        app_context.rate_limiter.clone(),
-        config.router_config.queue_size,
-        Duration::from_secs(config.router_config.queue_timeout_secs),
-    );
+    let admission_queue =
+        if app_context.rate_limiter.is_some() && config.router_config.queue_size > 0 {
+            debug!(
+                "Admission queue enabled (size: {}, timeout: {}s)",
+                config.router_config.queue_size, config.router_config.queue_timeout_secs
+            );
+            Some(Arc::new(AdmissionQueue::new(
+                config.router_config.queue_size,
+                Duration::from_secs(config.router_config.queue_timeout_secs),
+            )))
+        } else {
+            None
+        };
 
     if app_context.rate_limiter.is_none() {
         info!("Rate limiting is disabled (max_concurrent_requests = -1)");
-    }
-
-    match processor {
-        Some(proc) => {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "request queue processor runs for the lifetime of the server"
-            )]
-            spawn(proc.run());
-            debug!(
-                "Started request queue (size: {}, timeout: {}s)",
-                config.router_config.queue_size, config.router_config.queue_timeout_secs
-            );
-        }
-        None => {
-            debug!(
-                "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
-                config.router_config.max_concurrent_requests
-            );
-        }
+    } else if admission_queue.is_none() {
+        debug!(
+            "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
+            config.router_config.max_concurrent_requests
+        );
     }
 
     // Get mesh cluster state and port before moving mesh_handler into app_state
@@ -1358,7 +1351,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
-        concurrency_queue_tx: limiter.queue_tx.clone(),
+        admission_queue,
         router_manager: Some(router_manager),
         mesh_handler,
         mesh_adapters,
