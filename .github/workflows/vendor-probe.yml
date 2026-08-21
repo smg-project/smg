@@ -2,9 +2,13 @@ name: Vendor Probe
 
 # Record ground-truth behavior of the real OpenAI Responses and Anthropic
 # Messages APIs for SMG compatibility audits. Recordings (bodies, SSE
-# transcripts, error shapes, structural fingerprints) upload as artifacts.
-# Lives outside e2e_test/ so no existing path filter runs it; a PR touching
-# only vendor_probe/** (or this file) runs ONLY this workflow.
+# transcripts, error shapes, structural fingerprints) upload as artifacts;
+# full workflow_dispatch runs additionally archive them as assets on a
+# vendor-truth-<date> release so they outlive the artifact window (they feed
+# baseline refreshes — see vendor_probe/README.md).
+# Note: vendor_probe/** also feeds pr-test-rust.yml's `agentic` change family
+# so the vendor-conformance e2e suite (e2e_test/vendor_compat) revalidates
+# probe/baseline changes on a real engine.
 
 on:
   workflow_dispatch:
@@ -159,6 +163,7 @@ jobs:
 
       # Fail the job only on transport failures (network/timeout/persistent
       # 5xx-429). Behavioral 4xx from error-probes are successful recordings.
+      # publish-truth below only archives runs that pass this gate.
       - name: Health gate (>20% transport failures fails the job)
         if: always()
         env:
@@ -192,3 +197,75 @@ jobs:
                   failed = True
           sys.exit(1 if failed else 0)
           PY
+
+  # Full workflow_dispatch runs preserve the raw recordings beyond the 14-day
+  # artifact window by attaching them (gzipped) to a release tagged
+  # vendor-truth-<date>. These archives are the input for refreshing the
+  # checked-in baselines (vendor_probe/baselines/ — see the README). Runs only
+  # when the probe job passed its health gate: unhealthy runs are not truth.
+  publish-truth:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.tier == 'all' }}
+    needs: probe
+    runs-on: k8s-runner-cpu
+    timeout-minutes: 15
+    # WIDER THAN THE WORKFLOW DEFAULT (contents: read): creating the
+    # vendor-truth-<date> release and uploading its assets needs
+    # contents: write. Scoped to this job only — the probe job that holds the
+    # vendor API keys keeps read-only. Documented in vendor_probe/README.md.
+    permissions:
+      contents: write
+    steps:
+      - name: Install gh CLI
+        run: |
+          if ! command -v gh &>/dev/null; then
+            mkdir -p "$HOME/.local/bin"
+            GH_VERSION="2.74.0"
+            GH_SHA256="e55c9d49dc49c0b0fef0a9acd3510482fd9e27ff52ae80f8a6e838cd25b4cd89"
+            curl -fsSL --connect-timeout 10 --max-time 120 -o /tmp/gh.tgz \
+              "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+            echo "${GH_SHA256}  /tmp/gh.tgz" | sha256sum --check --quiet
+            tar xzf /tmp/gh.tgz --strip-components=2 -C "$HOME/.local/bin" "gh_${GH_VERSION}_linux_amd64/bin/gh"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Download recording artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: vendor-probe-*
+          path: recordings
+
+      - name: Publish recordings to vendor-truth release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          TAG="vendor-truth-$(date -u +%F)"
+          # Idempotent: reuse the tag if a run already created it today;
+          # --clobber below replaces same-named assets from earlier runs.
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$REPO" --title "$TAG" \
+              --notes "Raw vendor ground-truth recordings from the full probe matrix (vendor-probe workflow run ${RUN_ID}, commit ${SHA}). Inputs for vendor_probe/baselines/ refreshes — see vendor_probe/README.md."
+          fi
+          assets=()
+          for prov in openai anthropic; do
+            dir="recordings/vendor-probe-${prov}"
+            [ -d "$dir" ] || continue
+            for f in results.jsonl fingerprints.jsonl; do
+              if [ -f "$dir/$f" ]; then gzip -f "$dir/$f"; fi
+            done
+            for f in results.jsonl.gz fingerprints.jsonl.gz summary.json; do
+              if [ -f "$dir/$f" ]; then
+                cp "$dir/$f" "recordings/${prov}-${f}"
+                assets+=("recordings/${prov}-${f}")
+              fi
+            done
+          done
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "::error::no recording artifacts found to publish"
+            exit 1
+          fi
+          gh release upload "$TAG" "${assets[@]}" --repo "$REPO" --clobber
+          echo "published ${#assets[@]} assets to release $TAG"
