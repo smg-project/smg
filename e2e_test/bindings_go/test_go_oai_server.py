@@ -103,17 +103,17 @@ class TestGoOAIServerBasic:
 @pytest.mark.engine("sglang")
 @pytest.mark.gpu(1)
 @pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
-@pytest.mark.xfail(
-    reason="Llama-3.2-1B-Instruct doesn't reliably support tool calling with tool_choice=required",
-    strict=False,  # Allow tests to pass if model happens to work
-)
 class TestGoOAIServerFunctionCalling:
     """Tests for function calling through Go OAI server.
 
-    Note: Function calling requires the model to support tool use.
-    The meta-llama/Llama-3.2-1B-Instruct model may not reliably support tool_choice='required'.
-    These tests are marked as xfail to allow CI to pass while still
-    testing the Go OAI server's tool calling proxy functionality.
+    Note: Function calling requires the model to support tool use, and
+    meta-llama/Llama-3.2-1B-Instruct may not reliably emit a tool call even
+    with tool_choice='required'. Only that model-dependent step is allowed to
+    xfail (via an imperative ``pytest.xfail`` when the model produces no tool
+    call). Structural assertions — response shape, streamed index/argument
+    accumulation, JSON validity of any tool call the server *does* parse, and
+    tool_choice='none' suppression — are unconditional: they verify the Go OAI
+    server's proxy logic, not the model.
     """
 
     TOOLS = [
@@ -162,17 +162,31 @@ class TestGoOAIServerFunctionCalling:
             stream=False,
         )
 
+        # Structural: response shape (unconditional).
         assert response.choices is not None
+        assert len(response.choices) > 0
         tool_calls = response.choices[0].message.tool_calls
 
-        assert tool_calls is not None, "Expected tool calls"
-        assert len(tool_calls) > 0, "Expected at least one tool call"
+        # Model-dependent: whether the 1B model emits a tool call at all.
+        if not tool_calls:
+            pytest.xfail(
+                "Llama-3.2-1B-Instruct did not emit a tool call despite "
+                "tool_choice='required' (known model limitation)"
+            )
 
+        # Structural: any parsed tool call must be well-formed (unconditional).
         tool_call = tool_calls[0]
         assert tool_call.function.name == "get_weather"
 
         args = json.loads(tool_call.function.arguments)
-        assert "location" in args
+        assert isinstance(args, dict)
+
+        # Model-dependent: argument quality.
+        if "location" not in args:
+            pytest.xfail(
+                f"Llama-3.2-1B-Instruct produced schema-incomplete arguments {args} "
+                "(known model limitation)"
+            )
         logger.info(f"Tool call: {tool_call.function.name}({args})")
 
     def test_function_calling_streaming(self, go_openai_client, go_oai_server):
@@ -191,6 +205,7 @@ class TestGoOAIServerFunctionCalling:
             stream=True,
         )
 
+        # Structural: the stream itself must be well-formed (unconditional).
         chunks = list(response_stream)
         assert len(chunks) > 0
 
@@ -213,18 +228,37 @@ class TestGoOAIServerFunctionCalling:
                     if tc.function.arguments:
                         tool_calls_by_index[idx]["arguments"] += tc.function.arguments
 
-        assert len(tool_calls_by_index) > 0, "Expected tool calls in stream"
+        # Model-dependent: whether the 1B model emits a tool call at all.
+        if not tool_calls_by_index:
+            pytest.xfail(
+                "Llama-3.2-1B-Instruct streamed no tool call despite "
+                "tool_choice='required' (known model limitation)"
+            )
 
-        # Verify first tool call
+        # Structural: index math and argument accumulation (unconditional).
+        assert 0 in tool_calls_by_index, (
+            f"Streamed tool call indices must start at 0, got {sorted(tool_calls_by_index)}"
+        )
         first_tc = tool_calls_by_index[0]
         assert first_tc["name"] == "get_weather"
 
         args = json.loads(first_tc["arguments"])
-        assert "location" in args
+        assert isinstance(args, dict)
+
+        # Model-dependent: argument quality.
+        if "location" not in args:
+            pytest.xfail(
+                f"Llama-3.2-1B-Instruct produced schema-incomplete arguments {args} "
+                "(known model limitation)"
+            )
         logger.info(f"Streamed tool call: {first_tc['name']}({args})")
 
     def test_function_calling_tool_choice_none(self, go_openai_client, go_oai_server):
-        """Test that tool_choice='none' prevents function calls."""
+        """Test that tool_choice='none' prevents function calls.
+
+        This is a server-side suppression contract, not a model capability:
+        a weak tool-caller cannot make it fail, so nothing here may xfail.
+        """
         _, _, model_path = go_oai_server
 
         response = go_openai_client.chat.completions.create(
@@ -631,14 +665,15 @@ class TestGoOAIServerEdgeCases:
 @pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
 @pytest.mark.xfail(
     reason="Go OAI server does not currently support n > 1 (multiple choices)",
-    strict=False,
+    strict=True,  # deterministic capability gap: XPASS must fail so the marker is removed when n>1 lands
 )
 class TestGoOAIServerMultipleChoices:
     """Tests for n parameter (multiple choices).
 
     Note: The Go OAI server currently does not support generating multiple
-    choices (n > 1). These tests are marked as xfail to document the expected
-    behavior and will pass when support is added.
+    choices (n > 1) — a deterministic server capability gap, not model
+    flakiness — so these tests are strict xfails: when support is added they
+    will XPASS and fail CI, forcing removal of the marker.
     """
 
     def test_n_parameter_non_streaming(self, go_openai_client, go_oai_server):

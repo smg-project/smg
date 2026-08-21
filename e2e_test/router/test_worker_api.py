@@ -152,14 +152,24 @@ class TestIGWMode:
                 initial_count = len(gateway.list_workers())
                 logger.info("Worker count after add: %d", initial_count)
 
-                # Remove worker
+                # Remove worker — removal must succeed and the worker must
+                # disappear from the registry.
                 success, msg = gateway.remove_worker(http_worker.base_url)
-                if success:
-                    logger.info("Removed worker: %s", msg)
-                    final_count = len(gateway.list_workers())
-                    logger.info("Worker count after remove: %d", final_count)
-                else:
-                    logger.warning("Remove worker not supported: %s", msg)
+                assert success, f"Failed to remove worker: {msg}"
+                logger.info("Removed worker: %s", msg)
+
+                # Poll briefly in case removal is applied asynchronously.
+                deadline = time.perf_counter() + 15
+                while time.perf_counter() < deadline:
+                    remaining_urls = [w.url for w in gateway.list_workers()]
+                    if http_worker.base_url not in remaining_urls:
+                        break
+                    time.sleep(1.0)
+
+                assert http_worker.base_url not in remaining_urls, (
+                    f"Worker {http_worker.base_url} still listed after removal: {remaining_urls}"
+                )
+                logger.info("Worker count after remove: %d", len(remaining_urls))
             finally:
                 gateway.shutdown()
         finally:
