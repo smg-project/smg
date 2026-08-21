@@ -100,7 +100,7 @@ The PR-triggered workflow run stays on the curated tier; `workflow_dispatch`
 defaults to `tier=all` at concurrency 24 (`tier`, `concurrency`, `budget`
 inputs).
 
-## Dual-target replay (future SMG diff)
+## Dual-target replay (SMG diff)
 
 ```bash
 export SMG_BASE_URL=http://localhost:8080 SMG_API_KEY=...
@@ -108,10 +108,87 @@ python -m vendor_probe.runner --provider smg-openai    --out results/smg-openai
 python -m vendor_probe.runner --provider smg-anthropic --out results/smg-anthropic
 ```
 
-The `smg-*` adapters reuse the same probe matrices with SMG's base_url/auth. Diff
-`fingerprints.jsonl` (vendor vs SMG) by `probe_id`: `field_paths` for JSON bodies,
-`event_type_sequence` for streams. The fingerprint block is what a diff tool
-consumes first; `results.jsonl` holds the raw bytes for deeper inspection.
+The `smg-*` adapters reuse the same probe matrices with SMG's base_url/auth
+(`smg-openai` sends `Authorization: Bearer`, `smg-anthropic` sends `x-api-key`).
+
+### Local replay against a mock worker
+
+The maximum local surface is the gRPC (TokenSpeed) lane: the gateway itself
+builds the Responses/Messages envelopes, validates requests, renders SSE
+framing, and serves the conversations/lifecycle CRUD from the in-memory
+history backend — exactly the structural surface the probes record. The
+canned mock worker streams fixed token ids, so response *content* is fake but
+*structure* is real.
+
+```bash
+cargo build --release -p smg -p mock-worker
+
+# 1) one canned gRPC mock worker; --tokenizer points at any local HF snapshot
+#    dir with tokenizer.json (the gateway autoloads it for the worker's model)
+target/release/mock-worker --grpc-base-port 19700 --grpc-count 1 \
+  --model mock-model --tokenizer ~/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/<rev> \
+  --output-tokens 8 --gen-ms 0
+
+# 2) gateway in regular gRPC mode; aliases map the vendor model names the
+#    probes send onto the mock's model id (gated models like
+#    computer-use-preview stay unmapped on purpose: their unknown-model
+#    envelope is part of the recording). A generic chat template keeps
+#    arbitrary role sequences renderable with a base tokenizer.
+target/release/smg launch --host 127.0.0.1 --port 31700 \
+  --prometheus-host 127.0.0.1 --prometheus-port 31701 \
+  --worker-urls grpc://127.0.0.1:19700 --backend tokenspeed \
+  --model-path <same tokenizer dir> --chat-template chatml.jinja \
+  --history-backend memory --tool-call-parser json --reasoning-parser deepseek_r1 \
+  --model-alias gpt-5-nano=mock-model --model-alias gpt-4.1-nano=mock-model \
+  --model-alias claude-haiku-4-5=mock-model --policy round_robin
+
+# 3) replay (local target: no retries, tight timeouts)
+SMG_BASE_URL=http://127.0.0.1:31700 python -m vendor_probe.runner \
+  --provider smg-openai --tier all --concurrency 24 --max-retries 0 \
+  --timeout 30 --stream-timeout 60 --out results/smg-openai
+SMG_BASE_URL=http://127.0.0.1:31700 python -m vendor_probe.runner \
+  --provider smg-anthropic --tier all --concurrency 24 --max-retries 0 \
+  --timeout 30 --stream-timeout 60 --out results/smg-anthropic
+```
+
+Auth stays disabled: SMG's serving auth is Bearer-only while the Anthropic
+adapter authenticates via `x-api-key`, so enabling `--api-key` would 401 the
+whole Anthropic matrix. The differ classifies vendor-401 probes as
+`config-limited` accordingly.
+
+## Structural compat differ
+
+```bash
+python -m vendor_probe.compat_diff \
+  --vendor results/openai    --smg results/smg-openai    --provider openai    --out compat/openai
+python -m vendor_probe.compat_diff \
+  --vendor results/anthropic --smg results/smg-anthropic --provider anthropic --out compat/anthropic
+```
+
+Per probe it compares status (exact + class), the nested field-path inventory
+of JSON bodies (direction-marked), run-length-collapsed SSE event-type
+sequences, and 4xx envelope shape (`error.type`/`code`/`param`, and whether
+the mutated field is named in the message — recovered from `*.mut.<slug>.*`
+probe ids). Probes aggregate into the vendor-side fingerprint clusters and
+the report ranks divergent clusters:
+
+- **S1** status-class mismatch — subtyped `server-error` (SMG 5xx) >
+  `rejects-valid` (vendor 2xx, SMG 4xx) > `accepts-invalid` (vendor 4xx, SMG 2xx)
+- **S2** field-inventory drift (with an aggregate rollup of the most common
+  vendor-only / SMG-only paths across all 200-vs-200 probes)
+- **S3** SSE core-sequence drift (content-bound events stripped;
+  `response.completed`/`response.incomplete` unified — which one fires is
+  content-bound against a canned mock; nameless `data: [DONE]` frames are
+  surfaced as `[DONE]`)
+- **S4** error-envelope drift
+
+Content-dependent differences (`output[]` item mix, `content[]` block mix,
+`incomplete_details`, tool/reasoning/annotation events, delta arity) are
+classified **mock-limited**, never divergences. Value-level volatility (ids,
+timestamps, model names, token counts) never registers: body comparison is
+path-based, and envelope comparisons scrub volatile substrings first.
+Outputs: `report.md` (ranked, human) + `diff.jsonl` (one line per probe,
+machine-readable, tagged with cluster id and verdict).
 
 ## Artifact layout (per provider `--out` dir)
 
