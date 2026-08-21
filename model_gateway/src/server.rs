@@ -1065,6 +1065,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.multimodal_shm_min_bytes,
     );
 
+    // Seed the process-wide per-worker series toggle before any worker
+    // registration can emit metrics.
+    metrics::init_worker_metrics_detail(config.router_config.worker_metrics_detail);
+
     // Start the metrics server. It binds the port eagerly so we fail fast on
     // port conflicts or bad addresses.
     if let Some(prometheus_config) = &config.prometheus_config {

@@ -637,6 +637,13 @@ struct CliArgs {
     #[arg(long, num_args = 0.., help_heading = "Prometheus Metrics")]
     prometheus_duration_buckets: Vec<f64>,
 
+    /// Emit per-worker Prometheus series (worker-labeled circuit-breaker
+    /// counters and per-worker smg_worker_* gauges). By default those
+    /// counters aggregate across workers and smg_worker_requests_active
+    /// reports the fleet total, keeping scrape size flat as the fleet grows.
+    #[arg(long, default_value_t = false, help_heading = "Prometheus Metrics")]
+    worker_metrics_detail: bool,
+
     // ==================== Request Handling ====================
     /// Custom HTTP headers to check for request IDs
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
@@ -1791,6 +1798,7 @@ impl CliArgs {
             .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
             .kv_indexer_max_entries(self.kv_indexer_max_entries)
             .engine_metrics(self.engine_metrics)
+            .worker_metrics_detail(self.worker_metrics_detail)
             .multimodal_tensor_transport(self.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .max_concurrent_requests(self.max_concurrent_requests)
@@ -2373,6 +2381,39 @@ mod tests {
             server_config.router_config.engine_metrics,
             "engine_metrics must survive into ServerConfig via to_server_config"
         );
+    }
+
+    /// `--worker-metrics-detail` must flow into `RouterConfig` and survive
+    /// nesting into `ServerConfig.router_config` — server startup seeds the
+    /// process-wide toggle from `RouterConfig`. Two-path config-plumbing guard.
+    #[test]
+    fn worker_metrics_detail_flows_into_both_configs() {
+        let cli = cli_args_from(&["--worker-metrics-detail"]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            router_config.worker_metrics_detail,
+            "worker_metrics_detail must reach RouterConfig via to_router_config"
+        );
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(
+            server_config.router_config.worker_metrics_detail,
+            "worker_metrics_detail must survive into ServerConfig via to_server_config"
+        );
+    }
+
+    /// Default is off: per-worker series stay gated and circuit-breaker
+    /// counters aggregate unless the flag is passed.
+    #[test]
+    fn worker_metrics_detail_defaults_to_false_in_both_configs() {
+        let cli = cli_args_from(&[]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(!router_config.worker_metrics_detail);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(!server_config.router_config.worker_metrics_detail);
     }
 
     /// The overload thresholds must reach `RouterConfig` and survive nesting

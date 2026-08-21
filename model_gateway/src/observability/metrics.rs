@@ -1,6 +1,13 @@
 #[cfg(test)]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use dashmap::DashMap;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
@@ -36,6 +43,25 @@ pub(crate) fn intern_string(s: &str) -> Arc<str> {
 #[cfg(test)]
 pub(crate) fn interner_size() -> usize {
     STRING_INTERNER.len()
+}
+
+/// Per-worker series toggle (`--worker-metrics-detail`). Off by default:
+/// circuit-breaker counters aggregate across workers and
+/// `smg_worker_requests_active` reports the fleet total, keeping scrape size
+/// flat as the fleet grows.
+static WORKER_METRICS_DETAIL: AtomicBool = AtomicBool::new(false);
+
+/// Fleet-total bookkeeping for `smg_worker_requests_active` when per-worker
+/// detail is off: last reported value per worker, so each report applies a
+/// delta to the single unlabeled gauge.
+static WORKER_ACTIVE_REQUESTS: Lazy<DashMap<Arc<str>, f64>> = Lazy::new(DashMap::new);
+
+pub fn init_worker_metrics_detail(enabled: bool) {
+    WORKER_METRICS_DETAIL.store(enabled, Ordering::Release);
+}
+
+fn worker_metrics_detail() -> bool {
+    WORKER_METRICS_DETAIL.load(Ordering::Acquire)
 }
 
 /// Sentinel substituted once a bounded interner reaches its cap, so a flood of
@@ -326,11 +352,11 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_worker_requests_active",
-        "Currently running requests per worker"
+        "Currently running requests (fleet total; per worker with --worker-metrics-detail)"
     );
     describe_gauge!(
         "smg_worker_health",
-        "Worker health status (1=healthy, 0=unhealthy)"
+        "Worker health status (1=healthy, 0=unhealthy; only with --worker-metrics-detail)"
     );
     describe_counter!(
         "smg_worker_health_checks_total",
@@ -382,23 +408,23 @@ pub(crate) fn init_metrics() {
     // Layer 3: Worker resilience metrics (circuit breaker)
     describe_gauge!(
         "smg_worker_cb_state",
-        "Circuit breaker state per worker (0=closed, 1=open, 2=half_open)"
+        "Circuit breaker state per worker (0=closed, 1=open, 2=half_open; only with --worker-metrics-detail)"
     );
     describe_counter!(
         "smg_worker_cb_transitions_total",
-        "Circuit breaker state transitions by worker, from, to"
+        "Circuit breaker state transitions by from, to (per-worker label with --worker-metrics-detail)"
     );
     describe_counter!(
         "smg_worker_cb_outcomes_total",
-        "Circuit breaker outcomes by worker and outcome (success/failure)"
+        "Circuit breaker outcomes (success/failure; per-worker label with --worker-metrics-detail)"
     );
     describe_gauge!(
         "smg_worker_cb_consecutive_failures",
-        "Current consecutive failure count per worker"
+        "Current consecutive failure count per worker (only with --worker-metrics-detail)"
     );
     describe_gauge!(
         "smg_worker_cb_consecutive_successes",
-        "Current consecutive success count per worker"
+        "Current consecutive success count per worker (only with --worker-metrics-detail)"
     );
 
     // Layer 3: Worker resilience metrics (retry)
@@ -1437,18 +1463,32 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Set running requests per worker
+    /// Set running requests for a worker. Without `--worker-metrics-detail`
+    /// the per-worker value feeds a single unlabeled fleet-total series.
     pub fn set_worker_requests_active(worker: &str, count: usize) {
         let worker_interned = intern_string(worker);
-        gauge!(
-            "smg_worker_requests_active",
-            "worker" => worker_interned
-        )
-        .set(count as f64);
+        if worker_metrics_detail() {
+            gauge!(
+                "smg_worker_requests_active",
+                "worker" => worker_interned
+            )
+            .set(count as f64);
+            return;
+        }
+        let delta = {
+            let mut entry = WORKER_ACTIVE_REQUESTS.entry(worker_interned).or_insert(0.0);
+            let prev = *entry;
+            *entry = count as f64;
+            count as f64 - prev
+        };
+        gauge!("smg_worker_requests_active").increment(delta);
     }
 
     /// Set active routing keys per worker
     pub fn set_worker_routing_keys_active(worker: &str, count: usize) {
+        if !worker_metrics_detail() {
+            return;
+        }
         let worker_interned = intern_string(worker);
         gauge!(
             "smg_worker_routing_keys_active",
@@ -1459,6 +1499,9 @@ impl Metrics {
 
     /// Set worker health status
     pub fn set_worker_health(worker_url: &str, healthy: bool) {
+        if !worker_metrics_detail() {
+            return;
+        }
         let worker_interned = intern_string(worker_url);
         gauge!(
             "smg_worker_health",
@@ -1485,6 +1528,9 @@ impl Metrics {
 
     /// Set circuit breaker state (0=closed, 1=open, 2=half_open)
     pub fn set_worker_cb_state(worker: &str, state_code: u8) {
+        if !worker_metrics_detail() {
+            return;
+        }
         let worker_interned = intern_string(worker);
         gauge!(
             "smg_worker_cb_state",
@@ -1495,6 +1541,15 @@ impl Metrics {
 
     /// Record circuit breaker state transition
     pub fn record_worker_cb_transition(worker: &str, from: &'static str, to: &'static str) {
+        if !worker_metrics_detail() {
+            counter!(
+                "smg_worker_cb_transitions_total",
+                "from" => from,
+                "to" => to
+            )
+            .increment(1);
+            return;
+        }
         let worker_interned = intern_string(worker);
         counter!(
             "smg_worker_cb_transitions_total",
@@ -1507,6 +1562,14 @@ impl Metrics {
 
     /// Record circuit breaker outcome
     pub fn record_worker_cb_outcome(worker: &str, outcome: &'static str) {
+        if !worker_metrics_detail() {
+            counter!(
+                "smg_worker_cb_outcomes_total",
+                "outcome" => outcome
+            )
+            .increment(1);
+            return;
+        }
         let worker_interned = intern_string(worker);
         counter!(
             "smg_worker_cb_outcomes_total",
@@ -1518,6 +1581,9 @@ impl Metrics {
 
     /// Set circuit breaker consecutive failures
     pub fn set_worker_cb_consecutive_failures(worker: &str, count: u32) {
+        if !worker_metrics_detail() {
+            return;
+        }
         let worker_interned = intern_string(worker);
         gauge!(
             "smg_worker_cb_consecutive_failures",
@@ -1528,6 +1594,9 @@ impl Metrics {
 
     /// Set circuit breaker consecutive successes
     pub fn set_worker_cb_consecutive_successes(worker: &str, count: u32) {
+        if !worker_metrics_detail() {
+            return;
+        }
         let worker_interned = intern_string(worker);
         gauge!(
             "smg_worker_cb_consecutive_successes",
@@ -1820,6 +1889,15 @@ impl Metrics {
     // ========================================================================
 
     pub fn remove_worker_metrics(worker_url: &str) {
+        if !worker_metrics_detail() {
+            // Per-worker series were never emitted; fold the worker's last
+            // reported load out of the fleet total.
+            if let Some((_, prev)) = WORKER_ACTIVE_REQUESTS.remove(worker_url) {
+                gauge!("smg_worker_requests_active").decrement(prev);
+            }
+            return;
+        }
+
         // Intern once, clone (cheap) for each metric
         let worker = intern_string(worker_url);
 
@@ -2046,6 +2124,170 @@ mod tests {
                         && l.ends_with(&format!(" {value}"))
                 }),
                 "smg_cache_tree_tenants {tree} series missing; rendered:\n{rendered}"
+            );
+        }
+    }
+
+    // ========================================================================
+    // Worker-metrics detail gating tests
+    // ========================================================================
+
+    /// Serializes tests that flip the process-global detail toggle.
+    static DETAIL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds `DETAIL_LOCK` and restores the toggle to off on drop (also on
+    /// panic, so a failing test cannot leak detail mode into others).
+    struct DetailGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl DetailGuard {
+        fn set(enabled: bool) -> Self {
+            let lock = DETAIL_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            init_worker_metrics_detail(enabled);
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for DetailGuard {
+        fn drop(&mut self) {
+            init_worker_metrics_detail(false);
+        }
+    }
+
+    #[test]
+    fn worker_metrics_default_aggregates_and_gates_per_worker_series() {
+        let _guard = DetailGuard::set(false);
+        let rendered = render_with_recorder(|| {
+            Metrics::record_worker_cb_outcome("http://agg-w1:1", "success");
+            Metrics::record_worker_cb_outcome("http://agg-w2:1", "success");
+            Metrics::record_worker_cb_outcome("http://agg-w1:1", "failure");
+            Metrics::record_worker_cb_transition("http://agg-w1:1", "closed", "open");
+            Metrics::record_worker_cb_transition("http://agg-w2:1", "closed", "open");
+            Metrics::set_worker_cb_state("http://agg-w1:1", 1);
+            Metrics::set_worker_cb_consecutive_failures("http://agg-w1:1", 5);
+            Metrics::set_worker_cb_consecutive_successes("http://agg-w1:1", 2);
+            Metrics::set_worker_health("http://agg-w1:1", true);
+            Metrics::set_worker_routing_keys_active("http://agg-w1:1", 3);
+        });
+
+        // Counters aggregate across workers with no worker label.
+        assert!(
+            rendered.contains(r#"smg_worker_cb_outcomes_total{outcome="success"} 2"#),
+            "aggregated success outcomes missing; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"smg_worker_cb_outcomes_total{outcome="failure"} 1"#),
+            "aggregated failure outcomes missing; rendered:\n{rendered}"
+        );
+        let transition_line = rendered
+            .lines()
+            .find(|l| l.starts_with("smg_worker_cb_transitions_total{"))
+            .unwrap_or_else(|| panic!("aggregated transitions missing; rendered:\n{rendered}"));
+        assert!(
+            transition_line.contains(r#"from="closed""#)
+                && transition_line.contains(r#"to="open""#)
+                && transition_line.ends_with(" 2"),
+            "transitions must aggregate by from/to: {transition_line}"
+        );
+        assert!(
+            !rendered.contains("worker=\"http://agg-"),
+            "no per-worker label may appear by default; rendered:\n{rendered}"
+        );
+
+        // Per-worker gauges are gated off entirely.
+        for gated in [
+            "smg_worker_cb_state{",
+            "smg_worker_cb_consecutive_failures{",
+            "smg_worker_cb_consecutive_successes{",
+            "smg_worker_health{",
+            "smg_worker_routing_keys_active{",
+        ] {
+            assert!(
+                !rendered.contains(gated),
+                "{gated} must not be emitted by default; rendered:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_requests_active_reports_fleet_total_by_default() {
+        let _guard = DetailGuard::set(false);
+        let rendered = render_with_recorder(|| {
+            Metrics::set_worker_requests_active("http://total-w1:1", 5);
+            Metrics::set_worker_requests_active("http://total-w2:1", 3);
+            // Re-report: the total tracks the latest value, not the sum of reports.
+            Metrics::set_worker_requests_active("http://total-w1:1", 2);
+            // Removal folds the worker's last value out of the total.
+            Metrics::remove_worker_metrics("http://total-w2:1");
+        });
+
+        assert!(
+            rendered.contains("smg_worker_requests_active 2"),
+            "unlabeled fleet total wrong; rendered:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("smg_worker_requests_active{"),
+            "no per-worker series may appear by default; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn worker_metrics_detail_emits_per_worker_series() {
+        let _guard = DetailGuard::set(true);
+        let rendered = render_with_recorder(|| {
+            Metrics::record_worker_cb_outcome("http://det-w1:1", "success");
+            Metrics::record_worker_cb_transition("http://det-w1:1", "closed", "open");
+            Metrics::set_worker_cb_state("http://det-w1:1", 1);
+            Metrics::set_worker_cb_consecutive_failures("http://det-w1:1", 4);
+            Metrics::set_worker_cb_consecutive_successes("http://det-w1:1", 1);
+            Metrics::set_worker_health("http://det-w1:1", false);
+            Metrics::set_worker_routing_keys_active("http://det-w1:1", 7);
+            Metrics::set_worker_requests_active("http://det-w1:1", 9);
+        });
+
+        let w = r#"worker="http://det-w1:1""#;
+        for (name, value) in [
+            ("smg_worker_cb_outcomes_total", "1"),
+            ("smg_worker_cb_transitions_total", "1"),
+            ("smg_worker_cb_state", "1"),
+            ("smg_worker_cb_consecutive_failures", "4"),
+            ("smg_worker_cb_consecutive_successes", "1"),
+            ("smg_worker_health", "0"),
+            ("smg_worker_routing_keys_active", "7"),
+            ("smg_worker_requests_active", "9"),
+        ] {
+            assert!(
+                rendered.lines().any(|l| l.starts_with(&format!("{name}{{"))
+                    && l.contains(w)
+                    && l.ends_with(&format!(" {value}"))),
+                "{name} per-worker series missing under detail mode; rendered:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_metrics_detail_removal_resets_per_worker_series() {
+        let _guard = DetailGuard::set(true);
+        let rendered = render_with_recorder(|| {
+            Metrics::set_worker_requests_active("http://det-rm:1", 6);
+            Metrics::set_worker_health("http://det-rm:1", true);
+            Metrics::remove_worker_metrics("http://det-rm:1");
+        });
+
+        let w = r#"worker="http://det-rm:1""#;
+        for (name, value) in [
+            ("smg_worker_requests_active", "0"),
+            ("smg_worker_health", "-1"),
+            ("smg_worker_cb_state", "-1"),
+        ] {
+            assert!(
+                rendered.lines().any(|l| l.starts_with(&format!("{name}{{"))
+                    && l.contains(w)
+                    && l.ends_with(&format!(" {value}"))),
+                "{name} not sentineled on removal; rendered:\n{rendered}"
             );
         }
     }

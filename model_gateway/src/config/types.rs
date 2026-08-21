@@ -139,6 +139,14 @@ pub struct RouterConfig {
     /// observability from routing.
     #[serde(default)]
     pub engine_metrics: bool,
+    /// Emit per-worker Prometheus series: worker-labeled circuit-breaker
+    /// counters plus the per-worker gauges (`smg_worker_cb_*`,
+    /// `smg_worker_health`, `smg_worker_requests_active`,
+    /// `smg_worker_routing_keys_active`). Off by default: circuit-breaker
+    /// counters aggregate across workers and `smg_worker_requests_active`
+    /// reports the fleet total, keeping scrape size flat as the fleet grows.
+    #[serde(default)]
+    pub worker_metrics_detail: bool,
     /// Global multimodal tensor transport mode (`inline` | `shm` | `auto` | `rdma`).
     /// Per-worker `WorkerSpec.multimodal_tensor_transport` overrides this; when
     /// unset, falls back to `SMG_MM_TENSOR_TRANSPORT`, then `inline`.
@@ -1063,6 +1071,7 @@ impl Default for RouterConfig {
             kv_indexer_ttl_secs: None,
             kv_indexer_max_entries: None,
             engine_metrics: false,
+            worker_metrics_detail: false,
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,
             dp_aware: false,

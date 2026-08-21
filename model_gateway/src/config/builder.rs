@@ -298,6 +298,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn worker_metrics_detail(mut self, enabled: bool) -> Self {
+        self.config.worker_metrics_detail = enabled;
+        self
+    }
+
     /// Global multimodal tensor transport mode (per-worker specs can override).
     pub fn multimodal_tensor_transport(mut self, mode: Option<TransportMode>) -> Self {
         self.config.multimodal_tensor_transport = mode;
