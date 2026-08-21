@@ -88,6 +88,15 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false
     }
 
+    /// Whether `select_worker` applies the full [`Worker::is_available`]
+    /// eligibility test to every candidate itself, so callers may pass the
+    /// unfiltered pool instead of pre-filtering it. `false` for policies
+    /// that route on a weaker predicate (the hash policies skip the circuit
+    /// breaker) and so rely on the caller's availability filter.
+    fn filters_unavailable_workers(&self) -> bool {
+        false
+    }
+
     /// Drop any cached per-worker state for a removed worker.
     ///
     /// Called when a worker leaves the registry so load-aware policies don't

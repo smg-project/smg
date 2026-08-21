@@ -385,6 +385,10 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
         "least_load"
     }
 
+    fn filters_unavailable_workers(&self) -> bool {
+        true
+    }
+
     fn update_loads(&self, loads: &HashMap<String, WorkerLoadResponse>) {
         if let Ok(mut cached) = self.cached_loads.write() {
             cached.extend(loads.iter().map(|(k, v)| (k.clone(), v.clone())));

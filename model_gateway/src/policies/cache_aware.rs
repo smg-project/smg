@@ -99,6 +99,10 @@ pub(crate) type LoadReceiver = watch::Receiver<HashMap<String, WorkerLoadRespons
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
+    /// Either `*_token_usage_threshold` sits below its disabled `1.0`
+    /// default. Computed once so a disabled config skips the per-selection
+    /// backend-usage bounds scan entirely.
+    kv_pressure_enabled: bool,
     /// String-based trees for HTTP connections (text input)
     string_trees: Arc<DashMap<String, Arc<Tree>>>,
     /// Token-based trees for gRPC connections (pre-tokenized input)
@@ -316,8 +320,12 @@ impl CacheAwarePolicy {
             None
         };
 
+        let kv_pressure_enabled = config.balance_token_usage_threshold < 1.0
+            || config.overload_token_usage_threshold < 1.0;
+
         Self {
             config,
+            kv_pressure_enabled,
             string_trees,
             token_trees,
             _eviction_task: eviction_task,
@@ -490,6 +498,9 @@ impl CacheAwarePolicy {
     /// pressure is instead applied per request, to the selected candidate,
     /// in [`Self::gate_selected_candidate`].
     fn is_kv_imbalanced(&self, workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> bool {
+        if !self.kv_pressure_enabled {
+            return false;
+        }
         // KV-based triggers — need a load snapshot; both default 1.0 = disabled.
         if let Some((min_usage, max_usage)) =
             self.backend_token_usage_bounds(workers, healthy_indices)
@@ -1120,9 +1131,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
     /// Backend loads feed the KV-usage gate and the waiting-prefill decay;
     /// both are disabled by default, so only configured policies poll.
     fn needs_backend_loads(&self) -> bool {
-        self.config.overlap_decay > 0.0
-            || self.config.balance_token_usage_threshold < 1.0
-            || self.config.overload_token_usage_threshold < 1.0
+        self.config.overlap_decay > 0.0 || self.kv_pressure_enabled
+    }
+
+    fn filters_unavailable_workers(&self) -> bool {
+        true
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -2361,6 +2374,23 @@ mod tests {
         assert!(
             !imbalanced(&policy, &workers),
             "default thresholds (1.0) must ignore KV usage entirely"
+        );
+    }
+
+    #[test]
+    fn kv_pressure_disabled_thresholds_never_scan_bounds() {
+        // Out-of-range usage would trip `max > 1.0` if the bounds were
+        // computed; the construction-time gate keeps the scan off entirely.
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        assert!(!policy.needs_backend_loads());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let _tx = inject_kv(&policy, &workers, &[5.0, 0.0]);
+        assert!(
+            !imbalanced(&policy, &workers),
+            "disabled thresholds must skip the bounds scan"
         );
     }
 

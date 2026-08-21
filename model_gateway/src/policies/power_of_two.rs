@@ -55,6 +55,10 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         "power_of_two"
     }
 
+    fn filters_unavailable_workers(&self) -> bool {
+        true
+    }
+
     fn update_loads(&self, loads: &HashMap<String, WorkerLoadResponse>) {
         self.scorer.update_loads(loads);
     }

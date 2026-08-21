@@ -41,6 +41,10 @@ impl LoadBalancingPolicy for RandomPolicy {
         "random"
     }
 
+    fn filters_unavailable_workers(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

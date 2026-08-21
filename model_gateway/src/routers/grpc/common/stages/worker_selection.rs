@@ -282,26 +282,42 @@ impl WorkerSelectionStage {
 
         // Get workers for the specified model. The gRPC router serves both gRPC
         // and direct-ZMQ workers, so accept either transport (not HTTP).
-        let workers = self.worker_registry.get_workers_filtered(
-            model_filter,
-            Some(WorkerType::Regular),
-            None,  // grpc + zmq, filtered below
-            None,  // any runtime type
-            false, // get all workers, we'll filter by is_available() next
-        );
-
-        // Use into_iter() to take ownership of Arcs without cloning (avoids atomic inc/dec)
-        let available: Vec<Arc<dyn Worker>> = workers
-            .into_iter()
-            .filter(|w| w.connection_mode().uses_grpc_pipeline() && w.is_available())
-            .collect();
-
-        if available.is_empty() {
-            return None;
-        }
+        let shared;
+        let owned;
+        let pool: &[Arc<dyn Worker>] = match model_filter {
+            Some(model) => {
+                shared = self.worker_registry.get_by_model_matching(model, |w| {
+                    *w.worker_type() == WorkerType::Regular
+                        && w.connection_mode().uses_grpc_pipeline()
+                });
+                &shared
+            }
+            None => {
+                owned = self
+                    .worker_registry
+                    .get_workers_filtered(None, Some(WorkerType::Regular), None, None, false)
+                    .into_iter()
+                    .filter(|w| w.connection_mode().uses_grpc_pipeline())
+                    .collect::<Vec<_>>();
+                &owned
+            }
+        };
 
         // Get the appropriate policy for this model
         let policy = self.policy_registry.get_policy_or_default(model_id);
+
+        // Policies that apply the full availability test themselves take the
+        // pool directly; the rest keep the pre-filter pass.
+        let prefiltered: Vec<Arc<dyn Worker>>;
+        let available: &[Arc<dyn Worker>] = if policy.filters_unavailable_workers() {
+            pool
+        } else {
+            prefiltered = pool.iter().filter(|w| w.is_available()).cloned().collect();
+            &prefiltered
+        };
+        if available.is_empty() {
+            return None;
+        }
 
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
@@ -310,7 +326,7 @@ impl WorkerSelectionStage {
         // when enabled; otherwise delegates to the configured policy).
         let idx = self.policy_registry.select_worker(
             &policy,
-            &available,
+            available,
             &SelectWorkerInfo {
                 request_text: text,
                 tokens,

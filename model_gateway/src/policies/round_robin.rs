@@ -47,6 +47,10 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
         "round_robin"
     }
 
+    fn filters_unavailable_workers(&self) -> bool {
+        true
+    }
+
     fn reset(&self) {
         self.counter.store(0, Ordering::Relaxed);
     }

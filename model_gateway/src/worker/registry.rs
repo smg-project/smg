@@ -379,6 +379,22 @@ impl WorkerRegistry {
             .unwrap_or_else(|| Arc::from(Self::EMPTY_WORKERS))
     }
 
+    /// Model-scoped candidate pool for selection hot paths: returns the
+    /// shared per-model slice as-is when every worker matches (an atomic
+    /// refcount bump, no per-request clone), cloning only the matching
+    /// workers when the pool is mixed.
+    pub fn get_by_model_matching(
+        &self,
+        model_id: &str,
+        matches: impl Fn(&Arc<dyn Worker>) -> bool,
+    ) -> Arc<[Arc<dyn Worker>]> {
+        let workers = self.get_by_model(model_id);
+        if workers.iter().all(&matches) {
+            return workers;
+        }
+        workers.iter().filter(|w| matches(w)).cloned().collect()
+    }
+
     /// Apply the absolute overload veto to `worker`, returning `true` when the
     /// flag transitioned. The only sanctioned writer of
     /// [`Worker::set_overloaded`]: counters and gauge move once per edge.
@@ -2693,6 +2709,44 @@ mod tests {
         let llama_workers_after = registry.get_by_model("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
+    }
+
+    #[test]
+    fn get_by_model_matching_shares_the_slice_for_uniform_pools() {
+        let registry = WorkerRegistry::new();
+        for url in ["http://m1:8080", "http://m2:8080"] {
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new("m"))
+                        .worker_type(WorkerType::Regular)
+                        .build(),
+                ))
+                .unwrap();
+        }
+
+        let all = registry.get_by_model("m");
+        let matched =
+            registry.get_by_model_matching("m", |w| *w.worker_type() == WorkerType::Regular);
+        assert!(
+            Arc::ptr_eq(&all, &matched),
+            "uniform pool must reuse the shared per-model slice"
+        );
+
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://m3:8080")
+                    .model(ModelCard::new("m"))
+                    .worker_type(WorkerType::Prefill)
+                    .build(),
+            ))
+            .unwrap();
+        let filtered =
+            registry.get_by_model_matching("m", |w| *w.worker_type() == WorkerType::Regular);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered
+            .iter()
+            .all(|w| *w.worker_type() == WorkerType::Regular));
     }
 
     // Health-checker integration tests moved to worker/manager.rs along with
