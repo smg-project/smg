@@ -44,8 +44,10 @@ except ImportError:  # pragma: no cover - dry-run works without httpx
 # Import probe matrices (support both `-m vendor_probe.runner` and direct run).
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from vendor_probe import genmatrix
     from vendor_probe.probes import anthropic_messages, openai_responses
 else:
+    from . import genmatrix
     from .probes import anthropic_messages, openai_responses
 
 # --- response header allowlist ----------------------------------------------
@@ -262,6 +264,16 @@ def stream_event_names(sse_events, provider):
         else:
             names.append(ev.get("event") or "?")
     return ">".join(names)
+
+
+def fingerprint_sig(record, provider):
+    """Hashable behavior signature; identical sigs = one behavior cluster."""
+    resp = record.get("response") or {}
+    if "sse_events" in resp:
+        return ("sse", resp.get("status"), stream_event_names(resp["sse_events"], provider))
+    body = resp.get("body")
+    paths = tuple(sorted(field_paths(body))) if isinstance(body, (dict, list)) else ()
+    return ("json", resp.get("status"), paths)
 
 
 # =============================================================================
@@ -632,6 +644,7 @@ def price_for(model):
 
 def build_summary(adapter, records):
     cats = {}
+    sigs = {}  # category -> set of behavior signatures (recorded probes only)
     in_tok = out_tok = 0
     cost = 0.0
     n_recorded = n_transport = n_skipped = n_expected_err = 0
@@ -657,6 +670,7 @@ def build_summary(adapter, records):
         if r.get("recorded"):
             c["recorded"] += 1
             n_recorded += 1
+            sigs.setdefault(r["category"], set()).add(fingerprint_sig(r, adapter.name))
         resp = r.get("response") or {}
         status = resp.get("status")
         if r.get("expect") == "error" and status and 400 <= status < 500:
@@ -674,6 +688,10 @@ def build_summary(adapter, records):
             cost += (it / 1e6) * pi + (ot / 1e6) * po
     total = len(records)
     ran = total - n_skipped
+    # distinct behaviors per category: the volume-vs-signal metric — how many
+    # fingerprint clusters the recorded probes collapse into
+    for cat, c in cats.items():
+        c["fingerprint_clusters"] = len(sigs.get(cat, ()))
     return {
         "provider": adapter.name,
         "total_probes": total,
@@ -682,6 +700,7 @@ def build_summary(adapter, records):
         "transport_failures": n_transport,
         "expected_error_recorded": n_expected_err,
         "transport_failure_rate": round(n_transport / ran, 4) if ran else 0.0,
+        "fingerprint_clusters_total": len(set().union(*sigs.values())) if sigs else 0,
         "tokens": {"input": in_tok, "output": out_tok},
         "estimated_cost_usd": round(cost, 4),
         "categories": cats,
@@ -728,6 +747,18 @@ def main(argv=None):
     ap.add_argument("--out", default=None, help="output dir (default results/<provider>)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--filter", default=None, help="regex over probe ids")
+    ap.add_argument(
+        "--tier",
+        choices=["curated", "generated", "all"],
+        default="curated",
+        help="curated = hand-written matrix; generated = genmatrix tier; all = both",
+    )
+    ap.add_argument(
+        "--budget", type=int, default=0, help="generated-tier probe budget (0 = unlimited)"
+    )
+    ap.add_argument(
+        "--max-probes", type=int, default=0, help="cap total probes after filtering (0 = no cap)"
+    )
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--stream-timeout", type=float, default=180.0)
@@ -743,10 +774,24 @@ def main(argv=None):
         os.environ["OPENAI_MODEL_CLASSIC"] = args.model_classic
 
     adapter = build_adapter(args.provider)
-    probes = list(adapter.probes)
+    family = "openai" if adapter.name.endswith("openai") else "anthropic"
+    probes = []
+    if args.tier in ("curated", "all"):
+        probes.extend(adapter.probes)
+    if args.tier in ("generated", "all"):
+        probes.extend(genmatrix.generate(family, budget=args.budget))
+    ids = [p["id"] for p in probes]
+    if len(set(ids)) != len(ids):
+        seen, dups = set(), set()
+        for i in ids:
+            (dups if i in seen else seen).add(i)
+        print(f"duplicate probe ids: {sorted(dups)[:10]}", file=sys.stderr)
+        return 2
     if args.filter:
         rx = re.compile(args.filter)
         probes = [p for p in probes if rx.search(p["id"])]
+    if args.max_probes > 0:
+        probes = probes[: args.max_probes]
     if not probes:
         print("no probes matched", file=sys.stderr)
         return 2
