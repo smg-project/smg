@@ -84,6 +84,11 @@ class MessagesOverPD:
         assert len(full_text) > 0
 
 
+@pytest.mark.skip(
+    reason="SGLang's /v1/messages does not carry PD bootstrap fields through "
+    "to the scheduler yet: the decode leg rejects with 'Disaggregated request "
+    "received without bootstrap room id'. Unskip when the engine forwards them."
+)
 @pytest.mark.engine("sglang")
 @pytest.mark.gpu(2)
 @pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")

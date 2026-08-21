@@ -31,6 +31,11 @@ import smg_client
 logger = logging.getLogger(__name__)
 
 
+@pytest.mark.skip(
+    reason="SGLang's /v1/responses does not accept PD-disaggregated requests "
+    "yet (bootstrap fields are not carried through to the scheduler). Unskip "
+    "when the engine forwards them."
+)
 @pytest.mark.engine("sglang")
 @pytest.mark.gpu(2)
 @pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
