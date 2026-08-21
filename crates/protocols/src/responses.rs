@@ -2941,7 +2941,7 @@ pub struct ResponsesRequest {
     pub store: Option<bool>,
 
     /// Whether to stream the response
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
 
     /// Temperature for sampling
