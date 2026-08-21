@@ -54,7 +54,9 @@ pub struct EngineCoreReadyResponse {
     pub max_model_len: u64,
     /// Number of GPU blocks available for KV cache on this engine.
     pub num_gpu_blocks: u64,
-    /// KV cache block size (tokens per block).
+    /// KV cache block size (tokens per block). TokenSpeed renamed the wire
+    /// key to `prefix_granularity`; both spellings decode into this field.
+    #[serde(alias = "prefix_granularity")]
     pub block_size: u64,
     /// DP coordinator stats publish address, if applicable.
     pub dp_stats_address: Option<String>,
@@ -191,5 +193,25 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&json).unwrap();
         let resp: EngineCoreReadyResponse = decode_msgpack(&bytes).unwrap();
         assert_eq!(resp.max_num_batched_tokens, -1);
+    }
+
+    #[test]
+    fn ready_response_accepts_tokenspeed_prefix_granularity_rename() {
+        // TokenSpeed renamed the wire key `block_size` -> `prefix_granularity`;
+        // the decoder must accept either spelling.
+        let json = serde_json::json!({
+            "max_model_len": 131072u64,
+            "num_gpu_blocks": 6660u64,
+            "prefix_granularity": 64u64,
+            "dp_stats_address": serde_json::Value::Null,
+            "dtype": "bfloat16",
+            "vllm_version": "tokenspeed-0.1.0",
+            "world_size": 2u64,
+            "data_parallel_size": 2u64,
+            "kv_cache_size_tokens": 426176u64,
+        });
+        let bytes = rmp_serde::to_vec_named(&json).unwrap();
+        let resp: EngineCoreReadyResponse = decode_msgpack(&bytes).unwrap();
+        assert_eq!(resp.block_size, 64);
     }
 }
