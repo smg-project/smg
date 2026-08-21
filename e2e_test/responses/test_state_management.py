@@ -34,6 +34,7 @@ class _StateManagementCloudBase:
         assert resp.status == "completed"
         assert len(resp.output_text) > 0
         assert resp.usage is not None
+        assert resp.usage.total_tokens == resp.usage.input_tokens + resp.usage.output_tokens
 
     def test_streaming_response(self, model, api_client):
         """Test streaming response."""
@@ -248,6 +249,7 @@ class TestStateManagementLocal:
         assert resp.status == "completed"
         assert len(resp.output_text) > 0
         assert resp.usage is not None
+        assert resp.usage.total_tokens == resp.usage.input_tokens + resp.usage.output_tokens
 
     def test_streaming_response(self, model, api_client):
         """Test streaming response."""
@@ -357,6 +359,7 @@ class TestStateManagementGptOss:
         assert resp.status == "completed"
         assert len(resp.output_text) > 0
         assert resp.usage is not None
+        assert resp.usage.total_tokens == resp.usage.input_tokens + resp.usage.output_tokens
 
     def test_streaming_response(self, model, api_client):
         """Test streaming response."""

@@ -87,7 +87,9 @@ class TestChatCompletion:
         assert response.created
         assert response.usage.prompt_tokens > 0
         assert response.usage.completion_tokens > 0
-        assert response.usage.total_tokens > 0
+        assert response.usage.total_tokens == (
+            response.usage.prompt_tokens + response.usage.completion_tokens
+        )
 
     @pytest.mark.parametrize(
         "logprobs",
@@ -136,7 +138,8 @@ class TestChatCompletion:
             if usage is not None:
                 assert usage.prompt_tokens > 0, "usage.prompt_tokens was zero"
                 assert usage.completion_tokens > 0, "usage.completion_tokens was zero"
-                assert usage.total_tokens > 0, "usage.total_tokens was zero"
+                assert usage.total_tokens == usage.prompt_tokens + usage.completion_tokens
+                assert response.choices == [], "usage chunk should carry no choices"
                 continue
 
             # Skip if no choices
