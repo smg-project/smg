@@ -62,6 +62,16 @@ pub fn extract_routing_key_hint(headers: Option<&HeaderMap>) -> Option<&str> {
     extract_routing_key_hint_named(headers, &HEADER_ROUTING_KEY)
 }
 
+/// Declared size of the incoming raw body; pre-sizes reserialization buffers.
+pub fn content_length(headers: Option<&HeaderMap>) -> Option<usize> {
+    headers?
+        .get(http::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
 fn extract_header_value<'a>(headers: Option<&'a HeaderMap>, name: &HeaderName) -> Option<&'a str> {
     headers
         .and_then(|h| h.get(name))

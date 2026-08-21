@@ -568,12 +568,13 @@ impl Router {
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
+        let raw_body_len = header_utils::content_length(headers);
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
         let response = match lease.serialize_with(|view| {
-            serialize_request_body(view.request, canonical_model, worker.as_ref())
+            serialize_request_body(view.request, canonical_model, worker.as_ref(), raw_body_len)
         }) {
             Ok(body) => {
                 // Past this point dispatch needs only the serialized bytes;

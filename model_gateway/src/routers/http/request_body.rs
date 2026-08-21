@@ -15,7 +15,10 @@ use serde::{
 use serde_json::value::{to_raw_value, RawValue};
 
 use crate::{
-    routers::openai::{is_stripped_sglang_default, strip_default_sglang_fields, SGLANG_FIELDS},
+    routers::{
+        common::{serialize_json_sized, serialized_capacity},
+        openai::{is_stripped_sglang_default, strip_default_sglang_fields, SGLANG_FIELDS},
+    },
     worker::{Worker, WorkerError},
 };
 
@@ -32,12 +35,13 @@ pub(crate) fn serialize_request_body<T: Serialize>(
     typed_req: &T,
     canonical_model: Option<&str>,
     worker: &dyn Worker,
+    raw_len: Option<usize>,
 ) -> Result<Vec<u8>, RequestBodyError> {
     if worker.mutates_request() {
-        return value_request_body(typed_req, canonical_model, worker);
+        return value_request_body(typed_req, canonical_model, worker, raw_len);
     }
 
-    let bytes = to_vec_value_compatible(typed_req).map_err(RequestBodyError::Serialize)?;
+    let bytes = to_vec_value_compatible(typed_req, raw_len).map_err(RequestBodyError::Serialize)?;
     let canonical_raw = canonical_model
         .map(to_raw_value)
         .transpose()
@@ -47,14 +51,19 @@ pub(crate) fn serialize_request_body<T: Serialize>(
     // the Value pipeline rather than skipping the hooks.
     let mut body = match serde_json::from_slice::<RawBody>(&bytes) {
         Ok(body) => body,
-        Err(_) => return value_request_body(typed_req, canonical_model, worker),
+        Err(_) => return value_request_body(typed_req, canonical_model, worker, raw_len),
     };
     if let Some(model) = canonical_raw.as_deref() {
         body.set_model(model);
     }
     body.strip_default_sglang_fields();
     if body.mutated {
-        serde_json::to_vec(&body).map_err(RequestBodyError::Serialize)
+        // Edits only strip fields or swap the model id, so the first pass
+        // plus the canonical id bounds the reserialization.
+        let capacity = bytes.len() + canonical_raw.as_deref().map_or(0, |m| m.get().len());
+        let mut out = Vec::with_capacity(capacity);
+        serde_json::to_writer(&mut out, &body).map_err(RequestBodyError::Serialize)?;
+        Ok(out)
     } else {
         Ok(bytes)
     }
@@ -67,6 +76,7 @@ fn value_request_body<T: Serialize>(
     typed_req: &T,
     canonical_model: Option<&str>,
     worker: &dyn Worker,
+    raw_len: Option<usize>,
 ) -> Result<Vec<u8>, RequestBodyError> {
     let mut json_val = serde_json::to_value(typed_req).map_err(RequestBodyError::Serialize)?;
     if let Some(canonical_model) = canonical_model {
@@ -76,7 +86,7 @@ fn value_request_body<T: Serialize>(
         .prepare_request(json_val)
         .map_err(RequestBodyError::Prepare)?;
     strip_default_sglang_fields(&mut json_val);
-    serde_json::to_vec(&json_val).map_err(RequestBodyError::Serialize)
+    serialize_json_sized(&json_val, raw_len).map_err(RequestBodyError::Serialize)
 }
 
 /// `serde_json::to_value` stores `f32` widened to `f64`, so the `Value`
@@ -94,8 +104,11 @@ impl serde_json::ser::Formatter for F32WideningFormatter {
     }
 }
 
-fn to_vec_value_compatible<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
-    let mut buf = Vec::with_capacity(128);
+fn to_vec_value_compatible<T: Serialize>(
+    value: &T,
+    raw_len: Option<usize>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut buf = Vec::with_capacity(raw_len.map_or(128, serialized_capacity));
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, F32WideningFormatter);
     value.serialize(&mut ser)?;
     Ok(buf)
@@ -238,7 +251,7 @@ mod tests {
         assert!(!worker.mutates_request());
         let req = generate_request(json!({}));
 
-        let body = serialize_request_body(&req, None, &worker).unwrap();
+        let body = serialize_request_body(&req, None, &worker, None).unwrap();
 
         assert_eq!(body, value_path_bytes(&req, None, &worker));
         let parsed: Value = serde_json::from_slice(&body).unwrap();
@@ -250,7 +263,7 @@ mod tests {
         let worker = worker();
         let req = generate_request(json!({}));
 
-        let body = serialize_request_body(&req, Some("canonical-model"), &worker).unwrap();
+        let body = serialize_request_body(&req, Some("canonical-model"), &worker, None).unwrap();
 
         assert_eq!(
             body,
@@ -266,7 +279,7 @@ mod tests {
         assert!(worker.mutates_request());
         let req = generate_request(json!({}));
 
-        let body = serialize_request_body(&req, None, &worker).unwrap();
+        let body = serialize_request_body(&req, None, &worker, None).unwrap();
 
         assert_eq!(body, value_path_bytes(&req, None, &worker));
         let parsed: Value = serde_json::from_slice(&body).unwrap();
@@ -285,7 +298,7 @@ mod tests {
             "min_p": 0.0
         }));
 
-        let body = serialize_request_body(&req, None, &worker).unwrap();
+        let body = serialize_request_body(&req, None, &worker, None).unwrap();
 
         assert_eq!(body, value_path_bytes(&req, None, &worker));
         let parsed: Value = serde_json::from_slice(&body).unwrap();
@@ -304,10 +317,10 @@ mod tests {
         // body needs editing.
         let req = generate_request(json!({"return_hidden_states": true}));
 
-        let body = serialize_request_body(&req, None, &worker).unwrap();
+        let body = serialize_request_body(&req, None, &worker, None).unwrap();
 
         assert_eq!(body, value_path_bytes(&req, None, &worker));
-        assert_eq!(body, to_vec_value_compatible(&req).unwrap());
+        assert_eq!(body, to_vec_value_compatible(&req, None).unwrap());
     }
 
     #[test]
@@ -315,7 +328,8 @@ mod tests {
         let worker = worker();
         let req = generate_request(json!({}));
 
-        let body = String::from_utf8(serialize_request_body(&req, None, &worker).unwrap()).unwrap();
+        let body =
+            String::from_utf8(serialize_request_body(&req, None, &worker, None).unwrap()).unwrap();
 
         // `to_value` widens `f32` to `f64`; the plain writer would emit the
         // shorter `0.7` and change wire bytes.
@@ -334,13 +348,13 @@ mod tests {
         }))
         .unwrap();
 
-        let plain = serialize_request_body(&req, None, &worker).unwrap();
+        let plain = serialize_request_body(&req, None, &worker, None).unwrap();
         assert_eq!(plain, value_path_bytes(&req, None, &worker));
         let parsed: Value = serde_json::from_slice(&plain).unwrap();
         assert!(parsed.get("separate_reasoning").is_none());
         assert_eq!(parsed["skip_special_tokens"], true);
 
-        let aliased = serialize_request_body(&req, Some("canonical-model"), &worker).unwrap();
+        let aliased = serialize_request_body(&req, Some("canonical-model"), &worker, None).unwrap();
         assert_eq!(
             aliased,
             value_path_bytes(&req, Some("canonical-model"), &worker)
@@ -353,15 +367,32 @@ mod tests {
         let req = vec![1, 2, 3];
 
         // The raw editor rejects the shape, so this exercises the fallback.
-        let direct = to_vec_value_compatible(&req).unwrap();
+        let direct = to_vec_value_compatible(&req, None).unwrap();
         assert!(serde_json::from_slice::<RawBody>(&direct).is_err());
 
-        let body = serialize_request_body(&req, Some("canonical-model"), &worker).unwrap();
+        let body = serialize_request_body(&req, Some("canonical-model"), &worker, None).unwrap();
 
         assert_eq!(
             body,
             value_path_bytes(&req, Some("canonical-model"), &worker)
         );
         assert_eq!(body, b"[1,2,3]");
+    }
+
+    #[test]
+    fn presized_body_capacity_stays_within_slack_of_len() {
+        let worker = worker();
+        let req = generate_request(json!({ "text": "x".repeat(32 << 20) }));
+        let raw_len = serde_json::to_vec(&req).unwrap().len();
+
+        let body = serialize_request_body(&req, None, &worker, Some(raw_len)).unwrap();
+
+        assert!(body.len() > 32 << 20);
+        assert!(
+            body.capacity() <= body.len() + body.len() / 8 + 1024,
+            "capacity {} must stay within slack of len {}",
+            body.capacity(),
+            body.len()
+        );
     }
 }

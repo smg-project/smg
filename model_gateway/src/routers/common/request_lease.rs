@@ -4,6 +4,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
 
+use super::trim_serialization_slack;
 use crate::{config::types::RetryConfig, observability::metrics::Metrics};
 
 /// When a [`RequestLease`] lets go of the parsed request.
@@ -113,7 +114,11 @@ impl<T> RequestLease<T> {
         f: impl FnOnce(LeaseView<'_, T>) -> Result<Vec<u8>, E>,
     ) -> Result<Bytes, E> {
         let mut inner = self.lock();
-        let body = Bytes::from(f(Self::view(&inner))?);
+        let mut buf = f(Self::view(&inner))?;
+        // The frozen memo can outlive dispatch (retry replay); never let it
+        // drag growth slack along.
+        trim_serialization_slack(&mut buf);
+        let body = Bytes::from(buf);
         inner.body = SerializedBody::Single(body.clone());
         Ok(body)
     }
@@ -126,7 +131,9 @@ impl<T> RequestLease<T> {
         f: impl FnOnce(LeaseView<'_, T>) -> Result<(Vec<u8>, Vec<u8>), E>,
     ) -> Result<(Bytes, Bytes), E> {
         let mut inner = self.lock();
-        let (prefill, decode) = f(Self::view(&inner))?;
+        let (mut prefill, mut decode) = f(Self::view(&inner))?;
+        trim_serialization_slack(&mut prefill);
+        trim_serialization_slack(&mut decode);
         let legs = (Bytes::from(prefill), Bytes::from(decode));
         inner.body = SerializedBody::Legs(legs.0.clone(), legs.1.clone());
         Ok(legs)

@@ -45,7 +45,9 @@ use crate::{
             overload,
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, RetryExecutor},
+            serialize_json_sized,
             sse::{SseEncoder, SSE_CHANNEL_BUFFER},
+            trim_serialization_slack,
         },
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
@@ -488,6 +490,8 @@ impl PDRouter {
             return shed;
         }
 
+        let raw_body_len = header_utils::content_length(headers);
+
         // Keyed-load accounting uses the same effective key as selection:
         // rid-derived first, header fallback. Built before the lease releases.
         let load_guards = lease.with_view(|view| {
@@ -538,9 +542,9 @@ impl PDRouter {
                     }
 
                     Ok((
-                        serde_json::to_vec(&prefill_json)
+                        serialize_json_sized(&prefill_json, raw_body_len)
                             .map_err(|e| Box::new(Self::handle_serialization_error(e)))?,
-                        serde_json::to_vec(&json_request)
+                        serialize_json_sized(&json_request, raw_body_len)
                             .map_err(|e| Box::new(Self::handle_serialization_error(e)))?,
                     ))
                 });
@@ -636,9 +640,9 @@ impl PDRouter {
             }
 
             Ok((
-                serde_json::to_vec(&prefill_json_request)
+                serialize_json_sized(&prefill_json_request, raw_body_len)
                     .map_err(|e| Box::new(Self::handle_serialization_error(e)))?,
-                serde_json::to_vec(&decode_json_request)
+                serialize_json_sized(&decode_json_request, raw_body_len)
                     .map_err(|e| Box::new(Self::handle_serialization_error(e)))?,
             ))
         });
@@ -1130,7 +1134,9 @@ impl PDRouter {
         if let (Some(obj), Some(params)) = (decode_json.as_object_mut(), decode_params) {
             obj.insert("kv_transfer_params".to_string(), params);
         }
-        let decode_body = match serde_json::to_vec(&decode_json) {
+        // The leg's own serialized length bounds the reserialization; the
+        // slack covers the injected kv_transfer_params.
+        let decode_body = match serialize_json_sized(&decode_json, Some(decode_body.len())) {
             Ok(body) => Bytes::from(body),
             Err(e) => return Self::handle_serialization_error(e),
         };
@@ -1588,9 +1594,13 @@ impl PDRouter {
 
         Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
 
-        // Return merged response
-        match serde_json::to_vec(&decode_json) {
-            Ok(body) => Self::non_stream_pd_json_response(status, Bytes::from(body)),
+        // Return merged response; the two leg bodies together bound the
+        // merge, and the trim drops whatever the prefill leg didn't add.
+        match serialize_json_sized(&decode_json, Some(decode_body.len() + prefill_body.len())) {
+            Ok(mut body) => {
+                trim_serialization_slack(&mut body);
+                Self::non_stream_pd_json_response(status, Bytes::from(body))
+            }
             Err(e) => {
                 error!("Failed to serialize merged response: {}", e);
                 Self::non_stream_pd_json_response(status, decode_body)
