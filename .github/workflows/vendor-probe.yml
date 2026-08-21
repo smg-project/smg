@@ -1,0 +1,160 @@
+name: Vendor Probe
+
+# Record ground-truth behavior of the real OpenAI Responses and Anthropic
+# Messages APIs for SMG compatibility audits. Recordings (bodies, SSE
+# transcripts, error shapes, structural fingerprints) upload as artifacts.
+# Lives outside e2e_test/ so no existing path filter runs it; a PR touching
+# only vendor_probe/** (or this file) runs ONLY this workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: Which vendor(s) to probe
+        type: choice
+        options: [all, openai, anthropic]
+        default: all
+      openai_model:
+        description: OpenAI @MODEL override
+        type: string
+        default: gpt-5-nano
+      anthropic_model:
+        description: Anthropic @MODEL override
+        type: string
+        default: claude-haiku-4-5
+      probe_filter:
+        description: Optional regex over probe ids
+        type: string
+        default: ""
+  pull_request:
+    paths:
+      - vendor_probe/**
+      - .github/workflows/vendor-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vendor-probe-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PROVIDER_SEL: ${{ inputs.provider || 'all' }}
+  OPENAI_MODEL: ${{ inputs.openai_model || 'gpt-5-nano' }}
+  ANTHROPIC_MODEL: ${{ inputs.anthropic_model || 'claude-haiku-4-5' }}
+  PROBE_FILTER: ${{ inputs.probe_filter || '' }}
+
+jobs:
+  probe:
+    runs-on: k8s-runner-cpu
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install httpx
+        run: pip install httpx
+
+      # Anthropic key comes from the runner pod env (mirror nightly-triage.yml).
+      - name: Export Anthropic API key from pod env
+        if: ${{ env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'anthropic' }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::ANTHROPIC_API_KEY is not present in the runner pod environment"
+            exit 1
+          fi
+          echo "::add-mask::${ANTHROPIC_API_KEY}"
+          echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" >> "$GITHUB_ENV"
+
+      - name: Probe OpenAI
+        id: openai
+        if: ${{ env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai' }}
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          FILTER_ARG=""
+          [ -n "$PROBE_FILTER" ] && FILTER_ARG="--filter $PROBE_FILTER"
+          python -m vendor_probe.runner --provider openai \
+            --out results/openai $FILTER_ARG
+
+      - name: Upload OpenAI artifact
+        if: ${{ always() && (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: vendor-probe-openai
+          path: results/openai
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Probe Anthropic
+        id: anthropic
+        if: ${{ env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'anthropic' }}
+        continue-on-error: true
+        run: |
+          FILTER_ARG=""
+          [ -n "$PROBE_FILTER" ] && FILTER_ARG="--filter $PROBE_FILTER"
+          python -m vendor_probe.runner --provider anthropic \
+            --out results/anthropic $FILTER_ARG
+
+      - name: Upload Anthropic artifact
+        if: ${{ always() && (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'anthropic') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: vendor-probe-anthropic
+          path: results/anthropic
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Print summaries
+        if: always()
+        run: |
+          for d in results/openai results/anthropic; do
+            if [ -f "$d/summary.json" ]; then
+              echo "===== $d/summary.json ====="
+              cat "$d/summary.json"
+              echo
+            fi
+          done
+
+      # Fail the job only on transport failures (network/timeout/persistent
+      # 5xx-429). Behavioral 4xx from error-probes are successful recordings.
+      - name: Health gate (>20% transport failures fails the job)
+        if: always()
+        env:
+          OPENAI_OUTCOME: ${{ steps.openai.outcome }}
+          ANTHROPIC_OUTCOME: ${{ steps.anthropic.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          sel = os.environ.get("PROVIDER_SEL", "all")
+          checks = []
+          if sel in ("all", "openai"):
+              checks.append(("openai", "results/openai/summary.json",
+                             os.environ.get("OPENAI_OUTCOME")))
+          if sel in ("all", "anthropic"):
+              checks.append(("anthropic", "results/anthropic/summary.json",
+                             os.environ.get("ANTHROPIC_OUTCOME")))
+          failed = False
+          for name, path, outcome in checks:
+              if not os.path.exists(path):
+                  # runner crashed before writing a summary -> treat as failure
+                  print(f"::error::{name}: no summary.json (runner outcome={outcome})")
+                  failed = True
+                  continue
+              s = json.load(open(path))
+              rate = s.get("transport_failure_rate", 0.0)
+              print(f"{name}: transport_failure_rate={rate} "
+                    f"recorded={s.get('recorded')} skipped={s.get('skipped')} "
+                    f"transport_failures={s.get('transport_failures')}")
+              if rate > 0.20:
+                  print(f"::error::{name}: transport failure rate {rate:.1%} exceeds 20%")
+                  failed = True
+          sys.exit(1 if failed else 0)
+          PY
