@@ -5,6 +5,7 @@ completions, so every create below exercises prefill/decode pair selection,
 bootstrap injection, and dual dispatch.
 
 Backends:
+- "pd_http": HTTP mode (SGLang only - vLLM does not support HTTP)
 - "pd_grpc": gRPC mode (both SGLang and vLLM)
 
 Requirements:
@@ -28,6 +29,47 @@ import pytest
 import smg_client
 
 logger = logging.getLogger(__name__)
+
+
+@pytest.mark.engine("sglang")
+@pytest.mark.gpu(2)
+@pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
+@pytest.mark.e2e
+@pytest.mark.skip_for_runtime("vllm", reason="vLLM does not support HTTP mode")
+@pytest.mark.parametrize("setup_backend", ["pd_http"], indirect=True)
+class TestPDResponsesHttp:
+    """Responses API through the HTTP PD router's dual dispatch.
+
+    Creation and streaming only: in HTTP mode the gateway proxies to the
+    engine's own /v1/responses, so storage semantics (retrieval, chaining)
+    are the engine's and are not asserted here.
+    """
+
+    def test_basic_response_creation(self, model, api_client):
+        """Test basic response creation."""
+        resp = api_client.responses.create(model=model, input="What is 2+2?")
+
+        assert resp.id is not None
+        assert resp.error is None
+        assert resp.status == "completed"
+        assert len(resp.output_text) > 0
+        assert resp.usage is not None
+
+    def test_streaming_response(self, model, api_client):
+        """Test streaming response."""
+        resp = api_client.responses.create(
+            model=model, input="Count to 5", stream=True, max_output_tokens=50
+        )
+
+        events = list(resp)
+        created_events = [e for e in events if e.type == "response.created"]
+        assert len(created_events) > 0
+
+        delta_events = [e for e in events if e.type == "response.output_text.delta"]
+        assert len(delta_events) > 0
+
+        completed_events = [e for e in events if e.type == "response.completed"]
+        assert len(completed_events) == 1
 
 
 @pytest.mark.engine("sglang", "vllm")
