@@ -477,8 +477,11 @@ class Gateway:
                 f"{self.base_url}/workers/{worker_id}",
                 timeout=timeout,
             )
-            if resp.status_code == 200:
-                return True, "Worker removed"
+            # 200 = removed synchronously; 202 = removal accepted and queued
+            # for background processing. Either means the request succeeded —
+            # callers that need completion poll list_workers for absence.
+            if resp.status_code in (200, 202):
+                return True, resp.text
             return False, resp.text
         except (httpx.RequestError, httpx.TimeoutException) as e:
             return False, str(e)
