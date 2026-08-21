@@ -64,6 +64,11 @@ on:
         type: string
         default: ""
         description: "DP engines per ZMQ worker (grouped vLLM launch; empty = 1)"
+      min_selected:
+        required: false
+        type: number
+        default: 0
+        description: "Minimum effective (selected) test count; exported as E2E_MIN_SELECTED for the pytest harness floor check (0 = disabled)"
 
 jobs:
   run:
@@ -159,6 +164,7 @@ jobs:
           SHOW_WORKER_LOGS: "0"
           SHOW_ROUTER_LOGS: "1"
           E2E_LOG_DIR: e2e-logs
+          E2E_MIN_SELECTED: ${{ inputs.min_selected }}
           BRAVE_MCP_HOST: ${{ inputs.setup_agentic_deps && 'brave-search-mcp' || '' }}
         run: |
           bash scripts/ci_killall_sglang.sh "nuke_gpus"
