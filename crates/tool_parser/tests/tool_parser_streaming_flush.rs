@@ -9,7 +9,7 @@
 //! empty stream — no tool_call deltas AND no content deltas — while the
 //! non-streaming path correctly fell back to returning the text as content.
 //!
-//! Three properties are covered here:
+//! Four properties are covered here:
 //! 1. Text that is definitively not a declared tool call (complete JSON with
 //!    a missing or undeclared name) is surfaced as normal text mid-stream
 //!    instead of being buffered forever or silently dropped, while legitimate
@@ -248,6 +248,19 @@ async fn streaming_never_swallows_content() {
             ..BLANK
         },
         Case {
+            // The helper bails out on the undeclared, still-incomplete value
+            // and emits the whole chunk, so `normal_text_buffer` holds back
+            // the trailing partial `</tool_call>`. With no tool call ever
+            // announced that suffix is real text, not marker debris.
+            label: "qwen: partial </tool_call> held in normal_text_buffer",
+            make: qwen,
+            feed: Feed::Chunks(&[r#"<tool_call>
+{"name": "bogus"</tool"#]),
+            text: "<tool_call>\n{\"name\": \"bogus\"",
+            flush: "</tool",
+            ..BLANK
+        },
+        Case {
             // Every other cohere emission path strips response markers; the
             // flush must too, rather than leaking control tokens as content.
             label: "cohere: response markers stripped from the flushed text",
@@ -381,15 +394,40 @@ async fn partial_declared_name_keeps_buffering() {
 }
 
 #[tokio::test]
-async fn reset_clears_the_streaming_buffer() {
-    let mut parser = LlamaParser::new();
+async fn reset_clears_the_streaming_buffers() {
     let tools = create_test_tools();
 
-    parser
+    // The shared buffer every helper-based parser holds.
+    let mut llama = LlamaParser::new();
+    llama
         .parse_incremental(r#"{"name": "get_wea"#, &tools)
         .await
         .unwrap();
-    parser.reset();
+    llama.reset();
+    assert_eq!(
+        llama.take_unstreamed_normal_text(),
+        "",
+        "reset must clear the streaming buffer"
+    );
 
-    assert_eq!(parser.take_unstreamed_normal_text(), "");
+    // Qwen additionally parks a partial `</tool_call>` in `normal_text_buffer`,
+    // which reset() must clear too or it bleeds into the next request.
+    let held = r#"<tool_call>
+{"name": "bogus"</tool"#;
+    let mut qwen = QwenParser::new();
+    qwen.parse_incremental(held, &tools).await.unwrap();
+    let mut drained = QwenParser::new();
+    drained.parse_incremental(held, &tools).await.unwrap();
+    assert_eq!(
+        drained.take_unstreamed_normal_text(),
+        "</tool",
+        "precondition: normal_text_buffer is holding the partial end token"
+    );
+
+    qwen.reset();
+    assert_eq!(
+        qwen.take_unstreamed_normal_text(),
+        "",
+        "reset must clear normal_text_buffer, not just the main buffer"
+    );
 }
