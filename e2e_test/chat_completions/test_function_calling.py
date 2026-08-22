@@ -976,52 +976,221 @@ class _TestToolChoiceBase:
         """Check if the current test is marked as flaky for this class."""
         return test_name in self.FLAKY_TESTS
 
+    @staticmethod
+    def _auto_decision_tools():
+        """Only ``get_weather``, so the auto *decision* is unambiguous.
+
+        The full ``get_test_tools()`` set declares ``make_next_step_decision``,
+        an agentic catch-all whose description tells the model to call it to
+        ANSWER arbitrary questions. With it declared, routing "What is 2+2?"
+        through a tool is defensible behaviour rather than a bug, so
+        "no tool was needed" would not be a property of the request. Narrowing
+        to the one tool the prompts are about makes both scenarios test
+        tool_choice='auto' instead of the model's appetite for a meta-tool.
+        """
+        return [tool for tool in get_test_tools() if tool["function"]["name"] == "get_weather"]
+
+    # Prompt that clearly needs the declared ``get_weather`` tool.
+    AUTO_TOOL_NEEDED_MESSAGES = [{"role": "user", "content": "What's the weather in Tokyo?"}]
+    # Prompt that clearly needs no tool at all.
+    AUTO_NO_TOOL_MESSAGES = [
+        {"role": "user", "content": "What is 2+2? Answer with just the number."}
+    ]
+
+    def _assert_auto_tool_calls_valid(self, tool_calls, tools):
+        """Every produced tool call must carry JSON-dict arguments.
+
+        Deliberately *not* asserted: that the name is one of the declared
+        tools. The gateway forwards a call the model explicitly marked even
+        when it invents the name - dropping it would lose the call, and
+        rewriting it as text would lose its structure. Only a call inferred
+        from bare JSON, with no start marker, stays content. So an undeclared
+        name reaching the client is intended behaviour here, not a defect, and
+        asserting otherwise would pin the opposite of the contract.
+
+        What is still a gateway contract, and is asserted, is that whatever is
+        forwarded is well-formed: arguments must parse to a JSON object.
+        """
+        del tools  # names are the model's to choose; see the docstring
+        for tool_call in tool_calls:
+            assert tool_call.function.arguments, (
+                f"tool call {tool_call.function.name!r} carried no arguments"
+            )
+            args = json.loads(tool_call.function.arguments)
+            assert isinstance(args, dict), f"Arguments should parse to a dict, got {type(args)}"
+
     def test_tool_choice_auto_non_streaming(self, model, api_client):
-        """Test tool_choice='auto' in non-streaming mode."""
+        """Test tool_choice='auto' semantics in non-streaming mode.
 
-        tools = get_test_tools()
-        messages = get_test_messages()
+        - A prompt that clearly needs the declared weather tool should yield a
+          tool call for a declared tool, with JSON args mentioning the location.
+        - A prompt that clearly needs no tool should yield non-empty text,
+          no tool calls, and finish_reason == 'stop'.
 
+        For models registered in FLAKY_TESTS (weak tool-callers), the
+        *decision* (call vs. answer) is relaxed but every produced tool call
+        must still be structurally valid.
+        """
+
+        tools = self._auto_decision_tools()
+        flaky = self._is_flaky_test("test_tool_choice_auto_non_streaming")
+
+        # --- Scenario 1: prompt that needs the weather tool ---
         response = api_client.chat.completions.create(
             model=model,
-            messages=messages,
+            messages=self.AUTO_TOOL_NEEDED_MESSAGES,
             max_tokens=2048,
+            temperature=0.2,
             tools=tools,
             tool_choice="auto",
             stream=False,
         )
 
-        assert response.choices[0].message is not None
-        # With auto, tool calls are optional
+        choice = response.choices[0]
+        tool_calls = choice.message.tool_calls
+        if tool_calls:
+            self._assert_auto_tool_calls_valid(tool_calls, tools)
+            # Argument *quality* is model-dependent in the same way the
+            # call/answer decision is, so it is relaxed for the same models.
+            assert flaky or any(
+                "tokyo" in (tc.function.arguments or "").lower() for tc in tool_calls
+            ), f"Expected the location (Tokyo) in tool call args, got: {tool_calls}"
+            assert choice.finish_reason == "tool_calls", (
+                f"Expected finish_reason 'tool_calls', got {choice.finish_reason!r}"
+            )
+        else:
+            assert flaky, (
+                "tool_choice='auto' produced no tool call for a prompt that "
+                "clearly needs the declared weather tool"
+            )
+            # Weak model answered directly; it must at least answer with text.
+            assert choice.message.content and choice.message.content.strip(), (
+                "Expected non-empty text content when no tool call was made"
+            )
+            assert choice.finish_reason == "stop", (
+                f"Expected finish_reason 'stop', got {choice.finish_reason!r}"
+            )
 
-    def test_tool_choice_auto_streaming(self, model, api_client):
-        """Test tool_choice='auto' in streaming mode."""
-
-        tools = get_test_tools()
-        messages = get_test_messages()
-
+        # --- Scenario 2: prompt that needs no tool ---
         response = api_client.chat.completions.create(
             model=model,
-            messages=messages,
-            max_tokens=2048,
+            messages=self.AUTO_NO_TOOL_MESSAGES,
+            max_tokens=256,
+            temperature=0.2,
             tools=tools,
             tool_choice="auto",
-            stream=True,
+            stream=False,
         )
 
-        # Collect streaming response
-        content_chunks = []
-        tool_call_chunks = []
+        choice = response.choices[0]
+        if flaky and choice.message.tool_calls:
+            # Weak model spuriously called a tool; it must still be declared/valid.
+            self._assert_auto_tool_calls_valid(choice.message.tool_calls, tools)
+            assert choice.finish_reason == "tool_calls", (
+                f"Expected finish_reason 'tool_calls', got {choice.finish_reason!r}"
+            )
+        else:
+            assert not choice.message.tool_calls, (
+                f"Expected no tool calls for a trivial arithmetic prompt, "
+                f"got: {choice.message.tool_calls}"
+            )
+            assert choice.message.content and choice.message.content.strip(), (
+                "Expected non-empty text content for a trivial arithmetic prompt"
+            )
+            assert choice.finish_reason == "stop", (
+                f"Expected finish_reason 'stop', got {choice.finish_reason!r}"
+            )
 
-        for chunk in response:
-            if chunk.choices[0].delta.content:
-                content_chunks.append(chunk.choices[0].delta.content)
-            elif chunk.choices[0].delta.tool_calls:
-                tool_call_chunks.extend(chunk.choices[0].delta.tool_calls)
+    def test_tool_choice_auto_streaming(self, model, api_client):
+        """Test tool_choice='auto' semantics in streaming mode.
 
-        # Should complete without errors
-        assert isinstance(content_chunks, list)
-        assert isinstance(tool_call_chunks, list)
+        Same contract as the non-streaming variant, verified over accumulated
+        stream deltas (chunk collection mirrors
+        test_required_streaming_arguments_chunks_json).
+        """
+
+        tools = self._auto_decision_tools()
+        flaky = self._is_flaky_test("test_tool_choice_auto_streaming")
+
+        def collect_stream(messages, max_tokens):
+            response = api_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.2,
+                tools=tools,
+                tool_choice="auto",
+                stream=True,
+            )
+            content_parts = []
+            tool_calls_by_index = {}
+            finish_reason = None
+            for chunk in response:
+                choice = chunk.choices[0]
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+                if choice.delta.content:
+                    content_parts.append(choice.delta.content)
+                if choice.delta.tool_calls:
+                    for tc_delta in choice.delta.tool_calls:
+                        tool_call = tool_calls_by_index.setdefault(
+                            tc_delta.index, {"name": "", "arguments": ""}
+                        )
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                tool_call["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                tool_call["arguments"] += tc_delta.function.arguments
+            return "".join(content_parts), list(tool_calls_by_index.values()), finish_reason
+
+        def assert_streamed_calls_valid(tool_calls):
+            # Name provenance is not asserted - see _assert_auto_tool_calls_valid.
+            for tool_call in tool_calls:
+                assert tool_call["arguments"], (
+                    f"streamed tool call {tool_call['name']!r} produced no argument "
+                    "deltas - the call is unusable by the client"
+                )
+                args = json.loads(tool_call["arguments"])
+                assert isinstance(args, dict)
+
+        # --- Scenario 1: prompt that needs the weather tool ---
+        content, tool_calls, finish_reason = collect_stream(
+            self.AUTO_TOOL_NEEDED_MESSAGES, max_tokens=2048
+        )
+        if tool_calls:
+            assert_streamed_calls_valid(tool_calls)
+            assert flaky or any("tokyo" in tc["arguments"].lower() for tc in tool_calls), (
+                f"Expected the location (Tokyo) in streamed tool call args, got: {tool_calls}"
+            )
+            assert finish_reason == "tool_calls", (
+                f"Expected finish_reason 'tool_calls', got {finish_reason!r}"
+            )
+        else:
+            assert flaky, (
+                "tool_choice='auto' streamed no tool call for a prompt that "
+                "clearly needs the declared weather tool"
+            )
+            assert content.strip(), "Expected non-empty streamed text when no tool call was made"
+            assert finish_reason == "stop", f"Expected finish_reason 'stop', got {finish_reason!r}"
+
+        # --- Scenario 2: prompt that needs no tool ---
+        content, tool_calls, finish_reason = collect_stream(
+            self.AUTO_NO_TOOL_MESSAGES, max_tokens=256
+        )
+        if flaky and tool_calls:
+            assert_streamed_calls_valid(tool_calls)
+            assert finish_reason == "tool_calls", (
+                f"Expected finish_reason 'tool_calls', got {finish_reason!r}"
+            )
+        else:
+            assert not tool_calls, (
+                f"Expected no streamed tool calls for a trivial arithmetic prompt, "
+                f"got: {tool_calls}"
+            )
+            assert content.strip(), (
+                "Expected non-empty streamed text for a trivial arithmetic prompt"
+            )
+            assert finish_reason == "stop", f"Expected finish_reason 'stop', got {finish_reason!r}"
 
     def test_tool_choice_required_non_streaming(self, model, api_client):
         """Test tool_choice='required' in non-streaming mode."""
@@ -1508,10 +1677,13 @@ class _TestToolChoiceBase:
 class TestToolChoiceLlama(_TestToolChoiceBase):
     """Tests for tool_choice functionality with Llama model."""
 
-    # Mark flaky tests for this model
+    # Mark flaky tests for this model — Llama-3.2-1B does not reliably
+    # decide correctly with tool_choice='auto'.
     FLAKY_TESTS = {
         "test_multi_tool_scenario_auto",
         "test_multi_tool_scenario_required",
+        "test_tool_choice_auto_non_streaming",
+        "test_tool_choice_auto_streaming",
     }
 
 
@@ -1547,10 +1719,13 @@ class TestToolChoiceQwen(_TestToolChoiceBase):
 class TestToolChoiceMistral(_TestToolChoiceBase):
     """Tests for tool_choice functionality with Mistral model."""
 
-    # Mark flaky tests for this model
+    # Mark flaky tests for this model — Mistral-7B-v0.3 is not a reliable
+    # tool_choice='auto' decision-maker.
     FLAKY_TESTS = {
         "test_multi_tool_scenario_auto",
         "test_multi_tool_scenario_required",
+        "test_tool_choice_auto_non_streaming",
+        "test_tool_choice_auto_streaming",
     }
 
     def test_complex_parameters_required_non_streaming(self, model, api_client):
