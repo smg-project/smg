@@ -19,6 +19,9 @@
 //!    swallowed — and nothing is invented once a tool call was announced.
 //! 3. A declared tool call trailing a non-tool value in the same chunk still
 //!    becomes tool-call deltas rather than stranded text.
+//! 4. A call whose name and arguments both land in one chunk streams *both*
+//!    in that chunk. There is no later parser call to fall back on, so a name
+//!    without arguments would reach the client as an unusable tool call.
 mod common;
 
 use common::{create_test_tools, streaming_helpers};
@@ -200,6 +203,7 @@ async fn streaming_never_swallows_content() {
             label: "llama: nothing invented after a completed tool call",
             feed: Feed::Chunks(&[r#"{"name": "get_weather", "parameters": {"city": "Tokyo"}}"#]),
             call: Some("get_weather"),
+            args_contain: Some(r#"{"city":"Tokyo"}"#),
             ..BLANK
         },
         Case {
@@ -208,6 +212,48 @@ async fn streaming_never_swallows_content() {
             label: "llama: announced call whose arguments are truncated",
             feed: Feed::Chunks(&[r#"{"name": "get_weather", "parameters": {"city": "Par"#]),
             call: Some("get_weather"),
+            ..BLANK
+        },
+        // --- a call whose name and arguments arrive together must stream both
+        //     in that single invocation: no later call ever comes
+        Case {
+            label: "json: whole declared call inside one chunk",
+            make: json,
+            feed: Feed::Chunks(&[r#"{"name": "get_weather", "arguments": {"city": "Tokyo"}}"#]),
+            call: Some("get_weather"),
+            args_contain: Some(r#"{"city":"Tokyo"}"#),
+            ..BLANK
+        },
+        Case {
+            label: "mistral: declared call after an undeclared one streams its args",
+            make: mistral,
+            feed: Feed::Chunks(&[
+                r#"[TOOL_CALLS] [{"name": "bogus", "arguments": {}}, {"name": "get_weather", "arguments": {"city": "Paris"}}"#,
+                "]",
+            ]),
+            text: r#"[TOOL_CALLS] [{"name": "bogus", "arguments": {}}, "#,
+            call: Some("get_weather"),
+            args_contain: Some(r#"{"city":"Paris"}"#),
+            ..BLANK
+        },
+        Case {
+            label: "cohere: complete action block streams name and arguments",
+            make: cohere,
+            feed: Feed::Chunks(&[
+                r#"<|START_ACTION|>{"tool_name": "search", "parameters": {"query": "rust"}}<|END_ACTION|>"#,
+                " done",
+            ]),
+            call: Some("search"),
+            args_contain: Some(r#"{"query":"rust"}"#),
+            ..BLANK
+        },
+        Case {
+            // Every other cohere emission path strips response markers; the
+            // flush must too, rather than leaking control tokens as content.
+            label: "cohere: response markers stripped from the flushed text",
+            make: cohere,
+            feed: Feed::Chunks(&["<|START_RESPONSE|>Hello<|START_AC"]),
+            flush: "Hello<|START_AC",
             ..BLANK
         },
         // --- text still buffered at end of stream is recovered by the flush
@@ -263,6 +309,7 @@ async fn streaming_never_swallows_content() {
             ]),
             text: r#"{"note": "checking"} "#,
             call: Some("get_weather"),
+            args_contain: Some(r#"{"city":"Tokyo"}"#),
             ..BLANK
         },
         Case {
@@ -274,6 +321,7 @@ async fn streaming_never_swallows_content() {
             )]),
             text: r#"{"name": "bogus_tool", "arguments": {}}"#,
             call: Some("get_weather"),
+            args_contain: Some(r#"{"city":"Paris"}"#),
             ..BLANK
         },
     ];

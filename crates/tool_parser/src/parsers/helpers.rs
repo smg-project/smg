@@ -413,8 +413,19 @@ pub(crate) fn handle_json_tool_streaming(
             }
         }
     }
-    // Case 2: Handle streaming arguments
-    else if let Some(cur_arguments) = current_tool_call.get("arguments") {
+
+    // Case 2: Handle streaming arguments. This is deliberately not an `else`:
+    // when the whole call arrives in one chunk, Case 1 sends the name and the
+    // arguments must still stream in the *same* invocation. There is no later
+    // call to fall back on - the router stops feeding the parser once the
+    // engine stream ends - so returning here would emit a tool call with an
+    // empty `arguments`, and `get_unstreamed_tool_args()` could not recover
+    // them either because only this branch populates `prev_tool_call_arr`.
+    // `current_tool_name_sent` implies `current_tool_id >= 0`.
+    if *current_tool_name_sent {
+        let Some(cur_arguments) = current_tool_call.get("arguments") else {
+            return Ok(result);
+        };
         let tool_id = *current_tool_id as usize;
         let sent = streamed_args_for_tool
             .get(tool_id)
