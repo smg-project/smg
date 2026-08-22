@@ -412,15 +412,25 @@ class Gateway:
             },
         )
 
-    def list_workers(self, timeout: float = 5.0) -> list[WorkerInfo]:
-        """List all workers connected to the gateway."""
+    def list_workers(self, timeout: float = 5.0, strict: bool = False) -> list[WorkerInfo]:
+        """List all workers connected to the gateway.
+
+        With ``strict=True``, request failures and non-200 responses raise
+        instead of degrading to ``[]`` — required when an empty list is the
+        assertion target (e.g. "worker was removed"), where a swallowed error
+        would pass vacuously.
+        """
         try:
             resp = httpx.get(f"{self.base_url}/workers", timeout=timeout)
             if resp.status_code == 200:
                 data = resp.json()
                 return [self._worker_from_api_response(w) for w in data.get("workers", [])]
+            if strict:
+                raise RuntimeError(f"GET /workers returned {resp.status_code}: {resp.text}")
             return []
         except (httpx.RequestError, httpx.TimeoutException):
+            if strict:
+                raise
             return []
 
     def add_worker(
@@ -477,8 +487,11 @@ class Gateway:
                 f"{self.base_url}/workers/{worker_id}",
                 timeout=timeout,
             )
-            if resp.status_code == 200:
-                return True, "Worker removed"
+            # 200 = removed synchronously; 202 = removal accepted and queued
+            # for background processing. Either means the request succeeded —
+            # callers that need completion poll list_workers for absence.
+            if resp.status_code in (200, 202):
+                return True, resp.text
             return False, resp.text
         except (httpx.RequestError, httpx.TimeoutException) as e:
             return False, str(e)
