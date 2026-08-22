@@ -21,7 +21,7 @@ echo "Using uv version: $(uv --version)"
 # Install CUDA toolkit (nvcc) — required for SGLang JIT kernel compilation.
 # SGLang >= 0.5.9 JIT-compiles CUDA kernels (RoPE, etc.) at runtime via tvm_ffi,
 # which invokes nvcc. The CI runners have CUDA runtime (driver) but not the compiler.
-# sglang 0.5.16 pins torch==2.11.0, whose default PyPI wheels are CUDA 13, so the
+# sglang 0.5.18 pins torch==2.13.0, whose default PyPI wheels are CUDA 13, so the
 # compiler must be nvcc 13 to match the runtime headers (a 12.x nvcc is replaced).
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 if [ ! -x "${CUDA_HOME}/bin/nvcc" ] || ! "${CUDA_HOME}/bin/nvcc" --version | grep -q "release 13\."; then
@@ -43,7 +43,7 @@ fi
 
 # Install SGLang with all dependencies
 echo "Installing SGLang..."
-uv pip install --prerelease=allow "sglang[all]==0.5.17"
+uv pip install --prerelease=allow "sglang[all]==0.5.18"
 
 # Install flashinfer-jit-cache: sglang bundles flashinfer_python but only for attention ops.
 # Multi-GPU models need trtllm_comm kernels (fused allreduce + layernorm) which FlashInfer
@@ -72,13 +72,13 @@ fi
 
 # Install mooncake for SGLang PD disaggregation (KV transfer)
 # Mooncake's native transfer engine requires InfiniBand/RDMA libraries at runtime.
-# Package and pin track upstream sglang v0.5.16 CI on the cu13 stack
-# (cuda13 wheel variant + nvrtc, since torch 2.11 defaults to CUDA 13):
-# https://github.com/sgl-project/sglang/blob/v0.5.16/scripts/ci/cuda/ci_install_dependency.sh
+# Package and pin track upstream sglang v0.5.18 CI on the cu13 stack
+# (cuda13 wheel variant + nvrtc, since torch 2.13 defaults to CUDA 13):
+# https://github.com/sgl-project/sglang/blob/v0.5.18/scripts/ci/cuda/ci_install_dependency.sh
 echo "Installing mooncake system dependencies..."
 sudo apt-get install -y --no-install-recommends libnuma-dev libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
 echo "Installing mooncake..."
-uv pip install mooncake-transfer-engine-cuda13==0.3.11.post1 nvidia-cuda-nvrtc
+uv pip install mooncake-transfer-engine-cuda13==0.3.12.post1 nvidia-cuda-nvrtc
 
 # Install gRPC packages from source (not PyPI) so PR changes are always tested
 echo "Installing smg-grpc-proto and smg-grpc-servicer from source..."
