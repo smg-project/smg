@@ -116,11 +116,11 @@ pub struct CompletionRequest {
     pub stop_token_ids: Option<Vec<u32>>,
 
     /// Skip trimming stop tokens from output
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub no_stop_trim: bool,
 
     /// Ignore end-of-sequence tokens during generation
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub ignore_eos: bool,
 
     /// Skip special tokens during detokenization
@@ -134,7 +134,7 @@ pub struct CompletionRequest {
     pub session_params: Option<HashMap<String, Value>>,
 
     /// Return model hidden states
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub return_hidden_states: bool,
 
     /// Sampling seed for deterministic outputs
@@ -280,4 +280,49 @@ pub struct CompletionStreamChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<LogProbs>,
     pub finish_reason: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(mut extra: Value) -> CompletionRequest {
+        let mut value = serde_json::json!({"model": "m", "prompt": "hello"});
+        value
+            .as_object_mut()
+            .expect("object")
+            .append(extra.as_object_mut().expect("object"));
+        serde_json::from_value(value).expect("request must deserialize")
+    }
+
+    #[test]
+    fn default_sglang_flags_are_omitted_and_absent_reads_defaults() {
+        let value = serde_json::to_value(req(serde_json::json!({}))).expect("serialize");
+        for field in ["no_stop_trim", "ignore_eos", "return_hidden_states"] {
+            assert!(value.get(field).is_none(), "{field} serialized at default");
+        }
+
+        let back: CompletionRequest = serde_json::from_value(value).expect("roundtrip");
+        assert!(!back.no_stop_trim);
+        assert!(!back.ignore_eos);
+        assert!(!back.return_hidden_states);
+    }
+
+    #[test]
+    fn non_default_sglang_flags_round_trip() {
+        let value = serde_json::to_value(req(serde_json::json!({
+            "no_stop_trim": true,
+            "ignore_eos": true,
+            "return_hidden_states": true
+        })))
+        .expect("serialize");
+        assert_eq!(value["no_stop_trim"], true);
+        assert_eq!(value["ignore_eos"], true);
+        assert_eq!(value["return_hidden_states"], true);
+
+        let back: CompletionRequest = serde_json::from_value(value).expect("roundtrip");
+        assert!(back.no_stop_trim);
+        assert!(back.ignore_eos);
+        assert!(back.return_hidden_states);
+    }
 }
