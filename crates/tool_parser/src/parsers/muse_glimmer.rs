@@ -391,7 +391,7 @@ impl MuseGlimmerParser {
         scan
     }
 
-    /// Segmenting never fails: unparseable input degrades to normal text, so
+    /// Segmenting never fails: unparsable input degrades to normal text, so
     /// this returns the pair directly and the trait methods wrap it.
     fn parse_complete_inner(&self, text: &str, tools: &[Tool]) -> (String, Vec<ToolCall>) {
         if !self.has_tool_markers(text) {
