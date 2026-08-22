@@ -783,6 +783,7 @@ jobs:
   # and run under e2e-1gpu-chat above.
 
   e2e-1gpu-responses:
+    name: e2e-1gpu-responses (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
       always()
@@ -792,13 +793,30 @@ jobs:
           || (needs.detect-changes.result == 'success'
               && (needs.detect-changes.outputs.common == 'true'
                   || needs.detect-changes.outputs.agentic == 'true')))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: sglang
+            timeout: 28
+            test_timeout: 20
+          - engine: vllm
+            timeout: 28
+            test_timeout: 20
+          # tokenspeed builds from source (~30m cold), so keep the job
+          # timeout generous even though the test step is short. Only the
+          # cross-engine gpt-oss-20b responses tests select onto this lane;
+          # the engine marker filter deselects the sglang-only cases.
+          - engine: tokenspeed
+            timeout: 50
+            test_timeout: 20
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
-      engine: sglang
+      engine: ${{ matrix.engine }}
       gpu_tier: "1"
       runner: 1-gpu-h100
-      timeout: 28
-      test_timeout: 20
+      timeout: ${{ matrix.timeout }}
+      test_timeout: ${{ matrix.test_timeout }}
       test_dirs: e2e_test/responses
       setup_agentic_deps: true
       min_selected: 92 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
