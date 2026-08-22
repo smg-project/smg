@@ -626,9 +626,29 @@ impl StreamingProcessor {
             }
         }
 
-        // Phase 3: Check unstreamed tool args
+        // Phase 3: End-of-stream parser flush: first any text still buffered
+        // as a prospective tool call that never materialized (dropping it
+        // produced fully-empty streams), then any parsed-but-unstreamed tool
+        // arguments.
         for (index, parser) in &tool_parsers {
-            let parser_guard = parser.lock().await;
+            let mut parser_guard = parser.lock().await;
+
+            let leftover_text = parser_guard.take_unstreamed_normal_text();
+            if !leftover_text.is_empty() {
+                let content_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                    .created(created)
+                    .add_choice_content(*index, "assistant", leftover_text)
+                    .maybe_system_fingerprint(system_fingerprint)
+                    .build();
+
+                let sse_chunk = sse_encoder
+                    .encode_data(&content_chunk)
+                    .map_err(|e| format!("Failed to serialize content chunk: {e}"))?;
+                tx.send(Ok(sse_chunk))
+                    .await
+                    .map_err(|_| "Failed to send flushed content chunk".to_string())?;
+            }
+
             if let Some(unstreamed_items) = parser_guard.get_unstreamed_tool_args() {
                 for tool_call_item in unstreamed_items {
                     let tool_call_delta = ToolCallDelta {
@@ -2340,7 +2360,42 @@ impl StreamingProcessor {
             }
         }
 
-        // Phase 3: Flush unstreamed tool args from the incremental parser
+        // Phase 3: End-of-stream parser flush: first any text still buffered
+        // as a prospective tool call that never materialized (dropping it
+        // produced fully-empty streams), then any parsed-but-unstreamed tool
+        // arguments.
+        if let Some(ref mut parser) = streaming_tool_parser {
+            let leftover_text = parser.take_unstreamed_normal_text();
+            if !leftover_text.is_empty() {
+                if !text_block_open {
+                    Self::send_messages_event(
+                        tx,
+                        &mut sse_buffer,
+                        &MessageStreamEvent::ContentBlockStart {
+                            index: current_block_index,
+                            content_block: ContentBlock::Text {
+                                text: String::new(),
+                                citations: None,
+                            },
+                        },
+                    )
+                    .await?;
+                    text_block_open = true;
+                }
+                Self::send_messages_event(
+                    tx,
+                    &mut sse_buffer,
+                    &MessageStreamEvent::ContentBlockDelta {
+                        index: current_block_index,
+                        delta: ContentBlockDelta::TextDelta {
+                            text: leftover_text,
+                        },
+                    },
+                )
+                .await?;
+            }
+        }
+
         if let Some(ref parser) = streaming_tool_parser {
             if let Some(unstreamed_items) = parser.get_unstreamed_tool_args() {
                 for tool_call_item in unstreamed_items {

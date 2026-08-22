@@ -294,6 +294,10 @@ impl ToolParser for JsonParser {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
 
+    fn take_unstreamed_normal_text(&mut self) -> String {
+        helpers::take_unstreamed_normal_text(&mut self.buffer, self.current_tool_id)
+    }
+
     fn reset(&mut self) {
         helpers::reset_parser_state(
             &mut self.buffer,

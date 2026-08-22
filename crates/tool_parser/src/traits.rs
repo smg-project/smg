@@ -45,6 +45,23 @@ pub trait ToolParser: Send + Sync {
         None
     }
 
+    /// Take any text still buffered by the streaming parser that never became
+    /// a tool call, transferring ownership to the caller.
+    ///
+    /// Streaming consumers call this once at end of stream, alongside
+    /// [`Self::get_unstreamed_tool_args`]: text held back as a *prospective*
+    /// tool call (a bare `{` prefix, a partial start marker, or tool JSON
+    /// that never completed) must be surfaced as normal content instead of
+    /// being silently dropped — mirroring the non-streaming fallback that
+    /// returns unparsable tool text verbatim. Parsers that announced a tool
+    /// call from the buffered text return an empty string (the remaining
+    /// arguments are recovered via `get_unstreamed_tool_args`).
+    ///
+    /// The default returns an empty string (parser holds no buffered text).
+    fn take_unstreamed_normal_text(&mut self) -> String {
+        String::new()
+    }
+
     /// Reset the parser state for reuse across requests.
     /// This should clear all buffers and reset state to initial values.
     fn reset(&mut self) {
