@@ -247,16 +247,17 @@ jobs:
           pytest -q grpc_servicer/tests
 
       # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
-      # ZMQ/EPD command builders, ZMQ-lane collection filter). --noconftest keeps
-      # e2e_test/conftest.py — which needs the generated smg_client types and a
-      # live backend — out of the picture; PYTHONPATH replaces the sys.path setup
-      # it would otherwise do.
+      # ZMQ/EPD command builders, ZMQ-lane collection filter, vendor-conformance
+      # selection/judgment logic). --noconftest keeps e2e_test/conftest.py —
+      # which needs the generated smg_client types and a live backend — out of
+      # the picture; PYTHONPATH replaces the sys.path setup it would otherwise do.
       - name: Run e2e harness unit tests
         env:
           PYTHONPATH: e2e_test
         run: |
           pip install ./e2e_test
-          pytest -q --noconftest e2e_test/infra e2e_test/fixtures
+          pytest -q --noconftest e2e_test/infra e2e_test/fixtures \
+            e2e_test/vendor_compat/test_conformance_unit.py
 
   unit-tests:
     needs: [detect-changes]
@@ -483,6 +484,10 @@ jobs:
               - 'crates/data_connector/**'
               - 'e2e_test/responses/**'
               - 'e2e_test/messages/**'
+              # vendor-truth conformance suite rides the responses lane: probe
+              # matrix / baseline changes must revalidate conformance
+              - 'e2e_test/vendor_compat/**'
+              - 'vendor_probe/**'
               - 'scripts/ci_agentic_svc_deps.sh'
               - 'scripts/oracle_flyway/**'
             completions:
@@ -797,9 +802,11 @@ jobs:
       engine: sglang
       gpu_tier: "1"
       runner: 1-gpu-h100
-      timeout: 28
-      test_timeout: 20
-      test_dirs: e2e_test/responses
+      # +12 over the old 28/20: e2e_test/vendor_compat replays ~380 recorded
+      # vendor probes (cluster representatives) against this lane's gateway
+      timeout: 40
+      test_timeout: 32
+      test_dirs: e2e_test/responses e2e_test/vendor_compat
       setup_agentic_deps: true
       min_selected: 92 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     secrets: inherit

@@ -1,0 +1,37 @@
+{
+  "baseline_bytes": 651607,
+  "clusters": 26,
+  "date": "2026-08-21",
+  "exemplar_kinds": {
+    "body": 19,
+    "sse": 7
+  },
+  "max_exemplar_bytes": 8192,
+  "models": {
+    "observed": [
+      "claude-haiku-4-5-20251001"
+    ],
+    "requested": [
+      "",
+      "claude-haiku-4-5",
+      "claude-nope"
+    ]
+  },
+  "probe_set_git_sha": "0ec065a1",
+  "probes_distilled": 5280,
+  "probes_total": 5281,
+  "provider": "anthropic",
+  "recording": {
+    "estimated_cost_usd": 1.7587,
+    "expected_error_recorded": 310,
+    "fingerprint_clusters_total": 56,
+    "recorded": 5280,
+    "skipped": 1,
+    "tokens": {
+      "input": 1365957,
+      "output": 78541
+    },
+    "transport_failures": 0
+  },
+  "recording_run_id": "32506359628"
+}
