@@ -1096,6 +1096,14 @@ pub enum ProtoRequest {
 }
 
 impl ProtoRequest {
+    /// Serialized wire size, for the release metric.
+    pub fn wire_len(&self) -> usize {
+        match self {
+            Self::Generate(request) => request.wire_len(),
+            Self::Embed(request) => request.wire_len(),
+        }
+    }
+
     /// Get request ID from either variant
     pub fn request_id(&self) -> &str {
         match self {
@@ -1296,6 +1304,18 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// Serialized wire size, for the release metric.
+    pub fn wire_len(&self) -> usize {
+        use prost::Message;
+        match self {
+            Self::Sglang(req) => req.encoded_len(),
+            Self::Vllm(req) => req.encoded_len(),
+            Self::Trtllm(req) => req.encoded_len(),
+            Self::Mlx(req) => req.encoded_len(),
+            Self::TokenSpeed(req) => req.encoded_len(),
+        }
+    }
+
     /// Clone for a PD leg that carries no multimodal pixels (see
     /// `clear_mm_pixel_values`), without ever duplicating them: detach,
     /// clone, reattach to `self`.
@@ -1364,6 +1384,18 @@ impl ProtoGenerateRequest {
             Self::Trtllm(req) => &req.request_id,
             Self::Mlx(req) => &req.request_id,
             Self::TokenSpeed(req) => &req.request_id,
+        }
+    }
+
+    /// Set request ID (retry attempts re-mint per-execution engine ids on
+    /// the retained plan).
+    pub fn set_request_id(&mut self, request_id: String) {
+        match self {
+            Self::Sglang(req) => req.request_id = request_id,
+            Self::Vllm(req) => req.request_id = request_id,
+            Self::Trtllm(req) => req.request_id = request_id,
+            Self::Mlx(req) => req.request_id = request_id,
+            Self::TokenSpeed(req) => req.request_id = request_id,
         }
     }
 
@@ -2130,6 +2162,15 @@ pub enum ProtoEmbedRequest {
 }
 
 impl ProtoEmbedRequest {
+    /// Serialized wire size, for the release metric.
+    pub fn wire_len(&self) -> usize {
+        use prost::Message;
+        match self {
+            Self::Sglang(req) => req.encoded_len(),
+            Self::Vllm(req) => req.encoded_len(),
+        }
+    }
+
     /// Get SGLang variant
     #[expect(
         clippy::panic,
@@ -2174,6 +2215,14 @@ impl ProtoEmbedRequest {
         match self {
             Self::Sglang(req) => &req.request_id,
             Self::Vllm(req) => &req.request_id,
+        }
+    }
+
+    /// Set request ID.
+    pub fn set_request_id(&mut self, request_id: String) {
+        match self {
+            Self::Sglang(req) => req.request_id = request_id,
+            Self::Vllm(req) => req.request_id = request_id,
         }
     }
 }

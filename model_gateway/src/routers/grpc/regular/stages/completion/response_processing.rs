@@ -15,9 +15,10 @@ use tracing::error;
 use crate::routers::{
     error,
     grpc::{
-        common::stages::{helpers, PipelineStage, RateLimitCell},
-        context::{FinalResponse, RequestContext},
+        common::stages::{helpers, ProcessStage, RateLimitCell},
+        context::{DispatchContext, FinalResponse},
         regular::{processor, streaming},
+        spec::ResponseSpec,
     },
 };
 
@@ -40,25 +41,39 @@ impl CompletionResponseProcessingStage {
 }
 
 #[async_trait]
-impl PipelineStage for CompletionResponseProcessingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        let is_streaming = ctx.is_streaming();
-
-        let execution_result = ctx.state.response.execution_result.take().ok_or_else(|| {
+impl ProcessStage for CompletionResponseProcessingStage {
+    async fn process(
+        &self,
+        ctx: &mut DispatchContext,
+        spec: ResponseSpec,
+    ) -> Result<Option<Response>, Response> {
+        let ResponseSpec::Completion(completion_request) = spec else {
             error!(
-                function = "CompletionResponseProcessingStage::execute",
+                function = "CompletionResponseProcessingStage::process",
+                "Wrong response spec"
+            );
+            return Err(error::internal_error(
+                "wrong_response_spec",
+                "Wrong response spec",
+            ));
+        };
+
+        let is_streaming = ctx.streaming;
+
+        let execution_result = ctx.response.execution_result.take().ok_or_else(|| {
+            error!(
+                function = "CompletionResponseProcessingStage::process",
                 "No execution result"
             );
             error::internal_error("no_execution_result", "No execution result")
         })?;
 
         let dispatch = ctx
-            .state
             .dispatch
             .as_ref()
             .ok_or_else(|| {
                 error!(
-                    function = "CompletionResponseProcessingStage::execute",
+                    function = "CompletionResponseProcessingStage::process",
                     "Dispatch metadata not set"
                 );
                 error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
@@ -67,7 +82,7 @@ impl PipelineStage for CompletionResponseProcessingStage {
 
         let tokenizer = ctx.tokenizer_arc().ok_or_else(|| {
             error!(
-                function = "CompletionResponseProcessingStage::execute",
+                function = "CompletionResponseProcessingStage::process",
                 "Tokenizer not cached in context"
             );
             error::internal_error(
@@ -82,7 +97,6 @@ impl PipelineStage for CompletionResponseProcessingStage {
             // via the attached ReservationAttachment's Drop below on early
             // disconnect/error.
             let reservation = ctx
-                .input
                 .rate_limit_cell
                 .as_deref()
                 .and_then(RateLimitCell::take_for_streaming_handoff);
@@ -92,7 +106,7 @@ impl PipelineStage for CompletionResponseProcessingStage {
                 .clone()
                 .process_completion_streaming_response(
                     execution_result,
-                    ctx.completion_request_arc(),
+                    completion_request,
                     dispatch,
                     tokenizer,
                     reservation.clone(),
@@ -101,21 +115,16 @@ impl PipelineStage for CompletionResponseProcessingStage {
 
             // Attach load guards (and the reservation's disconnect/error
             // safety net) to the response body for proper RAII lifecycle.
-            let response = helpers::attach_response_guards(
-                response,
-                ctx.state.load_guards.take(),
-                reservation,
-            );
+            let response =
+                helpers::attach_response_guards(response, ctx.load_guards.take(), reservation);
 
             return Ok(Some(response));
         }
 
         // Non-streaming path
-        let completion_request = ctx.completion_request_arc();
-
-        let stop_decoder = ctx.state.response.stop_decoder.as_mut().ok_or_else(|| {
+        let stop_decoder = ctx.response.stop_decoder.as_mut().ok_or_else(|| {
             error!(
-                function = "CompletionResponseProcessingStage::execute",
+                function = "CompletionResponseProcessingStage::process",
                 "Stop decoder not initialized"
             );
             error::internal_error(
@@ -135,7 +144,7 @@ impl PipelineStage for CompletionResponseProcessingStage {
             )
             .await?;
 
-        ctx.state.response.final_response = Some(FinalResponse::Completion(response));
+        ctx.response.final_response = Some(FinalResponse::Completion(response));
 
         Ok(None)
     }

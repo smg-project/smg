@@ -10,12 +10,13 @@ use crate::routers::{
     grpc::{
         backend_client::BackendClient,
         client::GrpcClient,
-        common::stages::{helpers, PipelineStage},
+        common::stages::{helpers, BuildStage},
         context::{
-            ClientSelection, ExecutionPlan, ExecutionPlanKind, PreparationOutput, RequestContext,
-            RequestType,
+            AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
+            PreparationOutput, RequestContext, RequestType,
         },
         proto_wrapper::ProtoGenerateRequest,
+        spec::{HarmonyResponseSpec, ResponseSpec},
         zmq_client::ZmqDialect,
     },
 };
@@ -40,12 +41,12 @@ impl HarmonyRequestBuildingStage {
 }
 
 #[async_trait]
-impl PipelineStage for HarmonyRequestBuildingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+impl BuildStage for HarmonyRequestBuildingStage {
+    async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         // Take preparation output (last consumer — worker_selection already ran)
         let prep = ctx.state.preparation.take().ok_or_else(|| {
             error!(
-                function = "HarmonyRequestBuildingStage::execute",
+                function = "HarmonyRequestBuildingStage::build",
                 "Preparation stage not completed"
             );
             error::internal_error("preparation_not_completed", "Preparation not completed")
@@ -68,7 +69,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
         // Get clients
         let clients = ctx.state.clients.as_ref().ok_or_else(|| {
             error!(
-                function = "HarmonyRequestBuildingStage::execute",
+                function = "HarmonyRequestBuildingStage::build",
                 "Client acquisition stage not completed"
             );
             error::internal_error(
@@ -81,28 +82,36 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             ClientSelection::Disaggregated { prefill, .. } => prefill,
         };
 
-        // Generate request_id based on request type
+        // Generate request_id based on request type. The Harmony spec owns a
+        // handle to the request: the tool loop legitimately re-reads it
+        // across iterations (the one sanctioned post-build request holder).
         let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
-        let request_id = match &ctx.input.request_type {
-            RequestType::Chat(_) => helpers::resolve_request_id(
-                &ctx.input.request_type,
-                ctx.input.tenant_request_meta.as_ref(),
-                "chatcmpl-",
-                disaggregated,
-            ),
-            RequestType::Responses(_) => helpers::resolve_request_id(
-                &ctx.input.request_type,
-                ctx.input.tenant_request_meta.as_ref(),
-                "responses-",
-                disaggregated,
-            ),
+        let (request_id, id_stamp, harmony_spec) = match &ctx.input.request_type {
+            RequestType::Chat(request) => {
+                let (id, stamp) = helpers::resolve_request_id_stamp(
+                    &ctx.input.request_type,
+                    ctx.input.tenant_request_meta.as_ref(),
+                    "chatcmpl-",
+                    disaggregated,
+                );
+                (id, stamp, HarmonyResponseSpec::Chat(request.clone()))
+            }
+            RequestType::Responses(request) => {
+                let (id, stamp) = helpers::resolve_request_id_stamp(
+                    &ctx.input.request_type,
+                    ctx.input.tenant_request_meta.as_ref(),
+                    "responses-",
+                    disaggregated,
+                );
+                (id, stamp, HarmonyResponseSpec::Responses(request.clone()))
+            }
             request_type @ (RequestType::Generate(_)
             | RequestType::Completion(_)
             | RequestType::Embedding(_)
             | RequestType::Classify(_)
             | RequestType::Messages(_)) => {
                 error!(
-                    function = "HarmonyRequestBuildingStage::execute",
+                    function = "HarmonyRequestBuildingStage::build",
                     request_type = %request_type,
                     "{request_type} request type not supported for Harmony models"
                 );
@@ -150,7 +159,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             tool_constraints,
         )
         .map_err(|e| {
-            error!(function = "HarmonyRequestBuildingStage::execute", error = %e, "Failed to build Harmony generate request");
+            error!(function = "HarmonyRequestBuildingStage::build", error = %e, "Failed to build Harmony generate request");
             error::bad_request(
                 "invalid_request_parameters",
                 format!("Invalid request parameters: {e}"),
@@ -185,8 +194,18 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             }
         }
 
-        ctx.state.execution_plan = Some(ExecutionPlan::generate(self.plan_kind, proto_request));
-        Ok(None)
+        Ok(BuildOutput {
+            plan: ExecutionPlan::generate(self.plan_kind, proto_request),
+            spec: ResponseSpec::Harmony(harmony_spec),
+            stamp: AttemptStamp {
+                id: id_stamp,
+                // Harmony builds never applied worker sampling defaults;
+                // retries must not start applying them.
+                sampling_mask: None,
+                sampling_baseline: None,
+                inject_pd_metadata: self.inject_pd_metadata,
+            },
+        })
     }
 
     fn name(&self) -> &'static str {

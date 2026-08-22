@@ -8,11 +8,13 @@ use crate::routers::{
     error,
     grpc::{
         client::GenerateRequestBuildOptions,
-        common::stages::{helpers, PipelineStage},
+        common::stages::{helpers, BuildStage},
         context::{
-            ClientSelection, ExecutionPlan, ExecutionPlanKind, PreparationOutput, RequestContext,
+            AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
+            PreparationOutput, RequestContext,
         },
         multimodal::{assemble_multimodal_data, assemble_multimodal_data_after_encode},
+        spec::{ChatResponseSpec, ResponseSpec},
         utils,
     },
 };
@@ -35,12 +37,12 @@ impl ChatRequestBuildingStage {
 }
 
 #[async_trait]
-impl PipelineStage for ChatRequestBuildingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+impl BuildStage for ChatRequestBuildingStage {
+    async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         // Take preparation state (last consumer — worker_selection already ran)
         let prep = ctx.state.preparation.take().ok_or_else(|| {
             error!(
-                function = "ChatRequestBuildingStage::execute",
+                function = "ChatRequestBuildingStage::build",
                 "Preparation not completed"
             );
             error::internal_error("preparation_not_completed", "Preparation not completed")
@@ -48,7 +50,7 @@ impl PipelineStage for ChatRequestBuildingStage {
 
         let clients = ctx.state.clients.as_ref().ok_or_else(|| {
             error!(
-                function = "ChatRequestBuildingStage::execute",
+                function = "ChatRequestBuildingStage::build",
                 "Client acquisition not completed"
             );
             error::internal_error(
@@ -80,7 +82,7 @@ impl PipelineStage for ChatRequestBuildingStage {
 
         // Build chat request
         let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
-        let request_id = helpers::resolve_request_id(
+        let (request_id, id_stamp) = helpers::resolve_request_id_stamp(
             &ctx.input.request_type,
             ctx.input.tenant_request_meta.as_ref(),
             "chatcmpl-",
@@ -106,7 +108,7 @@ impl PipelineStage for ChatRequestBuildingStage {
                     .await
             };
             Some(assembled.map_err(|e| {
-                error!(function = "ChatRequestBuildingStage::execute", error = %e, "Failed to assemble multimodal request");
+                error!(function = "ChatRequestBuildingStage::build", error = %e, "Failed to assemble multimodal request");
                 error::bad_request("multimodal_not_supported", format!("{e}"))
             })?)
         } else {
@@ -137,13 +139,15 @@ impl PipelineStage for ChatRequestBuildingStage {
                 },
             )
             .map_err(|e| {
-                error!(function = "ChatRequestBuildingStage::execute", error = %e, "Failed to build generate request");
+                error!(function = "ChatRequestBuildingStage::build", error = %e, "Failed to build generate request");
                 error::bad_request("invalid_request_parameters", format!("Invalid request parameters: {e}"))
             })?;
 
-        helpers::apply_sampling_defaults_to_generate_request(
+        let sampling_mask =
+            helpers::SamplingDefaultsMask::from_request_type(&ctx.input.request_type);
+        let sampling_baseline = helpers::apply_sampling_defaults(
             &mut proto_request,
-            &ctx.input.request_type,
+            sampling_mask,
             ctx.state.workers.as_ref(),
         );
 
@@ -173,8 +177,16 @@ impl PipelineStage for ChatRequestBuildingStage {
             helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
         }
 
-        ctx.state.execution_plan = Some(ExecutionPlan::generate(self.plan_kind, proto_request));
-        Ok(None)
+        Ok(BuildOutput {
+            plan: ExecutionPlan::generate(self.plan_kind, proto_request),
+            spec: ResponseSpec::Chat(ChatResponseSpec::from(chat_request.as_ref())),
+            stamp: AttemptStamp {
+                id: id_stamp,
+                sampling_mask,
+                sampling_baseline,
+                inject_pd_metadata: self.inject_pd_metadata,
+            },
+        })
     }
 
     fn name(&self) -> &'static str {

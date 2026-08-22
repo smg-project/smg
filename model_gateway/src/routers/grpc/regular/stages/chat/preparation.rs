@@ -25,10 +25,10 @@ pub(crate) struct ChatPreparationStage;
 
 #[async_trait]
 impl PipelineStage for ChatPreparationStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         let request = ctx.chat_request_arc();
         self.prepare_chat(ctx, &request).await?;
-        Ok(None)
+        Ok(())
     }
 
     fn name(&self) -> &'static str {

@@ -11,13 +11,11 @@ use llm_tokenizer::{
     traits::Tokenizer,
 };
 use openai_protocol::{
-    chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
-    common::{
-        FunctionCallResponse, StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue, Usage,
-    },
-    completion::{CompletionChoice, CompletionRequest, CompletionResponse},
-    generate::{GenerateMetaInfo, GenerateRequest, GenerateResponse},
-    messages::{self, CreateMessageRequest, Message},
+    chat::{ChatChoice, ChatCompletionMessage, ChatCompletionResponse},
+    common::{FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue, Usage},
+    completion::{CompletionChoice, CompletionResponse},
+    generate::{GenerateMetaInfo, GenerateResponse},
+    messages::{self, Message},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use tool_parser::ParserFactory as ToolParserFactory;
@@ -29,6 +27,7 @@ use crate::routers::{
         common::{response_collection, response_formatting},
         context::{DispatchMetadata, ExecutionResult},
         proto_wrapper::ProtoGenerateComplete,
+        spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
         utils,
     },
 };
@@ -61,7 +60,8 @@ impl ResponseProcessor {
         &self,
         complete: &ProtoGenerateComplete,
         index: usize,
-        original_request: &ChatCompletionRequest,
+        original_request: &ChatResponseSpec,
+        model: &str,
         tokenizer: &Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
         history_tool_calls_count: usize,
@@ -113,7 +113,7 @@ impl ResponseProcessor {
             if let Some(mut parser) = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
                 reasoning_parser_name,
-                &original_request.model,
+                model,
             ) {
                 // If the template injected `<think>` in the prefill (thinking toggle
                 // is supported and effectively ON), start in reasoning mode.
@@ -170,14 +170,14 @@ impl ResponseProcessor {
                 (tool_calls, processed_text) = utils::parse_json_schema_response(
                     &processed_text,
                     original_request.tool_choice.as_ref(),
-                    &original_request.model,
+                    model,
                     history_tool_calls_count,
                 );
             } else if tool_parser_available {
                 (tool_calls, processed_text) = self
                     .parse_tool_calls(
                         &processed_text,
-                        &original_request.model,
+                        model,
                         tool_parser_name,
                         original_request.tools.as_deref().unwrap_or(&[]),
                         history_tool_calls_count,
@@ -239,26 +239,27 @@ impl ResponseProcessor {
     pub async fn process_non_streaming_chat_response(
         &self,
         execution_result: ExecutionResult,
-        chat_request: Arc<ChatCompletionRequest>,
+        chat_request: ChatResponseSpec,
         dispatch: DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
         request_logprobs: bool,
     ) -> Result<ChatCompletionResponse, axum::response::Response> {
-        let reasoning_parser_name = self.parser_resolver.reasoning_parser(&chat_request.model);
-        let tool_parser_name = self.parser_resolver.tool_parser(&chat_request.model);
+        let model = &dispatch.model;
+        let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
+        let tool_parser_name = self.parser_resolver.tool_parser(model);
         // Collect all responses from the execution result
         let all_responses =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
 
-        let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
+        let history_tool_calls_count = chat_request.history_tool_calls_count;
 
         // Check parser availability once upfront (not per choice)
         let reasoning_parser_available = chat_request.separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
                 reasoning_parser_name.as_deref(),
-                &chat_request.model,
+                model,
             );
 
         let tool_choice_enabled = !matches!(
@@ -271,22 +272,18 @@ impl ResponseProcessor {
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
                 tool_parser_name.as_deref(),
-                &chat_request.model,
+                model,
             );
 
         // Log once per request (not per choice)
         if chat_request.separate_reasoning && !reasoning_parser_available {
             tracing::debug!(
-                "No reasoning parser found for model '{}', skipping reasoning parsing",
-                chat_request.model
+                "No reasoning parser found for model '{model}', skipping reasoning parsing"
             );
         }
 
         if chat_request.tools.is_some() && tool_choice_enabled && !tool_parser_available {
-            tracing::debug!(
-                "No tool parser found for model '{}', skipping tool call parsing",
-                chat_request.model
-            );
+            tracing::debug!("No tool parser found for model '{model}', skipping tool call parsing");
         }
 
         // Process all choices
@@ -297,6 +294,7 @@ impl ResponseProcessor {
                     complete,
                     index,
                     &chat_request,
+                    model,
                     &tokenizer,
                     stop_decoder,
                     history_tool_calls_count,
@@ -396,7 +394,6 @@ impl ResponseProcessor {
     pub async fn process_non_streaming_generate_response(
         &self,
         execution_result: ExecutionResult,
-        _generate_request: Arc<GenerateRequest>,
         dispatch: DispatchMetadata,
         stop_decoder: &mut StopSequenceDecoder,
         request_logprobs: bool,
@@ -504,15 +501,14 @@ impl ResponseProcessor {
     pub async fn process_non_streaming_messages_response(
         &self,
         execution_result: ExecutionResult,
-        messages_request: Arc<CreateMessageRequest>,
+        messages_request: MessagesResponseSpec,
         dispatch: DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<Message, axum::response::Response> {
-        let reasoning_parser_name = self
-            .parser_resolver
-            .reasoning_parser(&messages_request.model);
-        let tool_parser_name = self.parser_resolver.tool_parser(&messages_request.model);
+        let model = &dispatch.model;
+        let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
+        let tool_parser_name = self.parser_resolver.tool_parser(model);
         // Collect all responses (no logprobs for Messages API)
         let all_responses = response_collection::collect_responses(execution_result, false).await?;
 
@@ -549,7 +545,7 @@ impl ResponseProcessor {
         let reasoning_requires_special_tokens = utils::reasoning_parser_requires_special_tokens(
             &self.reasoning_parser_factory,
             reasoning_parser_name.as_deref(),
-            &messages_request.model,
+            model,
         );
         let separate_reasoning = reasoning_requires_special_tokens
             || matches!(
@@ -563,7 +559,7 @@ impl ResponseProcessor {
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
                 reasoning_parser_name.as_deref(),
-                &messages_request.model,
+                model,
             );
 
         let tool_choice_enabled = !matches!(
@@ -572,25 +568,21 @@ impl ResponseProcessor {
         );
 
         let tool_parser_available = tool_choice_enabled
-            && messages_request.tools.is_some()
+            && messages_request.has_tools
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
                 tool_parser_name.as_deref(),
-                &messages_request.model,
+                model,
             );
 
         if separate_reasoning && !reasoning_parser_available {
             tracing::debug!(
-                "No reasoning parser found for model '{}', reasoning content will not be separated",
-                messages_request.model
+                "No reasoning parser found for model '{model}', reasoning content will not be separated"
             );
         }
 
-        if messages_request.tools.is_some() && tool_choice_enabled && !tool_parser_available {
-            tracing::debug!(
-                "No tool parser found for model '{}', skipping tool call parsing",
-                messages_request.model
-            );
+        if messages_request.has_tools && tool_choice_enabled && !tool_parser_available {
+            tracing::debug!("No tool parser found for model '{model}', skipping tool call parsing");
         }
 
         // Decode tokens through stop decoder
@@ -636,7 +628,7 @@ impl ResponseProcessor {
             if let Some(mut parser) = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
                 reasoning_parser_name.as_deref(),
-                &messages_request.model,
+                model,
             ) {
                 // If thinking is effectively ON and template has a toggle, start in reasoning mode.
                 {
@@ -670,7 +662,7 @@ impl ResponseProcessor {
         // Step 2: Parse tool calls
         let mut tool_calls: Option<Vec<ToolCall>> = None;
 
-        if tool_choice_enabled && messages_request.tools.is_some() {
+        if tool_choice_enabled && messages_request.has_tools {
             // Check if JSON schema constraint was used (specific tool or any/required mode)
             let has_structural_tag = self
                 .tool_parser_factory
@@ -692,24 +684,17 @@ impl ResponseProcessor {
                 (tool_calls, processed_text) = utils::parse_json_schema_response(
                     &processed_text,
                     chat_tool_choice.as_ref(),
-                    &messages_request.model,
-                    utils::message_utils::get_history_tool_calls_count_messages(&messages_request),
+                    model,
+                    messages_request.history_tool_calls_count,
                 );
             } else if tool_parser_available {
-                let chat_tools = messages_request
-                    .tools
-                    .as_deref()
-                    .map(utils::message_utils::extract_chat_tools)
-                    .unwrap_or_default();
                 (tool_calls, processed_text) = self
                     .parse_tool_calls(
                         &processed_text,
-                        &messages_request.model,
+                        model,
                         tool_parser_name.as_deref(),
-                        &chat_tools,
-                        utils::message_utils::get_history_tool_calls_count_messages(
-                            &messages_request,
-                        ),
+                        &messages_request.chat_tools,
+                        messages_request.history_tool_calls_count,
                     )
                     .await;
             }
@@ -817,21 +802,18 @@ impl ResponseProcessor {
     pub async fn process_non_streaming_completion_response(
         &self,
         execution_result: ExecutionResult,
-        completion_req: Arc<CompletionRequest>,
+        completion_req: CompletionResponseSpec,
         dispatch: DispatchMetadata,
         _tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<CompletionResponse, axum::response::Response> {
-        let request_logprobs = completion_req.logprobs.is_some();
+        let request_logprobs = completion_req.logprobs;
         let per_prompt_results = match execution_result {
             ExecutionResult::Batch { results } => results,
             other => vec![other],
         };
-        let choices_per_prompt = completion_req.n.unwrap_or(1).max(1);
-        let prompt_texts: Vec<&str> = match &completion_req.prompt {
-            StringOrArray::String(text) => vec![text.as_str()],
-            StringOrArray::Array(texts) => texts.iter().map(String::as_str).collect(),
-        };
+        let choices_per_prompt = completion_req.choices_per_prompt;
+        let prompt_texts = &completion_req.prompt_texts;
 
         // Drain all sub-streams concurrently; decoding below stays sequential
         // (shared stop decoder).
@@ -847,7 +829,10 @@ impl ResponseProcessor {
         let mut choices = Vec::new();
 
         for (prompt_index, all_responses) in collected.into_iter().enumerate() {
-            let prompt_text = prompt_texts.get(prompt_index).copied().unwrap_or_default();
+            let prompt_text = prompt_texts
+                .get(prompt_index)
+                .map(String::as_str)
+                .unwrap_or_default();
             let index_offset = prompt_index as u32 * choices_per_prompt;
             // n>1 choices share one prompt: max within a prompt, summed across prompts.
             let mut prompt_tokens = 0u32;
