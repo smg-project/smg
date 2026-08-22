@@ -13,7 +13,10 @@ use openai_protocol::{
 };
 use serde_json::{json, to_value, Value};
 
-use super::{types::strip_default_sglang_fields, OpenAIProvider, Provider, XAIProvider};
+use super::{
+    types::{is_stripped_sglang_default, strip_default_sglang_fields, SGLANG_FIELDS},
+    OpenAIProvider, Provider, XAIProvider,
+};
 use crate::worker::Endpoint;
 
 /// Build a `ResponsesRequest` whose single input message carries every
@@ -87,6 +90,26 @@ fn strip_default_sglang_fields_removes_false_and_null_values() {
     assert_eq!(payload.get("stream_reasoning"), None);
     assert_eq!(payload.get("no_stop_trim"), Some(&json!(true)));
     assert_eq!(payload.get("model"), Some(&json!("test-model")));
+}
+
+#[test]
+fn raw_predicate_agrees_with_value_strip_for_every_field() {
+    for field in SGLANG_FIELDS {
+        for raw in ["null", "false", "true", "0", "1.5", "\"false\"", "[false]"] {
+            let value: Value = serde_json::from_str(raw).expect("literal parses");
+            let mut fields = serde_json::Map::new();
+            fields.insert((*field).to_string(), value);
+            let mut payload = Value::Object(fields);
+            strip_default_sglang_fields(&mut payload);
+
+            let value_stripped = payload.get(*field).is_none();
+            assert_eq!(
+                is_stripped_sglang_default(field, raw),
+                value_stripped,
+                "field={field} raw={raw}"
+            );
+        }
+    }
 }
 
 #[test]

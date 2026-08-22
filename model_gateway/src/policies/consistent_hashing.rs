@@ -23,7 +23,7 @@ use rand::RngExt as _;
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{
     observability::metrics::Metrics,
-    routers::common::header_utils::{extract_routing_key, extract_target_worker},
+    routers::common::header_utils::{extract_routing_key_hint, extract_target_worker},
     worker::Worker,
 };
 
@@ -74,7 +74,7 @@ impl ConsistentHashingPolicy {
         let healthy_url_to_idx: std::collections::HashMap<&str, usize> = workers
             .iter()
             .enumerate()
-            .filter(|(_, w)| w.is_healthy())
+            .filter(|(_, w)| w.is_healthy_and_eligible())
             .map(|(i, w)| (w.url(), i))
             .collect();
 
@@ -123,13 +123,17 @@ impl ConsistentHashingPolicy {
         }
 
         let target_worker = extract_target_worker(info.headers);
-        let routing_key = extract_routing_key(info.headers);
+        // Both sides apply the hint caps: an over-cap or non-UTF-8 key must not
+        // influence placement on any path.
+        let routing_key = info
+            .routing_key
+            .or_else(|| extract_routing_key_hint(info.headers));
 
         // Priority 1: X-SMG-Target-Worker - direct routing by worker index
         // O(1) parse + O(1) bounds check + O(1) health check
         if let Some(idx_str) = target_worker {
             if let Ok(idx) = idx_str.parse::<usize>() {
-                if idx < workers.len() && workers[idx].is_healthy() {
+                if idx < workers.len() && workers[idx].is_healthy_and_eligible() {
                     return (Some(idx), Branch::TargetWorkerHit);
                 }
             }
@@ -161,7 +165,10 @@ impl ConsistentHashingPolicy {
         }
 
         // Fallback: random selection (truly anonymous client)
-        let healthy_count = workers.iter().filter(|w| w.is_healthy()).count();
+        let healthy_count = workers
+            .iter()
+            .filter(|w| w.is_healthy_and_eligible())
+            .count();
         if healthy_count == 0 {
             return (None, Branch::NoHealthyWorkers);
         }
@@ -170,7 +177,7 @@ impl ConsistentHashingPolicy {
         let idx = workers
             .iter()
             .enumerate()
-            .filter(|(_, w)| w.is_healthy())
+            .filter(|(_, w)| w.is_healthy_and_eligible())
             .nth(random_healthy_idx)
             .map(|(i, _)| i);
 
@@ -235,6 +242,54 @@ mod tests {
             .collect()
     }
 
+    /// Every consistent-hashing entry point gathers on
+    /// `is_healthy_and_eligible()`, so a vetoed worker must drop out of the
+    /// ring, out of an explicit target-worker probe, and out of the random
+    /// fallback alike.
+    #[test]
+    fn overloaded_worker_is_skipped_by_every_selection_path() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        let headers = headers_with_routing_key("user-veto");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let owner = policy.select_worker_impl(&workers, &info).0.unwrap();
+
+        workers[owner].set_overloaded(true);
+        let respilled = policy.select_worker_impl(&workers, &info).0.unwrap();
+        assert_ne!(respilled, owner, "the ring must skip a vetoed worker");
+
+        // Explicit target-worker probe: an operator pin does not beat the veto.
+        let target = headers_with_target_worker(owner);
+        let targeted_info = SelectWorkerInfo {
+            headers: Some(&target),
+            ..Default::default()
+        };
+        assert_ne!(
+            policy.select_worker_impl(&workers, &targeted_info).0,
+            Some(owner)
+        );
+
+        // Random fallback: no routing key at all.
+        let fallback_info = SelectWorkerInfo::default();
+        for _ in 0..32 {
+            assert_ne!(
+                policy.select_worker_impl(&workers, &fallback_info).0,
+                Some(owner)
+            );
+        }
+
+        workers[owner].set_overloaded(false);
+        assert_eq!(
+            policy.select_worker_impl(&workers, &info).0,
+            Some(owner),
+            "recovery re-admits the ring owner"
+        );
+    }
+
     #[test]
     fn test_consistent_routing() {
         let policy = ConsistentHashingPolicy::new();
@@ -274,6 +329,22 @@ mod tests {
         }
 
         assert!(distribution.len() > 1, "Should distribute across workers");
+    }
+
+    #[test]
+    fn test_over_cap_routing_key_is_ignored() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        let headers = headers_with_routing_key(&"k".repeat(129));
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert!(result.is_some());
+        assert_eq!(branch, Branch::RandomFallback);
     }
 
     #[test]
@@ -507,6 +578,85 @@ mod tests {
             Some(original_idx),
             "Should return to original worker after recovery"
         );
+    }
+
+    #[test]
+    fn test_routing_key_hint_field_routes_consistently() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        let info = SelectWorkerInfo {
+            routing_key: Some("user-123"),
+            ..Default::default()
+        };
+
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        let first_idx = first_result.unwrap();
+        assert_eq!(branch, Branch::RoutingKeyHit);
+
+        for _ in 0..10 {
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(result, Some(first_idx));
+            assert_eq!(branch, Branch::RoutingKeyHit);
+        }
+    }
+
+    #[test]
+    fn test_routing_key_hint_field_distributes() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        let mut distribution = HashMap::new();
+        for i in 0..100 {
+            let key = format!("user-{i}");
+            let info = SelectWorkerInfo {
+                routing_key: Some(&key),
+                ..Default::default()
+            };
+            let (result, _) = policy.select_worker_impl(&workers, &info);
+            *distribution.entry(result.unwrap()).or_insert(0) += 1;
+        }
+
+        assert!(distribution.len() > 1, "Should distribute across workers");
+    }
+
+    #[test]
+    fn test_routing_key_hint_wins_over_raw_header() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = create_workers(&[
+            "http://w1:8000",
+            "http://w2:8000",
+            "http://w3:8000",
+            "http://w4:8000",
+        ]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+
+        let select_by_key = |key: &str| {
+            let info = SelectWorkerInfo {
+                routing_key: Some(key),
+                hash_ring: Some(ring.clone()),
+                ..Default::default()
+            };
+            policy.select_worker_impl(&workers, &info).0.unwrap()
+        };
+
+        // Find two keys that land on different workers.
+        let base_idx = select_by_key("key-0");
+        let other_key = (1..64)
+            .map(|i| format!("key-{i}"))
+            .find(|key| select_by_key(key) != base_idx)
+            .expect("some key must land on a different worker");
+
+        let headers = headers_with_routing_key(&other_key);
+        let info = SelectWorkerInfo {
+            routing_key: Some("key-0"),
+            headers: Some(&headers),
+            hash_ring: Some(ring.clone()),
+            ..Default::default()
+        };
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(result, Some(base_idx), "the validated hint must win");
+        assert_eq!(branch, Branch::RoutingKeyHit);
     }
 
     #[test]

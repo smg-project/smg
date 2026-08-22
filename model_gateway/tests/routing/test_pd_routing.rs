@@ -168,6 +168,11 @@ mod pd_routing_unit_tests {
                     block_size: 16,
                     balance_token_usage_threshold: 1.0,
                     overload_token_usage_threshold: 1.0,
+                    overlap_decay: 0.0,
+                    selection_temperature: 0.0,
+                    cache_index: Default::default(),
+                    cache_ttl_secs: 180,
+                    cache_boundaries: Vec::new(),
                 },
             ),
             (
@@ -245,6 +250,7 @@ mod pd_routing_unit_tests {
                     client.clone(),
                     config.load_monitor_interval_secs,
                     config.engine_metrics,
+                    config.disable_load_monitoring,
                 )));
 
                 // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator

@@ -59,6 +59,16 @@ on:
         type: string
         default: ""
         description: "Wire override for local backends: zmq runs the local cases over ZMQ"
+      zmq_engine_count:
+        required: false
+        type: string
+        default: ""
+        description: "DP engines per ZMQ worker (grouped vLLM launch; empty = 1)"
+      min_selected:
+        required: false
+        type: number
+        default: 0
+        description: "Minimum effective (selected) test count; exported as E2E_MIN_SELECTED for the pytest harness floor check (0 = disabled)"
 
 jobs:
   run:
@@ -72,6 +82,7 @@ jobs:
       E2E_GPU_TIER: ${{ inputs.gpu_tier }}
       E2E_VLLM_KV_BACKEND: ${{ inputs.vllm_kv_backend }}
       E2E_CONNECTION_MODE: ${{ inputs.connection_mode }}
+      E2E_ZMQ_ENGINE_COUNT: ${{ inputs.zmq_engine_count }}
       ROUTER_LOCAL_MODEL_PATH: /models
     steps:
       - name: Checkout code
@@ -153,6 +164,7 @@ jobs:
           SHOW_WORKER_LOGS: "0"
           SHOW_ROUTER_LOGS: "1"
           E2E_LOG_DIR: e2e-logs
+          E2E_MIN_SELECTED: ${{ inputs.min_selected }}
           BRAVE_MCP_HOST: ${{ inputs.setup_agentic_deps && 'brave-search-mcp' || '' }}
         run: |
           bash scripts/ci_killall_sglang.sh "nuke_gpus"

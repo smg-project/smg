@@ -147,8 +147,8 @@ class Router:
             - PolicyType.RoundRobin: Distribute requests in round-robin fashion
             - PolicyType.CacheAware: Distribute requests based on cache state and load
               balance
-            - PolicyType.PowerOfTwo: Select best of two random workers based on load
-              (PD mode only)
+            - PolicyType.PowerOfTwo: Sample two random workers and route to the
+              one with the lower expected wait (least-load scoring over the pair)
             - PolicyType.LeastLoad: Route to the worker with the lowest load score
               (in-flight requests plus KV-cache pressure)
         host: Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::,
@@ -162,9 +162,35 @@ class Router:
             every worker_startup_check_interval. Default: 0
         worker_startup_check_interval: Interval in seconds between checks for worker
             initialization. Default: 30
+        job_queue_capacity: Max pending control-plane jobs (worker add/remove,
+            tokenizer, MCP, WASM). Size to fleet scale so a service-discovery
+            reconcile pass can enqueue every worker without blocking.
+            Default: 1000
+        job_queue_concurrency: Max control-plane jobs dispatched concurrently.
+            Default: 200
         cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to
             cached worker if the match rate exceeds threshold, otherwise routes to the
             worker with the smallest tree. Default: 0.5
+        cache_boundaries: Token positions at which serving engines retain reusable
+            prefix state; cache-affinity policies hash request heads at the deepest
+            applicable boundary. Default: []
+        cache_index: Index under-layer for cache_aware: 'tree' (radix prefix trees)
+            or 'hash' (TTL'd exact-match placement map keyed on request heads at
+            cache_boundaries; token-bearing requests only — untokenized requests
+            stay load-balanced). Default: 'tree'
+        cache_ttl_secs: Seconds a cache-affinity placement stays routable; should
+            approximate serving-engine cache retention. Default: 180
+        prefix_token_count: Number of prefix tokens hashed by the prefix_hash
+            policy, or four times as many characters of the prompt when the
+            request is untokenized. Size it past any shared system prompt so
+            distinct conversations hash apart. Default: 256
+        prefix_hash_load_factor: Load factor above which the prefix_hash policy
+            walks the ring instead of using the hashed worker (multiple of the
+            average load). Default: 1.25
+        prefix_hash_balance_abs_threshold: Absolute load difference over average
+            a worker must also exceed before prefix_hash treats it as
+            overloaded. Guards the load factor against sampling noise when each
+            router replica sees only a share of a worker's load. Default: 10
         balance_abs_threshold: Load balancing is triggered when (max_load - min_load) >
             abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache
             aware. Default: 32
@@ -173,11 +199,24 @@ class Router:
             aware. Default: 1.0001
         eviction_interval_secs: Interval in seconds between cache eviction operations
             in cache-aware routing. Default: 60
+        overlap_decay: Cache-aware anti-hotspot decay: each candidate's overlap score
+            is divided by 1 + overlap_decay * x, where x is the worker's
+            waiting-prefill backlog (blocks above the candidate minimum) per request
+            block. Requires backend load reporting. Default: 0.0 (disabled)
+        selection_temperature: Cache-aware softmax temperature over min-max
+            normalized scores for event-driven selection. 0.0 is exact argmax;
+            larger values spread picks across candidates. Default: 0.0
         max_payload_size: Maximum payload size in bytes. Default: 256MB
-        max_tree_size: Maximum size of the approximation tree for cache-aware routing.
-            Default: 2^24
+        max_tree_size: Maximum total size of each model's approximation tree for
+            cache-aware routing (chars for HTTP, tokens for gRPC), shared across
+            all workers; eviction keeps every tree at or under this bound.
+            Default: 2^26
         dp_aware: Enable data parallelism aware schedule. Default: False
         dp_minimum_tokens_scheduler: Enable minimum tokens scheduler for data parallel group. Default: False
+        upstream_http2: Speak HTTP/2 to workers via prior knowledge (h2c on
+            cleartext), multiplexing every request to a worker over one
+            connection. Requires every HTTP worker to serve HTTP/2 without an
+            upgrade handshake. Default: False
         enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When
             enabled, the router can manage multiple models simultaneously with per-model
             load balancing policies. Default: False

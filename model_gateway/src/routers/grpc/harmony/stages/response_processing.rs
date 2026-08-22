@@ -98,7 +98,8 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                             dispatch,
                             router_stop_strings(ctx),
                             reservation.clone(),
-                        );
+                        )
+                        .await;
 
                     // Attach load guards (and the reservation's
                     // disconnect/error safety net) to the response body for

@@ -770,6 +770,30 @@ class TestVllmWorkerLauncher:
         for arg in backend_args:
             assert arg in cmd
 
+    def test_build_zmq_command_defaults_to_single_engine(self):
+        launcher = VllmWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="zmq")
+        cmd = launcher.build_command(args, [], "127.0.0.1", 31000)
+        assert cmd[cmd.index("--data-parallel-size") + 1] == "1"
+        assert cmd[cmd.index("--data-parallel-size-local") + 1] == "1"
+
+    def test_build_zmq_command_grouped_engine_dp(self):
+        """Engine-level --data-parallel-size N launches a grouped worker:
+        the launcher owns both dp flags (operator's copy is filtered) and
+        emits N for size and size-local."""
+        launcher = VllmWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="zmq")
+        cmd = launcher.build_command(args, ["--data-parallel-size", "2"], "127.0.0.1", 31000)
+        assert cmd.count("--data-parallel-size") == 1
+        assert cmd[cmd.index("--data-parallel-size") + 1] == "2"
+        assert cmd[cmd.index("--data-parallel-size-local") + 1] == "2"
+
+    def test_build_zmq_command_grouped_engine_dp_equals_form(self):
+        launcher = VllmWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="zmq")
+        cmd = launcher.build_command(args, ["--data-parallel-size=4"], "127.0.0.1", 31000)
+        assert cmd[cmd.index("--data-parallel-size") + 1] == "4"
+
     def test_worker_url(self):
         launcher = VllmWorkerLauncher()
         args = argparse.Namespace(connection_mode="grpc")
@@ -834,8 +858,52 @@ class TestTokenspeedWorkerLauncher:
         assert str(expected_port) in cmd
         assert "--zmq-engine-index" in cmd
         assert "0" in cmd
+        # The launcher owns the engine's control-plane port layout: --port
+        # seeds the derived cluster per worker, --dist-init-addr pins the
+        # torch.distributed store at TokenSpeed's own dp==1 derivation
+        # (port + 233) so dp==1 and dp>1 share one layout.
+        assert cmd[cmd.index("--port") + 1] == "31000"
+        assert cmd[cmd.index("--dist-init-addr") + 1] == "127.0.0.1:31233"
         for arg in backend_args:
             assert arg in cmd
+
+    def test_build_zmq_command_passes_dp_size_through(self):
+        # DP is the engine's flag: the launcher forwards it untouched and the
+        # ranks each dial the shared socket set with their own identity.
+        launcher = TokenspeedWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="zmq")
+        cmd = launcher.build_command(args, ["--data-parallel-size", "2"], "127.0.0.1", 31000)
+
+        assert cmd[cmd.index("--data-parallel-size") + 1] == "2"
+        # dp>1 hard-requires the explicit store address the launcher always passes.
+        assert cmd[cmd.index("--dist-init-addr") + 1] == "127.0.0.1:31233"
+
+    def test_build_zmq_command_reflects_dist_port_below_u16_ceiling(self):
+        launcher = TokenspeedWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="zmq")
+        cmd = launcher.build_command(args, [], "127.0.0.1", 65500)
+
+        assert cmd[cmd.index("--dist-init-addr") + 1] == f"127.0.0.1:{65500 - 233}"
+
+    def test_dist_port_never_enters_the_handshake_band(self):
+        # The handshake port is a hash of the ipc path folded into
+        # 20000..=29999, so a dist port inside that band can land on some
+        # worker's rpc listener — which port collides depends on the socket
+        # dir (uid). The launcher must keep the dist port out of the band
+        # entirely; that also implies it never equals this worker's own
+        # rpc port. Sweep every worker port whose naive +233 derivation
+        # lands in the band, plus the band edges and the u16 reflection.
+        launcher = TokenspeedWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="zmq")
+        ports = [*range(19767, 29767), 19766, 29767, 31000, 65500]
+        for port in ports:
+            cmd = launcher.build_command(args, [], "127.0.0.1", port)
+            dist_port = int(cmd[cmd.index("--dist-init-addr") + 1].rsplit(":", 1)[1])
+            rpc_port = _zmq_handshake_port(_zmq_ipc_url(port))
+            assert not 20000 <= dist_port <= 29999, (port, dist_port)
+            assert dist_port != rpc_port, (port, dist_port)
+            assert dist_port != port, (port, dist_port)
+            assert 1 <= dist_port <= 65535, (port, dist_port)
 
     def test_build_zmq_command_filters_launcher_owned_flags(self):
         launcher = TokenspeedWorkerLauncher()
@@ -1319,6 +1387,48 @@ class TestServeOrchestrator:
 
             assert result.backend == backend
             assert result.worker_urls == [_zmq_ipc_url(31000)]
+
+    def test_build_router_args_zmq_engine_count_from_engine_dp(self):
+        """Engine-level --data-parallel-size groups N engines on one socket set
+        for both ZMQ runtimes, so the router must await N engines."""
+        from types import SimpleNamespace
+
+        for backend in ("vllm", "tokenspeed"):
+            args = _make_args(backend=backend, data_parallel_size=1, connection_mode="zmq")
+            orch = ServeOrchestrator(backend, args, ["--data-parallel-size", "2"])
+            orch.workers = [(MagicMock(), 31000)]
+
+            router_args = SimpleNamespace(
+                backend="sglang",
+                zmq_engine_count=None,
+                disable_retries=True,
+                disable_circuit_breaker=True,
+                policy="passthrough",
+            )
+            with patch("smg.serve.RouterArgs.from_cli_args", return_value=router_args):
+                result = orch._build_router_args()
+
+            assert result.zmq_engine_count == 2, backend
+
+    def test_build_router_args_zmq_engine_count_unset_without_engine_dp(self):
+        """An ungrouped ZMQ launch leaves zmq_engine_count alone (defaults to 1)."""
+        from types import SimpleNamespace
+
+        args = _make_args(backend="tokenspeed", data_parallel_size=1, connection_mode="zmq")
+        orch = ServeOrchestrator("tokenspeed", args, [])
+        orch.workers = [(MagicMock(), 31000)]
+
+        router_args = SimpleNamespace(
+            backend="sglang",
+            zmq_engine_count=None,
+            disable_retries=True,
+            disable_circuit_breaker=True,
+            policy="passthrough",
+        )
+        with patch("smg.serve.RouterArgs.from_cli_args", return_value=router_args):
+            result = orch._build_router_args()
+
+        assert result.zmq_engine_count is None
 
     def test_build_router_args_grpc_keeps_router_backend(self):
         """Off the ZMQ path the router backend stays whatever --router-backend

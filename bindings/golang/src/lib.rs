@@ -13,6 +13,13 @@
 //! All functions marked with `#[no_mangle]` and `extern "C"` must be called
 //! with valid pointers and follow the documented memory management rules.
 
+// Jemalloc for all Rust-side allocations in the cdylib. Prefixed symbols
+// leave the host process's allocator untouched; disable_initial_exec_tls is
+// required for a dlopen'd shared library.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 // Re-export error types
 // Re-export client stream function (defined in client.rs but used by stream)
 pub use client::sgl_client_chat_completion_stream;
@@ -69,6 +76,20 @@ mod stream_state;
 mod tokenizer;
 mod tool_parser;
 mod utils;
+
+#[cfg(all(test, not(target_env = "msvc"), not(target_env = "musl")))]
+mod allocator_tests {
+    #[test]
+    fn rust_allocations_use_global_jemalloc() {
+        let allocated =
+            tikv_jemalloc_ctl::thread::allocatedp::read().expect("thread allocation counter");
+        let before = allocated.get();
+        let allocation = std::hint::black_box(vec![0_u8; 1024 * 1024]);
+        let after = allocated.get();
+        assert!(after > before, "Rust allocation bypassed jemalloc");
+        std::hint::black_box(&allocation);
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -2,7 +2,7 @@ name: Release SMG+SGLang Docker Image
 
 run-name: >-
   SMG+SGLang |
-  ${{ github.event_name == 'push' && 'base=lmsysorg/sglang:v0.5.16' || format('base={0}', inputs.base_image_ref || 'lmsysorg/sglang:v0.5.16') }} |
+  ${{ github.event_name == 'push' && 'base=lmsysorg/sglang:v0.5.17' || format('base={0}', inputs.base_image_ref || 'lmsysorg/sglang:v0.5.17') }} |
   engine=${{ inputs.sglang_commit || 'latest' }} |
   smg=${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.9.0' }} |
   ${{ github.event_name == 'pull_request' && 'dry-run |' || '' }}
@@ -23,8 +23,8 @@ on:
   workflow_dispatch:
     inputs:
       base_image_ref:
-        description: 'Base image (e.g. lmsysorg/sglang:v0.5.16)'
-        default: 'lmsysorg/sglang:v0.5.16'
+        description: 'Base image (e.g. lmsysorg/sglang:v0.5.17)'
+        default: 'lmsysorg/sglang:v0.5.17'
         required: true
         type: string
       sglang_repo:
@@ -47,7 +47,7 @@ on:
         default: 'v1.9.0'
         type: string
       tag:
-        description: 'Override image tag (e.g. v1.9.0-sglang-v0.5.16)'
+        description: 'Override image tag (e.g. v1.9.0-sglang-v0.5.17)'
         required: false
         type: string
 
@@ -60,7 +60,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        base_image: ${{ github.event_name == 'push' && fromJSON('["lmsysorg/sglang:v0.5.16"]') || fromJSON(format('["{0}"]', inputs.base_image_ref || 'lmsysorg/sglang:v0.5.16')) }}
+        base_image: ${{ github.event_name == 'push' && fromJSON('["lmsysorg/sglang:v0.5.17"]') || fromJSON(format('["{0}"]', inputs.base_image_ref || 'lmsysorg/sglang:v0.5.17')) }}
     uses: ./.github/workflows/_build-engine-image.yml
     with:
       engine: sglang

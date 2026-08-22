@@ -318,6 +318,9 @@ impl ParserFactory {
         registry.register_parser("qwen", || Box::new(QwenParser::new()));
         registry.register_parser("qwen_xml", || Box::new(QwenXmlParser::new()));
         registry.register_parser("qwen_coder", || Box::new(QwenXmlParser::new()));
+        // Nemotron-3 family emits the same XML-parameter format as Qwen3-Coder;
+        // named alias so operators can select it explicitly per model.
+        registry.register_parser("nemotron", || Box::new(QwenXmlParser::new()));
         registry.register_parser("pythonic", || Box::new(PythonicParser::new()));
         registry.register_parser("llama", || Box::new(LlamaParser::new()));
         registry.register_parser("deepseek", || Box::new(DeepSeekParser::new()));
@@ -371,6 +374,14 @@ impl ParserFactory {
         registry.map_model("Qwen3.5*", "qwen_xml");
         registry.map_model("qwen3.5*", "qwen_xml");
         registry.map_model("qwen/qwen3.5*", "qwen_xml");
+        registry.map_model("Qwen/Qwen3.6*", "qwen_xml");
+        registry.map_model("Qwen3.6*", "qwen_xml");
+        registry.map_model("qwen3.6*", "qwen_xml");
+        registry.map_model("qwen/qwen3.6*", "qwen_xml");
+        registry.map_model("Qwen/Qwen3.8*", "qwen_xml");
+        registry.map_model("Qwen3.8*", "qwen_xml");
+        registry.map_model("qwen3.8*", "qwen_xml");
+        registry.map_model("qwen/qwen3.8*", "qwen_xml");
         registry.map_model("Qwen/Qwen3-Coder*", "qwen_xml");
         registry.map_model("Qwen3-Coder*", "qwen_xml");
         registry.map_model("qwen3-coder*", "qwen_xml");
@@ -378,6 +389,14 @@ impl ParserFactory {
         // Qwen3 and earlier (including Qwen2.5-Coder) use JSON format
         registry.map_model("qwen*", "qwen");
         registry.map_model("Qwen*", "qwen");
+
+        // Nemotron-3 generation (Nano/Super/Ultra/3.5-Lightning): the chat
+        // template renders tool calls in the Qwen3-Coder XML-parameter format
+        // (`<tool_call>\n<function=name>\n<parameter=key>value</parameter>...`)
+        // and tool results as `<tool_response>` blocks. Scoped to `nemotron-3`
+        // so earlier Nemotron families with different formats never match
+        // (matching is case-insensitive substring, so one spelling suffices).
+        registry.map_model("nemotron-3*", "qwen_xml");
 
         // Llama models
         registry.map_model("llama-4*", "pythonic");

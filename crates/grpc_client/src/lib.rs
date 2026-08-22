@@ -27,7 +27,9 @@ pub mod vllm_engine;
 use std::sync::Arc;
 
 pub use abort_on_drop::{AbortOnDropClient, AbortOnDropStream};
-pub use channel::{connect_channel, normalize_grpc_endpoint};
+pub use channel::{
+    connect_channel, connect_channel_with_timeout, normalize_grpc_endpoint, DEFAULT_CONNECT_TIMEOUT,
+};
 pub use mlx_engine::{proto as mlx_proto, MlxEngineClient};
 pub use sglang_scheduler::{
     proto as sglang_proto, SglangGenerateRequestOptions, SglangSchedulerClient,
@@ -75,6 +77,13 @@ pub const FLUSH_RPC_DEADLINE_MARGIN: std::time::Duration = std::time::Duration::
 /// Local deadline for profile start/stop RPCs. Stopping a profile can take
 /// a long time while the backend serializes large traces.
 pub const PROFILE_RPC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(630);
+
+/// Local deadline for the fire-and-forget abort RPC issued from
+/// [`abort_on_drop::AbortOnDropStream`]'s `Drop`. The abort is a tiny unary RPC,
+/// but it runs in a detached task no caller can cancel; bounding it stops those
+/// tasks from accumulating without limit against a wedged backend — which is
+/// exactly when streams are mass-dropped (clients time out and disconnect).
+pub const ABORT_RPC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Shared admin-op implementations (`flush_cache`, `start_profile`,
 /// `stop_profile`) for engine clients whose protos expose the common

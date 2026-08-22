@@ -40,7 +40,7 @@ use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::Value;
 use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler};
-use tokio::{signal, spawn, sync::mpsc};
+use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
@@ -48,15 +48,19 @@ use crate::{
     app_context::AppContext,
     config::RouterConfig,
     mesh::MeshAdapters,
-    middleware::{self, AuthConfig, QueuedRequest},
+    middleware::{self, AdmissionQueue, AuthConfig},
     observability::{
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
         metrics_server, otel_trace, runtime_metrics,
     },
     routers::{
-        common::realtime::ws::RealtimeQueryParams, conversations, parse,
-        responses as response_handlers, router_manager::RouterManager, tokenize, RouterTrait,
+        common::realtime::ws::RealtimeQueryParams,
+        conversations,
+        http::router::{stream_large_request_bodies, StreamBodyState},
+        parse, responses as response_handlers,
+        router_manager::RouterManager,
+        tokenize, RouterTrait,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
@@ -73,7 +77,7 @@ use crate::{
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
-    pub concurrency_queue_tx: Option<mpsc::Sender<QueuedRequest>>,
+    pub admission_queue: Option<Arc<AdmissionQueue>>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
     pub mesh_adapters: Option<Arc<MeshAdapters>>,
@@ -147,11 +151,12 @@ async fn generate(
     cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<GenerateRequest>,
 ) -> Response {
+    let model = body.model.clone();
     cancel
         .guard(
             state
                 .router
-                .route_generate(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_generate(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -163,11 +168,12 @@ async fn v1_chat_completions(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
+    let model = body.model.clone();
     cancel
         .guard(
             state
                 .router
-                .route_chat(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_chat(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -179,11 +185,12 @@ async fn v1_completions(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CompletionRequest>,
 ) -> Response {
+    let model = body.model.clone();
     cancel
         .guard(
             state
                 .router
-                .route_completion(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_completion(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -195,11 +202,12 @@ async fn rerank(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<RerankRequest>,
 ) -> Response {
+    let model = body.model.clone();
     cancel
         .guard(
             state
                 .router
-                .route_rerank(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_rerank(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -212,13 +220,13 @@ async fn v1_rerank(
     Json(body): Json<V1RerankReqInput>,
 ) -> Response {
     let rerank_body: RerankRequest = body.into();
+    let model = rerank_body.model.clone();
     cancel
-        .guard(state.router.route_rerank(
-            Some(&headers),
-            &tenant_meta,
-            &rerank_body,
-            &rerank_body.model,
-        ))
+        .guard(
+            state
+                .router
+                .route_rerank(Some(&headers), &tenant_meta, rerank_body, &model),
+        )
         .await
 }
 
@@ -229,11 +237,12 @@ async fn v1_responses(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<ResponsesRequest>,
 ) -> Response {
+    let model = body.model.clone();
     cancel
         .guard(
             state
                 .router
-                .route_responses(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_responses(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -245,13 +254,14 @@ async fn v1_interactions(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<InteractionsRequest>,
 ) -> Response {
-    let model_id = body.model.as_deref().or(body.agent.as_deref());
+    let model_id = body.model.clone().or_else(|| body.agent.clone());
     cancel
-        .guard(
-            state
-                .router
-                .route_interactions(Some(&headers), &tenant_meta, &body, model_id),
-        )
+        .guard(state.router.route_interactions(
+            Some(&headers),
+            &tenant_meta,
+            body,
+            model_id.as_deref(),
+        ))
         .await
 }
 
@@ -262,11 +272,12 @@ async fn v1_embeddings(
     cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<EmbeddingRequest>,
 ) -> Response {
+    let model = body.model.clone();
     cancel
         .guard(
             state
                 .router
-                .route_embeddings(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_embeddings(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -278,11 +289,12 @@ async fn v1_messages(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CreateMessageRequest>,
 ) -> Response {
+    let model = body.model.clone();
     cancel
         .guard(
             state
                 .router
-                .route_messages(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_messages(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -294,11 +306,12 @@ async fn v1_classify(
     cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<ClassifyRequest>,
 ) -> Response {
+    let model = body.model.clone();
     cancel
         .guard(
             state
                 .router
-                .route_classify(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_classify(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -552,9 +565,17 @@ async fn stop_profile(
 }
 
 async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    WorkerManager::get_all_worker_loads(&state.context.worker_registry, &state.context.client)
-        .await
-        .into_response()
+    WorkerManager::get_all_worker_loads(
+        &state.context.worker_registry,
+        &state.context.client,
+        state
+            .context
+            .worker_monitor
+            .as_ref()
+            .map(|monitor| monitor.native_loads_absent()),
+    )
+    .await
+    .into_response()
 }
 
 async fn create_worker(
@@ -723,6 +744,9 @@ pub struct ServerConfig {
 /// the original `concurrency_limit_middleware`. Either runs innermost of the
 /// protective layers (closest to the handler), after tenant resolution has
 /// populated `RouteRequestMeta`.
+///
+/// Invariant: a request parked at admission keeps its body unread — bodies
+/// are collected only at handler extraction, after a permit is granted.
 fn with_admission_layer(
     router: Router<Arc<AppState>>,
     admission_mode: &middleware::scheduler::AdmissionMode,
@@ -817,6 +841,12 @@ pub fn build_app(
             .route("/v1/messages", post(v1_messages))
             .route("/v1/interactions", post(v1_interactions))
             .route("/v1/classify", post(v1_classify))
+            // Streamed pass-through for large typed-JSON bodies; everything
+            // else passes to the handlers untouched.
+            .route_layer(axum::middleware::from_fn_with_state(
+                StreamBodyState::new(app_state.router.clone(), &app_state.context.router_config),
+                stream_large_request_bodies,
+            ))
             // Tokenize / Detokenize endpoints
             .route("/v1/tokenize", post(v1_tokenize))
             .route("/v1/detokenize", post(v1_detokenize))
@@ -1039,12 +1069,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // port conflicts or bad addresses.
     if let Some(prometheus_config) = &config.prometheus_config {
         let handle = metrics::start_prometheus(prometheus_config.clone());
-        let _server_handle = metrics_server::start_metrics_server(
+        let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
             handle,
             prometheus_config.host.clone(),
             prometheus_config.port,
         )
-        .await;
+        .await?;
         // Tokio runtime self-observability (event-loop canary + sampler).
         // `startup` runs on the main runtime, so the observer lands on —
         // and therefore measures — the runtime that serves requests.
@@ -1089,6 +1119,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             handler.mesh_kv(),
             handler.self_name.clone(),
             app_context.worker_registry.clone(),
+            handler.state.clone(),
+            app_context.policy_registry.clone(),
         )
     });
     if let Some(mesh_server) = mesh_server {
@@ -1108,7 +1140,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     }
 
     let weak_context = Arc::downgrade(&app_context);
-    let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);
+    let worker_job_queue = JobQueue::new(
+        JobQueueConfig {
+            queue_capacity: config.router_config.job_queue_capacity,
+            max_concurrent_jobs: config.router_config.job_queue_concurrency,
+        },
+        weak_context,
+    );
     #[expect(
         clippy::expect_used,
         reason = "OnceLock initialization during startup; double-init is a fatal bug"
@@ -1257,34 +1295,27 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         debug!("Started WorkerMonitor event loop");
     }
 
-    let (limiter, processor) = middleware::ConcurrencyLimiter::new(
-        app_context.rate_limiter.clone(),
-        config.router_config.queue_size,
-        Duration::from_secs(config.router_config.queue_timeout_secs),
-    );
+    let admission_queue =
+        if app_context.rate_limiter.is_some() && config.router_config.queue_size > 0 {
+            debug!(
+                "Admission queue enabled (size: {}, timeout: {}s)",
+                config.router_config.queue_size, config.router_config.queue_timeout_secs
+            );
+            Some(Arc::new(AdmissionQueue::new(
+                config.router_config.queue_size,
+                Duration::from_secs(config.router_config.queue_timeout_secs),
+            )))
+        } else {
+            None
+        };
 
     if app_context.rate_limiter.is_none() {
         info!("Rate limiting is disabled (max_concurrent_requests = -1)");
-    }
-
-    match processor {
-        Some(proc) => {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "request queue processor runs for the lifetime of the server"
-            )]
-            spawn(proc.run());
-            debug!(
-                "Started request queue (size: {}, timeout: {}s)",
-                config.router_config.queue_size, config.router_config.queue_timeout_secs
-            );
-        }
-        None => {
-            debug!(
-                "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
-                config.router_config.max_concurrent_requests
-            );
-        }
+    } else if admission_queue.is_none() {
+        debug!(
+            "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
+            config.router_config.max_concurrent_requests
+        );
     }
 
     // Get mesh cluster state and port before moving mesh_handler into app_state
@@ -1320,7 +1351,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
-        concurrency_queue_tx: limiter.queue_tx.clone(),
+        admission_queue,
         router_manager: Some(router_manager),
         mesh_handler,
         mesh_adapters,

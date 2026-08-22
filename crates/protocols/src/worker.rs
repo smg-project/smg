@@ -243,6 +243,10 @@ pub enum RuntimeType {
     Mlx,
     /// TokenSpeed runtime.
     TokenSpeed,
+    /// Generic OpenAI-compatible HTTP backend whose engine could not be
+    /// identified (e.g. a nested SMG gateway fronting the real engine).
+    /// Routed as plain OpenAI HTTP; no engine-specific features are assumed.
+    Generic,
     /// External OpenAI-compatible API (not local inference).
     External,
 }
@@ -263,6 +267,7 @@ impl RuntimeType {
             RuntimeType::Trtllm => "trtllm",
             RuntimeType::Mlx => "mlx",
             RuntimeType::TokenSpeed => "tokenspeed",
+            RuntimeType::Generic => "generic",
             RuntimeType::External => "external",
         }
     }
@@ -290,6 +295,8 @@ impl std::str::FromStr for RuntimeType {
             Ok(RuntimeType::Mlx)
         } else if s.eq_ignore_ascii_case("tokenspeed") {
             Ok(RuntimeType::TokenSpeed)
+        } else if s.eq_ignore_ascii_case("generic") {
+            Ok(RuntimeType::Generic)
         } else if s.eq_ignore_ascii_case("external") {
             Ok(RuntimeType::External)
         } else {
@@ -720,6 +727,12 @@ pub struct WorkerSpec {
     /// fixed, pre-agreed address rather than the derived one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zmq_handshake_address: Option<String>,
+
+    /// Per-worker absolute overload threshold overrides (partial — only `Some`
+    /// fields override gateway defaults). Either field set enables overload
+    /// protection for this worker even when the gateway leaves it off.
+    #[serde(default, skip_serializing_if = "OverloadUpdate::is_empty")]
+    pub overload: OverloadUpdate,
 }
 
 impl WorkerSpec {
@@ -753,6 +766,7 @@ impl WorkerSpec {
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,
             zmq_handshake_address: None,
+            overload: OverloadUpdate::default(),
         }
     }
 }
@@ -1022,6 +1036,28 @@ impl HttpPoolConfig {
     }
 }
 
+/// Per-worker absolute overload threshold overrides.
+/// All fields optional — `None` means "use gateway default". Either field set
+/// enables overload protection for this worker even when the gateway leaves
+/// it off. Mirrors `HealthCheckUpdate` pattern for PATCH-style config.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OverloadUpdate {
+    /// Queued (waiting) requests summed across DP ranks at or above which this
+    /// worker is considered overloaded. Must be `>= 1`.
+    pub waiting_requests: Option<usize>,
+    /// Mean KV-cache token usage across DP ranks at or above which this worker
+    /// is considered overloaded. Must be in `(0.0, 1.0]`.
+    pub token_usage: Option<f64>,
+}
+
+impl OverloadUpdate {
+    /// Returns `true` if all fields are `None` (no overrides specified).
+    pub fn is_empty(&self) -> bool {
+        self.waiting_requests.is_none() && self.token_usage.is_none()
+    }
+}
+
 /// Per-worker resilience overrides (retry + circuit breaker).
 /// All fields optional — `None` means "use router default".
 /// Mirrors `HealthCheckUpdate` pattern for PATCH-style config.
@@ -1055,9 +1091,17 @@ pub struct ResilienceUpdate {
     pub disable_circuit_breaker: Option<bool>,
 
     // ── Retryable status codes ──
-    /// Custom retryable HTTP status codes.
-    /// When set, replaces the default set (408, 429, 500, 502, 503, 504).
+    /// HTTP status codes this worker counts as circuit-breaker failures.
+    /// When set, replaces the default set (408, 429, 500, 502, 503, 504)
+    /// verbatim - entries are not merged in. This does not gate retries:
+    /// whether a response is retried is a router-global rule, independent of
+    /// this set, so narrowing it cannot make a status non-retryable.
     pub retryable_status_codes: Option<Vec<u16>>,
+    /// Capacity-pushback HTTP status codes: still retryable on another
+    /// worker, but never counted as circuit-breaker failures (backpressure
+    /// is a routing signal, not a fault). When set, replaces the default
+    /// set (429).
+    pub capacity_status_codes: Option<Vec<u16>>,
 }
 
 impl ResilienceUpdate {
@@ -1075,6 +1119,7 @@ impl ResilienceUpdate {
             && self.cb_window_secs.is_none()
             && self.disable_circuit_breaker.is_none()
             && self.retryable_status_codes.is_none()
+            && self.capacity_status_codes.is_none()
     }
 }
 
@@ -1289,6 +1334,11 @@ impl WorkerLoadResponse {
             .sum()
     }
 
+    /// Total waiting (queued) requests summed across all DP ranks.
+    pub fn total_waiting_reqs(&self) -> i64 {
+        self.loads.iter().map(|l| l.num_waiting_reqs as i64).sum()
+    }
+
     /// Total generation throughput (tokens/s) summed across all DP ranks.
     pub fn total_gen_throughput(&self) -> f64 {
         self.loads.iter().map(|l| l.gen_throughput).sum()
@@ -1436,6 +1486,33 @@ mod connection_mode_tests {
 }
 
 #[cfg(test)]
+mod runtime_type_tests {
+    use super::RuntimeType;
+
+    #[test]
+    fn generic_round_trips_through_str_and_serde() {
+        assert_eq!(RuntimeType::Generic.as_str(), "generic");
+        assert_eq!(
+            "generic".parse::<RuntimeType>().unwrap(),
+            RuntimeType::Generic
+        );
+        assert_eq!(
+            serde_json::to_string(&RuntimeType::Generic).unwrap(),
+            "\"generic\""
+        );
+        assert_eq!(
+            serde_json::from_str::<RuntimeType>("\"generic\"").unwrap(),
+            RuntimeType::Generic
+        );
+    }
+
+    #[test]
+    fn generic_counts_as_specified() {
+        assert!(RuntimeType::Generic.is_specified());
+    }
+}
+
+#[cfg(test)]
 mod worker_status_tests {
     use super::WorkerStatus;
 
@@ -1537,5 +1614,61 @@ mod health_check_drain_settle_tests {
         }"#;
         let cfg: HealthCheckConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.drain_settle_secs, 5);
+    }
+}
+
+#[cfg(test)]
+mod overload_update_tests {
+    use serde_json::json;
+
+    use super::{OverloadUpdate, WorkerSpec};
+
+    #[test]
+    fn spec_without_block_deserializes_empty_and_is_not_serialized() {
+        // Existing serialized specs carry no `overload` key; they must keep
+        // deserializing, and an empty block must not appear on output.
+        let spec: WorkerSpec = serde_json::from_value(json!({"url": "http://w:1"})).unwrap();
+        assert!(spec.overload.is_empty());
+
+        let out = serde_json::to_value(&spec).unwrap();
+        assert!(out.get("overload").is_none());
+    }
+
+    #[test]
+    fn overload_block_round_trips_per_field() {
+        let spec: WorkerSpec = serde_json::from_value(json!({
+            "url": "http://w:1",
+            "overload": {"waiting_requests": 8, "token_usage": 0.85},
+        }))
+        .unwrap();
+        assert_eq!(spec.overload.waiting_requests, Some(8));
+        assert_eq!(spec.overload.token_usage, Some(0.85));
+
+        let out = serde_json::to_value(&spec).unwrap();
+        assert_eq!(out["overload"]["waiting_requests"], 8);
+        assert_eq!(out["overload"]["token_usage"], 0.85);
+
+        // A one-field block leaves the other signal unset, not defaulted.
+        let partial: WorkerSpec = serde_json::from_value(json!({
+            "url": "http://w:1",
+            "overload": {"token_usage": 0.9},
+        }))
+        .unwrap();
+        assert_eq!(partial.overload.waiting_requests, None);
+        assert_eq!(partial.overload.token_usage, Some(0.9));
+        assert!(!partial.overload.is_empty());
+    }
+
+    #[test]
+    fn is_empty_tracks_both_fields() {
+        let mut update = OverloadUpdate::default();
+        assert!(update.is_empty());
+        update.waiting_requests = Some(1);
+        assert!(!update.is_empty());
+        update = OverloadUpdate {
+            waiting_requests: None,
+            token_usage: Some(1.0),
+        };
+        assert!(!update.is_empty());
     }
 }

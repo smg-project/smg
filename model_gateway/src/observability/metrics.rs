@@ -38,6 +38,54 @@ pub(crate) fn interner_size() -> usize {
     STRING_INTERNER.len()
 }
 
+/// Sentinel substituted once a bounded interner reaches its cap, so a flood of
+/// client-controlled label values (model IDs, MCP tool names) cannot mint an
+/// unbounded number of interner entries or Prometheus series.
+const BOUNDED_LABEL_SENTINEL: &str = "other";
+
+/// Max distinct client-supplied model labels retained before collapsing to the
+/// sentinel. A gateway fronts far fewer real models than this; the cap only bites
+/// on adversarial or unvalidated input.
+const MAX_MODEL_LABELS: usize = 1024;
+
+/// Max distinct client/model-controlled MCP tool-name labels.
+const MAX_TOOL_LABELS: usize = 1024;
+
+static MODEL_LABELS: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
+static TOOL_LABELS: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
+static BOUNDED_LABEL_SENTINEL_ARC: Lazy<Arc<str>> = Lazy::new(|| Arc::from(BOUNDED_LABEL_SENTINEL));
+
+/// Intern a client-controlled label with a hard cardinality cap.
+///
+/// Distinct values beyond `cap` collapse to a shared sentinel, so untrusted input
+/// (client-supplied model names, model-generated tool names) cannot grow the
+/// interner — or the metric's Prometheus series set — without bound. Unlike an LRU,
+/// admitted values are never evicted and re-admitted, which would keep minting new
+/// series in the recorder even as the map churned.
+fn intern_bounded_label(map: &DashMap<String, Arc<str>>, cap: usize, s: &str) -> Arc<str> {
+    if let Some(entry) = map.get(s) {
+        return Arc::clone(entry.value());
+    }
+    // Best-effort cap; a small concurrent overshoot is harmless.
+    if map.len() >= cap {
+        return Arc::clone(&BOUNDED_LABEL_SENTINEL_ARC);
+    }
+    map.entry(s.to_string())
+        .or_insert_with(|| Arc::from(s))
+        .clone()
+}
+
+/// Intern a client-supplied model label, bounded by [`MAX_MODEL_LABELS`].
+fn intern_model_label(model_id: &str) -> Arc<str> {
+    intern_bounded_label(&MODEL_LABELS, MAX_MODEL_LABELS, model_id)
+}
+
+/// Intern a client/model-controlled MCP tool-name label, bounded by
+/// [`MAX_TOOL_LABELS`].
+fn intern_tool_label(tool_name: &str) -> Arc<str> {
+    intern_bounded_label(&TOOL_LABELS, MAX_TOOL_LABELS, tool_name)
+}
+
 // =============================================================================
 // STATIC STRING CONSTANTS
 // =============================================================================
@@ -134,7 +182,30 @@ impl Default for PrometheusConfig {
 /// `PrometheusBuilder::upkeep_timeout()` in `start_prometheus`.
 pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 
+/// Marks jemalloc as the final artifact's Rust global allocator.
+///
+/// Call this before [`start_prometheus`] only from a binary or extension that
+/// declares `tikv_jemallocator::Jemalloc` with `#[global_allocator]`. Keeping
+/// this registration at the artifact boundary prevents `smg` rlib consumers
+/// that use the system allocator from publishing statistics for an unused
+/// linked jemalloc instance.
+pub fn register_jemalloc_as_global_allocator() {
+    #[cfg(all(
+        feature = "jemalloc-stats",
+        not(target_env = "msvc"),
+        not(target_env = "musl")
+    ))]
+    allocator_stats::register_global_allocator();
+}
+
 pub(crate) fn init_metrics() {
+    #[cfg(all(
+        feature = "jemalloc-stats",
+        not(target_env = "msvc"),
+        not(target_env = "musl")
+    ))]
+    allocator_stats::describe();
+
     // Layer 1: HTTP metrics
     describe_counter!(
         "smg_http_requests_total",
@@ -160,6 +231,18 @@ pub(crate) fn init_metrics() {
         "smg_http_rate_limit_total",
         "Rate limiting decisions by result (allowed/rejected)"
     );
+    describe_gauge!(
+        "smg_admission_queue_depth",
+        "Requests currently parked in the admission queue"
+    );
+    describe_counter!(
+        "smg_admission_queue_rejected_total",
+        "Requests rejected at admission by reason (full/timeout)"
+    );
+    describe_gauge!(
+        "smg_admission_inflight",
+        "Requests currently holding an admission token"
+    );
 
     // Layer 2: Router metrics
     describe_counter!(
@@ -181,6 +264,10 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_router_upstream_responses_total",
         "Upstream backend HTTP responses by router_type, status_code, error_code"
+    );
+    describe_counter!(
+        "smg_router_request_buffers_released_early_bytes_total",
+        "Serialized size of request buffers freed at dispatch instead of response completion (retries disabled)"
     );
 
     // Layer 2: Router inference metrics (gRPC only)
@@ -263,8 +350,33 @@ pub(crate) fn init_metrics() {
          (panic, join_error, intern_failed)"
     );
     describe_gauge!(
+        "smg_workers_overloaded",
+        "Workers currently flagged overloaded and excluded from routing, by model"
+    );
+    describe_counter!(
+        "smg_worker_overload_shed_total",
+        "Requests shed because every worker for the model is overloaded, by stage \
+         (selection, dispatch)"
+    );
+    describe_gauge!(
         "smg_manual_policy_cache_entries",
         "Number of routing entries in manual policy cache"
+    );
+    describe_gauge!(
+        "smg_cache_tree_chars",
+        "Cache-aware string tree cached characters by model (summed across tenants)"
+    );
+    describe_gauge!(
+        "smg_cache_tree_tokens",
+        "Cache-aware token tree cached tokens by model (summed across tenants)"
+    );
+    describe_gauge!(
+        "smg_cache_tree_tenants",
+        "Cache-aware tree tenant count by model and tree (string/token)"
+    );
+    describe_gauge!(
+        "smg_cache_placement_entries",
+        "Cache-aware hash-index placement entries by model (keys with a live holder)"
     );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
@@ -459,7 +571,106 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
         )
         .expect("failed to set event loop delay buckets")
         .install_recorder()
+        .inspect(|_| {
+            #[cfg(all(
+                feature = "jemalloc-stats",
+                not(target_env = "msvc"),
+                not(target_env = "musl")
+            ))]
+            allocator_stats::start_reporting();
+        })
         .expect("failed to install Prometheus recorder")
+}
+
+#[cfg(all(
+    feature = "jemalloc-stats",
+    not(target_env = "msvc"),
+    not(target_env = "musl")
+))]
+pub(crate) mod allocator_stats {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use metrics::{describe_gauge, gauge};
+
+    static JEMALLOC_IS_GLOBAL: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn register_global_allocator() {
+        JEMALLOC_IS_GLOBAL.store(true, Ordering::Release);
+    }
+
+    fn is_global_allocator() -> bool {
+        JEMALLOC_IS_GLOBAL.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn describe() {
+        if !is_global_allocator() {
+            return;
+        }
+        describe_gauge!(
+            "smg_allocator_allocated_bytes",
+            "Bytes in live Rust allocations managed by SMG's jemalloc instance"
+        );
+        describe_gauge!(
+            "smg_allocator_active_bytes",
+            "Bytes in active pages for SMG's Rust jemalloc heap"
+        );
+        describe_gauge!(
+            "smg_allocator_resident_bytes",
+            "Upper bound on resident bytes for SMG's Rust jemalloc heap"
+        );
+        describe_gauge!(
+            "smg_allocator_metadata_bytes",
+            "Metadata bytes for SMG's Rust jemalloc instance"
+        );
+    }
+
+    fn record() {
+        use tikv_jemalloc_ctl::{epoch, stats};
+        if epoch::advance().is_err() {
+            return;
+        }
+        if let Ok(v) = stats::allocated::read() {
+            gauge!("smg_allocator_allocated_bytes").set(v as f64);
+        }
+        if let Ok(v) = stats::active::read() {
+            gauge!("smg_allocator_active_bytes").set(v as f64);
+        }
+        if let Ok(v) = stats::resident::read() {
+            gauge!("smg_allocator_resident_bytes").set(v as f64);
+        }
+        if let Ok(v) = stats::metadata::read() {
+            gauge!("smg_allocator_metadata_bytes").set(v as f64);
+        }
+    }
+
+    /// Registration at the final-artifact boundary keeps these gauges tied to
+    /// Rust's actual global allocator.
+    pub(crate) fn start_reporting() {
+        if !is_global_allocator() {
+            return;
+        }
+        record();
+        // Plain thread: metrics must not depend on a runtime being alive.
+        let _ = std::thread::Builder::new()
+            .name("smg-allocator-stats".into())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                record();
+            });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn jemalloc_stats_interface_readable() {
+            use tikv_jemalloc_ctl::{epoch, stats};
+            epoch::advance().expect("epoch advance");
+            stats::allocated::read().expect("stats.allocated readable");
+            stats::active::read().expect("stats.active readable");
+            stats::resident::read().expect("stats.resident readable");
+            stats::metadata::read().expect("stats.metadata readable");
+        }
+    }
 }
 
 /// Label constants for consistent metric labeling
@@ -547,6 +758,10 @@ pub mod metrics_labels {
     // Rate limit results
     pub const RATE_LIMIT_ALLOWED: &str = "allowed";
     pub const RATE_LIMIT_REJECTED: &str = "rejected";
+
+    // Admission rejection reasons
+    pub const ADMISSION_REJECTED_FULL: &str = "full";
+    pub const ADMISSION_REJECTED_TIMEOUT: &str = "timeout";
 
     // Circuit breaker states
     pub const CB_CLOSED: &str = "closed";
@@ -646,6 +861,35 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Track a request entering the admission queue.
+    pub fn record_admission_queue_entered() {
+        gauge!("smg_admission_queue_depth").increment(1.0);
+    }
+
+    /// Track a request leaving the admission queue (admitted, rejected, or cancelled).
+    pub fn record_admission_queue_exited() {
+        gauge!("smg_admission_queue_depth").decrement(1.0);
+    }
+
+    /// Record a request rejected at admission.
+    pub fn record_admission_rejected(reason: &'static str) {
+        counter!(
+            "smg_admission_queue_rejected_total",
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Track acquisition of an admission token.
+    pub fn record_admission_inflight_acquired() {
+        gauge!("smg_admission_inflight").increment(1.0);
+    }
+
+    /// Track release of an admission token.
+    pub fn record_admission_inflight_released() {
+        gauge!("smg_admission_inflight").decrement(1.0);
+    }
+
     /// Record one multimodal tensor sent over `path` ("inline"|"shm"|"remote") for `runtime`.
     pub fn record_mm_tensor(runtime: &'static str, path: &'static str, nbytes: usize) {
         counter!("smg_mm_tensors_total", "runtime" => runtime, "path" => path).increment(1);
@@ -676,7 +920,7 @@ impl Metrics {
         endpoint: &'static str,
         streaming: &'static str,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         counter!(
             "smg_router_requests_total",
             "router_type" => router_type,
@@ -699,7 +943,7 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         histogram!(
             "smg_router_request_duration_seconds",
             "router_type" => router_type,
@@ -721,7 +965,7 @@ impl Metrics {
         endpoint: &'static str,
         error_type: &'static str,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         counter!(
             "smg_router_request_errors_total",
             "router_type" => router_type,
@@ -747,6 +991,21 @@ impl Metrics {
             "stage" => stage
         )
         .record(duration.as_secs_f64());
+    }
+
+    /// Record a single-shot resend after a pre-response transport failure.
+    pub fn record_upstream_send_retry(router_type: &'static str) {
+        counter!(
+            "smg_router_upstream_send_retries_total",
+            "router_type" => router_type
+        )
+        .increment(1);
+    }
+
+    /// Record request buffers freed at dispatch (retries disabled), sized by
+    /// the serialized upstream body.
+    pub fn record_request_buffers_released_early(bytes: usize) {
+        counter!("smg_router_request_buffers_released_early_bytes_total").increment(bytes as u64);
     }
 
     /// Record upstream backend response.
@@ -780,7 +1039,7 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         histogram!(
             "smg_router_ttft_seconds",
             "router_type" => router_type,
@@ -799,7 +1058,7 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         histogram!(
             "smg_router_tpot_seconds",
             "router_type" => router_type,
@@ -819,7 +1078,7 @@ impl Metrics {
         token_type: &'static str,
         count: u64,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         counter!(
             "smg_router_tokens_total",
             "router_type" => router_type,
@@ -840,7 +1099,7 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         histogram!(
             "smg_router_generation_duration_seconds",
             "router_type" => router_type,
@@ -868,7 +1127,7 @@ impl Metrics {
         } = params;
 
         // Intern model string once - Arc::clone is just a ref count increment
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
 
         // TTFT and TPOT (only if we have a first token time)
         if let Some(ttft_duration) = ttft {
@@ -948,7 +1207,7 @@ impl Metrics {
         runtime: &'static str,
         duration: Duration,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         histogram!(
             "smg_pd_prefill_duration_seconds",
             "backend_type" => backend_type,
@@ -966,7 +1225,7 @@ impl Metrics {
         runtime: &'static str,
         duration: Duration,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         histogram!(
             "smg_pd_kv_transfer_duration_seconds",
             "backend_type" => backend_type,
@@ -989,7 +1248,7 @@ impl Metrics {
         runtime: &'static str,
         duration: Duration,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         histogram!(
             "smg_pd_ttft_seconds",
             "backend_type" => backend_type,
@@ -1029,7 +1288,7 @@ impl Metrics {
         model_id: &str,
         size: usize,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         gauge!(
             "smg_worker_pool_size",
             "worker_type" => worker_type,
@@ -1070,7 +1329,7 @@ impl Metrics {
         model_id: &str,
         policy: &'static str,
     ) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         counter!(
             "smg_worker_selection_total",
             "worker_type" => worker_type,
@@ -1096,6 +1355,23 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Set the count of workers a model currently has vetoed by the absolute
+    /// overload guard. Written only when a worker's flag transitions.
+    pub fn set_workers_overloaded(model_id: &str, count: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_workers_overloaded", "model" => model).set(count as f64);
+    }
+
+    /// Record a request shed because every worker for the model is overloaded.
+    /// `stage` is "selection" or "dispatch".
+    pub fn record_worker_overload_shed(stage: &'static str) {
+        counter!(
+            "smg_worker_overload_shed_total",
+            "stage" => stage
+        )
+        .increment(1);
+    }
+
     /// Record manual policy execution branch for routing decisions
     pub fn record_worker_manual_policy_branch(branch: &'static str) {
         counter!(
@@ -1108,6 +1384,39 @@ impl Metrics {
     /// Set manual policy cache entries count
     pub fn set_manual_policy_cache_entries(count: usize) {
         gauge!("smg_manual_policy_cache_entries").set(count as f64);
+    }
+
+    /// Record which source supplied the sticky routing key for a keyed request
+    pub fn record_routing_key_source(source: &'static str) {
+        counter!(
+            "smg_routing_key_source_total",
+            "source" => source
+        )
+        .increment(1);
+    }
+
+    /// Set cache-aware string-tree cached characters for a model
+    pub fn set_cache_tree_chars(model_id: &str, chars: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_cache_tree_chars", "model" => model).set(chars as f64);
+    }
+
+    /// Set cache-aware token-tree cached tokens for a model
+    pub fn set_cache_tree_tokens(model_id: &str, tokens: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_cache_tree_tokens", "model" => model).set(tokens as f64);
+    }
+
+    /// Set cache-aware tree tenant count for a model and tree kind ("string"/"token")
+    pub fn set_cache_tree_tenants(model_id: &str, tree: &'static str, count: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_cache_tree_tenants", "model" => model, "tree" => tree).set(count as f64);
+    }
+
+    /// Set cache-aware hash-index placement entry count for a model
+    pub fn set_cache_placement_entries(model_id: &str, count: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_cache_placement_entries", "model" => model).set(count as f64);
     }
 
     /// Record consistent hashing policy execution branch for routing decisions
@@ -1316,8 +1625,8 @@ impl Metrics {
 
     /// Record MCP tool call
     pub fn record_mcp_tool_call(model_id: &str, tool_name: &str, result: &'static str) {
-        let model = intern_string(model_id);
-        let tool = intern_string(tool_name);
+        let model = intern_model_label(model_id);
+        let tool = intern_tool_label(tool_name);
         counter!(
             "smg_mcp_tool_calls_total",
             "model" => model,
@@ -1329,8 +1638,8 @@ impl Metrics {
 
     /// Record MCP tool execution duration
     pub fn record_mcp_tool_duration(model_id: &str, tool_name: &str, duration: Duration) {
-        let model = intern_string(model_id);
-        let tool = intern_string(tool_name);
+        let model = intern_model_label(model_id);
+        let tool = intern_tool_label(tool_name);
         histogram!(
             "smg_mcp_tool_duration_seconds",
             "model" => model,
@@ -1346,7 +1655,7 @@ impl Metrics {
 
     /// Record MCP tool loop iteration
     pub fn record_mcp_tool_iteration(model_id: &str) {
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
         counter!(
             "smg_mcp_tool_iterations_total",
             "model" => model
@@ -1420,7 +1729,7 @@ impl Metrics {
         response: &openai_protocol::worker::WorkerLoadResponse,
     ) {
         let worker = intern_string(worker_url);
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
 
         for load in &response.loads {
             let dp_rank = intern_string(&load.dp_rank.to_string());
@@ -1535,7 +1844,7 @@ impl Metrics {
     /// `dp_rank`) or a fresh series is created instead of overwriting the live one.
     pub fn remove_engine_load_metrics(worker_url: &str, model_id: &str, dp_size: usize) {
         let worker = intern_string(worker_url);
-        let model = intern_string(model_id);
+        let model = intern_model_label(model_id);
 
         for rank in 0..dp_size.max(1) {
             let dp_rank = intern_string(&rank.to_string());
@@ -1585,6 +1894,31 @@ mod tests {
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 
     use super::*;
+
+    #[test]
+    fn intern_bounded_label_caps_cardinality_with_sentinel() {
+        let map: DashMap<String, Arc<str>> = DashMap::new();
+
+        let a = intern_bounded_label(&map, 2, "m1");
+        let b = intern_bounded_label(&map, 2, "m2");
+        assert_eq!(map.len(), 2);
+
+        // Repeats return the same interned Arc without growing the map.
+        let a2 = intern_bounded_label(&map, 2, "m1");
+        assert!(Arc::ptr_eq(&a, &a2));
+        assert_eq!(map.len(), 2);
+
+        // A distinct value past the cap collapses to the sentinel and does not
+        // grow the map, so no new Prometheus series is minted for it.
+        let c = intern_bounded_label(&map, 2, "m3");
+        assert_eq!(&*c, BOUNDED_LABEL_SENTINEL);
+        assert_eq!(map.len(), 2);
+
+        // Already-admitted values still resolve normally after the cap is hit.
+        let b2 = intern_bounded_label(&map, 2, "m2");
+        assert!(Arc::ptr_eq(&b, &b2));
+        assert_ne!(&*a, BOUNDED_LABEL_SENTINEL);
+    }
 
     /// Run `f` under a thread-local Prometheus recorder and return the
     /// rendered `/metrics` text — the same scrape output the :29000 endpoint
@@ -1687,6 +2021,33 @@ mod tests {
             &pd_labels,
             "4",
         );
+    }
+
+    #[test]
+    fn cache_tree_setters_emit_per_model_gauges() {
+        let rendered = render_with_recorder(|| {
+            Metrics::set_cache_tree_chars("m", 120);
+            Metrics::set_cache_tree_tokens("m", 64);
+            Metrics::set_cache_tree_tenants("m", "string", 3);
+            Metrics::set_cache_tree_tenants("m", "token", 2);
+        });
+
+        assert_metric(&rendered, "smg_cache_tree_chars", &["model=\"m\""], "120");
+        assert_metric(&rendered, "smg_cache_tree_tokens", &["model=\"m\""], "64");
+        // Two tenant series (one per tree kind); series order within the
+        // family is exporter-defined, so match each line independently.
+        for (tree, value) in [("string", "3"), ("token", "2")] {
+            let label = format!("tree=\"{tree}\"");
+            assert!(
+                rendered.lines().any(|l| {
+                    l.starts_with("smg_cache_tree_tenants{")
+                        && l.contains("model=\"m\"")
+                        && l.contains(&label)
+                        && l.ends_with(&format!(" {value}"))
+                }),
+                "smg_cache_tree_tenants {tree} series missing; rendered:\n{rendered}"
+            );
+        }
     }
 
     #[test]

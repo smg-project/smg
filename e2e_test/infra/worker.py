@@ -24,6 +24,7 @@ from .constants import (
     ConnectionMode,
     WorkerType,
     get_runtime,
+    get_zmq_engine_count,
     vllm_kv_backend,
 )
 from .model_specs import get_model_spec
@@ -287,9 +288,13 @@ class Worker:
         args = argparse.Namespace(
             connection_mode="zmq", model=model_path, tensor_parallel_size=tp_size
         )
-        return VllmWorkerLauncher().build_command(
-            args, list(spec.get("vllm_args", [])), DEFAULT_HOST, self.port
-        )
+        backend_args = list(spec.get("vllm_args", []))
+        # Grouped lane: an engine-level dp flag makes the launcher start that
+        # many engines on this worker's socket set (see get_zmq_engine_count).
+        engine_count = get_zmq_engine_count()
+        if engine_count > 1:
+            backend_args += ["--data-parallel-size", str(engine_count)]
+        return VllmWorkerLauncher().build_command(args, backend_args, DEFAULT_HOST, self.port)
 
     def _build_vllm_grpc_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
         """Build vLLM gRPC server command."""
@@ -366,9 +371,13 @@ class Worker:
         args = argparse.Namespace(
             connection_mode="zmq", model=model_path, tensor_parallel_size=tp_size
         )
-        return TokenspeedWorkerLauncher().build_command(
-            args, list(spec.get("tokenspeed_args", [])), DEFAULT_HOST, self.port
-        )
+        backend_args = list(spec.get("tokenspeed_args", []))
+        # Grouped lane: an engine-level dp flag makes the launcher start that
+        # many ranks on this worker's socket set (see get_zmq_engine_count).
+        engine_count = get_zmq_engine_count()
+        if engine_count > 1:
+            backend_args += ["--data-parallel-size", str(engine_count)]
+        return TokenspeedWorkerLauncher().build_command(args, backend_args, DEFAULT_HOST, self.port)
 
     def _build_tokenspeed_grpc_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
         """Build TokenSpeed gRPC server command.
@@ -617,6 +626,19 @@ def start_workers(
 
     spec = get_model_spec(model_id)
     gpus_per_worker = gpus or spec.get("tp", 1)
+    if gpus is None and mode == ConnectionMode.ZMQ:
+        # A grouped ZMQ worker launches get_zmq_engine_count() engines, each
+        # tp-wide, in one process — size its GPU slice accordingly. vLLM and
+        # TokenSpeed launchers both start engine groups; a grouped count on
+        # any other runtime would reserve GPUs for engines that never launch
+        # and leave the gateway awaiting handshakes that never come.
+        zmq_engine_count = get_zmq_engine_count()
+        if zmq_engine_count > 1 and engine not in ("vllm", "tokenspeed"):
+            raise ValueError(
+                f"E2E_ZMQ_ENGINE_COUNT={zmq_engine_count} needs an engine-group "
+                f"launcher (vllm or tokenspeed); got engine={engine!r}"
+            )
+        gpus_per_worker *= zmq_engine_count
     timeout = spec.get("startup_timeout", timeout)
 
     # Detect IB device for PD workers

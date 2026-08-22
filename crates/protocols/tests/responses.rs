@@ -4109,6 +4109,100 @@ fn test_mcp_call_input_item_full_round_trip() {
     );
 }
 
+/// Structured `mcp_call.error` variants round-trip byte-for-byte on both the
+/// input and output item shapes.
+#[test]
+fn test_mcp_call_structured_error_round_trips() {
+    let errors = [
+        json!({"type": "mcp_protocol_error", "code": -32601, "message": "method not found"}),
+        json!({"type": "mcp_tool_execution_error", "content": "rate limited"}),
+        json!({"type": "mcp_tool_execution_error", "content": [{"type": "text", "text": "boom"}]}),
+        json!({"type": "http_error", "code": 502, "message": "bad gateway"}),
+    ];
+    for error in errors {
+        let input_payload = json!({
+            "type": "mcp_call",
+            "id": "mcp_call_3",
+            "arguments": "{}",
+            "name": "ask_question",
+            "server_label": "deepwiki",
+            "error": error,
+        });
+        let item: ResponseInputOutputItem = serde_json::from_value(input_payload.clone())
+            .unwrap_or_else(|e| panic!("structured error should deserialize: {e}"));
+        assert_eq!(
+            serde_json::to_value(&item).expect("serialize"),
+            input_payload
+        );
+
+        let output_payload = json!({
+            "type": "mcp_call",
+            "id": "mcp_call_3",
+            "status": "failed",
+            "arguments": "{}",
+            "name": "ask_question",
+            "output": "",
+            "server_label": "deepwiki",
+            "error": error,
+        });
+        let item: ResponseOutputItem = serde_json::from_value(output_payload.clone())
+            .unwrap_or_else(|e| panic!("structured error should deserialize: {e}"));
+        assert_eq!(
+            serde_json::to_value(&item).expect("serialize"),
+            output_payload
+        );
+    }
+}
+
+/// Legacy plain-string `mcp_call.error` (pre-union wire shape, still present in
+/// stored history) coerces to the tool-execution variant so replay serializes
+/// the object form OpenAI now requires.
+#[test]
+fn test_mcp_call_legacy_string_error_coerces_to_structured() {
+    let item: ResponseInputOutputItem = serde_json::from_value(json!({
+        "type": "mcp_call",
+        "id": "mcp_call_4",
+        "arguments": "{}",
+        "name": "brave_web_search",
+        "server_label": "brave",
+        "status": "failed",
+        "error": "Tool call failed: rate limited",
+    }))
+    .expect("legacy string error should still deserialize");
+
+    match &item {
+        ResponseInputOutputItem::McpCall { error, .. } => {
+            assert_eq!(
+                error,
+                &Some(McpToolCallError::execution(
+                    "Tool call failed: rate limited"
+                ))
+            );
+        }
+        other => panic!("expected McpCall, got {other:?}"),
+    }
+    assert_eq!(
+        serde_json::to_value(&item).expect("serialize")["error"],
+        json!({"type": "mcp_tool_execution_error", "content": "Tool call failed: rate limited"})
+    );
+
+    let item: ResponseOutputItem = serde_json::from_value(json!({
+        "type": "mcp_call",
+        "id": "mcp_call_4",
+        "status": "failed",
+        "arguments": "{}",
+        "name": "brave_web_search",
+        "output": "",
+        "server_label": "brave",
+        "error": "Tool call failed: rate limited",
+    }))
+    .expect("legacy string error should still deserialize");
+    assert_eq!(
+        serde_json::to_value(&item).expect("serialize")["error"],
+        json!({"type": "mcp_tool_execution_error", "content": "Tool call failed: rate limited"})
+    );
+}
+
 /// Input-item `mcp_list_tools` round-trips with a non-empty `tools` array; the
 /// optional `error` field is omitted on serialize when absent.
 #[test]

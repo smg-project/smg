@@ -242,7 +242,7 @@ async fn test_openai_router_responses_with_mock() {
 
     let tenant_meta = test_tenant_meta();
     let response1 = router
-        .route_responses(None, &tenant_meta, &request1, &request1.model)
+        .route_responses(None, &tenant_meta, request1.clone(), &request1.model)
         .await;
     assert_eq!(response1.status(), StatusCode::OK);
     let body1_bytes = axum::body::to_bytes(response1.into_body(), usize::MAX)
@@ -262,7 +262,7 @@ async fn test_openai_router_responses_with_mock() {
 
     let tenant_meta = test_tenant_meta();
     let response2 = router
-        .route_responses(None, &tenant_meta, &request2, &request2.model)
+        .route_responses(None, &tenant_meta, request2.clone(), &request2.model)
         .await;
     assert_eq!(response2.status(), StatusCode::OK);
     let body2_bytes = axum::body::to_bytes(response2.into_body(), usize::MAX)
@@ -511,7 +511,7 @@ async fn test_openai_router_responses_streaming_with_mock() {
 
     let tenant_meta = test_tenant_meta();
     let response = router
-        .route_responses(None, &tenant_meta, &request, &request.model)
+        .route_responses(None, &tenant_meta, request.clone(), &request.model)
         .await;
     assert_eq!(response.status(), StatusCode::OK);
 
@@ -656,7 +656,7 @@ async fn test_unsupported_endpoints() {
         .route_generate(
             None,
             &tenant_meta,
-            &generate_request,
+            generate_request.clone(),
             &generate_request.model,
         )
         .await;
@@ -668,7 +668,7 @@ async fn test_unsupported_endpoints() {
         .route_completion(
             None,
             &tenant_meta,
-            &completion_request,
+            completion_request.clone(),
             &completion_request.model,
         )
         .await;
@@ -698,7 +698,12 @@ async fn test_openai_router_chat_completion_with_mock() {
     // Route the request
     let tenant_meta = test_tenant_meta();
     let response = router
-        .route_chat(None, &tenant_meta, &chat_request, &chat_request.model)
+        .route_chat(
+            None,
+            &tenant_meta,
+            chat_request.clone(),
+            &chat_request.model,
+        )
         .await;
 
     // Should get a successful response from mock server
@@ -746,7 +751,7 @@ async fn test_openai_e2e_with_server() {
                         .route_chat(
                             Some(&parts.headers),
                             &tenant_meta,
-                            &chat_request,
+                            chat_request.clone(),
                             &chat_request.model,
                         )
                         .await
@@ -810,7 +815,12 @@ async fn test_openai_router_chat_streaming_with_mock() {
 
     let tenant_meta = test_tenant_meta();
     let response = router
-        .route_chat(None, &tenant_meta, &chat_request, &chat_request.model)
+        .route_chat(
+            None,
+            &tenant_meta,
+            chat_request.clone(),
+            &chat_request.model,
+        )
         .await;
     assert_eq!(response.status(), StatusCode::OK);
 
@@ -846,7 +856,12 @@ async fn test_openai_router_circuit_breaker() {
     for _ in 0..3 {
         let tenant_meta = test_tenant_meta();
         let response = router
-            .route_chat(None, &tenant_meta, &chat_request, &chat_request.model)
+            .route_chat(
+                None,
+                &tenant_meta,
+                chat_request.clone(),
+                &chat_request.model,
+            )
             .await;
         // Should get either an error or circuit breaker response
         assert!(

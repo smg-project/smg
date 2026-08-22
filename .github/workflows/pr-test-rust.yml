@@ -246,6 +246,18 @@ jobs:
           pip install ./crates/grpc_client/python
           pytest -q grpc_servicer/tests
 
+      # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
+      # ZMQ/EPD command builders, ZMQ-lane collection filter). --noconftest keeps
+      # e2e_test/conftest.py — which needs the generated smg_client types and a
+      # live backend — out of the picture; PYTHONPATH replaces the sys.path setup
+      # it would otherwise do.
+      - name: Run e2e harness unit tests
+        env:
+          PYTHONPATH: e2e_test
+        run: |
+          pip install ./e2e_test
+          pytest -q --noconftest e2e_test/infra e2e_test/fixtures
+
   unit-tests:
     needs: [detect-changes]
     if: >-
@@ -444,10 +456,22 @@ jobs:
               - 'scripts/ci_build_wheel.sh'
               - 'crates/tokenizer/**'
               - 'crates/tool_parser/**'
+              # Router-embedded crates: changes here alter gateway behavior
+              # across every API surface, so they must trigger the e2e lanes.
+              - 'crates/auth/**'
+              - 'crates/kv_index/**'
+              - 'crates/mesh/**'
+              - 'crates/mm_rdma/**'
+              - 'crates/wasm/**'
+              - 'crates/workflow/**'
             chat-completions:
               - 'crates/reasoning_parser/**'
               - 'crates/multimodal/**'
               - 'crates/grpc_client/**'
+              # The ZMQ wire crates drive the e2e-*-chat-zmq* lanes, which gate
+              # on this filter.
+              - 'crates/engine_zmq_client/**'
+              - 'crates/mock_worker/**'
               - 'grpc_servicer/**'
               - 'e2e_test/chat_completions/**'
               - 'e2e_test/router/**'
@@ -517,12 +541,15 @@ jobs:
           - engine: sglang
             timeout: 36
             test_timeout: 28
+            min_selected: 204 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
             timeout: 24
             test_timeout: 18
+            min_selected: 202 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: trtllm
             timeout: 32
             test_timeout: 18
+            min_selected: 180 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           # tokenspeed builds from source (~30m cold), so keep the job
           # timeout generous even though the test step is short.
           # Admin-ops e2e (flush/profile) piggybacks here because this is
@@ -533,6 +560,7 @@ jobs:
             timeout: 50
             test_timeout: 18
             test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py
+            min_selected: 114 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -541,6 +569,7 @@ jobs:
       timeout: ${{ matrix.timeout }}
       test_timeout: ${{ matrix.test_timeout }}
       test_dirs: ${{ matrix.test_dirs || 'e2e_test/chat_completions' }}
+      min_selected: ${{ matrix.min_selected }}
     secrets: inherit
 
   e2e-1gpu-chat-zmq:
@@ -568,9 +597,11 @@ jobs:
           - engine: vllm
             timeout: 46
             test_timeout: 40
+            min_selected: 202 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: tokenspeed
             timeout: 50
             test_timeout: 40
+            min_selected: 109 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -580,6 +611,54 @@ jobs:
       test_timeout: ${{ matrix.test_timeout }}
       test_dirs: e2e_test/chat_completions
       connection_mode: zmq
+      min_selected: ${{ matrix.min_selected }}
+    secrets: inherit
+
+  e2e-2gpu-chat-zmq-dp:
+    name: e2e-2gpu-chat-zmq-dp (${{ matrix.engine }})
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && (needs.detect-changes.outputs.common == 'true'
+                  || needs.detect-changes.outputs.chat-completions == 'true')))
+    # The 1-GPU ZMQ suite with grouped workers: each ZMQ worker launches two
+    # DP engines on one socket set (tp=1 models, one GPU per engine), so the
+    # gateway's handshake, the connector's least-loaded selection, and
+    # per-rank output attribution all run against a real dp=2 group. The wave
+    # protocol is vLLM-only (TokenSpeed ranks run independently).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: vllm
+            timeout: 46
+            min_selected: 202 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+          # The TokenSpeed ZMQ lane restarts the engine per model group, and
+          # DP doubles model load + warmup. The ~22-minute TokenSpeed source
+          # build eats the front of the budget, and at 50 the first dp run was
+          # killed mid-suite while progressing (28 minutes of test time); 60
+          # leaves the tests the same ~40 minutes the test_timeout allows.
+          - engine: tokenspeed
+            timeout: 60
+            min_selected: 82 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: ${{ matrix.engine }}
+      # Tier selects the TEST SET (and model downloads): this lane runs the
+      # tier-1 chat suite; the second GPU serves the second engine of the
+      # group, not 2-GPU-marked tests.
+      gpu_tier: "1"
+      runner: 2-gpu-h100
+      timeout: ${{ matrix.timeout }}
+      test_timeout: 40
+      test_dirs: e2e_test/chat_completions
+      connection_mode: zmq
+      zmq_engine_count: "2"
+      min_selected: ${{ matrix.min_selected }}
     secrets: inherit
 
   e2e-1gpu-completions:
@@ -599,8 +678,10 @@ jobs:
         include:
           - engine: sglang
             timeout: 20
+            min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
             timeout: 20
+            min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -608,6 +689,7 @@ jobs:
       runner: 1-gpu-h100
       timeout: ${{ matrix.timeout }}
       test_dirs: e2e_test/completions
+      min_selected: ${{ matrix.min_selected }}
     secrets: inherit
 
   e2e-1gpu-embeddings:
@@ -627,8 +709,10 @@ jobs:
         include:
           - engine: sglang
             timeout: 20
+            min_selected: 18 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
             timeout: 20
+            min_selected: 20 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -637,6 +721,7 @@ jobs:
       timeout: ${{ matrix.timeout }}
       test_dirs: e2e_test/embeddings
       extra_deps: "sentence-transformers"
+      min_selected: ${{ matrix.min_selected }}
     secrets: inherit
 
   e2e-1gpu-realtime:
@@ -657,6 +742,7 @@ jobs:
       timeout: 25
       test_timeout: 20
       test_dirs: e2e_test/realtime
+      min_selected: 3 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     secrets: inherit
 
   e2e-1gpu-gateway:
@@ -676,8 +762,10 @@ jobs:
         include:
           - engine: sglang
             timeout: 20
+            min_selected: 23 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
             timeout: 20
+            min_selected: 3 # vllm gateway lane selects only 3 tests; floor covers all of them (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -686,6 +774,7 @@ jobs:
       timeout: ${{ matrix.timeout }}
       test_dirs: e2e_test/router
       test_filter: "--ignore=e2e_test/router/test_pd_mmlu.py"
+      min_selected: ${{ matrix.min_selected }}
     secrets: inherit
 
   # === 2 GPU ===
@@ -712,6 +801,7 @@ jobs:
       test_timeout: 20
       test_dirs: e2e_test/responses
       setup_agentic_deps: true
+      min_selected: 92 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     secrets: inherit
 
   e2e-2gpu-pd:
@@ -731,11 +821,14 @@ jobs:
         include:
           - engine: sglang
             timeout: 30
+            min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
             timeout: 30
+            min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
             kv_backend: mooncake
             timeout: 30
+            min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -744,6 +837,7 @@ jobs:
       timeout: ${{ matrix.timeout }}
       test_dirs: e2e_test/router
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
+      min_selected: ${{ matrix.min_selected }}
     secrets: inherit
 
   # === 4 GPU ===
@@ -757,10 +851,13 @@ jobs:
         include:
           - engine: sglang
             timeout: 30
+            min_selected: 32 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
             timeout: 30
+            min_selected: 32 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: trtllm
             timeout: 45
+            min_selected: 24 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -768,6 +865,7 @@ jobs:
       runner: 4-gpu-h100
       timeout: ${{ matrix.timeout }}
       test_dirs: e2e_test/chat_completions
+      min_selected: ${{ matrix.min_selected }}
     secrets: inherit
 
   e2e-4gpu-gateway:
@@ -795,6 +893,7 @@ jobs:
       test_timeout: 65
       test_dirs: e2e_test/chat_completions/test_epd_multimodal.py
       extra_models: "Qwen/Qwen3.5-9B"
+      min_selected: 6 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     secrets: inherit
 
   # --- Vendor E2E: CPU-only cloud backend tests ---
@@ -1088,11 +1187,55 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-zmq, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: k8s-runner-cpu
-    permissions: {}
+    permissions:
+      contents: read
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      # Self-check: every e2e-* job defined in this workflow must gate merge
+      # via finish.needs AND the failure check below. Keeps a new (or
+      # forgotten) lane from silently becoming non-blocking.
+      - name: Gate-integrity lint
+        run: |
+          python3 - <<'EOF'
+          import re, sys
+
+          path = ".github/workflows/pr-test-rust.yml"
+          src = open(path).read()
+          jobs = re.findall(r"^  (e2e-[a-z0-9_-]*):", src, re.M)
+          if not jobs:
+              sys.exit("gate-integrity lint: found no e2e-* job definitions; lint is broken")
+          fin = re.search(r"^  finish:\n(.*?)(?=^  \S|\Z)", src, re.M | re.S)
+          if not fin:
+              sys.exit("gate-integrity lint: could not locate the finish job")
+          body = fin.group(1)
+          needs_m = re.search(r"needs:\s*\[([^\]]*)\]", body)
+          if not needs_m:
+              sys.exit("gate-integrity lint: finish.needs not found in inline-list form")
+          needs = {n.strip() for n in needs_m.group(1).split(",")}
+          missing_needs = sorted(j for j in jobs if j not in needs)
+          # Search only the failure-check step, not the whole job body — a
+          # comment elsewhere must not satisfy the check.
+          check = re.search(
+              r"- name: Check CI result\n(.*?)(?=^      - name:|\Z)", body, re.M | re.S
+          )
+          if not check:
+              sys.exit("gate-integrity lint: could not locate the 'Check CI result' step")
+          check_body = check.group(1)
+          missing_check = sorted(j for j in jobs if f"needs.{j}.result" not in check_body)
+          if missing_needs or missing_check:
+              if missing_needs:
+                  print(f"e2e jobs missing from finish.needs: {missing_needs}")
+              if missing_check:
+                  print(f"e2e jobs missing from the finish failure check: {missing_check}")
+              sys.exit(1)
+          print(f"OK: all {len(jobs)} e2e-* jobs gate merge: {sorted(jobs)}")
+          EOF
+
       - name: Check CI result
         run: |
           if [[ "${{ needs.pre-commit.result }}" == "failure" || \
@@ -1104,8 +1247,10 @@ jobs:
                 "${{ needs.benchmarks.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat-zmq.result }}" == "failure" || \
+                "${{ needs.e2e-2gpu-chat-zmq-dp.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-completions.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-embeddings.result }}" == "failure" || \
+                "${{ needs.e2e-1gpu-realtime.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-gateway.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-responses.result }}" == "failure" || \
                 "${{ needs.e2e-2gpu-pd.result }}" == "failure" || \

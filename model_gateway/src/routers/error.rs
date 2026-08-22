@@ -24,6 +24,12 @@ struct ErrorDetail<'a> {
 
 pub const HEADER_X_SMG_ERROR_CODE: &str = "X-SMG-Error-Code";
 
+/// Gateway-minted error code, carried as a process-local response extension.
+/// Upstream responses can forge the `X-SMG-Error-Code` header (rebuilt
+/// responses preserve upstream headers) but can never inject an extension.
+#[derive(Clone)]
+struct GatewayErrorCode(String);
+
 pub fn internal_error(code: impl Into<String>, message: impl Into<String>) -> Response {
     create_error(StatusCode::INTERNAL_SERVER_ERROR, code, message)
 }
@@ -77,7 +83,7 @@ pub fn create_error(
         headers.insert(HEADER_X_SMG_ERROR_CODE, val);
     }
 
-    (
+    let mut response = (
         status,
         headers,
         Json(ErrorResponse {
@@ -89,7 +95,9 @@ pub fn create_error(
             },
         }),
     )
-        .into_response()
+        .into_response();
+    response.extensions_mut().insert(GatewayErrorCode(code_str));
+    response
 }
 
 fn status_code_to_str(status_code: StatusCode) -> &'static str {
@@ -106,12 +114,16 @@ pub fn model_not_found(model: &str) -> Response {
     )
 }
 
+/// Error-code metric label for a response.
+///
+/// Reads only the [`GatewayErrorCode`] extension set by [`create_error`],
+/// never the `X-SMG-Error-Code` header: a backend-supplied header value would
+/// otherwise mint unbounded metric label values.
 pub fn extract_error_code_from_response<B>(response: &Response<B>) -> &str {
     response
-        .headers()
-        .get(HEADER_X_SMG_ERROR_CODE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
+        .extensions()
+        .get::<GatewayErrorCode>()
+        .map_or("", |code| code.0.as_str())
 }
 
 #[expect(
@@ -165,6 +177,47 @@ pub fn sanitize_error_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_error_code_reads_gateway_minted_code() {
+        let response = create_error(StatusCode::NOT_FOUND, "model_not_found", "nope");
+
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "model_not_found"
+        );
+        // The client-facing header is still set.
+        assert_eq!(
+            response.headers().get(HEADER_X_SMG_ERROR_CODE).unwrap(),
+            "model_not_found"
+        );
+    }
+
+    #[test]
+    fn extract_error_code_ignores_upstream_supplied_header() {
+        // A response rebuilt from preserved upstream headers carries the
+        // header but no extension; it must not become a metric label.
+        let mut response = StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        response.headers_mut().insert(
+            HEADER_X_SMG_ERROR_CODE,
+            HeaderValue::from_static("upstream-minted-code"),
+        );
+
+        assert_eq!(extract_error_code_from_response(&response), "");
+    }
+
+    #[test]
+    fn extract_error_code_survives_header_tampering() {
+        let mut response = create_error(StatusCode::BAD_GATEWAY, "upstream_error", "boom");
+        response
+            .headers_mut()
+            .insert(HEADER_X_SMG_ERROR_CODE, HeaderValue::from_static("forged"));
+
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "upstream_error"
+        );
+    }
 
     #[test]
     fn test_sanitize_org_id() {

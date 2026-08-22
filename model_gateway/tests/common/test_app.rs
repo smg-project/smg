@@ -38,7 +38,7 @@ pub fn create_test_app(
             let rate_limit_tokens = router_config
                 .rate_limit_tokens_per_second
                 .filter(|&t| t > 0)
-                .unwrap_or(n);
+                .unwrap_or(0);
             Some(Arc::new(TokenBucket::new(
                 n as usize,
                 rate_limit_tokens as usize,
@@ -64,6 +64,7 @@ pub fn create_test_app(
         client.clone(),
         router_config.load_monitor_interval_secs,
         router_config.engine_metrics,
+        router_config.disable_load_monitoring,
     )));
 
     // Create empty OnceLock for worker job queue and workflow engines
@@ -103,7 +104,7 @@ pub fn create_test_app(
         router,
         probe_state: start_probe_state(&app_context),
         context: app_context,
-        concurrency_queue_tx: None,
+        admission_queue: None,
         router_manager: None,
         mesh_handler: None,
         mesh_adapters: None,
@@ -168,7 +169,7 @@ pub fn create_test_app_with_context(
         router,
         probe_state: start_probe_state(&app_context),
         context: app_context.clone(),
-        concurrency_queue_tx: None,
+        admission_queue: None,
         router_manager: None,
         mesh_handler: None,
         mesh_adapters: None,

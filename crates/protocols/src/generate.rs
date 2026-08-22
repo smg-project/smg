@@ -203,6 +203,10 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
 }
 
 impl GenerationRequest for GenerateRequest {
+    fn rid(&self) -> Option<&str> {
+        self.rid.as_deref()
+    }
+
     fn is_stream(&self) -> bool {
         self.stream
     }
@@ -234,6 +238,21 @@ impl GenerationRequest for GenerateRequest {
 
         // No text input found
         String::new()
+    }
+
+    fn routing_tokens(&self) -> Option<&[i32]> {
+        // Token ids win over text: they key routing on what the backend KV
+        // cache keys on. Empty ids fall back to text.
+        match &self.input_ids {
+            Some(InputIds::Single(ids)) if !ids.is_empty() => Some(ids),
+            // A batch is dispatched to a single worker; the first sequence is
+            // the best available affinity signal.
+            Some(InputIds::Batch(seqs)) => seqs
+                .first()
+                .map(Vec::as_slice)
+                .filter(|ids| !ids.is_empty()),
+            _ => None,
+        }
     }
 }
 
@@ -304,4 +323,61 @@ pub enum GenerateFinishReason {
 pub enum GenerateFinishType {
     Length,
     Stop,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req() -> GenerateRequest {
+        serde_json::from_value(serde_json::json!({"model": "m"})).expect("minimal request")
+    }
+
+    #[test]
+    fn routing_tokens_from_single_input_ids() {
+        let mut r = req();
+        r.input_ids = Some(InputIds::Single(vec![1, 2, 3]));
+        assert_eq!(r.routing_tokens(), Some(&[1, 2, 3][..]));
+    }
+
+    #[test]
+    fn routing_tokens_prefer_input_ids_over_text() {
+        let mut r = req();
+        r.text = Some("hello".to_string());
+        r.input_ids = Some(InputIds::Single(vec![1, 2, 3]));
+        assert_eq!(r.routing_tokens(), Some(&[1, 2, 3][..]));
+
+        r.input_ids = Some(InputIds::Batch(vec![vec![4, 5], vec![6]]));
+        assert_eq!(r.routing_tokens(), Some(&[4, 5][..]));
+    }
+
+    #[test]
+    fn routing_tokens_none_for_empty_input_ids_with_text() {
+        let mut r = req();
+        r.text = Some("hello".to_string());
+        r.input_ids = Some(InputIds::Single(vec![]));
+        assert_eq!(r.routing_tokens(), None);
+        assert_eq!(r.extract_text_for_routing(), "hello");
+    }
+
+    #[test]
+    fn routing_tokens_from_batch_first_sequence() {
+        let mut r = req();
+        r.input_ids = Some(InputIds::Batch(vec![vec![1, 2], vec![3, 4]]));
+        assert_eq!(r.routing_tokens(), Some(&[1, 2][..]));
+    }
+
+    #[test]
+    fn routing_tokens_none_for_empty_inputs() {
+        let mut r = req();
+        r.input_ids = Some(InputIds::Batch(vec![]));
+        assert_eq!(r.routing_tokens(), None);
+
+        let mut r = req();
+        r.input_ids = Some(InputIds::Batch(vec![vec![], vec![1]]));
+        assert_eq!(r.routing_tokens(), None);
+
+        let r = req();
+        assert_eq!(r.routing_tokens(), None);
+    }
 }

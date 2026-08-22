@@ -84,11 +84,15 @@ pub trait RouterTrait: Send + Sync + Debug {
     }
 
     /// Route a generate request
+    ///
+    /// Typed-JSON route methods take the parsed body by value: the dispatching
+    /// router owns it and can free it as soon as the upstream bytes exist,
+    /// instead of the handler pinning a copy for the whole response.
     async fn route_generate(
         &self,
         _headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        _body: &GenerateRequest,
+        _body: GenerateRequest,
         _model_id: &str,
     ) -> Response {
         (
@@ -103,7 +107,7 @@ pub trait RouterTrait: Send + Sync + Debug {
         &self,
         _headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        _body: &ChatCompletionRequest,
+        _body: ChatCompletionRequest,
         _model_id: &str,
     ) -> Response {
         (
@@ -118,7 +122,7 @@ pub trait RouterTrait: Send + Sync + Debug {
         &self,
         _headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        _body: &CompletionRequest,
+        _body: CompletionRequest,
         _model_id: &str,
     ) -> Response {
         (
@@ -133,7 +137,7 @@ pub trait RouterTrait: Send + Sync + Debug {
         &self,
         _headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        _body: &ResponsesRequest,
+        _body: ResponsesRequest,
         _model_id: &str,
     ) -> Response {
         (
@@ -157,7 +161,7 @@ pub trait RouterTrait: Send + Sync + Debug {
         &self,
         _headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        _body: &EmbeddingRequest,
+        _body: EmbeddingRequest,
         _model_id: &str,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Embeddings not implemented").into_response()
@@ -168,7 +172,7 @@ pub trait RouterTrait: Send + Sync + Debug {
         &self,
         _headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        _body: &ClassifyRequest,
+        _body: ClassifyRequest,
         _model_id: &str,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Classify not implemented").into_response()
@@ -200,7 +204,7 @@ pub trait RouterTrait: Send + Sync + Debug {
         &self,
         _headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        _body: &RerankRequest,
+        _body: RerankRequest,
         _model_id: &str,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Rerank not implemented").into_response()
@@ -211,7 +215,7 @@ pub trait RouterTrait: Send + Sync + Debug {
         &self,
         _headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        _body: &CreateMessageRequest,
+        _body: CreateMessageRequest,
         _model_id: &str,
     ) -> Response {
         (
@@ -226,7 +230,7 @@ pub trait RouterTrait: Send + Sync + Debug {
         &self,
         _headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        _body: &InteractionsRequest,
+        _body: InteractionsRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (

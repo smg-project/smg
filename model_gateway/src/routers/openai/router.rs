@@ -158,7 +158,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &ChatCompletionRequest,
+        body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
         // Use per-model retry config if set by a worker, otherwise fall back to router default.
@@ -180,7 +180,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &ResponsesRequest,
+        body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
         let deps = ResponsesRouterContext {
@@ -188,7 +188,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             provider_registry: &self.provider_registry,
             responses_components: &self.responses_components,
         };
-        responses_route::route_responses(&deps, headers, tenant_meta, body, model_id).await
+        responses_route::route_responses(&deps, headers, tenant_meta, &body, model_id).await
     }
 
     async fn route_realtime_session(

@@ -5,6 +5,7 @@ on:
     branches:
       - main
     paths:
+      - .cargo/config.toml
       - docker/Dockerfile
       - bindings/python/pyproject.toml
   workflow_dispatch:

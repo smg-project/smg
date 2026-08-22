@@ -411,3 +411,4 @@ class TestCompletionBatch:
         assert usage is not None
         assert usage.prompt_tokens > 0
         assert usage.completion_tokens > 0
+        assert usage.total_tokens == usage.prompt_tokens + usage.completion_tokens

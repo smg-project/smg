@@ -9,9 +9,6 @@
 //! features are typed fully. Pooling params and prompt embeds are carried as
 //! [`crate::codec::OpaqueValue`] — they serialize as `nil` on supported paths.
 
-// The startup handshake is engine-neutral (TokenSpeed speaks the same
-// protocol); re-exported here so existing `vllm::handshake` paths keep working.
-pub use crate::protocol::handshake;
 pub mod logprobs;
 pub mod lora;
 pub mod multimodal;
@@ -93,15 +90,18 @@ impl EngineProtocol for VllmProtocol {
     }
 
     fn encode_abort(request_id: &str) -> Result<Vec<u8>> {
-        encode_msgpack(&[request_id.to_string()])
+        encode_msgpack(&[request_id])
     }
 
-    fn encode_start_wave(wave: u32, exclude_engine_index: u32) -> Result<Option<(Bytes, Vec<u8>)>> {
+    fn encode_start_wave(wave: u64) -> Result<Option<(Bytes, Vec<u8>)>> {
         // Python decodes this with the generic msgpack decoder and unpacks it
-        // positionally as `new_wave, exclude_eng_index`.
+        // positionally as `new_wave, exclude_eng_index`. `nil` excludes no
+        // rank — the same encoding vLLM's own DP coordinator emits — so every
+        // rank adopts `wave`.
+        const NO_EXCLUDED_RANK: Option<u32> = None;
         Ok(Some((
             EngineCoreRequestType::StartDpWave.to_frame(),
-            encode_msgpack(&(wave, exclude_engine_index))?,
+            encode_msgpack(&(wave, NO_EXCLUDED_RANK))?,
         )))
     }
 
@@ -130,5 +130,23 @@ impl EngineProtocol for VllmProtocol {
             }),
             EngineCoreOutputs::Utility(_) => Ok(EngineBatch::default()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rmpv::Value;
+
+    use super::*;
+    use crate::codec::decode_value;
+
+    #[test]
+    fn start_wave_encodes_a_nil_excluded_rank() {
+        let (frame, payload) = VllmProtocol::encode_start_wave(9).unwrap().unwrap();
+        assert_eq!(frame.as_ref(), b"\x02");
+        assert_eq!(
+            decode_value(&payload).unwrap(),
+            Value::Array(vec![Value::from(9), Value::Nil])
+        );
     }
 }

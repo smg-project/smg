@@ -92,8 +92,10 @@ impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
+        Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
         Self::validate_storage_context_headers(config)?;
+        Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
         Self::validate_model_aliases(config)?;
@@ -183,6 +185,17 @@ impl ConfigValidator {
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_routing_key_headers(config: &RouterConfig) -> ConfigResult<()> {
+        for name in &config.routing_key_override.headers {
+            HeaderName::try_from(name.as_str()).map_err(|e| ConfigError::ValidationFailed {
+                reason: format!(
+                    "routing_key_override.headers contains an invalid HTTP header name '{name}': {e}"
+                ),
+            })?;
+        }
         Ok(())
     }
 
@@ -456,7 +469,46 @@ impl ConfigValidator {
                 block_size,
                 balance_token_usage_threshold,
                 overload_token_usage_threshold,
+                overlap_decay,
+                selection_temperature,
+                cache_index,
+                cache_ttl_secs,
+                cache_boundaries,
             } => {
+                Self::validate_cache_boundaries(cache_boundaries)?;
+
+                if *cache_ttl_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cache_ttl_secs".to_string(),
+                        value: cache_ttl_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *cache_index == CacheIndexKind::Hash && cache_boundaries.is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cache_index".to_string(),
+                        value: "hash".to_string(),
+                        reason: "cache_index=hash requires non-empty cache_boundaries".to_string(),
+                    });
+                }
+
+                if !overlap_decay.is_finite() || *overlap_decay < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "overlap_decay".to_string(),
+                        value: overlap_decay.to_string(),
+                        reason: "Must be finite and >= 0.0 (0.0 disables)".to_string(),
+                    });
+                }
+
+                if !selection_temperature.is_finite() || *selection_temperature < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "selection_temperature".to_string(),
+                        value: selection_temperature.to_string(),
+                        reason: "Must be finite and >= 0.0 (0.0 is argmax)".to_string(),
+                    });
+                }
+
                 if *block_size == 0 {
                     return Err(ConfigError::InvalidValue {
                         field: "block_size".to_string(),
@@ -529,6 +581,7 @@ impl ConfigValidator {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
+                max_waiting_requests: _,
             } => {
                 if *load_check_interval_secs == 0 {
                     return Err(ConfigError::InvalidValue {
@@ -593,6 +646,8 @@ impl ConfigValidator {
             PolicyConfig::PrefixHash {
                 prefix_token_count,
                 load_factor,
+                balance_abs_threshold: _,
+                cache_boundaries,
             } => {
                 if *prefix_token_count == 0 {
                     return Err(ConfigError::InvalidValue {
@@ -609,7 +664,27 @@ impl ConfigValidator {
                         reason: "Must be >= 1.0".to_string(),
                     });
                 }
+
+                Self::validate_cache_boundaries(cache_boundaries)?;
             }
+        }
+        Ok(())
+    }
+
+    fn validate_cache_boundaries(boundaries: &[usize]) -> ConfigResult<()> {
+        if boundaries.first() == Some(&0) {
+            return Err(ConfigError::InvalidValue {
+                field: "cache_boundaries".to_string(),
+                value: "0".to_string(),
+                reason: "Boundaries must be > 0".to_string(),
+            });
+        }
+        if boundaries.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(ConfigError::InvalidValue {
+                field: "cache_boundaries".to_string(),
+                value: format!("{boundaries:?}"),
+                reason: "Boundaries must be strictly ascending".to_string(),
+            });
         }
         Ok(())
     }
@@ -654,6 +729,61 @@ impl ConfigValidator {
                 field: "max_payload_size".to_string(),
                 value: config.max_payload_size.to_string(),
                 reason: "Must be > 0".to_string(),
+            });
+        }
+
+        // A zero-capacity job channel panics at construction and a
+        // zero-permit dispatcher never dequeues; reject both here so a
+        // config-file value fails as early as the CLI parsers do.
+        // Mirror the CLI parser bounds so config-file and bindings paths get
+        // the same guarantees (zero panics at channel construction; unbounded
+        // values are allocation hazards).
+        if !(1..=1_000_000).contains(&config.job_queue_capacity) {
+            return Err(ConfigError::InvalidValue {
+                field: "job_queue_capacity".to_string(),
+                value: config.job_queue_capacity.to_string(),
+                reason: "Must be in 1..=1000000".to_string(),
+            });
+        }
+        if !(1..=100_000).contains(&config.job_queue_concurrency) {
+            return Err(ConfigError::InvalidValue {
+                field: "job_queue_concurrency".to_string(),
+                value: config.job_queue_concurrency.to_string(),
+                reason: "Must be in 1..=100000".to_string(),
+            });
+        }
+
+        // Overload thresholds are `>=` comparisons, so the excluded ends of
+        // these ranges are exactly the values that would veto every worker
+        // unconditionally. Mirrors the CLI parsers for the config-file and
+        // bindings paths.
+        if config.worker_overload_waiting_requests == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "worker_overload_waiting_requests".to_string(),
+                value: "0".to_string(),
+                reason: "Must be >= 1 (0 would mark every worker overloaded)".to_string(),
+            });
+        }
+        if let Some(threshold) = config.worker_overload_token_usage {
+            if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "worker_overload_token_usage".to_string(),
+                    value: threshold.to_string(),
+                    reason: "Must be a fraction in (0.0, 1.0]".to_string(),
+                });
+            }
+        }
+
+        // The body-limit layer rejects payloads above max_payload_size before
+        // the streaming threshold is consulted, so a threshold at or above it
+        // could never activate.
+        if config.stream_request_bodies_over != 0
+            && config.stream_request_bodies_over >= config.max_payload_size as u64
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "stream_request_bodies_over".to_string(),
+                value: config.stream_request_bodies_over.to_string(),
+                reason: format!("Must be < max_payload_size ({})", config.max_payload_size),
             });
         }
 
@@ -1059,6 +1189,42 @@ mod tests {
     use crate::worker::ConnectionMode;
 
     #[test]
+    fn stream_threshold_at_or_above_payload_cap_is_rejected() {
+        let below = RouterConfig {
+            stream_request_bodies_over: 1024,
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&below).is_ok());
+
+        let at_cap = RouterConfig {
+            stream_request_bodies_over: RouterConfig::default().max_payload_size as u64,
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&at_cap),
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "stream_request_bodies_over"
+        ));
+    }
+
+    #[test]
+    fn prefix_hash_policy_cache_boundaries_are_validated() {
+        let config = RouterConfig {
+            policy: PolicyConfig::PrefixHash {
+                prefix_token_count: 256,
+                load_factor: 1.25,
+                balance_abs_threshold: 10,
+                cache_boundaries: vec![8192, 2048],
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "cache_boundaries"
+        ));
+    }
+
+    #[test]
     fn mesh_server_name_with_colon_is_rejected() {
         assert!(matches!(
             validate_mesh_server_name("node:a"),
@@ -1171,6 +1337,23 @@ mod tests {
             },
             PolicyConfig::Random,
         )
+    }
+
+    #[test]
+    fn routing_key_headers_validated_as_header_names() {
+        let mut config = regular_mode_config();
+        config.routing_key_override.headers =
+            vec!["x-routing-key".to_string(), "x-smg-routing-key".to_string()];
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        for bad in ["", "has space", "bad\nname"] {
+            config.routing_key_override.headers = vec![bad.to_string()];
+            assert!(matches!(
+                ConfigValidator::validate(&config),
+                Err(ConfigError::ValidationFailed { ref reason })
+                    if reason.contains("routing_key_override.headers")
+            ));
+        }
     }
 
     #[test]
@@ -1392,9 +1575,104 @@ mod tests {
                 block_size: 16,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
             },
         );
 
+        assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_cache_aware_pressure_knobs() {
+        let make = |overlap_decay: f32, selection_temperature: f32| {
+            RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec![
+                        "http://worker1:8000".to_string(),
+                        "http://worker2:8000".to_string(),
+                    ],
+                },
+                PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                    block_size: 16,
+                    balance_token_usage_threshold: 1.0,
+                    overload_token_usage_threshold: 1.0,
+                    overlap_decay,
+                    selection_temperature,
+                    cache_index: Default::default(),
+                    cache_ttl_secs: 180,
+                    cache_boundaries: Vec::new(),
+                },
+            )
+        };
+
+        // Off (defaults) and positive values are valid.
+        assert!(ConfigValidator::validate(&make(0.0, 0.0)).is_ok());
+        assert!(ConfigValidator::validate(&make(4.0, 0.7)).is_ok());
+        // Negative or non-finite values are rejected for both knobs.
+        assert!(ConfigValidator::validate(&make(-0.1, 0.0)).is_err());
+        assert!(ConfigValidator::validate(&make(0.0, -1.0)).is_err());
+        assert!(ConfigValidator::validate(&make(f32::NAN, 0.0)).is_err());
+        assert!(ConfigValidator::validate(&make(0.0, f32::INFINITY)).is_err());
+    }
+
+    #[test]
+    fn test_validate_cache_index_fields() {
+        let make = |cache_index: CacheIndexKind, cache_ttl_secs: u64, boundaries: Vec<usize>| {
+            RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec!["http://worker1:8000".to_string()],
+                },
+                PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                    block_size: 16,
+                    balance_token_usage_threshold: 1.0,
+                    overload_token_usage_threshold: 1.0,
+                    overlap_decay: 0.0,
+                    selection_temperature: 0.0,
+                    cache_index,
+                    cache_ttl_secs,
+                    cache_boundaries: boundaries,
+                },
+            )
+        };
+
+        assert!(ConfigValidator::validate(&make(CacheIndexKind::Tree, 180, vec![])).is_ok());
+        assert!(ConfigValidator::validate(&make(CacheIndexKind::Hash, 180, vec![16, 64])).is_ok());
+        // TTL must be positive.
+        assert!(ConfigValidator::validate(&make(CacheIndexKind::Tree, 0, vec![])).is_err());
+        // Hash mode without boundaries has nothing to key on.
+        assert!(ConfigValidator::validate(&make(CacheIndexKind::Hash, 180, vec![])).is_err());
+        // Boundaries must be strictly ascending and non-zero.
+        assert!(ConfigValidator::validate(&make(CacheIndexKind::Hash, 180, vec![64, 16])).is_err());
+        assert!(ConfigValidator::validate(&make(CacheIndexKind::Hash, 180, vec![16, 16])).is_err());
+        assert!(ConfigValidator::validate(&make(CacheIndexKind::Hash, 180, vec![0, 16])).is_err());
+    }
+
+    #[test]
+    fn test_validate_shared_cache_boundaries_field() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        config.cache_boundaries = vec![16, 64];
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.cache_boundaries = vec![64, 16];
         assert!(ConfigValidator::validate(&config).is_err());
     }
 
@@ -1414,6 +1692,11 @@ mod tests {
                 block_size: 16,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
             },
         );
 
@@ -1471,6 +1754,11 @@ mod tests {
                 block_size: 16,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
             },
         );
 
@@ -1518,6 +1806,11 @@ mod tests {
                     block_size: 16,
                     balance_token_usage_threshold: 1.0,
                     overload_token_usage_threshold: 1.0,
+                    overlap_decay: 0.0,
+                    selection_temperature: 0.0,
+                    cache_index: Default::default(),
+                    cache_ttl_secs: 180,
+                    cache_boundaries: Vec::new(),
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
@@ -1644,6 +1937,11 @@ mod tests {
                     block_size: 16,
                     balance_token_usage_threshold: 1.0,
                     overload_token_usage_threshold: 1.0,
+                    overlap_decay: 0.0,
+                    selection_temperature: 0.0,
+                    cache_index: Default::default(),
+                    cache_ttl_secs: 180,
+                    cache_boundaries: Vec::new(),
                 }),
                 prefill_policy: None,
                 decode_policy: None,
@@ -1662,6 +1960,7 @@ mod tests {
                     kv_pressure_weight: 0.15,
                     mean_prefill_tokens: 1024,
                     default_throughput: 2000.0,
+                    max_waiting_requests: 0,
                 }),
                 prefill_policy: None,
                 decode_policy: None,
@@ -1828,6 +2127,44 @@ mod tests {
         config.health_check_port = Some(8081);
         assert!(ConfigValidator::validate(&config).is_ok());
         config.health_check_port = None;
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// The CLI parsers reject these, but TOML/JSON and the Python bindings
+    /// reach `RouterConfig` without going through clap.
+    #[test]
+    fn test_reject_degenerate_worker_overload_thresholds() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+
+        // Unset is the default and always valid.
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.worker_overload_waiting_requests = Some(0);
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "worker_overload_waiting_requests"
+        ));
+        config.worker_overload_waiting_requests = Some(1);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        for bad in [0.0, -0.1, 1.5, f64::NAN] {
+            config.worker_overload_token_usage = Some(bad);
+            assert!(
+                matches!(
+                    ConfigValidator::validate(&config),
+                    Err(ConfigError::InvalidValue { ref field, .. })
+                        if field == "worker_overload_token_usage"
+                ),
+                "{bad} must be rejected"
+            );
+        }
+        config.worker_overload_token_usage = Some(1.0);
         assert!(ConfigValidator::validate(&config).is_ok());
     }
 }

@@ -1,7 +1,8 @@
 //! Positional indexer for cache-aware routing.
 //!
-//! Uses a single `DashMap<(usize, ContentHash), SeqEntry>` keyed by (position, content_hash).
-//! No capacity limit — the map grows unboundedly as blocks are stored.
+//! Uses a single `DashMap<(usize, ContentHash), IndexEntry>` keyed by (position, content_hash).
+//! Unbounded by default; [`PositionalIndexer::prune`] optionally bounds it with a
+//! last-touch TTL and/or a capacity ceiling (oldest-first eviction).
 //! Jump search skips positions in strides, yielding amortized O(D/J + W) complexity.
 //!
 //! **Dual-hash scheme**: backends send a position-aware `block_hash` (SequenceHash)
@@ -23,9 +24,10 @@
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
+    time::Instant,
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
@@ -42,6 +44,19 @@ const INDEX_SHARD_COUNT: usize = 1024;
 /// Shard count for worker-keyed DashMaps (worker_blocks, worker_to_id).
 /// These maps hold at most ~500 entries (one per worker), so 8 shards is sufficient.
 const WORKER_SHARD_COUNT: usize = 8;
+
+/// Capacity-pass eviction skips entries touched within this many seconds.
+///
+/// `apply_stored` inserts a batch's index entries before its single deferred
+/// `tree_sizes` increment; evicting one of those entries in that gap would
+/// decrement a counter that was never incremented (clamping at zero) and
+/// leave the later increment counting an already-evicted entry. Entries
+/// stamped within the grace are never capacity-eviction candidates, so a
+/// prune cannot race a store batch that is still being accounted (the TTL
+/// pass is inherently safe: a just-stored stamp is always newer than any
+/// cutoff). Side effect: a burst of all-fresh entries can transiently exceed
+/// the ceiling until they age past the grace.
+const CAPACITY_EVICTION_GRACE_SECS: u32 = 2;
 
 /// Length of the first `TreeSizes` segment (covers worker ids 0..2048).
 /// Segment `s` doubles to `FIRST_SEGMENT_LEN << s` entries, so worker count is
@@ -196,40 +211,67 @@ impl SeqEntry {
     }
 
     /// Insert a worker for a given seq_hash, upgrading to Multi if needed.
-    fn insert(&mut self, seq_hash: SequenceHash, worker_id: u32) {
+    /// Returns whether the membership was newly added (false for a duplicate
+    /// store of an existing membership) so callers can keep `tree_sizes`
+    /// consistent with what is actually in the index.
+    fn insert(&mut self, seq_hash: SequenceHash, worker_id: u32) -> bool {
         match self {
             Self::Single(existing_hash, workers) if *existing_hash == seq_hash => {
-                workers.insert(worker_id);
+                workers.insert(worker_id)
             }
             Self::Single(existing_hash, existing_workers) => {
                 let mut map = FxHashMap::with_capacity_and_hasher(2, FxBuildHasher);
                 map.insert(*existing_hash, std::mem::take(existing_workers));
-                map.entry(seq_hash).or_default().insert(worker_id);
+                let added = map.entry(seq_hash).or_default().insert(worker_id);
                 *self = Self::Multi(map);
+                added
             }
-            Self::Multi(map) => {
-                map.entry(seq_hash).or_default().insert(worker_id);
-            }
+            Self::Multi(map) => map.entry(seq_hash).or_default().insert(worker_id),
         }
     }
 
     /// Remove a worker from a given seq_hash.
-    /// Returns true if the entry is now completely empty and should be removed.
-    fn remove(&mut self, seq_hash: SequenceHash, worker_id: u32) -> bool {
+    /// Returns `(removed, now_empty)`: whether the worker was actually present
+    /// under that seq_hash (so callers can keep `tree_sizes` consistent — a
+    /// membership already gone, e.g. pruned, must not be decremented twice),
+    /// and whether the entry is now completely empty and should be dropped.
+    fn remove(&mut self, seq_hash: SequenceHash, worker_id: u32) -> (bool, bool) {
         match self {
             Self::Single(existing_hash, workers) if *existing_hash == seq_hash => {
-                workers.remove(&worker_id);
-                workers.is_empty()
+                let removed = workers.remove(&worker_id);
+                (removed, workers.is_empty())
             }
-            Self::Single(_, _) => false,
+            Self::Single(_, _) => (false, false),
             Self::Multi(map) => {
+                let mut removed = false;
                 if let Some(workers) = map.get_mut(&seq_hash) {
-                    workers.remove(&worker_id);
+                    removed = workers.remove(&worker_id);
                     if workers.is_empty() {
                         map.remove(&seq_hash);
                     }
                 }
-                map.is_empty()
+                (removed, map.is_empty())
+            }
+        }
+    }
+
+    /// Count per-worker memberships in this entry, accumulating into `acc`.
+    /// A worker appearing under multiple prefix hashes counts once per prefix
+    /// hash — mirroring how `apply_stored` incremented `tree_sizes`. Used by
+    /// [`PositionalIndexer::prune`] to decrement counters on eviction.
+    fn accumulate_worker_counts(&self, acc: &mut FxHashMap<u32, usize>) {
+        match self {
+            Self::Single(_, workers) => {
+                for &w in workers {
+                    *acc.entry(w).or_default() += 1;
+                }
+            }
+            Self::Multi(map) => {
+                for workers in map.values() {
+                    for &w in workers {
+                        *acc.entry(w).or_default() += 1;
+                    }
+                }
             }
         }
     }
@@ -341,6 +383,21 @@ impl TreeSizes {
             .map(|size| size.load(Ordering::Relaxed))
             .sum()
     }
+
+    /// Subtract `n` from a worker's count, saturating at 0. Prune-side
+    /// decrements are approximate (see `apply_stored`'s duplicate-store
+    /// counting), so saturation — not wrapping — is the safe failure mode.
+    fn sub_saturating(&self, id: u32, n: usize) {
+        let slot = self.slot(id);
+        let mut current = slot.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(n);
+            match slot.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -353,19 +410,61 @@ impl TreeSizes {
 /// Callers own one `WorkerBlockMap` per worker and pass it to write-path methods.
 pub type WorkerBlockMap = FxHashMap<SequenceHash, (usize, ContentHash, SequenceHash)>;
 
+/// Value stored in the positional index: the seq-hash/worker entry plus a
+/// coarse last-access stamp consumed by [`PositionalIndexer::prune`].
+#[derive(Debug)]
+struct IndexEntry {
+    seq: SeqEntry,
+    /// Seconds since the indexer's epoch at the last store or successful query
+    /// read. Relaxed atomics throughout: a stamp stale by one prune cycle only
+    /// delays eviction by one interval.
+    last_touch: AtomicU32,
+}
+
+impl IndexEntry {
+    fn new(seq: SeqEntry, now: u32) -> Self {
+        Self {
+            seq,
+            last_touch: AtomicU32::new(now),
+        }
+    }
+
+    #[inline]
+    fn touch(&self, now: u32) {
+        self.last_touch.store(now, Ordering::Relaxed);
+    }
+}
+
+/// The positional index map type (see [`IndexEntry`]).
+type PosIndex = DashMap<(usize, ContentHash), IndexEntry, FxBuildHasher>;
+
+/// Outcome of a [`PositionalIndexer::prune`] pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PruneStats {
+    /// Entries inspected across both passes.
+    pub scanned: usize,
+    /// Entries evicted because their last touch exceeded the TTL.
+    pub evicted_ttl: usize,
+    /// Entries evicted to enforce the capacity ceiling (oldest first).
+    pub evicted_capacity: usize,
+    /// Entries remaining after the pass.
+    pub remaining: usize,
+}
+
 /// Positional indexer for cache-aware routing.
 ///
-/// Uses a single `DashMap<(usize, ContentHash), SeqEntry>` — keyed by
-/// (position, content_hash). Grows unboundedly (no capacity limit).
+/// Uses a single `DashMap<(usize, ContentHash), IndexEntry>` — keyed by
+/// (position, content_hash). Unbounded by default; [`prune`](Self::prune)
+/// optionally bounds it with a last-touch TTL and a capacity ceiling.
 /// Jump search gives amortized O(D/J + W) matching complexity.
 ///
 /// Write-path methods take a caller-owned `&mut WorkerBlockMap` (one per worker).
 /// This gives direct HashMap access (~5ns) instead of DashMap hash+shard locking
 /// (~25ns), achieving zero-contention for single-writer-per-worker.
 pub struct PositionalIndexer {
-    /// Single flat index: (position, content_hash) → SeqEntry.
-    /// No capacity limit — grows as blocks are stored.
-    index: DashMap<(usize, ContentHash), SeqEntry, FxBuildHasher>,
+    /// Single flat index: (position, content_hash) → IndexEntry.
+    /// Bounded only when the owner runs [`prune`](Self::prune).
+    index: PosIndex,
     /// Per-worker block counts, tracked atomically for O(1) reads during queries.
     /// Segmented array indexed by worker_id — lock-free reads on the query hot
     /// path (array index ~1ns vs DashMap hash+lock+probe ~25ns per access),
@@ -378,6 +477,11 @@ pub struct PositionalIndexer {
     next_worker_id: AtomicU64,
     /// Jump size for search optimization (default 64).
     jump_size: usize,
+    /// Origin of the coarse `last_touch` clock (whole seconds since creation).
+    epoch: Instant,
+    /// Test override for the coarse clock; `u32::MAX` = disabled.
+    #[cfg(test)]
+    test_now: AtomicU32,
 }
 
 impl PositionalIndexer {
@@ -394,7 +498,30 @@ impl PositionalIndexer {
             worker_to_id: DashMap::with_hasher_and_shard_amount(FxBuildHasher, WORKER_SHARD_COUNT),
             next_worker_id: AtomicU64::new(0),
             jump_size,
+            epoch: Instant::now(),
+            #[cfg(test)]
+            test_now: AtomicU32::new(u32::MAX),
         }
+    }
+
+    /// Coarse clock: whole seconds since this indexer was created. Saturates
+    /// at `u32::MAX - 1` (~136 years) so `u32::MAX` stays free as the test
+    /// override sentinel.
+    fn now_secs(&self) -> u32 {
+        #[cfg(test)]
+        {
+            let t = self.test_now.load(Ordering::Relaxed);
+            if t != u32::MAX {
+                return t;
+            }
+        }
+        self.epoch.elapsed().as_secs().min(u32::MAX as u64 - 1) as u32
+    }
+
+    /// Override the coarse clock in tests (u32::MAX restores the real clock).
+    #[cfg(test)]
+    fn set_test_now(&self, now: u32) {
+        self.test_now.store(now, Ordering::Relaxed);
     }
 
     /// Get the internal u32 ID for a worker URL, if it has been interned.
@@ -439,6 +566,9 @@ impl PositionalIndexer {
 
         let mut prev_prefix = parent_prefix;
         let mut num_new_blocks = 0usize;
+        // One coarse stamp per batch — cheaper than per-block clock reads and
+        // precise enough for prune's second-granularity TTL.
+        let now = self.now_secs();
         for (i, block) in blocks.iter().enumerate() {
             let position = start_pos + i;
             let content_hash = block.content_hash;
@@ -451,17 +581,27 @@ impl PositionalIndexer {
                 None => SequenceHash(content_hash.0),
             };
 
-            self.index
-                .entry((position, content_hash))
-                .and_modify(|entry| entry.insert(prefix_hash, worker_id))
-                .or_insert_with(|| SeqEntry::new(prefix_hash, worker_id));
+            let membership_added = match self.index.entry((position, content_hash)) {
+                Entry::Occupied(mut occupied) => {
+                    let entry = occupied.get_mut();
+                    let added = entry.seq.insert(prefix_hash, worker_id);
+                    entry.touch(now);
+                    added
+                }
+                Entry::Vacant(vacant) => {
+                    vacant.insert(IndexEntry::new(SeqEntry::new(prefix_hash, worker_id), now));
+                    true
+                }
+            };
 
-            // Only count genuinely new blocks — duplicate store events must not
-            // inflate tree_sizes, which would cause incorrect routing decisions.
-            if worker_blocks
-                .insert(block.seq_hash, (position, content_hash, prefix_hash))
-                .is_none()
-            {
+            // Keep the reverse map current regardless; count only memberships
+            // actually added to the index. Duplicate store events still don't
+            // inflate tree_sizes, and re-storing a block whose entry was
+            // pruned (its stale reverse mapping kept) restores its count —
+            // mirroring apply_removed, which decrements only memberships
+            // actually removed.
+            worker_blocks.insert(block.seq_hash, (position, content_hash, prefix_hash));
+            if membership_added {
                 num_new_blocks += 1;
             }
             prev_prefix = Some(prefix_hash);
@@ -502,12 +642,18 @@ impl PositionalIndexer {
                 continue;
             };
 
+            // Count only memberships actually removed from the index. A stale
+            // reverse-map entry (its index entry was pruned earlier) must not
+            // decrement tree_sizes a second time.
             if let Entry::Occupied(mut occupied) = self.index.entry((position, content_hash)) {
-                if occupied.get_mut().remove(prefix_hash, worker_id) {
+                let (removed, now_empty) = occupied.get_mut().seq.remove(prefix_hash, worker_id);
+                if now_empty {
                     occupied.remove();
                 }
+                if removed {
+                    num_removed += 1;
+                }
             }
-            num_removed += 1;
         }
 
         if num_removed > 0 {
@@ -525,7 +671,8 @@ impl PositionalIndexer {
         let drained = std::mem::take(worker_blocks);
         for &(position, content_hash, prefix_hash) in drained.values() {
             if let Entry::Occupied(mut occ) = self.index.entry((position, content_hash)) {
-                if occ.get_mut().remove(prefix_hash, worker_id) {
+                let (_, now_empty) = occ.get_mut().seq.remove(prefix_hash, worker_id);
+                if now_empty {
                     occ.remove();
                 }
             }
@@ -540,7 +687,8 @@ impl PositionalIndexer {
     pub fn remove_worker(&self, worker_id: u32, worker_blocks: WorkerBlockMap) {
         for &(position, content_hash, prefix_hash) in worker_blocks.values() {
             if let Entry::Occupied(mut occ) = self.index.entry((position, content_hash)) {
-                if occ.get_mut().remove(prefix_hash, worker_id) {
+                let (_, now_empty) = occ.get_mut().seq.remove(prefix_hash, worker_id);
+                if now_empty {
                     occ.remove();
                 }
             }
@@ -551,6 +699,118 @@ impl PositionalIndexer {
     /// Get total number of blocks across all workers.
     pub fn current_size(&self) -> usize {
         self.tree_sizes.total()
+    }
+
+    /// Number of `(position, content_hash)` entries currently in the index.
+    /// O(shards); intended for prune decisions and observability, not hot paths.
+    pub fn entry_count(&self) -> usize {
+        self.index.len()
+    }
+
+    /// Evict stale and/or excess index entries. Intended to be driven
+    /// periodically by the owner (e.g. the routing policy's eviction cycle).
+    ///
+    /// * `ttl_secs`: entries neither stored to nor read by a query within this
+    ///   many seconds are evicted. `None` or `Some(0)` disables the TTL pass.
+    /// * `max_entries`: when the index holds more entries than this ceiling,
+    ///   the oldest-touched entries are evicted down to a low-water mark of
+    ///   90% of the ceiling (avoids re-evicting every cycle at the boundary).
+    ///   `None` or `Some(0)` disables the capacity pass.
+    ///
+    /// Semantics and caveats:
+    /// * Queries touch exactly the entries they read (position 0, jump
+    ///   landings, and linear-scan ranges), so entries a hot request stream
+    ///   actually needs stay resident; interior positions the jump shortcut
+    ///   skips may age out — harmless, the shortcut never reads them, and a
+    ///   later drain across an evicted position under-counts that one score
+    ///   (same tolerance as the documented `apply_removed` gap behavior).
+    /// * Eviction leaves the per-worker reverse maps (`WorkerBlockMap`)
+    ///   untouched; a later `apply_removed` for a pruned block is a safe
+    ///   no-op (membership check), and stale reverse entries are dropped by
+    ///   the backend's own removal/clear events or worker removal.
+    /// * `tree_sizes` is decremented per evicted membership (saturating), so
+    ///   worker totals stay approximately consistent under eviction.
+    ///
+    /// Runs off the hot path; both passes collect candidate keys first and
+    /// then re-check under the entry lock, sparing entries touched since the
+    /// scan.
+    pub fn prune(&self, ttl_secs: Option<u32>, max_entries: Option<usize>) -> PruneStats {
+        self.prune_with_now(self.now_secs(), ttl_secs, max_entries)
+    }
+
+    fn prune_with_now(
+        &self,
+        now: u32,
+        ttl_secs: Option<u32>,
+        max_entries: Option<usize>,
+    ) -> PruneStats {
+        let mut stats = PruneStats::default();
+        let mut decrements: FxHashMap<u32, usize> = FxHashMap::default();
+
+        // Pass 1: TTL. `cutoff == 0` (indexer younger than the TTL) means
+        // nothing can be stale yet.
+        if let Some(ttl) = ttl_secs.filter(|&t| t > 0) {
+            let cutoff = now.saturating_sub(ttl);
+            if cutoff > 0 {
+                let mut expired: Vec<(usize, ContentHash)> = Vec::new();
+                for item in &self.index {
+                    stats.scanned += 1;
+                    if item.value().last_touch.load(Ordering::Relaxed) < cutoff {
+                        expired.push(*item.key());
+                    }
+                }
+                for key in expired {
+                    if let Entry::Occupied(occ) = self.index.entry(key) {
+                        // Re-check under the entry lock: touched since the scan → spare.
+                        if occ.get().last_touch.load(Ordering::Relaxed) < cutoff {
+                            occ.get().seq.accumulate_worker_counts(&mut decrements);
+                            occ.remove();
+                            stats.evicted_ttl += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pass 2: capacity ceiling, oldest-touched first. Entries inside the
+        // freshness grace are not candidates (see CAPACITY_EVICTION_GRACE_SECS),
+        // so eviction can fall short of the low-water mark under an all-fresh
+        // burst; the next cycle catches up once entries age.
+        if let Some(max) = max_entries.filter(|&m| m > 0) {
+            let len = self.index.len();
+            if len > max {
+                let low_water = max - max / 10;
+                let fresh_cutoff = now.saturating_sub(CAPACITY_EVICTION_GRACE_SECS);
+                let mut aged: Vec<(u32, (usize, ContentHash))> = Vec::new();
+                for item in &self.index {
+                    stats.scanned += 1;
+                    let stamp = item.value().last_touch.load(Ordering::Relaxed);
+                    if stamp < fresh_cutoff {
+                        aged.push((stamp, *item.key()));
+                    }
+                }
+                let evict_n = len.saturating_sub(low_water).min(aged.len());
+                if evict_n > 0 {
+                    aged.select_nth_unstable_by_key(evict_n - 1, |&(stamp, _)| stamp);
+                    for &(stamp, key) in &aged[..evict_n] {
+                        if let Entry::Occupied(occ) = self.index.entry(key) {
+                            // Touched since the scan → spare it this cycle.
+                            if occ.get().last_touch.load(Ordering::Relaxed) == stamp {
+                                occ.get().seq.accumulate_worker_counts(&mut decrements);
+                                occ.remove();
+                                stats.evicted_capacity += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (worker, n) in decrements {
+            self.tree_sizes.sub_saturating(worker, n);
+        }
+        stats.remaining = self.index.len();
+        stats
     }
 
     /// Find overlap scores for a request's content hash sequence.
@@ -648,20 +908,23 @@ impl PositionalIndexer {
     /// Copies worker IDs into a Vec — used only once at position 0 to initialize `active`.
     /// Skips rolling hash computation for Single entries (unambiguous match).
     fn get_workers_lazy(
-        index: &DashMap<(usize, ContentHash), SeqEntry, FxBuildHasher>,
+        index: &PosIndex,
         position: usize,
         content_hash: ContentHash,
         seq_hashes: &mut Vec<SequenceHash>,
         sequence: &[ContentHash],
+        now: u32,
     ) -> Option<Vec<u32>> {
         let entry = index.get(&(position, content_hash))?;
-        if let Some(workers) = entry.value().workers_if_single() {
+        entry.value().touch(now);
+        if let Some(workers) = entry.value().seq.workers_if_single() {
             return Some(workers.iter().copied().collect());
         }
         // Multi: need rolling hash to disambiguate
         Self::ensure_seq_hash_computed(seq_hashes, position, sequence);
         entry
             .value()
+            .seq
             .get(seq_hashes[position])
             .map(|workers| workers.iter().copied().collect())
     }
@@ -669,21 +932,25 @@ impl PositionalIndexer {
     /// Count workers at a position matching the prefix_hash (no set materialization).
     /// Skips rolling hash computation for Single entries (unambiguous match).
     fn count_workers_at(
-        index: &DashMap<(usize, ContentHash), SeqEntry, FxBuildHasher>,
+        index: &PosIndex,
         position: usize,
         content_hash: ContentHash,
         seq_hashes: &mut Vec<SequenceHash>,
         sequence: &[ContentHash],
+        now: u32,
     ) -> usize {
         let Some(entry) = index.get(&(position, content_hash)) else {
             return 0;
         };
-        if let Some(workers) = entry.value().workers_if_single() {
+        entry.value().touch(now);
+        if let Some(workers) = entry.value().seq.workers_if_single() {
             return workers.len();
         }
         // Multi: need rolling hash to disambiguate
         Self::ensure_seq_hash_computed(seq_hashes, position, sequence);
         entry
+            .value()
+            .seq
             .get(seq_hashes[position])
             .map(|workers| workers.len())
             .unwrap_or(0)
@@ -696,7 +963,7 @@ impl PositionalIndexer {
     /// (all active workers are still present, no work to do).
     #[expect(clippy::too_many_arguments)]
     fn linear_scan_drain(
-        index: &DashMap<(usize, ContentHash), SeqEntry, FxBuildHasher>,
+        index: &PosIndex,
         sequence: &[ContentHash],
         seq_hashes: &mut Vec<SequenceHash>,
         active: &mut Vec<u32>,
@@ -704,6 +971,7 @@ impl PositionalIndexer {
         lo: usize,
         hi: usize,
         early_exit: bool,
+        now: u32,
     ) {
         for (offset, &content_hash) in sequence[lo..hi].iter().enumerate() {
             if active.is_empty() {
@@ -718,9 +986,10 @@ impl PositionalIndexer {
                 active.clear();
                 break;
             };
+            entry.value().touch(now);
 
             // Fast path: Single entry — skip rolling hash, use workers directly.
-            if let Some(workers) = entry.value().workers_if_single() {
+            if let Some(workers) = entry.value().seq.workers_if_single() {
                 // Retain guard: only retain when some workers
                 // have dropped off. When workers.len() >= active.len(), all active
                 // workers are still present — skip the O(active) iteration.
@@ -745,7 +1014,7 @@ impl PositionalIndexer {
             Self::ensure_seq_hash_computed(seq_hashes, pos, sequence);
             let seq_hash = seq_hashes[pos];
 
-            let Some(workers) = entry.get(seq_hash) else {
+            let Some(workers) = entry.value().seq.get(seq_hash) else {
                 for &w in active.iter() {
                     internal_scores.insert(w, pos as u32);
                 }
@@ -784,6 +1053,7 @@ impl PositionalIndexer {
         }
 
         let mut seq_hashes = Vec::with_capacity(content_hashes.len());
+        let now = self.now_secs();
 
         let Some(initial_workers) = Self::get_workers_lazy(
             &self.index,
@@ -791,6 +1061,7 @@ impl PositionalIndexer {
             content_hashes[0],
             &mut seq_hashes,
             content_hashes,
+            now,
         ) else {
             return scores;
         };
@@ -828,6 +1099,7 @@ impl PositionalIndexer {
                 content_hashes[next_pos],
                 &mut seq_hashes,
                 content_hashes,
+                now,
             );
 
             // If the worker count at the jump destination matches the active set size,
@@ -844,6 +1116,7 @@ impl PositionalIndexer {
                     current_pos + 1,
                     next_pos + 1,
                     false,
+                    now,
                 );
                 current_pos = next_pos;
             }
@@ -2301,5 +2574,248 @@ mod tests {
                 assert_eq!(scores.scores.get(&wid), Some(&2));
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // prune: TTL + capacity bounding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prune_disabled_is_noop() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb1 = WorkerBlockMap::default();
+        indexer
+            .apply_stored(w1, &make_blocks(&[10, 20, 30]), None, &mut wb1)
+            .unwrap();
+        indexer.set_test_now(1_000_000);
+
+        for (ttl, max) in [(None, None), (Some(0), Some(0)), (None, Some(0))] {
+            let stats = indexer.prune(ttl, max);
+            assert_eq!(stats.evicted_ttl, 0);
+            assert_eq!(stats.evicted_capacity, 0);
+            assert_eq!(stats.remaining, 3);
+        }
+        assert_eq!(indexer.current_size(), 3);
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&3));
+    }
+
+    #[test]
+    fn test_prune_ttl_evicts_stale_keeps_recent() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let w2 = indexer.intern_worker("http://w2:8000").unwrap();
+        let mut wb1 = WorkerBlockMap::default();
+        let mut wb2 = WorkerBlockMap::default();
+
+        indexer.set_test_now(0);
+        indexer
+            .apply_stored(w1, &make_blocks(&[10, 20, 30]), None, &mut wb1)
+            .unwrap();
+        indexer.set_test_now(500);
+        indexer
+            .apply_stored(w2, &make_blocks(&[40, 50]), None, &mut wb2)
+            .unwrap();
+
+        indexer.set_test_now(600);
+        let stats = indexer.prune(Some(200), None);
+        assert_eq!(stats.evicted_ttl, 3);
+        assert_eq!(stats.evicted_capacity, 0);
+        assert_eq!(stats.remaining, 2);
+
+        assert!(indexer
+            .find_matches(&hashes(&[10, 20, 30]), false)
+            .scores
+            .is_empty());
+        let scores = indexer.find_matches(&hashes(&[40, 50]), false);
+        assert_eq!(scores.scores.get(&w2), Some(&2));
+        assert_eq!(indexer.current_size(), 2);
+    }
+
+    #[test]
+    fn test_prune_ttl_query_touch_keeps_hot_entries() {
+        // jump_size 1 so a full query touches every position of the chain.
+        let indexer = PositionalIndexer::new(1);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let w2 = indexer.intern_worker("http://w2:8000").unwrap();
+        let mut wb1 = WorkerBlockMap::default();
+        let mut wb2 = WorkerBlockMap::default();
+
+        indexer.set_test_now(0);
+        indexer
+            .apply_stored(w1, &make_blocks(&[10, 20, 30]), None, &mut wb1)
+            .unwrap();
+        indexer
+            .apply_stored(w2, &make_blocks(&[40, 50, 60]), None, &mut wb2)
+            .unwrap();
+
+        // Only w1's chain is queried (touched) after storing.
+        indexer.set_test_now(500);
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&3));
+
+        indexer.set_test_now(600);
+        let stats = indexer.prune(Some(200), None);
+        assert_eq!(stats.evicted_ttl, 3); // w2's untouched chain
+
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&3));
+        assert!(indexer
+            .find_matches(&hashes(&[40, 50, 60]), false)
+            .scores
+            .is_empty());
+    }
+
+    #[test]
+    fn test_prune_capacity_evicts_oldest_first() {
+        let indexer = PositionalIndexer::new(1);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb1 = WorkerBlockMap::default();
+
+        // Ten independent single-block chains stored at increasing times.
+        for i in 0u64..10 {
+            indexer.set_test_now(i as u32);
+            indexer
+                .apply_stored(w1, &make_blocks(&[100 + i]), None, &mut wb1)
+                .unwrap();
+        }
+        assert_eq!(indexer.entry_count(), 10);
+
+        indexer.set_test_now(100);
+        // Ceiling 5 → low-water 5 (5/10 == 0) → evict the 5 oldest.
+        let stats = indexer.prune(None, Some(5));
+        assert_eq!(stats.evicted_ttl, 0);
+        assert_eq!(stats.evicted_capacity, 5);
+        assert_eq!(stats.remaining, 5);
+        assert_eq!(indexer.current_size(), 5);
+
+        for i in 0u64..10 {
+            let found = !indexer
+                .find_matches(&hashes(&[100 + i]), false)
+                .scores
+                .is_empty();
+            assert_eq!(found, i >= 5, "chain {i} presence");
+        }
+    }
+
+    #[test]
+    fn test_prune_capacity_spares_fresh_entries() {
+        // Entries stamped within the freshness grace are never capacity
+        // candidates — a prune must not race a store batch whose deferred
+        // tree_sizes increment hasn't landed yet.
+        let indexer = PositionalIndexer::new(1);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb1 = WorkerBlockMap::default();
+
+        indexer.set_test_now(100);
+        for i in 0u64..10 {
+            indexer
+                .apply_stored(w1, &make_blocks(&[100 + i]), None, &mut wb1)
+                .unwrap();
+        }
+
+        // All entries are at now == stamp → inside the grace → spared.
+        let stats = indexer.prune(None, Some(5));
+        assert_eq!(stats.evicted_capacity, 0);
+        assert_eq!(indexer.entry_count(), 10);
+
+        // Once they age past the grace, the ceiling is enforced.
+        indexer.set_test_now(100 + CAPACITY_EVICTION_GRACE_SECS + 1);
+        let stats = indexer.prune(None, Some(5));
+        assert_eq!(stats.evicted_capacity, 5);
+        assert_eq!(indexer.entry_count(), 5);
+    }
+
+    #[test]
+    fn test_restore_after_prune_restores_counts() {
+        // Re-storing blocks whose entries were pruned (with the stale reverse
+        // mapping still present) must restore both the index entries and the
+        // per-worker counts — counting is keyed on index memberships, not on
+        // reverse-map novelty.
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb1 = WorkerBlockMap::default();
+        let blocks = make_blocks(&[10, 20, 30]);
+
+        indexer.set_test_now(0);
+        indexer.apply_stored(w1, &blocks, None, &mut wb1).unwrap();
+        indexer.set_test_now(1000);
+        indexer.prune(Some(100), None);
+        assert_eq!(indexer.current_size(), 0);
+        assert_eq!(wb1.len(), 3); // reverse map untouched by prune
+
+        indexer.apply_stored(w1, &blocks, None, &mut wb1).unwrap();
+        assert_eq!(indexer.current_size(), 3);
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&3));
+
+        // And duplicate stores of live memberships still don't inflate.
+        indexer.apply_stored(w1, &blocks, None, &mut wb1).unwrap();
+        assert_eq!(indexer.current_size(), 3);
+    }
+
+    #[test]
+    fn test_prune_capacity_noop_under_ceiling() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb1 = WorkerBlockMap::default();
+        indexer
+            .apply_stored(w1, &make_blocks(&[10, 20, 30]), None, &mut wb1)
+            .unwrap();
+
+        let stats = indexer.prune(None, Some(10));
+        assert_eq!(stats.evicted_capacity, 0);
+        assert_eq!(stats.remaining, 3);
+    }
+
+    #[test]
+    fn test_prune_then_stale_removal_no_double_decrement() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb1 = WorkerBlockMap::default();
+        let blocks = make_blocks(&[10, 20, 30]);
+
+        indexer.set_test_now(0);
+        indexer.apply_stored(w1, &blocks, None, &mut wb1).unwrap();
+        indexer.set_test_now(1000);
+        let stats = indexer.prune(Some(100), None);
+        assert_eq!(stats.evicted_ttl, 3);
+        assert_eq!(indexer.current_size(), 0);
+
+        // The reverse map still holds the pruned blocks; their removal events
+        // must be a counting no-op (a wrap would make current_size huge).
+        let seq_hashes: Vec<SequenceHash> = blocks.iter().map(|b| b.seq_hash).collect();
+        indexer.apply_removed(w1, &seq_hashes, &mut wb1);
+        assert!(wb1.is_empty());
+        assert_eq!(indexer.current_size(), 0);
+
+        // The worker can start a fresh chain afterwards.
+        indexer.apply_stored(w1, &blocks, None, &mut wb1).unwrap();
+        assert_eq!(indexer.current_size(), 3);
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
+        assert_eq!(scores.scores.get(&w1), Some(&3));
+    }
+
+    #[test]
+    fn test_prune_multi_worker_entry_decrements_each() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let w2 = indexer.intern_worker("http://w2:8000").unwrap();
+        let mut wb1 = WorkerBlockMap::default();
+        let mut wb2 = WorkerBlockMap::default();
+        let blocks = make_blocks(&[10, 20, 30]);
+
+        indexer.set_test_now(0);
+        indexer.apply_stored(w1, &blocks, None, &mut wb1).unwrap();
+        indexer.apply_stored(w2, &blocks, None, &mut wb2).unwrap();
+        assert_eq!(indexer.current_size(), 6);
+        assert_eq!(indexer.entry_count(), 3); // shared entries
+
+        indexer.set_test_now(1000);
+        let stats = indexer.prune(Some(100), None);
+        assert_eq!(stats.evicted_ttl, 3);
+        assert_eq!(indexer.current_size(), 0);
+        assert_eq!(indexer.entry_count(), 0);
     }
 }

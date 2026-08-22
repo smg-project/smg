@@ -2,6 +2,12 @@
 rustflags = []
 incremental = true
 
+[env]
+# Linux aarch64 distributions must run on 4 KiB, 16 KiB, and 64 KiB page
+# kernels. tikv-jemalloc-sys checks this target-qualified variable before the
+# generic JEMALLOC_SYS_WITH_LG_PAGE value, including during cross-compilation.
+AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE = { value = "16", force = true }
+
 [target.aarch64-apple-darwin]
 rustflags = [
     "-C", "link-arg=-undefined",

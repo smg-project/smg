@@ -95,10 +95,10 @@ pub enum EngineInbound {
     /// An abort for the given request ids (`EngineCoreRequestType::Abort`).
     Abort(Vec<String>),
     /// A lockstep-group wake (`EngineCoreRequestType::StartDpWave`): start this
-    /// wave unless this engine is the excluded one.
+    /// wave unless this engine is the excluded one (`None` excludes no rank).
     StartDpWave {
-        wave: u32,
-        exclude_engine_index: u32,
+        wave: u64,
+        exclude_engine_index: Option<u32>,
     },
     /// Any other request type byte (Utility), unhandled here.
     Other(u8),

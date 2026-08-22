@@ -567,7 +567,7 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &GenerateRequest,
+        body: GenerateRequest,
         model_id: &str,
     ) -> Response {
         if self.requires_explicit_generate_model(model_id) {
@@ -596,7 +596,7 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &ChatCompletionRequest,
+        body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
         let router = self.select_router_for_request(Some(model_id));
@@ -618,7 +618,7 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &CompletionRequest,
+        body: CompletionRequest,
         model_id: &str,
     ) -> Response {
         let router = self.select_router_for_request(Some(model_id));
@@ -640,7 +640,7 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &CreateMessageRequest,
+        body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
         let router = self.select_router_for_request(Some(model_id));
@@ -661,7 +661,7 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &ResponsesRequest,
+        body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
         let router = self.select_router_for_request(Some(model_id));
@@ -682,15 +682,19 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &InteractionsRequest,
+        body: InteractionsRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let selected_model = model_id.or(body.model.as_deref()).or(body.agent.as_deref());
-        let router = self.select_router_for_request(selected_model);
+        // Owned so it can outlive `body`, which moves into the routed call.
+        let selected_model = model_id
+            .map(str::to_string)
+            .or_else(|| body.model.clone())
+            .or_else(|| body.agent.clone());
+        let router = self.select_router_for_request(selected_model.as_deref());
 
         if let Some(router) = router {
             router
-                .route_interactions(headers, tenant_meta, body, selected_model)
+                .route_interactions(headers, tenant_meta, body, selected_model.as_deref())
                 .await
         } else {
             (
@@ -718,7 +722,7 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &EmbeddingRequest,
+        body: EmbeddingRequest,
         model_id: &str,
     ) -> Response {
         let router = self.select_router_for_request(Some(model_id));
@@ -740,7 +744,7 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &ClassifyRequest,
+        body: ClassifyRequest,
         model_id: &str,
     ) -> Response {
         let router = self.select_router_for_request(Some(model_id));
@@ -785,7 +789,7 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &RerankRequest,
+        body: RerankRequest,
         model_id: &str,
     ) -> Response {
         let router = self.select_router_for_request(Some(model_id));
@@ -931,7 +935,7 @@ mod tests {
             &self,
             _headers: Option<&HeaderMap>,
             _tenant_meta: &TenantRequestMeta,
-            _body: &GenerateRequest,
+            _body: GenerateRequest,
             _model_id: &str,
         ) -> Response {
             (StatusCode::OK, "routed").into_response()
@@ -955,7 +959,7 @@ mod tests {
             &self,
             _headers: Option<&HeaderMap>,
             _tenant_meta: &TenantRequestMeta,
-            _body: &GenerateRequest,
+            _body: GenerateRequest,
             _model_id: &str,
         ) -> Response {
             (StatusCode::OK, "pd-routed").into_response()
@@ -979,7 +983,7 @@ mod tests {
             &self,
             _headers: Option<&HeaderMap>,
             _tenant_meta: &TenantRequestMeta,
-            _body: &GenerateRequest,
+            _body: GenerateRequest,
             _model_id: &str,
         ) -> Response {
             (StatusCode::OK, "epd-routed").into_response()
@@ -1110,7 +1114,7 @@ mod tests {
         assert_eq!(request.model, UNKNOWN_MODEL_ID);
 
         let response = manager
-            .route_generate(None, &test_tenant_meta(), &request, &request.model)
+            .route_generate(None, &test_tenant_meta(), request.clone(), &request.model)
             .await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -1128,7 +1132,7 @@ mod tests {
         assert_eq!(request.model, UNKNOWN_MODEL_ID);
 
         let response = manager
-            .route_generate(None, &test_tenant_meta(), &request, &request.model)
+            .route_generate(None, &test_tenant_meta(), request.clone(), &request.model)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);

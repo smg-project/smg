@@ -51,11 +51,29 @@ pub struct BatchTokenIDOutSlim {
     /// parallel to it per request. Empty inner `Vec` when logprobs were not
     /// requested.
     pub output_token_logprobs_idx: Vec<Vec<u32>>,
+    /// Producing DP rank's engine index. The output PULL socket carries no
+    /// routing identity, so under DP the batch itself names its rank. Appended
+    /// tail field: an older (pre-DP) sender emits 9 elements and this defaults
+    /// to `0`, which is also the sole rank of a single-engine worker.
+    pub engine_index: u32,
+    /// Piggybacked scheduler-load snapshot, sampled by the producing rank at
+    /// send time (the msgpack wire drops control replies, so the output batch
+    /// is the only in-band load channel). Appended tail fields: all default
+    /// to `0` from older senders, and `kv_total_pages == 0` means "no
+    /// snapshot" — the decoder then reports no load at all rather than a
+    /// fabricated zero.
+    pub num_running: u64,
+    /// Scheduler waiting-queue depth at send time.
+    pub num_waiting: u64,
+    /// KV pages held by running requests (the usage ratio's numerator).
+    pub kv_active_pages: u64,
+    /// Usable KV pages on the rank (the usage ratio's denominator).
+    pub kv_total_pages: u64,
 }
 
 impl Serialize for BatchTokenIDOutSlim {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let mut tuple = serializer.serialize_tuple(9)?;
+        let mut tuple = serializer.serialize_tuple(14)?;
         tuple.serialize_element(BATCH_TOKEN_ID_OUT_SLIM_TAG)?;
         tuple.serialize_element(&self.rids)?;
         tuple.serialize_element(&self.output_ids)?;
@@ -65,6 +83,11 @@ impl Serialize for BatchTokenIDOutSlim {
         tuple.serialize_element(&self.cached_tokens)?;
         tuple.serialize_element(&self.output_token_logprobs_val)?;
         tuple.serialize_element(&self.output_token_logprobs_idx)?;
+        tuple.serialize_element(&self.engine_index)?;
+        tuple.serialize_element(&self.num_running)?;
+        tuple.serialize_element(&self.num_waiting)?;
+        tuple.serialize_element(&self.kv_active_pages)?;
+        tuple.serialize_element(&self.kv_total_pages)?;
         tuple.end()
     }
 }
@@ -94,6 +117,15 @@ impl<'de> Deserialize<'de> for BatchTokenIDOutSlim {
                     cached_tokens: next_field(&mut seq, "cached_tokens")?,
                     output_token_logprobs_val: next_field(&mut seq, "output_token_logprobs_val")?,
                     output_token_logprobs_idx: next_field(&mut seq, "output_token_logprobs_idx")?,
+                    // Appended by the DP wire revision: a 9-element batch from
+                    // an older sender means rank 0 (the only rank it can be).
+                    engine_index: seq.next_element::<u32>()?.unwrap_or(0),
+                    // Appended by the load-piggyback revision; zeros from
+                    // older senders decode as "no snapshot".
+                    num_running: seq.next_element::<u64>()?.unwrap_or(0),
+                    num_waiting: seq.next_element::<u64>()?.unwrap_or(0),
+                    kv_active_pages: seq.next_element::<u64>()?.unwrap_or(0),
+                    kv_total_pages: seq.next_element::<u64>()?.unwrap_or(0),
                 };
                 drain_trailing(&mut seq)?;
                 Ok(batch)
@@ -178,6 +210,13 @@ impl BatchTokenIDOutSlim {
             cached_tokens,
             output_token_logprobs_val,
             output_token_logprobs_idx,
+            // Batch-level fields, not per-request columns; the caller reads
+            // them off the batch before splitting.
+            engine_index: _,
+            num_running: _,
+            num_waiting: _,
+            kv_active_pages: _,
+            kv_total_pages: _,
         } = self;
 
         Ok(rids
@@ -218,22 +257,38 @@ mod tests {
     use super::*;
     use crate::codec::{decode_msgpack, decode_value, encode_msgpack};
 
-    /// A slim output batch captured from the Python encoder: rids ["vec-1"],
-    /// output_ids [[10, 11]], finished_reasons ["length"], prompt 3 /
-    /// completion 2 / cached 1, logprobs [[-0.5, -0.25]] over tokens [[10, 11]].
+    /// A slim output batch captured from the Python msgspec encoder: rids
+    /// ["vec-1"], output_ids [[10, 11]], finished_reasons ["length"], prompt 3
+    /// / completion 2 / cached 1, logprobs [[-0.5, -0.25]] over tokens
+    /// [[10, 11]], engine_index 1, load snapshot (2 running, 5 waiting,
+    /// 100/400 KV pages).
     const PYTHON_OUTPUT_VECTOR: &str =
+        "9eb34261746368546f6b656e49444f7574536c696d91a57665632d3191920a0b91a66c656e\
+         6774689103910291019192cbbfe0000000000000cbbfd000000000000091920a0b01020564\
+         cd0190";
+
+    /// The same batch as encoded by the engine_index-era sender: 10 elements,
+    /// no load snapshot.
+    const PYTHON_OUTPUT_VECTOR_PRE_LOAD: &str =
+        "9ab34261746368546f6b656e49444f7574536c696d91a57665632d3191920a0b91a66c656e\
+         6774689103910291019192cbbfe0000000000000cbbfd000000000000091920a0b01";
+
+    /// The same batch as encoded before the DP wire revision: 9 elements, no
+    /// engine_index tail field.
+    const PYTHON_OUTPUT_VECTOR_PRE_DP: &str =
         "99b34261746368546f6b656e49444f7574536c696d91a57665632d3191920a0b91a66c656e\
          6774689103910291019192cbbfe0000000000000cbbfd000000000000091920a0b";
 
-    fn python_output_bytes() -> Vec<u8> {
-        let hex: String = PYTHON_OUTPUT_VECTOR
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
+    fn vector_bytes(hex_vector: &str) -> Vec<u8> {
+        let hex: String = hex_vector.chars().filter(|c| !c.is_whitespace()).collect();
         (0..hex.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    fn python_output_bytes() -> Vec<u8> {
+        vector_bytes(PYTHON_OUTPUT_VECTOR)
     }
 
     fn vector_batch() -> BatchTokenIDOutSlim {
@@ -246,11 +301,16 @@ mod tests {
             cached_tokens: vec![1],
             output_token_logprobs_val: vec![vec![-0.5, -0.25]],
             output_token_logprobs_idx: vec![vec![10, 11]],
+            engine_index: 1,
+            num_running: 2,
+            num_waiting: 5,
+            kv_active_pages: 100,
+            kv_total_pages: 400,
         }
     }
 
     /// The pinned cross-language vector — the exact bytes the engine sends —
-    /// decodes into the full 9-element (tag + 8 columns) batch.
+    /// decodes into the full 14-element (tag + 8 columns + rank + load) batch.
     #[test]
     fn python_output_vector_decodes() {
         let decoded: BatchTokenIDOutSlim = decode_msgpack(&python_output_bytes()).unwrap();
@@ -277,16 +337,59 @@ mod tests {
     }
 
     #[test]
-    fn batch_output_serializes_as_tagged_nine_element_array() {
+    fn batch_output_serializes_as_tagged_fourteen_element_array() {
         let encoded = encode_msgpack(&vector_batch()).unwrap();
         let Value::Array(array) = decode_value(&encoded).unwrap() else {
             panic!("expected positional array");
         };
-        assert_eq!(array.len(), 9);
+        assert_eq!(array.len(), 14);
         assert_eq!(array[0], Value::from(BATCH_TOKEN_ID_OUT_SLIM_TAG));
         assert_eq!(array[1], Value::Array(vec![Value::from("vec-1")])); // rids
         assert_eq!(array[3], Value::Array(vec![Value::from("length")])); // finished_reasons
         assert_eq!(array[6], Value::Array(vec![Value::from(1)])); // cached_tokens
+        assert_eq!(array[9], Value::from(1)); // engine_index
+                                              // Load snapshot tail: running, waiting, active pages, total pages.
+        assert_eq!(array[10], Value::from(2));
+        assert_eq!(array[11], Value::from(5));
+        assert_eq!(array[12], Value::from(100));
+        assert_eq!(array[13], Value::from(400));
+    }
+
+    /// A pre-DP sender emits 9 elements; the missing tail decodes as rank 0
+    /// (the only rank a single-engine worker can be) with no load snapshot.
+    #[test]
+    fn pre_dp_nine_element_batch_decodes_as_rank_zero() {
+        let decoded: BatchTokenIDOutSlim =
+            decode_msgpack(&vector_bytes(PYTHON_OUTPUT_VECTOR_PRE_DP)).unwrap();
+        assert_eq!(
+            decoded,
+            BatchTokenIDOutSlim {
+                engine_index: 0,
+                num_running: 0,
+                num_waiting: 0,
+                kv_active_pages: 0,
+                kv_total_pages: 0,
+                ..vector_batch()
+            }
+        );
+    }
+
+    /// An engine_index-era sender emits 10 elements; the missing load tail
+    /// decodes as the zero "no snapshot" defaults.
+    #[test]
+    fn pre_load_ten_element_batch_decodes_with_zero_snapshot() {
+        let decoded: BatchTokenIDOutSlim =
+            decode_msgpack(&vector_bytes(PYTHON_OUTPUT_VECTOR_PRE_LOAD)).unwrap();
+        assert_eq!(
+            decoded,
+            BatchTokenIDOutSlim {
+                num_running: 0,
+                num_waiting: 0,
+                kv_active_pages: 0,
+                kv_total_pages: 0,
+                ..vector_batch()
+            }
+        );
     }
 
     #[test]
@@ -324,6 +427,7 @@ mod tests {
             cached_tokens: vec![0, 1],
             output_token_logprobs_val: vec![vec![-0.5], vec![-1.0, -2.0]],
             output_token_logprobs_idx: vec![vec![10], vec![20, 21]],
+            ..Default::default()
         };
         let outputs = batch.into_outputs().unwrap();
         assert_eq!(outputs.len(), 2);
@@ -351,6 +455,7 @@ mod tests {
             cached_tokens: vec![0],
             output_token_logprobs_val: vec![vec![]],
             output_token_logprobs_idx: vec![vec![]],
+            ..Default::default()
         };
         let outputs = batch.into_outputs().unwrap();
         assert!(outputs[0].output_logprobs_val.is_empty());
@@ -368,6 +473,7 @@ mod tests {
             cached_tokens: vec![0, 1],
             output_token_logprobs_val: vec![vec![], vec![]],
             output_token_logprobs_idx: vec![vec![], vec![]],
+            ..Default::default()
         };
         assert!(batch.into_outputs().is_err());
     }
@@ -384,6 +490,7 @@ mod tests {
             // Only one logprob column entry for two requests.
             output_token_logprobs_val: vec![vec![]],
             output_token_logprobs_idx: vec![vec![], vec![]],
+            ..Default::default()
         };
         assert!(batch.into_outputs().is_err());
     }

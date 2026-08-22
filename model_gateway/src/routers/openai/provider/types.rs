@@ -52,6 +52,14 @@ pub(crate) fn strip_default_sglang_fields(payload: &mut Value) {
     }
 }
 
+/// Raw-slice twin of [`strip_default_sglang_fields`]: decides whether a
+/// [`SGLANG_FIELDS`] entry would be stripped, given the compact serde_json
+/// rendering of its value. Must mirror the `Value` version above.
+pub(crate) fn is_stripped_sglang_default(field: &str, raw_json: &str) -> bool {
+    matches!(raw_json, "null" | "false")
+        || (matches!(field, "separate_reasoning" | "stream_reasoning") && raw_json == "true")
+}
+
 #[derive(Error, Debug)]
 pub enum ProviderError {
     #[error("Unsupported endpoint: {0:?}")]

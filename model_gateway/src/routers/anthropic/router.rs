@@ -93,10 +93,10 @@ impl RouterTrait for AnthropicRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &CreateMessageRequest,
+        body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        let request = body.clone();
+        let request = body;
         let headers_owned = headers.cloned();
 
         let mcp_servers = if header_utils::is_smg_mcp_enabled(headers) && request.has_mcp_toolset()

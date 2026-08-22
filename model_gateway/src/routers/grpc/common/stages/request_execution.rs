@@ -11,6 +11,10 @@ use super::PipelineStage;
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
+        common::kv_transfer::{
+            connector_mode_for_worker, mooncake_decode_params, mooncake_prefill_params,
+            KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
+        },
         error,
         grpc::{
             common::stages::encode::EncodeDispatchPlan,
@@ -25,9 +29,7 @@ use crate::{
             utils::tonic_ext::{TonicResultExt, TonicStatusExt},
         },
     },
-    worker::{
-        ConnectionModeExt, RuntimeType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
-    },
+    worker::{ConnectionModeExt, RuntimeType},
 };
 
 type StreamResult = Result<ProtoStream, tonic::Status>;
@@ -46,94 +48,6 @@ fn pd_leg_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
             (label, label)
         }
     }
-}
-
-/// KV-transfer params tagged onto the NIXL prefill leg so the engine pins its
-/// KV blocks and returns the handoff params for the decode worker.
-const NIXL_PREFILL_KV_PARAMS: &str = r#"{"do_remote_decode":true,"do_remote_prefill":false}"#;
-
-/// PD KV-transfer behavior derived from prefill worker metadata.
-#[derive(Debug, Clone, PartialEq)]
-enum KvConnectorMode {
-    /// MooncakeConnector: mint a transfer_id, tag both legs, synthesize decode
-    /// params from worker metadata; legacy host/port injection when the
-    /// servicer predates kv_engine_id reporting (or DP runs without a pinned rank).
-    Mooncake {
-        host: String,
-        port: u32,
-        engine_id: Option<String>,
-    },
-    /// NixlConnector: tag prefill with do_remote_decode, relay returned params to decode.
-    Nixl,
-    /// Unknown/absent connector: relay returned params opportunistically.
-    Passthrough,
-}
-
-impl KvConnectorMode {
-    fn metrics_label(&self) -> &'static str {
-        match self {
-            Self::Mooncake { .. } => metrics_labels::KV_CONNECTOR_MOONCAKE,
-            Self::Nixl => metrics_labels::KV_CONNECTOR_NIXL,
-            Self::Passthrough => metrics_labels::KV_CONNECTOR_PASSTHROUGH,
-        }
-    }
-}
-
-fn kv_connector_mode(
-    kv_connector: Option<&str>,
-    bootstrap_host: &str,
-    bootstrap_port: Option<u16>,
-    kv_engine_id: Option<&str>,
-) -> KvConnectorMode {
-    match kv_connector {
-        Some(MOONCAKE_CONNECTOR) => KvConnectorMode::Mooncake {
-            host: bootstrap_host.to_string(),
-            port: u32::from(bootstrap_port.unwrap_or(DEFAULT_BOOTSTRAP_PORT)),
-            // Empty means unknown (forces the legacy fallback)
-            engine_id: kv_engine_id.filter(|s| !s.is_empty()).map(str::to_string),
-        },
-        Some(NIXL_CONNECTOR) => KvConnectorMode::Nixl,
-        _ => KvConnectorMode::Passthrough,
-    }
-}
-
-/// Connector id of the engine core serving the prefill leg. With DP the cores
-/// suffix the configured id as `{base}_dp{rank}`, so minting needs a pinned
-/// rank; unpinned DP>1 yields None (no mint — decode recomputes locally).
-fn effective_kv_engine_id(
-    base: Option<&str>,
-    dp_size: Option<usize>,
-    dp_rank: Option<usize>,
-) -> Option<String> {
-    let base = base.filter(|s| !s.is_empty())?;
-    if dp_size.unwrap_or(1) > 1 {
-        dp_rank.map(|rank| format!("{base}_dp{rank}"))
-    } else {
-        Some(base.to_string())
-    }
-}
-
-/// Prefill-leg params for Mooncake: the engine pins blocks under the minted id.
-fn mooncake_prefill_params(transfer_id: &str) -> String {
-    serde_json::json!({
-        "do_remote_decode": true,
-        "do_remote_prefill": false,
-        "transfer_id": transfer_id,
-    })
-    .to_string()
-}
-
-/// Decode-leg params for Mooncake, synthesized from prefill worker metadata
-/// (the engine returns nothing to relay; the connector is push-based).
-fn mooncake_decode_params(transfer_id: &str, engine_id: &str, host: &str, port: u32) -> String {
-    serde_json::json!({
-        "do_remote_decode": false,
-        "do_remote_prefill": true,
-        "transfer_id": transfer_id,
-        "remote_engine_id": engine_id,
-        "remote_bootstrap_addr": format!("http://{host}:{port}"),
-    })
-    .to_string()
 }
 
 /// Request execution stage: execute the plan produced by request building.
@@ -191,7 +105,7 @@ impl PipelineStage for RequestExecutionStage {
         };
         ctx.state.load_guards = Some(LoadGuards::scaled(
             workers,
-            ctx.input.headers.as_ref(),
+            ctx.state.sticky_key.as_deref(),
             sub_requests,
         ));
 
@@ -274,6 +188,7 @@ impl RequestExecutionStage {
             }
             Some(RuntimeType::Trtllm)
             | Some(RuntimeType::Mlx)
+            | Some(RuntimeType::Generic)
             | Some(RuntimeType::External)
             | Some(RuntimeType::Unspecified) => {
                 error!(
@@ -477,14 +392,14 @@ impl RequestExecutionStage {
             )
         })?;
 
-        let mut prefill_request = proto_request.clone_inner();
         // Decode consumes the KV handoff from prefill, but TokenSpeed still
         // needs multimodal metadata to pad placeholders and compute MRoPE in
         // the same way as prefill. Drop raw pixels and prefill-only encode
-        // rooms, but keep the per-item metadata.
-        let mut decode_request = proto_request;
+        // rooms, but keep the per-item metadata. The pixel-free leg is the
+        // clone, so pixel tensors are never duplicated.
+        let mut prefill_request = proto_request;
+        let mut decode_request = prefill_request.clone_without_mm_pixels();
         decode_request.clear_encode_bootstrap_info();
-        decode_request.clear_mm_pixel_values();
         if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
             prefill_request.set_data_parallel_rank(rank as i32);
         }
@@ -537,6 +452,16 @@ impl RequestExecutionStage {
             )
         })?;
 
+        // A client disconnect drops both leg streams, which normally fires an
+        // immediate abort to each worker. The decode leg must not be aborted
+        // while it is still receiving the KV handoff from prefill — tearing
+        // the request down mid-transfer can crash or leak on the engine — so
+        // its abort is deferred until the first decode response (the proof
+        // the handoff completed). The prefill leg keeps the immediate abort:
+        // if prefill is still running there is nothing to hand off yet, and
+        // stopping it promptly frees capacity.
+        let decode_stream = decode_stream.defer_abort_until_first_item();
+
         Ok(ExecutionResult::PrefillDecode {
             prefill: prefill_stream,
             decode: Box::new(decode_stream),
@@ -555,7 +480,7 @@ impl RequestExecutionStage {
     /// then relays the kv_transfer_params returned by the prefill engine to decode.
     async fn execute_sequential_pd(
         &self,
-        proto_request: ProtoGenerateRequest,
+        mut proto_request: ProtoGenerateRequest,
         clients: &mut ClientSelection,
         workers: &WorkerSelection,
         model: &str,
@@ -577,22 +502,7 @@ impl RequestExecutionStage {
 
         let mode = workers
             .prefill_worker()
-            .map(|w| {
-                let meta = w.metadata();
-                // Discovered dp_size matters even without --dp-aware expansion:
-                // a DP>1 engine behind an unexpanded worker must not be minted for
-                let dp_size = w
-                    .dp_size()
-                    .or_else(|| meta.spec.labels.get("dp_size").and_then(|s| s.parse().ok()));
-                let engine_id =
-                    effective_kv_engine_id(meta.spec.kv_engine_id.as_deref(), dp_size, w.dp_rank());
-                kv_connector_mode(
-                    meta.spec.kv_connector.as_deref(),
-                    &meta.spec.bootstrap_host,
-                    meta.spec.bootstrap_port,
-                    engine_id.as_deref(),
-                )
-            })
+            .map(|w| connector_mode_for_worker(w.as_ref()))
             .unwrap_or(KvConnectorMode::Passthrough);
 
         // Recorded on the success path (after decode established) so failed
@@ -640,8 +550,15 @@ impl RequestExecutionStage {
             _ => None,
         };
 
-        // Clone request and sanitize sampling (max_tokens=1, n=1), stream=false for prefill
-        let mut prefill_request = proto_request.clone_inner();
+        // Decode reuses the request minus pixels: it receives KV via the P/D
+        // transfer, and prefill reads and unlinks any /dev/shm segments, so a
+        // reused ShmHandle would be unreadable. Same request_id on both legs
+        // is load-bearing for NIXL P/D correlation on vLLM < 0.13. The
+        // pixel-free leg is the clone, so pixel tensors are never duplicated
+        // and die with the prefill send.
+        let mut decode_request = proto_request.clone_without_mm_pixels();
+        // Sanitize prefill sampling (max_tokens=1, n=1), stream=false.
+        let mut prefill_request = proto_request;
         prefill_request.sanitize_sampling_for_prefill(1);
         prefill_request.set_stream(false);
         if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
@@ -720,14 +637,6 @@ impl RequestExecutionStage {
 
         debug!("vLLM PD: prefill completed, sending decode request");
 
-        // Decode reuses proto_request as-is; same request_id as the prefill leg is
-        // load-bearing for NIXL P/D correlation on vLLM < 0.13
-        let mut decode_request = proto_request;
-        // Decode doesn't run the vision encoder (it receives KV via the P/D
-        // transfer), so drop the multimodal inputs — mirrors the parallel PD
-        // path. Load-bearing for SHM: prefill already read and unlinked the
-        // /dev/shm segments, so a reused ShmHandle here would be unreadable.
-        decode_request.clear_mm_pixel_values();
         if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
             decode_request.set_data_parallel_rank(rank as i32);
         }
@@ -816,6 +725,13 @@ impl RequestExecutionStage {
             kv_window_start.elapsed(),
         );
 
+        // Prefill has completed and its KV blocks are held pending decode's
+        // transfer; aborting decode mid-transfer on a client disconnect can
+        // crash or leak on the engine side. Defer the abort until the first
+        // decode response proves the handoff finished (see the parallel PD
+        // path for the same invariant).
+        let decode_stream = decode_stream.defer_abort_until_first_item();
+
         Ok(ExecutionResult::Single {
             stream: decode_stream,
         })
@@ -826,7 +742,7 @@ impl RequestExecutionStage {
 mod tests {
     use std::sync::Arc;
 
-    use smg_grpc_client::vllm_proto as vllm;
+    use smg_grpc_client::{tokenspeed_proto as ts, vllm_proto as vllm};
 
     use super::*;
     use crate::worker::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerType};
@@ -862,70 +778,6 @@ mod tests {
     }
 
     #[test]
-    fn kv_connector_mode_mooncake_uses_bootstrap_metadata() {
-        let mode = kv_connector_mode(
-            Some(MOONCAKE_CONNECTOR),
-            "prefill-host",
-            Some(9090),
-            Some("engine-1"),
-        );
-        assert_eq!(
-            mode,
-            KvConnectorMode::Mooncake {
-                host: "prefill-host".to_string(),
-                port: 9090,
-                engine_id: Some("engine-1".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn kv_connector_mode_mooncake_defaults_port_and_tolerates_missing_engine_id() {
-        let mode = kv_connector_mode(Some(MOONCAKE_CONNECTOR), "prefill-host", None, None);
-        assert_eq!(
-            mode,
-            KvConnectorMode::Mooncake {
-                host: "prefill-host".to_string(),
-                port: u32::from(DEFAULT_BOOTSTRAP_PORT),
-                engine_id: None,
-            }
-        );
-    }
-
-    #[test]
-    fn kv_connector_mode_mooncake_empty_engine_id_means_legacy() {
-        let mode = kv_connector_mode(Some(MOONCAKE_CONNECTOR), "host", Some(9090), Some(""));
-        assert_eq!(
-            mode,
-            KvConnectorMode::Mooncake {
-                host: "host".to_string(),
-                port: 9090,
-                engine_id: None,
-            }
-        );
-    }
-
-    #[test]
-    fn kv_connector_mode_nixl() {
-        assert_eq!(
-            kv_connector_mode(Some(NIXL_CONNECTOR), "ignored", Some(9090), None),
-            KvConnectorMode::Nixl
-        );
-    }
-
-    #[test]
-    fn kv_connector_mode_unknown_or_missing_is_passthrough() {
-        assert_eq!(
-            kv_connector_mode(Some("LMCacheConnector"), "host", None, None),
-            KvConnectorMode::Passthrough
-        );
-        assert_eq!(
-            kv_connector_mode(None, "host", None, None),
-            KvConnectorMode::Passthrough
-        );
-    }
-
-    #[test]
     fn mooncake_prefill_params_carry_transfer_id() {
         let value: serde_json::Value =
             serde_json::from_str(&mooncake_prefill_params("xfer-abc")).unwrap();
@@ -955,6 +807,63 @@ mod tests {
         assert_eq!(value["do_remote_decode"], true);
         assert_eq!(value["do_remote_prefill"], false);
         assert_eq!(value.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn clone_without_mm_pixels_keeps_pixels_on_the_original_only() {
+        let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: "pd-1".to_string(),
+            mm_inputs: Some(vllm::MultimodalInputs::default()),
+            ..Default::default()
+        }));
+        let clone = request.clone_without_mm_pixels();
+        let ProtoGenerateRequest::Vllm(original) = request else {
+            panic!("expected vLLM request");
+        };
+        let ProtoGenerateRequest::Vllm(decode) = clone else {
+            panic!("expected vLLM clone");
+        };
+        assert!(original.mm_inputs.is_some(), "prefill leg keeps pixels");
+        assert!(
+            decode.mm_inputs.is_none(),
+            "decode leg never carries pixels"
+        );
+        assert_eq!(decode.request_id, "pd-1");
+    }
+
+    #[test]
+    fn clone_without_mm_pixels_keeps_tokenspeed_item_metadata() {
+        let item = ts::MultimodalItem {
+            encoder_input: Some(ts::TensorData::default()),
+            placeholder_token_id: Some(7),
+            ..Default::default()
+        };
+        let mut request = ProtoGenerateRequest::TokenSpeed(Box::new(ts::GenerateRequest {
+            mm_inputs: Some(ts::MultimodalInputs { items: vec![item] }),
+            ..Default::default()
+        }));
+        let clone = request.clone_without_mm_pixels();
+        let ProtoGenerateRequest::TokenSpeed(original) = request else {
+            panic!("expected TokenSpeed request");
+        };
+        let ProtoGenerateRequest::TokenSpeed(decode) = clone else {
+            panic!("expected TokenSpeed clone");
+        };
+        let original_item = &original.mm_inputs.as_ref().unwrap().items[0];
+        assert!(
+            original_item.encoder_input.is_some(),
+            "prefill leg keeps encoder input"
+        );
+        let decode_item = &decode.mm_inputs.as_ref().unwrap().items[0];
+        assert!(
+            decode_item.encoder_input.is_none(),
+            "decode leg drops encoder input"
+        );
+        assert_eq!(
+            decode_item.placeholder_token_id,
+            Some(7),
+            "decode leg keeps per-item metadata"
+        );
     }
 
     #[test]
@@ -1042,40 +951,5 @@ mod tests {
 
         let unset = ProtoGenerateComplete::Vllm(vllm::GenerateComplete::default());
         assert_eq!(unset.kv_transfer_params_json(), None);
-    }
-
-    #[test]
-    fn effective_engine_id_passthrough_when_no_dp() {
-        assert_eq!(
-            effective_kv_engine_id(Some("eng"), None, None).as_deref(),
-            Some("eng")
-        );
-        assert_eq!(
-            effective_kv_engine_id(Some("eng"), Some(1), None).as_deref(),
-            Some("eng")
-        );
-    }
-
-    #[test]
-    fn effective_engine_id_suffixes_pinned_dp_rank() {
-        assert_eq!(
-            effective_kv_engine_id(Some("eng"), Some(2), Some(1)).as_deref(),
-            Some("eng_dp1")
-        );
-        assert_eq!(
-            effective_kv_engine_id(Some("eng"), Some(2), Some(0)).as_deref(),
-            Some("eng_dp0")
-        );
-    }
-
-    #[test]
-    fn effective_engine_id_none_for_unpinned_dp() {
-        assert_eq!(effective_kv_engine_id(Some("eng"), Some(2), None), None);
-    }
-
-    #[test]
-    fn effective_engine_id_none_for_missing_or_empty_base() {
-        assert_eq!(effective_kv_engine_id(None, Some(2), Some(0)), None);
-        assert_eq!(effective_kv_engine_id(Some(""), None, None), None);
     }
 }

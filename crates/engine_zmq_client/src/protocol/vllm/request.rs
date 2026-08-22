@@ -61,7 +61,7 @@ pub struct ReasoningParserKwargs {
 /// Engine-core add-request payload sent from frontend to engine.
 ///
 /// This is a msgspec `array_like=True` struct: it serializes as a positional
-/// msgpack array of exactly 20 elements. **Field order is the wire contract** —
+/// msgpack array of exactly 21 elements. **Field order is the wire contract** —
 /// do not reorder. Mirrors Python `EngineCoreRequest`.
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple, DefaultFromSerde)]
 pub struct EngineCoreRequest {
@@ -112,6 +112,9 @@ pub struct EngineCoreRequest {
     /// connector-side cleanup runs via the standard `request_finished` hook.
     #[serde(default)]
     pub abort_immediately: bool,
+    /// Stable session identity shared by related requests.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 impl EngineCoreRequest {
@@ -175,8 +178,8 @@ mod tests {
             other => panic!("expected array, got {other:?}"),
         };
 
-        // 20-element positional tuple; spot-check the wire positions.
-        assert_eq!(array.len(), 20);
+        // 21-element positional tuple; spot-check the wire positions.
+        assert_eq!(array.len(), 21);
         assert_eq!(array[0], Value::from("req-1"));
         assert_eq!(array[2], Value::Nil); // mm_features
         assert_eq!(array[4], Value::Nil); // pooling_params

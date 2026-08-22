@@ -4,10 +4,13 @@
 //! Engine-agnostic wire primitives: msgpack (de)serialization, numpy dtype
 //! handling, and the zero-copy tensor aux-frame codec.
 
-use std::{any::type_name, io::Cursor};
+use std::{any::type_name, fmt, io::Cursor, marker::PhantomData};
 
 use rmpv::Value;
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{value::SeqAccessDeserializer, IgnoredAny, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 
 use crate::error::{Error, Result};
 
@@ -18,11 +21,60 @@ pub mod tensor;
 /// yet strongly typed.
 pub type OpaqueValue = Value;
 
+/// Decode adapter for msgspec `array_like` structs. Upstream grows those
+/// structs by appending fields, so a newer engine sends a longer positional
+/// array than this client knows about — and `rmp-serde` rejects an array with
+/// unconsumed elements, which would fail the whole message. This wrapper
+/// consumes the elements `T` declares and discards the trailing remainder.
+pub struct TrailingTolerant<T>(pub T);
+
+impl<'de, T> Deserialize<'de> for TrailingTolerant<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct TupleVisitor<T>(PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for TupleVisitor<T> {
+            type Value = TrailingTolerant<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "a positional array for `{}`", type_name::<T>())
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let value = T::deserialize(SeqAccessDeserializer::new(&mut seq))?;
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(TrailingTolerant(value))
+            }
+        }
+
+        deserializer.deserialize_seq(TupleVisitor(PhantomData))
+    }
+}
+
+/// Deserialize a sequence of `array_like` structs, tolerating trailing wire
+/// fields in each element. Use as `#[serde(deserialize_with = ...)]`.
+pub fn deserialize_tolerant_seq<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    let items = Vec::<TrailingTolerant<T>>::deserialize(deserializer)?;
+    Ok(items.into_iter().map(|item| item.0).collect())
+}
+
 /// Encode a Rust value into msgpack using named fields (map encoding for
 /// structs; positional arrays come from `serde_tuple`-derived types).
 pub fn encode_msgpack<T>(value: &T) -> Result<Vec<u8>>
 where
-    T: Serialize + std::fmt::Debug,
+    T: Serialize + fmt::Debug,
 {
     rmp_serde::to_vec_named(value).map_err(|error| Error::Encode {
         target_type: type_name::<T>(),

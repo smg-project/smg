@@ -29,6 +29,7 @@ use super::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
         ProtoRequest, ProtoStream,
     },
+    utils::ParserResolver,
 };
 use crate::{
     middleware::TenantRequestMeta,
@@ -144,10 +145,9 @@ pub(crate) struct SharedComponents {
     pub worker_registry: Arc<WorkerRegistry>,
     pub tool_parser_factory: ToolParserFactory,
     pub reasoning_parser_factory: ReasoningParserFactory,
-    /// Configured tool parser name (from CLI `--tool-call-parser`)
-    pub configured_tool_parser: Option<String>,
-    /// Configured reasoning parser name (from CLI `--reasoning-parser`)
-    pub configured_reasoning_parser: Option<String>,
+    /// Per-request parser-name resolution (model-card override → configured
+    /// CLI `--tool-call-parser`/`--reasoning-parser` names).
+    pub parser_resolver: ParserResolver,
     /// Multimodal processing components (initialized at router creation)
     pub multimodal: Option<Arc<MultimodalComponents>>,
 }
@@ -174,6 +174,10 @@ pub(crate) struct ProcessingState {
 
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
+
+    /// Effective sticky key (rid-derived wins, header falls back), recorded by
+    /// worker selection so load guards account keyed load identically.
+    pub sticky_key: Option<String>,
 
     // Stage 3: Client acquisition outputs
     pub clients: Option<ClientSelection>,
@@ -441,27 +445,29 @@ pub(crate) enum LoadGuards {
 }
 
 impl LoadGuards {
-    pub fn new(selection: &WorkerSelection, headers: Option<&HeaderMap>) -> Self {
+    pub fn new(selection: &WorkerSelection, routing_key: Option<&str>) -> Self {
         match selection {
             WorkerSelection::Single { worker } => LoadGuards::Single {
-                _guard: WorkerLoadGuard::new(worker.clone(), headers),
+                _guard: WorkerLoadGuard::with_key(worker.clone(), routing_key),
             },
             WorkerSelection::Disaggregated {
                 prefill, decode, ..
             } => LoadGuards::Disaggregated {
-                _prefill: WorkerLoadGuard::new(prefill.clone(), headers),
-                _decode: WorkerLoadGuard::new(decode.clone(), headers),
+                _prefill: WorkerLoadGuard::with_key(prefill.clone(), routing_key),
+                _decode: WorkerLoadGuard::with_key(decode.clone(), routing_key),
             },
         }
     }
 
     /// One guard set per concurrent sub-request.
-    pub fn scaled(selection: &WorkerSelection, headers: Option<&HeaderMap>, count: usize) -> Self {
+    pub fn scaled(selection: &WorkerSelection, routing_key: Option<&str>, count: usize) -> Self {
         if count <= 1 {
-            Self::new(selection, headers)
+            Self::new(selection, routing_key)
         } else {
             Self::Batch {
-                _guards: (0..count).map(|_| Self::new(selection, headers)).collect(),
+                _guards: (0..count)
+                    .map(|_| Self::new(selection, routing_key))
+                    .collect(),
             }
         }
     }

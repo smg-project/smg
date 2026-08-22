@@ -10,7 +10,7 @@ use std::{
 
 use dashmap::DashMap;
 use openai_protocol::worker::{
-    JobStatus, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
+    ConnectionMode, JobStatus, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
 };
 use smg_mcp::McpConfig;
 use tokio::sync::{mpsc, Semaphore};
@@ -565,18 +565,7 @@ impl JobQueue {
                     spec.worker_type = proto_worker_type;
                     spec.api_key.clone_from(&api_key);
                     spec.bootstrap_port = bootstrap_port;
-                    // ZMQ startup workers carry the runtime pinned by
-                    // `--backend` (the shared handshake cannot be probed for a
-                    // wire protocol); `None` — HTTP/gRPC or no `--backend` —
-                    // keeps auto-detection in detect_backend.
-                    if let Some(runtime) = router_config.startup_worker_runtime_type {
-                        spec.runtime_type = runtime;
-                    }
-                    // Health config is resolved at worker build time from router
-                    // defaults + per-worker overrides (spec.health). No need to
-                    // set spec.health here since these workers have no overrides.
-                    spec.max_connection_attempts =
-                        router_config.health_check.success_threshold.max(1) * 10;
+                    apply_startup_worker_config(&mut spec, router_config);
                     let config = spec;
 
                     let job = Job::AddWorker {
@@ -734,7 +723,17 @@ impl JobQueue {
         }
     }
 
-    /// Cleanup old job statuses (TTL 5 minutes)
+    /// A status is reclaimed only once terminal and older than the TTL.
+    /// Pending/processing entries are the reconciler's in-flight guard: a
+    /// long registration wave holds jobs in those states well past any
+    /// fixed TTL, and purging them makes every discovery pass resubmit
+    /// duplicate jobs for workers already mid-registration.
+    fn status_expired(status: &JobStatus, now: u64, ttl: u64) -> bool {
+        !matches!(status.status.as_str(), "pending" | "processing")
+            && now.saturating_sub(status.timestamp) >= ttl
+    }
+
+    /// Cleanup old terminal job statuses (TTL 5 minutes)
     async fn cleanup_old_statuses(status_map: Arc<DashMap<String, JobStatus>>) {
         const CLEANUP_INTERVAL: Duration = Duration::from_secs(60); // Run every minute
         const STATUS_TTL: u64 = 300; // 5 minutes in seconds
@@ -747,8 +746,7 @@ impl JobQueue {
                 .unwrap_or_default()
                 .as_secs();
 
-            // Remove statuses older than TTL
-            status_map.retain(|_key, value| now - value.timestamp < STATUS_TTL);
+            status_map.retain(|_key, value| !Self::status_expired(value, now, STATUS_TTL));
 
             debug!(
                 "Cleaned up old job statuses, remaining: {}",
@@ -756,6 +754,31 @@ impl JobQueue {
             );
         }
     }
+}
+
+/// Stamp the router-config-derived fields onto a startup worker's spec: the
+/// pinned runtime, the grouped-ZMQ engine count, and the connection budget.
+/// Identity fields (url, worker type, api key, bootstrap port) are the
+/// caller's.
+fn apply_startup_worker_config(spec: &mut WorkerSpec, router_config: &RouterConfig) {
+    // ZMQ startup workers carry the runtime pinned by `--backend` (the shared
+    // handshake cannot be probed for a wire protocol); `None` — HTTP/gRPC or no
+    // `--backend` — keeps auto-detection in detect_backend.
+    if let Some(runtime) = router_config.startup_worker_runtime_type {
+        spec.runtime_type = runtime;
+    }
+    // Grouped ZMQ worker: the handshake awaits this many DP engines on one
+    // socket set. Only ZMQ URLs — dp_size on an HTTP/gRPC startup worker would
+    // misread as dp-awareness.
+    if let Some(count) = router_config.zmq_engine_count.filter(|&n| n > 1) {
+        if ConnectionMode::from_url(&spec.url) == Some(ConnectionMode::Zmq) {
+            spec.dp_size = Some(count);
+        }
+    }
+    // Health config is resolved at worker build time from router defaults +
+    // per-worker overrides (spec.health). No need to set spec.health here since
+    // these workers have no overrides.
+    spec.max_connection_attempts = router_config.health_check.success_threshold.max(1) * 10;
 }
 
 /// Submit AddWorker jobs for external provider endpoints (OpenAI/Anthropic/Gemini).
@@ -813,4 +836,135 @@ fn build_external_worker_config(
     // set spec.health here since these workers have no overrides.
     spec.max_connection_attempts = router_config.health_check.success_threshold.max(1) * 10;
     spec
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec_for(url: &str, router_config: &RouterConfig) -> WorkerSpec {
+        let mut spec = WorkerSpec::new(url);
+        apply_startup_worker_config(&mut spec, router_config);
+        spec
+    }
+
+    /// A grouped-ZMQ fleet stamps `dp_size` only on the `ipc://` workers:
+    /// `dp_size` on an HTTP/gRPC worker means rank-aware DP routing, a
+    /// different topology entirely.
+    #[test]
+    fn engine_count_only_reaches_zmq_workers_in_a_mixed_fleet() {
+        let config = RouterConfig {
+            zmq_engine_count: Some(4),
+            ..RouterConfig::default()
+        };
+
+        assert_eq!(spec_for("ipc:///tmp/smg/engine", &config).dp_size, Some(4));
+        assert_eq!(spec_for("grpc://127.0.0.1:30000", &config).dp_size, None);
+        assert_eq!(spec_for("http://127.0.0.1:8000", &config).dp_size, None);
+    }
+
+    /// One engine is an ungrouped worker, not a group of one: the ZMQ client
+    /// awaits a single engine by default, and `Some(1)` must not turn the
+    /// worker into a dp-aware one.
+    #[test]
+    fn a_single_engine_leaves_dp_size_unset() {
+        let mut config = RouterConfig {
+            zmq_engine_count: Some(1),
+            ..RouterConfig::default()
+        };
+        assert_eq!(spec_for("ipc:///tmp/smg/engine", &config).dp_size, None);
+
+        config.zmq_engine_count = None;
+        assert_eq!(spec_for("ipc:///tmp/smg/engine", &config).dp_size, None);
+    }
+
+    /// `--backend` pins the ZMQ wire protocol (the handshake can't be probed);
+    /// without it the spec keeps its default so `detect_backend` can probe.
+    #[test]
+    fn startup_runtime_is_pinned_only_when_configured() {
+        let default_runtime = WorkerSpec::new("ipc:///tmp/smg/engine").runtime_type;
+
+        let mut config = RouterConfig {
+            startup_worker_runtime_type: Some(RuntimeType::Vllm),
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            spec_for("ipc:///tmp/smg/engine", &config).runtime_type,
+            RuntimeType::Vllm
+        );
+
+        config.startup_worker_runtime_type = None;
+        assert_eq!(
+            spec_for("ipc:///tmp/smg/engine", &config).runtime_type,
+            default_runtime
+        );
+    }
+
+    /// Pending/processing statuses are the discovery reconciler's in-flight
+    /// guard: purging them mid-wave makes every pass resubmit duplicate jobs
+    /// for workers still registering, multiplying the wave's work.
+    #[test]
+    fn cleanup_never_expires_in_flight_statuses() {
+        let pending = JobStatus::pending("AddWorker", "http://w:8000");
+        let processing = JobStatus::processing("AddWorker", "http://w:8000");
+        let far_future = pending.timestamp + 100_000;
+
+        assert!(!JobQueue::status_expired(&pending, far_future, 300));
+        assert!(!JobQueue::status_expired(&processing, far_future, 300));
+    }
+
+    /// Terminal statuses still age out so a failed worker retries on a later
+    /// reconcile pass and the map stays bounded.
+    #[test]
+    fn cleanup_expires_terminal_statuses_after_the_ttl() {
+        let failed = JobStatus::failed("AddWorker", "http://w:8000", "boom".to_string());
+
+        assert!(!JobQueue::status_expired(
+            &failed,
+            failed.timestamp + 299,
+            300
+        ));
+        assert!(JobQueue::status_expired(
+            &failed,
+            failed.timestamp + 300,
+            300
+        ));
+    }
+
+    /// The queue channel and dispatch semaphore are sized from the config,
+    /// not hardcoded.
+    #[tokio::test]
+    async fn queue_sizing_comes_from_the_config() {
+        let context: Weak<AppContext> = Weak::new();
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                queue_capacity: 7,
+                max_concurrent_jobs: 3,
+            },
+            context,
+        );
+
+        assert_eq!(queue.tx.max_capacity(), 7);
+        let (queue_depth, available_permits) = queue.get_load_info();
+        assert_eq!(queue_depth, 0);
+        assert_eq!(available_permits, 3);
+    }
+
+    /// The connection budget scales with the health-check success threshold,
+    /// and a zero threshold must not collapse it to zero attempts.
+    #[test]
+    fn connection_attempts_scale_with_the_success_threshold_floor() {
+        let mut config = RouterConfig::default();
+        config.health_check.success_threshold = 0;
+        assert_eq!(
+            spec_for("http://127.0.0.1:8000", &config).max_connection_attempts,
+            10
+        );
+
+        config.health_check.success_threshold = 3;
+        assert_eq!(
+            spec_for("http://127.0.0.1:8000", &config).max_connection_attempts,
+            30
+        );
+    }
 }

@@ -13,7 +13,10 @@ use openai_protocol::models::ListModelsResponse;
 
 use crate::{
     routers::{
-        common::header_utils::{apply_provider_headers, extract_auth_header},
+        common::{
+            header_utils::{apply_provider_headers, extract_auth_header},
+            overload,
+        },
         error,
     },
     worker::{ConnectionMode, ProviderType, RuntimeType, Worker, WorkerRegistry, WorkerType},
@@ -83,6 +86,17 @@ impl<'a> WorkerSelector<'a> {
             return Ok(worker);
         }
 
+        // Shed before the refresh, not after. Refresh-on-miss is the expensive
+        // branch — a second registry walk plus a `/v1/models` fan-out under a
+        // 5 s timeout — and a fleet whose every worker is vetoed will not be
+        // un-vetoed by re-reading model lists. Without this, saturation turns
+        // each of these requests into three registry walks and up to 5 s of
+        // network wait to reach a 503 that carries neither the shed error code
+        // nor the shed counter.
+        if let Some(shed) = self.shed_if_all_overloaded(req) {
+            return Err(shed);
+        }
+
         tracing::debug!(
             model = req.model_id,
             "No worker found, refreshing external worker models"
@@ -107,29 +121,48 @@ impl<'a> WorkerSelector<'a> {
         })
     }
 
-    fn get_candidates(&self, req: &SelectWorkerRequest<'_>) -> Vec<Arc<dyn Worker>> {
+    /// The pool selection walks. `require_available` adds the `is_available()`
+    /// veto; the shed path takes the same pool without it, so the shed verdict
+    /// always describes exactly what selection saw.
+    fn candidate_pool(
+        &self,
+        req: &SelectWorkerRequest<'_>,
+        require_available: bool,
+    ) -> Vec<Arc<dyn Worker>> {
         let workers = self.registry.get_workers_filtered(
             None, // model_id index lookup not used — we filter via supports_model
             req.worker_type,
             req.connection_mode,
             req.runtime_type,
-            false, // we filter availability ourselves for consistent behavior
+            false,
         );
-
-        let candidates: Vec<_> = workers.into_iter().filter(|w| w.is_available()).collect();
-
-        match &req.provider {
-            Some(provider) => filter_by_provider(candidates, provider),
-            None => candidates,
-        }
-    }
-
-    fn find_best_worker(&self, req: &SelectWorkerRequest<'_>) -> Option<Arc<dyn Worker>> {
-        self.get_candidates(req)
+        let workers: Vec<_> = if require_available {
+            workers.into_iter().filter(|w| w.is_available()).collect()
+        } else {
+            workers
+        };
+        let candidates = match &req.provider {
+            Some(provider) => filter_by_provider(workers, provider),
+            None => workers,
+        };
+        candidates
             .into_iter()
             .filter(|w| w.supports_model(req.model_id))
             .filter(|w| !req.require_realtime_capable || w.is_realtime_capable())
+            .collect()
+    }
+
+    fn find_best_worker(&self, req: &SelectWorkerRequest<'_>) -> Option<Arc<dyn Worker>> {
+        self.candidate_pool(req, true)
+            .into_iter()
             .min_by_key(|w| w.load())
+    }
+
+    /// Shed when every worker this request could have selected is vetoed.
+    /// Runs only on the miss path.
+    fn shed_if_all_overloaded(&self, req: &SelectWorkerRequest<'_>) -> Option<Response> {
+        let candidates = self.candidate_pool(req, false);
+        overload::shed_if_all_overloaded(&candidates, req.model_id)
     }
 
     /// Check if any healthy worker supports the model (regardless of circuit breaker).

@@ -339,7 +339,7 @@ THIRD_PARTY_MODELS: dict[str, dict] = {
     },
     "xai": {
         "description": "xAI API",
-        "model": "grok-4-fast",
+        "model": "grok-4.20-0309-non-reasoning",
         "api_key_env": "XAI_API_KEY",
     },
     "anthropic": {

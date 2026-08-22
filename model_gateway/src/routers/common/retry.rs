@@ -19,6 +19,27 @@ pub fn is_retryable_status(status: StatusCode) -> bool {
     )
 }
 
+/// Response extension marking a response terminal for the retry layer
+/// regardless of its status code — for outcomes whose cause cannot clear
+/// inside a backoff window (the load-shed 503: its veto moves at the poll
+/// interval, not the retry interval).
+#[derive(Debug, Clone, Copy)]
+pub struct NonRetryable;
+
+/// Mark `response` terminal for [`is_retryable_response`].
+pub fn mark_non_retryable(response: &mut Response) {
+    response.extensions_mut().insert(NonRetryable);
+}
+
+/// Whether a response should be retried: a retryable status that has not been
+/// explicitly marked terminal by the code that produced it.
+///
+/// This is what `should_retry` predicates should call. `is_retryable_status`
+/// alone cannot see the marker and will retry a shed.
+pub fn is_retryable_response(response: &Response) -> bool {
+    response.extensions().get::<NonRetryable>().is_none() && is_retryable_status(response.status())
+}
+
 /// Computes exponential backoff with optional jitter.
 #[derive(Debug, Clone)]
 pub struct BackoffCalculator;

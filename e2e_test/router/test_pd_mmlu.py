@@ -4,7 +4,8 @@ PD disaggregation separates prefill and decode phases across different
 workers for improved throughput and resource utilization.
 
 Backends:
-- "pd_http": HTTP mode (SGLang only - vLLM does not support HTTP)
+- "pd_http": HTTP mode (SGLang parallel bootstrap dispatch; vLLM sequential
+  prefill-then-decode with kv_transfer_params relay)
 - "pd_grpc": gRPC mode (both SGLang and vLLM)
 
 Requirements:
@@ -16,7 +17,7 @@ Usage:
     # SGLang (runs both HTTP and gRPC)
     pytest e2e_test/router/test_pd_mmlu.py -v
 
-    # vLLM (runs gRPC only, HTTP skipped)
+    # vLLM (runs both HTTP and gRPC)
     E2E_RUNTIME=vllm pytest e2e_test/router/test_pd_mmlu.py -v
 """
 
@@ -31,11 +32,10 @@ from infra import run_eval
 logger = logging.getLogger(__name__)
 
 
-@pytest.mark.engine("sglang")
+@pytest.mark.engine("sglang", "vllm")
 @pytest.mark.gpu(2)
 @pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
 @pytest.mark.e2e
-@pytest.mark.skip_for_runtime("vllm", reason="vLLM does not support HTTP mode")
 @pytest.mark.parametrize("setup_backend", ["pd_http"], indirect=True)
 class TestPDMMLUHttp:
     """MMLU evaluation tests using PD disaggregation (HTTP mode)."""

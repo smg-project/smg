@@ -2,6 +2,13 @@ use std::collections::HashMap;
 
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
+
+// Jemalloc for all Rust-side allocations in the extension. Prefixed symbols
+// leave CPython's allocators untouched; disable_initial_exec_tls is required
+// for a dlopen'd cdylib.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use smg::*;
 use smg_auth as auth;
 
@@ -388,14 +395,18 @@ struct Router {
     block_size: usize,
     balance_token_usage_threshold: f32,
     overload_token_usage_threshold: f32,
+    prefix_token_count: usize,
+    prefix_hash_load_factor: f64,
+    prefix_hash_balance_abs_threshold: usize,
     least_load_kv_pressure_weight: f64,
     least_load_default_throughput: f64,
     least_load_mean_prefill_tokens: u32,
     max_idle_secs: u64,
-    assignment_mode: String,
+    assignment_mode: Option<String>,
     max_payload_size: usize,
     dp_aware: bool,
     dp_minimum_tokens_scheduler: bool,
+    upstream_http2: bool,
     api_key: Option<String>,
     log_dir: Option<String>,
     log_level: Option<String>,
@@ -495,6 +506,26 @@ struct Router {
     model_aliases: HashMap<String, String>,
     worker_startup_delay: u64,
     worker_ports_annotation: String,
+    /// DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped).
+    /// Appended last: positional constructor compatibility (see the field
+    /// ordering rule on this struct's signature).
+    zmq_engine_count: Option<usize>,
+    overlap_decay: f32,
+    selection_temperature: f32,
+    upstream_pool_idle_timeout_secs: u64,
+    least_load_max_waiting_requests: u32,
+    stream_request_bodies_over: u64,
+    stream_body_stall_timeout_secs: u64,
+    routing_key_headers: Vec<String>,
+    cache_boundaries: Vec<usize>,
+    cache_index: String,
+    cache_ttl_secs: u64,
+    job_queue_capacity: usize,
+    job_queue_concurrency: usize,
+    worker_overload_waiting_requests: Option<usize>,
+    worker_overload_token_usage: Option<f64>,
+    worker_overload_protection: bool,
+    disable_load_monitoring: bool,
 }
 
 impl Router {
@@ -524,15 +555,34 @@ impl Router {
         })
     }
 
-    fn parse_assignment_mode(&self) -> Result<config::ManualAssignmentMode, config::ConfigError> {
-        match self.assignment_mode.as_str() {
+    fn parse_cache_index(&self) -> Result<config::CacheIndexKind, config::ConfigError> {
+        match self.cache_index.as_str() {
+            "tree" => Ok(config::CacheIndexKind::Tree),
+            "hash" => Ok(config::CacheIndexKind::Hash),
+            other => Err(config::ConfigError::InvalidValue {
+                field: "cache_index".to_string(),
+                value: other.to_string(),
+                reason: "expected 'tree' or 'hash'".to_string(),
+            }),
+        }
+    }
+
+    fn parse_assignment_mode(
+        &self,
+        default: config::ManualAssignmentMode,
+    ) -> Result<config::ManualAssignmentMode, config::ConfigError> {
+        let Some(mode) = self.assignment_mode.as_deref() else {
+            return Ok(default);
+        };
+        match mode {
             "random" => Ok(config::ManualAssignmentMode::Random),
             "min_load" => Ok(config::ManualAssignmentMode::MinLoad),
             "min_group" => Ok(config::ManualAssignmentMode::MinGroup),
+            "delegate" => Ok(config::ManualAssignmentMode::Delegate),
             other => Err(config::ConfigError::InvalidValue {
                 field: "assignment_mode".to_string(),
                 value: other.to_string(),
-                reason: "expected 'random', 'min_load', or 'min_group'".to_string(),
+                reason: "expected 'random', 'min_load', 'min_group', or 'delegate'".to_string(),
             }),
         }
     }
@@ -573,15 +623,21 @@ impl Router {
                     block_size: self.block_size,
                     balance_token_usage_threshold: self.balance_token_usage_threshold,
                     overload_token_usage_threshold: self.overload_token_usage_threshold,
+                    overlap_decay: self.overlap_decay,
+                    selection_temperature: self.selection_temperature,
+                    cache_index: self.parse_cache_index()?,
+                    cache_ttl_secs: self.cache_ttl_secs,
+                    cache_boundaries: self.cache_boundaries.clone(),
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 5,
+                    load_check_interval_secs: self.load_monitor_interval,
                 },
                 PolicyType::LeastLoad => ConfigPolicyConfig::LeastLoad {
-                    load_check_interval_secs: 5,
+                    load_check_interval_secs: self.load_monitor_interval,
                     kv_pressure_weight: self.least_load_kv_pressure_weight,
                     mean_prefill_tokens: self.least_load_mean_prefill_tokens,
                     default_throughput: self.least_load_default_throughput,
+                    max_waiting_requests: self.least_load_max_waiting_requests,
                 },
                 PolicyType::Bucket => ConfigPolicyConfig::Bucket {
                     balance_abs_threshold: self.balance_abs_threshold,
@@ -591,12 +647,15 @@ impl Router {
                 PolicyType::Manual => ConfigPolicyConfig::Manual {
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_idle_secs: self.max_idle_secs,
-                    assignment_mode: self.parse_assignment_mode()?,
+                    assignment_mode: self
+                        .parse_assignment_mode(config::ManualAssignmentMode::Random)?,
                 },
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
-                    prefix_token_count: 256,
-                    load_factor: 1.25,
+                    prefix_token_count: self.prefix_token_count,
+                    load_factor: self.prefix_hash_load_factor,
+                    balance_abs_threshold: self.prefix_hash_balance_abs_threshold,
+                    cache_boundaries: self.cache_boundaries.clone(),
                 },
             })
         };
@@ -764,16 +823,24 @@ impl Router {
         config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
+            .cache_boundaries(self.cache_boundaries.clone())
             .host(&self.host)
             .port(self.port)
             .health_check_port(self.health_check_port)
             .connection_mode(self.connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
+            .zmq_engine_count(self.zmq_engine_count)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
+            .job_queue_capacity(self.job_queue_capacity)
+            .job_queue_concurrency(self.job_queue_concurrency)
+            .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
+            .worker_overload_token_usage(self.worker_overload_token_usage)
+            .worker_overload_protection(self.worker_overload_protection)
+            .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
@@ -837,13 +904,19 @@ impl Router {
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .enable_wasm(self.enable_wasm)
             .dp_aware(self.dp_aware)
+            .upstream_http2(self.upstream_http2)
+            .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
+            .stream_request_bodies_over(self.stream_request_bodies_over)
+            .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval_secs,
                 max_idle_secs: self.max_idle_secs,
-                assignment_mode: self.parse_assignment_mode()?,
+                assignment_mode: self
+                    .parse_assignment_mode(config::ManualAssignmentMode::Delegate)?,
+                headers: self.routing_key_headers.clone(),
             })
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
@@ -885,7 +958,7 @@ impl Router {
         least_load_default_throughput = 2000.0,
         least_load_mean_prefill_tokens = 1024,
         max_idle_secs = 14400,
-        assignment_mode = String::from("random"),
+        assignment_mode = None,
         max_payload_size = 512 * 1024 * 1024,
         dp_aware = false,
         dp_minimum_tokens_scheduler = false,
@@ -989,6 +1062,27 @@ impl Router {
         model_aliases = HashMap::new(),
         worker_startup_delay = 0,
         worker_ports_annotation = String::from("smg.ai/worker-ports"),
+        zmq_engine_count = None,
+        prefix_token_count = 256,
+        prefix_hash_load_factor = 1.25,
+        prefix_hash_balance_abs_threshold = 10,
+        upstream_http2 = false,
+        overlap_decay = 0.0,
+        selection_temperature = 0.0,
+        upstream_pool_idle_timeout_secs = 3,
+        least_load_max_waiting_requests = 0,
+        stream_request_bodies_over = 0,
+        stream_body_stall_timeout_secs = 300,
+        routing_key_headers = vec![String::from("x-smg-routing-key")],
+        cache_boundaries = vec![],
+        cache_index = String::from("tree"),
+        cache_ttl_secs = 180,
+        job_queue_capacity = 1000,
+        job_queue_concurrency = 200,
+        worker_overload_waiting_requests = None,
+        worker_overload_token_usage = None,
+        worker_overload_protection = false,
+        disable_load_monitoring = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1015,7 +1109,7 @@ impl Router {
         least_load_default_throughput: f64,
         least_load_mean_prefill_tokens: u32,
         max_idle_secs: u64,
-        assignment_mode: String,
+        assignment_mode: Option<String>,
         max_payload_size: usize,
         dp_aware: bool,
         dp_minimum_tokens_scheduler: bool,
@@ -1118,6 +1212,27 @@ impl Router {
         model_aliases: HashMap<String, String>,
         worker_startup_delay: u64,
         worker_ports_annotation: String,
+        zmq_engine_count: Option<usize>,
+        prefix_token_count: usize,
+        prefix_hash_load_factor: f64,
+        prefix_hash_balance_abs_threshold: usize,
+        upstream_http2: bool,
+        overlap_decay: f32,
+        selection_temperature: f32,
+        upstream_pool_idle_timeout_secs: u64,
+        least_load_max_waiting_requests: u32,
+        stream_request_bodies_over: u64,
+        stream_body_stall_timeout_secs: u64,
+        routing_key_headers: Vec<String>,
+        cache_boundaries: Vec<usize>,
+        cache_index: String,
+        cache_ttl_secs: u64,
+        job_queue_capacity: usize,
+        job_queue_concurrency: usize,
+        worker_overload_waiting_requests: Option<usize>,
+        worker_overload_token_usage: Option<f64>,
+        worker_overload_protection: bool,
+        disable_load_monitoring: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1157,6 +1272,9 @@ impl Router {
             block_size,
             balance_token_usage_threshold,
             overload_token_usage_threshold,
+            prefix_token_count,
+            prefix_hash_load_factor,
+            prefix_hash_balance_abs_threshold,
             least_load_kv_pressure_weight,
             least_load_default_throughput,
             least_load_mean_prefill_tokens,
@@ -1165,6 +1283,7 @@ impl Router {
             max_payload_size,
             dp_aware,
             dp_minimum_tokens_scheduler,
+            upstream_http2,
             api_key,
             log_dir,
             log_level,
@@ -1261,6 +1380,23 @@ impl Router {
             model_aliases,
             worker_startup_delay,
             worker_ports_annotation,
+            zmq_engine_count,
+            overlap_decay,
+            selection_temperature,
+            upstream_pool_idle_timeout_secs,
+            least_load_max_waiting_requests,
+            stream_request_bodies_over,
+            stream_body_stall_timeout_secs,
+            routing_key_headers,
+            cache_boundaries,
+            cache_index,
+            cache_ttl_secs,
+            job_queue_capacity,
+            job_queue_concurrency,
+            worker_overload_waiting_requests,
+            worker_overload_token_usage,
+            worker_overload_protection,
+            disable_load_monitoring,
         })
     }
 
@@ -1443,6 +1579,8 @@ fn get_available_reasoning_parsers() -> Vec<String> {
 
 #[pymodule]
 fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    observability::metrics::register_jemalloc_as_global_allocator();
+
     m.add_class::<PolicyType>()?;
     m.add_class::<BackendType>()?;
     m.add_class::<HistoryBackendType>()?;

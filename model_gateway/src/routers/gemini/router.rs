@@ -15,7 +15,7 @@ use crate::{
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
     routers::{
-        common::retry::{is_retryable_status, RetryExecutor},
+        common::retry::{is_retryable_response, RetryExecutor},
         RouterTrait,
     },
 };
@@ -76,10 +76,10 @@ impl RouterTrait for GeminiRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: &InteractionsRequest,
+        body: InteractionsRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let request = Arc::new(body.clone());
+        let request = Arc::new(body);
         let headers_cloned = headers.cloned();
         let model_id_cloned = model_id.map(String::from);
         let components = self.shared_components.clone();
@@ -105,7 +105,7 @@ impl RouterTrait for GeminiRouter {
                     driver::execute(&mut ctx).await
                 }
             },
-            |res, _attempt| is_retryable_status(res.status()),
+            |res, _attempt| is_retryable_response(res),
             |_delay, _attempt| {
                 // TODO: record retry metrics when Gemini metrics are added
             },

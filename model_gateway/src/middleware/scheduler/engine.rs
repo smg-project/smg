@@ -57,7 +57,7 @@ pub enum AdmitOutcome {
 pub enum RejectionReason {
     /// Per-class queue is at its configured limit. → 429.
     QueueFull,
-    /// Queued waiter aged past `queue_timeout`. → 408.
+    /// Queued waiter aged past `queue_timeout`. → 503 + Retry-After.
     QueueTimeout,
     /// Scheduler cancelled this inflight to admit a higher-priority
     /// waiter. → 503 + Retry-After.

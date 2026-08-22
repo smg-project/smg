@@ -27,9 +27,20 @@ pub struct RouterConfig {
     /// this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_worker_runtime_type: Option<RuntimeType>,
+    /// DP engines per startup ZMQ worker: each `--worker-urls` ZMQ worker
+    /// becomes a grouped worker whose handshake awaits this many engines on
+    /// one socket set (`dp_size` on the worker spec, no rank). `None`/1 keeps
+    /// today's one-engine workers; HTTP/gRPC workers ignore this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zmq_engine_count: Option<usize>,
     pub policy: PolicyConfig,
-    /// Per-request sticky-routing override (honors `X-SMG-Routing-Key`).
-    #[serde(default)]
+    /// Token positions at which serving engines retain reusable prefix state;
+    /// cache-affinity policies hash request heads at the deepest applicable
+    /// boundary. Ascending; empty disables boundary-based keying.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_boundaries: Vec<usize>,
+    /// Per-request sticky-session routing (rid-lineage keys, header fallback).
+    #[serde(default, alias = "sticky_sessions")]
     pub routing_key_override: RoutingKeyOverrideConfig,
     pub host: String,
     pub port: u16,
@@ -44,7 +55,28 @@ pub struct RouterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_worker_threads: Option<usize>,
     pub max_payload_size: usize,
+    /// Forward request bodies larger than this many bytes to the worker as a
+    /// raw stream instead of buffering, when the route's policy needs no
+    /// request text — or the request carries a valid routing hint header
+    /// that stands in for it — and the worker applies no body mutation.
+    /// Streamed bodies cannot be replayed, so those requests bypass
+    /// router-level retries; bodies without a Content-Length header always
+    /// buffer. `0` disables.
+    #[serde(default)]
+    pub stream_request_bodies_over: u64,
+    /// Abort a streamed request body once the upstream sender has waited on
+    /// the client for this many seconds (408). The clock pauses while the
+    /// worker applies backpressure, so a slow worker read never trips it.
+    /// `0` disables the watchdog.
+    #[serde(default = "default_stream_body_stall_timeout_secs")]
+    pub stream_body_stall_timeout_secs: u64,
     pub request_timeout_secs: u64,
+    /// Idle timeout for pooled upstream connections. Must stay below the
+    /// backend HTTP server's keep-alive timeout (vLLM and SGLang default to
+    /// 5s), or the pool hands out connections the server has already closed
+    /// and non-idempotent sends fail. `0` keeps idle connections forever.
+    #[serde(default = "default_upstream_pool_idle_timeout_secs")]
+    pub upstream_pool_idle_timeout_secs: u64,
     pub worker_startup_timeout_secs: u64,
     /// Grace period before the first worker-startup check fires. The engine is
     /// left alone for this long, then polled every
@@ -52,8 +84,56 @@ pub struct RouterConfig {
     #[serde(default)]
     pub worker_startup_delay_secs: u64,
     pub worker_startup_check_interval_secs: u64,
+    /// Control-plane job queue: max pending jobs. Size to fleet scale so a
+    /// discovery reconcile pass can enqueue every worker without blocking.
+    #[serde(default = "default_job_queue_capacity")]
+    pub job_queue_capacity: usize,
+    /// Control-plane job queue: max jobs dispatched concurrently.
+    #[serde(default = "default_job_queue_concurrency")]
+    pub job_queue_concurrency: usize,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// Restore the conditional load-monitor poll gate: only poll worker groups
+    /// when a load-aware routing policy, `engine_metrics`, or overload
+    /// protection needs the data. Default `false` — the monitor polls every
+    /// group unconditionally from registration onward. A load-aware policy is
+    /// always fed regardless of this flag.
+    #[serde(default)]
+    pub disable_load_monitoring: bool,
+    /// Enable absolute worker overload protection with the gateway default of
+    /// `worker_overload_token_usage = 0.9` (KV token usage is engine-universal;
+    /// a waiting-requests default would be workload-dependent, so that signal
+    /// stays unset). Redundant when either explicit threshold below is set —
+    /// those enable protection on their own, exactly as before this flag.
+    #[serde(default)]
+    pub worker_overload_protection: bool,
+    /// Queued-request count at or above which a worker is considered
+    /// overloaded and excluded from routing until the signal recovers; when all
+    /// workers are overloaded, requests are shed immediately rather than
+    /// queued. Evaluated once per ingested load report, never per request.
+    /// `None` (default) disables this signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_overload_waiting_requests: Option<usize>,
+    /// KV-cache token usage (0.0-1.0, averaged across DP ranks) at or above
+    /// which a worker is considered overloaded — the same signal
+    /// `balance_token_usage_threshold` reads, applied as an absolute per-worker
+    /// ceiling instead of a fleet-relative spread. `None` (default) disables
+    /// this signal; with both signals unset, overload protection is off and
+    /// routing behaves exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_overload_token_usage: Option<f64>,
+    /// TTL in seconds for entries in the event-driven cache-aware positional
+    /// indexer: entries neither stored to nor read by a query within this
+    /// window are evicted by a periodic background prune. Bounds index growth
+    /// when a backend stops emitting removal events (crash, stream downgrade).
+    /// `None`/`0` disables the TTL pass (default, preserving unbounded growth).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_indexer_ttl_secs: Option<u64>,
+    /// Capacity ceiling per model for the positional indexer, enforced by the
+    /// same periodic prune: beyond it, oldest-touched entries are evicted down
+    /// to 90% of the ceiling. `None`/`0` disables the ceiling (default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_indexer_max_entries: Option<usize>,
     /// Re-export engine `GetLoads` signals as `smg_engine_*` gauges, polling
     /// even when no load-aware routing policy is active. Decouples engine
     /// observability from routing.
@@ -87,11 +167,13 @@ pub struct RouterConfig {
     pub storage_context_headers: HashMap<String, String>,
     #[serde(default)]
     pub tenant_resolution: TenantResolutionConfig,
-    /// Set to -1 to disable rate limiting
+    /// Standing-concurrency cap; -1 disables. Each admission permit is
+    /// held for the full response, including streaming bodies.
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
     pub queue_timeout_secs: u64,
-    /// If not set, defaults to max_concurrent_requests
+    /// Unset or 0 = no refill: `max_concurrent_requests` bounds standing
+    /// concurrency alone.
     pub rate_limit_tokens_per_second: Option<i32>,
     /// Enable the priority-aware admission scheduler. When false (default),
     /// the legacy concurrency-limit middleware stays wired — zero behavior
@@ -177,6 +259,13 @@ pub struct RouterConfig {
     /// PEM format, loaded from ca_cert_paths during config creation
     #[serde(default)]
     pub ca_certificates: Vec<Vec<u8>>,
+    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext) on all
+    /// engine-directed connections — request dispatch and health/probe traffic
+    /// alike — multiplexing every request to a worker over one connection
+    /// instead of one TCP connection per in-flight request. Requires every
+    /// HTTP worker to serve HTTP/2 without an upgrade handshake.
+    #[serde(default)]
+    pub upstream_http2: bool,
     /// Loaded from mcp_config_path during config creation
     #[serde(skip)]
     pub mcp_config: Option<smg_mcp::McpConfig>,
@@ -239,6 +328,14 @@ pub struct TokenizerCacheConfig {
 
 fn default_load_monitor_interval_secs() -> u64 {
     10
+}
+
+fn default_job_queue_capacity() -> usize {
+    1000
+}
+
+fn default_job_queue_concurrency() -> usize {
+    200
 }
 
 fn default_enable_l0() -> bool {
@@ -407,12 +504,23 @@ pub enum ManualAssignmentMode {
     MinLoad,
     /// Select worker with minimum active routing keys
     MinGroup,
+    /// Delegate the first assignment for a key to the underlying routing
+    /// policy, then pin. With `--policy manual` (no underlying policy to
+    /// delegate to) this falls back to min-load.
+    Delegate,
 }
 
-/// Per-request sticky-routing override: when `X-SMG-Routing-Key` is present, any
+/// Per-request sticky-routing override: when a sticky key is present, any
 /// eligible policy routes via manual sticky-map semantics. Reuses the manual
 /// policy knobs for the sticky map; eviction defaults match the manual policy so
 /// config-file users with only `enabled: true` still get TTL eviction (no leak).
+///
+/// Key priority is fixed: a key derived from the typed body's `rid` (per-turn
+/// `_t<n>` and per-retry `_r<n>` suffixes stripped, so every turn of a
+/// conversation shares one key) wins over the routing-key headers; the first
+/// configured header carrying a valid value is the fallback when no rid is
+/// present. Raw-streamed requests have no readable body and therefore derive
+/// keys from the headers only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingKeyOverrideConfig {
     /// When false, policies are used unchanged.
@@ -420,10 +528,29 @@ pub struct RoutingKeyOverrideConfig {
     pub enabled: bool,
     #[serde(default = "default_manual_eviction_interval_secs")]
     pub eviction_interval_secs: u64,
-    #[serde(default = "default_manual_max_idle_secs")]
+    #[serde(
+        default = "default_manual_max_idle_secs",
+        alias = "sticky_key_idle_secs"
+    )]
     pub max_idle_secs: u64,
-    #[serde(default)]
+    /// Defaults to `delegate`: first-seen keys route via the underlying
+    /// policy, then pin.
+    #[serde(default = "default_override_assignment_mode")]
     pub assignment_mode: ManualAssignmentMode,
+    /// Ordered header names consulted for the routing key; the first header
+    /// present with a valid value (non-empty UTF-8 within the byte cap) wins.
+    /// When the override is enabled, header keys get the same per-turn /
+    /// per-retry suffix stripping as rid-derived keys.
+    #[serde(default = "default_routing_key_headers")]
+    pub headers: Vec<String>,
+}
+
+fn default_override_assignment_mode() -> ManualAssignmentMode {
+    ManualAssignmentMode::Delegate
+}
+
+fn default_routing_key_headers() -> Vec<String> {
+    vec!["x-smg-routing-key".to_string()]
 }
 
 impl Default for RoutingKeyOverrideConfig {
@@ -432,9 +559,22 @@ impl Default for RoutingKeyOverrideConfig {
             enabled: false,
             eviction_interval_secs: default_manual_eviction_interval_secs(),
             max_idle_secs: default_manual_max_idle_secs(),
-            assignment_mode: ManualAssignmentMode::default(),
+            assignment_mode: default_override_assignment_mode(),
+            headers: default_routing_key_headers(),
         }
     }
+}
+
+/// Under-layer index the cache_aware policy keeps per model.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheIndexKind {
+    /// Radix prefix tree (default).
+    #[default]
+    Tree,
+    /// TTL'd exact-match placement map keyed on quantized request heads
+    /// (`cache_boundaries`); the radix tree is neither consulted nor populated.
+    Hash,
 }
 
 /// Policy configuration for routing
@@ -455,8 +595,17 @@ pub enum PolicyConfig {
 
     #[serde(rename = "cache_aware")]
     CacheAware {
+        /// Minimum matched-prefix share before a request pins to a holder.
+        #[serde(alias = "cache_match_threshold")]
         cache_threshold: f32,
+        /// Spill gate, absolute part: the selected worker spills to
+        /// least-loaded when its load exceeds the healthy-fleet mean by this
+        /// many requests AND by `balance_rel_threshold`.
+        #[serde(alias = "spill_abs_threshold")]
         balance_abs_threshold: usize,
+        /// Spill gate, relative part (multiple of the healthy-fleet mean);
+        /// fires only together with `balance_abs_threshold`.
+        #[serde(alias = "spill_rel_threshold")]
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
@@ -470,8 +619,38 @@ pub enum PolicyConfig {
         /// triggers shedding regardless of spread. `>= 1.0` disables (default).
         #[serde(default = "default_balance_token_usage_threshold")]
         overload_token_usage_threshold: f32,
+        /// Anti-hotspot decay for event-driven overlap credit: each
+        /// candidate's overlap score is divided by `1 + overlap_decay * x`,
+        /// with `x` the worker's waiting-prefill backlog (blocks in excess of
+        /// the candidate minimum) per request block. `0.0` disables (default).
+        #[serde(default = "default_overlap_decay")]
+        overlap_decay: f32,
+        /// Softmax temperature for event-driven selection over min-max
+        /// normalized scores. `0.0` (default) is exact argmax with the
+        /// existing tie-breaks; larger values spread picks across candidates.
+        #[serde(default = "default_selection_temperature")]
+        selection_temperature: f32,
+        /// Index under-layer: `tree` (default) or `hash` (TTL'd exact-match
+        /// placement map over `cache_boundaries` heads).
+        #[serde(default)]
+        cache_index: CacheIndexKind,
+        /// Seconds a cache-affinity placement stays routable; should
+        /// approximate serving-engine cache retention.
+        #[serde(default = "default_cache_ttl_secs")]
+        cache_ttl_secs: u64,
+        /// Boundary token positions for the hash index (copied from the
+        /// shared `cache_boundaries` config).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cache_boundaries: Vec<usize>,
     },
 
+    /// Power-of-two choices policy: samples two workers and routes to the one
+    /// with the lower expected wait, scored like `least_load`
+    /// (`(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`).
+    /// TODO: Implement per-policy load monitoring intervals.
+    /// Currently, load_check_interval_secs is populated from RouterConfig.load_monitor_interval_secs,
+    /// but WorkerMonitor does not yet use per-policy intervals. This field is reserved for
+    /// future support of different polling cadences per policy.
     #[serde(rename = "power_of_two")]
     PowerOfTwo { load_check_interval_secs: u64 },
 
@@ -481,6 +660,10 @@ pub enum PolicyConfig {
     /// from the load monitor with in-flight correction. See `policies/least_load.rs`.
     #[serde(rename = "least_load")]
     LeastLoad {
+        /// TODO: Implement per-policy load monitoring intervals.
+        /// Currently, load_check_interval_secs is populated from RouterConfig.load_monitor_interval_secs,
+        /// but WorkerMonitor does not yet use per-policy intervals. This field is reserved for
+        /// future support of different polling cadences per policy.
         #[serde(default = "default_least_load_interval")]
         load_check_interval_secs: u64,
         /// KV-pressure weight `λ_t` (seconds): the time-cost of KV contention,
@@ -496,13 +679,22 @@ pub enum PolicyConfig {
         /// per-replica generation rate; co-tunes with `kv_pressure_weight`.
         #[serde(default = "default_least_load_throughput")]
         default_throughput: f64,
+        /// Per-worker waiting-queue cap: skip workers whose reported waiting
+        /// requests, plus dispatches since their last poll, have reached this
+        /// count; when every candidate is at the cap, selection fails and the
+        /// request falls to the router's admission queue. `0` disables. Set
+        /// below the engine's max batch size.
+        #[serde(default)]
+        max_waiting_requests: u32,
     },
 
     #[serde(rename = "bucket")]
     Bucket {
         /// Absolute load difference threshold for load balancing
+        #[serde(alias = "spill_abs_threshold")]
         balance_abs_threshold: usize,
         /// Relative load ratio threshold for load balancing
+        #[serde(alias = "spill_rel_threshold")]
         balance_rel_threshold: f32,
         /// Interval between bucket boundary adjustment cycles (seconds)
         bucket_adjust_interval_secs: usize,
@@ -518,8 +710,12 @@ pub enum PolicyConfig {
         /// Interval between TTL eviction cycles (seconds, default: 60)
         #[serde(default = "default_manual_eviction_interval_secs")]
         eviction_interval_secs: u64,
-        /// Maximum idle time before eviction (seconds, default: 14400 = 4 hours)
-        #[serde(default = "default_manual_max_idle_secs")]
+        /// Maximum idle time before a key is evicted (seconds, default:
+        /// 14400 = 4 hours)
+        #[serde(
+            default = "default_manual_max_idle_secs",
+            alias = "sticky_key_idle_secs"
+        )]
         max_idle_secs: u64,
         /// Assignment mode for new routing keys (default: random)
         #[serde(default)]
@@ -537,16 +733,27 @@ pub enum PolicyConfig {
     /// A lightweight alternative to cache_aware radix tree.
     /// Routes requests based on prefix token hash for cache locality.
     /// - Uses consistent hash ring with bounded load balancing
-    /// - Walks ring if worker is overloaded (load > avg * load_factor)
+    /// - Diverts to the least loaded worker when the hashed one is overloaded
     /// - O(log n) lookup instead of O(prefix_len) radix tree traversal
     #[serde(rename = "prefix_hash")]
     PrefixHash {
-        /// Number of prefix tokens to hash (default: 256)
+        /// Number of prefix tokens to hash, or four times as many characters
+        /// of the prompt when the request is untokenized (default: 256)
         #[serde(default = "default_prefix_token_count")]
         prefix_token_count: usize,
-        /// Load factor threshold - walk ring if load > avg * factor (default: 1.25)
+        /// Relative load threshold - a worker is overloaded when its load
+        /// exceeds both avg * factor and the absolute margin (default: 1.25)
         #[serde(default = "default_load_factor")]
         load_factor: f64,
+        /// Absolute load difference over average a worker must also exceed
+        /// before it counts as overloaded (default: 10)
+        #[serde(default = "default_prefix_hash_balance_abs_threshold")]
+        balance_abs_threshold: usize,
+        /// Resolved copy of `RouterConfig::cache_boundaries`: ascending token
+        /// positions; requests hash at the deepest boundary they reach.
+        /// Empty = hash at `prefix_token_count` only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cache_boundaries: Vec<usize>,
     },
 }
 
@@ -558,12 +765,36 @@ fn default_balance_token_usage_threshold() -> f32 {
     1.0
 }
 
+fn default_overlap_decay() -> f32 {
+    0.0
+}
+
+fn default_selection_temperature() -> f32 {
+    0.0
+}
+
+fn default_cache_ttl_secs() -> u64 {
+    180
+}
+
 fn default_prefix_token_count() -> usize {
     256
 }
 
 fn default_load_factor() -> f64 {
     1.25
+}
+
+fn default_upstream_pool_idle_timeout_secs() -> u64 {
+    3
+}
+
+fn default_stream_body_stall_timeout_secs() -> u64 {
+    300
+}
+
+fn default_prefix_hash_balance_abs_threshold() -> usize {
+    10
 }
 
 fn default_manual_eviction_interval_secs() -> u64 {
@@ -705,7 +936,9 @@ pub struct HealthCheckConfig {
     pub check_interval_secs: u64,
     pub endpoint: String,
     pub disable_health_check: bool,
-    #[serde(default)]
+    /// Let workers recover after prolonged failure: removal re-enters them
+    /// through service discovery once their engine returns.
+    #[serde(default, alias = "worker_auto_recovery")]
     pub remove_unhealthy_workers: bool,
     /// Seconds to keep a Ready worker in `Draining` after `RemoveWorker`
     /// is submitted before the registry entry is removed. Lets in-flight
@@ -806,17 +1039,29 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             policy: PolicyConfig::Random,
+            cache_boundaries: Vec::new(),
             routing_key_override: RoutingKeyOverrideConfig::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
             health_check_port: None,
             runtime_worker_threads: None,
-            max_payload_size: 536_870_912,     // 512MB
-            request_timeout_secs: 1800,        // 30 minutes
+            max_payload_size: 536_870_912, // 512MB
+            stream_request_bodies_over: 0,
+            stream_body_stall_timeout_secs: default_stream_body_stall_timeout_secs(),
+            request_timeout_secs: 1800, // 30 minutes
+            upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_delay_secs: 0,
             worker_startup_check_interval_secs: 30,
+            job_queue_capacity: default_job_queue_capacity(),
+            job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
+            disable_load_monitoring: false,
+            worker_overload_protection: false,
+            worker_overload_waiting_requests: None,
+            worker_overload_token_usage: None,
+            kv_indexer_ttl_secs: None,
+            kv_indexer_max_entries: None,
             engine_metrics: false,
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,
@@ -852,6 +1097,7 @@ impl Default for RouterConfig {
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
             startup_worker_runtime_type: None,
+            zmq_engine_count: None,
             model_path: None,
             tokenizer_path: None,
             chat_template: None,
@@ -866,6 +1112,7 @@ impl Default for RouterConfig {
             tokenizer_cache: TokenizerCacheConfig::default(),
             client_identity: None,
             ca_certificates: vec![],
+            upstream_http2: false,
             mcp_config: None,
             enable_wasm: false,
             storage_hook_wasm_path: None,
@@ -959,7 +1206,9 @@ mod tests {
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 3001);
         assert_eq!(config.max_payload_size, 536_870_912);
+        assert_eq!(config.stream_request_bodies_over, 0);
         assert_eq!(config.request_timeout_secs, 1800);
+        assert_eq!(config.upstream_pool_idle_timeout_secs, 3);
         assert_eq!(config.worker_startup_timeout_secs, 1800);
         assert_eq!(config.worker_startup_check_interval_secs, 30);
         assert_eq!(config.load_monitor_interval_secs, 10);
@@ -1051,6 +1300,211 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_request_bodies_over_serde_roundtrip_and_backward_compat() {
+        // Config files predating the field deserialize to the disabled default.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("stream_request_bodies_over")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.stream_request_bodies_over, 0);
+
+        // When set, the value round-trips.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .stream_request_bodies_over(4 * 1024 * 1024)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.stream_request_bodies_over, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_job_queue_sizing_serde_default_and_roundtrip() {
+        // Config files predating the fields deserialize to today's values.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("job_queue_capacity").unwrap();
+        obj.remove("job_queue_concurrency").unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.job_queue_capacity, 1000);
+        assert_eq!(without.job_queue_concurrency, 200);
+
+        // When set, the values round-trip.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .job_queue_capacity(20_000)
+            .job_queue_concurrency(500)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.job_queue_capacity, 20_000);
+        assert_eq!(with.job_queue_concurrency, 500);
+    }
+
+    #[test]
+    fn test_job_queue_sizing_rejects_zero() {
+        // Config-file values bypass the CLI parsers, so validation is the
+        // backstop against a zero-capacity channel panic at startup and
+        // mirrors the CLI upper bounds.
+        for (capacity, concurrency) in [(0, 200), (1000, 0), (1_000_001, 200), (1000, 100_001)] {
+            let config = RouterConfig::builder()
+                .regular_mode(vec![])
+                .job_queue_capacity(capacity)
+                .job_queue_concurrency(concurrency)
+                .build_unchecked();
+            assert!(config.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn test_stream_body_stall_timeout_serde_default_and_roundtrip() {
+        // Config files predating the field deserialize to the 300s default.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("stream_body_stall_timeout_secs")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.stream_body_stall_timeout_secs, 300);
+
+        // The disabling zero round-trips instead of reverting to the default.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .stream_body_stall_timeout_secs(0)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.stream_body_stall_timeout_secs, 0);
+    }
+
+    #[test]
+    fn alias_field_spellings_deserialize_and_serialize_canonically() {
+        // Config files may use the intent-revealing spellings; alias in,
+        // canonical out.
+        let mut json = serde_json::to_value(RouterConfig::default()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        let v = obj.remove("routing_key_override").unwrap();
+        obj.insert("sticky_sessions".to_string(), v);
+        let hc = obj
+            .get_mut("health_check")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        hc.remove("remove_unhealthy_workers").unwrap();
+        hc.insert(
+            "worker_auto_recovery".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let cfg: RouterConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.health_check.remove_unhealthy_workers);
+        let out = serde_json::to_string(&cfg).unwrap();
+        assert!(out.contains("routing_key_override"));
+        assert!(out.contains("remove_unhealthy_workers"));
+        assert!(!out.contains("sticky_sessions"));
+        assert!(!out.contains("worker_auto_recovery"));
+    }
+
+    #[test]
+    fn policy_alias_field_spellings_deserialize_identically() {
+        let canonical: PolicyConfig = serde_json::from_value(serde_json::json!({
+            "type": "cache_aware",
+            "cache_threshold": 0.6,
+            "balance_abs_threshold": 8,
+            "balance_rel_threshold": 1.2,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1024,
+        }))
+        .unwrap();
+        let aliased: PolicyConfig = serde_json::from_value(serde_json::json!({
+            "type": "cache_aware",
+            "cache_match_threshold": 0.6,
+            "spill_abs_threshold": 8,
+            "spill_rel_threshold": 1.2,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1024,
+        }))
+        .unwrap();
+        assert_eq!(format!("{canonical:?}"), format!("{aliased:?}"));
+        let out = serde_json::to_string(&aliased).unwrap();
+        assert!(!out.contains("cache_match_threshold"));
+        assert!(!out.contains("spill_abs_threshold"));
+
+        let manual: PolicyConfig = serde_json::from_value(serde_json::json!({
+            "type": "manual",
+            "sticky_key_idle_secs": 123,
+        }))
+        .unwrap();
+        match manual {
+            PolicyConfig::Manual { max_idle_secs, .. } => assert_eq!(max_idle_secs, 123),
+            other => panic!("expected manual policy, got {other:?}"),
+        }
+
+        let override_cfg: RoutingKeyOverrideConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "sticky_key_idle_secs": 321,
+        }))
+        .unwrap();
+        assert_eq!(override_cfg.max_idle_secs, 321);
+    }
+
+    #[test]
+    fn test_routing_key_override_serde_default_and_roundtrip() {
+        // Config files with only `enabled` deserialize to the defaults.
+        let json: serde_json::Value = serde_json::json!({ "enabled": true });
+        let cfg: RoutingKeyOverrideConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.assignment_mode, ManualAssignmentMode::Delegate);
+        assert_eq!(cfg.headers, vec!["x-smg-routing-key".to_string()]);
+
+        let cfg = RoutingKeyOverrideConfig {
+            enabled: true,
+            assignment_mode: ManualAssignmentMode::MinLoad,
+            headers: vec!["x-routing-key".into(), "x-smg-routing-key".into()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let roundtripped: RoutingKeyOverrideConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.assignment_mode, ManualAssignmentMode::MinLoad);
+        assert_eq!(
+            roundtripped.headers,
+            vec!["x-routing-key".to_string(), "x-smg-routing-key".to_string()]
+        );
+    }
+
+    #[test]
+    fn delegate_assignment_mode_survives_serde_roundtrip() {
+        let json = serde_json::to_string(&ManualAssignmentMode::Delegate).unwrap();
+        assert_eq!(json, "\"delegate\"");
+        let back: ManualAssignmentMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ManualAssignmentMode::Delegate);
+
+        let cfg = RoutingKeyOverrideConfig {
+            enabled: true,
+            assignment_mode: ManualAssignmentMode::Delegate,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let roundtripped: RoutingKeyOverrideConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.assignment_mode, ManualAssignmentMode::Delegate);
+    }
+
+    #[test]
+    fn assignment_mode_defaults_split_by_context() {
+        // Manual policy standalone keeps random; the override sticky map
+        // defaults to delegate. Both are operator-visible defaults.
+        assert_eq!(
+            ManualAssignmentMode::default(),
+            ManualAssignmentMode::Random
+        );
+        assert_eq!(
+            RoutingKeyOverrideConfig::default().assignment_mode,
+            ManualAssignmentMode::Delegate
+        );
+    }
+
+    #[test]
     fn test_routing_mode_is_pd_mode() {
         let regular = RoutingMode::Regular {
             worker_urls: vec!["http://worker1".to_string()],
@@ -1134,6 +1588,11 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -1158,6 +1617,11 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -1183,6 +1647,11 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         };
 
         match cache_aware {
@@ -1202,6 +1671,111 @@ mod tests {
             }
             _ => panic!("Expected CacheAware"),
         }
+    }
+
+    #[test]
+    fn test_cache_aware_pressure_knobs_default_off_when_absent() {
+        // Config files written before the knobs existed must keep parsing,
+        // with both knobs off (behavior-preserving defaults).
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.5,
+            "balance_abs_threshold": 32,
+            "balance_rel_threshold": 1.1,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1000
+        }"#;
+        let policy: PolicyConfig = serde_json::from_str(json).unwrap();
+        match policy {
+            PolicyConfig::CacheAware {
+                overlap_decay,
+                selection_temperature,
+                ..
+            } => {
+                assert_eq!(overlap_decay, 0.0);
+                assert_eq!(selection_temperature, 0.0);
+            }
+            _ => panic!("Expected CacheAware"),
+        }
+    }
+
+    #[test]
+    fn test_cache_aware_index_fields_default_when_absent() {
+        // Config files written before the hash index existed must keep
+        // parsing as tree mode with the default TTL and no boundaries.
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.5,
+            "balance_abs_threshold": 32,
+            "balance_rel_threshold": 1.1,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1000
+        }"#;
+        let policy: PolicyConfig = serde_json::from_str(json).unwrap();
+        match policy {
+            PolicyConfig::CacheAware {
+                cache_index,
+                cache_ttl_secs,
+                cache_boundaries,
+                ..
+            } => {
+                assert_eq!(cache_index, CacheIndexKind::Tree);
+                assert_eq!(cache_ttl_secs, 180);
+                assert!(cache_boundaries.is_empty());
+            }
+            _ => panic!("Expected CacheAware"),
+        }
+    }
+
+    #[test]
+    fn test_cache_aware_index_fields_round_trip() {
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.5,
+            "balance_abs_threshold": 32,
+            "balance_rel_threshold": 1.1,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1000,
+            "cache_index": "hash",
+            "cache_ttl_secs": 90,
+            "cache_boundaries": [2048, 8192]
+        }"#;
+        let policy: PolicyConfig = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_string(&policy).unwrap();
+        assert!(serialized.contains("\"cache_index\":\"hash\""));
+        assert!(serialized.contains("\"cache_ttl_secs\":90"));
+        assert!(serialized.contains("\"cache_boundaries\":[2048,8192]"));
+        match serde_json::from_str::<PolicyConfig>(&serialized).unwrap() {
+            PolicyConfig::CacheAware {
+                cache_index,
+                cache_ttl_secs,
+                cache_boundaries,
+                ..
+            } => {
+                assert_eq!(cache_index, CacheIndexKind::Hash);
+                assert_eq!(cache_ttl_secs, 90);
+                assert_eq!(cache_boundaries, vec![2048, 8192]);
+            }
+            _ => panic!("Expected CacheAware"),
+        }
+    }
+
+    #[test]
+    fn test_router_config_cache_boundaries_default_and_skip() {
+        // Absent in old configs → empty; empty is skipped on serialize.
+        let config = RouterConfig::default();
+        assert!(config.cache_boundaries.is_empty());
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("cache_boundaries"));
+
+        let with_boundaries = RouterConfig {
+            cache_boundaries: vec![16, 64],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&with_boundaries).unwrap();
+        assert!(json.contains("\"cache_boundaries\":[16,64]"));
+        let parsed: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.cache_boundaries, vec![16, 64]);
     }
 
     #[test]
@@ -1596,6 +2170,11 @@ mod tests {
                 block_size: 16,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1629,6 +2208,11 @@ mod tests {
                 block_size: 16,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
             }),
             decode_policy: None,
         };
@@ -1688,6 +2272,11 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         };
 
         match pd.get_prefill_policy(&main_policy) {

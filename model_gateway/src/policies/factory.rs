@@ -19,17 +19,27 @@ impl PolicyFactory {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::Passthrough => Arc::new(PassthroughPolicy::new()),
-            PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
+            PolicyConfig::PowerOfTwo { .. } => {
+                // TODO: Pass load_check_interval_secs to WorkerMonitor for per-policy polling intervals.
+                // Currently, WorkerMonitor uses RouterConfig.load_monitor_interval_secs globally.
+                Arc::new(PowerOfTwoPolicy::new())
+            }
             PolicyConfig::LeastLoad {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
+                max_waiting_requests,
                 ..
-            } => Arc::new(LeastLoadPolicy::with_params(
-                *kv_pressure_weight,
-                *mean_prefill_tokens,
-                *default_throughput,
-            )),
+            } => {
+                // TODO: Pass load_check_interval_secs to WorkerMonitor for per-policy polling intervals.
+                // Currently, WorkerMonitor uses RouterConfig.load_monitor_interval_secs globally.
+                Arc::new(LeastLoadPolicy::with_params(
+                    *kv_pressure_weight,
+                    *mean_prefill_tokens,
+                    *default_throughput,
+                    *max_waiting_requests,
+                ))
+            }
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold,
@@ -39,6 +49,11 @@ impl PolicyFactory {
                 block_size,
                 balance_token_usage_threshold,
                 overload_token_usage_threshold,
+                overlap_decay,
+                selection_temperature,
+                cache_index,
+                cache_ttl_secs,
+                cache_boundaries,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -49,6 +64,11 @@ impl PolicyFactory {
                     block_size: *block_size,
                     balance_token_usage_threshold: *balance_token_usage_threshold,
                     overload_token_usage_threshold: *overload_token_usage_threshold,
+                    overlap_decay: *overlap_decay,
+                    selection_temperature: *selection_temperature,
+                    cache_index: *cache_index,
+                    cache_ttl_secs: *cache_ttl_secs,
+                    cache_boundaries: cache_boundaries.clone(),
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
@@ -80,10 +100,14 @@ impl PolicyFactory {
             PolicyConfig::PrefixHash {
                 prefix_token_count,
                 load_factor,
+                balance_abs_threshold,
+                cache_boundaries,
             } => {
                 let config = PrefixHashConfig {
                     prefix_token_count: *prefix_token_count,
                     load_factor: *load_factor,
+                    balance_abs_threshold: *balance_abs_threshold,
+                    cache_boundaries: cache_boundaries.clone(),
                 };
                 Arc::new(PrefixHashPolicy::new(config))
             }
@@ -139,6 +163,11 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         });
         assert_eq!(policy.name(), "cache_aware");
 
@@ -162,6 +191,8 @@ mod tests {
         let policy = PolicyFactory::create_from_config(&PolicyConfig::PrefixHash {
             prefix_token_count: 100,
             load_factor: 0.8,
+            balance_abs_threshold: 10,
+            cache_boundaries: vec![2048, 8192],
         });
         assert_eq!(policy.name(), "prefix_hash");
     }

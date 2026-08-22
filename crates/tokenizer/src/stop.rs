@@ -72,9 +72,6 @@ pub struct StopSequenceDecoder {
     visible_boundary_idx: usize,
     /// Buffer for partial matches (the "jail")
     jail_buffer: String,
-    /// Maximum bytes to retain in jail_buffer — equal to the longest stop sequence.
-    /// Text beyond this window cannot participate in a future match and is safe to drain.
-    jail_max_bytes: usize,
     /// Whether we've stopped
     stopped: bool,
     /// The string stop sequence that triggered the stop, if any. Set only for
@@ -109,17 +106,6 @@ impl StopSequenceDecoder {
                 .map(|s| s.as_str()),
         );
 
-        // Precompute the maximum stop sequence length in bytes.
-        // The jail buffer only needs to retain this many bytes — any text older than
-        // this window cannot be part of a future match and is safe to emit.
-        let jail_max_bytes = config
-            .stop_sequences
-            .iter()
-            .chain(&config.visible_stop_sequences)
-            .map(|s| s.len())
-            .max()
-            .unwrap_or(0);
-
         let aho_corasick = if patterns.is_empty() {
             None
         } else {
@@ -140,11 +126,50 @@ impl StopSequenceDecoder {
             aho_corasick,
             visible_boundary_idx,
             jail_buffer: String::new(),
-            jail_max_bytes,
             stopped: false,
             matched_stop: None,
             token_only,
         }
+    }
+
+    /// Byte length of the longest suffix of the jail buffer that is a *proper*
+    /// prefix of some stop sequence.
+    ///
+    /// That suffix is the only part of the buffer that can still grow into a stop
+    /// sequence once more tokens arrive; everything before it can never take part
+    /// in a match. A full-length match is excluded because the Aho-Corasick scan
+    /// has already ruled one out by the time this runs.
+    fn pending_match_len(&self) -> usize {
+        let buf = self.jail_buffer.as_bytes();
+        let Some(&last) = buf.last() else {
+            return 0;
+        };
+
+        let mut longest = 0;
+        for pattern in self
+            .config
+            .stop_sequences
+            .iter()
+            .chain(&self.config.visible_stop_sequences)
+        {
+            let pat = pattern.as_bytes();
+            // Only proper prefixes count, and only ones longer than the best so far.
+            let max_n = pat.len().saturating_sub(1).min(buf.len());
+            for n in (longest + 1..=max_n).rev() {
+                // Cheap necessary condition first: the prefix has to end on the
+                // byte the buffer ends on, which skips most of the comparisons.
+                if pat[n - 1] != last {
+                    continue;
+                }
+                // A prefix ending mid-character would split a multi-byte codepoint
+                // in the buffer, so only consider character-aligned prefixes.
+                if pattern.is_char_boundary(n) && buf.ends_with(&pat[..n]) {
+                    longest = n;
+                    break;
+                }
+            }
+        }
+        longest
     }
 
     /// Process a single token
@@ -190,27 +215,13 @@ impl StopSequenceDecoder {
             return Ok(SequenceDecoderOutput::Text(new_text));
         }
 
-        let old_len = self.jail_buffer.len();
         self.jail_buffer.push_str(&new_text);
 
-        // Check for stop sequences using Aho-Corasick, scoped to avoid rescanning
-        // old text: a match can start no earlier than `old_len - jail_max_bytes + 1`
-        // because any earlier match would have been found on a previous call.
+        // Check for stop sequences using Aho-Corasick. The jail only ever retains a
+        // proper prefix of some pattern, so the buffer is bounded by
+        // `longest_pattern + one token of text` and scanning it whole is cheap.
         if let Some(ac) = &self.aho_corasick {
-            let search_start = if old_len >= self.jail_max_bytes {
-                // Walk forward to a char boundary (we must not start mid-codepoint)
-                let raw = old_len + 1 - self.jail_max_bytes;
-                let mut start = raw;
-                while start < self.jail_buffer.len() && !self.jail_buffer.is_char_boundary(start) {
-                    start += 1;
-                }
-                start
-            } else {
-                0
-            };
-
-            let input = Input::new(&self.jail_buffer).span(search_start..self.jail_buffer.len());
-            if let Some(mat) = ac.find(input) {
+            if let Some(mat) = ac.find(Input::new(&self.jail_buffer)) {
                 self.stopped = true;
                 self.matched_stop = Some(self.jail_buffer[mat.start()..mat.end()].to_string());
                 let is_visible = mat.pattern().as_usize() >= self.visible_boundary_idx;
@@ -233,25 +244,17 @@ impl StopSequenceDecoder {
             }
         }
 
-        // Drain the jail buffer down to at most jail_max_bytes, emitting safe text.
-        // Any text older than the window cannot be part of a future stop sequence match.
-        if self.jail_buffer.len() > self.jail_max_bytes {
-            // Find a char-safe drain point: we want to keep the last jail_max_bytes,
-            // but must not split a multi-byte UTF-8 character.
-            let mut drain_to = self.jail_buffer.len() - self.jail_max_bytes;
-            while drain_to > 0 && !self.jail_buffer.is_char_boundary(drain_to) {
-                // Move backward to retain at least jail_max_bytes (safe: retains more, not less)
-                drain_to -= 1;
-            }
-
-            if drain_to > 0 {
-                let suffix = self.jail_buffer.split_off(drain_to);
-                let to_output = std::mem::replace(&mut self.jail_buffer, suffix);
-                return Ok(SequenceDecoderOutput::Text(to_output));
-            }
+        // Withhold only the longest suffix that is still a *partial* stop sequence.
+        // Everything before it can never take part in a match, so emit it now
+        // rather than trailing the stream by the length of the longest stop word.
+        let drain_to = self.jail_buffer.len() - self.pending_match_len();
+        if drain_to > 0 {
+            let suffix = self.jail_buffer.split_off(drain_to);
+            let to_output = std::mem::replace(&mut self.jail_buffer, suffix);
+            return Ok(SequenceDecoderOutput::Text(to_output));
         }
 
-        // Buffer is within the window — hold everything for potential partial match
+        // The whole buffer is a partial stop sequence — hold it.
         Ok(SequenceDecoderOutput::Held)
     }
 
@@ -502,19 +505,85 @@ mod tests {
     }
 
     #[test]
-    fn test_flush_after_partial() {
+    fn test_flush_returns_pending_partial_match() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        // "Hello" is a proper prefix of the stop sequence, so it must be held
+        // back: the next token could complete the match.
+        let config = StopSequenceConfig::default().with_stop_sequence("Hello world");
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        assert_eq!(
+            decoder.process_token(1).unwrap(), // "Hello"
+            SequenceDecoderOutput::Held,
+            "a proper prefix of the stop sequence must be withheld"
+        );
+
+        // The stream ended without completing the match, so flush releases it.
+        assert_eq!(
+            decoder.flush(),
+            SequenceDecoderOutput::Text("Hello".to_string())
+        );
+        assert_eq!(decoder.flush(), SequenceDecoderOutput::Held);
+    }
+
+    #[test]
+    fn test_text_that_cannot_match_is_emitted_immediately() {
         let tokenizer = Arc::new(MockTokenizer::new());
         let config = StopSequenceConfig::default().with_stop_sequence("NEVER_MATCH");
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
 
-        // Process a token
-        decoder.process_token(1).unwrap(); // "Hello"
+        // No suffix of "Hello" can grow into "NEVER_MATCH", so nothing is jailed
+        // and the text goes out with the token that produced it.
+        assert_eq!(
+            decoder.process_token(1).unwrap(),
+            SequenceDecoderOutput::Text("Hello".to_string())
+        );
 
-        // Flush should return any remaining text in jail
-        let result = decoder.flush();
+        // Nothing is left behind for the caller to flush unparsed at end of stream.
+        assert_eq!(decoder.flush(), SequenceDecoderOutput::Held);
+    }
 
-        // After processing, flush should work
-        assert!(matches!(result, SequenceDecoderOutput::Text(_)));
+    #[test]
+    fn test_control_token_is_not_sliced_by_the_jail() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        // A stop sequence long enough to span a control token, and sharing its
+        // "<|" opening. This is the shape that leaked: the jail used to retain
+        // the last `len(stop)` bytes unconditionally, so a control token landing
+        // on that boundary was cut in half and its tail escaped through `flush()`.
+        let config = StopSequenceConfig::default().with_stop_sequence("<|im_end|>");
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        // "<|im_start|>" cannot become "<|im_end|>" — no suffix of it is a prefix
+        // of the stop sequence — so it must be emitted whole and at once.
+        assert_eq!(
+            decoder.process_token(1001).unwrap(),
+            SequenceDecoderOutput::Text("<|im_start|>".to_string())
+        );
+        assert_eq!(
+            decoder.flush(),
+            SequenceDecoderOutput::Held,
+            "no fragment of the control token may be left for an unparsed flush"
+        );
+        assert!(!decoder.is_stopped());
+    }
+
+    #[test]
+    fn test_partial_match_is_released_when_it_diverges() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let config = StopSequenceConfig::default().with_stop_sequence("Hello world");
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        // "Hello" looks like the start of the stop sequence — hold it.
+        assert_eq!(
+            decoder.process_token(1).unwrap(),
+            SequenceDecoderOutput::Held
+        );
+
+        // "test" makes the match impossible; the held text must come back out
+        // in full rather than being dropped or trimmed.
+        let out = decoder.process_token(3).unwrap();
+        assert_eq!(out, SequenceDecoderOutput::Text("Hello test".to_string()));
+        assert_eq!(decoder.flush(), SequenceDecoderOutput::Held);
     }
 
     #[test]
@@ -663,12 +732,14 @@ mod tests {
     /// Tokens: 3 ("test"), 1 ("Hello"), 2 ("world")
     /// Stop sequence: "Hello world" (11 bytes)
     ///
-    /// With the bounded jail window, all text is held until the jail exceeds
-    /// jail_max_bytes (11). The jail accumulates:
-    ///   - Token 3: jail = "test" (4 bytes ≤ 11) → Held
-    ///   - Token 1: jail = "test Hello" (10 bytes ≤ 11) → Held
-    ///   - Token 2: jail = "test Hello world" → Aho-Corasick matches "Hello world"
-    ///     → StoppedWithText("test ") (text before the hidden stop sequence)
+    /// Only a suffix that is a proper prefix of the stop sequence is withheld,
+    /// so text flows out as soon as it can no longer be part of a match:
+    ///   - Token 3: "test" cannot start "Hello world"           → Text("test")
+    ///   - Token 1: jail = " Hello", holds "Hello"              → Text(" ")
+    ///   - Token 2: jail = "Hello world" — Aho-Corasick matches → Stopped
+    ///
+    /// The caller sees "test " either way; the difference is that it arrives
+    /// with the tokens that produced it instead of trailing the stream.
     #[test]
     fn test_stop_sequence_spanning_tokens_with_preceding_text() {
         let tokenizer = Arc::new(MockTokenizer::new());
@@ -676,39 +747,38 @@ mod tests {
         let config = StopSequenceConfig::default().with_stop_sequence("Hello world");
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
 
-        // Token 3 ("test"): jail = "test" (4 bytes), within the 11-byte window → Held
-        let result1 = decoder.process_token(3).unwrap();
-        assert!(
-            matches!(result1, SequenceDecoderOutput::Held),
-            "Expected Held for token within jail window, got {result1:?}"
-        );
+        let mut emitted = String::new();
+        let mut stopped = false;
+        for token in [3u32, 1, 2] {
+            match decoder.process_token(token).unwrap() {
+                SequenceDecoderOutput::Text(t) => emitted.push_str(&t),
+                SequenceDecoderOutput::StoppedWithText(t) => {
+                    emitted.push_str(&t);
+                    stopped = true;
+                }
+                SequenceDecoderOutput::Stopped => stopped = true,
+                SequenceDecoderOutput::Held => {}
+            }
+        }
 
-        // Token 1 ("Hello"): jail = "test Hello" (10 bytes), still within window → Held
-        let result2 = decoder.process_token(1).unwrap();
         assert!(
-            matches!(result2, SequenceDecoderOutput::Held),
-            "Expected Held for token within jail window, got {result2:?}"
+            stopped,
+            "the stop sequence spanning tokens should have fired"
         );
-
-        // Token 2 ("world"): jail = "test Hello world" — Aho-Corasick matches
-        // "Hello world", so we stop. Text before the match ("test ") is emitted.
-        let result3 = decoder.process_token(2).unwrap();
-        assert!(
-            matches!(
-                result3,
-                SequenceDecoderOutput::Stopped | SequenceDecoderOutput::StoppedWithText(_)
-            ),
-            "Expected Stopped or StoppedWithText when stop sequence completes, got {result3:?}"
+        assert_eq!(
+            emitted, "test ",
+            "everything before the hidden stop sequence is emitted, and nothing more"
+        );
+        assert_eq!(
+            decoder.flush(),
+            SequenceDecoderOutput::Held,
+            "a completed stop must leave nothing jailed for an unparsed flush"
         );
         assert!(decoder.is_stopped());
-
-        // Verify that any text before the stop sequence is preserved
-        if let SequenceDecoderOutput::StoppedWithText(text) = &result3 {
-            assert!(
-                !text.contains("Hello world"),
-                "Hidden stop sequence should not appear in output, got: {text:?}"
-            );
-        }
+        assert!(
+            !emitted.contains("Hello world"),
+            "the hidden stop sequence must not appear in the output, got: {emitted:?}"
+        );
     }
 
     #[test]

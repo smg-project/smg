@@ -121,6 +121,53 @@ class TestReasoningContentAPI:
         assert len(reasoning_content) > 0
         assert len(content) > 0
 
+    @pytest.mark.parametrize("stop", [["wtf"], ["wtfx"], ["0123456789"]])
+    def test_streaming_unmatched_stop_word_does_not_change_output(self, model, api_client, stop):
+        """A `stop` word that never fires must not change what the client sees.
+
+        The stop decoder withholds text that could still complete a stop
+        sequence. When generation is cut short — here by `max_tokens`, before
+        the model ever emits the stop word — whatever is still held is released
+        at end of stream. That release used to skip the reasoning parser, so the
+        held bytes surfaced as assistant `content`: a tail of the reasoning
+        text, or a fragment of the model's own structural tokens. The leak was
+        exactly as long as the stop word, which is what the parametrize covers.
+        """
+
+        def run(stop_words):
+            kwargs = {"stop": stop_words} if stop_words else {}
+            response = api_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "What is 1+3?"}],
+                # Cut generation off early so the stream ends mid-reasoning,
+                # with text still held back by the stop decoder.
+                max_tokens=24,
+                temperature=0,
+                stream=True,
+                extra_body={"separate_reasoning": True},
+                **kwargs,
+            )
+            reasoning, content = "", ""
+            for chunk in response:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    content += delta.content
+                if delta.reasoning_content:
+                    reasoning += delta.reasoning_content
+            return reasoning, content
+
+        baseline_reasoning, baseline_content = run(None)
+        stopped_reasoning, stopped_content = run(stop)
+
+        assert stopped_content == baseline_content, (
+            f"stop={stop!r} leaked {stopped_content[len(baseline_content) :]!r} "
+            "into content; text held by the stop decoder must still be parsed"
+        )
+        assert stopped_reasoning == baseline_reasoning, (
+            f"stop={stop!r} changed reasoning_content; a stop word that never "
+            "matches must not affect the reasoning/content split"
+        )
+
     def test_nonstreaming_separate_reasoning_false(self, model, api_client):
         """Test non-streaming with separate_reasoning=False, reasoning_content should be empty."""
 

@@ -37,7 +37,7 @@ mod request_format_tests {
             &self,
             _headers: Option<&HeaderMap>,
             _tenant_meta: &TenantRequestMeta,
-            body: &ChatCompletionRequest,
+            body: ChatCompletionRequest,
             _model_id: &str,
         ) -> Response {
             *self.request.lock().unwrap() = Some(body.reasoning_effort.clone());

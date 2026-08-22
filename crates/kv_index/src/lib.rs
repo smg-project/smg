@@ -21,7 +21,8 @@ mod token_tree;
 pub use common::{MatchResult, TenantId};
 pub use event_tree::{
     compute_content_hash, compute_request_content_hashes, ApplyError, ContentHash, OverlapScores,
-    PositionalIndexer, SequenceHash, StoredBlock, WorkerBlockMap, WorkerId, WorkerIdExhausted,
+    PositionalIndexer, PruneStats, SequenceHash, StoredBlock, WorkerBlockMap, WorkerId,
+    WorkerIdExhausted,
 };
 pub use path_hash::{hash_node_path, hash_token_path, GLOBAL_EVICTION_HASH};
 // Re-export under names matching old tree.rs API for easier migration
@@ -68,7 +69,7 @@ pub trait RadixTree: Send + Sync {
     /// * `max_units` - Maximum units (chars/tokens) to retain for this tenant
     fn evict(&self, tenant: &TenantId, max_units: usize);
 
-    // No `remove_tenant`: stale entries are reclaimed via LRU eviction.
+    // Tenant purge lives on the concrete trees (`remove_tenant_all`), not the trait.
 
     /// Get the current size (in units) for a tenant.
     fn tenant_size(&self, tenant: &TenantId) -> usize;
