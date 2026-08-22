@@ -145,12 +145,14 @@ pub(super) async fn route_chat(
         clippy::expect_used,
         reason = "payload is set earlier in this function; absence is a logic error"
     )]
-    let payload_ref = ctx.payload().expect("Payload not prepared");
-    let payload_json = Arc::new(payload_ref.json.clone());
+    let payload_json = Arc::new(ctx.take_payload().expect("Payload not prepared").json);
     let client = ctx.components.client().clone();
     let headers_cloned = Arc::new(ctx.headers().cloned());
     let worker_api_key = Arc::new(worker.api_key().cloned());
     let is_streaming = ctx.is_streaming();
+    // The retry loop replays from the serialized payload alone; the parsed
+    // request and its context must not outlive dispatch.
+    drop(ctx);
 
     let response = RetryExecutor::execute_response_with_retry(
         deps.retry_config,
