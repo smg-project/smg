@@ -743,6 +743,32 @@ mod qwen_mapping_tests {
     use crate::factory::ParserFactory;
 
     #[test]
+    fn test_muse_glimmer_model_mappings() {
+        let factory = ParserFactory::new();
+        let registry = factory.registry();
+
+        for model in [
+            "meta-models/Muse-Glimmer-30B",
+            "Muse-Glimmer-30B",
+            "muse-glimmer-30b",
+            "muse_glimmer-30b",
+        ] {
+            assert_eq!(
+                registry.resolve_model_to_parser(model),
+                Some("muse_glimmer".to_string()),
+                "{model} should resolve to muse_glimmer"
+            );
+        }
+
+        assert_ne!(
+            registry
+                .resolve_model_to_parser("meta-llama/Llama-4-Scout")
+                .unwrap_or_default(),
+            "muse_glimmer"
+        );
+    }
+
+    #[test]
     fn test_qwen_xml_model_mappings() {
         let factory = ParserFactory::new();
         let registry = factory.registry();

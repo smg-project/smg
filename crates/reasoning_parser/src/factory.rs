@@ -7,8 +7,8 @@ use parking_lot::RwLock;
 use crate::{
     parsers::{
         BaseReasoningParser, CohereCmdParser, DeepSeekR1Parser, Glm45Parser, InklingParser,
-        KimiK3Parser, KimiParser, MiniMaxParser, NanoV3Parser, PassthroughParser, Qwen3Parser,
-        QwenThinkingParser, Step3Parser,
+        KimiK3Parser, KimiParser, MiniMaxParser, MuseGlimmerParser, NanoV3Parser,
+        PassthroughParser, Qwen3Parser, QwenThinkingParser, Step3Parser,
     },
     traits::{ParserConfig, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE},
 };
@@ -196,6 +196,10 @@ impl ParserFactory {
         // Kimi K3 XTML think channel (structural <|open|>/<|close|>/<|sep|> tokens).
         registry.register_parser("kimi_k3", || Box::new(KimiK3Parser::new()));
 
+        // Muse-Glimmer channel segments: `<|start|>assistant to=<recipient>
+        // <|message|>…`, where `to=self` is the reasoning channel.
+        registry.register_parser("muse_glimmer", || Box::new(MuseGlimmerParser::new()));
+
         registry.register_pattern("deepseek-r1", "deepseek_r1");
         registry.register_pattern("deepseek-v4", "deepseek_v4");
         registry.register_pattern("deepseek_v4", "deepseek_v4");
@@ -237,6 +241,11 @@ impl ParserFactory {
 
         // Inkling checkpoints use the model-family name in their ID or config.
         registry.register_pattern("inkling", "inkling");
+
+        // Muse-Glimmer, in both the hyphenated release spelling and the
+        // underscored parser spelling.
+        registry.register_pattern("muse-glimmer", "muse_glimmer");
+        registry.register_pattern("muse_glimmer", "muse_glimmer");
 
         Self { registry }
     }
@@ -280,6 +289,31 @@ impl Default for ParserFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_factory_resolves_muse_glimmer_family() {
+        let factory = ParserFactory::new();
+
+        for model in [
+            "meta-models/Muse-Glimmer-30B",
+            "Muse-Glimmer-30B",
+            "muse-glimmer-30b",
+            "MUSE-GLIMMER",
+            "muse_glimmer-30b",
+        ] {
+            assert_eq!(
+                factory.create(model).model_type(),
+                "muse_glimmer",
+                "{model} should resolve to the muse_glimmer reasoning parser"
+            );
+        }
+
+        // A neighbouring family must not be captured by the new patterns.
+        assert_eq!(
+            factory.create("meta-llama/Llama-3-70B").model_type(),
+            "passthrough"
+        );
+    }
 
     #[test]
     fn test_factory_creates_deepseek_r1() {
