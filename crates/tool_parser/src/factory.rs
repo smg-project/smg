@@ -459,9 +459,12 @@ impl ParserFactory {
         registry.map_model("Inkling*", "inkling");
 
         // Muse-Glimmer models emit ATEM tool calls inside channel segments.
+        // Matching is case-insensitive substring, so these also cover
+        // org-namespaced ids such as `meta-models/Muse-Glimmer-30B`; a leading
+        // `*/` glob would be dead, since the resolver only strips a trailing
+        // `*` and no model id contains a literal `*/`.
         registry.map_model("muse-glimmer*", "muse_glimmer");
         registry.map_model("muse_glimmer*", "muse_glimmer");
-        registry.map_model("*/muse-glimmer*", "muse_glimmer");
 
         // MiniMax models
         registry.map_model("minimax*", "minimax_m2");
