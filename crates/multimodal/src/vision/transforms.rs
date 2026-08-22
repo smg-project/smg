@@ -136,7 +136,7 @@ pub fn fill_transparent_bg(image: &DynamicImage, config: TransparentBgConfig) ->
     let mut out = Vec::with_capacity(width as usize * height as usize * 3);
 
     for (y, row) in rgba.as_raw().chunks_exact(width as usize * 4).enumerate() {
-        for (x, px) in row.chunks_exact(4).enumerate() {
+        for (x, px) in row.as_chunks::<4>().0.iter().enumerate() {
             let bg = f32::from(config.background_at(x as u32, y as u32));
             let alpha = f32::from(px[3]) / 255.0;
             let inv = 1.0 - alpha;
@@ -636,7 +636,12 @@ fn pil_h_band_rgb(
             let mut blue = half;
             let source_start = source_x * 3;
             let source_end = (source_x + source_columns) * 3;
-            for (pixel, &coefficient) in row[source_start..source_end].chunks_exact(3).zip(kernel) {
+            for (pixel, &coefficient) in row[source_start..source_end]
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(kernel)
+            {
                 red += pixel[0] as i64 * coefficient;
                 green += pixel[1] as i64 * coefficient;
                 blue += pixel[2] as i64 * coefficient;

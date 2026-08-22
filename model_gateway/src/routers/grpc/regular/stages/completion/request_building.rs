@@ -43,10 +43,6 @@ impl CompletionRequestBuildingStage {
     /// Build one backend request for one prompt. PD bootstrap rooms are minted
     /// per call, so injection runs per sub-request rather than
     /// build-once-then-clone.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Response is the standard error type in the pipeline stage pattern"
-    )]
     fn build_proto_request(
         &self,
         builder_client: &BackendClient,

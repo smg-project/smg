@@ -88,7 +88,7 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist --features vendored-openssl --interpreter ${{ matrix.interpreter || '3.9 3.10 3.11 3.12 3.13 3.14' }}
-          rust-toolchain: stable
+          rust-toolchain: 1.98.0
           docker-options: -e CI -e CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc -e CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
           before-script-linux: |
             # Install build dependencies (perl/make for vendored OpenSSL, protoc for gRPC)
@@ -143,7 +143,7 @@ jobs:
           working-directory: smg-repo/bindings/python
           command: sdist
           args: --out dist
-          rust-toolchain: stable
+          rust-toolchain: 1.98.0
 
       - uses: actions/upload-artifact@v7
         with:

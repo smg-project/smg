@@ -166,7 +166,12 @@ fn fill_array_as_f32_bytes(output: &mut [u8], encoder_input: &ArrayViewD<'_, f32
 }
 
 fn fill_f32_values_as_bytes(output: &mut [u8], values: impl IntoIterator<Item = f32>) {
-    for (output, value) in output.chunks_exact_mut(size_of::<f32>()).zip(values) {
+    for (output, value) in output
+        .as_chunks_mut::<{ size_of::<f32>() }>()
+        .0
+        .iter_mut()
+        .zip(values)
+    {
         output.copy_from_slice(&value.to_le_bytes());
     }
 }
@@ -266,7 +271,12 @@ where
     I: IntoIterator<Item = f32>,
     F: Fn(f32) -> u16 + Copy,
 {
-    for (output, value) in bytes.chunks_exact_mut(size_of::<u16>()).zip(values) {
+    for (output, value) in bytes
+        .as_chunks_mut::<{ size_of::<u16>() }>()
+        .0
+        .iter_mut()
+        .zip(values)
+    {
         output.copy_from_slice(&convert(value).to_le_bytes());
     }
 }

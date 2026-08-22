@@ -14,7 +14,7 @@ else
 fi
 
 # Install rustup (Rust installer and version manager)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.95.0
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.0
 
 
 # Follow the installation prompts, then reload your shell

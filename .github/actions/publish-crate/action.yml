@@ -42,7 +42,7 @@ runs:
 
     - name: Setup Rust
       if: steps.check.outputs.changed == 'true'
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@1.98.0
 
     - name: Install protoc
       if: steps.check.outputs.changed == 'true'

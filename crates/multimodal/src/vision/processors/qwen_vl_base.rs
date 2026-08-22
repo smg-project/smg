@@ -947,7 +947,7 @@ impl QwenVLProcessorBase {
                                 let source_end = (row + patch_size) * 3;
                                 for (dst, pixel) in chunk[o..o + patch_size]
                                     .iter_mut()
-                                    .zip(raw[source_start..source_end].chunks_exact(3))
+                                    .zip(raw[source_start..source_end].as_chunks::<3>().0.iter())
                                 {
                                     *dst = lut_c[pixel[c] as usize];
                                 }

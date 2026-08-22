@@ -217,7 +217,6 @@ async fn parse_multipart(
 }
 
 /// Parse an `application/sdp` body.
-#[expect(clippy::result_large_err, reason = "Response is inherently large")]
 fn parse_sdp(body: &Bytes, query_model: &str) -> Result<WebRtcParsedRequest, Response> {
     let query_model = query_model.trim();
     if query_model.is_empty() {
@@ -237,7 +236,6 @@ fn parse_sdp(body: &Bytes, query_model: &str) -> Result<WebRtcParsedRequest, Res
 }
 
 /// Validate and decode raw bytes as a valid SDP offer.
-#[expect(clippy::result_large_err, reason = "Response is inherently large")]
 fn validate_sdp(bytes: &[u8]) -> Result<String, Response> {
     let sdp = std::str::from_utf8(bytes)
         .map_err(|_| error::bad_request("invalid_sdp", "SDP is not valid UTF-8"))?;
@@ -322,7 +320,6 @@ pub(crate) async fn handle_realtime_webrtc(
 }
 
 /// Resolve the effective auth string from user header or worker API key.
-#[expect(clippy::result_large_err, reason = "Response is inherently large")]
 fn resolve_auth(
     labels: RealtimeLabels,
     model: &str,

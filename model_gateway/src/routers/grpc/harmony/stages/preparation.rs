@@ -89,10 +89,6 @@ impl PipelineStage for HarmonyPreparationStage {
 
 impl HarmonyPreparationStage {
     /// Prepare a chat completion request using Harmony encoding
-    #[expect(
-        clippy::result_large_err,
-        reason = "Response is the standard error type in the pipeline stage pattern"
-    )]
     fn prepare_chat(
         &self,
         ctx: &mut RequestContext,
@@ -162,10 +158,6 @@ impl HarmonyPreparationStage {
     ///
     /// For responses API, we build from conversation history using the same Harmony
     /// encoding that the builder provides. This handles the MCP loop integration.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Response is the standard error type in the pipeline stage pattern"
-    )]
     pub fn prepare_responses(
         &self,
         ctx: &mut RequestContext,
