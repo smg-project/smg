@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 from smg.launch_router import RouterArgs, parse_router_args
-from smg.router import policy_from_str
+from smg.router import Router, policy_from_str
 
 
 class TestRouterArgs:
@@ -32,6 +32,11 @@ class TestRouterArgs:
         # Test PD-specific defaults
         assert args.prefill_policy is None
         assert args.decode_policy is None
+        assert args.chars_per_token == 4
+        assert args.long_prefill_threshold == 100_000
+        assert args.long_pool_max_load == 4
+        assert args.short_pool_max_load == 32
+        assert args.long_prefill_indices == []
 
         # Test service discovery defaults
         assert args.service_discovery is False
@@ -175,6 +180,135 @@ class TestRouterArgs:
         # Test None
         result = RouterArgs._parse_decode_urls(None)
         assert result == []
+
+    def test_parse_cache_aware_length_prefill_pool_command(self):
+        """The Python entrypoint accepts a static long/short prefill pool."""
+        router_args = parse_router_args(
+            [
+                "--pd-disaggregation",
+                "--prefill-policy",
+                "cache_aware_length",
+                "--long-prefill-threshold",
+                "100000",
+                "--balance-abs-threshold",
+                "16",
+                "--balance-rel-threshold",
+                "2.0",
+                "--eviction-interval",
+                "120",
+                "--long-pool-max-load",
+                "4",
+                "--short-pool-max-load",
+                "32",
+                "--cache-threshold",
+                "0.25",
+                "--prefill",
+                "http://p1:8000",
+                "--prefill",
+                "http://p2:8000",
+                "--prefill",
+                "http://p3:8000",
+                "--prefill",
+                "http://p4:8000",
+                "--prefill",
+                "http://p5:8000",
+                "--decode",
+                "http://d1:8000",
+                "--long-prefill-indices",
+                "3,4",
+            ]
+        )
+        router_args._validate_router_args()
+
+        assert router_args.pd_disaggregation is True
+        assert router_args.prefill_policy == "cache_aware_length"
+        assert router_args.long_prefill_threshold == 100_000
+        assert router_args.balance_abs_threshold == 16
+        assert router_args.balance_rel_threshold == 2.0
+        assert router_args.eviction_interval_secs == 120
+        assert router_args.long_pool_max_load == 4
+        assert router_args.short_pool_max_load == 32
+        assert router_args.cache_threshold == 0.25
+        assert router_args.long_prefill_indices == [3, 4]
+
+    def test_cache_aware_length_pool_arguments_reach_rust_router(self, monkeypatch):
+        router_args = parse_router_args(
+            [
+                "--pd-disaggregation",
+                "--prefill-policy",
+                "cache_aware_length",
+                "--prefill",
+                "http://p1:8000",
+                "--prefill",
+                "http://p2:8000",
+                "--long-prefill-indices",
+                "1",
+                "--long-prefill-threshold",
+                "100000",
+                "--long-pool-max-load",
+                "4",
+                "--short-pool-max-load",
+                "32",
+                "--decode",
+                "http://d1:8000",
+            ]
+        )
+        captured = {}
+
+        def fake_rust_router(**kwargs):
+            captured.update(kwargs)
+            return object()
+
+        monkeypatch.setattr("smg.router._Router", fake_rust_router)
+        Router.from_args(router_args)
+
+        assert captured["prefill_policy"] == policy_from_str("cache_aware_length")
+        assert captured["long_prefill_indices"] == [1]
+        assert captured["long_prefill_threshold"] == 100_000
+        assert captured["long_pool_max_load"] == 4
+        assert captured["short_pool_max_load"] == 32
+
+    @pytest.mark.parametrize(
+        ("indices", "message"),
+        [
+            ([-1], "non-negative"),
+            ([3, 3], "duplicate"),
+            ([5], "out of range"),
+        ],
+    )
+    def test_long_prefill_indices_reject_invalid_values(self, indices, message):
+        router_args = RouterArgs(
+            pd_disaggregation=True,
+            prefill_urls=[(f"http://p{i}:8000", None) for i in range(1, 6)],
+            decode_urls=["http://d1:8000"],
+            prefill_policy="cache_aware_length",
+            long_prefill_indices=indices,
+        )
+
+        with pytest.raises(ValueError, match=message):
+            router_args._validate_router_args()
+
+    def test_prefill_decode_urls_require_disaggregation_mode(self):
+        router_args = parse_router_args(
+            [
+                "--prefill",
+                "http://p1:8000",
+                "--decode",
+                "http://d1:8000",
+            ]
+        )
+
+        with pytest.raises(ValueError, match="--pd-disaggregation"):
+            router_args._validate_router_args()
+
+    def test_prefixed_eviction_interval_alias_maps_to_router_args(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+
+        namespace = parser.parse_args(["--router-eviction-interval", "120"])
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+
+        assert router_args.eviction_interval_secs == 120
 
     def test_from_cli_args_basic(self):
         """Test creating RouterArgs from basic CLI arguments."""
@@ -1401,6 +1535,11 @@ class TestRouterArgsFieldOrder:
         "worker_overload_token_usage",
         "worker_overload_protection",
         "disable_load_monitoring",
+        "chars_per_token",
+        "long_prefill_threshold",
+        "long_pool_max_load",
+        "short_pool_max_load",
+        "long_prefill_indices",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1433,8 +1572,37 @@ class TestRouterArgsFieldOrder:
             "worker_overload_token_usage",
             "worker_overload_protection",
             "disable_load_monitoring",
+            "chars_per_token",
+            "long_prefill_threshold",
+            "long_pool_max_load",
+            "short_pool_max_load",
+            "long_prefill_indices",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "
                 "preserve positional callers"
             )
+
+    def test_cache_aware_length_cli_args(self):
+        """Test --chars-per-token, --long-prefill-* CLI args are parsed."""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            [
+                "--chars-per-token",
+                "8",
+                "--long-prefill-threshold",
+                "200000",
+                "--long-pool-max-load",
+                "10",
+                "--short-pool-max-load",
+                "64",
+                "--long-prefill-indices",
+                "0,2",
+            ]
+        )
+        assert args.chars_per_token == 8
+        assert args.long_prefill_threshold == 200000
+        assert args.long_pool_max_load == 10
+        assert args.short_pool_max_load == 64
+        assert args.long_prefill_indices == [0, 2]

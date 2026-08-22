@@ -17,8 +17,8 @@ use tracing::{debug, info, warn};
 use super::{
     get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
-    BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig,
-    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
+    BucketPolicy, CacheAwareLengthPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy,
+    ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
 };
 use crate::{
     config::types::{ManualAssignmentMode, PolicyConfig, RoutingKeyOverrideConfig},
@@ -807,6 +807,15 @@ impl PolicyRegistry {
                     );
                     cache_aware.init_workers(workers);
                 }
+            } else if policy.name() == "cache_aware_length" {
+                if let Some(cal) = policy.as_any().downcast_ref::<CacheAwareLengthPolicy>() {
+                    debug!(
+                        "Initializing cache_aware_length policy with {} workers for model {}",
+                        workers.len(),
+                        model_id
+                    );
+                    cal.init_workers(workers);
+                }
             }
         }
     }
@@ -821,6 +830,14 @@ impl PolicyRegistry {
                     cache_aware.remove_worker_by_url(worker_url);
                     debug!(
                         "Removed worker {} from cache-aware policy for model {}",
+                        worker_url, model_id
+                    );
+                }
+            } else if policy.name() == "cache_aware_length" {
+                if let Some(cal) = policy.as_any().downcast_ref::<CacheAwareLengthPolicy>() {
+                    cal.remove_worker_by_url(worker_url);
+                    debug!(
+                        "Removed worker {} from cache_aware_length policy for model {}",
                         worker_url, model_id
                     );
                 }
@@ -842,6 +859,14 @@ impl PolicyRegistry {
                         cache_aware.remove_worker_by_url(worker_url);
                         debug!(
                             "Removed worker {} from {} cache-aware policy",
+                            worker_url, worker_type
+                        );
+                    }
+                } else if policy.name() == "cache_aware_length" {
+                    if let Some(cal) = policy.as_any().downcast_ref::<CacheAwareLengthPolicy>() {
+                        cal.remove_worker_by_url(worker_url);
+                        debug!(
+                            "Removed worker {} from {} cache_aware_length policy",
                             worker_url, worker_type
                         );
                     }
@@ -882,6 +907,19 @@ impl PolicyRegistry {
                         cache_aware.init_workers(prefill_workers);
                     }
                 }
+            } else if prefill_policy.name() == "cache_aware_length" {
+                if let Some(cal) = prefill_policy
+                    .as_any()
+                    .downcast_ref::<CacheAwareLengthPolicy>()
+                {
+                    if !prefill_workers.is_empty() {
+                        debug!(
+                            "Initializing prefill cache_aware_length policy with {} workers",
+                            prefill_workers.len()
+                        );
+                        cal.init_workers(prefill_workers);
+                    }
+                }
             }
         }
 
@@ -896,6 +934,19 @@ impl PolicyRegistry {
                             decode_workers.len()
                         );
                         cache_aware.init_workers(decode_workers);
+                    }
+                }
+            } else if decode_policy.name() == "cache_aware_length" {
+                if let Some(cal) = decode_policy
+                    .as_any()
+                    .downcast_ref::<CacheAwareLengthPolicy>()
+                {
+                    if !decode_workers.is_empty() {
+                        debug!(
+                            "Initializing decode cache_aware_length policy with {} workers",
+                            decode_workers.len()
+                        );
+                        cal.init_workers(decode_workers);
                     }
                 }
             }

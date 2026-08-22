@@ -230,7 +230,7 @@ struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "cache_aware_length", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
     policy: String,
 
     /// Minimum matched-prefix share (0.0-1.0) before cache-aware routing
@@ -369,6 +369,33 @@ struct CliArgs {
     #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Routing Policy")]
     cache_ttl_secs: u64,
 
+    // ---- cache_aware_length policy ----
+    /// Divisor for char-level token estimation when X-Prompt-Tokens is absent
+    /// (cache_aware_length policy). Default 4.
+    #[arg(long, default_value_t = 4, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
+    chars_per_token: usize,
+
+    /// Uncached-prefill-token boundary between long and short requests
+    /// (cache_aware_length policy). Default 100000.
+    #[arg(long, default_value_t = 100_000, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
+    long_prefill_threshold: usize,
+
+    /// Load ceiling for the long pool (pool=long workers) in the
+    /// cache_aware_length policy. Default 4.
+    #[arg(long, default_value_t = 4, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
+    long_pool_max_load: usize,
+
+    /// Load ceiling for the short pool (remaining workers) in the
+    /// cache_aware_length policy. Default 32.
+    #[arg(long, default_value_t = 32, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
+    short_pool_max_load: usize,
+
+    /// Comma-separated 0-based indices of --prefill URLs that belong to the
+    /// long pool (get pool=long label for cache_aware_length). E.g. "3,4"
+    /// marks the 4th and 5th prefill workers as long pool.
+    #[arg(long, value_delimiter = ',', help_heading = "PD Disaggregation")]
+    long_prefill_indices: Vec<usize>,
+
     /// How long an unused sticky routing key stays pinned: keys idle beyond
     /// this many seconds are evicted from the manual-policy / sticky-session
     /// map
@@ -470,11 +497,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "cache_aware_length", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "cache_aware_length", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
 
     /// Specific policy for encode nodes in EPD mode. Defaults to consistent_hashing.
@@ -1382,6 +1409,25 @@ impl CliArgs {
                 cache_ttl_secs: self.cache_ttl_secs,
                 cache_boundaries: self.cache_boundaries.clone(),
             },
+            "cache_aware_length" => PolicyConfig::CacheAwareLength {
+                cache_threshold: self.cache_threshold,
+                balance_abs_threshold: self.balance_abs_threshold,
+                balance_rel_threshold: self.balance_rel_threshold,
+                eviction_interval_secs: self.eviction_interval,
+                max_tree_size: self.max_tree_size,
+                block_size: self.block_size,
+                balance_token_usage_threshold: self.balance_token_usage_threshold,
+                overload_token_usage_threshold: self.overload_token_usage_threshold,
+                overlap_decay: self.overlap_decay,
+                selection_temperature: self.selection_temperature,
+                cache_index: Self::parse_cache_index(&self.cache_index),
+                cache_ttl_secs: self.cache_ttl_secs,
+                cache_boundaries: self.cache_boundaries.clone(),
+                chars_per_token: self.chars_per_token,
+                long_prefill_threshold: self.long_prefill_threshold,
+                long_pool_max_load: self.long_pool_max_load,
+                short_pool_max_load: self.short_pool_max_load,
+            },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
             },
@@ -1766,6 +1812,7 @@ impl CliArgs {
             .mode(mode)
             .policy(policy)
             .cache_boundaries(self.cache_boundaries.clone())
+            .long_prefill_indices(self.long_prefill_indices.clone())
             .connection_mode(connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
             .zmq_engine_count(self.zmq_engine_count)

@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use super::{
-    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
-    LeastLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy, PassthroughPolicy,
-    PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwareLengthConfig, CacheAwareLengthPolicy,
+    CacheAwarePolicy, ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, ManualConfig,
+    ManualPolicy, PassthroughPolicy, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy,
+    RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -72,6 +73,49 @@ impl PolicyFactory {
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
+            PolicyConfig::CacheAwareLength {
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+                eviction_interval_secs,
+                max_tree_size,
+                block_size,
+                balance_token_usage_threshold,
+                overload_token_usage_threshold,
+                overlap_decay,
+                selection_temperature,
+                cache_index,
+                cache_ttl_secs,
+                cache_boundaries,
+                chars_per_token,
+                long_prefill_threshold,
+                long_pool_max_load,
+                short_pool_max_load,
+            } => {
+                let base = CacheAwareConfig {
+                    cache_threshold: *cache_threshold,
+                    balance_abs_threshold: *balance_abs_threshold,
+                    balance_rel_threshold: *balance_rel_threshold,
+                    eviction_interval_secs: *eviction_interval_secs,
+                    max_tree_size: *max_tree_size,
+                    block_size: *block_size,
+                    balance_token_usage_threshold: *balance_token_usage_threshold,
+                    overload_token_usage_threshold: *overload_token_usage_threshold,
+                    overlap_decay: *overlap_decay,
+                    selection_temperature: *selection_temperature,
+                    cache_index: *cache_index,
+                    cache_ttl_secs: *cache_ttl_secs,
+                    cache_boundaries: cache_boundaries.clone(),
+                };
+                let config = CacheAwareLengthConfig {
+                    base,
+                    chars_per_token: *chars_per_token,
+                    long_prefill_threshold: *long_prefill_threshold,
+                    long_pool_max_load: *long_pool_max_load,
+                    short_pool_max_load: *short_pool_max_load,
+                };
+                Arc::new(CacheAwareLengthPolicy::with_config(config))
+            }
             PolicyConfig::Bucket {
                 balance_abs_threshold,
                 balance_rel_threshold,
@@ -123,6 +167,9 @@ impl PolicyFactory {
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "least_load" | "leastload" => Some(Arc::new(LeastLoadPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
+            "cache_aware_length" | "cacheawarelength" => {
+                Some(Arc::new(CacheAwareLengthPolicy::new()))
+            }
             "bucket" => Some(Arc::new(BucketPolicy::new())),
             "manual" => Some(Arc::new(ManualPolicy::new())),
             "consistent_hashing" | "consistenthashing" => {
@@ -171,6 +218,39 @@ mod tests {
         });
         assert_eq!(policy.name(), "cache_aware");
 
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::CacheAwareLength {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 30,
+            max_tree_size: 10000,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
+            chars_per_token: 4,
+            long_prefill_threshold: 100_000,
+            long_pool_max_load: 4,
+            short_pool_max_load: 32,
+        });
+        assert_eq!(policy.name(), "cache_aware_length");
+        // Verify config values are preserved, not just the policy name.
+        let cal = policy
+            .as_any()
+            .downcast_ref::<CacheAwareLengthPolicy>()
+            .unwrap();
+        let cfg = cal.config_for_test();
+        assert_eq!(cfg.chars_per_token, 4);
+        assert_eq!(cfg.long_prefill_threshold, 100_000);
+        assert_eq!(cfg.long_pool_max_load, 4);
+        assert_eq!(cfg.short_pool_max_load, 32);
+        assert_eq!(cfg.base.cache_threshold, 0.5);
+        assert_eq!(cfg.base.block_size, 16);
+
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Bucket {
             balance_abs_threshold: 10,
             balance_rel_threshold: 1.5,
@@ -212,6 +292,18 @@ mod tests {
         assert!(PolicyFactory::create_by_name("PowerOfTwo").is_some());
         assert!(PolicyFactory::create_by_name("cache_aware").is_some());
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
+        assert_eq!(
+            PolicyFactory::create_by_name("cache_aware_length")
+                .unwrap()
+                .name(),
+            "cache_aware_length"
+        );
+        assert_eq!(
+            PolicyFactory::create_by_name("CacheAwareLength")
+                .unwrap()
+                .name(),
+            "cache_aware_length"
+        );
         assert!(PolicyFactory::create_by_name("bucket").is_some());
         assert!(PolicyFactory::create_by_name("Bucket").is_some());
         assert!(PolicyFactory::create_by_name("manual").is_some());

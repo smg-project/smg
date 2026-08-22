@@ -712,10 +712,16 @@ impl AppContextBuilder {
     fn with_kv_event_monitor(mut self, config: &RouterConfig) -> Self {
         use crate::config::types::{PolicyConfig, RoutingMode};
 
-        let role_is_cache_aware =
-            |policy: &Option<PolicyConfig>| matches!(policy, Some(PolicyConfig::CacheAware { .. }));
-        let is_cache_aware = matches!(config.policy, PolicyConfig::CacheAware { .. })
-            || match &config.mode {
+        let role_is_cache_aware = |policy: &Option<PolicyConfig>| {
+            matches!(
+                policy,
+                Some(PolicyConfig::CacheAware { .. } | PolicyConfig::CacheAwareLength { .. })
+            )
+        };
+        let is_cache_aware = matches!(
+            config.policy,
+            PolicyConfig::CacheAware { .. } | PolicyConfig::CacheAwareLength { .. }
+        ) || match &config.mode {
                 RoutingMode::PrefillDecode {
                     prefill_policy,
                     decode_policy,

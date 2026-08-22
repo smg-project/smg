@@ -2123,7 +2123,7 @@ mod tests {
     use super::*;
     use crate::{
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
-        policies::CacheAwarePolicy,
+        policies::{CacheAwareLengthPolicy, CacheAwarePolicy},
         routers::common::request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
         worker::BasicWorkerBuilder,
     };
@@ -2474,6 +2474,40 @@ mod tests {
             .worker_type(WorkerType::Regular)
             .health_config(no_health_check())
             .build()
+    }
+
+    /// Like `plain_worker` but attaches a `pool=<pool>` label so the
+    /// cache_aware_length policy can split workers into long/short pools.
+    fn labeled_worker(url: &str, pool: Option<&str>) -> crate::worker::BasicWorker {
+        let mut builder = BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check());
+        if let Some(p) = pool {
+            builder = builder.label("pool", p);
+        }
+        builder.build()
+    }
+
+    fn cache_aware_length_policy() -> PolicyConfig {
+        PolicyConfig::CacheAwareLength {
+            cache_threshold: 0.3,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 4096,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
+            chars_per_token: 4,
+            long_prefill_threshold: 100_000,
+            long_pool_max_load: 2,
+            short_pool_max_load: 2,
+        }
     }
 
     type CapturedUpstreamRequest = Arc<tokio::sync::Mutex<Option<(HeaderMap, Bytes)>>>;
@@ -2987,5 +3021,451 @@ mod tests {
     async fn missing_worker_falls_back_to_buffered() {
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
         assert_falls_back_with_body_intact(&router).await;
+    }
+
+    // ===== cache_aware_length E2E: all 16 decision-table scenarios =====
+    //
+    // Each test drives the real routing decision point
+    // (`select_worker_for_model`), which builds the exact `SelectWorkerInfo`
+    // (request_text + headers) the policy receives in production — the same
+    // path the buffered HTTP request takes. Workers carry `pool=long` labels;
+    // pre-set loads use WorkerLoadGuard + mem::forget (same as the unit tests).
+
+    /// Pin a worker's in-flight load at `load` for the lifetime of the test by
+    /// leaking the RAII guard (the process tears down on test exit). Accepts
+    /// the registered `Arc<dyn Worker>` directly — no downcast needed since
+    /// `WorkerLoadGuard::new` takes `Arc<dyn Worker>`.
+    fn pin_load(worker: &Arc<dyn Worker>, load: usize) {
+        for _ in 0..load {
+            std::mem::forget(WorkerLoadGuard::new(Arc::clone(worker), None));
+        }
+    }
+
+    /// Spawn a two-pool router: short workers (no label) + long workers
+    /// (`pool=long`), with cache_aware_length as the default policy and trees
+    /// seeded. Returns the router so tests can assert routed worker.
+    async fn length_router(short_urls: &[&str], long_urls: &[&str]) -> Router {
+        let mut workers: Vec<crate::worker::BasicWorker> = Vec::new();
+        for u in short_urls {
+            workers.push(labeled_worker(u, None));
+        }
+        for u in long_urls {
+            workers.push(labeled_worker(u, Some("long")));
+        }
+        let router = streaming_router(cache_aware_length_policy(), 1024 * 1024, workers);
+        let live = router.worker_registry.get_all();
+        router
+            .policy_registry
+            .get_default_policy()
+            .as_any()
+            .downcast_ref::<CacheAwareLengthPolicy>()
+            .unwrap()
+            .init_workers(&live);
+        router
+    }
+
+    /// Route `prompt` through the real `select_worker_for_model` (the exact
+    /// path a buffered HTTP request takes), returning the selected worker's
+    /// URL — the value the router writes to `x-smg-routed-worker-id`.
+    /// Returns `None` when the fleet rejects (503). Panics if the selection
+    /// unexpectedly fails (use `route_or_none` for the reject case).
+    fn route_to_url(router: &Router, prompt: &str, headers: Option<&HeaderMap>) -> String {
+        router
+            .select_worker_for_model(
+                crate::worker::UNKNOWN_MODEL_ID,
+                Some(prompt),
+                None,
+                headers,
+                None,
+            )
+            .map(|w| w.url().to_string())
+            .expect("selection should succeed with healthy workers")
+    }
+
+    /// Like `route_to_url` but returns `None` when the fleet rejects (503).
+    fn route_or_none(router: &Router, prompt: &str, headers: Option<&HeaderMap>) -> Option<String> {
+        router
+            .select_worker_for_model(
+                crate::worker::UNKNOWN_MODEL_ID,
+                Some(prompt),
+                None,
+                headers,
+                None,
+            )
+            .map(|w| w.url().to_string())
+    }
+
+    /// Build a HeaderMap with `X-Prompt-Tokens: <tokens>`.
+    fn tokens_header(tokens: usize) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "x-prompt-tokens",
+            http::HeaderValue::from_str(&tokens.to_string()).unwrap(),
+        );
+        h
+    }
+
+    /// Find a live worker by URL in the router's registry and pin its load.
+    fn pin_worker(router: &Router, url: &str, load: usize) {
+        let worker = router
+            .worker_registry
+            .get_all()
+            .iter()
+            .find(|w| w.url() == url)
+            .cloned()
+            .unwrap();
+        pin_load(&worker, load);
+    }
+
+    /// Mark a worker unhealthy by URL.
+    fn mark_unhealthy(router: &Router, url: &str) {
+        router
+            .worker_registry
+            .get_all()
+            .iter()
+            .find(|w| w.url() == url)
+            .cloned()
+            .unwrap()
+            .set_status(openai_protocol::worker::WorkerStatus::NotReady);
+    }
+
+    // --- Step 1: health filter ---
+
+    #[tokio::test]
+    async fn cal_step1_all_unhealthy_returns_503() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        mark_unhealthy(&router, &url_s);
+        mark_unhealthy(&router, &url_l);
+        let h = tokens_header(200_000);
+        let routed = route_or_none(&router, "hello", Some(&h));
+        assert!(
+            routed.is_none(),
+            "all unhealthy → 503 (None), got {routed:?}"
+        );
+    }
+
+    // --- Step 2: global imbalance ---
+
+    #[tokio::test]
+    async fn cal_step2_global_imbalance_picks_min_load() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        // Pin the long-pool worker high so the fleet is imbalanced (100 vs 0).
+        pin_worker(&router, &url_l, 100);
+        let h = tokens_header(200_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_s, "imbalanced fleet → healthy min-load worker");
+    }
+
+    // --- Step 3: cache hit ---
+
+    #[tokio::test]
+    async fn cal_step3_cache_hit_sticks_regardless_of_pool() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let prompt = "shared long prompt prefix that builds cache affinity";
+
+        // Seed the cache with a long-request header so the first request goes
+        // to the long-pool worker (url_l), not the default short-pool routing.
+        let h = tokens_header(200_000);
+        let first = route_to_url(&router, prompt, Some(&h));
+        assert_eq!(first, url_l, "header-classified long request → long pool");
+
+        // Same prompt without the header: cache lookup (Step 3) takes
+        // precedence over pool selection (Step 4), so it stays on url_l.
+        let second = route_to_url(&router, prompt, None);
+        assert_eq!(second, url_l, "cache hit overrides short-pool routing");
+    }
+
+    #[tokio::test]
+    async fn cal_step3_no_tree_random_healthy_does_not_panic() {
+        // Do NOT call init_workers → no tree → random healthy fallback.
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = streaming_router(
+            cache_aware_length_policy(),
+            1024 * 1024,
+            vec![
+                labeled_worker(&url_s, None),
+                labeled_worker(&url_l, Some("long")),
+            ],
+        );
+        let routed = route_to_url(&router, "novel", None);
+        assert!(
+            routed == url_s || routed == url_l,
+            "random fallback picks a healthy worker: {routed}"
+        );
+    }
+
+    // --- Step 4 long request (uncached ≥ 100K): 4 paths ---
+
+    #[tokio::test]
+    async fn cal_step4_long_uses_long_pool_when_free() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let h = tokens_header(200_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_l, "long request, free long pool → long pool");
+    }
+
+    #[tokio::test]
+    async fn cal_step4_long_overflows_to_idle_short() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        pin_worker(&router, &url_l, 2); // long pool full (load = max)
+        let h = tokens_header(200_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_s, "full long pool → idle (load 0) short worker");
+    }
+
+    #[tokio::test]
+    async fn cal_step4_long_queues_on_long_when_short_busy() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        pin_worker(&router, &url_l, 2); // long full
+        pin_worker(&router, &url_s, 1); // short busy (load > 0, not idle)
+        let h = tokens_header(200_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_l, "long full + short busy → queue on long pool");
+    }
+
+    // Step 4: long pool all unhealthy + short pool all load>0 → all-healthy min-load.
+    #[tokio::test]
+    async fn cal_step4_long_unhealthy_short_busy_all_healthy_min_load() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        mark_unhealthy(&router, &url_l); // long pool unhealthy
+        pin_worker(&router, &url_s, 1); // short busy (load > 0)
+        let h = tokens_header(200_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(
+            routed, url_s,
+            "long unhealthy + short busy → all-healthy min-load (short worker)"
+        );
+    }
+
+    // --- Step 4 short request (uncached < 100K): 5 paths ---
+
+    #[tokio::test]
+    async fn cal_step4_short_uses_short_pool_when_free() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let h = tokens_header(1_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_s, "short request, free short pool → short pool");
+    }
+
+    #[tokio::test]
+    async fn cal_step4_short_overflows_to_long_when_short_full() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        pin_worker(&router, &url_s, 2); // short pool full
+        let h = tokens_header(1_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_l, "short pool full → overflow to long pool");
+    }
+
+    #[tokio::test]
+    async fn cal_step4_short_falls_back_to_short_when_both_full() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        pin_worker(&router, &url_s, 2); // short full
+        pin_worker(&router, &url_l, 2); // long full
+        let h = tokens_header(1_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_s, "both full → queue on short pool min-load");
+    }
+
+    #[tokio::test]
+    async fn cal_step4_short_uses_long_when_short_pool_empty() {
+        // Only long-pool workers configured; short pool is empty.
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[], &[&url_l]).await;
+        let h = tokens_header(1_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_l, "no short pool → long pool min-load");
+    }
+
+    #[tokio::test]
+    async fn cal_step4_short_both_pools_empty_all_healthy_min_load() {
+        // Only one healthy short worker (long pool empty); it is the sole
+        // all-healthy min-load candidate.
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[]).await;
+        let h = tokens_header(1_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(
+            routed, url_s,
+            "single healthy worker → all-healthy min-load"
+        );
+    }
+
+    // --- Step 4: token source priority (header vs char estimate vs none) ---
+
+    #[tokio::test]
+    async fn cal_step4_char_estimate_fallback_when_no_header() {
+        // No X-Prompt-Tokens header → char-level estimate. A 400-char novel
+        // prompt → 100 tokens < 100K threshold → short request → short pool.
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let prompt = "a".repeat(400);
+        let routed = route_to_url(&router, &prompt, None);
+        assert_eq!(routed, url_s, "char estimate < threshold → short pool");
+    }
+
+    #[tokio::test]
+    async fn cal_step4_uncached_unknown_all_healthy_min_load() {
+        // Empty prompt, no header, no tokens → uncached not computable →
+        // all-healthy min-load. Pin the long worker higher so the short worker
+        // is the unique minimum-load candidate.
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        pin_worker(&router, &url_l, 10); // long worker at load 10
+        let routed = route_to_url(&router, "", None);
+        assert_eq!(
+            routed, url_s,
+            "uncached unknown → all-healthy min-load (short worker at load 0)"
+        );
+    }
+
+    // --- Step 5: tree recording (cache hit after pool routing) ---
+
+    #[tokio::test]
+    async fn cal_step5_pool_routing_records_tree_for_future_hit() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let prompt = "novel pool-routed prompt that will be recorded";
+        // First request: novel → pool split (short, since <100K by char estimate)
+        let first = route_to_url(&router, prompt, None);
+        // Second request: same prompt → now a cache hit → same worker.
+        let second = route_to_url(&router, prompt, None);
+        assert_eq!(first, second, "pool routing recorded tree → subsequent hit");
+    }
+
+    // --- Additional scenarios ---
+
+    // Step 3: cache hit but matched worker unhealthy → clean stale + first healthy
+    #[tokio::test]
+    async fn cal_step3_hit_unhealthy_falls_back_to_first_healthy() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let prompt = "shared cache-building prompt for affinity test";
+        // First request: seed the cache
+        let first = route_to_url(&router, prompt, None);
+        // Mark the selected worker unhealthy
+        mark_unhealthy(&router, &first);
+        // Second request: same prompt hits cache, but matched worker is
+        // unhealthy → fall back to another healthy worker
+        let second = route_to_url(&router, prompt, None);
+        assert_ne!(
+            second, first,
+            "unhealthy matched worker must not be selected"
+        );
+    }
+
+    // Step 4 ≥100K: long pool all unhealthy + short pool has load=0 worker → long→short overflow to idle worker
+    #[tokio::test]
+    async fn cal_step4_long_pool_unhealthy_overflows_to_idle_short() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        mark_unhealthy(&router, &url_l); // long pool all unhealthy
+                                         // short pool worker idle (load 0)
+        let h = tokens_header(200_000);
+        let routed = route_to_url(&router, "novel", Some(&h));
+        assert_eq!(routed, url_s, "long pool all unhealthy → idle short worker");
+    }
+
+    // Step 4 token source priority: header exact value overrides char estimate
+    #[tokio::test]
+    async fn cal_step4_header_overrides_char_estimate() {
+        // Short prompt (char estimate → 1 token → short request → short pool),
+        // but header says 200000 (→ long request → long pool).
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let h = tokens_header(200_000);
+        let routed = route_to_url(&router, "short", Some(&h));
+        assert_eq!(
+            routed, url_l,
+            "header (200K) must override char estimate (1 token) → long pool"
+        );
+    }
+
+    // --- Full HTTP path via route_typed_request ---
+
+    /// Construct a minimal CompletionRequest for routing tests.
+    fn completion_request(prompt: &str) -> CompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "",
+            "prompt": prompt,
+            "stream": false,
+        }))
+        .unwrap()
+    }
+
+    /// E2E via route_typed_request: a header-classified long request routes
+    /// to the long-pool worker, and the response carries x-smg-routed-worker-id.
+    #[tokio::test]
+    async fn cal_http_long_request_routes_to_long_pool() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        let headers = tokens_header(200_000);
+        let resp = router
+            .route_typed_request(
+                Some(&headers),
+                completion_request("novel prompt"),
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let routed = resp
+            .headers()
+            .get("x-smg-routed-worker-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(routed, url_l, "header-classified long request → long pool");
+    }
+
+    /// E2E via route_typed_request: an all-unhealthy fleet returns 503.
+    #[tokio::test]
+    async fn cal_http_all_unhealthy_returns_503() {
+        let (url_s, _cap_s) = spawn_capture_stub("application/json", "{}").await;
+        let (url_l, _cap_l) = spawn_capture_stub("application/json", "{}").await;
+        let router = length_router(&[&url_s], &[&url_l]).await;
+        mark_unhealthy(&router, &url_s);
+        mark_unhealthy(&router, &url_l);
+        let resp = router
+            .route_typed_request(
+                None,
+                completion_request("hello"),
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "all unhealthy → 503"
+        );
     }
 }

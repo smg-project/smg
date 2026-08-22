@@ -85,6 +85,46 @@ use crate::{
 /// Latest per-worker backend load snapshot stream, keyed by worker URL.
 pub(crate) type LoadReceiver = watch::Receiver<HashMap<String, WorkerLoadResponse>>;
 
+/// Hint about the uncached prefill portion from a partial cache match that
+/// fell below `cache_threshold`. Lets the no-cache strategy classify by
+/// actual prefill work instead of the full request size.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum UncachedHint {
+    /// Uncached token count (gRPC / token-tree path).
+    Tokens(usize),
+    /// Uncached character count (HTTP / string-tree path); the strategy
+    /// converts to tokens via its `chars_per_token` setting.
+    Chars(usize),
+}
+
+/// Strategy for the no-cache branch: when a request does not hit the
+/// cache tree (or KV events / hash index), this trait selects which worker
+/// receives the request. The default behavior (no strategy set) routes to
+/// the least-loaded healthy worker (`min_load_idx`). `CacheAwareLengthPolicy`
+/// injects a strategy that splits workers into long/short pools by
+/// uncached prefill tokens.
+pub(crate) trait NoCacheStrategy: Send + Sync + std::fmt::Debug {
+    /// Select a worker for the no-cache (miss) branch. `min_load_idx` is
+    /// the pre-computed least-loaded healthy worker the caller would use
+    /// by default; the strategy may return it or a pool-selected alternative.
+    ///
+    /// `uncached_hint` carries the estimated uncached-prefill size when the
+    /// call originates from a partial cache match that fell below
+    /// `cache_threshold`. It is `None` when no matching was attempted (e.g.
+    /// imbalanced fallback, event-driven no-overlap, hash-path fallback), in
+    /// which case the strategy should estimate from `info` as before.
+    fn select_no_cache(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        healthy_indices: &[usize],
+        min_load_idx: Option<usize>,
+        avg_load: f64,
+        model_id: &str,
+        uncached_hint: Option<UncachedHint>,
+    ) -> Option<usize>;
+}
+
 /// Cache-aware routing policy
 ///
 /// Routes requests based on cache affinity when load is balanced,
@@ -152,6 +192,11 @@ pub struct CacheAwarePolicy {
     /// cloned inner handle stays canonical and walking it never holds
     /// an outer-shard guard.
     placement_index: Arc<DashMap<String, Arc<PlacementMap>>>,
+    /// Optional no-cache strategy. When `None`, the no-cache fallback
+    /// routes to `min_load_idx` (the default behavior). When `Some`,
+    /// the strategy selects the worker instead — used by
+    /// `CacheAwareLengthPolicy` for long/short pool split.
+    no_cache_strategy: Option<Arc<dyn NoCacheStrategy>>,
 }
 
 /// Hash-mode per-model placement map: (boundary position, xxh3 of the token
@@ -327,6 +372,47 @@ impl CacheAwarePolicy {
             populate_hash_index: AtomicBool::new(false),
             mesh_tree_sync: RwLock::new(None),
             placement_index,
+            no_cache_strategy: None,
+        }
+    }
+
+    /// Attach a no-cache strategy, enabling custom worker selection on the
+    /// cache-miss branch. Used by `CacheAwareLengthPolicy` for long/short
+    /// pool split. Returns `self` for chaining.
+    pub(crate) fn with_no_cache_strategy(mut self, strategy: Arc<dyn NoCacheStrategy>) -> Self {
+        self.no_cache_strategy = Some(strategy);
+        self
+    }
+
+    /// Resolve the no-cache branch: if a strategy is attached, delegate to
+    /// it; otherwise fall back to `min_load_idx` (the default behavior).
+    /// Callers still own tree update + `increment_processed` for the
+    /// returned index.
+    ///
+    /// `uncached_hint` is the estimated uncached-prefill token count from a
+    /// partial cache match (below `cache_threshold`); `None` when no matching
+    /// was attempted.
+    fn resolve_no_cache(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        healthy_indices: &[usize],
+        min_load_idx: Option<usize>,
+        avg_load: f64,
+        model_id: &str,
+        uncached_hint: Option<UncachedHint>,
+    ) -> Option<usize> {
+        match &self.no_cache_strategy {
+            Some(strategy) => strategy.select_no_cache(
+                workers,
+                info,
+                healthy_indices,
+                min_load_idx,
+                avg_load,
+                model_id,
+                uncached_hint,
+            ),
+            None => min_load_idx,
         }
     }
 
@@ -687,15 +773,26 @@ impl CacheAwarePolicy {
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
+        healthy_indices: &[usize],
         min_load_idx: Option<usize>,
+        avg_load: f64,
         model_id: &str,
     ) -> Option<usize> {
         // Shortest queue when imbalanced. The min-load index is gathered upstream
         // in select_worker with the (load, processed_requests, idx) tie-break
-        // from #1714 (spreads load when decode outpaces prefill).
-        let min_load_idx = min_load_idx?;
+        // from #1714 (spreads load when decode outpaces prefill). When a
+        // no-cache strategy is attached, it may override the selection.
+        let min_load_idx = self.resolve_no_cache(
+            workers,
+            info,
+            healthy_indices,
+            min_load_idx,
+            avg_load,
+            model_id,
+            None,
+        )?;
 
-        let worker_url = workers[min_load_idx].url();
+        let worker_url = workers[min_load_idx].url().to_string();
 
         // Even in imbalanced mode, update the appropriate tree to maintain cache state
         // Prefer token tree for gRPC requests, fall back to string tree for HTTP
@@ -715,7 +812,7 @@ impl CacheAwarePolicy {
                 // prefix length the standalone match returned. When we don't
                 // populate the index, a plain insert (no match) suffices.
                 if self.should_populate_hash_index() {
-                    let result = tree.match_and_insert(tokens, worker_url);
+                    let result = tree.match_and_insert(tokens, &worker_url);
                     let matched_prefix: Vec<u32> = tokens[..result.matched_token_count].to_vec();
                     self.hash_index
                         .entry(model_id.to_string())
@@ -723,7 +820,7 @@ impl CacheAwarePolicy {
                         .token_tree
                         .insert(kv_index::hash_token_path(tokens), matched_prefix);
                 } else {
-                    tree.insert_tokens(tokens, worker_url);
+                    tree.insert_tokens(tokens, &worker_url);
                 }
             }
         } else if let Some(text) = info.request_text {
@@ -741,7 +838,7 @@ impl CacheAwarePolicy {
                 // prefix length the standalone match returned. When we don't
                 // populate the index, a plain insert (no match) suffices.
                 if self.should_populate_hash_index() {
-                    let result = tree.match_and_insert(text, worker_url);
+                    let result = tree.match_and_insert(text, &worker_url);
                     let matched_prefix: String =
                         text.chars().take(result.matched_char_count).collect();
                     let path_hash = kv_index::hash_node_path(text);
@@ -751,7 +848,7 @@ impl CacheAwarePolicy {
                         .string_tree
                         .insert(path_hash, matched_prefix);
                 } else {
-                    tree.insert_text(text, worker_url);
+                    tree.insert_text(text, &worker_url);
                 }
             } else {
                 debug!(
@@ -766,7 +863,7 @@ impl CacheAwarePolicy {
 
         debug!(
             branch = "kv_pressure_min_load",
-            worker = worker_url,
+            worker = %worker_url,
             model_id,
             "Cache-aware selection"
         );
@@ -1057,7 +1154,14 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // request-count pressure is applied per request to the selected
         // candidate inside each affinity path.
         if self.is_kv_imbalanced(workers, &healthy_indices) {
-            return self.select_worker_min_load(workers, info, min_load_idx, model_id);
+            return self.select_worker_min_load(
+                workers,
+                info,
+                &healthy_indices,
+                min_load_idx,
+                avg_load,
+                model_id,
+            );
         }
 
         // Cache-aware routing when balanced — three types (mutually exclusive):
@@ -1068,6 +1172,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             if self.has_event_indexer(model_id) {
                 self.select_worker_event_driven(
                     workers,
+                    info,
                     tokens,
                     &healthy_indices,
                     min_load_idx,
@@ -1077,6 +1182,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             } else {
                 self.select_worker_with_tokens(
                     workers,
+                    info,
                     tokens,
                     &healthy_indices,
                     min_load_idx,
@@ -1088,6 +1194,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             let text = request_text.unwrap_or("");
             self.select_worker_with_text(
                 workers,
+                info,
                 text,
                 &healthy_indices,
                 min_load_idx,
@@ -1246,6 +1353,7 @@ impl CacheAwarePolicy {
     fn select_worker_event_driven(
         &self,
         workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
         tokens: &[u32],
         healthy_indices: &[usize],
         min_load_idx: Option<usize>,
@@ -1279,8 +1387,16 @@ impl CacheAwarePolicy {
             return self.gate_selected_candidate(workers, idx, avg_load, min_load_idx);
         }
 
-        // No cache overlap — min-load fallback (min-load index gathered upstream)
-        let min_idx = min_load_idx?;
+        // No cache overlap — delegate to no-cache strategy (default: min-load).
+        let min_idx = self.resolve_no_cache(
+            workers,
+            info,
+            healthy_indices,
+            min_load_idx,
+            avg_load,
+            model_id,
+            None,
+        )?;
         debug!(
             worker = workers[min_idx].url(),
             model_id, "Event-driven routing: no overlap, min-load fallback"
@@ -1538,7 +1654,10 @@ impl CacheAwarePolicy {
         let Some(tokens) = info.tokens.filter(|t| !t.is_empty()) else {
             return self.hash_min_load(
                 workers,
+                info,
+                healthy_indices,
                 min_load_idx,
+                avg_load,
                 model_id,
                 "min_load_fallback",
                 &[],
@@ -1557,7 +1676,10 @@ impl CacheAwarePolicy {
         if applicable.is_empty() {
             return self.hash_min_load(
                 workers,
+                info,
+                healthy_indices,
                 min_load_idx,
+                avg_load,
                 model_id,
                 "short_request",
                 tokens,
@@ -1569,7 +1691,10 @@ impl CacheAwarePolicy {
         if self.is_kv_imbalanced(workers, healthy_indices) {
             return self.hash_min_load(
                 workers,
+                info,
+                healthy_indices,
                 min_load_idx,
+                avg_load,
                 model_id,
                 "kv_pressure_min_load",
                 tokens,
@@ -1601,7 +1726,10 @@ impl CacheAwarePolicy {
 
         self.hash_min_load(
             workers,
+            info,
+            healthy_indices,
             min_load_idx,
+            avg_load,
             model_id,
             "min_load_fallback",
             tokens,
@@ -1616,14 +1744,25 @@ impl CacheAwarePolicy {
     fn hash_min_load(
         &self,
         workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        healthy_indices: &[usize],
         min_load_idx: Option<usize>,
+        avg_load: f64,
         model_id: &str,
         branch: &'static str,
         tokens: &[u32],
         applicable: &[usize],
         now: Instant,
     ) -> Option<usize> {
-        let idx = min_load_idx?;
+        let idx = self.resolve_no_cache(
+            workers,
+            info,
+            healthy_indices,
+            min_load_idx,
+            avg_load,
+            model_id,
+            None,
+        )?;
         if !applicable.is_empty() {
             self.record_placement(model_id, tokens, applicable, workers[idx].url(), now);
         }
@@ -1747,6 +1886,7 @@ impl CacheAwarePolicy {
     fn select_worker_with_tokens(
         &self,
         workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
         tokens: &[u32],
         healthy_indices: &[usize],
         min_load_idx: Option<usize>,
@@ -1797,7 +1937,28 @@ impl CacheAwarePolicy {
                         min_load_idx,
                     )
                 } else {
-                    min_load_idx
+                    // Partial match below threshold: pass the uncached
+                    // portion (input - matched) so the length strategy can
+                    // classify by actual prefill work, not full size.
+                    // When matched == 0 (no match at all), pass None so the
+                    // strategy falls through to its normal priority chain
+                    // (header → tokens → char estimate).
+                    let uncached_hint = (result.matched_token_count > 0).then(|| {
+                        UncachedHint::Tokens(
+                            result
+                                .input_token_count
+                                .saturating_sub(result.matched_token_count),
+                        )
+                    });
+                    self.resolve_no_cache(
+                        workers,
+                        info,
+                        healthy_indices,
+                        min_load_idx,
+                        avg_load,
+                        model_id,
+                        uncached_hint,
+                    )
                 };
 
                 // Insert for the selected worker (None => no insert, exactly
@@ -1874,6 +2035,7 @@ impl CacheAwarePolicy {
     fn select_worker_with_text(
         &self,
         workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
         text: &str,
         healthy_indices: &[usize],
         min_load_idx: Option<usize>,
@@ -1914,7 +2076,27 @@ impl CacheAwarePolicy {
                         min_load_idx,
                     )
                 } else {
-                    min_load_idx
+                    // Partial match below threshold: pass the uncached
+                    // char count (input - matched) so the length strategy
+                    // can classify by actual prefill work, not full size.
+                    // When matched == 0 (no match at all), pass None so the
+                    // strategy falls through to its normal priority chain.
+                    let uncached_hint = (result.matched_char_count > 0).then(|| {
+                        UncachedHint::Chars(
+                            result
+                                .input_char_count
+                                .saturating_sub(result.matched_char_count),
+                        )
+                    });
+                    self.resolve_no_cache(
+                        workers,
+                        info,
+                        healthy_indices,
+                        min_load_idx,
+                        avg_load,
+                        model_id,
+                        uncached_hint,
+                    )
                 };
 
                 // Insert for the selected worker (None => no insert, exactly

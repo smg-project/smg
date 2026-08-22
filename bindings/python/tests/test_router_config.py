@@ -433,3 +433,32 @@ class TestRouterConfigValidation:
         assert args.prefill_selector == {}
         assert args.decode_selector == {}
         assert args.storage_context_headers == {}
+
+    def test_cache_aware_length_params_defaults(self):
+        """Test cache_aware_length parameters have correct defaults."""
+        args = RouterArgs()
+        assert args.chars_per_token == 4
+        assert args.long_prefill_threshold == 100_000
+        assert args.long_pool_max_load == 4
+        assert args.short_pool_max_load == 32
+        assert args.long_prefill_indices == []
+
+    def test_cache_aware_length_params_custom(self):
+        """Test cache_aware_length parameters accept custom values."""
+        args = RouterArgs(
+            chars_per_token=8,
+            long_prefill_threshold=200_000,
+            long_pool_max_load=10,
+            short_pool_max_load=64,
+            long_prefill_indices=[0, 2],
+        )
+        assert args.chars_per_token == 8
+        assert args.long_prefill_threshold == 200_000
+        assert args.long_pool_max_load == 10
+        assert args.short_pool_max_load == 64
+        assert args.long_prefill_indices == [0, 2]
+
+    def test_policy_from_str_cache_aware_length(self):
+        """Test policy_from_str maps cache_aware_length correctly."""
+        result = policy_from_str("cache_aware_length")
+        assert result == PolicyType.CacheAwareLength

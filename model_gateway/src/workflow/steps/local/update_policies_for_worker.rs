@@ -45,14 +45,18 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdatePoliciesForWorkerStep {
             let workers = app_context.worker_registry.get_by_model(model_id);
 
             if let Some(policy) = app_context.policy_registry.get_policy(model_id) {
-                if policy.name() == "cache_aware" && !workers.is_empty() {
-                    // Re-initialize cache-aware policy with updated workers
+                if (policy.name() == "cache_aware" || policy.name() == "cache_aware_length")
+                    && !workers.is_empty()
+                {
+                    // Re-initialize cache-aware (or cache_aware_length) policy
+                    // with updated workers.
                     app_context
                         .policy_registry
                         .init_cache_aware_policy(model_id, &workers);
 
                     debug!(
-                        "Updated cache-aware policy for model {} ({} workers)",
+                        "Updated {} policy for model {} ({} workers)",
+                        policy.name(),
                         model_id,
                         workers.len()
                     );
