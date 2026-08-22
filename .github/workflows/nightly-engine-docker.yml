@@ -46,8 +46,8 @@ jobs:
             base_image_ref: vllm/vllm-openai:v0.27.1
             engine_ver: v0.27.1
           - engine: sglang
-            base_image_ref: lmsysorg/sglang:v0.5.17
-            engine_ver: v0.5.17
+            base_image_ref: lmsysorg/sglang:v0.5.18
+            engine_ver: v0.5.18
           - engine: trtllm
             base_image_ref: nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24
             engine_ver: 1.3.0rc24
