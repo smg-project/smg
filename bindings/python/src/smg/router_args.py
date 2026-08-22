@@ -242,6 +242,7 @@ class RouterArgs:
     worker_overload_protection: bool = False
     # Restore the conditional load-monitor poll gate (default: poll always)
     disable_load_monitoring: bool = False
+    tool_choice_none_ban: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -1279,6 +1280,16 @@ class RouterArgs:
             default=None,
             choices=tool_call_parser_choices,
             help="Specify the parser for tool-call interactions (e.g., json, qwen)",
+        )
+        parser_group.add_argument(
+            f"--{prefix}tool-choice-none-ban",
+            action="store_true",
+            help=(
+                "With tools present but tool_choice 'none', ban the resolved"
+                " parser's tool-call opener strings at decode time (requires"
+                " engine support for the any_text/excludes structural-tag"
+                " format)"
+            ),
         )
         parser_group.add_argument(
             f"--{prefix}mcp-config-path",

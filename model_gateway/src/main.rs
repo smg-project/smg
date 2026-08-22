@@ -886,6 +886,12 @@ struct CliArgs {
     #[arg(long, help_heading = "Parsers")]
     tool_call_parser: Option<String>,
 
+    /// With tools present but tool_choice "none", ban the resolved parser's
+    /// tool-call opener strings at decode time (requires engine support for
+    /// the any_text/excludes structural-tag format)
+    #[arg(long, default_value_t = false, help_heading = "Parsers")]
+    tool_choice_none_ban: bool,
+
     /// Path to MCP server configuration file
     #[arg(long, help_heading = "Parsers")]
     mcp_config_path: Option<String>,
@@ -1860,6 +1866,7 @@ impl CliArgs {
             .maybe_redis(redis)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
+            .tool_choice_none_ban(self.tool_choice_none_ban)
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
             .routing_key_override(RoutingKeyOverrideConfig {
@@ -2372,6 +2379,33 @@ mod tests {
         assert!(
             server_config.router_config.engine_metrics,
             "engine_metrics must survive into ServerConfig via to_server_config"
+        );
+    }
+
+    /// `--tool-choice-none-ban` must flow into `RouterConfig` and survive
+    /// nesting into `ServerConfig.router_config` — the consumers (the gRPC
+    /// preparation stages) read it off `RouterConfig`. Two-path
+    /// config-plumbing guard, plus the off-by-default contract.
+    #[test]
+    fn tool_choice_none_ban_flows_into_both_configs() {
+        let cli = cli_args_from(&["--tool-choice-none-ban"]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            router_config.tool_choice_none_ban,
+            "tool_choice_none_ban must reach RouterConfig via to_router_config"
+        );
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(
+            server_config.router_config.tool_choice_none_ban,
+            "tool_choice_none_ban must survive into ServerConfig via to_server_config"
+        );
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            !defaults.tool_choice_none_ban,
+            "tool_choice_none_ban must default off"
         );
     }
 

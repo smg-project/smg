@@ -359,7 +359,8 @@ impl GrpcRouter {
                 worker_registry.clone(),
                 ctx.configured_tool_parser.clone(),
                 ctx.configured_reasoning_parser.clone(),
-            ),
+            )
+            .with_tool_choice_none_ban(ctx.router_config.tool_choice_none_ban),
             multimodal,
         });
 

@@ -526,6 +526,7 @@ struct Router {
     worker_overload_token_usage: Option<f64>,
     worker_overload_protection: bool,
     disable_load_monitoring: bool,
+    tool_choice_none_ban: bool,
 }
 
 impl Router {
@@ -900,6 +901,7 @@ impl Router {
             .maybe_redis(redis_config)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
+            .tool_choice_none_ban(self.tool_choice_none_ban)
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .enable_wasm(self.enable_wasm)
@@ -1083,6 +1085,7 @@ impl Router {
         worker_overload_token_usage = None,
         worker_overload_protection = false,
         disable_load_monitoring = false,
+        tool_choice_none_ban = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1233,6 +1236,7 @@ impl Router {
         worker_overload_token_usage: Option<f64>,
         worker_overload_protection: bool,
         disable_load_monitoring: bool,
+        tool_choice_none_ban: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1397,6 +1401,7 @@ impl Router {
             worker_overload_token_usage,
             worker_overload_protection,
             disable_load_monitoring,
+            tool_choice_none_ban,
         })
     }
 

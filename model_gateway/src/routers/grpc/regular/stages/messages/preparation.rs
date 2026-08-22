@@ -263,24 +263,30 @@ impl MessagePreparationStage {
         let tool_call_constraint = if let (false, Some(tool_choice)) =
             (filtered_tools.is_empty(), chat_tool_choice.as_ref())
         {
-            ctx.components
-                .tool_parser_factory
-                .registry()
-                .generate_tool_constraint(
-                    ctx.components
-                        .parser_resolver
-                        .tool_parser(&request.model)
-                        .as_deref(),
-                    &filtered_tools,
-                    tool_choice,
-                )
-                .map_err(|e| {
-                    error!(function = "MessagePreparationStage::execute", error = %e, "Invalid tool configuration");
-                    error::bad_request(
-                        "invalid_tool_configuration",
-                        format!("Invalid tool configuration: {e}"),
-                    )
-                })?
+            let resolved_parser = ctx.components.parser_resolver.tool_parser(&request.model);
+            if ctx.components.parser_resolver.tool_choice_none_ban()
+                && matches!(tool_choice, ToolChoice::Value(ToolChoiceValue::None))
+            {
+                // Opt-in: ban the parser's tool-call opener strings so the
+                // model cannot start native tool-call syntax at all (the
+                // prompt still advertises the tools; parsing stays disabled).
+                ctx.components
+                    .tool_parser_factory
+                    .registry()
+                    .tool_call_ban_constraint(resolved_parser.as_deref())
+            } else {
+                ctx.components
+                    .tool_parser_factory
+                    .registry()
+                    .generate_tool_constraint(resolved_parser.as_deref(), &filtered_tools, tool_choice)
+                    .map_err(|e| {
+                        error!(function = "MessagePreparationStage::execute", error = %e, "Invalid tool configuration");
+                        error::bad_request(
+                            "invalid_tool_configuration",
+                            format!("Invalid tool configuration: {e}"),
+                        )
+                    })?
+            }
         } else {
             None
         };

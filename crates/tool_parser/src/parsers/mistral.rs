@@ -45,6 +45,10 @@ pub struct MistralParser {
 }
 
 impl MistralParser {
+    /// Strings that only ever open Mistral's native tool-call syntax; banning
+    /// them makes tool calls unreachable when `tool_choice` is `"none"`.
+    pub const TOOL_CALL_BAN_STRINGS: &'static [&'static str] = &["[TOOL_CALLS]"];
+
     /// Build structural tag for Mistral tool call format.
     ///
     /// Mistral outputs tool calls as a JSON array after `[TOOL_CALLS]`:

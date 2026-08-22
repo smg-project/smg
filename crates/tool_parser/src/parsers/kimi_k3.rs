@@ -123,6 +123,14 @@ pub struct KimiK3Parser {
 }
 
 impl KimiK3Parser {
+    /// Strings that only ever open K3's native tool-call syntax; banning them
+    /// makes tool calls unreachable when `tool_choice` is `"none"`. ONLY the
+    /// tools-section opener qualifies: the structural-tag triggers also list
+    /// `<|close|>think<|sep|>` / `<|close|>response<|sep|>` (as tag-begin
+    /// prefixes), but those close sections ordinary generation must emit, so
+    /// excluding them would corrupt normal output.
+    pub const TOOL_CALL_BAN_STRINGS: &'static [&'static str] = &[TOOLS_OPEN];
+
     /// Build an xgrammar structural tag that constrains Kimi-K3 XTML tool
     /// calls to the declared `tools`.
     ///

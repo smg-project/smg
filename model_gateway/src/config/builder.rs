@@ -613,6 +613,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn tool_choice_none_ban(mut self, enable: bool) -> Self {
+        self.config.tool_choice_none_ban = enable;
+        self
+    }
+
     // ==================== Tokenizer Cache ====================
 
     pub fn tokenizer_cache(mut self, cache: TokenizerCacheConfig) -> Self {
