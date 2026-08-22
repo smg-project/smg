@@ -251,7 +251,21 @@ impl ToolParser for QwenParser {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
 
+    fn take_unstreamed_normal_text(&mut self) -> String {
+        // `normal_text_buffer` may be holding back a suffix that looked like a
+        // partial "</tool_call>" tag; at end of stream it is real text when no
+        // tool call was ever announced, and marker debris otherwise.
+        let held = std::mem::take(&mut self.normal_text_buffer);
+        let tail = helpers::take_unstreamed_normal_text(&mut self.buffer, self.current_tool_id);
+        if self.current_tool_id == -1 {
+            held + &tail
+        } else {
+            String::new()
+        }
+    }
+
     fn reset(&mut self) {
+        self.normal_text_buffer.clear();
         helpers::reset_parser_state(
             &mut self.buffer,
             &mut self.prev_tool_call_arr,
