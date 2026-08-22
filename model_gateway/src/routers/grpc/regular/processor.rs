@@ -792,15 +792,8 @@ impl ResponseProcessor {
         };
 
         // Step 5: Build usage
-        let usage = messages::Usage {
-            input_tokens: complete.prompt_tokens(),
-            output_tokens: complete.completion_tokens(),
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
-            cache_creation: None,
-            server_tool_use: None,
-            service_tier: None,
-        };
+        let usage =
+            messages_usage_from_counts(complete.prompt_tokens(), complete.completion_tokens());
 
         // Step 6: Build Message
         Ok(Message {
@@ -979,6 +972,21 @@ fn normalize_assistant_content(text: String) -> Option<String> {
     }
 }
 
+/// Usage for a unary Messages response. Cache counters are integer zeros,
+/// never null: the Anthropic wire contract has always-present cache counters
+/// (0 when caching is unused) and clients do arithmetic on them.
+fn messages_usage_from_counts(input_tokens: u32, output_tokens: u32) -> messages::Usage {
+    messages::Usage {
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens: Some(0),
+        cache_read_input_tokens: Some(0),
+        cache_creation: None,
+        server_tool_use: None,
+        service_tier: None,
+    }
+}
+
 #[cfg(test)]
 mod content_normalization_tests {
     use super::normalize_assistant_content;
@@ -991,5 +999,22 @@ mod content_normalization_tests {
             normalize_assistant_content("\n\nDone.".to_string()),
             Some("\n\nDone.".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod messages_usage_wire_tests {
+    use super::messages_usage_from_counts;
+
+    /// The contract is about the serialized JSON, not the Rust struct: cache
+    /// counters must be present as integer zeros (a struct-level Some(0) that
+    /// a serde attr silently skipped would still fail here).
+    #[test]
+    fn cache_counters_serialize_as_integer_zeros() {
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150)).unwrap();
+        assert_eq!(v["input_tokens"], 25);
+        assert_eq!(v["output_tokens"], 150);
+        assert_eq!(v["cache_creation_input_tokens"], 0);
+        assert_eq!(v["cache_read_input_tokens"], 0);
     }
 }

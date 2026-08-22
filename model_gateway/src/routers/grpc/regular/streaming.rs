@@ -2000,15 +2000,7 @@ impl StreamingProcessor {
             model: model.clone(),
             stop_reason: None,
             stop_sequence: None,
-            usage: messages::Usage {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
-                cache_creation: None,
-                server_tool_use: None,
-                service_tier: None,
-            },
+            usage: Self::initial_messages_usage(),
         };
         Self::send_messages_event(
             tx,
@@ -2480,13 +2472,10 @@ impl StreamingProcessor {
                     stop_reason,
                     stop_sequence,
                 },
-                usage: MessageDeltaUsage {
-                    output_tokens: completion_tokens.total(),
-                    input_tokens: None,
-                    cache_creation_input_tokens: None,
-                    cache_read_input_tokens: None,
-                    server_tool_use: None,
-                },
+                usage: Self::final_messages_delta_usage(
+                    completion_tokens.total(),
+                    saw_complete.then_some(prompt_tokens),
+                ),
             },
         )
         .await?;
@@ -3187,6 +3176,39 @@ impl StreamingProcessor {
             .with_cached_tokens(total_cached)
             .with_reasoning_tokens(total_reasoning)
     }
+
+    /// Skeleton usage for the `message_start` event. Cache counters are
+    /// integer zeros, never null: the Anthropic wire contract has
+    /// always-present cache counters and clients do arithmetic on them.
+    fn initial_messages_usage() -> messages::Usage {
+        messages::Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+            cache_creation: None,
+            server_tool_use: None,
+            service_tier: None,
+        }
+    }
+
+    /// Usage for the final `message_delta` event. `authoritative_input` is the
+    /// prompt count only when a `Complete` was seen; a clean EOF without one
+    /// must serialize `input_tokens: null` rather than claim a zero-token
+    /// prompt. Cache counters follow the same integer-not-null contract as
+    /// [`Self::initial_messages_usage`].
+    fn final_messages_delta_usage(
+        output_tokens: u32,
+        authoritative_input: Option<u32>,
+    ) -> MessageDeltaUsage {
+        MessageDeltaUsage {
+            output_tokens,
+            input_tokens: authoritative_input,
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+            server_tool_use: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3214,5 +3236,34 @@ mod tests {
                 .and_then(|details| details.reasoning_tokens),
             Some(3)
         );
+    }
+
+    /// Wire contract: cache counters serialize as integer zeros, never null,
+    /// in both the message_start skeleton and the final message_delta usage.
+    #[test]
+    fn messages_usage_cache_counters_serialize_as_integer_zeros() {
+        let start = serde_json::to_value(StreamingProcessor::initial_messages_usage()).unwrap();
+        assert_eq!(start["input_tokens"], 0);
+        assert_eq!(start["output_tokens"], 0);
+        assert_eq!(start["cache_creation_input_tokens"], 0);
+        assert_eq!(start["cache_read_input_tokens"], 0);
+
+        let delta =
+            serde_json::to_value(StreamingProcessor::final_messages_delta_usage(15, Some(25)))
+                .unwrap();
+        assert_eq!(delta["output_tokens"], 15);
+        assert_eq!(delta["input_tokens"], 25);
+        assert_eq!(delta["cache_creation_input_tokens"], 0);
+        assert_eq!(delta["cache_read_input_tokens"], 0);
+    }
+
+    /// A clean EOF without a `Complete` message has no authoritative prompt
+    /// count: `input_tokens` must serialize as null, not a fabricated zero.
+    #[test]
+    fn message_delta_input_tokens_null_without_authoritative_usage() {
+        let delta =
+            serde_json::to_value(StreamingProcessor::final_messages_delta_usage(15, None)).unwrap();
+        assert!(delta["input_tokens"].is_null());
+        assert_eq!(delta["cache_creation_input_tokens"], 0);
     }
 }
