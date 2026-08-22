@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use openai_protocol::common::Tool;
 use serde::de::{Deserialize, IgnoredAny};
@@ -6,7 +6,7 @@ use serde_json::{de::Deserializer, Value};
 
 use crate::{
     errors::{ParserError, ParserResult},
-    types::{StreamingParseResult, ToolCallItem},
+    types::{StreamingParseResult, ToolCall, ToolCallItem},
 };
 
 /// `param_name -> declared JSON-schema type` for the named function (empty if the
@@ -143,6 +143,77 @@ pub fn take_unstreamed_normal_text(buffer: &mut String, current_tool_id: i32) ->
     } else {
         String::new()
     }
+}
+
+/// Drop tool calls whose function name is not among the declared tools.
+///
+/// Streaming never announces an undeclared name: every parser that validates
+/// names in `parse_incremental` checks the call against the request's tool
+/// list and routes the text to content instead. The non-streaming path had no
+/// such guard - [`ToolParser::parse_complete`] is not even given the tool list
+/// - so identical model output produced a `tool_calls` entry naming a function
+/// the client never declared when `stream=false`, and plain content when
+/// `stream=true`. A client dispatching on `function.name` was handed a name
+/// that was never in its schema.
+///
+/// An empty `tools` means "no declared set to check against" (the parse
+/// endpoint and the Go FFI both allow it), so nothing is filtered. If
+/// filtering would remove every call, the model's original text is returned as
+/// content - the fallback each parser already uses when nothing parsed - so
+/// the text surfaces instead of disappearing.
+///
+/// [`ToolParser::parse_complete`]: crate::traits::ToolParser::parse_complete
+pub fn retain_declared_tool_calls(
+    original_text: &str,
+    normal_text: String,
+    calls: Vec<ToolCall>,
+    tools: &[Tool],
+) -> (String, Vec<ToolCall>) {
+    if tools.is_empty() || calls.is_empty() {
+        return (normal_text, calls);
+    }
+
+    let declared: HashSet<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
+    let total = calls.len();
+    let (kept, dropped): (Vec<ToolCall>, Vec<ToolCall>) = calls
+        .into_iter()
+        .partition(|call| declared.contains(call.function.name.as_str()));
+    for call in &dropped {
+        tracing::debug!(
+            "Undeclared tool name '{}' - not forwarding as a tool call",
+            call.function.name
+        );
+    }
+
+    if kept.len() == total {
+        return (normal_text, kept);
+    }
+    if kept.is_empty() {
+        // Nothing survived: surface the raw text as content rather than
+        // returning an empty response, matching the streaming fallback.
+        return (original_text.to_string(), Vec::new());
+    }
+
+    // Mixed batch: the declared calls stand, but the dropped ones must not
+    // vanish. Streaming emits an undeclared call's text as content, so the
+    // non-streaming path re-serializes each dropped call into the text rather
+    // than losing what the model produced. The rendering is normalized JSON,
+    // not the raw markers streaming happens to carry, but the information
+    // survives on both paths.
+    let mut text = normal_text;
+    for call in &dropped {
+        if !text.is_empty() && !text.ends_with(char::is_whitespace) {
+            text.push(' ');
+        }
+        text.push_str(
+            &serde_json::json!({
+                "name": call.function.name,
+                "arguments": call.function.arguments,
+            })
+            .to_string(),
+        );
+    }
+    (text, kept)
 }
 
 /// Check if a buffer ends with a partial occurrence of a token

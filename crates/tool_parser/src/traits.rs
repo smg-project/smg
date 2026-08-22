@@ -3,6 +3,7 @@ use openai_protocol::common::Tool;
 
 use crate::{
     errors::ParserResult,
+    parsers::helpers::retain_declared_tool_calls,
     types::{StreamingParseResult, ToolCall},
 };
 
@@ -14,14 +15,28 @@ pub trait ToolParser: Send + Sync {
     async fn parse_complete(&self, output: &str) -> ParserResult<(String, Vec<ToolCall>)>;
 
     /// Like [`Self::parse_complete`], but with the request's tool schemas so
-    /// schema-aware parsers coerce arg values by declared type. The default
-    /// ignores `tools` and delegates to `parse_complete`.
+    /// schema-aware parsers coerce arg values by declared type.
+    ///
+    /// The default delegates to [`Self::parse_complete`] and then drops any
+    /// call naming a function the request never declared, so a model that
+    /// invents a tool name cannot have it forwarded to the client. This is the
+    /// contract `parse_incremental` already enforces; without it the same
+    /// output yielded a bogus `tool_calls` entry when `stream=false` and plain
+    /// content when `stream=true`. Parsers that deliberately forward unknown
+    /// names (e.g. MiniMax-M2, which would otherwise leak `<invoke>` markup
+    /// into assistant text) override this method and keep their behaviour.
     async fn parse_complete_with_tools(
         &self,
         output: &str,
-        _tools: &[Tool],
+        tools: &[Tool],
     ) -> ParserResult<(String, Vec<ToolCall>)> {
-        self.parse_complete(output).await
+        let (normal_text, calls) = self.parse_complete(output).await?;
+        Ok(retain_declared_tool_calls(
+            output,
+            normal_text,
+            calls,
+            tools,
+        ))
     }
 
     /// Parse tool calls from model output (streaming)

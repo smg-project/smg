@@ -320,7 +320,15 @@ impl ToolParser for QwenXmlParser {
         text: &str,
         tools: &[Tool],
     ) -> ParserResult<(String, Vec<ToolCall>)> {
-        self.parse_complete_inner(text, tools)
+        let (normal_text, calls) = self.parse_complete_inner(text, tools)?;
+        // This parser validates names while streaming, so it must here too;
+        // overriding this method would otherwise skip the default's check.
+        Ok(helpers::retain_declared_tool_calls(
+            text,
+            normal_text,
+            calls,
+            tools,
+        ))
     }
 
     async fn parse_incremental(
