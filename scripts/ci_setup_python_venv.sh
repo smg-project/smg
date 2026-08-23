@@ -23,6 +23,9 @@ set -euo pipefail
 # drift this exists to prevent.
 PY_VERSION="${CI_PYTHON_VERSION:-3.12}"
 
+# Pinned so a job's toolchain does not change under it between runs.
+UV_VERSION="${UV_VERSION:-0.12.5}"
+
 host_python_version() {
     python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "none"
 }
@@ -35,12 +38,23 @@ if [ "$HOST_VERSION" = "$PY_VERSION" ]; then
     # adds no dependency, and downloads nothing. Only the outlier hosts take
     # the branch below.
     echo "Host python3 is $PY_VERSION - creating venv with it"
-    if ! command -v pip3 &> /dev/null || ! python3 -m venv --help &> /dev/null; then
-        echo "Installing pip and venv..."
+    # Gate on the venv module, not on a global pip3. What this script needs is
+    # the ability to build a venv and for that venv to get pip from ensurepip;
+    # whether pip happens to be installed system-wide is unrelated, and testing
+    # for it triggered a pointless apt install on hosts that were already fine.
+    if ! python3 -m venv --help &> /dev/null; then
+        echo "Installing python3-venv..."
         sudo apt update
         sudo apt install -y python3-pip python3-venv
     fi
     python3 -m venv .venv
+    # Some distro pythons build venvs without pip even when the module exists
+    # (Debian splits ensurepip out). Repair it here rather than letting the
+    # assertion below fail on something recoverable.
+    if ! .venv/bin/python -m pip --version &> /dev/null; then
+        echo "venv has no pip - bootstrapping with ensurepip"
+        .venv/bin/python -m ensurepip --upgrade || true
+    fi
 else
     # The host ships something else. Provision the pinned interpreter with uv
     # instead of mutating the machine: uv fetches a standalone CPython into the
@@ -49,8 +63,12 @@ else
     # to upgrade in place.
     echo "Host python3 is $HOST_VERSION - provisioning $PY_VERSION with uv"
     if ! command -v uv &> /dev/null; then
-        echo "Installing uv..."
-        curl -LsSf https://astral.sh/uv/install.sh | sh
+        # Version-pinned installer URL rather than the floating one. This runs
+        # before any other script that installs uv, and they all skip when uv is
+        # already present, so pinning here fixes the version for the whole job
+        # instead of inheriting whatever was released that morning.
+        echo "Installing uv $UV_VERSION..."
+        curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
         export PATH="$HOME/.local/bin:$PATH"
     fi
     uv python install "$PY_VERSION"
