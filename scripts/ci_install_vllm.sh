@@ -29,6 +29,30 @@ echo "Using uv version: $(uv --version)"
 echo "Installing vLLM..."
 uv pip install "vllm==0.27.1" --torch-backend=auto
 
+# vLLM 0.27.1 hard-pins flashinfer-python==0.6.16.post3, which cannot be
+# imported on Python < 3.12. Its flashinfer/comm/fd_exchange.py:55 declares
+#
+#     def _fd_ancillary(fd: int) -> tuple[tuple[int, int, array.array[int]]]:
+#
+# with no `from __future__ import annotations`, so the annotation is evaluated
+# at import time; `array.array` only gained __class_getitem__ in CPython 3.12,
+# and everything below it dies with "TypeError: 'type' object is not
+# subscriptable". vLLM imports flashinfer.comm eagerly from
+# distributed/device_communicators/flashinfer_all_reduce.py, so every worker
+# fails to start.
+#
+# This only bites where the venv is built on an older interpreter: the
+# bare-metal GPU runners resolve `python3` to 3.10, while the containerised
+# pools get 3.12+ and are unaffected. That asymmetry is why the blackwell legs
+# of the tau2 nightly failed for five consecutive runs while the h100 legs
+# stayed green.
+#
+# 0.6.16.post4 is the same release with `from __future__ import annotations`
+# added, so the annotation is never evaluated. --no-deps because vLLM's pin is
+# exact and would otherwise drag post3 back in.
+echo "Patching flashinfer-python (post3 is unimportable on Python < 3.12)..."
+uv pip install --no-deps "flashinfer-python==0.6.16.post4"
+
 # vLLM >=0.25 eagerly imports torchcodec, which dlopens the FFmpeg shared
 # libraries (libavutil/libavcodec/libavformat/...) at import time. The runner
 # image ships none, so every worker dies importing vllm. Install distro FFmpeg
@@ -106,5 +130,19 @@ uv pip install "flashinfer-jit-cache==${FLASHINFER_VERSION}" \
 echo "Installing smg-grpc-proto and smg-grpc-servicer from source..."
 uv pip install -e crates/grpc_client/python/
 uv pip install -e grpc_servicer/
+
+# Import canary: fail here (not 40 minutes later on a GPU) if flashinfer.comm
+# is unimportable. This runs LAST on purpose. The post4 override above leaves
+# the environment contradicting vLLM's exact post3 pin, and several uv installs
+# follow it -- any one of them could "repair" the environment back to post3 and
+# silently reinstate the TypeError. Importing the actual failing module is the
+# only check that cannot be fooled: a version string can look right while the
+# import still dies.
+echo "Checking flashinfer imports..."
+python3 -c "
+import importlib.metadata as m
+import flashinfer.comm  # noqa: F401  - the import IS the assertion
+print('flashinfer-python', m.version('flashinfer-python'), 'imports OK')
+"
 
 echo "vLLM installation complete"
