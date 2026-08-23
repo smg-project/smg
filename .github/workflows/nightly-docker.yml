@@ -11,9 +11,9 @@ on:
         type: boolean
         default: false
       runner:
-        description: 'Runner label to build on (default self-hosted cpu-e5; any self-hosted label or a GitHub-hosted size works, x86_64 assumed)'
+        description: 'Runner label to build on (default self-hosted b200; any self-hosted label or a GitHub-hosted size works, x86_64 assumed)'
         type: string
-        default: 'cpu-e5'
+        default: 'b200'
 
 concurrency:
   # Express builds run in their own lane so a fast one-off never cancels
@@ -33,13 +33,29 @@ jobs:
   build-and-push:
     name: Build nightly Docker image
     if: github.repository == 'smg-project/smg'
-    runs-on: ${{ inputs.runner || 'cpu-e5' }}
+    # `inputs` is empty on a schedule event, so this falls back to the literal
+    # below — which is what the nightly actually builds on. It read 'cpu-e5'
+    # until that label stopped existing: the host behind it was re-provisioned
+    # and re-registered as 'cpu-e5-test', leaving nothing claiming 'cpu-e5'.
+    # Scheduled runs then sat queued until GitHub reaped them at its 24h
+    # self-hosted limit, which reports as `cancelled` rather than as a failure —
+    # so the nightly image silently stopped being published without ever going
+    # red. Manual runs kept working only because whoever ran them typed a live
+    # label into the input.
+    runs-on: ${{ inputs.runner || 'b200' }}
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v7
 
+      # The one step b200 has not yet exercised. Both manual builds that ran
+      # there were express, so QEMU was skipped and only the amd64 half was
+      # proven; binfmt registration for the arm64 half is unverified on that
+      # host. Left as the full build anyway, because the failure modes are not
+      # comparable: if binfmt is missing this dies here in under a minute with a
+      # clear error, whereas the status quo hangs for 24h and reports
+      # `cancelled`. A loud, fast failure is strictly better than a silent one.
       - name: Set up QEMU
         if: env.EXPRESS != 'true'
         uses: docker/setup-qemu-action@v4
