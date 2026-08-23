@@ -34,7 +34,14 @@ jobs:
   # ---------------------------------------------------------------------------
 
   build-wheel:
-    runs-on: k8s-runner-gpu
+    # CPU-only work: a Rust/maturin compile plus openapi-gen and
+    # datamodel-codegen. It never needed a GPU, and the label it asked for
+    # ('k8s-runner-gpu') no longer has any runners behind it, so the job was
+    # never claimed -- it sat queued for 24h until GitHub's self-hosted limit
+    # reaped it, which reports as `cancelled` and took the whole run with it.
+    # pr-test-rust.yml's build-wheel already builds the same wheel on the CPU
+    # pool; match it.
+    runs-on: k8s-runner-cpu
     permissions:
       contents: read
     steps:
