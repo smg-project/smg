@@ -39,6 +39,26 @@ def find_model_config() -> Path:
     return Path(spec.origin)
 
 
+# Handlers whose tool payload rewrites "." to "_" in function names, per
+# bfcl_eval.model_handler.utils.convert_to_tool. For these the checker must
+# apply the same rewrite to the expected name, which is what `underscore_to_dot`
+# switches on — its own docstring says it "only matters for checker". Setting it
+# False alongside one of these handlers is internally inconsistent: the model is
+# asked for `math_factorial` and then graded against `math.factorial`, so every
+# dotted-name case is scored wrong no matter what the model or the frontend did.
+DOT_SANITIZING_HANDLERS = {
+    "OpenAICompletionsHandler",
+    "OpenAIResponsesHandler",
+    "MistralHandler",
+    "GoogleHandler",
+    "OSSHandler",
+    "AnthropicHandler",
+    "CohereHandler",
+    "AmazonHandler",
+    "NovitaHandler",
+}
+
+
 def build_entry(model_id: str, handler: str) -> str:
     return (
         f'    "{model_id}-FC": ModelConfig(\n'
@@ -51,7 +71,7 @@ def build_entry(model_id: str, handler: str) -> str:
         f"        input_price=None,\n"
         f"        output_price=None,\n"
         f"        is_fc_model=True,\n"
-        f"        underscore_to_dot=False,\n"
+        f"        underscore_to_dot={handler in DOT_SANITIZING_HANDLERS},\n"
         f"    ),\n"
     )
 
