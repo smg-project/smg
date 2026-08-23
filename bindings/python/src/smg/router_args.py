@@ -220,7 +220,6 @@ class RouterArgs:
     selection_temperature: float = 0.0
     upstream_pool_idle_timeout_secs: int = 3
     least_load_max_waiting_requests: int = 0
-    stream_request_bodies_over: int = 0
     stream_body_stall_timeout_secs: int = 300
     # Ordered header names checked for the routing key; first valid wins
     routing_key_headers: list[str] = dataclasses.field(
@@ -242,6 +241,9 @@ class RouterArgs:
     worker_overload_protection: bool = False
     # Restore the conditional load-monitor poll gate (default: poll always)
     disable_load_monitoring: bool = False
+    # Most bytes the router may buffer for a request it holds only to keep
+    # it retryable; larger eligible requests stream and forfeit router retries
+    max_buffered_request_bytes: int = 1048576
 
     @staticmethod
     def add_cli_args(
@@ -706,16 +708,17 @@ class RouterArgs:
             help="Maximum payload size in bytes",
         )
         routing_group.add_argument(
-            f"--{prefix}stream-request-bodies-over",
+            f"--{prefix}max-buffered-request-bytes",
             type=int,
-            default=RouterArgs.stream_request_bodies_over,
+            default=RouterArgs.max_buffered_request_bytes,
             help=(
-                "Forward request bodies larger than this many bytes to the"
-                " worker as a raw stream instead of buffering, when the"
-                " route's policy needs no request text and the worker applies"
-                " no body mutation. Streamed bodies cannot be replayed, so"
-                " those requests bypass router-level retries; bodies without"
-                " a Content-Length header always buffer. 0 disables"
+                "Most bytes the router may hold for a request it buffers only"
+                " to keep it retryable. Requests the router must parse buffer"
+                " regardless (bounded by max-payload-size); other eligible"
+                " requests buffer up to this many bytes when router retries"
+                " are enabled and otherwise stream to the worker verbatim,"
+                " forfeiting router-level retries. 0 never buffers for"
+                " retries"
             ),
         )
         routing_group.add_argument(
@@ -726,8 +729,8 @@ class RouterArgs:
                 "Abort a streamed request body once the upstream sender has"
                 " waited on the client for this many seconds (408). The clock"
                 " pauses while the worker applies backpressure, so a slow"
-                " worker read never trips it. Applies only to bodies streamed"
-                " via --stream-request-bodies-over. 0 disables"
+                " worker read never trips it. Applies only to streamed"
+                " request bodies. 0 disables"
             ),
         )
         routing_group.add_argument(

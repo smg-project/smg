@@ -7,10 +7,7 @@ use std::{
 use axum::{
     body::{to_bytes, Body},
     extract::{Request, State},
-    http::{
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
-        HeaderMap, HeaderValue, Method, StatusCode,
-    },
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -43,7 +40,7 @@ use tracing::{error, warn};
 
 use crate::{
     app_context::AppContext,
-    config::types::{RetryConfig, RouterConfig},
+    config::types::RetryConfig,
     middleware::{scheduler::PreemptionGuard, TenantRequestMeta},
     observability::{
         events::{self, Event},
@@ -53,7 +50,13 @@ use crate::{
     policies::{PolicyRegistry, SelectWorkerInfo},
     routers::{
         common::{
-            attach_sized_body, header_utils, overload,
+            attach_sized_body,
+            body_policy::{
+                decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
+                REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
+                REASON_WORKER_MUTATES_BODY,
+            },
+            header_utils, overload,
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
@@ -70,8 +73,9 @@ use crate::{
             request_stream::{CappedBodyStream, StreamProgress},
         },
         router_manager::RouterManager,
-        RouterTrait,
+        BodyPolicy, RouterTrait,
     },
+    wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{AttachedBody, ConnectionMode, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType},
 };
 
@@ -96,6 +100,10 @@ pub struct Router {
     /// Streamed-body stall watchdog: abort a dispatch once a single client
     /// wait lasts this long. `None` disables.
     stream_stall_timeout: Option<Duration>,
+    /// Cap on buffering a request only to keep it retryable; larger eligible
+    /// requests stream and forfeit router retries. `0` never buffers for
+    /// retries.
+    max_buffered_request_bytes: u64,
     realtime_registry: Arc<RealtimeRegistry>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
@@ -164,6 +172,7 @@ impl Router {
                 0 => None,
                 secs => Some(Duration::from_secs(secs)),
             },
+            max_buffered_request_bytes: ctx.router_config.max_buffered_request_bytes,
             realtime_registry: ctx.realtime_registry.clone(),
             webrtc_bind_addr: ctx.webrtc_bind_addr,
             webrtc_stun_server: ctx.webrtc_stun_server.clone(),
@@ -1633,30 +1642,9 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
 use async_trait::async_trait;
 
 impl Router {
-    /// Streamed pass-through: select a worker from headers alone and
-    /// forward the raw body verbatim (JSON validation and normalization
-    /// defer to the worker). `Err` hands the request back untouched —
-    /// body unconsumed — for the buffered typed path. Callers gate on
-    /// the size threshold via [`stream_large_request_bodies`].
-    pub(crate) async fn route_streaming_request(
-        &self,
-        req: Request<Body>,
-        route: &'static str,
-    ) -> Result<Response, Request<Body>> {
-        // Content-blind eligibility: the model and stream flag sit inside the
-        // unread body, so any registered policy that routes on request text
-        // (the body's model could select it) forces the buffered path unless
-        // a valid routing hint header stands in for the text. Every fallback
-        // hands the request back with its body unconsumed.
-        let model_id = crate::worker::UNKNOWN_MODEL_ID;
-        if self
-            .policy_registry
-            .any_policy_needs_request_text(Some(req.headers()))
-        {
-            return Err(req);
-        }
-        // A body-mutating worker (`prepare_request`) anywhere in the fleet
-        // forces the buffered path: the mutation needs the parsed body.
+    /// Gather this router's per-request state for the shared decision matrix
+    /// in [`crate::routers::common::body_policy`].
+    fn request_body_path(&self, headers: &HeaderMap, wasm_request_hooks: bool) -> BodyPath {
         let candidates = self.worker_registry.get_workers_filtered(
             None,
             Some(WorkerType::Regular),
@@ -1664,9 +1652,43 @@ impl Router {
             None,
             false,
         );
-        if candidates.iter().any(|w| w.mutates_request()) {
-            return Err(req);
-        }
+        decide_body_path(&BodyPathInputs {
+            policy_needs_text: self
+                .policy_registry
+                .any_policy_needs_request_text(Some(headers)),
+            model_ambiguous: self.worker_registry.model_count() > 1,
+            worker_mutates_body: candidates.iter().any(|w| w.mutates_request()),
+            wasm_request_hooks,
+            content_length: header_utils::content_length(Some(headers)).map(|len| len as u64),
+            // The model sits inside the unread body, so any per-model retry
+            // override that still allows retries must count as
+            // retries-enabled.
+            retries_enabled: self.retry_config.max_retries > 1
+                || self
+                    .worker_registry
+                    .any_model_retry_override_enables_retries(),
+            max_buffered_request_bytes: self.max_buffered_request_bytes,
+        })
+    }
+
+    /// Streamed pass-through: select a worker from headers alone and
+    /// forward the raw body verbatim (JSON validation and normalization
+    /// defer to the worker). `Err` hands the request back untouched —
+    /// body unconsumed — for the buffered typed path.
+    pub(crate) async fn route_streaming_request(
+        &self,
+        req: Request<Body>,
+        route: &'static str,
+        wasm_request_hooks: bool,
+    ) -> Result<Response, Request<Body>> {
+        let stream_reason = match self.request_body_path(req.headers(), wasm_request_hooks) {
+            BodyPath::Buffer(reason) => {
+                Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
+                return Err(req);
+            }
+            BodyPath::Stream(reason) => reason,
+        };
+        let model_id = crate::worker::UNKNOWN_MODEL_ID;
         // Buffered-path parity: a valid tokens hint is exactly what selection
         // would have received there (text is never extracted alongside it).
         // Streamed requests have no readable body, hence no rid key; the
@@ -1679,13 +1701,22 @@ impl Router {
             Some(req.headers()),
             None,
         ) else {
+            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
             return Err(req);
         };
-        // Guards a registration race: a mutating worker that joined after the
-        // fleet check above must still not receive an unmutated stream.
+        // Guard the registration races the decision left open: a mutating
+        // worker that joined after the fleet check must not receive an
+        // unmutated stream, and a second model appearing re-opens
+        // wrong-model selection.
         if worker.mutates_request() {
+            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_WORKER_MUTATES_BODY);
             return Err(req);
         }
+        if self.worker_registry.model_count() > 1 {
+            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_MODEL_AMBIGUOUS);
+            return Err(req);
+        }
+        Metrics::record_request_body_path(BODY_PATH_STREAMED, stream_reason);
 
         let start = Instant::now();
         let endpoint = route_to_endpoint(route);
@@ -1762,45 +1793,43 @@ impl Router {
     }
 }
 
-/// Whether the request qualifies for the streamed body pass-through:
-/// `--stream-request-bodies-over` is on and the declared Content-Length
-/// exceeds it. Chunked uploads carry no Content-Length and always buffer.
-fn exceeds_stream_threshold(threshold: u64, req: &Request<Body>) -> bool {
-    threshold > 0
-        && req
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .is_some_and(|len| len > threshold)
-}
-
-/// State for [`stream_large_request_bodies`]: the app-level router handle
-/// (the manager in production, a concrete router in tests) and the streaming
-/// threshold.
+/// State for [`stream_eligible_request_bodies`]: the app-level router handle
+/// (the manager in production, a concrete router in tests) and the app
+/// context carrying the WASM manager.
 #[derive(Clone)]
 pub struct StreamBodyState {
     router: Arc<dyn RouterTrait>,
-    threshold: u64,
+    context: Arc<AppContext>,
 }
 
 impl StreamBodyState {
-    pub fn new(router: Arc<dyn RouterTrait>, config: &RouterConfig) -> Self {
-        Self {
-            router,
-            threshold: config.stream_request_bodies_over,
-        }
+    pub fn new(router: Arc<dyn RouterTrait>, context: Arc<AppContext>) -> Self {
+        Self { router, context }
+    }
+
+    /// WASM OnRequest hooks read (and may rewrite) the buffered body, so
+    /// their presence forces the buffered path. A manager error counts as
+    /// present: never stream past a hook we could not enumerate.
+    fn wasm_request_hooks(&self) -> bool {
+        self.context.router_config.enable_wasm
+            && self.context.wasm_manager.as_ref().is_some_and(|manager| {
+                manager
+                    .get_modules_by_attach_point(WasmModuleAttachPoint::Middleware(
+                        MiddlewareAttachPoint::OnRequest,
+                    ))
+                    .map_or(true, |modules| !modules.is_empty())
+            })
     }
 }
 
-/// Route-layer middleware: a typed-JSON request whose declared Content-Length
-/// exceeds the threshold is offered to the HTTP regular router's streamed
-/// pass-through before the handler's `Json`/`ValidatedJson` extractor can
-/// buffer it. Any decline — other route, below threshold, no HTTP regular
-/// router, router-side ineligibility — falls through to the untouched
-/// handler with the body unconsumed. Sits inside the admission layer, so
-/// streamed requests hold an admission permit and race the preemption token.
-pub async fn stream_large_request_bodies(
+/// Route-layer middleware: every typed-JSON request on an eligible route is
+/// classified by the router family's [`BodyPolicy`]. A `MustBuffer` family
+/// is accounted and passed to the untouched handler; a `ForwardCapable`
+/// router then decides per request between the streamed pass-through and
+/// the handler's buffered `Json`/`ValidatedJson` path, always with the body
+/// unconsumed on decline. Sits inside the admission layer, so streamed
+/// requests hold an admission permit and race the preemption token.
+pub async fn stream_eligible_request_bodies(
     State(state): State<StreamBodyState>,
     cancel: PreemptionGuard,
     req: Request<Body>,
@@ -1815,25 +1844,34 @@ pub async fn stream_large_request_bodies(
         "/v1/classify" => "/v1/classify",
         _ => return next.run(req).await,
     };
-    if !exceeds_stream_threshold(state.threshold, &req) {
+    if let BodyPolicy::MustBuffer(reason) = state.router.request_body_policy() {
+        Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
         return next.run(req).await;
     }
+    // ForwardCapable: resolve the concrete regular router behind an optional
+    // manager. Either arm can only fail on a registration race that turned
+    // dispatch model-addressed again.
     let resolved = match state.router.as_any().downcast_ref::<RouterManager>() {
-        // Multi-router deployments route by the model inside the body; a
-        // content-blind dispatch could pick a router that does not serve it.
-        Some(manager) if manager.router_count() > 1 => return next.run(req).await,
         Some(manager) => match manager.select_router_for_request(None) {
             Some(selected) => selected,
-            None => return next.run(req).await,
+            None => {
+                Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_MODEL_SELECTION);
+                return next.run(req).await;
+            }
         },
         None => Arc::clone(&state.router),
     };
     let Some(http) = resolved.as_any().downcast_ref::<Router>() else {
+        Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_MODEL_SELECTION);
         return next.run(req).await;
     };
+    let wasm_request_hooks = state.wasm_request_hooks();
     cancel
         .guard(async move {
-            match http.route_streaming_request(req, route).await {
+            match http
+                .route_streaming_request(req, route, wasm_request_hooks)
+                .await
+            {
                 Ok(response) => response,
                 Err(req) => next.run(req).await,
             }
@@ -1845,6 +1883,10 @@ pub async fn stream_large_request_bodies(
 impl RouterTrait for Router {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn request_body_policy(&self) -> BodyPolicy {
+        BodyPolicy::ForwardCapable
     }
 
     async fn health_generate(&self, req: Request<Body>) -> Response {
@@ -2118,13 +2160,20 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
     };
 
+    use axum::http::header::CONTENT_LENGTH;
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
     use crate::{
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
         policies::CacheAwarePolicy,
-        routers::common::request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
+        routers::common::{
+            body_policy::{
+                REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT, REASON_RETRYABLE,
+                REASON_RETRY_FORFEITED, REASON_WASM_REQUEST_HOOK,
+            },
+            request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
+        },
         worker::BasicWorkerBuilder,
     };
 
@@ -2230,6 +2279,7 @@ mod tests {
             retry_config: RetryConfig::default(),
             max_payload_size: 536_870_912,
             stream_stall_timeout: Some(Duration::from_secs(60)),
+            max_buffered_request_bytes: 0,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
@@ -2463,6 +2513,9 @@ mod tests {
             retry_config: RetryConfig::default(),
             max_payload_size,
             stream_stall_timeout: Some(Duration::from_secs(60)),
+            // Streaming tests exercise the streamed path; 0 never buffers
+            // for retries.
+            max_buffered_request_bytes: 0,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
@@ -2509,48 +2562,155 @@ mod tests {
     }
 
     fn streamed_request(chunks: &[&'static [u8]]) -> Request<Body> {
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
         let chunks: Vec<Result<Bytes, std::io::Error>> =
             chunks.iter().map(|c| Ok(Bytes::from_static(c))).collect();
         Request::builder()
             .method(Method::POST)
             .uri("/generate")
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .header(CONTENT_LENGTH, total)
             .body(Body::from_stream(stream::iter(chunks)))
             .unwrap()
     }
 
-    fn request_with_content_length(len: Option<&str>) -> Request<Body> {
-        let mut builder = Request::builder().method(Method::POST).uri("/generate");
+    fn headers_with_content_length(len: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
         if let Some(len) = len {
-            builder = builder.header(CONTENT_LENGTH, len);
+            headers.insert(CONTENT_LENGTH, len.parse().unwrap());
         }
-        builder.body(Body::empty()).unwrap()
+        headers
     }
 
     #[test]
-    fn stream_threshold_requires_flag_and_larger_content_length() {
-        assert_eq!(RouterConfig::default().stream_request_bodies_over, 0);
-        assert!(!exceeds_stream_threshold(
-            0,
-            &request_with_content_length(Some("10000"))
-        ));
+    fn text_needing_policy_without_waiver_decides_buffer() {
+        let router = streaming_router(
+            cache_aware_policy(),
+            1024 * 1024,
+            vec![plain_worker("http://worker1:8080")],
+        );
+        assert_eq!(
+            router.request_body_path(&headers_with_content_length(Some("64")), false),
+            BodyPath::Buffer(REASON_POLICY_NEEDS_TEXT)
+        );
 
-        assert!(!exceeds_stream_threshold(
-            1024,
-            &request_with_content_length(None)
-        ));
-        assert!(!exceeds_stream_threshold(
-            1024,
-            &request_with_content_length(Some("1024"))
-        ));
-        assert!(!exceeds_stream_threshold(
-            1024,
-            &request_with_content_length(Some("not-a-number"))
-        ));
-        assert!(exceeds_stream_threshold(
-            1024,
-            &request_with_content_length(Some("1025"))
-        ));
+        // A valid tokens hint waives the text requirement.
+        let mut headers = headers_with_content_length(Some("64"));
+        headers.insert("x-smg-routing-tokens", "1,2,3".parse().unwrap());
+        assert_eq!(
+            router.request_body_path(&headers, false),
+            BodyPath::Stream(REASON_RETRY_FORFEITED)
+        );
+    }
+
+    #[test]
+    fn mutating_worker_decides_buffer() {
+        let worker = BasicWorkerBuilder::new("http://worker1:8080")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .dp_config(3, 8)
+            .build();
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![worker]);
+        assert_eq!(
+            router.request_body_path(&headers_with_content_length(Some("64")), false),
+            BodyPath::Buffer(REASON_WORKER_MUTATES_BODY)
+        );
+    }
+
+    #[test]
+    fn wasm_request_hook_decides_buffer() {
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker("http://worker1:8080")],
+        );
+        assert_eq!(
+            router.request_body_path(&headers_with_content_length(Some("64")), true),
+            BodyPath::Buffer(REASON_WASM_REQUEST_HOOK)
+        );
+    }
+
+    #[test]
+    fn missing_or_invalid_content_length_decides_buffer() {
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker("http://worker1:8080")],
+        );
+        for headers in [
+            headers_with_content_length(None),
+            headers_with_content_length(Some("not-a-number")),
+        ] {
+            assert_eq!(
+                router.request_body_path(&headers, false),
+                BodyPath::Buffer(REASON_NO_CONTENT_LENGTH)
+            );
+        }
+    }
+
+    /// Content-blind selection cannot tell which model's worker a streamed
+    /// request needs; two registered models force the buffered typed path.
+    #[test]
+    fn multi_model_registry_decides_buffer() {
+        let worker_for = |url: &str, model: &str| {
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .models(vec![crate::worker::ModelCard::new(model)])
+                .build()
+        };
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![
+                worker_for("http://worker1:8080", "model-a"),
+                worker_for("http://worker2:8080", "model-b"),
+            ],
+        );
+        assert_eq!(
+            router.request_body_path(&headers_with_content_length(Some("64")), false),
+            BodyPath::Buffer(REASON_MODEL_AMBIGUOUS)
+        );
+
+        // Two workers serving the same lone model stay streamable.
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![
+                worker_for("http://worker1:8080", "model-a"),
+                worker_for("http://worker2:8080", "model-a"),
+            ],
+        );
+        assert_eq!(
+            router.request_body_path(&headers_with_content_length(Some("64")), false),
+            BodyPath::Stream(REASON_RETRY_FORFEITED)
+        );
+    }
+
+    #[test]
+    fn per_model_retry_override_keeps_small_bodies_buffered() {
+        let mut router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker("http://worker1:8080")],
+        );
+        router.retry_config = RetryConfig {
+            max_retries: 1,
+            ..Default::default()
+        };
+        router.max_buffered_request_bytes = 1024;
+        router.worker_registry.set_model_retry_config(
+            "some-model",
+            RetryConfig {
+                max_retries: 3,
+                ..Default::default()
+            },
+            true,
+        );
+        assert_eq!(
+            router.request_body_path(&headers_with_content_length(Some("64")), false),
+            BodyPath::Buffer(REASON_RETRYABLE)
+        );
     }
 
     #[tokio::test]
@@ -2562,6 +2722,7 @@ mod tests {
             .route_streaming_request(
                 streamed_request(&[b"{\"text\":\"", b"hello\"}"]),
                 "/generate",
+                false,
             )
             .await
             .unwrap();
@@ -2595,7 +2756,11 @@ mod tests {
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
 
         let response = router
-            .route_streaming_request(streamed_request(&[b"{\"stream\":true}"]), "/generate")
+            .route_streaming_request(
+                streamed_request(&[b"{\"stream\":true}"]),
+                "/generate",
+                false,
+            )
             .await
             .unwrap();
 
@@ -2617,7 +2782,7 @@ mod tests {
         let router = streaming_router(least_load_policy(), 8, vec![plain_worker(&url)]);
 
         let response = router
-            .route_streaming_request(streamed_request(&[b"12345678", b"9"]), "/generate")
+            .route_streaming_request(streamed_request(&[b"12345678", b"9"]), "/generate", false)
             .await
             .unwrap();
 
@@ -2652,11 +2817,12 @@ mod tests {
             .method(Method::POST)
             .uri("/generate")
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .header(CONTENT_LENGTH, 1024)
             .body(stalled_body)
             .unwrap();
 
         let response = router
-            .route_streaming_request(req, "/generate")
+            .route_streaming_request(req, "/generate", false)
             .await
             .unwrap();
 
@@ -2698,11 +2864,12 @@ mod tests {
             .method(Method::POST)
             .uri("/generate")
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .header(CONTENT_LENGTH, 1024)
             .body(aborted_body)
             .unwrap();
 
         let response = router
-            .route_streaming_request(req, "/generate")
+            .route_streaming_request(req, "/generate", false)
             .await
             .unwrap();
 
@@ -2720,7 +2887,11 @@ mod tests {
 
     async fn assert_falls_back_with_body_intact(router: &Router) {
         let req = router
-            .route_streaming_request(streamed_request(&[b"{\"text\":\"hello\"}"]), "/generate")
+            .route_streaming_request(
+                streamed_request(&[b"{\"text\":\"hello\"}"]),
+                "/generate",
+                false,
+            )
             .await
             .unwrap_err();
 
@@ -2745,7 +2916,7 @@ mod tests {
 
     async fn routed_worker_id(router: &Router, req: Request<Body>) -> String {
         let response = router
-            .route_streaming_request(req, "/generate")
+            .route_streaming_request(req, "/generate", false)
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -2817,7 +2988,7 @@ mod tests {
                 hint,
             );
             let req = router
-                .route_streaming_request(req, "/generate")
+                .route_streaming_request(req, "/generate", false)
                 .await
                 .unwrap_err();
             let body = to_bytes(req.into_body(), usize::MAX).await.unwrap();
@@ -2839,7 +3010,7 @@ mod tests {
             "media-1",
         );
         assert!(router
-            .route_streaming_request(req, "/generate")
+            .route_streaming_request(req, "/generate", false)
             .await
             .is_err());
 
@@ -2877,7 +3048,7 @@ mod tests {
             &"k".repeat(129),
         );
         assert!(router
-            .route_streaming_request(req, "/generate")
+            .route_streaming_request(req, "/generate", false)
             .await
             .is_err());
     }

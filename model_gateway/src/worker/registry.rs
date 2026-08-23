@@ -709,6 +709,15 @@ impl WorkerRegistry {
             .collect()
     }
 
+    /// Distinct canonical models with at least one worker serving them.
+    /// Wildcard workers carry no model and contribute nothing.
+    pub fn model_count(&self) -> usize {
+        self.model_index
+            .iter()
+            .filter(|entry| !entry.value().is_empty())
+            .count()
+    }
+
     /// Whether at least one worker serves this name, as a canonical model ID
     /// or as an alias.
     ///
@@ -844,6 +853,15 @@ impl WorkerRegistry {
         self.model_retry_configs
             .get(model_id)
             .map(|entry| entry.value().clone())
+    }
+
+    /// True when any per-model retry override still allows retries; the
+    /// content-blind streamed path cannot know the model, so it must assume
+    /// the strictest override.
+    pub fn any_model_retry_override_enables_retries(&self) -> bool {
+        self.model_retry_configs
+            .iter()
+            .any(|entry| entry.value().max_retries > 1)
     }
 
     // ───────────────────────────────────────────────────────────────────

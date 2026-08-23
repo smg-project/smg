@@ -1,10 +1,11 @@
-//! Streamed request-body pass-through (`--stream-request-bodies-over`).
+//! Per-request body-path decision (`--max-buffered-request-bytes`).
 //!
-//! Above the threshold, with a policy that needs no request text, the raw
-//! body must flow to the worker as a chunked stream, byte-for-byte. Below the
-//! threshold, without a Content-Length, or under a text-needing policy, the
-//! buffered typed path (which re-serializes and sends a Content-Length) must
-//! be used instead.
+//! An eligible request larger than the retry-buffer cap must flow to the
+//! worker as a chunked stream, byte-for-byte; with retries disabled it must
+//! stream at any size. Under the cap with retries enabled, without a
+//! Content-Length, under a text-needing policy, or in a registry serving
+//! more than one model, the buffered typed path (which re-serializes and
+//! sends a Content-Length) must be used instead.
 
 use std::sync::Arc;
 
@@ -48,6 +49,8 @@ async fn spawn_capture_worker() -> (String, Captured) {
     let app = axum::Router::new()
         .route("/generate", axum::routing::post(capture))
         .route("/v1/chat/completions", axum::routing::post(capture))
+        // Outsize axum's 2MB default so multi-MiB streamed forwards land.
+        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(Arc::clone(&captured));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -87,27 +90,38 @@ fn cache_aware_policy() -> PolicyConfig {
     }
 }
 
-/// App wired through the real `build_app` stack with the capture stub as the
-/// only worker.
-async fn streaming_app(
-    policy: PolicyConfig,
-    threshold: u64,
-    max_payload_size: usize,
-) -> (axum::Router, Captured, AppTestContext) {
-    let (worker_url, captured) = spawn_capture_worker().await;
-
-    let mut config = RouterConfig::builder()
+fn base_config(max_payload_size: usize) -> RouterConfig {
+    RouterConfig::builder()
         .regular_mode(vec![])
         .host("127.0.0.1")
         .port(3002)
         .max_payload_size(max_payload_size)
-        .stream_request_bodies_over(threshold)
         .request_timeout_secs(600)
         .worker_startup_timeout_secs(5)
         .worker_startup_check_interval_secs(1)
         .max_concurrent_requests(64)
         .queue_timeout_secs(60)
-        .build_unchecked();
+        .build_unchecked()
+}
+
+/// App wired through the real `build_app` stack with the capture stub as the
+/// only worker.
+async fn streaming_app(
+    policy: PolicyConfig,
+    max_buffered_request_bytes: u64,
+    max_payload_size: usize,
+) -> (axum::Router, Captured, AppTestContext) {
+    let mut config = base_config(max_payload_size);
+    config.max_buffered_request_bytes = max_buffered_request_bytes;
+    streaming_app_with_config(policy, config).await
+}
+
+async fn streaming_app_with_config(
+    policy: PolicyConfig,
+    mut config: RouterConfig,
+) -> (axum::Router, Captured, AppTestContext) {
+    let (worker_url, captured) = spawn_capture_worker().await;
+
     config.policy = policy;
     config.health_check.disable_health_check = true;
 
@@ -218,7 +232,7 @@ async fn large_chat_body_streams_to_worker_chunked() {
 }
 
 #[tokio::test]
-async fn below_threshold_body_stays_buffered() {
+async fn body_under_retry_buffer_cap_stays_buffered() {
     let (app, captured, ctx) =
         streaming_app(least_load_policy(), 64 * 1024, 64 * 1024 * 1024).await;
     let payload = generate_payload(64);
@@ -232,6 +246,116 @@ async fn below_threshold_body_stays_buffered() {
     assert!(
         headers.get(CONTENT_LENGTH).is_some(),
         "the buffered path sends a fixed-length body"
+    );
+    drop(captured);
+    ctx.shutdown().await;
+}
+
+#[tokio::test]
+async fn retries_disabled_streams_a_small_body() {
+    let mut config = base_config(64 * 1024 * 1024);
+    config.disable_retries = true;
+    let (app, captured, ctx) = streaming_app_with_config(least_load_policy(), config).await;
+    let payload = generate_payload(64);
+
+    let req = chunked_json_request("/generate", payload.clone(), Some(payload.len() as u64));
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let captured = captured.lock().await;
+    let (headers, body) = captured.first().unwrap();
+    assert_eq!(body.as_ref(), payload.as_slice());
+    assert!(
+        headers.get(CONTENT_LENGTH).is_none(),
+        "a pure-forward request must stream at any size"
+    );
+    drop(captured);
+    ctx.shutdown().await;
+}
+
+#[tokio::test]
+async fn default_config_buffers_small_and_streams_past_one_mib() {
+    let (app, captured, ctx) =
+        streaming_app_with_config(least_load_policy(), base_config(64 * 1024 * 1024)).await;
+
+    let small = generate_payload(64);
+    let req = chunked_json_request("/generate", small.clone(), Some(small.len() as u64));
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    {
+        let captured = captured.lock().await;
+        let (headers, _) = captured.first().unwrap();
+        assert!(
+            headers.get(CONTENT_LENGTH).is_some(),
+            "a retryable body under the 1MiB default must buffer"
+        );
+    }
+
+    let app = ctx.create_app();
+    let large = generate_payload(2 * 1024 * 1024);
+    let req = chunked_json_request("/generate", large.clone(), Some(large.len() as u64));
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let captured = captured.lock().await;
+    let (headers, body) = captured.last().unwrap();
+    assert_eq!(body.as_ref(), large.as_slice());
+    assert!(
+        headers.get(CONTENT_LENGTH).is_none(),
+        "a body past the 1MiB default must stream and forfeit retries"
+    );
+    drop(captured);
+    ctx.shutdown().await;
+}
+
+/// Streamed selection is content-blind, so a second model in the registry
+/// must force the buffered typed path — which reads the model and lands the
+/// request on the right worker even past the retry-buffer cap.
+#[tokio::test]
+async fn multi_model_registry_buffers_and_routes_to_the_right_model() {
+    let (url_a, captured_a) = spawn_capture_worker().await;
+    let (url_b, captured_b) = spawn_capture_worker().await;
+
+    let mut config = base_config(64 * 1024 * 1024);
+    config.policy = least_load_policy();
+    config.health_check.disable_health_check = true;
+    let ctx = AppTestContext::new_with_config(config, vec![]).await;
+    for (url, model) in [(&url_a, "model-a"), (&url_b, "model-b")] {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .models(vec![ModelCard::new(model)])
+                .health_config(openai_protocol::worker::HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        ctx.app_context.worker_registry.register(worker);
+    }
+    let app = ctx.create_app();
+
+    let payload = serde_json::to_vec(&json!({
+        "model": "model-b",
+        "messages": [{"role": "user", "content": "y".repeat(2 * 1024 * 1024)}]
+    }))
+    .unwrap();
+    let req = chunked_json_request(
+        "/v1/chat/completions",
+        payload.clone(),
+        Some(payload.len() as u64),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert!(
+        captured_a.lock().await.is_empty(),
+        "model-a's worker must never see a model-b request"
+    );
+    let captured = captured_b.lock().await;
+    let (headers, _) = captured.first().unwrap();
+    assert!(
+        headers.get(CONTENT_LENGTH).is_some(),
+        "a multi-model registry must take the buffered typed path"
     );
     drop(captured);
     ctx.shutdown().await;
@@ -254,7 +378,7 @@ async fn missing_content_length_stays_buffered() {
 }
 
 #[tokio::test]
-async fn text_needing_policy_stays_buffered_above_threshold() {
+async fn text_needing_policy_stays_buffered_past_the_cap() {
     let (app, captured, ctx) = streaming_app(cache_aware_policy(), 1024, 64 * 1024 * 1024).await;
     let payload = generate_payload(16 * 1024);
 

@@ -677,25 +677,23 @@ struct CliArgs {
     #[arg(long, default_value_t = 536870912, help_heading = "Request Handling")]
     max_payload_size: usize,
 
-    /// Forward request bodies larger than this many bytes to the worker as a
-    /// raw stream instead of buffering, when the route's policy needs no
-    /// request text — or the request carries a valid x-smg-routing-tokens
-    /// hint, or a valid x-smg-routing-key under --routing-key-override — and
-    /// the worker applies no body mutation. Streamed bodies are forwarded
-    /// verbatim, so JSON validation and normalization defer to the worker,
-    /// and they cannot be replayed, so those requests bypass router-level
-    /// retries; bodies without a Content-Length header always buffer. WASM
-    /// OnRequest modules inspect buffered bodies, so deployments running
-    /// them keep buffering (and their own body-size cap) ahead of this.
-    /// Must be below max-payload-size. 0 disables
-    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
-    stream_request_bodies_over: u64,
+    /// Most bytes the router may hold for a request it buffers only to keep
+    /// it retryable. The router decides per request: a request it must parse
+    /// (text-routing policy without a routing hint, body-mutating worker,
+    /// WASM request hooks, missing Content-Length, PD/batch backends) always
+    /// buffers, bounded by max-payload-size; an eligible request buffers up
+    /// to this many bytes when router retries are enabled, and otherwise
+    /// streams to the worker verbatim — forfeiting router-level retries,
+    /// with JSON validation deferring to the worker. 0 never buffers for
+    /// retries
+    #[arg(long, default_value_t = 1_048_576, help_heading = "Request Handling")]
+    max_buffered_request_bytes: u64,
 
     /// Abort a streamed request body once the upstream sender has waited on
     /// the client for this many seconds (408, request_body_stalled). The
     /// clock pauses while the worker applies backpressure, so a slow worker
-    /// read never trips it. Applies only to bodies streamed via
-    /// --stream-request-bodies-over. 0 disables
+    /// read never trips it. Applies only to streamed request bodies. 0
+    /// disables
     #[arg(long, default_value_t = 300, help_heading = "Request Handling")]
     stream_body_stall_timeout_secs: u64,
 
@@ -1774,7 +1772,7 @@ impl CliArgs {
             .health_check_port(self.health_check_port)
             .runtime_worker_threads(self.runtime_worker_threads)
             .max_payload_size(self.max_payload_size)
-            .stream_request_bodies_over(self.stream_request_bodies_over)
+            .max_buffered_request_bytes(self.max_buffered_request_bytes)
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
             .request_timeout_secs(self.request_timeout_secs)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
@@ -2155,6 +2153,24 @@ mod tests {
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.kv_indexer_ttl_secs, None);
         assert_eq!(defaults.kv_indexer_max_entries, None);
+    }
+
+    /// The retry-buffer cap must flow through both conversion paths.
+    #[test]
+    fn max_buffered_request_bytes_flows_into_both_config_paths() {
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.max_buffered_request_bytes, 1_048_576);
+
+        let cli = cli_args_from(&["--max-buffered-request-bytes", "4096"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.max_buffered_request_bytes, 4096);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.max_buffered_request_bytes, 4096);
+
+        let zeroed = cli_args_from(&["--max-buffered-request-bytes", "0"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert_eq!(zeroed.max_buffered_request_bytes, 0);
     }
 
     /// Job queue sizing must flow through both conversion paths: into

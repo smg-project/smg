@@ -42,6 +42,7 @@ pub mod responses;
 pub mod router_manager;
 pub mod tokenize;
 
+pub use common::body_policy::BodyPolicy;
 pub use factory::RouterFactory;
 // Re-export HTTP routers for convenience
 pub use http::{pd_router, pd_types, router};
@@ -54,6 +55,12 @@ pub use http::{pd_router, pd_types, router};
 pub trait RouterTrait: Send + Sync + Debug {
     /// Get a reference to self as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Buffering is always correct and is the default; override only when
+    /// the family forwards bodies verbatim.
+    fn request_body_policy(&self) -> BodyPolicy {
+        BodyPolicy::MustBuffer(self.router_type())
+    }
 
     /// Route a health generate request
     async fn health_generate(&self, _req: Request<Body>) -> Response {

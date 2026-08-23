@@ -6,6 +6,9 @@
 //! `RouterTrait` definition and the per-protocol submodules.
 //!
 //! Submodules:
+//! - [`body_policy`] — per-family [`body_policy::BodyPolicy`] capability,
+//!   the per-request buffer-vs-stream decision matrix and its counter
+//!   vocabulary
 //! - [`header_utils`] — request header parsing helpers
 //!   (`extract_routing_key`, `extract_target_worker`, etc.)
 //! - [`mcp_utils`] — Model Context Protocol tool-call orchestration
@@ -27,6 +30,7 @@
 //! - [`sse`] — shared SSE codec (encoder + decoder) for streaming
 //!   responses to clients and parsing upstream SSE byte streams
 
+pub mod body_policy;
 pub mod header_utils;
 pub(crate) mod kv_transfer;
 pub mod mcp_utils;

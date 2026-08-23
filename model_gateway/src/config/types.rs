@@ -55,15 +55,13 @@ pub struct RouterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_worker_threads: Option<usize>,
     pub max_payload_size: usize,
-    /// Forward request bodies larger than this many bytes to the worker as a
-    /// raw stream instead of buffering, when the route's policy needs no
-    /// request text — or the request carries a valid routing hint header
-    /// that stands in for it — and the worker applies no body mutation.
-    /// Streamed bodies cannot be replayed, so those requests bypass
-    /// router-level retries; bodies without a Content-Length header always
-    /// buffer. `0` disables.
-    #[serde(default)]
-    pub stream_request_bodies_over: u64,
+    /// Most bytes the router may hold for a request it buffers only to keep
+    /// it retryable; a larger eligible request streams to the worker verbatim
+    /// and forfeits router-level retries. `0` never buffers for retries.
+    /// Requests the router must parse buffer regardless, bounded by
+    /// `max_payload_size`.
+    #[serde(default = "default_max_buffered_request_bytes")]
+    pub max_buffered_request_bytes: u64,
     /// Abort a streamed request body once the upstream sender has waited on
     /// the client for this many seconds (408). The clock pauses while the
     /// worker applies backpressure, so a slow worker read never trips it.
@@ -793,6 +791,10 @@ fn default_stream_body_stall_timeout_secs() -> u64 {
     300
 }
 
+fn default_max_buffered_request_bytes() -> u64 {
+    1_048_576
+}
+
 fn default_prefix_hash_balance_abs_threshold() -> usize {
     10
 }
@@ -1046,7 +1048,7 @@ impl Default for RouterConfig {
             health_check_port: None,
             runtime_worker_threads: None,
             max_payload_size: 536_870_912, // 512MB
-            stream_request_bodies_over: 0,
+            max_buffered_request_bytes: default_max_buffered_request_bytes(),
             stream_body_stall_timeout_secs: default_stream_body_stall_timeout_secs(),
             request_timeout_secs: 1800, // 30 minutes
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
@@ -1206,7 +1208,7 @@ mod tests {
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 3001);
         assert_eq!(config.max_payload_size, 536_870_912);
-        assert_eq!(config.stream_request_bodies_over, 0);
+        assert_eq!(config.max_buffered_request_bytes, 1_048_576);
         assert_eq!(config.request_timeout_secs, 1800);
         assert_eq!(config.upstream_pool_idle_timeout_secs, 3);
         assert_eq!(config.worker_startup_timeout_secs, 1800);
@@ -1300,24 +1302,23 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_request_bodies_over_serde_roundtrip_and_backward_compat() {
-        // Config files predating the field deserialize to the disabled default.
+    fn test_max_buffered_request_bytes_serde_default_and_roundtrip() {
+        // Config files predating the field deserialize to the 1MiB default.
         let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
         json.as_object_mut()
             .unwrap()
-            .remove("stream_request_bodies_over")
+            .remove("max_buffered_request_bytes")
             .unwrap();
         let without: RouterConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(without.stream_request_bodies_over, 0);
+        assert_eq!(without.max_buffered_request_bytes, 1_048_576);
 
-        // When set, the value round-trips.
         let config = RouterConfig::builder()
             .regular_mode(vec![])
-            .stream_request_bodies_over(4 * 1024 * 1024)
+            .max_buffered_request_bytes(8 * 1024 * 1024)
             .build_unchecked();
         let json = serde_json::to_string(&config).unwrap();
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(with.stream_request_bodies_over, 4 * 1024 * 1024);
+        assert_eq!(with.max_buffered_request_bytes, 8 * 1024 * 1024);
     }
 
     #[test]

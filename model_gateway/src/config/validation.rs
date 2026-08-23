@@ -774,19 +774,6 @@ impl ConfigValidator {
             }
         }
 
-        // The body-limit layer rejects payloads above max_payload_size before
-        // the streaming threshold is consulted, so a threshold at or above it
-        // could never activate.
-        if config.stream_request_bodies_over != 0
-            && config.stream_request_bodies_over >= config.max_payload_size as u64
-        {
-            return Err(ConfigError::InvalidValue {
-                field: "stream_request_bodies_over".to_string(),
-                value: config.stream_request_bodies_over.to_string(),
-                reason: format!("Must be < max_payload_size ({})", config.max_payload_size),
-            });
-        }
-
         if config.request_timeout_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "request_timeout_secs".to_string(),
@@ -1187,25 +1174,6 @@ impl ConfigValidator {
 mod tests {
     use super::*;
     use crate::worker::ConnectionMode;
-
-    #[test]
-    fn stream_threshold_at_or_above_payload_cap_is_rejected() {
-        let below = RouterConfig {
-            stream_request_bodies_over: 1024,
-            ..Default::default()
-        };
-        assert!(ConfigValidator::validate(&below).is_ok());
-
-        let at_cap = RouterConfig {
-            stream_request_bodies_over: RouterConfig::default().max_payload_size as u64,
-            ..Default::default()
-        };
-        assert!(matches!(
-            ConfigValidator::validate(&at_cap),
-            Err(ConfigError::InvalidValue { ref field, .. })
-                if field == "stream_request_bodies_over"
-        ));
-    }
 
     #[test]
     fn prefix_hash_policy_cache_boundaries_are_validated() {

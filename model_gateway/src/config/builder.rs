@@ -213,8 +213,8 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn stream_request_bodies_over(mut self, bytes: u64) -> Self {
-        self.config.stream_request_bodies_over = bytes;
+    pub fn max_buffered_request_bytes(mut self, bytes: u64) -> Self {
+        self.config.max_buffered_request_bytes = bytes;
         self
     }
 

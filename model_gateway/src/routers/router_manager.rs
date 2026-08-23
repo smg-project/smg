@@ -43,10 +43,10 @@ use crate::{
     config::RoutingMode,
     middleware::{AuthConfig, TenantRequestMeta},
     routers::{
-        common::header_utils::apply_provider_headers,
+        common::{body_policy::REASON_MODEL_SELECTION, header_utils::apply_provider_headers},
         error as route_error,
         factory::{router_ids, RouterId},
-        RouterFactory, RouterTrait,
+        BodyPolicy, RouterFactory, RouterTrait,
     },
     server::ServerConfig,
     worker::{ConnectionMode, ProviderType, RuntimeType, Worker, WorkerRegistry, WorkerType},
@@ -473,6 +473,17 @@ impl RouterManager {
 impl RouterTrait for RouterManager {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// Multi-router dispatch reads the model from the body; a lone router
+    /// speaks for itself.
+    fn request_body_policy(&self) -> BodyPolicy {
+        if self.router_count() == 1 {
+            if let Some(router) = self.select_router_for_request(None) {
+                return router.request_body_policy();
+            }
+        }
+        BodyPolicy::MustBuffer(REASON_MODEL_SELECTION)
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
@@ -1001,6 +1012,67 @@ mod tests {
         let manager = Arc::new(manager);
         manager.register_router(router_ids::HTTP_REGULAR, Arc::new(StubRouter));
         manager
+    }
+
+    /// A lone router speaks for itself — a forward-capable one keeps
+    /// streaming enabled, a buffering one shows its derived reason — and
+    /// more than one router makes dispatch model-addressed.
+    #[test]
+    fn body_policy_delegates_to_a_lone_router_and_buffers_multi_router() {
+        #[derive(Debug)]
+        struct ForwardStubRouter;
+
+        #[async_trait]
+        impl RouterTrait for ForwardStubRouter {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            fn request_body_policy(&self) -> BodyPolicy {
+                BodyPolicy::ForwardCapable
+            }
+
+            fn router_type(&self) -> &'static str {
+                "stub_forward"
+            }
+        }
+
+        let forward_manager = {
+            let mut m = RouterManager::new(Arc::new(WorkerRegistry::new()), reqwest::Client::new());
+            m.enable_igw = false;
+            let m = Arc::new(m);
+            m.register_router(router_ids::HTTP_REGULAR, Arc::new(ForwardStubRouter));
+            m
+        };
+        assert_eq!(
+            forward_manager.request_body_policy(),
+            BodyPolicy::ForwardCapable
+        );
+
+        let manager = test_manager(false);
+        assert_eq!(
+            manager.request_body_policy(),
+            BodyPolicy::MustBuffer("stub")
+        );
+
+        let pd_manager = {
+            let mut m = RouterManager::new(Arc::new(WorkerRegistry::new()), reqwest::Client::new());
+            m.enable_igw = false;
+            let m = Arc::new(m);
+            m.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+            m
+        };
+        assert_eq!(
+            pd_manager.request_body_policy(),
+            BodyPolicy::MustBuffer("pd")
+        );
+
+        let manager = test_manager(true);
+        manager.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+        assert_eq!(
+            manager.request_body_policy(),
+            BodyPolicy::MustBuffer(REASON_MODEL_SELECTION)
+        );
     }
 
     fn test_tenant_meta() -> TenantRequestMeta {
