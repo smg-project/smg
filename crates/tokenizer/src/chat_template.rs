@@ -1262,6 +1262,9 @@ mod tests {
         );
 
         // thinking = Some(false) injects enable_thinking=false under the model's key.
+        // Rendered Python-style: transformers evaluates these templates under
+        // Jinja2, where `{{ False }}` is "False", so a template that echoes the
+        // flag into the prompt must produce the same bytes we would there.
         let out = state
             .apply(
                 &[],
@@ -1271,7 +1274,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(out, "false");
+        assert_eq!(out, "False");
 
         // An explicit template_kwargs entry overrides the injected default.
         let mut kwargs: HashMap<String, serde_json::Value> = HashMap::new();
@@ -1286,6 +1289,28 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(out, "true");
+        assert_eq!(out, "True");
+    }
+
+    /// Regression: a conditional expression used as a keyword-argument value.
+    /// Jinja2 accepts it, so published chat templates use it — Muse-Glimmer's
+    /// does, in a `namespace(...)` call — but minijinja rejected it before
+    /// 2.24, which made the whole template uncompilable and left the model
+    /// unservable rather than merely mis-rendered.
+    #[test]
+    fn conditional_expression_in_keyword_argument_compiles() {
+        let template = "{%- set r = namespace(name=x if x else '') -%}{{ r.name }}";
+        let state = ChatTemplateState::new(Some(template.to_string()))
+            .expect("conditional kwargs must compile");
+        let out = state.apply(&[], ChatTemplateParams::default()).unwrap();
+        assert_eq!(out, "");
+    }
+
+    /// None renders Python-style too, for the same Jinja2-parity reason.
+    #[test]
+    fn none_renders_python_style() {
+        let state = ChatTemplateState::new(Some("{{ undefined_value }}".to_string())).unwrap();
+        let out = state.apply(&[], ChatTemplateParams::default()).unwrap();
+        assert_eq!(out, "");
     }
 }
