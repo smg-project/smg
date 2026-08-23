@@ -38,19 +38,37 @@ if [ "$HOST_VERSION" = "$PY_VERSION" ]; then
     # adds no dependency, and downloads nothing. Only the outlier hosts take
     # the branch below.
     echo "Host python3 is $PY_VERSION - creating venv with it"
-    # Gate on the venv module, not on a global pip3. What this script needs is
-    # the ability to build a venv and for that venv to get pip from ensurepip;
-    # whether pip happens to be installed system-wide is unrelated, and testing
-    # for it triggered a pointless apt install on hosts that were already fine.
-    if ! python3 -m venv --help &> /dev/null; then
-        echo "Installing python3-venv..."
-        sudo apt update
-        sudo apt install -y python3-pip python3-venv
+    # Try, repair, retry -- deliberately not a pre-flight capability check.
+    #
+    # Every proxy for "can this host build a venv" is wrong somewhere.
+    # `command -v pip3` reports on a global pip that has no bearing on venv
+    # creation. `python3 -m venv --help` succeeds on Debian even when creation
+    # will fail, because the venv module and ensurepip ship in separate
+    # packages -- which is exactly how this script broke once: the guard did
+    # not fire, apt never ran, and creation died on "ensurepip is not
+    # available".
+    #
+    # Attempting the thing is the only check that cannot be wrong about it, and
+    # the repair costs nothing on hosts that were already fine because it only
+    # runs after a real failure.
+    VENV_ERR="$(mktemp)"
+    if ! python3 -m venv .venv 2> "$VENV_ERR"; then
+        cat "$VENV_ERR" >&2
+        if command -v apt-get &> /dev/null; then
+            echo "venv creation failed - installing python3-venv/python3-pip, then retrying"
+            sudo apt-get update
+            sudo apt-get install -y python3-pip python3-venv
+            rm -rf .venv
+            python3 -m venv .venv
+        else
+            echo "ERROR: cannot create a venv, and apt-get is not available to repair it" >&2
+            rm -f "$VENV_ERR"
+            exit 1
+        fi
     fi
-    python3 -m venv .venv
-    # Some distro pythons build venvs without pip even when the module exists
-    # (Debian splits ensurepip out). Repair it here rather than letting the
-    # assertion below fail on something recoverable.
+    rm -f "$VENV_ERR"
+    # Creation can succeed and still leave no pip. Recoverable, so repair it
+    # rather than letting the assertion below fail on it.
     if ! .venv/bin/python -m pip --version &> /dev/null; then
         echo "venv has no pip - bootstrapping with ensurepip"
         .venv/bin/python -m ensurepip --upgrade || true

@@ -79,6 +79,12 @@ case "$1" in
         case "$2" in
             venv)
                 if [ "$3" = "--help" ]; then exit "${STUB_VENV_MODULE_MISSING:-0}"; fi
+                # Debian ships the venv module and ensurepip separately, so
+                # `--help` can succeed while creation fails. Model that.
+                if [ "${STUB_VENV_CREATE_FAILS:-0}" = "1" ] && [ ! -f "${STUB_APT_MARKER:-/nonexistent}" ]; then
+                    echo "The virtual environment was not created successfully because ensurepip is not available" >&2
+                    exit 1
+                fi
                 make_venv "$3"
                 exit 0 ;;
         esac ;;
@@ -114,7 +120,19 @@ fi
 exit 0
 STUB
 
-    chmod +x "$dir/bin/python3" "$dir/bin/uv"
+    cat > "$dir/bin/sudo" <<'STUB'
+#!/bin/bash
+exec "$@"
+STUB
+
+    cat > "$dir/bin/apt-get" <<'STUB'
+#!/bin/bash
+# Records the repair, and flips the python3 stub into a working state.
+touch "${STUB_APT_MARKER:-/dev/null}"
+exit 0
+STUB
+
+    chmod +x "$dir/bin/python3" "$dir/bin/uv" "$dir/bin/sudo" "$dir/bin/apt-get"
 }
 
 # Run the script under test inside a fresh sandbox.
@@ -128,6 +146,7 @@ run_case() {
         cd "$dir"
         export PATH="$dir/bin:$PATH"
         export STUB_UV_MARKER="$dir/uv_called"
+        export STUB_APT_MARKER="$dir/apt_called"
         unset GITHUB_PATH GITHUB_ENV
         set +e
         bash "$SCRIPT" > "$dir/out" 2> "$dir/err"
@@ -182,6 +201,19 @@ fi
 echo "test: missing pip is repaired by ensurepip"
 STUB_HOST_PYVER=3.12 CI_PYTHON_VERSION=3.12 STUB_VENV_HAS_PIP=0 STUB_ENSUREPIP_WORKS=1 run_case
 assert_eq "0" "$LAST_CODE" "recovers without failing the job"
+
+echo "test: venv creation fails, apt repairs it, retry succeeds"
+# Regression: `python3 -m venv --help` succeeds on Debian even when ensurepip is
+# packaged separately and creation will fail. A pre-flight capability check
+# therefore passed, apt never ran, and build-wheel died on
+# "ensurepip is not available". Attempting-then-repairing is what fixes it.
+STUB_HOST_PYVER=3.12 CI_PYTHON_VERSION=3.12 STUB_VENV_CREATE_FAILS=1 run_case
+assert_eq "0" "$LAST_CODE" "recovers instead of failing the job"
+if [ -f "$LAST_DIR/apt_called" ]; then
+    ok "installed python3-venv and retried"
+else
+    fail "expected an apt-get repair after creation failed"
+fi
 
 echo "test: CI_PYTHON_VERSION override is honoured"
 STUB_HOST_PYVER=3.10 CI_PYTHON_VERSION=3.10 run_case
