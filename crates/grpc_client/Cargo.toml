@@ -1,6 +1,6 @@
 [package]
 name = "smg-grpc-client"
-version = "1.10.0"
+version = "1.11.0"
 edition = "2021"
 description = "gRPC clients for vLLM, TensorRT-LLM, MLX, TokenSpeed, and SGLang backends"
 license = "Apache-2.0"

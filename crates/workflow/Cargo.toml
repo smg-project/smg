@@ -1,6 +1,6 @@
 [package]
 name = "wfaas"
-version = "1.0.5"
+version = "1.1.0"
 edition = "2021"
 description = "Workflow-as-a-Service engine for managing multi-step operations"
 license = "Apache-2.0"

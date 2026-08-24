@@ -1,6 +1,6 @@
 [package]
 name = "smg-client"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Rust HTTP client for SMG (Shepherd Model Gateway)"
 license = "Apache-2.0"

@@ -1,6 +1,6 @@
 [package]
 name = "llm-multimodal"
-version = "1.9.0"
+version = "1.10.0"
 edition = "2021"
 description = "Multimodal processing for vision and other modalities"
 license = "Apache-2.0"

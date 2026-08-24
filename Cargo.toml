@@ -4,20 +4,20 @@ resolver = "2"
 
 [workspace.dependencies]
 # Internal workspace crates
-openai-protocol = { version = "1.11.0", path = "crates/protocols" }
-smg-mm-rdma = { version = "0.1.0", path = "crates/mm_rdma" }
-reasoning-parser = { version = "1.6.0", path = "crates/reasoning_parser" }
-tool-parser = { version = "1.6.0", path = "crates/tool_parser" }
-wfaas = { version = "1.0.5", path = "crates/workflow" }
-llm-tokenizer = { version = "1.6.0", path = "crates/tokenizer" }
-smg-auth = { version = "1.2.2", path = "crates/auth" }
-smg-mcp = { version = "2.3.2", path = "crates/mcp" }
-kv-index = { version = "1.3.2", path = "crates/kv_index" }
-smg-data-connector = { version = "2.3.3", path = "crates/data_connector", package = "data-connector" }
-llm-multimodal = { version = "1.9.0", path = "crates/multimodal" }
-smg-wasm = { version = "1.1.3", path = "crates/wasm", package = "smg-wasm" }
-smg-mesh = { version = "1.4.2", path = "crates/mesh", package = "smg-mesh" }
-smg-grpc-client = { version = "1.10.0", path = "crates/grpc_client" }
+openai-protocol = { version = "1.12.0", path = "crates/protocols" }
+smg-mm-rdma = { version = "0.1.1", path = "crates/mm_rdma" }
+reasoning-parser = { version = "1.7.0", path = "crates/reasoning_parser" }
+tool-parser = { version = "1.7.0", path = "crates/tool_parser" }
+wfaas = { version = "1.1.0", path = "crates/workflow" }
+llm-tokenizer = { version = "1.7.0", path = "crates/tokenizer" }
+smg-auth = { version = "1.2.3", path = "crates/auth" }
+smg-mcp = { version = "2.3.3", path = "crates/mcp" }
+kv-index = { version = "1.4.0", path = "crates/kv_index" }
+smg-data-connector = { version = "2.3.4", path = "crates/data_connector", package = "data-connector" }
+llm-multimodal = { version = "1.10.0", path = "crates/multimodal" }
+smg-wasm = { version = "1.1.4", path = "crates/wasm", package = "smg-wasm" }
+smg-mesh = { version = "1.4.3", path = "crates/mesh", package = "smg-mesh" }
+smg-grpc-client = { version = "1.11.0", path = "crates/grpc_client" }
 engine-zmq-client = { version = "0.1.0", path = "crates/engine_zmq_client" }
 
 # Shared dependencies

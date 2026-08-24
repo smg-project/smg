@@ -1,6 +1,6 @@
 [package]
 name = "reasoning-parser"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 description = "Parser for AI model reasoning/thinking outputs (chain-of-thought, etc.)"
 license = "Apache-2.0"
