@@ -60,6 +60,12 @@ impl ToolConstraint {
 struct ParserEntry {
     creator: ParserCreator,
     build_structural_tag: Option<BuildStructuralTagFn>,
+    /// Strings that exclusively open this parser's native tool-call syntax,
+    /// used to build the `tool_choice: "none"` suppression constraint. Empty
+    /// for parsers without one (no suppression possible). Curated per parser:
+    /// this is NOT the structural-tag trigger list — triggers may include
+    /// markers ordinary generation must emit.
+    tool_call_ban_strings: &'static [&'static str],
 }
 
 /// Registry for model-specific tool parsers with pooling support.
@@ -97,6 +103,7 @@ impl ParserRegistry {
             Arc::new(ParserEntry {
                 creator: Arc::new(creator),
                 build_structural_tag: None,
+                tool_call_ban_strings: &[],
             }),
         );
     }
@@ -105,11 +112,16 @@ impl ParserRegistry {
     ///
     /// The `build_structural_tag` function takes `(&[Tool], at_least_one)` and returns
     /// the full xgrammar structural tag JSON for this parser's native tool-call format.
+    /// `tool_call_ban_strings` is the parser's curated `tool_choice: "none"`
+    /// suppression inventory: strings that exclusively open its native
+    /// tool-call syntax (NOT the trigger list — triggers may include markers
+    /// ordinary generation must emit). Pass an empty slice to opt out.
     pub fn register_parser_with_structural_tag<F>(
         &self,
         name: &str,
         creator: F,
         build_structural_tag: fn(&[Tool], bool) -> serde_json::Value,
+        tool_call_ban_strings: &'static [&'static str],
     ) where
         F: Fn() -> Box<dyn ToolParser> + Send + Sync + 'static,
     {
@@ -119,6 +131,7 @@ impl ParserRegistry {
             Arc::new(ParserEntry {
                 creator: Arc::new(creator),
                 build_structural_tag: Some(Arc::new(build_structural_tag)),
+                tool_call_ban_strings,
             }),
         );
     }
@@ -181,6 +194,29 @@ impl ParserRegistry {
     /// via `--tool-call-parser`).
     pub fn has_structural_tag_for_parser(&self, configured: Option<&str>) -> bool {
         configured.is_some_and(|p| self.has_structural_tag(p))
+    }
+
+    /// Build the decode-time suppression constraint for `tool_choice: "none"`:
+    /// free-form output that may never contain the strings opening the
+    /// configured parser's native tool-call syntax, expressed as an xgrammar
+    /// structural tag (`any_text` with `excludes`).
+    ///
+    /// Returns `None` when no parser is configured, the name is unknown, or
+    /// the parser has no curated ban inventory — callers fall back to today's
+    /// behavior (no constraint; parsing is separately disabled for `"none"`).
+    pub fn tool_call_ban_constraint(&self, configured: Option<&str>) -> Option<ToolConstraint> {
+        let entries = self.entries.read();
+        let entry = entries.get(configured?)?;
+        if entry.tool_call_ban_strings.is_empty() {
+            return None;
+        }
+        let tag = serde_json::json!({
+            "format": {
+                "type": "any_text",
+                "excludes": entry.tool_call_ban_strings,
+            }
+        });
+        Some(ToolConstraint::StructuralTag(tag.to_string()))
     }
 
     /// Generate tool call constraint.
@@ -314,6 +350,7 @@ impl ParserFactory {
             "mistral",
             || Box::new(MistralParser::new()),
             MistralParser::build_structural_tag,
+            MistralParser::TOOL_CALL_BAN_STRINGS,
         );
         registry.register_parser("qwen", || Box::new(QwenParser::new()));
         registry.register_parser("qwen_xml", || Box::new(QwenXmlParser::new()));
@@ -335,16 +372,19 @@ impl ParserFactory {
             "kimik2",
             || Box::new(KimiK2Parser::new()),
             KimiK2Parser::build_structural_tag,
+            KimiK2Parser::TOOL_CALL_BAN_STRINGS,
         );
         registry.register_parser_with_structural_tag(
             "kimi_k3",
             || Box::new(KimiK3Parser::new()),
             KimiK3Parser::build_structural_tag,
+            KimiK3Parser::TOOL_CALL_BAN_STRINGS,
         );
         registry.register_parser_with_structural_tag(
             "inkling",
             || Box::new(InklingParser::new()),
             InklingParser::build_structural_tag,
+            InklingParser::TOOL_CALL_BAN_STRINGS,
         );
         registry.register_parser("minimax_m2", || Box::new(MinimaxM2Parser::new()));
         registry.register_parser("cohere", || Box::new(CohereParser::new()));

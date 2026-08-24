@@ -51,6 +51,13 @@ pub struct KimiK2Parser {
 }
 
 impl KimiK2Parser {
+    /// Strings that only ever open K2's native tool-call syntax; banning them
+    /// makes tool calls unreachable when `tool_choice` is `"none"`. Both the
+    /// section opener and the per-call opener appear exclusively in tool-call
+    /// output, so both are safe to exclude.
+    pub const TOOL_CALL_BAN_STRINGS: &'static [&'static str] =
+        &["<|tool_calls_section_begin|>", "<|tool_call_begin|>"];
+
     /// Build structural tag for Kimi K2 tool call format.
     ///
     /// Uses dual triggers following sglang's approach:

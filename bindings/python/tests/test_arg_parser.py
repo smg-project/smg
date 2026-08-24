@@ -1401,6 +1401,7 @@ class TestRouterArgsFieldOrder:
         "worker_overload_token_usage",
         "worker_overload_protection",
         "disable_load_monitoring",
+        "tool_choice_none_ban",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

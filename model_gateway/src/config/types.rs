@@ -245,6 +245,13 @@ pub struct RouterConfig {
     pub reasoning_parser: Option<String>,
     /// For tool-call interactions
     pub tool_call_parser: Option<String>,
+    /// When tools are present but `tool_choice` is `"none"`, emit a
+    /// decode-time constraint banning the resolved parser's tool-call opener
+    /// strings, so the model cannot start native tool-call syntax at all.
+    /// Off by default: requires engines whose grammar backend understands the
+    /// `any_text`/`excludes` structural-tag format.
+    #[serde(default)]
+    pub tool_choice_none_ban: bool,
     #[serde(default)]
     pub tokenizer_cache: TokenizerCacheConfig,
     /// Server TLS certificate (PEM)
@@ -1109,6 +1116,7 @@ impl Default for RouterConfig {
             redis: None,
             reasoning_parser: None,
             tool_call_parser: None,
+            tool_choice_none_ban: false,
             tokenizer_cache: TokenizerCacheConfig::default(),
             client_identity: None,
             ca_certificates: vec![],
@@ -1222,6 +1230,21 @@ mod tests {
             config.tenant_resolution.tenant_header_name,
             DEFAULT_TENANT_HEADER_NAME
         );
+        assert!(!config.tool_choice_none_ban);
+    }
+
+    #[test]
+    fn test_tool_choice_none_ban_absent_from_config_defaults_off() {
+        // Existing config files predate the field; they must keep parsing
+        // with the ban disabled.
+        let mut value = serde_json::to_value(RouterConfig::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("tool_choice_none_ban")
+            .expect("field is serialized");
+        let config: RouterConfig = serde_json::from_value(value).unwrap();
+        assert!(!config.tool_choice_none_ban);
     }
 
     #[test]

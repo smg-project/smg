@@ -32,6 +32,9 @@ pub(crate) struct ParserResolver {
     worker_registry: Option<Arc<WorkerRegistry>>,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
+    /// Emit the tool-call suppression constraint when tools are present but
+    /// `tool_choice` is `"none"` (RouterConfig `tool_choice_none_ban`).
+    tool_choice_none_ban: bool,
 }
 
 impl ParserResolver {
@@ -44,6 +47,7 @@ impl ParserResolver {
             worker_registry: Some(worker_registry),
             configured_tool_parser,
             configured_reasoning_parser,
+            tool_choice_none_ban: false,
         }
     }
 
@@ -54,7 +58,19 @@ impl ParserResolver {
             worker_registry: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            tool_choice_none_ban: false,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_tool_choice_none_ban(mut self, enabled: bool) -> Self {
+        self.tool_choice_none_ban = enabled;
+        self
+    }
+
+    /// Whether the `tool_choice: "none"` suppression constraint is enabled.
+    pub(crate) fn tool_choice_none_ban(&self) -> bool {
+        self.tool_choice_none_ban
     }
 
     /// Effective tool-parser name for `model`, if any.
@@ -513,6 +529,16 @@ mod parser_resolver_tests {
         let resolver = ParserResolver::disabled();
         assert_eq!(resolver.tool_parser("m"), None);
         assert_eq!(resolver.reasoning_parser("m"), None);
+    }
+
+    #[test]
+    fn tool_choice_none_ban_defaults_off_and_round_trips() {
+        let registry = registry_with_card(ModelCard::new("m"));
+        let resolver = ParserResolver::new(registry, None, None);
+        assert!(!resolver.tool_choice_none_ban());
+        assert!(!ParserResolver::disabled().tool_choice_none_ban());
+        let enabled = resolver.with_tool_choice_none_ban(true);
+        assert!(enabled.tool_choice_none_ban());
     }
 
     #[test]
