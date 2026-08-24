@@ -62,13 +62,18 @@ jobs:
           python-version: "3.13"
 
       - name: Install linting tools
-        run: pip install ruff mypy
+        run: pip install ruff mypy pytest
 
       - name: Ruff check
         run: ruff check e2e_test/ bindings/python/ scripts/
 
       - name: Ruff format check
         run: ruff format --check e2e_test/ bindings/python/ scripts/
+
+      # Exercise the pure-Python scoring and workflow-wiring guards without
+      # putting them behind a GPU lane; the suite completes in under a second.
+      - name: Pytest (scripts/tests)
+        run: pytest scripts/tests/ -q
 
       - name: Mypy (e2e_test)
         run: mypy e2e_test/ --config-file mypy.ini

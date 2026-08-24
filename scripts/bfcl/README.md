@@ -1,6 +1,6 @@
 # BFCL nightly A/B — `scripts/bfcl/`
 
-**Track B** of the parser-verification proposal (`docs/proposals/2026-06-10-bfcl-nightly-parser-verification.md`): run the **official** Berkeley Function Calling Leaderboard (`bfcl-eval`) against two serving "arms" and diff the scores. The companion **Track A** (offline, deterministic parser-conformance gate) lives in `crates/parser_conformance/`.
+**Track B** of the parser-verification proposal (`docs/proposals/2026-06-10-bfcl-nightly-parser-verification.md`): run the **official** Berkeley Function Calling Leaderboard (`bfcl-eval`) against serving arms. Normal legs diff pure vLLM against SMG; an `smg_only` leg reports absolute scores for a checkpoint the pinned vLLM cannot serve. The companion **Track A** (offline, deterministic parser-conformance gate) lives in `crates/parser_conformance/`.
 
 ## The experiment
 
@@ -19,8 +19,8 @@ Two arms expose an identical OpenAI `/v1` endpoint. The same official `bfcl` CLI
 
 | file | what |
 |---|---|
-| `launch_arm.sh` | bring up one arm (`a` = pure vLLM, `b` = vLLM-gRPC + SMG); prints its base_url; `stop` tears down via pidfiles. Fully env-parameterised. |
-| `run_ab.py` | point official `bfcl generate`+`evaluate` (FC mode) at both arms, parse per-category accuracy + test-case count, emit a markdown + JSON comparison table (with both **unweighted** = mean-of-categories and **weighted-by-n** = micro overall, matching BFCL's `calculate_unweighted/weighted_accuracy`), and a regression gate. Arms must already be serving. |
+| `launch_arm.sh` | bring up one arm (`a` = pure vLLM, `b` = SMG in front of a vLLM or SGLang gRPC worker); prints its base_url; `stop` tears down via pidfiles. Fully env-parameterised. |
+| `run_ab.py` | point official `bfcl generate`+`evaluate` (FC mode) at arms, parse per-category accuracy + test-case count, and emit markdown + JSON. A/B mode applies a regression gate; `--report-arm` emits absolute single-arm scores and applies the same completeness gate. |
 | `register_bfcl_model.py` | register a model that bfcl-eval doesn't ship a handler for yet (new SKUs), by cloning an existing FC entry. Idempotent. |
 
 ## Quick start (manual, e.g. on a GPU box)
@@ -54,7 +54,7 @@ B_URL=$(BFCL_GPU=2,3 BFCL_SMG_TOOL_PARSER=qwen_xml  BFCL_SMG_REASONING_PARSER=qw
 bash launch_arm.sh stop
 ```
 
-Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`), `BFCL_TP` (tensor-parallel size — match the GPU count), `BFCL_MAX_MODEL_LEN`, `BFCL_{VLLM,SMG}_{TOOL,REASONING}_PARSER`, and `BFCL_VLLM_EXTRA` for extra vLLM flags.
+Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`), `BFCL_TP` (tensor-parallel size — match the GPU count), `BFCL_MAX_MODEL_LEN`, `BFCL_{VLLM,SMG}_{TOOL,REASONING}_PARSER`, `BFCL_ARM_B_WORKER` (`vllm` or `sglang`), and the engine-specific `BFCL_{VLLM,SGLANG}_EXTRA` flags.
 
 `run_ab.py` exits non-zero if the candidate's overall accuracy drops more than `--tolerance` (default 2pp) below the baseline.
 
@@ -66,7 +66,9 @@ Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`)
 | gpt-oss-120b (`gpt-oss`) | `4-gpu-h100` | 2 | `openai` / — | _(none — SMG auto-routes harmony)_ / — |
 | DeepSeek-V4-Flash-0731 (`deepseek-v4`) | `blackwell` | 4 | `deepseek_v4` / `deepseek_v4` (+`--tokenizer-mode deepseek_v4 --trust-remote-code`) | `deepseek_v4` / `deepseek_v4` |
 | MiniMax-M2.7 (`minimax-m2.7`) | `blackwell` | 4 | `minimax_m2` / `minimax_m2` (+`--trust-remote-code`) | `minimax_m2` / `minimax` |
-| Kimi-K2.6 int4 (`kimi-k2.6`) | `blackwell` | 4 | `kimi_k2` / `kimi_k2` (+`--trust-remote-code`) | `kimik2` / `kimi_k25`† |
+| Kimi-K2.6 int4 (`kimi-k2.6`) | `blackwell` | 4 | `kimi_k2` / `kimi_k2` (+`--trust-remote-code`) | `kimik2` / `kimi_thinking` |
+| GLM-5.2-FP8 (`glm-5.2`) | `blackwell` | 8 sequential | `glm47` / `glm45` | `glm47_moe` / `glm45` |
+| Muse-Glimmer-30B (`muse-glimmer`) | `4-gpu-h100` | 2 single arm | unsupported | SGLang worker + `muse_glimmer` / `muse_glimmer` |
 
 > **gpt-oss has no SMG tool-call-parser.** SMG handles gpt-oss through its harmony
 > pipeline (`model_gateway/src/routers/grpc/harmony/`), auto-activated by
@@ -75,10 +77,10 @@ Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`)
 > `—` in **both** reasoning-parser columns for gpt-oss is likewise intentional:
 > harmony carries its own reasoning channel, so neither arm sets a reasoning parser.
 >
-> **† Reasoning-parser fallbacks.** SMG's reasoning registry has no `kimi_k2` entry
-> yet; the closest existing parser (`kimi_k25`) is used. Confirm on the first
-> nightly; adding exact parsers to `crates/reasoning_parser` is a follow-up if
-> outputs diverge.
+> **Muse-Glimmer has no A/B baseline.** The pinned vLLM cannot load the model, so
+> this leg runs SGLang in SMG gRPC mode and reports absolute official BFCL scores.
+> Those numbers validate the complete serving/parser path, but they do not establish
+> frontend parity and must not be presented as a vLLM comparison.
 >
 > The mid-2026 SKU ids and a couple of vLLM parser names may shift; confirm against
 > the installed vLLM build: `vllm serve --help | grep -A40 tool-call-parser`.
@@ -88,32 +90,34 @@ Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`)
 The nightly (`.github/workflows/nightly-bfcl.yml`) runs the A/B as a GitHub Actions
 matrix — one leg per model, `fail-fast: false`, each on its own runner:
 
-- `4-gpu-h100` — Qwen3.6-27B and gpt-oss-120b, TP=2 per arm (GPUs 0,1 + 2,3).
+- `4-gpu-h100` — Qwen3.6-27B and gpt-oss-120b use TP=2 per A/B arm; Muse-Glimmer
+  uses one TP=2 SGLang-backed SMG arm.
 - `blackwell` (B200) — DeepSeek-V4-Flash-0731, MiniMax-M2.7, Kimi-K2.6 int4, TP=4 per arm
-  (GPUs 0-3 + 4-7).
+  (GPUs 0-3 + 4-7), plus whole-node sequential GLM-5.2 at TP=8.
 
-All legs use `max_model_len` **32768**: the `multi_turn` categories emit ~18k-token
-prompts that 400'd ("decoder prompt longer than the maximum model length") at 16384.
-Weights already fit at each leg's TP and the extra KV for a 32k window is only a few
-GB/sequence, so the larger context needs no extra GPUs — arms stay **concurrent**.
+Nightly legs use `max_model_len=auto`, capped at each checkpoint's native window,
+because `multi_turn_long_context` can exceed a fixed 16k limit. The launch helpers
+retain 16k defaults for smaller manual smoke runs.
 
 Each leg sets `arm_mode`:
 
-- **concurrent** (all current legs) — both arms serve at once on opposite GPU halves;
+- **concurrent** — both arms serve at once on opposite GPU halves;
   `run_ab.py` scores them **in parallel** (separate servers/GPUs, no contention) and diffs.
-- **sequential** (in reserve, unused) — for a model that needs the whole node (TP=8)
+- **sequential** — for a model that needs the whole node (currently GLM-5.2 at TP=8)
   so the arms can't coexist: `run_ab.py --score-arm` scores arm A alone → tears it
   down → scores arm B alone → `--diff-baseline/--diff-candidate` compares the two
-  saved score files. Flip a leg's `arm_mode` to enable it.
+  saved score files.
+- **smg_only** — launch only arm B, save its scores, then use `--report-arm` for an
+  absolute report. Completeness is still enforced; there is intentionally no delta.
 
 Per the A/B's premise, model size is irrelevant — a smaller same-family checkpoint
 exercises the identical parser — so the matrix uses DeepSeek-V4-Flash-0731 and int4
 Kimi-K2.6 to validate the `deepseek_v4` / `kimi_k2` parsers without the full weights.
 
-`workflow_dispatch` can target one leg via the `only` input and override
-`model`/`bfcl_model`/parsers per run. PRs touching this pipeline run **all** legs
-(H100 + Blackwell) as an end-to-end sanity check, but cheaply — the PR category set
-is a tiny non-live subset (`simple_python,irrelevance`) for every leg.
+`workflow_dispatch` can target one leg via the `only` input and override the paired
+`model`/`bfcl_model` plus parsers. The PR trigger is intentionally disabled because
+the full matrix is expensive; dispatch a targeted leg with a small category set for
+pre-merge smoke coverage.
 
 ## Gotchas discovered while bringing this up (read before debugging)
 

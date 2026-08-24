@@ -1,6 +1,6 @@
 # τ²-bench nightly A/B — `scripts/tau2/`
 
-**Track B** of the multi-turn parser-verification suite: run **τ²-bench** (`tau2-bench`) against two serving "arms" and diff pass^1 and pass^k. The companion **Track A** (an offline, deterministic parser-conformance gate) is proposed but not yet built — see the parser-verification proposal in `docs/proposals/`.
+**Track B** of the multi-turn parser-verification suite: run **τ²-bench** (`tau2-bench`) against serving arms. Normal legs diff pass^1/pass^k between pure vLLM and SMG; an `smg_only` leg reports absolute scores for a checkpoint the pinned vLLM cannot serve. The companion **Track A** (an offline, deterministic parser-conformance gate) is proposed but not yet built — see the parser-verification proposal in `docs/proposals/`.
 
 ## The experiment
 
@@ -20,8 +20,8 @@ Two arms expose an identical OpenAI `/v1` endpoint. The same `tau2` CLI is point
 
 | file | what |
 |---|---|
-| `launch_arms.sh` | bring up one arm (`a` = pure vLLM, `b` = vLLM gRPC worker + SMG gateway); prints its base_url on stdout; `stop` tears down all arms via pidfiles. Fully env-parameterised. |
-| `run_ab.py` | point `tau2 run` at both arms (one domain at a time), read back `results.json`, compute pass^1 and pass^k per domain, emit a markdown + JSON comparison table, and apply a regression gate. Arms must already be serving. |
+| `launch_arms.sh` | bring up one arm (`a` = pure vLLM, `b` = SMG in front of a vLLM or SGLang gRPC worker); prints its base_url; `stop` tears down via pidfiles. |
+| `run_ab.py` | point `tau2 run` at arms, read `results.json`, and compute pass^1/pass^k. A/B mode emits deltas and a regression gate; `--report-arm` emits absolute single-arm scores with the same completeness gate. |
 
 ## Quick start (manual, e.g. on a GPU box)
 
@@ -59,7 +59,7 @@ python scripts/tau2/run_ab.py \
 bash launch_arms.sh stop
 ```
 
-Key env knobs for `launch_arms.sh`: `TAU2_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`), `TAU2_TP` (tensor-parallel size — match the GPU count), `TAU2_MAX_MODEL_LEN`, `TAU2_{VLLM,SMG}_{TOOL,REASONING}_PARSER`, `TAU2_VLLM_EXTRA` for extra vLLM flags, and `TAU2_ARM_A_PORT` / `TAU2_ARM_B_GRPC_PORT` / `TAU2_ARM_B_GW_PORT` / `TAU2_ARM_B_METRICS_PORT` to pin ports (default: OS-assigned free ports, so concurrent arms/jobs on one host don't collide).
+Key env knobs for `launch_arms.sh`: `TAU2_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`), `TAU2_TP` (tensor-parallel size — match the GPU count), `TAU2_MAX_MODEL_LEN`, `TAU2_{VLLM,SMG}_{TOOL,REASONING}_PARSER`, `TAU2_ARM_B_WORKER` (`vllm` or `sglang`), the engine-specific `TAU2_{VLLM,SGLANG}_EXTRA` flags, and the `TAU2_ARM_*_PORT` overrides.
 
 `run_ab.py` exits non-zero if the candidate's overall pass^k drops more than `--tolerance` (default 2pp) below the baseline. Use `--max-concurrency N` to run N tau2 simulations per arm in parallel (the lever that keeps large runs within a time budget).
 
@@ -85,13 +85,11 @@ where `<DATA_DIR>` is the path you pass to the **required** `--data-dir` flag (t
 
 ## Per-model parser flags (the nightly matrix)
 
-Mirrors `nightly-bfcl.yml`'s 6-leg matrix. The 2 H100 legs run full task sets; the 4
-Blackwell legs are capped at `num_tasks=30`/domain (tau2 is multi-turn + spends
-gpt-5.2 per turn). `glm-5.2` runs **sequential** (whole 8-GPU node per arm — `run_ab.py
---score-arm` each arm, then `--diff`); the rest run both arms concurrently on opposite
-GPU halves. On PRs **all** legs run on a tiny retail / 1-trial / few-task subset — a
-quick "does each leg launch + parse + score" smoke (the heavy Blackwell legs are
-dominated by model-load time, serialized by a host lock, so a PR run is not fast).
+Mirrors `nightly-bfcl.yml`'s 7-leg matrix. Most legs run both arms concurrently;
+`glm-5.2` runs sequentially on a whole node, and Muse-Glimmer runs one SGLang-backed
+SMG arm. Expensive legs are capped at `num_tasks=30`/domain to bound GPU time and
+gpt-5.2 user-simulator spend. The PR trigger is disabled; use a targeted dispatch
+with retail / one trial / a few tasks for pre-merge smoke coverage.
 
 | leg | model | runner (TP) | vLLM tool/reason | SMG tool/reason |
 |---|---|---|---|---|
@@ -99,12 +97,17 @@ dominated by model-load time, serialized by a host lock, so a PR run is not fast
 | gpt-oss | openai/gpt-oss-120b | 4-gpu-h100 (2) | `openai` / — | — / — (harmony auto) |
 | deepseek-v4 | deepseek-ai/DeepSeek-V4-Flash-0731 | blackwell (4) | `deepseek_v4` / `deepseek_v4` | `deepseek_v4` / `deepseek_v4` |
 | minimax-m2.7 | MiniMaxAI/MiniMax-M2.7 | blackwell (4) | `minimax_m2` / `minimax_m2` | `minimax_m2` / `minimax` |
-| kimi-k2.6 | moonshotai/Kimi-K2.6 | blackwell (4) | `kimi_k2` / `kimi_k2` | `kimik2` / `kimi_k25` |
+| kimi-k2.6 | moonshotai/Kimi-K2.6 | blackwell (4) | `kimi_k2` / `kimi_k2` | `kimik2` / `kimi_thinking` |
 | glm-5.2 | zai-org/GLM-5.2-FP8 | blackwell (8, seq) | `glm47` / `glm45` | `glm47_moe` / `glm45` |
+| muse-glimmer | meta-models/Muse-Glimmer-30B | 4-gpu-h100 (2, single arm) | unsupported | SGLang + `muse_glimmer` / `muse_glimmer` |
 
 > Dispatch `only=<leg>` runs a single leg; `model=` overrides its weights. SKU ids and
 > vLLM parser names may shift; confirm against the installed vLLM build:
 > `vllm serve --help | grep -A40 tool-call-parser`.
+>
+> Muse-Glimmer's τ² result is an absolute SMG score, not a frontend A/B. It is also
+> not directly comparable to the model card's τ3-Banking number: benchmark version,
+> domain, and user-simulator setup differ.
 
 ## Gotchas discovered while bringing this up (read before debugging)
 

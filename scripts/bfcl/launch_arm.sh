@@ -3,8 +3,8 @@
 #
 #   arm A = pure vLLM OpenAI server  (vLLM owns chat template + tokenization +
 #           tool/reasoning parsing)
-#   arm B = SMG in front of a vLLM gRPC worker (SMG owns chat template +
-#           tokenization + tool/reasoning parsing; vLLM runs raw-token)
+#   arm B = SMG in front of a vLLM or SGLang gRPC worker (SMG owns chat
+#           template + tokenization + tool/reasoning parsing; worker runs raw-token)
 #
 # Both expose an identical OpenAI /v1 endpoint, so the official BFCL harness can
 # point at either and the ONLY thing that differs is the frontend — which is
@@ -51,6 +51,11 @@ SMG_REASONING_PARSER="${BFCL_SMG_REASONING_PARSER:-}"
 # more stable under sustained bfcl load on shared/contended GPUs.
 VLLM_EXTRA="${BFCL_VLLM_EXTRA:-}"
 
+# Engine behind SMG on arm B. SGLang is used for checkpoints the pinned vLLM
+# cannot load; both expose the same SMG gRPC contract to the gateway.
+ARM_B_WORKER="${BFCL_ARM_B_WORKER:-vllm}"
+SGLANG_EXTRA="${BFCL_SGLANG_EXTRA:-}"
+
 # Ports. Default to an OS-assigned free port (resolved per-arm in the case
 # below) so concurrent arms/jobs sharing a host — e.g. bin-packed CI runners
 # under hostNetwork — don't collide on a fixed port. Pin via env for a stable
@@ -63,6 +68,7 @@ ARM_B_METRICS_PORT="${BFCL_ARM_B_METRICS_PORT:-}" # SMG Prometheus port (default
 # Executables (override for venv / box paths).
 VLLM_BIN="${VLLM_BIN:-vllm}"                      # `vllm serve` console script
 VLLM_PYTHON="${VLLM_PYTHON:-python}"             # python that can `-m vllm.entrypoints.grpc_server`
+SGLANG_PYTHON="${SGLANG_PYTHON:-python}"         # python that can `-m sglang.launch_server`
 SMG_LAUNCH="${SMG_LAUNCH:-smg launch}"           # SMG launcher (binary subcmd or `python -m smg.launch_router`)
 
 mkdir -p "$RUN_DIR"
@@ -100,6 +106,21 @@ free_port() {  # OS-assigned free TCP port (same idiom as the e2e infra's get_op
   python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()'
 }
 
+# SGLang derives another port as base + 10000 in SMG gRPC mode. Keep the base
+# low enough that the derived port remains in the valid TCP range.
+free_low_port() {
+  local port
+  for _ in $(seq 1 20); do
+    port=$(free_port)
+    if [ "$port" -le 55000 ]; then
+      echo "$port"
+      return 0
+    fi
+  done
+  echo "[launch_arm] no free port <=55000 after 20 tries" >&2
+  return 1
+}
+
 case "$ARM" in
   a)
     ARM_A_PORT="${ARM_A_PORT:-$(free_port)}"
@@ -122,19 +143,36 @@ case "$ARM" in
     ;;
 
   b)
-    ARM_B_GRPC_PORT="${ARM_B_GRPC_PORT:-$(free_port)}"
+    case "$ARM_B_WORKER" in
+      vllm) ARM_B_GRPC_PORT="${ARM_B_GRPC_PORT:-$(free_port)}" ;;
+      sglang) ARM_B_GRPC_PORT="${ARM_B_GRPC_PORT:-$(free_low_port)}" ;;
+      *) echo "[launch_arm] unsupported arm-B worker: $ARM_B_WORKER" >&2; exit 2 ;;
+    esac
     ARM_B_GW_PORT="${ARM_B_GW_PORT:-$(free_port)}"
     ARM_B_METRICS_PORT="${ARM_B_METRICS_PORT:-$(free_port)}"
-    # 1) vLLM gRPC worker (raw-token; SMG will own template+parsing).
-    declare -a wcmd=(
-      CUDA_VISIBLE_DEVICES="$GPU" "$VLLM_PYTHON" -m vllm.entrypoints.grpc_server
-      --model "$MODEL_SRC" --served-model-name "$MODEL"
-      --host 0.0.0.0 --port "$ARM_B_GRPC_PORT"
-      --tensor-parallel-size "$TP" --max-model-len "$MAX_MODEL_LEN"
-      --gpu-memory-utilization "$GPU_MEM_UTIL"
-    )
-    # shellcheck disable=SC2206  # intentional word-split of optional extra flags
-    [ -n "$VLLM_EXTRA" ] && wcmd+=($VLLM_EXTRA)
+    # 1) gRPC worker (raw-token; SMG will own template+parsing).
+    if [ "$ARM_B_WORKER" = sglang ]; then
+      declare -a wcmd=(
+        CUDA_VISIBLE_DEVICES="$GPU" "$SGLANG_PYTHON" -m sglang.launch_server
+        --model-path "$MODEL_SRC" --served-model-name "$MODEL"
+        --host 0.0.0.0 --port "$ARM_B_GRPC_PORT"
+        --tp-size "$TP" --mem-fraction-static "$GPU_MEM_UTIL"
+        --smg-grpc-mode --log-level info
+      )
+      [ "$MAX_MODEL_LEN" != auto ] && wcmd+=(--context-length "$MAX_MODEL_LEN")
+      # shellcheck disable=SC2206  # intentional word-split of optional extra flags
+      [ -n "$SGLANG_EXTRA" ] && wcmd+=($SGLANG_EXTRA)
+    else
+      declare -a wcmd=(
+        CUDA_VISIBLE_DEVICES="$GPU" "$VLLM_PYTHON" -m vllm.entrypoints.grpc_server
+        --model "$MODEL_SRC" --served-model-name "$MODEL"
+        --host 0.0.0.0 --port "$ARM_B_GRPC_PORT"
+        --tensor-parallel-size "$TP" --max-model-len "$MAX_MODEL_LEN"
+        --gpu-memory-utilization "$GPU_MEM_UTIL"
+      )
+      # shellcheck disable=SC2206  # intentional word-split of optional extra flags
+      [ -n "$VLLM_EXTRA" ] && wcmd+=($VLLM_EXTRA)
+    fi
     start arm_b_worker "$RUN_DIR/arm_b_worker.log" "${wcmd[@]}"
     log_tail=$(stream_log "$RUN_DIR/arm_b_worker.log")
     wait_grpc "$ARM_B_GRPC_PORT" "${BFCL_STARTUP_TIMEOUT:-420}"
@@ -155,7 +193,9 @@ case "$ARM" in
     [ -n "$SMG_REASONING_PARSER" ] && smg_cmd+=(--reasoning-parser "$SMG_REASONING_PARSER")
     start arm_b_gateway "$RUN_DIR/arm_b_gateway.log" "${smg_cmd[@]}"
     log_tail=$(stream_log "$RUN_DIR/arm_b_gateway.log")
-    wait_http "http://127.0.0.1:$ARM_B_GW_PORT/health" "${BFCL_STARTUP_TIMEOUT:-420}"
+    # The gRPC worker's tokenizer is registered asynchronously. /readiness does
+    # not flip until that completes; /health can race and yield tokenizer 500s.
+    wait_http "http://127.0.0.1:$ARM_B_GW_PORT/readiness" "${BFCL_STARTUP_TIMEOUT:-420}"
     kill "$log_tail" 2>/dev/null || true
     echo "http://127.0.0.1:$ARM_B_GW_PORT"
     ;;

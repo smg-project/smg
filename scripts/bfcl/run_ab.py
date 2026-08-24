@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the official BFCL benchmark against two "arms" and diff the scores.
+"""Run the official BFCL benchmark against serving arms and report the scores.
 
 This is **Track B** of the parser-verification proposal: a live, end-to-end A/B
 that holds the model + engine + checkpoint + sampling fixed and varies only the
@@ -28,8 +28,11 @@ launch them. Example::
         --project-root /home/keyang/bfcl_ab \\
         --out /tmp/bfcl_ab.md --json-out /tmp/bfcl_ab.json
 
+The normal mode compares two arms. ``--report-arm`` renders absolute scores for
+a saved single arm when the serving engine has no comparable pure-vLLM path.
+
 Exit codes: ``0`` clean, ``1`` score regression beyond ``--tolerance``, ``2`` an
-arm did not finish (timed out or scored nothing), so there is nothing to compare.
+arm did not finish (timed out, missed a category, or processed zero cases).
 """
 
 from __future__ import annotations
@@ -62,6 +65,7 @@ class Arm:
     scores: dict[str, float] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)  # per-category test-case count
     timed_out: list[str] = field(default_factory=list)  # stages killed by --run-timeout
+    failed: dict[str, str] = field(default_factory=dict)  # nonzero benchmark stages
 
 
 def parse_arm(spec: str, project_root: Path) -> Arm:
@@ -115,7 +119,7 @@ def run_bfcl(
 
     cats = ",".join(categories)
     if not skip_generate:
-        if not _run(
+        generate_rc = _run(
             [
                 bfcl,
                 "generate",
@@ -135,20 +139,27 @@ def run_bfcl(
             env,
             f"[{arm.name}] generate",
             timeout=run_timeout,
-        ):
+        )
+        if generate_rc is None:
             arm.timed_out.append("generate")
+        elif generate_rc != 0:
+            arm.failed["generate"] = f"exited {generate_rc}"
     # Evaluate even after a killed generate: whatever completed is already on disk.
-    _run(
+    evaluate_rc = _run(
         [bfcl, "evaluate", "--model", model, "--test-category", cats],
         env,
         f"[{arm.name}] evaluate",
         timeout=run_timeout,
     )
+    if evaluate_rc is None:
+        arm.timed_out.append("evaluate")
+    elif evaluate_rc != 0:
+        arm.failed["evaluate"] = f"exited {evaluate_rc}"
     arm.scores, arm.counts = parse_scores(arm.project_root, model, categories)
 
 
-def _run(cmd: list[str], env: dict[str, str], label: str, timeout: int = 0) -> bool:
-    """Run one bfcl subcommand; return False if it hit ``timeout`` (0 = no cap)."""
+def _run(cmd: list[str], env: dict[str, str], label: str, timeout: int = 0) -> int | None:
+    """Run one bfcl subcommand; return its status, or None after a timeout."""
     print(f"\n=== {label}: {' '.join(cmd)}", flush=True)
     # Own session so a timeout can SIGKILL the whole group: bfcl generate fans out
     # over a thread pool and can sit blocked on a hung HTTP read.
@@ -158,10 +169,10 @@ def _run(cmd: list[str], env: dict[str, str], label: str, timeout: int = 0) -> b
     except subprocess.TimeoutExpired:
         _killpg(proc)
         print(f"WARNING: {label} timed out after {timeout}s; killed", file=sys.stderr)
-        return False
+        return None
     if returncode != 0:
         print(f"WARNING: {label} exited {returncode}", file=sys.stderr)
-    return True
+    return returncode
 
 
 def _killpg(proc: subprocess.Popen) -> None:
@@ -214,15 +225,23 @@ def _find_category_summary(score_root: Path, category: str) -> tuple[float, int]
 def incompleteness(arm: Arm, categories: list[str]) -> str | None:
     """Why this arm can't be compared (timed out / unscored categories), else None."""
     missing = [c for c in categories if c not in arm.scores]
-    if not missing and not arm.timed_out:
+    zero_count = [c for c in categories if c in arm.scores and arm.counts.get(c, 0) <= 0]
+    if not missing and not zero_count and not arm.timed_out and not arm.failed:
         return None
-    reason = f"no score for {len(missing)}/{len(categories)} categories"
-    if arm.timed_out:
-        reason += f"; timed out during: {', '.join(arm.timed_out)}"
+    reasons = []
     if missing:
         shown = ", ".join(missing[:8]) + (f", +{len(missing) - 8} more" if len(missing) > 8 else "")
-        reason += f"; unscored: {shown}"
-    return reason
+        reasons.append(f"no score for {len(missing)}/{len(categories)} categories: {shown}")
+    if arm.timed_out:
+        reasons.append(f"timed out during: {', '.join(arm.timed_out)}")
+    if arm.failed:
+        reasons.append(
+            "failed/partial: "
+            + ", ".join(f"{stage} ({failure})" for stage, failure in arm.failed.items())
+        )
+    if zero_count:
+        reasons.append(f"zero cases: {', '.join(zero_count)}")
+    return "; ".join(reasons)
 
 
 def build_report(baseline: Arm, candidate: Arm, categories: list[str]) -> tuple[str, dict]:
@@ -305,6 +324,7 @@ def build_report(baseline: Arm, candidate: Arm, categories: list[str]) -> tuple[
             "scores": baseline.scores,
             "counts": baseline.counts,
             "timed_out": baseline.timed_out,
+            "failed": baseline.failed,
         },
         "candidate": {
             "name": candidate.name,
@@ -312,6 +332,7 @@ def build_report(baseline: Arm, candidate: Arm, categories: list[str]) -> tuple[
             "scores": candidate.scores,
             "counts": candidate.counts,
             "timed_out": candidate.timed_out,
+            "failed": candidate.failed,
         },
         "incomplete": incomplete,
         "per_category": rows,
@@ -321,6 +342,72 @@ def build_report(baseline: Arm, candidate: Arm, categories: list[str]) -> tuple[
             "candidate": c_weighted,
             "delta": weighted_delta,
         },
+    }
+    return "\n".join(lines), payload
+
+
+def build_single_report(arm: Arm, categories: list[str]) -> tuple[str, dict]:
+    """Build an absolute BFCL report for one arm with no comparable baseline."""
+    rows = [
+        {
+            "category": category,
+            "accuracy": arm.scores.get(category),
+            "count": arm.counts.get(category),
+        }
+        for category in categories
+    ]
+    numeric = [row["accuracy"] for row in rows if row["accuracy"] is not None]
+    overall = sum(numeric) / len(numeric) if numeric else None
+    weighted_num = sum(
+        row["accuracy"] * row["count"]
+        for row in rows
+        if row["accuracy"] is not None and row["count"]
+    )
+    weighted_den = sum(row["count"] for row in rows if row["accuracy"] is not None and row["count"])
+    overall_weighted = weighted_num / weighted_den if weighted_den else None
+
+    def fmt(value: float | None) -> str:
+        return "—" if value is None else f"{value * 100:.2f}"
+
+    lines = [
+        f"# BFCL — {arm.name} (single arm)",
+        "",
+        "| category | n | accuracy |",
+        "|---|---:|---:|",
+    ]
+    for row in rows:
+        count = "—" if row["count"] is None else str(row["count"])
+        lines.append(f"| {row['category']} | {count} | {fmt(row['accuracy'])} |")
+    total = sum(row["count"] for row in rows if row["count"]) or "—"
+    lines.extend(
+        [
+            f"| **overall (unweighted)** | {total} | **{fmt(overall)}** |",
+            f"| **overall (weighted by n)** | {total} | **{fmt(overall_weighted)}** |",
+            "",
+        ]
+    )
+    incomplete = incompleteness(arm, categories)
+    if incomplete:
+        lines.extend([f"> ⚠️ **Incomplete arm `{arm.name}`** — {incomplete}.", ""])
+    lines.append(
+        "_Absolute official BFCL FC-mode scores. This is a single-arm run because "
+        "the comparison engine cannot serve this checkpoint; no frontend parity "
+        "claim or A/B delta is implied._"
+    )
+    payload = {
+        "mode": "single_arm",
+        "arm": {
+            "name": arm.name,
+            "base_url": arm.base_url,
+            "scores": arm.scores,
+            "counts": arm.counts,
+            "timed_out": arm.timed_out,
+            "failed": arm.failed,
+        },
+        "incomplete": incomplete,
+        "per_category": rows,
+        "overall": overall,
+        "overall_weighted": overall_weighted,
     }
     return "\n".join(lines), payload
 
@@ -339,6 +426,7 @@ def save_scores(arm: Arm, path: Path) -> None:
                 "scores": arm.scores,
                 "counts": arm.counts,
                 "timed_out": arm.timed_out,
+                "failed": arm.failed,
             },
             indent=2,
         )
@@ -356,6 +444,7 @@ def load_scores(path: Path) -> Arm:
         scores=data["scores"],
         counts=data.get("counts", {}),
         timed_out=data.get("timed_out", []),
+        failed=data.get("failed", {}),
     )
 
 
@@ -388,6 +477,21 @@ def write_report_and_gate(
     return exit_code
 
 
+def write_single_report_and_gate(arm: Arm, categories: list[str], args: argparse.Namespace) -> int:
+    """Emit one arm's absolute report and reject incomplete benchmark output."""
+    report_md, payload = build_single_report(arm, categories)
+    print("\n" + report_md)
+    if args.out:
+        args.out.write_text(report_md + "\n", encoding="utf-8")
+    if args.json_out:
+        args.json_out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    if payload["incomplete"] and not args.allow_incomplete:
+        print(f"\nINCOMPLETE: arm {arm.name} — {payload['incomplete']}", file=sys.stderr)
+        return EXIT_INCOMPLETE
+    return EXIT_OK
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -399,6 +503,11 @@ def main() -> int:
     # then later diff the two saved score files.
     p.add_argument("--score-arm", help="name=base_url of the single live arm to score")
     p.add_argument("--scores-out", type=Path, help="write this arm's scores JSON here")
+    p.add_argument(
+        "--report-arm",
+        type=Path,
+        help="render and gate one saved arm's absolute scores (from --scores-out)",
+    )
     p.add_argument("--diff-baseline", type=Path, help="baseline scores JSON (from --scores-out)")
     p.add_argument("--diff-candidate", type=Path, help="candidate scores JSON (from --scores-out)")
     p.add_argument(
@@ -439,6 +548,10 @@ def main() -> int:
     args = p.parse_args()
 
     categories = [c.strip() for c in args.categories.split(",") if c.strip()]
+
+    # Mode: report one previously-scored arm when no comparable baseline exists.
+    if args.report_arm:
+        return write_single_report_and_gate(load_scores(args.report_arm), categories, args)
 
     # Mode: diff two previously-saved score files (sequential mode, final step).
     if args.diff_baseline or args.diff_candidate:

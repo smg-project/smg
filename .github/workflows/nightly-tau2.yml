@@ -1,20 +1,18 @@
-# Nightly τ²-bench A/B — multi-turn agentic benchmark comparing SMG's parsing
-# frontend (SMG -> vLLM gRPC) against pure vLLM, same model/engine/checkpoint/
-# sampling. Mirrors nightly-bfcl.yml's model matrix. Informational/non-blocking —
-# never a merge gate.
+# Nightly τ²-bench — multi-turn agentic benchmark. Normal legs compare SMG's
+# parsing frontend (SMG -> vLLM gRPC) against pure vLLM with the serving inputs
+# held fixed. Checkpoints unsupported by the pinned vLLM use an absolute
+# SMG-only leg backed by SGLang. Mirrors nightly-bfcl.yml's model matrix and is
+# informational/non-blocking — never a merge gate.
 #
 # User-sim is the fixed gpt-5.2 model via the OpenAI API; agent arms expose an
 # identical OpenAI /v1 endpoint so the τ²-bench harness can point at either and
 # the ONLY variable is the frontend (tokenization + tool/reasoning parsing).
 #
-# Runs nightly across retail, airline, and telecom domains over a 6-model matrix
-# (qwen3.6 + gpt-oss on H100; deepseek-v4, minimax-m2.7, kimi-k2.6, glm-5.2 on
-# Blackwell). The 4 Blackwell legs are num_tasks-capped to bound GPU time and
-# gpt-5.2 spend (tau2 is far heavier per-leg than bfcl: multi-turn + per-turn API
-# spend). On PRs that touch this pipeline ALL legs run on a tiny retail / 1-trial /
-# few-task subset — a quick "does each leg launch + parse + score" smoke. The heavy
-# Blackwell legs are dominated by model-load time and serialized by a host lock, so
-# a PR run is not fast, but it confirms every leg works end-to-end before merge.
+# Runs nightly across retail, airline, and telecom over a 7-model matrix. Qwen3.6,
+# gpt-oss, and the SGLang-backed Muse-Glimmer leg use H100; deepseek-v4,
+# minimax-m2.7, kimi-k2.6, and glm-5.2 use Blackwell. Expensive legs are
+# num_tasks-capped to bound GPU time and gpt-5.2 spend. Pre-merge validation uses
+# a targeted workflow_dispatch; the full-matrix pull_request trigger stays disabled.
 name: Nightly tau2
 
 on:
@@ -22,7 +20,7 @@ on:
     - cron: "17 7 * * 2,4,6" # Tue/Thu/Sat 07:17 UTC = 00:17 PDT — alternates nights with nightly-bfcl so the two ~7h runs don't queue back-to-back on the shared Blackwell runner
   # PR sanity (disabled, like nightly-bfcl): when the tau2 pipeline itself changes
   # this would run ALL legs on a tiny retail / 1-trial / few-task subset — but the
-  # 6-leg run (incl. the ~7h Blackwell legs) is too heavy for every pipeline PR.
+  # 7-leg run (incl. the ~7h Blackwell legs) is too heavy for every pipeline PR.
   # Re-enable temporarily to smoke a pipeline change, or use workflow_dispatch.
   # pull_request:
   #   paths:
@@ -31,7 +29,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run only this matrix leg (qwen3.6|gpt-oss|deepseek-v4|minimax-m2.7|kimi-k2.6|glm-5.2); empty = all"
+        description: "Run only this matrix leg (qwen3.6|gpt-oss|deepseek-v4|minimax-m2.7|kimi-k2.6|glm-5.2|muse-glimmer); empty = all"
         required: false
         default: ""
       model:
@@ -203,16 +201,28 @@ jobs:
                "arm_mode": "sequential", "max_model_len": "auto", "num_tasks": 30,
                # Sequential: both arms share the 360m job, so half the per-domain budget.
                "run_timeout": "2700"},
+              # Muse-Glimmer is an SMG-only leg because the pinned vLLM cannot
+              # load this architecture. SGLang serves raw tokens over the same
+              # gRPC contract; SMG owns template rendering and both parsers.
+              {"name": "muse-glimmer", "runner": "4-gpu-h100", "tp": 2,
+               "gpu_a": "", "gpu_b": "0,1",
+               "model": "meta-models/Muse-Glimmer-30B",
+               "vllm_tool": "", "vllm_reason": "",
+               "smg_tool": "muse_glimmer", "smg_reason": "muse_glimmer",
+               "vllm_extra": "", "sglang_extra": "", "gpu_mem": "0.85",
+               "startup_timeout": "900", "model_cache": "/models",
+               "arm_mode": "smg_only", "arm_b_worker": "sglang",
+               "max_model_len": "auto", "num_tasks": 30, "run_timeout": "5400"},
           ]
+          for leg in legs:
+              leg.setdefault("arm_b_worker", "vllm")
+              leg.setdefault("sglang_extra", "")
           only = os.environ.get("ONLY", "")
           valid = [l["name"] for l in legs]
           if only:
               legs = [l for l in legs if l["name"] == only]
               if not legs:
                   raise SystemExit(f"unknown leg {only!r}; valid: {valid}")
-          # All legs (incl. Blackwell) run on PRs too — the PR env below forces a
-          # tiny retail / 1-trial / few-task subset, so each leg is just a quick
-          # "does it launch + parse + score" smoke (model load dominates its time).
           print("matrix=" + json.dumps({"include": legs}))
           PY
 
@@ -256,12 +266,29 @@ jobs:
           name: smg-wheel
           path: wheel
       - name: Setup vLLM env (provides vllm + grpc servicer + smg)
+        if: matrix.arm_b_worker != 'sglang'
         uses: ./.github/actions/setup-vllm
+      - name: Setup SGLang env (arm-B worker for unsupported vLLM architectures)
+        if: matrix.arm_b_worker == 'sglang'
+        uses: ./.github/actions/setup-sglang
       - name: Install smg wheel + ninja (for vLLM torch.compile)
         run: |
           pip uninstall -y smg || true
           pip install wheel/*.whl
           pip install ninja
+      - name: Align protobuf runtime with the installed gencode
+        if: matrix.arm_b_worker == 'sglang'
+        # Keep this identical to BFCL: probe the generated health stubs and
+        # raise protobuf only when SGLang's prerelease dependency set needs it.
+        run: |
+          set -euo pipefail
+          probe() { python -c "from grpc_health.v1 import health_pb2_grpc" 2>&1; }
+          if ! probe >/dev/null; then
+            echo "grpc_health import failed:"
+            probe | tail -3 || true
+            pip install --upgrade "protobuf<8"
+          fi
+          python -c "from grpc_health.v1 import health_pb2_grpc; print('grpc_health imports OK')"
       - name: Install tau2-bench
         run: |
           # uv for fast venv management, then clone + sync tau2-bench (its own .venv).
@@ -292,6 +319,9 @@ jobs:
           TAU2_VLLM_REASONING_PARSER: ${{ github.event.inputs.reasoning_parser || matrix.vllm_reason }}
           TAU2_SMG_REASONING_PARSER: ${{ github.event.inputs.reasoning_parser || matrix.smg_reason }}
           TAU2_VLLM_EXTRA: ${{ matrix.vllm_extra }}
+          TAU2_SGLANG_EXTRA: ${{ matrix.sglang_extra }}
+          TAU2_ARM_B_WORKER: ${{ matrix.arm_b_worker }}
+          SGLANG_PYTHON: python
           TAU2_STARTUP_TIMEOUT: ${{ matrix.startup_timeout }}
           TAU2_RUN_DIR: ${{ runner.temp }}/tau2_run
           ARM_MODE: ${{ matrix.arm_mode }}
@@ -305,16 +335,20 @@ jobs:
           # (self-hosted models aren't in litellm's price map). sitecustomize runs at
           # interpreter startup, inheriting into the tau2 subprocess's own venv.
           export PYTHONPATH="$PWD/scripts/tau2/costmap_shim${PYTHONPATH:+:$PYTHONPATH}"
-          # Serialize the launch->serve->teardown phase PER HOST. Blackwell runner
-          # agents share one bare-metal machine (host network + the same 8 GPUs), so
-          # two legs at once collide on ports and GPU memory. A host-wide flock runs
+          # Serialize the launch->serve->teardown phase PER HOST. Runner agents
+          # share one bare-metal machine (host network + GPUs), so two benchmark
+          # legs at once collide on ports and GPU memory. A host-wide flock runs
           # them one at a time; the lock releases when this step's shell exits.
           #
           # CRITICAL: every launch_arms.sh call is invoked with `9>&-` so the
           # setsid-detached vLLM/SMG servers do NOT inherit lock FD 9 (a leaked
           # server would hold the lock forever and deadlock future jobs). With 9>&-,
           # only this step shell holds the lock; it always releases on step exit.
-          exec 9>/tmp/tau2-host.lock
+          # ROUTER_LOCAL_MODEL_PATH is a host-mounted cache shared by runner pods.
+          # BFCL and tau2 deliberately use one lock so their manual runs cannot
+          # overlap on the same host. /tmp is pod-local and cannot serialize them.
+          mkdir -p "$ROUTER_LOCAL_MODEL_PATH/.locks"
+          exec 9>"$ROUTER_LOCAL_MODEL_PATH/.locks/smg-benchmark-host.lock"
           echo "waiting for host lock..."
           flock -w 9000 9 || { echo "::error::host lock not acquired within 9000s"; exit 1; }
           echo "acquired host lock"
@@ -355,7 +389,37 @@ jobs:
                  AB_RC=$rc ;;
             esac
           }
-          if [ "$ARM_MODE" = sequential ]; then
+          if [ "$ARM_MODE" = smg_only ]; then
+            # The pinned vLLM cannot serve this checkpoint, so score the same SMG
+            # candidate path in isolation and publish absolute τ² results.
+            # --report-arm preserves the normal domain/sample completeness gate.
+            B_URL=$(TAU2_GPU="$GPU_B" bash scripts/tau2/launch_arms.sh b 9>&-)
+            echo "single arm (smg): $B_URL"
+            SCORE_RC=0
+            python scripts/tau2/run_ab.py --score-arm "smg=$B_URL" \
+              --scores-out "$RUNNER_TEMP/scores_smg.json" "${COMMON[@]}" \
+              || SCORE_RC=$?
+            bash scripts/tau2/launch_arms.sh stop 9>&- || true
+            if [ "$SCORE_RC" -ne 0 ]; then
+              echo "::error::tau2 single-arm scoring exited $SCORE_RC"
+              AB_RC=2
+            fi
+            if [ -f "$RUNNER_TEMP/scores_smg.json" ]; then
+              REPORT_RC=0
+              python scripts/tau2/run_ab.py --report-arm "$RUNNER_TEMP/scores_smg.json" \
+                --domains "$DOMAINS" --num-trials "$NUM_TRIALS" \
+                --out "$RUNNER_TEMP/tau2_ab.md" \
+                --json-out "$RUNNER_TEMP/tau2_ab.json" \
+                || REPORT_RC=$?
+              if [ "$REPORT_RC" -ne 0 ]; then
+                echo "::error::tau2 single-arm report failed (exit $REPORT_RC)"
+                AB_RC=2
+              fi
+            else
+              echo "tau2 single-arm scoring produced no score artifact." > "$RUNNER_TEMP/tau2_ab.md"
+              AB_RC=2
+            fi
+          elif [ "$ARM_MODE" = sequential ]; then
             # Whole node per arm (TP=8), one at a time: score arm A, tear it down to
             # free the GPUs, score arm B, then diff the two saved score files.
             A_URL=$(TAU2_GPU="$GPU_A" bash scripts/tau2/launch_arms.sh a 9>&-)
@@ -395,7 +459,11 @@ jobs:
         run: |
           {
             # Job name already shows the model + runner; keep this heading lean.
-            echo "## τ²-bench A/B (domains: $DOMAINS)"
+            if [ "${{ matrix.arm_mode }}" = smg_only ]; then
+              echo "## τ²-bench — SMG-only (domains: $DOMAINS)"
+            else
+              echo "## τ²-bench A/B (domains: $DOMAINS)"
+            fi
             cat "$RUNNER_TEMP/tau2_ab.md"
           } >> "$GITHUB_STEP_SUMMARY" || echo "no report produced for ${{ matrix.name }}" >> "$GITHUB_STEP_SUMMARY"
       - name: Collect tau2 transcripts
@@ -425,8 +493,8 @@ jobs:
             ${{ runner.temp }}/tau2_transcripts.tgz
           if-no-files-found: warn
           retention-days: 30
-      - name: Upload arm logs (failure only)
-        if: failure()
+      - name: Upload arm logs (failure or SMG-only result)
+        if: ${{ always() && (failure() || matrix.arm_mode == 'smg_only') }}
         uses: actions/upload-artifact@v7
         with:
           name: tau2-ab-${{ matrix.name }}-logs-${{ github.run_id }}

@@ -1,21 +1,21 @@
-# Nightly BFCL A/B — official Berkeley Function Calling Leaderboard run comparing
-# SMG's parsing frontend (SMG -> vLLM gRPC) against pure vLLM, same model/engine/
-# checkpoint/sampling. Track B of docs/proposals/2026-06-10-bfcl-nightly-parser-
-# verification.md. Informational/non-blocking — never a merge gate.
+# Nightly BFCL — official Berkeley Function Calling Leaderboard. Normal legs
+# compare SMG's parsing frontend (SMG -> vLLM gRPC) against pure vLLM with the
+# model/engine/checkpoint/sampling held fixed. Checkpoints unsupported by the
+# pinned vLLM use an absolute SMG-only leg backed by SGLang. Informational and
+# non-blocking — never a merge gate.
 #
 # Runs nightly over non_live + live + multi_turn (static, reproducible; excludes
 # the agentic/executable categories that need web-search/memory/sandbox infra).
-# On PRs that touch this pipeline it runs a quick non-live sanity subset for
-# merge confidence. The A/B mechanics were validated manually on an H100 box
-# (see scripts/bfcl/README.md "Validation status").
+# Pre-merge validation uses a targeted workflow_dispatch with a small category
+# subset; the pull_request trigger below stays disabled because the full model
+# matrix is expensive. See scripts/bfcl/README.md for validation history.
 name: Nightly BFCL
 
 on:
   schedule:
     - cron: "17 7 * * 1,3,5" # Mon/Wed/Fri 07:17 UTC = 00:17 PDT — alternates nights with nightly-tau2 so the two ~7h runs don't queue back-to-back on the shared Blackwell runner
-  # PR sanity: only when the BFCL pipeline itself changes. Runs a quick non-live
-  # subset so the A/B is exercised end-to-end (engine, FC mode, parser, scoring)
-  # before merge — confidence the pipeline works, not a statistical result.
+  # Disabled PR sanity trigger. If temporarily re-enabled, the PR-specific
+  # defaults below run a quick non-live subset; normally use workflow_dispatch.
   # pull_request:
   #   paths:
   #     - "scripts/bfcl/**"
@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run only this matrix leg (qwen3.6|gpt-oss|deepseek-v4|minimax-m2.7|kimi-k2.6|glm-5.2); empty = all"
+        description: "Run only this matrix leg (qwen3.6|gpt-oss|deepseek-v4|minimax-m2.7|kimi-k2.6|glm-5.2|muse-glimmer); empty = all"
         required: false
         default: ""
       model:
@@ -128,6 +128,13 @@ jobs:
           fi
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os
+          MODEL_OVERRIDE = os.environ.get("MODEL_OVERRIDE", "")
+          BFCL_OVERRIDE = os.environ.get("BFCL_OVERRIDE", "")
+          if MODEL_OVERRIDE and BFCL_OVERRIDE != f"{MODEL_OVERRIDE}-FC":
+              raise SystemExit(
+                  "bfcl_model must exactly equal model + '-FC': "
+                  f"model={MODEL_OVERRIDE!r}, bfcl_model={BFCL_OVERRIDE!r}"
+              )
           # max_model_len "auto": largest window that fits in GPU memory (capped at
           # native max). A fixed 32768 400'd on multi_turn_long_context (>32k prompts).
           #
@@ -206,13 +213,27 @@ jobs:
                # Sequential: both arms share the 360m job, healthy total 2h52m on 2026-08-05.
                "run_timeout": "7200",
                "model_cache": "/raid/models", "arm_mode": "sequential", "max_model_len": "auto"},
+              # Muse-Glimmer is an SMG-only leg because the pinned vLLM cannot
+              # load this architecture. SGLang serves raw tokens over the same
+              # gRPC contract; SMG owns template rendering and both parsers.
+              {"name": "muse-glimmer", "runner": "4-gpu-h100", "tp": 2,
+               "gpu_a": "", "gpu_b": "0,1",
+               "model": "meta-models/Muse-Glimmer-30B",
+               "bfcl_model": "meta-models/Muse-Glimmer-30B-FC",
+               "vllm_tool": "", "vllm_reason": "",
+               "smg_tool": "muse_glimmer", "smg_reason": "muse_glimmer",
+               "vllm_extra": "", "sglang_extra": "", "gpu_mem": "0.85",
+               "startup_timeout": "900", "run_timeout": "18000",
+               "model_cache": "/models", "arm_mode": "smg_only",
+               "arm_b_worker": "sglang", "max_model_len": "auto"},
           ]
+          for leg in legs:
+              leg.setdefault("arm_b_worker", "vllm")
+              leg.setdefault("sglang_extra", "")
           only = os.environ.get("ONLY", "")
           valid_names = [l["name"] for l in legs]
           if only:
               legs = [l for l in legs if l["name"] == only]
-          # All legs (incl. Blackwell) run on PRs; cheap because the PR CATEGORIES
-          # below are a tiny non-live subset for every leg.
           if only and not legs:
               raise SystemExit(f"unknown leg {only!r}; valid: {valid_names}")
           print("matrix=" + json.dumps({"include": legs}))
@@ -253,14 +274,47 @@ jobs:
           name: smg-wheel
           path: wheel
       - name: Setup vLLM env (provides vllm + grpc servicer + smg)
+        if: matrix.arm_b_worker != 'sglang'
         uses: ./.github/actions/setup-vllm
+      - name: Setup SGLang env (arm-B worker for unsupported vLLM architectures)
+        if: matrix.arm_b_worker == 'sglang'
+        uses: ./.github/actions/setup-sglang
       - name: Install smg wheel + bfcl-eval (+ ninja for vLLM torch.compile, soundfile for bfcl's qwen handler)
         run: |
           pip uninstall -y smg || true
           pip install wheel/*.whl
           pip install "bfcl-eval" soundfile ninja
+      - name: Align protobuf runtime with the installed gencode
+        if: matrix.arm_b_worker == 'sglang'
+        # The prerelease grpc-health package pulled by SGLang has occasionally
+        # shipped newer generated stubs than its declared protobuf minimum.
+        # Probe the actual import and raise the runtime only when necessary.
+        run: |
+          set -euo pipefail
+          probe() { python -c "from grpc_health.v1 import health_pb2_grpc" 2>&1; }
+          if ! probe >/dev/null; then
+            echo "grpc_health import failed:"
+            probe | tail -3 || true
+            pip install --upgrade "protobuf<8"
+          fi
+          python -c "from grpc_health.v1 import health_pb2_grpc; print('grpc_health imports OK')"
       - name: Register model in bfcl (no-op if bfcl already ships a handler)
-        run: python scripts/bfcl/register_bfcl_model.py --model-id "$MODEL" || true
+        # Registration is best-effort because BFCL may already know the model;
+        # the resulting exact FC handler is mandatory and checked immediately.
+        run: |
+          set -euo pipefail
+          python scripts/bfcl/register_bfcl_model.py --model-id "$MODEL" || true
+          python - <<'PY'
+          import os
+          from bfcl_eval.constants.model_config import MODEL_CONFIG_MAPPING
+
+          handler = os.environ["BFCL_MODEL_FC"]
+          if handler not in MODEL_CONFIG_MAPPING:
+              raise SystemExit(
+                  f"::error::{handler} is not registered in BFCL; generation would score nothing"
+              )
+          print(f"{handler} registered")
+          PY
       - name: Stage model weights
         # Skip if pre-staged locally at <cache>/<id> (e.g. blackwell NVMe); else
         # download just this leg's model (not the whole GPU tier, which pulls
@@ -282,6 +336,9 @@ jobs:
           BFCL_VLLM_REASONING_PARSER: ${{ github.event.inputs.reasoning_parser || matrix.vllm_reason }}
           BFCL_SMG_REASONING_PARSER: ${{ github.event.inputs.reasoning_parser || matrix.smg_reason }}
           BFCL_VLLM_EXTRA: ${{ matrix.vllm_extra }}
+          BFCL_SGLANG_EXTRA: ${{ matrix.sglang_extra }}
+          BFCL_ARM_B_WORKER: ${{ matrix.arm_b_worker }}
+          SGLANG_PYTHON: python
           BFCL_TP: ${{ matrix.tp }}
           BFCL_MAX_MODEL_LEN: ${{ matrix.max_model_len }}
           BFCL_GPU_MEM_UTIL: ${{ matrix.gpu_mem }}
@@ -295,9 +352,9 @@ jobs:
           BFCL_RUN_DIR: ${{ runner.temp }}/bfcl_run
         run: |
           set -euo pipefail
-          # Serialize the heavy launch->serve->teardown phase PER HOST. Multiple
-          # Blackwell runner agents share one bare-metal machine (host network +
-          # the same 8 GPUs), so two legs at once collide: on ports (free_port
+          # Serialize the heavy launch->serve->teardown phase PER HOST. Runner
+          # agents share one bare-metal machine (host network + GPUs), so two
+          # benchmark legs at once collide: on ports (free_port
           # picks a port, frees it, then vLLM binds it ~40s later — another leg
           # grabs it meanwhile) and on GPU memory. A host-wide flock runs them one
           # at a time; the lock releases when this step's shell exits.
@@ -308,7 +365,11 @@ jobs:
           # future bfcl jobs on this host. With 9>&-, only this step shell holds the
           # lock and it always releases on step exit. `-w` bounds the wait so a stuck
           # lock fails loudly instead of hanging to the job timeout.
-          exec 9>/tmp/bfcl-host.lock
+          # ROUTER_LOCAL_MODEL_PATH is a host-mounted cache shared by runner pods.
+          # BFCL and tau2 deliberately use one lock so their manual runs cannot
+          # overlap on the same host. /tmp is pod-local and cannot serialize them.
+          mkdir -p "$ROUTER_LOCAL_MODEL_PATH/.locks"
+          exec 9>"$ROUTER_LOCAL_MODEL_PATH/.locks/smg-benchmark-host.lock"
           echo "waiting for host lock..."
           flock -w 9000 9 || { echo "::error::host lock not acquired within 9000s"; exit 1; }
           echo "acquired host lock"
@@ -343,7 +404,40 @@ jobs:
                  AB_RC=$rc ;;
             esac
           }
-          if [ "$ARM_MODE" = sequential ]; then
+          if [ "$ARM_MODE" = smg_only ]; then
+            # The pinned vLLM cannot serve this checkpoint, so score the same SMG
+            # candidate path in isolation and publish absolute official BFCL
+            # scores. --report-arm applies the normal completeness gate without
+            # inventing a baseline or a frontend-parity claim.
+            B_URL=$(BFCL_GPU="$GPU_B" bash scripts/bfcl/launch_arm.sh b 9>&-)
+            echo "single arm (smg): $B_URL"
+            SCORE_RC=0
+            python scripts/bfcl/run_ab.py --score-arm "smg=$B_URL" \
+              --scores-out "$ROOT/scores_smg.json" \
+              --bfcl-model "$BFCL_MODEL_FC" --categories "$CATEGORIES" \
+              --bfcl "$BFCL" --project-root "$ROOT" --run-timeout "$RUN_TIMEOUT" \
+              || SCORE_RC=$?
+            bash scripts/bfcl/launch_arm.sh stop 9>&- || true
+            if [ "$SCORE_RC" -ne 0 ]; then
+              echo "::error::BFCL single-arm scoring exited $SCORE_RC"
+              AB_RC=2
+            fi
+            if [ -f "$ROOT/scores_smg.json" ]; then
+              REPORT_RC=0
+              python scripts/bfcl/run_ab.py --report-arm "$ROOT/scores_smg.json" \
+                --categories "$CATEGORIES" \
+                --out "$RUNNER_TEMP/bfcl_ab.md" \
+                --json-out "$RUNNER_TEMP/bfcl_ab.json" \
+                || REPORT_RC=$?
+              if [ "$REPORT_RC" -ne 0 ]; then
+                echo "::error::BFCL single-arm report failed (exit $REPORT_RC)"
+                AB_RC=2
+              fi
+            else
+              echo "BFCL single-arm scoring produced no score artifact." > "$RUNNER_TEMP/bfcl_ab.md"
+              AB_RC=2
+            fi
+          elif [ "$ARM_MODE" = sequential ]; then
             # Whole node per arm (TP=8), one at a time: each model needs all 8 GPUs
             # for enough KV cache at the larger max_model_len. Score arm A, tear it
             # down to free the GPUs, score arm B, then diff the two saved results.
@@ -391,7 +485,11 @@ jobs:
         if: always()
         run: |
           {
-            echo "## BFCL A/B — ${{ matrix.name }} (${{ matrix.model }})"
+            if [ "${{ matrix.arm_mode }}" = smg_only ]; then
+              echo "## BFCL — ${{ matrix.name }} (${{ matrix.model }}, SMG-only)"
+            else
+              echo "## BFCL A/B — ${{ matrix.name }} (${{ matrix.model }})"
+            fi
             cat "$RUNNER_TEMP/bfcl_ab.md"
           } >> "$GITHUB_STEP_SUMMARY" || echo "no report produced for ${{ matrix.name }}" >> "$GITHUB_STEP_SUMMARY"
       - name: Collect BFCL transcripts (both arms)
@@ -429,8 +527,8 @@ jobs:
             ${{ runner.temp }}/bfcl_transcripts.tgz
           if-no-files-found: warn
           retention-days: 30
-      - name: Upload arm logs (failure only)
-        if: failure()
+      - name: Upload arm logs (failure or SMG-only result)
+        if: ${{ always() && (failure() || matrix.arm_mode == 'smg_only') }}
         uses: actions/upload-artifact@v7
         with:
           name: bfcl-ab-${{ matrix.name }}-logs-${{ github.run_id }}
@@ -440,6 +538,8 @@ jobs:
           retention-days: 14
       - name: Teardown arms (leg-scoped backstop)
         if: always()
+        env:
+          BFCL_RUN_DIR: ${{ runner.temp }}/bfcl_run
         # Backstop to the in-step trap: kill THIS leg's process groups via its
         # pidfiles. NOT a node-wide GPU nuke — these hosts run other orgs' runner
         # agents, so killing by GPU occupancy would take down their jobs too.

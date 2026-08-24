@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run τ²-bench against two serving "arms" and diff pass^k. Track B (multi-turn).
+"""Run τ²-bench against serving arms and report pass^k. Track B (multi-turn).
 
 baseline = pure vLLM; candidate = SMG -> vLLM gRPC. Both expose an identical
 OpenAI /v1 endpoint; the official `tau2` CLI points --agent-llm at each arm and
@@ -7,8 +7,11 @@ OpenAI /v1 endpoint; the official `tau2` CLI points --agent-llm at each arm and
 frontend (tokenization + tool/reasoning parsing). Arms must already be serving
 (see launch_arms.sh); this driver does not launch them.
 
+The normal mode compares two arms. ``--report-arm`` renders absolute scores for
+a saved single arm when the serving engine has no comparable pure-vLLM path.
+
 Exit codes: 0 clean, 1 score regression beyond --tolerance, 2 an arm did not
-finish (timed out or scored nothing), so there is nothing to compare.
+finish (timed out, missed a domain, or produced zero simulations).
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ class Arm:
     base_url: str
     scores: dict[str, dict[str, float]] = field(default_factory=dict)
     timed_out: list[str] = field(default_factory=list)  # domains killed by --run-timeout
+    failed: dict[str, str] = field(default_factory=dict)  # domains with partial/failed tau2 runs
 
 
 def passk(num_success: int, num_trials: int, k: int) -> float:
@@ -73,6 +77,25 @@ def domain_scores(results: list[dict], k: int) -> dict[str, float]:
     per_task = [passk(sum(1 for x in xs if x >= 1.0), len(xs), k) for xs in by_task.values()]
     passk_val = sum(per_task) / len(per_task) if per_task else 0.0
     return {"pass1": pass1, "passk": passk_val, "n_tasks": len(by_task), "n_sims": len(all_rewards)}
+
+
+def result_cardinality_issue(results: list[dict], *, num_trials: int, num_tasks: int) -> str | None:
+    """Why a tau2 result set is partial, or None when requested cardinality completed."""
+    counts: dict[str, int] = {}
+    for result in results:
+        task_id = result["task_id"]
+        counts[task_id] = counts.get(task_id, 0) + 1
+
+    if num_tasks > 0 and len(counts) != num_tasks:
+        return f"expected {num_tasks} tasks, found {len(counts)}"
+
+    wrong_trials = sorted(task_id for task_id, count in counts.items() if count != num_trials)
+    if wrong_trials:
+        shown = ", ".join(wrong_trials[:8])
+        if len(wrong_trials) > 8:
+            shown += f", +{len(wrong_trials) - 8} more"
+        return f"expected {num_trials} trials per task; incomplete: {shown}"
+    return None
 
 
 def run_tau2(
@@ -154,31 +177,47 @@ def run_tau2(
         )
         arm.timed_out.append(domain)
         return
+    failure_reasons = []
     if proc.returncode != 0:
-        print(f"WARNING: [{arm.name}/{domain}] exited {proc.returncode}", file=sys.stderr)
+        reason = f"tau2 exited {proc.returncode}"
+        failure_reasons.append(reason)
+        print(f"WARNING: [{arm.name}/{domain}] {reason}", file=sys.stderr)
     results_json = data_dir / "simulations" / save_to / "results.json"
     try:
-        arm.scores[domain] = domain_scores(
-            load_results(json.loads(results_json.read_text())), k=num_trials
-        )
+        results = load_results(json.loads(results_json.read_text()))
+        arm.scores[domain] = domain_scores(results, k=num_trials)
+        if issue := result_cardinality_issue(results, num_trials=num_trials, num_tasks=num_tasks):
+            failure_reasons.append(issue)
+            print(f"WARNING: [{arm.name}/{domain}] {issue}", file=sys.stderr)
     except (FileNotFoundError, KeyError, ValueError) as e:
         # tau2 may have died before writing results (OOM, engine death, API auth).
         # Skip this domain rather than aborting — build_report renders "—" for a
         # missing domain, so one failure doesn't discard the rest of the run.
         print(f"WARNING: [{arm.name}/{domain}] no usable results ({e})", file=sys.stderr)
+    if failure_reasons:
+        arm.failed[domain] = "; ".join(failure_reasons)
 
 
 def incompleteness(arm: Arm, domains: list[str]) -> str | None:
     """Why this arm can't be compared (timed out / unscored domains), else None."""
     missing = [d for d in domains if d not in arm.scores]
-    if not missing and not arm.timed_out:
+    zero_sims = [d for d in domains if d in arm.scores and (arm.scores[d].get("n_sims") or 0) <= 0]
+    failed = {d: arm.failed[d] for d in domains if d in arm.failed}
+    if not missing and not zero_sims and not arm.timed_out and not failed:
         return None
-    reason = f"no score for {len(missing)}/{len(domains)} domains"
-    if arm.timed_out:
-        reason += f"; timed out: {', '.join(arm.timed_out)}"
+    reasons = []
     if missing:
-        reason += f"; unscored: {', '.join(missing)}"
-    return reason
+        reasons.append(f"no score for {len(missing)}/{len(domains)} domains: {', '.join(missing)}")
+    if arm.timed_out:
+        reasons.append(f"timed out: {', '.join(arm.timed_out)}")
+    if failed:
+        reasons.append(
+            "failed/partial: "
+            + ", ".join(f"{domain} ({reason})" for domain, reason in failed.items())
+        )
+    if zero_sims:
+        reasons.append(f"zero simulations: {', '.join(zero_sims)}")
+    return "; ".join(reasons)
 
 
 def build_report(baseline: Arm, candidate: Arm, domains: list[str], k: int):
@@ -280,15 +319,91 @@ def build_report(baseline: Arm, candidate: Arm, domains: list[str], k: int):
             "name": baseline.name,
             "scores": baseline.scores,
             "timed_out": baseline.timed_out,
+            "failed": baseline.failed,
         },
         "candidate": {
             "name": candidate.name,
             "scores": candidate.scores,
             "timed_out": candidate.timed_out,
+            "failed": candidate.failed,
         },
         "incomplete": incomplete,
         "per_domain": rows,
         "overall": overall_out,
+    }
+    return "\n".join(lines), payload
+
+
+def build_single_report(arm: Arm, domains: list[str], k: int) -> tuple[str, dict]:
+    """Build an absolute τ² report for one arm with no comparable baseline."""
+
+    def cell(value):
+        return "—" if value is None else f"{value * 100:.2f}"
+
+    rows = []
+    for domain in domains:
+        score = arm.scores.get(domain, {})
+        rows.append(
+            {
+                "domain": domain,
+                "n_tasks": score.get("n_tasks"),
+                "n_sims": score.get("n_sims"),
+                "pass1": score.get("pass1"),
+                "passk": score.get("passk"),
+            }
+        )
+
+    def mean(metric):
+        values = [row[metric] for row in rows if row[metric] is not None]
+        return sum(values) / len(values) if values else None
+
+    overall = {
+        "pass1": mean("pass1"),
+        "passk": mean("passk"),
+        "n_tasks": sum(row["n_tasks"] or 0 for row in rows),
+        "n_sims": sum(row["n_sims"] or 0 for row in rows),
+    }
+    metrics = ["pass1"] if k == 1 else ["pass1", "passk"]
+    labels = {"pass1": "pass^1", "passk": f"pass^{k}"}
+    header = " | ".join(labels[metric] for metric in metrics)
+    lines = [
+        f"# τ²-bench — {arm.name} (single arm)",
+        "",
+        f"| domain | tasks | simulations | {header} |",
+        "|---|---:|---:|" + "---:|" * len(metrics),
+    ]
+    for row in rows:
+        tasks = row["n_tasks"] if row["n_tasks"] is not None else "—"
+        sims = row["n_sims"] if row["n_sims"] is not None else "—"
+        values = " | ".join(cell(row[metric]) for metric in metrics)
+        lines.append(f"| {row['domain']} | {tasks} | {sims} | {values} |")
+    overall_values = " | ".join(f"**{cell(overall[metric])}**" for metric in metrics)
+    lines.extend(
+        [
+            f"| **overall** | **{overall['n_tasks']}** | **{overall['n_sims']}** | {overall_values} |",
+            "",
+        ]
+    )
+    incomplete = incompleteness(arm, domains)
+    if incomplete:
+        lines.extend([f"> ⚠️ **Incomplete arm `{arm.name}`** — {incomplete}.", ""])
+    lines.append(
+        "_Absolute τ²-bench scores with the configured fixed user simulator. This "
+        "is a single-arm run because the comparison engine cannot serve this "
+        "checkpoint; no frontend parity claim or A/B delta is implied._"
+    )
+    payload = {
+        "mode": "single_arm",
+        "arm": {
+            "name": arm.name,
+            "base_url": arm.base_url,
+            "scores": arm.scores,
+            "timed_out": arm.timed_out,
+            "failed": arm.failed,
+        },
+        "incomplete": incomplete,
+        "per_domain": rows,
+        "overall": overall,
     }
     return "\n".join(lines), payload
 
@@ -338,6 +453,7 @@ def save_scores(arm: Arm, path: Path) -> None:
                 "base_url": arm.base_url,
                 "scores": arm.scores,
                 "timed_out": arm.timed_out,
+                "failed": arm.failed,
             },
             indent=2,
         )
@@ -354,6 +470,7 @@ def load_scores(path: Path) -> Arm:
         base_url=data.get("base_url", ""),
         scores=data["scores"],
         timed_out=data.get("timed_out", []),
+        failed=data.get("failed", {}),
     )
 
 
@@ -386,6 +503,23 @@ def write_report_and_gate(
     return exit_code
 
 
+def write_single_report_and_gate(
+    arm: Arm, domains: list[str], k: int, args: argparse.Namespace
+) -> int:
+    """Emit one arm's absolute report and reject incomplete benchmark output."""
+    report_md, payload = build_single_report(arm, domains, k)
+    print("\n" + report_md)
+    if args.out:
+        args.out.write_text(report_md + "\n", encoding="utf-8")
+    if args.json_out:
+        args.json_out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    if payload["incomplete"] and not args.allow_incomplete:
+        print(f"\nINCOMPLETE: arm {arm.name} — {payload['incomplete']}", file=sys.stderr)
+        return EXIT_INCOMPLETE
+    return EXIT_OK
+
+
 def _parse_arm(spec: str) -> Arm:
     name, url = spec.split("=", 1)
     return Arm(name=name, base_url=url)
@@ -400,6 +534,11 @@ def main() -> int:
     # then later diff the two saved score files.
     p.add_argument("--score-arm", help="name=base_url of the single live arm to score")
     p.add_argument("--scores-out", type=Path, help="write this arm's per-domain scores JSON here")
+    p.add_argument(
+        "--report-arm",
+        type=Path,
+        help="render and gate one saved arm's absolute scores (from --scores-out)",
+    )
     p.add_argument("--diff-baseline", type=Path, help="baseline scores JSON (from --scores-out)")
     p.add_argument("--diff-candidate", type=Path, help="candidate scores JSON (from --scores-out)")
     p.add_argument("--domains", default="retail,airline,telecom")
@@ -446,6 +585,12 @@ def main() -> int:
     args = p.parse_args()
 
     domains = [d.strip() for d in args.domains.split(",") if d.strip()]
+
+    # Mode: report one previously-scored arm when no comparable baseline exists.
+    if args.report_arm:
+        return write_single_report_and_gate(
+            load_scores(args.report_arm), domains, args.num_trials, args
+        )
 
     # Mode: diff two previously-saved score files (sequential mode, final step).
     if args.diff_baseline or args.diff_candidate:

@@ -1,3 +1,4 @@
+import argparse
 import importlib.util
 import json
 import sys
@@ -185,13 +186,220 @@ def test_run_tau2_survives_domain_timeout(monkeypatch, tmp_path):
     assert "airline" not in arm.scores
 
 
+def _write_tau2_results(tmp_path, arm_name, domain, simulations):
+    path = tmp_path / "simulations" / f"ab_{arm_name}_{domain}" / "results.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"simulations": simulations}), encoding="utf-8")
+
+
+def _simulation(task_id, reward=1.0):
+    return {"task_id": task_id, "reward_info": {"reward": reward}}
+
+
+def test_run_tau2_marks_a_nonzero_partial_run_incomplete(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        run_ab.subprocess,
+        "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(returncode=7),
+    )
+    _write_tau2_results(tmp_path, "smg", "retail", [_simulation("task-1")])
+    arm = run_ab.Arm(name="smg", base_url="http://x:1")
+
+    _run_tau2(arm, tmp_path, domain="retail", num_trials=1, num_tasks=1)
+
+    assert arm.scores["retail"]["n_sims"] == 1
+    assert "exited 7" in arm.failed["retail"]
+    assert "exited 7" in (run_ab.incompleteness(arm, ["retail"]) or "")
+
+
+def test_run_tau2_rejects_missing_trials_even_after_zero_exit(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        run_ab.subprocess,
+        "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(returncode=0),
+    )
+    _write_tau2_results(
+        tmp_path,
+        "smg",
+        "retail",
+        [_simulation("task-1"), _simulation("task-2")],
+    )
+    arm = run_ab.Arm(name="smg", base_url="http://x:1")
+
+    _run_tau2(arm, tmp_path, domain="retail", num_trials=2, num_tasks=2)
+
+    assert "expected 2 trials per task" in arm.failed["retail"]
+    assert run_ab.incompleteness(arm, ["retail"]) is not None
+
+
+def test_run_tau2_rejects_missing_requested_tasks(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        run_ab.subprocess,
+        "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(returncode=0),
+    )
+    _write_tau2_results(
+        tmp_path,
+        "smg",
+        "retail",
+        [_simulation("task-1"), _simulation("task-1")],
+    )
+    arm = run_ab.Arm(name="smg", base_url="http://x:1")
+
+    _run_tau2(arm, tmp_path, domain="retail", num_trials=2, num_tasks=2)
+
+    assert "expected 2 tasks" in arm.failed["retail"]
+
+
+def test_run_tau2_accepts_the_requested_task_trial_cardinality(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        run_ab.subprocess,
+        "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(returncode=0),
+    )
+    _write_tau2_results(
+        tmp_path,
+        "smg",
+        "retail",
+        [
+            _simulation("task-1"),
+            _simulation("task-1", 0.0),
+            _simulation("task-2"),
+            _simulation("task-2", 0.0),
+        ],
+    )
+    arm = run_ab.Arm(name="smg", base_url="http://x:1")
+
+    _run_tau2(arm, tmp_path, domain="retail", num_trials=2, num_tasks=2)
+
+    assert arm.failed == {}
+    assert run_ab.incompleteness(arm, ["retail"]) is None
+
+
 def test_save_load_scores_roundtrip(tmp_path):
     # Sequential mode persists one arm's per-domain scores, then --diff reloads them.
     arm = run_ab.Arm(
-        name="vllm", base_url="http://x:1", scores={"retail": {"pass1": 0.7, "passk": 0.5}}
+        name="vllm",
+        base_url="http://x:1",
+        scores={"retail": {"pass1": 0.7, "passk": 0.5}},
+        failed={"airline": "tau2 exited 7"},
     )
     path = tmp_path / "vllm.json"
     run_ab.save_scores(arm, path)
     back = run_ab.load_scores(path)
     assert back.name == "vllm"
     assert back.scores == {"retail": {"pass1": 0.7, "passk": 0.5}}
+    assert back.failed == {"airline": "tau2 exited 7"}
+
+
+def _report_args(tmp_path, *, allow_incomplete=False):
+    return argparse.Namespace(
+        out=tmp_path / "report.md",
+        json_out=tmp_path / "report.json",
+        allow_incomplete=allow_incomplete,
+        tolerance=0.02,
+    )
+
+
+def test_single_arm_report_contains_absolute_scores_and_counts():
+    arm = run_ab.Arm(
+        name="smg",
+        base_url="http://localhost:8000",
+        scores={
+            "retail": {
+                "pass1": 0.75,
+                "passk": 0.5,
+                "n_tasks": 4,
+                "n_sims": 8,
+            }
+        },
+    )
+
+    markdown, payload = run_ab.build_single_report(arm, ["retail"], k=2)
+
+    assert "single arm" in markdown.lower()
+    assert "| retail | 4 | 8 | 75.00 | 50.00 |" in markdown
+    assert payload["mode"] == "single_arm"
+    assert payload["overall"]["passk"] == 0.5
+    assert payload["incomplete"] is None
+
+
+def test_single_arm_gate_rejects_a_domain_with_no_simulations(tmp_path):
+    arm = run_ab.Arm(
+        name="smg",
+        base_url="http://localhost:8000",
+        scores={
+            "retail": {
+                "pass1": 0.0,
+                "passk": 0.0,
+                "n_tasks": 0,
+                "n_sims": 0,
+            }
+        },
+    )
+
+    rc = run_ab.write_single_report_and_gate(arm, ["retail"], 2, _report_args(tmp_path))
+
+    assert rc == run_ab.EXIT_INCOMPLETE
+    assert "zero simulations" in (run_ab.incompleteness(arm, ["retail"]) or "")
+
+
+def test_single_arm_gate_accepts_zero_pass_rate_with_real_simulations(tmp_path):
+    arm = run_ab.Arm(
+        name="smg",
+        base_url="http://localhost:8000",
+        scores={
+            "retail": {
+                "pass1": 0.0,
+                "passk": 0.0,
+                "n_tasks": 3,
+                "n_sims": 6,
+            }
+        },
+    )
+
+    rc = run_ab.write_single_report_and_gate(arm, ["retail"], 2, _report_args(tmp_path))
+
+    assert rc == run_ab.EXIT_OK
+
+
+def test_report_arm_cli_loads_saved_scores(monkeypatch, tmp_path):
+    scores = tmp_path / "scores.json"
+    run_ab.save_scores(
+        run_ab.Arm(
+            name="smg",
+            base_url="http://localhost:8000",
+            scores={
+                "retail": {
+                    "pass1": 0.25,
+                    "passk": 0.125,
+                    "n_tasks": 4,
+                    "n_sims": 8,
+                }
+            },
+        ),
+        scores,
+    )
+    report = tmp_path / "single.md"
+    payload = tmp_path / "single.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(SPEC.origin),
+            "--report-arm",
+            str(scores),
+            "--domains",
+            "retail",
+            "--num-trials",
+            "2",
+            "--out",
+            str(report),
+            "--json-out",
+            str(payload),
+        ],
+    )
+
+    assert run_ab.main() == run_ab.EXIT_OK
+    assert "12.50" in report.read_text(encoding="utf-8")
+    assert payload.is_file()
