@@ -289,6 +289,17 @@ impl McpConnectionPool {
             },
         }
     }
+
+    /// Look up a connection by URL when exactly one pooled identity matches.
+    #[deprecated(
+        note = "use get() with a full PoolKey; URL-only lookup fails closed when ambiguous"
+    )]
+    pub fn get_by_url(&self, url: &str) -> Option<Arc<McpClient>> {
+        match self.get_unique_by_url(url) {
+            UrlLookup::Found(client) => Some(client),
+            UrlLookup::NotFound | UrlLookup::Ambiguous => None,
+        }
+    }
 }
 
 impl Default for McpConnectionPool {
@@ -538,6 +549,13 @@ mod tests {
             pool.get_unique_by_url("http://localhost:3000"),
             UrlLookup::NotFound
         ));
+    }
+
+    #[test]
+    #[expect(deprecated, reason = "verifies the source-compatibility wrapper")]
+    fn deprecated_get_by_url_fails_closed_on_empty_pool() {
+        let pool = McpConnectionPool::new();
+        assert!(pool.get_by_url("http://localhost:3000").is_none());
     }
 
     #[test]
