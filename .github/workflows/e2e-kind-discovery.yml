@@ -1,13 +1,15 @@
 name: E2E Kind Discovery
 
-# Manual-only while runner Docker support (dind on the k8s runner pool) is
-# unconfirmed; GitHub-hosted ubuntu-latest works out of the box. Builds smg
-# in-job: pr-test-rust publishes no server binary artifact (and its
-# artifacts expire after a day), and its self-hosted runner image is not
-# glibc-matched to ubuntu-latest — sccache keeps rebuilds cheap instead.
-# Once dind on k8s-runner-cpu is confirmed, set the runner input and
-# artifact reuse becomes safe.
+# Run automatically for service-discovery code and test-infrastructure
+# changes. GitHub-hosted ubuntu-latest provides Docker for the kind node;
+# manual dispatch keeps the runner selectable for ad-hoc validation.
 on:
+  pull_request:
+    paths:
+      - model_gateway/src/service_discovery.rs
+      - model_gateway/tests/k8s_discovery_test.rs
+      - e2e_test/kind_discovery/**
+      - .github/workflows/e2e-kind-discovery.yml
   workflow_dispatch:
     inputs:
       runner:
