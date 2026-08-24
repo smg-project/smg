@@ -473,6 +473,8 @@ async fn watch_interruption_relists_and_converges() {
 
 #[tokio::test]
 async fn drain_window_is_honored_despite_reconcile_passes() {
+    use openai_protocol::worker::WorkerStatus;
+
     let fake = FakeK8s::start().await;
     let app_context = test_context_with_drain(2).await;
     let (_engine, port) = start_mock_engine().await;
@@ -500,7 +502,6 @@ async fn drain_window_is_honored_despite_reconcile_passes() {
 
     // The drain path only settles Ready workers; promote if the registration
     // left it in another state (no health-check loop runs in tests).
-    use openai_protocol::worker::WorkerStatus;
     let registry = &app_context.worker_registry;
     let worker = registry
         .get_all()
@@ -517,10 +518,16 @@ async fn drain_window_is_honored_despite_reconcile_passes() {
         "worker must be Ready to exercise the drain path"
     );
 
-    // The 300ms check_interval guarantees several reconcile passes during
-    // the 2s drain; none of them may cut it short. Anchor on the observed
-    // Draining transition so discovery latency doesn't pad the measurement.
-    fake.delete_pod("drain-0");
+    // Ready=False must enter the same drain workflow as deletion. The 300ms
+    // check interval guarantees several reconcile passes during the 2s drain;
+    // none may cut it short. Anchor on the observed Draining transition so
+    // discovery latency does not pad the measurement.
+    fake.apply_pod(worker_pod(
+        "drain-0",
+        "uid-drain-0",
+        &port.to_string(),
+        false,
+    ));
     let url = worker.url().to_string();
     let drain_started = {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -551,6 +558,10 @@ async fn drain_window_is_honored_despite_reconcile_passes() {
         drained_for >= Duration::from_millis(1800),
         "drain window collapsed: worker removed {drained_for:?} after draining began (settle is 2s)"
     );
+    assert!(
+        fake.state.pods.lock().unwrap().contains_key("drain-0"),
+        "Ready=False must drain workers while the Pod still exists"
+    );
 
     handle.abort();
 }
@@ -561,6 +572,33 @@ async fn wait_for_pod_uid(app_context: &AppContext, port: u16, uid: &str, what: 
     loop {
         let found = app_context.worker_registry.get_all().into_iter().any(|w| {
             w.url().ends_with(&format!(":{port}"))
+                && w.metadata()
+                    .spec
+                    .labels
+                    .get(POD_UID_LABEL)
+                    .map(String::as_str)
+                    == Some(uid)
+        });
+        if found {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}; registry: {:?}",
+            app_context.worker_registry.get_all_urls()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_ready_pod_uid(app_context: &AppContext, port: u16, uid: &str, what: &str) {
+    use openai_protocol::worker::WorkerStatus;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let found = app_context.worker_registry.get_all().into_iter().any(|w| {
+            w.url().ends_with(&format!(":{port}"))
+                && w.status() == WorkerStatus::Ready
                 && w.metadata()
                     .spec
                     .labels
@@ -656,6 +694,81 @@ async fn pod_added_after_start_registers_only_once_ready() {
         "worker registered after pod became Ready",
         Duration::from_secs(15),
         |urls| has_url(urls, port),
+    )
+    .await;
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn ready_pod_becoming_unready_removes_all_workers_and_recovers() {
+    let fake = FakeK8s::start().await;
+    let app_context = test_context().await;
+    let (_engine_a, port_a) = start_mock_engine().await;
+    let (_engine_b, port_b) = start_mock_engine().await;
+    let ports = format!("{port_a},{port_b}");
+
+    fake.apply_pod(worker_pod("ready-flip-0", "uid-ready-flip-0", &ports, true));
+    let handle = start_service_discovery_with_client(
+        fake.client(),
+        discovery_config(),
+        Arc::clone(&app_context),
+        None,
+        None,
+    );
+    wait_for_ready_pod_uid(
+        &app_context,
+        port_a,
+        "uid-ready-flip-0",
+        "first worker routable before readiness change",
+    )
+    .await;
+    wait_for_ready_pod_uid(
+        &app_context,
+        port_b,
+        "uid-ready-flip-0",
+        "second worker routable before readiness change",
+    )
+    .await;
+
+    fake.apply_pod(worker_pod(
+        "ready-flip-0",
+        "uid-ready-flip-0",
+        &ports,
+        false,
+    ));
+    wait_for(
+        &app_context,
+        "all workers removed while pod remains unready",
+        Duration::from_secs(15),
+        |urls| !has_url(urls, port_a) && !has_url(urls, port_b),
+    )
+    .await;
+    assert!(
+        fake.state.pods.lock().unwrap().contains_key("ready-flip-0"),
+        "unready pod should still exist after its workers are removed"
+    );
+
+    fake.apply_pod(worker_pod("ready-flip-0", "uid-ready-flip-0", &ports, true));
+    wait_for(
+        &app_context,
+        "all workers re-registered after readiness recovery",
+        Duration::from_secs(15),
+        |urls| has_url(urls, port_a) && has_url(urls, port_b),
+    )
+    .await;
+    wait_for_ready_pod_uid(
+        &app_context,
+        port_a,
+        "uid-ready-flip-0",
+        "first recovered worker routable",
+    )
+    .await;
+    wait_for_ready_pod_uid(
+        &app_context,
+        port_b,
+        "uid-ready-flip-0",
+        "second recovered worker routable",
     )
     .await;
 

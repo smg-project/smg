@@ -667,12 +667,11 @@ struct DesiredWorker {
 /// Desired view of the cluster derived from the store snapshot.
 #[derive(Debug, Default)]
 struct DesiredState {
-    /// Owning pod uid per worker URL, for all live, non-terminating pods
-    /// (any readiness). Registered workers whose URL is absent — or owned by
-    /// a different pod uid — are removed; unready pods keep their own
-    /// workers (the health checker owns readiness flaps).
+    /// Owning pod uid per worker URL for Ready, non-terminating Pods.
+    /// Registered workers whose URL is absent — or owned by a different Pod
+    /// uid — enter the existing drain/remove workflow.
     uid_by_url: HashMap<String, String>,
-    /// Workers on healthy pods — registration candidates.
+    /// Workers on Running, Ready Pods — registration candidates.
     addable: Vec<DesiredWorker>,
 }
 
@@ -703,6 +702,13 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
         let Some(info) = PodInfo::from_pod(pod, Some(config)) else {
             continue;
         };
+        // Pod readiness is Kubernetes' standard traffic-admission signal.
+        // Controllers can drive it through readiness gates; direct Pod-IP
+        // routing must honor the aggregate Ready condition just like a
+        // Service/EndpointSlice consumer would.
+        if !info.is_ready {
+            continue;
+        }
         for (index, port) in info.ports.iter().enumerate() {
             let url = format!("{}:{}", info.ip, port);
             if state.uid_by_url.contains_key(&url) {
@@ -892,7 +898,10 @@ async fn reconcile_workers(
     );
 
     for worker in removals {
-        info!("Removing worker {}: pod gone or terminating", worker.url);
+        info!(
+            "Removing worker {}: pod unready, gone, terminating, or replaced",
+            worker.url
+        );
         let job = Job::RemoveWorker {
             url: worker.url.clone(),
             expected_revision: Some(worker.revision),
@@ -1624,9 +1633,9 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_desired_state_unready_pod_present_but_not_addable() {
+    fn test_compute_desired_state_unready_pod_excluded() {
         let config = make_regular_config();
-        let mut pod = make_labeled_pod("w", "10.0.0.1", &[("app", "sglang")]);
+        let mut pod = pod_with_annotations("w", &[("smg.ai/worker-ports", "8080,8081")]);
         if let Some(status) = pod.status.as_mut() {
             status.conditions = Some(vec![PodCondition {
                 type_: "Ready".to_string(),
@@ -1639,7 +1648,27 @@ mod tests {
             }]);
         }
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
-        assert!(desired.uid_by_url.contains_key("10.0.0.1:8000"));
+        assert!(desired.uid_by_url.is_empty());
+        assert!(desired.addable.is_empty());
+    }
+
+    #[test]
+    fn test_compute_desired_state_unknown_readiness_excluded() {
+        let config = make_regular_config();
+        let mut pod = make_labeled_pod("w", "10.0.0.1", &[("app", "sglang")]);
+        if let Some(status) = pod.status.as_mut() {
+            status.conditions = Some(vec![PodCondition {
+                type_: "Ready".to_string(),
+                status: "Unknown".to_string(),
+                last_probe_time: None,
+                last_transition_time: None,
+                message: None,
+                reason: None,
+                observed_generation: None,
+            }]);
+        }
+        let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
+        assert!(desired.uid_by_url.is_empty());
         assert!(desired.addable.is_empty());
     }
 
@@ -1727,18 +1756,13 @@ mod tests {
         }
     }
 
-    fn desired_state_of(workers: &[DesiredWorker], present_only: &[(&str, &str)]) -> DesiredState {
+    fn desired_state_of(workers: &[DesiredWorker]) -> DesiredState {
         let mut state = DesiredState::default();
         for worker in workers {
             state
                 .uid_by_url
                 .insert(worker.url.clone(), worker.pod_uid.clone());
             state.addable.push(worker.clone());
-        }
-        for (url, uid) in present_only {
-            state
-                .uid_by_url
-                .insert((*url).to_string(), (*uid).to_string());
         }
         state
     }
@@ -1753,13 +1777,10 @@ mod tests {
 
     #[test]
     fn test_compute_actions_adds_missing_workers() {
-        let desired = desired_state_of(
-            &[
-                desired_worker("10.0.0.1:8080", "u1"),
-                desired_worker("10.0.0.1:8081", "u1"),
-            ],
-            &[],
-        );
+        let desired = desired_state_of(&[
+            desired_worker("10.0.0.1:8080", "u1"),
+            desired_worker("10.0.0.1:8081", "u1"),
+        ]);
         let actions = compute_actions(&desired, &[]);
         assert_eq!(actions.add.len(), 2);
         assert!(actions.remove.is_empty());
@@ -1767,7 +1788,7 @@ mod tests {
 
     #[test]
     fn test_compute_actions_noop_when_converged() {
-        let desired = desired_state_of(&[desired_worker("10.0.0.1:8080", "u1")], &[]);
+        let desired = desired_state_of(&[desired_worker("10.0.0.1:8080", "u1")]);
         let registered = [owned("10.0.0.1:8080", "u1")];
         let actions = compute_actions(&desired, &registered);
         assert!(actions.add.is_empty());
@@ -1776,7 +1797,7 @@ mod tests {
 
     #[test]
     fn test_compute_actions_removes_workers_for_gone_pods() {
-        let desired = desired_state_of(&[desired_worker("10.0.0.1:8080", "u1")], &[]);
+        let desired = desired_state_of(&[desired_worker("10.0.0.1:8080", "u1")]);
         let registered = [owned("10.0.0.1:8080", "u1"), owned("10.0.0.2:8080", "u2")];
         let actions = compute_actions(&desired, &registered);
         assert!(actions.add.is_empty());
@@ -1789,7 +1810,7 @@ mod tests {
         // Same-IP pod restart (hostNetwork / stable IP): URL unchanged but
         // uid differs → the stale worker is removed (covers a scheme-flipped
         // sibling the Upsert cannot replace) and the new one registered.
-        let desired = desired_state_of(&[desired_worker("10.0.0.1:8080", "uid-new")], &[]);
+        let desired = desired_state_of(&[desired_worker("10.0.0.1:8080", "uid-new")]);
         let registered = [owned("10.0.0.1:8080", "uid-old")];
         let actions = compute_actions(&desired, &registered);
         assert_eq!(actions.add.len(), 1);
@@ -1799,15 +1820,30 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_actions_removes_stale_worker_behind_unready_replacement() {
-        // Pod A was deleted; unready replacement B holds the same URL. A's
-        // worker must go now — B registers only once it turns healthy.
-        let desired = desired_state_of(&[], &[("10.0.0.1:8080", "uid-b")]);
-        let registered = [owned("10.0.0.1:8080", "uid-a")];
+    fn test_compute_actions_unready_pod_removes_registered_workers() {
+        let config = make_regular_config();
+        let mut pod = pod_with_annotations("w", &[("smg.ai/worker-ports", "8080,8081")]);
+        if let Some(status) = pod.status.as_mut() {
+            status.conditions = Some(vec![PodCondition {
+                type_: "Ready".to_string(),
+                status: "False".to_string(),
+                last_probe_time: None,
+                last_transition_time: None,
+                message: None,
+                reason: None,
+                observed_generation: None,
+            }]);
+        }
+        let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
+        let registered = [
+            owned("10.0.0.1:8080", "uid-w"),
+            owned("10.0.0.1:8081", "uid-w"),
+        ];
         let actions = compute_actions(&desired, &registered);
         assert!(actions.add.is_empty());
-        assert_eq!(actions.remove.len(), 1);
-        assert_eq!(actions.remove[0].pod_uid, "uid-a");
+        assert_eq!(actions.remove.len(), 2);
+        assert_eq!(actions.remove[0].pod_uid, "uid-w");
+        assert_eq!(actions.remove[1].pod_uid, "uid-w");
     }
 
     #[test]
@@ -1818,17 +1854,6 @@ mod tests {
         assert_eq!(actions.remove[0].url, "10.0.0.1:8080");
         assert_eq!(actions.remove[0].revision, 1);
         assert!(actions.add.is_empty());
-    }
-
-    #[test]
-    fn test_compute_actions_unready_pod_keeps_registered_worker() {
-        // URL present (pod exists, unready → not addable) and registered:
-        // neither added nor removed — the health checker owns readiness.
-        let desired = desired_state_of(&[], &[("10.0.0.1:8080", "u1")]);
-        let registered = [owned("10.0.0.1:8080", "u1")];
-        let actions = compute_actions(&desired, &registered);
-        assert!(actions.add.is_empty());
-        assert!(actions.remove.is_empty());
     }
 
     #[test]
