@@ -70,7 +70,7 @@ def _grpc_server_options(max_message_bytes: int) -> list[tuple[str, int]]:
         ("grpc.max_receive_message_length", max_message_bytes),
         # Long EPD requests can spend minutes without sending DATA frames while
         # the Rust client still sends HTTP/2 keepalive pings.
-        ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
+        ("grpc.http2.min_ping_interval_without_data_ms", 10000),
         ("grpc.http2.max_pings_without_data", 0),
         ("grpc.http2.max_ping_strikes", 0),
         ("grpc.keepalive_permit_without_calls", True),
