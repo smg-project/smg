@@ -39,6 +39,8 @@ jobs:
             path: crates/mcp
           - crate: smg-mm-rdma
             path: crates/mm_rdma
+          - crate: engine-zmq-client
+            path: crates/engine_zmq_client
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/publish-crate
