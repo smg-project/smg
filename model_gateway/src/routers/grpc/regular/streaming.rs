@@ -66,10 +66,12 @@ struct CompletionStreamOutcome {
     reasoning_tokens: u32,
     completion_tokens: u32,
     first_token_time: Option<Instant>,
-    /// Whether *every* expected `n>1` choice in this unit received a
-    /// `Complete` message (the only source of authoritative usage) -- a
-    /// clean EOF partway through leaves this `false` even if some choices
-    /// did complete, so a partial result is never mistaken for full usage.
+    /// Whether *every* expected `n>1` choice in this unit reached a terminal
+    /// state with authoritative usage: a `Complete` message, or a
+    /// router-matched string stop whose terminal chunk carries the prompt
+    /// count. A clean EOF partway through leaves this `false` even if some
+    /// choices did complete, so a partial result is never mistaken for full
+    /// usage.
     saw_complete: bool,
 }
 
@@ -1961,10 +1963,12 @@ impl StreamingProcessor {
         // Token tracking
         let mut completion_tokens = CompletionTokenTracker::new();
         let mut prompt_tokens: u32 = 0;
-        // Authoritative usage only ever arrives via a `Complete` message; a
-        // clean EOF without one leaves `prompt_tokens` at its 0 initializer,
-        // which is indistinguishable from a genuinely empty prompt -- track
-        // separately so settle can tell "no usage" from "zero tokens".
+        // Authoritative usage arrives via a `Complete` message, or — for a
+        // router-matched string stop — via the terminal chunk that triggers
+        // it; a clean EOF with neither leaves `prompt_tokens` at its 0
+        // initializer, which is indistinguishable from a genuinely empty
+        // prompt -- track separately so settle can tell "no usage" from
+        // "zero tokens".
         let mut saw_complete = false;
         let mut finish_reason_str = String::new();
         let mut matched_stop: Option<Value> = None;
@@ -2133,6 +2137,11 @@ impl StreamingProcessor {
                     let router_string_stop = should_stop && matched_stop.is_some();
                     if router_string_stop {
                         prompt_tokens = chunk.prompt_tokens();
+                        // The terminal chunk's prompt count stands in for the
+                        // Complete this request will never read; without this
+                        // the terminal usage emit reports no input tokens and
+                        // the reservation settles on the estimate.
+                        saw_complete = true;
                     }
 
                     if chunk_text.is_empty() {
@@ -3057,6 +3066,14 @@ impl StreamingProcessor {
                         stopped_indices.insert(index);
                         terminal_indices.insert(index);
                         has_router_stop |= matched_sequence;
+                        if matched_sequence {
+                            // No Complete will be read for a router-stopped
+                            // choice; count it as completed so this unit still
+                            // reports the terminal chunk's usage as
+                            // authoritative instead of settling on the
+                            // reserved estimate.
+                            completed_indices.insert(index);
+                        }
                         total_prompt = total_prompt.max(chunk.prompt_tokens());
                         total_cached = total_cached.max(chunk.cached_tokens());
                         reasoning_tokens.insert(index, chunk.reasoning_tokens());
@@ -3250,10 +3267,12 @@ impl StreamingProcessor {
             grpc_stream.mark_completed();
         }
 
-        // `completed_indices` counts distinct indices that finished cleanly
-        // via a `Complete` message. A clean EOF partway through this unit's
-        // `n>1` choices (some completed, others didn't) must not be treated
-        // as full usage.
+        // `completed_indices` counts distinct indices that reached a terminal
+        // state with authoritative usage: finished cleanly via a `Complete`
+        // message, or stopped on a router-matched string stop (whose terminal
+        // chunk carries the prompt count the skipped Complete would have).
+        // A clean EOF partway through this unit's `n>1` choices (some
+        // completed, others didn't) must not be treated as full usage.
         let expected_choices = completion_request.n.unwrap_or(1).max(1);
         let saw_complete = completed_indices.len() as u32 >= expected_choices;
 
