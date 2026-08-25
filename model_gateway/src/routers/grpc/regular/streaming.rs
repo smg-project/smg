@@ -2431,9 +2431,10 @@ impl StreamingProcessor {
             // still open: emitting text first would close the block and send
             // trailing InputJsonDelta inside a text block, which the
             // content-block contract forbids.
-            let terminal_items = finalized.calls.into_iter().chain(
-                parser.get_unstreamed_tool_args().into_iter().flatten(),
-            );
+            let terminal_items = finalized
+                .calls
+                .into_iter()
+                .chain(parser.get_unstreamed_tool_args().into_iter().flatten());
             for tool_call_item in terminal_items {
                 has_tool_calls = true;
 
