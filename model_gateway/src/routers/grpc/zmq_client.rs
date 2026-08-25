@@ -340,6 +340,7 @@ async fn ensure_ipc_socket_dir(base_url: &str) -> Result<(), String> {
 /// Remove a stale ipc socket file left by a previous gateway process, if any.
 /// Only ever unlinks sockets (never a regular file at the path), inside the
 /// owner-verified socket dir.
+#[cfg(unix)]
 async fn unlink_stale_socket(address: &str) -> Result<(), String> {
     let Some(path) = address.strip_prefix("ipc://") else {
         return Ok(());
@@ -383,8 +384,11 @@ pub(crate) async fn connect_for_worker(
     // The dir is verified owner-only above, and a live gateway can't leave
     // these behind (each worker URL is bound by at most one process), so any
     // existing socket file here is stale by construction.
-    unlink_stale_socket(&input).await?;
-    unlink_stale_socket(&output).await?;
+    #[cfg(unix)]
+    {
+        unlink_stale_socket(&input).await?;
+        unlink_stale_socket(&output).await?;
+    }
     // The engine can't stop at EOS on its own (it has no tokenizer or model
     // config); resolve the EOS ids from the local model dir so every request
     // carries them.
@@ -1628,6 +1632,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn unlink_stale_socket_removes_sockets_and_refuses_files() {
         use std::os::unix::net::UnixListener;
