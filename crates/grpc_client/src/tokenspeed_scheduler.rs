@@ -229,6 +229,9 @@ impl TokenSpeedSchedulerClient {
             // `kv_bootstrap_info` (P->D KV).
             encode_bootstrap_info: None,
             kv_bootstrap_info: None,
+            // Attention-DP pin injected later via
+            // ProtoGenerateRequest::set_data_parallel_rank, if applicable.
+            data_parallel_rank: None,
         })
     }
 

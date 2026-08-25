@@ -128,6 +128,12 @@ message GenerateRequest {
   // prefill and decode worker; they meet at (`bootstrap_host`, `bootstrap_port`)
   // keyed by `bootstrap_room`. Absent for aggregated (single-worker) requests.
   optional KvBootstrapInfo kv_bootstrap_info = 11;
+
+  // Hard-pin to a specific attention-DP rank, bypassing load balancing.
+  // Disaggregation engines ignore a conflicting pin — the bootstrap_room
+  // residue (room % dp_size) stays the authoritative rank carrier. Only
+  // forwarded when the engine advertises attention-DP support (dp_size label).
+  optional int32 data_parallel_rank = 12;
 }
 
 // EPD encode->prefill pairing handed to a prefill worker. Each multimodal item

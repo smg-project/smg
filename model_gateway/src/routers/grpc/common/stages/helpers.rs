@@ -513,7 +513,22 @@ pub(crate) fn maybe_inject_pd_rendezvous(
         let bootstrap_port = metadata.bootstrap_port().unwrap_or(DEFAULT_BOOTSTRAP_PORT);
         // 63-bit room: no dedup, keep the space wide so the birthday collision
         // rate stays negligible. See the proto field doc.
-        let room_id = rand::rng().random_range(0..i64::MAX);
+        //
+        // When the prefill worker is a dp-aware virtual worker, mint the room
+        // congruent to its rank: TokenSpeed disaggregation engines dispatch by
+        // `room % dp_size` (the pin field is ignored there), so the residue is
+        // the placement carrier. The low bits therefore carry structure — do
+        // not shard on them elsewhere. Under round_robin the decode side
+        // follows the same residue and deliberately inherits the prefill
+        // placement (decode prefix reuse shrinks the KV transfer).
+        let room_id = match (prefill.dp_rank(), prefill.dp_size()) {
+            (Some(rank), Some(dp)) if dp > 1 && rank < dp => {
+                let dp = dp as i64;
+                let base = rand::rng().random_range(0..i64::MAX - dp);
+                base - (base % dp) + rank as i64
+            }
+            _ => rand::rng().random_range(0..i64::MAX),
+        };
 
         request.set_kv_bootstrap_info(hostname.to_string(), bootstrap_port as i32, room_id);
 

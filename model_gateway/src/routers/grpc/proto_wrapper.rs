@@ -1388,7 +1388,8 @@ impl ProtoGenerateRequest {
         match self {
             Self::Vllm(req) => req.data_parallel_rank = Some(rank),
             Self::Sglang(req) => req.data_parallel_rank = rank,
-            Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {}
+            Self::TokenSpeed(req) => req.data_parallel_rank = Some(rank),
+            Self::Trtllm(_) | Self::Mlx(_) => {}
         }
     }
 
@@ -2433,6 +2434,13 @@ mod tests {
         assert!(matches!(
             &sglang_req,
             ProtoGenerateRequest::Sglang(req) if req.data_parallel_rank == 3
+        ));
+
+        let mut ts_req = ProtoGenerateRequest::TokenSpeed(Box::default());
+        ts_req.set_data_parallel_rank(5);
+        assert!(matches!(
+            &ts_req,
+            ProtoGenerateRequest::TokenSpeed(req) if req.data_parallel_rank == Some(5)
         ));
 
         // Engines without the proto field ignore the pin

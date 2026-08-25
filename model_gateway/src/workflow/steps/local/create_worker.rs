@@ -225,15 +225,18 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         let health_endpoint = &app_context.router_config.health_check.endpoint;
 
         let dp_ranks: Vec<Option<(usize, usize)>> = if app_context.router_config.dp_aware {
-            let dp_info = context
-                .data
-                .dp_info
-                .as_ref()
-                .ok_or_else(|| WorkflowError::ContextValueNotFound("dp_info".to_string()))?;
-            validate_zmq_dp(*connection_mode, dp_info.dp_size, &config.url)?;
-            (0..dp_info.dp_size)
-                .map(|r| Some((r, dp_info.dp_size)))
-                .collect()
+            // dp_info == None means the engine advertised no dp_size label
+            // (it cannot honor a rank pin): register a plain single worker
+            // instead of failing; discover_dp already logged the degradation.
+            match context.data.dp_info.as_ref() {
+                Some(dp_info) => {
+                    validate_zmq_dp(*connection_mode, dp_info.dp_size, &config.url)?;
+                    (0..dp_info.dp_size)
+                        .map(|r| Some((r, dp_info.dp_size)))
+                        .collect()
+                }
+                None => vec![None],
+            }
         } else {
             vec![None] // single worker, no DP
         };

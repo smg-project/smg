@@ -400,11 +400,17 @@ impl RequestExecutionStage {
         let mut prefill_request = proto_request;
         let mut decode_request = prefill_request.clone_without_mm_pixels();
         decode_request.clear_encode_bootstrap_info();
-        if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
-            prefill_request.set_data_parallel_rank(rank as i32);
-        }
-        if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
-            decode_request.set_data_parallel_rank(rank as i32);
+        // TokenSpeed disaggregation engines route both sides by
+        // `bootstrap_room % dp_size` (minted residue-aligned in
+        // maybe_inject_pd_rendezvous); a pin is ignored there, and a
+        // mismatched decode-leg pin would spam conflict warnings.
+        if workers.disaggregated_runtime_type().copied() != Some(RuntimeType::TokenSpeed) {
+            if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
+                prefill_request.set_data_parallel_rank(rank as i32);
+            }
+            if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
+                decode_request.set_data_parallel_rank(rank as i32);
+            }
         }
 
         // `generate` only establishes the prefill stream here (SMG does not drain

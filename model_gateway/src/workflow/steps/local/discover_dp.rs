@@ -116,12 +116,22 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
 
         let dp_info = match context.data.connection_mode {
             // gRPC workers report dp_size through GetServerInfo, already
-            // flattened into the discovered metadata labels
-            Some(ConnectionMode::Grpc) => dp_info_from_labels(&context.data.discovered_labels)
-                .map_err(|e| WorkflowError::StepFailed {
-                    step_id: StepId::new("discover_dp_info"),
-                    message: format!("Failed to get DP info for {}: {e}", config.url),
-                })?,
+            // flattened into the discovered metadata labels. A missing label
+            // means the engine cannot honor a rank pin — degrade to a plain
+            // single worker instead of failing registration under --dp-aware.
+            Some(ConnectionMode::Grpc) => {
+                match dp_info_from_labels(&context.data.discovered_labels) {
+                    Ok(info) => info,
+                    Err(e) => {
+                        warn!(
+                            "No DP info for {} ({e}); registering as a single \
+                         non-DP worker",
+                            config.url
+                        );
+                        return Ok(StepResult::Success);
+                    }
+                }
+            }
             // A ZMQ worker has no metadata endpoint to discover from: its DP
             // shape is the spec's own `dp_size` (a grouped worker awaiting N
             // engines on one socket set). Report it so create_worker can
