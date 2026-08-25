@@ -89,7 +89,7 @@ env:
 jobs:
   # Build the smg wheel once (CPU-only Rust/maturin compile — no GPU needed).
   build-wheel:
-    runs-on: k8s-runner-cpu
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
       contents: read
     steps:

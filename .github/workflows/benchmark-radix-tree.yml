@@ -39,7 +39,7 @@ jobs:
     # CPU-only criterion/throughput benchmarks of the kv-index radix tree —
     # no GPU needed, so it runs on the CPU runner pool rather than competing
     # for GPU runners.
-    runs-on: k8s-runner-cpu
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     steps:
       - uses: actions/checkout@v7
         with:

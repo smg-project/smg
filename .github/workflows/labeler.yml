@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   labeler:
-    runs-on: k8s-runner-cpu
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     steps:
       - name: Label PR based on changed files
         uses: actions/labeler@v7

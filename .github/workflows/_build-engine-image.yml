@@ -62,7 +62,7 @@ on:
 jobs:
   build-and-push:
     if: github.repository == 'smg-project/smg'
-    runs-on: ["cpu-e5"]
+    runs-on: ${{ vars.SMG_RUNNER_DOCKER || 'cpu-e5' }}
     steps:
       - name: Print inputs to summary
         env:

@@ -24,7 +24,7 @@ jobs:
   build-and-push:
     name: Build and push Docker image
     if: github.repository == 'smg-project/smg'
-    runs-on: ["cpu-e5"]
+    runs-on: ${{ vars.SMG_RUNNER_DOCKER || 'cpu-e5' }}
     permissions:
       contents: read
     steps:

@@ -70,7 +70,7 @@ jobs:
   # Build the smg wheel once (mirrors nightly-benchmark.yml build-wheel + cache).
   # CPU-only work (Rust/maturin compile) — no GPU needed, so don't occupy a GPU runner.
   build-wheel:
-    runs-on: k8s-runner-cpu
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
       contents: read
     steps:

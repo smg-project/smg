@@ -23,7 +23,7 @@ env:
 
 jobs:
   collect:
-    runs-on: k8s-runner-cpu
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 10
     permissions:
       actions: read
@@ -69,7 +69,7 @@ jobs:
   triage:
     needs: collect
     if: needs.collect.outputs.has_failures == 'true'
-    runs-on: k8s-runner-cpu
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 45
     permissions:
       contents: read

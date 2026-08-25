@@ -127,6 +127,35 @@ Agents are welcome and useful. Three ground rules:
 
 ---
 
+## Running CI on your own runners
+
+Every self-hosted `runs-on` label in `.github/workflows/` reads from a repository
+variable with the upstream label as its fallback, e.g.
+
+```yaml
+runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+```
+
+Upstream sets none of these variables, so CI keeps using the labels above with no
+change. A fork that runs CI on its own runners only has to set the variables it
+needs (**Settings → Secrets and variables → Actions → Variables**) — no workflow
+edits, so upstream syncs stay conflict-free.
+
+| Variable | Upstream fallback | Used for |
+| --- | --- | --- |
+| `SMG_RUNNER_CPU` | `k8s-runner-cpu` | lint, build, unit tests, summaries |
+| `SMG_RUNNER_DOCKER` | `cpu-e5` | docker / engine image build and push |
+| `SMG_RUNNER_GPU` | `k8s-runner-gpu` | GPU jobs with no fixed GPU count |
+| `SMG_RUNNER_GPU_1` | `1-gpu-h100` | 1-GPU e2e jobs |
+| `SMG_RUNNER_GPU_2` | `2-gpu-h100` | 2-GPU e2e jobs |
+| `SMG_RUNNER_GPU_4` | `4-gpu-h100` | 4-GPU e2e and benchmark jobs |
+| `SMG_RUNNER_GPU_8` | `8-gpu-h200` | 8-GPU benchmark jobs |
+
+GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
+fork already has those.
+
+---
+
 ## Reporting security issues
 
 Please do **not** open a public issue for security vulnerabilities. Contact the
