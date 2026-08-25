@@ -1193,18 +1193,58 @@ impl Tree {
     /// Used for mesh eviction propagation and worker removal — size-based
     /// eviction never fires for a tenant whose count no longer grows.
     pub fn remove_tenant_all(&self, tenant_id: &TenantId) {
+        let expected_chars = self.tenant_char_size(tenant_id);
+
         // collect_tenant_nodes skips root (root is never LRU-evicted),
         // but global removal must include it.
         self.remove_tenant_from_node(&self.root, tenant_id);
+        if expected_chars == 0 {
+            self.tenant_char_count.remove(tenant_id);
+            return;
+        }
 
         let mut nodes: Vec<(NodeRef, u64)> = Vec::new();
-        self.collect_tenant_nodes(&self.root, tenant_id, &mut nodes);
+        self.collect_tenant_nodes_pruned(&self.root, tenant_id, &mut nodes);
+
+        // Normal inserts attach a tenant to every ancestor, allowing the
+        // pruned walk above to skip unrelated subtrees. Older snapshots and
+        // targeted eviction may not preserve that prefix-closed invariant;
+        // the maintained byte count detects that shape and falls back to the
+        // complete walk for correctness.
+        let collected_chars: usize = nodes
+            .iter()
+            .map(|(node, _)| node.text.read().char_count())
+            .sum();
+        if collected_chars != expected_chars {
+            nodes.clear();
+            self.collect_tenant_nodes(&self.root, tenant_id, &mut nodes);
+        }
         for (node, _) in &nodes {
             self.remove_tenant_from_node(node, tenant_id);
             Self::detach_empty_ancestors(node);
         }
         if let Some((_, count)) = self.tenant_char_count.remove(tenant_id) {
             self.total_char_count.fetch_sub(count, Ordering::Relaxed);
+        }
+    }
+
+    /// Fast tenant walk for the common prefix-closed ownership shape. If a
+    /// child does not contain the tenant, none of its descendants can contain
+    /// it either, so the entire unrelated subtree can be skipped.
+    fn collect_tenant_nodes_pruned(
+        &self,
+        node: &NodeRef,
+        tenant_id: &TenantId,
+        result: &mut Vec<(NodeRef, u64)>,
+    ) {
+        for child in &node.children {
+            let child = child.value();
+            let Some(ts) = child.tenant_last_access_time.get(tenant_id) else {
+                continue;
+            };
+            result.push((Arc::clone(child), *ts));
+            drop(ts);
+            self.collect_tenant_nodes_pruned(child, tenant_id, result);
         }
     }
 
@@ -3696,6 +3736,50 @@ mod tests {
         let r = tree.match_prefix_with_counts("hello there");
         assert_eq!(r.matched_char_count, "hello there".chars().count());
         assert_eq!(r.tenant.as_ref(), "tenant2");
+    }
+
+    #[test]
+    fn test_remove_tenant_all_prunes_unrelated_subtrees() {
+        let tree = Tree::new();
+        tree.insert_text("a-target", "target");
+        for depth in 1..=64 {
+            tree.insert_text(&format!("z{}", "x".repeat(depth)), "other");
+        }
+
+        let tenant = Arc::from("target");
+        let mut nodes = Vec::new();
+        tree.collect_tenant_nodes_pruned(&tree.root, &tenant, &mut nodes);
+
+        assert_eq!(nodes.len(), 1);
+
+        tree.remove_tenant_all(&tenant);
+        assert!(!tree.get_tenant_char_count().contains_key("target"));
+        assert_eq!(
+            tree.match_prefix_with_counts(&format!("z{}", "x".repeat(64)))
+                .matched_char_count,
+            65
+        );
+    }
+
+    #[test]
+    fn test_remove_tenant_all_falls_back_after_non_prefix_closed_eviction() {
+        let tree = Tree::new();
+        tree.insert_text("apple", "tenant1");
+        tree.insert_text("application", "tenant2");
+
+        // Targeted string eviction can remove an older ancestor before a
+        // newer descendant. The optimized purge must detect that shape and
+        // fall back to a complete walk.
+        tree.evict_by_tenant(&Arc::from("tenant1"), 3);
+        tree.remove_tenant_all(&Arc::from("tenant1"));
+
+        assert!(!tree.get_tenant_char_count().contains_key("tenant1"));
+        assert!(!tree.get_used_size_per_tenant().contains_key("tenant1"));
+        assert_eq!(
+            tree.match_prefix_with_counts("application")
+                .matched_char_count,
+            "application".chars().count()
+        );
     }
 
     #[test]

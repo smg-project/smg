@@ -21,7 +21,7 @@ use smg_grpc_client::common_proto::{
     kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent, KvEventBatch,
 };
 use tokio::{
-    sync::{oneshot, Mutex},
+    sync::{oneshot, Mutex, Semaphore},
     task::JoinHandle,
 };
 use tracing::{debug, error, info, warn};
@@ -44,6 +44,11 @@ const INITIAL_RECONNECT_DELAY_MS: u64 = 100;
 
 /// Maximum reconnection delay (caps exponential backoff).
 const MAX_RECONNECT_DELAY_MS: u64 = 30_000;
+
+/// Positional-index cleanup is CPU-bound and can touch many blocks. Keep it
+/// off Tokio workers and bound concurrent purges during fleet-wide drains.
+const MAX_CONCURRENT_INDEX_REMOVALS: usize = 4;
+static INDEX_REMOVAL_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_INDEX_REMOVALS);
 
 /// Manages per-worker KV cache event subscriptions.
 ///
@@ -190,7 +195,6 @@ impl KvEventMonitor {
             .entry(model_id.clone())
             .or_insert_with(|| Arc::new(PositionalIndexer::new(self.jump_size)))
             .clone();
-
         // Seed block_size provisionally from WorkerSpec. The event stream will
         // overwrite this with the backend's actual page size once received.
         if let Some(bs) = worker.metadata().spec.kv_block_size {
@@ -263,8 +267,10 @@ impl KvEventMonitor {
 
     /// Stop the KV event subscription for a worker.
     ///
-    /// Sends a graceful shutdown signal — the task cleans up its own
-    /// `WorkerBlockMap` in the indexer before exiting.
+    /// Sends a graceful shutdown signal. The subscription task cleans up its
+    /// own `WorkerBlockMap` using the indexer's per-worker reverse map; that
+    /// CPU-bound cleanup runs on the bounded blocking pool rather than a Tokio
+    /// runtime worker.
     pub async fn on_worker_removed(&self, worker_url: &str) {
         let subscription = {
             let mut handles = self.worker_handles.lock().await;
@@ -274,7 +280,6 @@ impl KvEventMonitor {
         let Some(sub) = subscription else {
             return;
         };
-
         info!(worker_url = %worker_url, "Stopping KV event subscription");
         // Signal graceful shutdown — task cleans up its worker_blocks in the indexer.
         let _ = sub.shutdown_tx.send(());
@@ -411,6 +416,26 @@ impl KvEventMonitor {
     ///
     /// Owns the `WorkerBlockMap` for this worker and cleans it up on exit.
     /// Exits when `shutdown_rx` fires or the backend returns `Unimplemented`.
+    async fn remove_indexer_worker(
+        indexer: Arc<PositionalIndexer>,
+        worker_id: u32,
+        worker_blocks: WorkerBlockMap,
+    ) {
+        let Ok(permit) = INDEX_REMOVAL_PERMITS.acquire().await else {
+            error!(worker_id, "Positional-index cleanup semaphore closed");
+            return;
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            indexer.remove_worker(worker_id, worker_blocks);
+        })
+        .await;
+
+        if let Err(error) = result {
+            error!(worker_id, %error, "Positional-index worker cleanup task failed");
+        }
+    }
+
     async fn subscription_loop(
         worker: Arc<dyn Worker>,
         worker_url: String,
@@ -463,7 +488,8 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        indexer.remove_worker(worker_id, worker_blocks);
+                        Self::remove_indexer_worker(Arc::clone(&indexer), worker_id, worker_blocks)
+                            .await;
                         return;
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
@@ -480,7 +506,8 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        indexer.remove_worker(worker_id, worker_blocks);
+                        Self::remove_indexer_worker(Arc::clone(&indexer), worker_id, worker_blocks)
+                            .await;
                         return;
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
@@ -507,7 +534,8 @@ impl KvEventMonitor {
                             "Backend does not implement SubscribeKvEvents, \
                              disabling KV event subscription for this worker"
                         );
-                        indexer.remove_worker(worker_id, worker_blocks);
+                        Self::remove_indexer_worker(Arc::clone(&indexer), worker_id, worker_blocks)
+                            .await;
                         return;
                     }
                     if e.code() == tonic::Code::OutOfRange {
@@ -531,7 +559,8 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        indexer.remove_worker(worker_id, worker_blocks);
+                        Self::remove_indexer_worker(Arc::clone(&indexer), worker_id, worker_blocks)
+                            .await;
                         return;
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
@@ -548,7 +577,12 @@ impl KvEventMonitor {
                     &mut worker_blocks, &mut last_seq, on_batch,
                 ) => result,
                 _ = &mut shutdown_rx => {
-                    indexer.remove_worker(worker_id, worker_blocks);
+                    Self::remove_indexer_worker(
+                        Arc::clone(&indexer),
+                        worker_id,
+                        worker_blocks,
+                    )
+                    .await;
                     return;
                 }
             };
@@ -567,7 +601,8 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        indexer.remove_worker(worker_id, worker_blocks);
+                        Self::remove_indexer_worker(Arc::clone(&indexer), worker_id, worker_blocks)
+                            .await;
                         return;
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
@@ -596,7 +631,8 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        indexer.remove_worker(worker_id, worker_blocks);
+                        Self::remove_indexer_worker(Arc::clone(&indexer), worker_id, worker_blocks)
+                            .await;
                         return;
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
@@ -1096,6 +1132,28 @@ mod tests {
     async fn test_on_worker_removed_nonexistent() {
         let monitor = KvEventMonitor::new(None);
         monitor.on_worker_removed("http://nonexistent:8000").await;
+    }
+
+    #[tokio::test]
+    async fn test_remove_indexer_worker_runs_cleanup_off_runtime() {
+        let indexer = Arc::new(PositionalIndexer::new(64));
+        let worker_id = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut worker_blocks = WorkerBlockMap::default();
+        indexer
+            .apply_stored(
+                worker_id,
+                &[StoredBlock {
+                    seq_hash: SequenceHash(1),
+                    content_hash: compute_content_hash(&[1, 2, 3]),
+                }],
+                None,
+                &mut worker_blocks,
+            )
+            .unwrap();
+
+        KvEventMonitor::remove_indexer_worker(Arc::clone(&indexer), worker_id, worker_blocks).await;
+
+        assert_eq!(indexer.current_size(), 0);
     }
 
     // -----------------------------------------------------------------------

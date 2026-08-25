@@ -54,7 +54,7 @@
 */
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -632,6 +632,44 @@ impl CacheAwarePolicy {
         for placements in placement_maps {
             placements.retain(|_, holders| {
                 holders.retain(|h| h.worker_url != url);
+                !holders.is_empty()
+            });
+        }
+    }
+
+    /// Remove several workers from one model. Tree cleanup remains precise per
+    /// tenant, while hash-placement state is scanned only once for the batch.
+    pub(crate) fn remove_workers_from_model(&self, model_id: &str, worker_urls: &HashSet<String>) {
+        let model_id = normalize_model_key(model_id);
+        let tenants: Vec<TenantId> = worker_urls
+            .iter()
+            .map(|worker_url| TenantId::from(worker_url.as_str()))
+            .collect();
+        let string_tree = self
+            .string_trees
+            .get(model_id)
+            .map(|entry| Arc::clone(entry.value()));
+        if let Some(tree) = string_tree {
+            for tenant in &tenants {
+                tree.remove_tenant_all(tenant);
+            }
+        }
+        let token_tree = self
+            .token_trees
+            .get(model_id)
+            .map(|entry| Arc::clone(entry.value()));
+        if let Some(tree) = token_tree {
+            for tenant in &tenants {
+                tree.remove_tenant_all(tenant);
+            }
+        }
+        let placements = self
+            .placement_index
+            .get(model_id)
+            .map(|entry| Arc::clone(entry.value()));
+        if let Some(placements) = placements {
+            placements.retain(|_, holders| {
+                holders.retain(|holder| !worker_urls.contains(&holder.worker_url));
                 !holders.is_empty()
             });
         }
@@ -2694,6 +2732,59 @@ mod tests {
         policy.remove_worker_by_url("http://w2:8000");
         assert!(string_tree.get_tenant_char_count().is_empty());
         assert!(token_tree.get_tenant_token_counts().is_empty());
+    }
+
+    #[test]
+    fn test_remove_workers_from_model_does_not_mutate_other_models() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            cache_boundaries: vec![16],
+            ..Default::default()
+        });
+        let worker_url = "http://shared-url:8000";
+        let tokens: Vec<u32> = (0..32).collect();
+
+        for model_id in ["retired-model", "active-model"] {
+            let string_tree = Arc::new(Tree::new());
+            string_tree.insert_text("shared prefix", worker_url);
+            policy
+                .string_trees
+                .insert(model_id.to_string(), string_tree);
+
+            let token_tree = Arc::new(policy.new_token_tree());
+            token_tree.insert_tokens(&tokens, worker_url);
+            policy.token_trees.insert(model_id.to_string(), token_tree);
+
+            policy.record_placement(model_id, &tokens, &[16], worker_url, Instant::now());
+        }
+
+        policy.remove_workers_from_model("retired-model", &HashSet::from([worker_url.to_string()]));
+
+        let retired_string = policy.string_trees.get("retired-model").unwrap();
+        let retired_token = policy.token_trees.get("retired-model").unwrap();
+        assert!(!retired_string
+            .get_tenant_char_count()
+            .contains_key(worker_url));
+        assert!(!retired_token
+            .get_tenant_token_counts()
+            .contains_key(worker_url));
+        assert!(policy
+            .placement_index
+            .get("retired-model")
+            .is_some_and(|placements| placements.is_empty()));
+
+        let active_string = policy.string_trees.get("active-model").unwrap();
+        let active_token = policy.token_trees.get("active-model").unwrap();
+        assert!(active_string
+            .get_tenant_char_count()
+            .contains_key(worker_url));
+        assert!(active_token
+            .get_tenant_token_counts()
+            .contains_key(worker_url));
+        assert!(policy
+            .placement_index
+            .get("active-model")
+            .is_some_and(|placements| !placements.is_empty()));
     }
 
     #[test]

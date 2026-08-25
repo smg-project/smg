@@ -1632,15 +1632,52 @@ impl TokenTree {
     /// Size-based eviction never fires for a tenant whose count no longer
     /// grows, so removed workers must be purged eagerly.
     pub fn remove_tenant_all(&self, tenant_id: &TenantId) {
+        let expected_tokens = self.tenant_token_size(tenant_id);
         self.root.tenant_last_access_time.remove(tenant_id.as_ref());
+        if expected_tokens == 0 {
+            self.tenant_token_count.remove(tenant_id.as_ref());
+            return;
+        }
 
         let mut nodes: Vec<NodeRef> = Vec::new();
-        self.collect_tenant_nodes(&self.root, tenant_id, &mut nodes);
+        self.collect_tenant_nodes_pruned(&self.root, tenant_id, &mut nodes);
+
+        // Inserts and leaf-first eviction keep tenant ownership prefix-closed,
+        // so the pruned walk normally sees exactly the maintained token count.
+        // Fall back to a complete walk if imported or concurrently-mutated
+        // state violates that invariant.
+        let collected_tokens: usize = nodes.iter().map(|node| node.tokens.read().len()).sum();
+        if collected_tokens != expected_tokens {
+            nodes.clear();
+            self.collect_tenant_nodes(&self.root, tenant_id, &mut nodes);
+        }
         for node in &nodes {
             self.remove_tenant_and_cleanup(node, tenant_id);
         }
         if let Some((_, count)) = self.tenant_token_count.remove(tenant_id.as_ref()) {
             self.total_token_count.fetch_sub(count, Ordering::Relaxed);
+        }
+    }
+
+    /// Fast tenant walk for the common prefix-closed ownership shape. If a
+    /// child does not contain the tenant, none of its descendants can contain
+    /// it either, so the entire unrelated subtree can be skipped.
+    fn collect_tenant_nodes_pruned(
+        &self,
+        node: &NodeRef,
+        tenant_id: &TenantId,
+        result: &mut Vec<NodeRef>,
+    ) {
+        for child in &node.children {
+            let child = child.value();
+            if !child
+                .tenant_last_access_time
+                .contains_key(tenant_id.as_ref())
+            {
+                continue;
+            }
+            result.push(Arc::clone(child));
+            self.collect_tenant_nodes_pruned(child, tenant_id, result);
         }
     }
 
@@ -3896,6 +3933,33 @@ mod tests {
         let r = tree.match_prefix_with_counts(&tokens2);
         assert_eq!(r.matched_token_count, 2 * PAGE_SIZE);
         assert_eq!(r.tenant.as_ref(), "tenant2");
+    }
+
+    #[test]
+    fn test_remove_tenant_all_prunes_unrelated_subtrees() {
+        let tree = TokenTree::new();
+        let target = make_tokens(1, 2);
+        tree.insert_tokens(&target, "target");
+
+        let mut unrelated = make_tokens(10_000, 1);
+        for page in 1..=64 {
+            unrelated.extend(make_tokens(10_000 + page * 100, 1));
+            tree.insert_tokens(&unrelated, "other");
+        }
+
+        let tenant = Arc::from("target");
+        let mut nodes = Vec::new();
+        tree.collect_tenant_nodes_pruned(&tree.root, &tenant, &mut nodes);
+
+        assert_eq!(nodes.len(), 1);
+
+        tree.remove_tenant_all(&tenant);
+        assert!(!tree.get_tenant_token_counts().contains_key("target"));
+        assert_eq!(
+            tree.match_prefix_with_counts(&unrelated)
+                .matched_token_count,
+            unrelated.len()
+        );
     }
 
     #[test]

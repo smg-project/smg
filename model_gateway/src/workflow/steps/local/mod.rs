@@ -73,12 +73,12 @@ pub(crate) fn find_workers_by_url(
 ///              │
 ///         drain_workers
 ///              │
-///     remove_from_policy_registry
-///              │
 ///     remove_from_worker_registry
 ///              │
-///     update_remaining_policies
+///     remove_from_policy_registry
 /// ```
+/// Cache cleanup removes only departed tenants, so surviving workers do not
+/// need the previous full-policy reinitialization pass.
 pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkflowData> {
     WorkflowDefinition::new("worker_removal", "Remove worker from router")
         .add_step(
@@ -114,9 +114,9 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
         )
         .add_step(
             StepDefinition::new(
-                "remove_from_policy_registry",
-                "Remove workers from policy registry",
-                Arc::new(RemoveFromPolicyRegistryStep),
+                "remove_from_worker_registry",
+                "Remove workers from worker registry",
+                Arc::new(RemoveFromWorkerRegistryStep),
             )
             .with_timeout(Duration::from_secs(10))
             .with_retry(RetryPolicy {
@@ -127,24 +127,12 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
         )
         .add_step(
             StepDefinition::new(
-                "remove_from_worker_registry",
-                "Remove workers from worker registry",
-                Arc::new(RemoveFromWorkerRegistryStep),
+                "remove_from_policy_registry",
+                "Remove workers from policy registry",
+                Arc::new(RemoveFromPolicyRegistryStep),
             )
-            .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
-            .depends_on(&["remove_from_policy_registry"]),
-        )
-        .add_step(
-            StepDefinition::new(
-                "update_remaining_policies",
-                "Update cache-aware policies for remaining workers",
-                Arc::new(UpdateRemainingPoliciesStep),
-            )
-            .with_timeout(Duration::from_secs(10))
+            // The old 10s override was too short for large cache cleanup.
+            // Inherit the workflow default after the worker is deregistered.
             .with_retry(RetryPolicy {
                 max_attempts: 1,
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
@@ -241,5 +229,38 @@ pub fn create_worker_update_workflow_data(
         app_context: Some(app_context),
         workers_to_update: None,
         updated_workers: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wfaas::StepId;
+
+    use super::*;
+
+    #[test]
+    fn worker_removal_deregisters_before_policy_cleanup() {
+        let workflow = create_worker_removal_workflow();
+        let registry_step = workflow
+            .steps
+            .iter()
+            .find(|step| step.id == StepId::new("remove_from_worker_registry"))
+            .unwrap();
+        let policy_step = workflow
+            .steps
+            .iter()
+            .find(|step| step.id == StepId::new("remove_from_policy_registry"))
+            .unwrap();
+
+        assert_eq!(registry_step.depends_on, vec![StepId::new("drain_workers")]);
+        assert_eq!(
+            policy_step.depends_on,
+            vec![StepId::new("remove_from_worker_registry")]
+        );
+        assert_eq!(policy_step.timeout, None);
+        assert!(workflow
+            .steps
+            .iter()
+            .all(|step| step.id != StepId::new("update_remaining_policies")));
     }
 }

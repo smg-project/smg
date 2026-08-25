@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
 };
 
@@ -845,6 +845,30 @@ impl PolicyRegistry {
                             worker_url, worker_type
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// Remove a batch of workers from every cache-aware policy that may route
+    /// the model. Shared policies are deduplicated by Arc identity.
+    pub(crate) fn remove_workers_from_cache_aware(
+        &self,
+        model_id: &str,
+        worker_urls: &HashSet<String>,
+    ) {
+        // A model can route through its explicit, default, or PD/EPD policy.
+        // `policies_for_model` deduplicates shared policy instances so each
+        // tree is cleaned at most once.
+        for policy in self.policies_for_model(model_id) {
+            if policy.name() == "cache_aware" {
+                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                    cache_aware.remove_workers_from_model(model_id, worker_urls);
+                    debug!(
+                        "Removed {} workers from cache-aware policy for model {}",
+                        worker_urls.len(),
+                        model_id
+                    );
                 }
             }
         }

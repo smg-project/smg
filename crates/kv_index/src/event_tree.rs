@@ -683,9 +683,10 @@ impl PositionalIndexer {
     /// Remove a worker entirely — takes ownership of blocks, cleans index, worker is gone.
     ///
     /// `worker_id`: internal ID from [`intern_worker`].
-    /// `worker_blocks`: caller-owned reverse lookup — consumed.
+    /// `worker_blocks`: caller-owned reverse lookup — consumed. Removal is
+    /// proportional to this worker's blocks, not to the total index size.
     pub fn remove_worker(&self, worker_id: u32, worker_blocks: WorkerBlockMap) {
-        for &(position, content_hash, prefix_hash) in worker_blocks.values() {
+        for (position, content_hash, prefix_hash) in worker_blocks.into_values() {
             if let Entry::Occupied(mut occ) = self.index.entry((position, content_hash)) {
                 let (_, now_empty) = occ.get_mut().seq.remove(prefix_hash, worker_id);
                 if now_empty {
@@ -1397,6 +1398,31 @@ mod tests {
         let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
         assert!(scores.scores.is_empty());
         assert_eq!(indexer.current_size(), 0);
+    }
+
+    #[test]
+    fn test_remove_worker_uses_reverse_map_and_preserves_unrelated_entries() {
+        let indexer = PositionalIndexer::new(64);
+        let removed = indexer.intern_worker("http://removed:8000").unwrap();
+        let survivor = indexer.intern_worker("http://survivor:8000").unwrap();
+        let mut removed_blocks = WorkerBlockMap::default();
+        let mut survivor_blocks = WorkerBlockMap::default();
+
+        indexer
+            .apply_stored(removed, &make_blocks(&[1]), None, &mut removed_blocks)
+            .unwrap();
+        for value in 10_000..11_000 {
+            indexer
+                .apply_stored(survivor, &make_blocks(&[value]), None, &mut survivor_blocks)
+                .unwrap();
+        }
+
+        indexer.remove_worker(removed, removed_blocks);
+
+        assert_eq!(indexer.current_size(), survivor_blocks.len());
+        let scores = indexer.find_matches(&hashes(&[10_999]), false);
+        assert_eq!(scores.scores.get(&survivor), Some(&1));
+        assert!(!scores.scores.contains_key(&removed));
     }
 
     #[test]
