@@ -3349,11 +3349,7 @@ mod tests {
     }
 
     impl llm_tokenizer::Decoder for FailingTokenizer {
-        fn decode(
-            &self,
-            _token_ids: &[u32],
-            _skip_special_tokens: bool,
-        ) -> anyhow::Result<String> {
+        fn decode(&self, _token_ids: &[u32], _skip_special_tokens: bool) -> anyhow::Result<String> {
             Err(anyhow::anyhow!("tokenizer decode failed"))
         }
     }
