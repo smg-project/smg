@@ -154,6 +154,24 @@ edits, so upstream syncs stay conflict-free.
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.
 
+### Container-mode GPU runners
+
+The GPU jobs declare their container image through a variable:
+
+```yaml
+container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
+```
+
+Unset, the expression is the empty string and the job runs directly on the runner
+— what upstream does today. Forks whose GPU runners are container-only (an
+Actions Runner Controller scale set with `containerMode: kubernetes` refuses jobs
+without a `container:`) set it to a CUDA-capable image and the same jobs run
+unchanged.
+
+Only the GPU jobs carry it: they are the ones that need a CUDA toolchain, and
+keeping the seam narrow keeps the blast radius small. It can be extended to the
+CPU jobs if someone needs it.
+
 ---
 
 ## Reporting security issues

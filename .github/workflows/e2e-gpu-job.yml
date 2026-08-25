@@ -73,6 +73,7 @@ on:
 jobs:
   run:
     runs-on: ${{ inputs.runner }}
+    container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: ${{ inputs.timeout }}
     permissions:
       contents: read

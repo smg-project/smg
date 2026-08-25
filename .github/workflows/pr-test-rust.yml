@@ -345,6 +345,7 @@ jobs:
   benchmarks:
     needs: build-wheel
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
+    container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: 36
     permissions:
       contents: read
@@ -1056,6 +1057,7 @@ jobs:
               && (needs.detect-changes.outputs.common == 'true'
                   || needs.detect-changes.outputs.go-bindings == 'true')))
     runs-on: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
+    container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -1127,6 +1129,7 @@ jobs:
     needs: build-wheel
     if: false  # Disabled
     runs-on: ${{ vars.SMG_RUNNER_GPU || 'k8s-runner-gpu' }}
+    container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: 32
     permissions:
       contents: read
