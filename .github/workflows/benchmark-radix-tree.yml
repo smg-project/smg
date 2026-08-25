@@ -35,7 +35,7 @@ permissions:
 jobs:
   benchmark:
     name: Radix Tree (Cache-Aware Routing)
-    if: github.repository == 'smg-project/smg'
+    if: github.repository == 'smg-project/smg' || vars.SMG_RUN_BENCHMARKS == 'true'
     # CPU-only criterion/throughput benchmarks of the kv-index radix tree —
     # no GPU needed, so it runs on the CPU runner pool rather than competing
     # for GPU runners.

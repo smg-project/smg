@@ -187,6 +187,22 @@ image **by digest** (`repo/image@sha256:...`) rather than by tag: the value is
 read at job start, so a mutable tag silently changes the CI environment with no
 workflow change to review.
 
+### Benchmark workflows
+
+The `benchmark-*` workflows are gated so a fork does not silently burn its
+runners on them:
+
+```yaml
+if: github.repository == 'smg-project/smg' || vars.SMG_RUN_BENCHMARKS == 'true'
+```
+
+They stay off in a fork until you set `SMG_RUN_BENCHMARKS` to `true`. Only
+`benchmark-radix-tree` runs on the self-hosted CPU pool, so it also needs
+`SMG_RUNNER_CPU`; the other four are on `ubuntu-latest` and need nothing else.
+
+The `release-*`, `nightly-*` and `stale` workflows are deliberately **not**
+opt-in — a fork should not publish artifacts or manage upstream's issues.
+
 ---
 
 ## Reporting security issues

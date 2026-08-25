@@ -39,7 +39,7 @@ permissions:
 jobs:
   benchmark:
     name: Request Processing
-    if: github.repository == 'smg-project/smg'
+    if: github.repository == 'smg-project/smg' || vars.SMG_RUN_BENCHMARKS == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
