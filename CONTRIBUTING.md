@@ -172,6 +172,21 @@ Only the GPU jobs carry it: they are the ones that need a CUDA toolchain, and
 keeping the seam narrow keeps the blast radius small. It can be extended to the
 CPU jobs if someone needs it.
 
+**What the image has to provide.** When the variable is set, the GPU job's steps
+run *inside* the image, so it is not enough for it to be CUDA-capable:
+
+| requirement | needed by |
+| --- | --- |
+| `bash`, `pip`, `pytest` | all four GPU jobs |
+| `python3` | `go-bindings-benchmark` |
+| a usable `docker` client with daemon access | `benchmarks`, `go-bindings-benchmark` |
+| CUDA runtime matching the engine under test | all four |
+
+A slim CUDA base image will fail during setup rather than at test time. Pin the
+image **by digest** (`repo/image@sha256:...`) rather than by tag: the value is
+read at job start, so a mutable tag silently changes the CI environment with no
+workflow change to review.
+
 ---
 
 ## Reporting security issues
