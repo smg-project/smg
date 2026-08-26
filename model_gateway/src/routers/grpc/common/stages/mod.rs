@@ -43,6 +43,7 @@ mod client_acquisition;
 mod dispatch_metadata;
 pub(crate) mod encode;
 pub(crate) mod helpers;
+pub(crate) mod pd_protocol;
 mod rate_limit;
 mod request_execution;
 mod worker_selection;

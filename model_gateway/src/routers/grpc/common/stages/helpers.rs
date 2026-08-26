@@ -11,6 +11,7 @@ use smg_grpc_client::{
 };
 use tracing::{debug, warn};
 
+use super::pd_protocol::{DpPlacement, PdProtocol, PdRendezvous};
 use crate::{
     middleware::{RequestId, TenantRequestMeta},
     rate_limit::{ReservationAttachment, SharedReservationHandle},
@@ -19,8 +20,8 @@ use crate::{
         proto_wrapper::ProtoGenerateRequest,
     },
     worker::{
-        sampling_defaults::SamplingDefaults, AttachedBody, RuntimeType, Worker,
-        DEFAULT_BOOTSTRAP_PORT, DEFAULT_SAMPLING_PARAMS_LABEL,
+        sampling_defaults::SamplingDefaults, AttachedBody, Worker, DEFAULT_BOOTSTRAP_PORT,
+        DEFAULT_SAMPLING_PARAMS_LABEL,
     },
 };
 
@@ -434,9 +435,9 @@ pub(crate) fn resolve_string_stops(
     Vec::new()
 }
 
-/// Inject PD bootstrap metadata for SGLang if needed.
+/// Inject PD bootstrap metadata when the runtime's rendezvous travels as
+/// SGLang-style `DisaggregatedParams` (bootstrap host/port/room).
 ///
-/// SGLang uses DisaggregatedParams with bootstrap host/port/room.
 /// vLLM kv_transfer_params are handled in the request_execution stage.
 pub(crate) fn maybe_inject_pd_metadata(
     request: &mut ProtoGenerateRequest,
@@ -448,7 +449,8 @@ pub(crate) fn maybe_inject_pd_metadata(
         ..
     } = workers
     {
-        if *runtime_type == RuntimeType::Sglang {
+        let rendezvous = PdProtocol::for_runtime(*runtime_type).map(|p| p.rendezvous);
+        if rendezvous == Some(PdRendezvous::SglangBootstrap) {
             inject_sglang_bootstrap_metadata(request, prefill);
         }
     }
@@ -507,36 +509,52 @@ pub(crate) fn maybe_inject_pd_rendezvous(
         } => (prefill, runtime_type),
         WorkerSelection::Single { .. } => return,
     };
-    if *runtime_type == RuntimeType::TokenSpeed {
-        let metadata = prefill.metadata();
-        let hostname = metadata.bootstrap_host();
-        let bootstrap_port = metadata.bootstrap_port().unwrap_or(DEFAULT_BOOTSTRAP_PORT);
-        // 63-bit room: no dedup, keep the space wide so the birthday collision
-        // rate stays negligible. See the proto field doc.
-        //
-        // When the prefill worker is a dp-aware virtual worker, mint the room
-        // congruent to its rank: TokenSpeed disaggregation engines dispatch by
-        // `room % dp_size` (the pin field is ignored there), so the residue is
-        // the placement carrier. The low bits therefore carry structure — do
-        // not shard on them elsewhere. Under round_robin the decode side
-        // follows the same residue and deliberately inherits the prefill
-        // placement (decode prefix reuse shrinks the KV transfer).
-        let room_id = match (prefill.dp_rank(), prefill.dp_size()) {
-            (Some(rank), Some(dp)) if dp > 1 && rank < dp => {
-                let dp = dp as i64;
-                let base = rand::rng().random_range(0..i64::MAX - dp);
-                base - (base % dp) + rank as i64
-            }
-            _ => rand::rng().random_range(0..i64::MAX),
-        };
-
-        request.set_kv_bootstrap_info(hostname.to_string(), bootstrap_port as i32, room_id);
-
-        debug!(
-            "Injected PD rendezvous: host={}, port={}, room={}",
-            hostname, bootstrap_port, room_id
-        );
+    let Some(protocol) = PdProtocol::for_runtime(*runtime_type) else {
+        return;
+    };
+    if protocol.rendezvous == PdRendezvous::KvBootstrapRoom {
+        inject_kv_bootstrap_room(request, prefill, protocol.dp_placement);
     }
+}
+
+/// Inject the KV bootstrap host/port/room into a generate request.
+fn inject_kv_bootstrap_room(
+    request: &mut ProtoGenerateRequest,
+    prefill_worker: &Arc<dyn Worker>,
+    dp_placement: DpPlacement,
+) {
+    let metadata = prefill_worker.metadata();
+    let hostname = metadata.bootstrap_host();
+    let bootstrap_port = metadata.bootstrap_port().unwrap_or(DEFAULT_BOOTSTRAP_PORT);
+    // 63-bit room: no dedup, keep the space wide so the birthday collision
+    // rate stays negligible. See the proto field doc.
+    //
+    // Under `DpPlacement::RoomResidue`, mint the room congruent to the
+    // dp-aware prefill worker's rank: the engine dispatches by
+    // `room % dp_size`, so the residue is the placement carrier. The low
+    // bits therefore carry structure — do not shard on them elsewhere. Under
+    // round_robin the decode side follows the same residue and deliberately
+    // inherits the prefill placement (decode prefix reuse shrinks the KV
+    // transfer).
+    let room_id = match (
+        dp_placement,
+        prefill_worker.dp_rank(),
+        prefill_worker.dp_size(),
+    ) {
+        (DpPlacement::RoomResidue, Some(rank), Some(dp)) if dp > 1 && rank < dp => {
+            let dp = dp as i64;
+            let base = rand::rng().random_range(0..i64::MAX - dp);
+            base - (base % dp) + rank as i64
+        }
+        _ => rand::rng().random_range(0..i64::MAX),
+    };
+
+    request.set_kv_bootstrap_info(hostname.to_string(), bootstrap_port as i32, room_id);
+
+    debug!(
+        "Injected PD rendezvous: host={}, port={}, room={}",
+        hostname, bootstrap_port, room_id
+    );
 }
 
 #[cfg(test)]
@@ -799,8 +817,8 @@ mod stop_resolution_tests {
 
     #[test]
     fn pd_bootstrap_injection_skips_non_sglang_requests() {
-        use super::{RuntimeType, Worker, WorkerSelection};
-        use crate::worker::{BasicWorkerBuilder, WorkerType};
+        use super::{Worker, WorkerSelection};
+        use crate::worker::{BasicWorkerBuilder, RuntimeType, WorkerType};
 
         // An SGLang-runtime worker selection paired with a non-SGLang proto
         // (e.g. a misreporting backend) must skip injection, not panic.
