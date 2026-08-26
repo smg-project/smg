@@ -76,10 +76,8 @@ jobs:
       - name: Mypy (bindings/python)
         run: mypy bindings/python/ --config-file mypy.ini
 
-      # Nothing ran these before, so the guards under scripts/tests/ never
-      # executed. They are hermetic (stubbed binaries, no network, no apt) and
-      # finish in about a second, so the lint job is the right home rather than
-      # a GPU lane.
+      # Hermetic (stubbed binaries, no network) and fast; nothing ran the
+      # files under scripts/tests/ before this step existed.
       - name: Shell tests (scripts/tests)
         run: |
           set -euo pipefail

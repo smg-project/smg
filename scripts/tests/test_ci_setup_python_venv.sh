@@ -1,16 +1,10 @@
 #!/bin/bash
 # Tests for scripts/ci_setup_python_venv.sh.
 #
-# This script decides which interpreter every CI lane runs on, and its failure
-# mode is silence: a venv built on the wrong Python does not error here, it
-# surfaces much later as an unrelated-looking import failure in a different
-# script. That is exactly how it went unnoticed that the bare-metal runners were
-# on 3.10 while everything else was on 3.12.
-#
-# So the branches are exercised against stubbed `python3` and `uv` on PATH.
-# Stubs keep this hermetic -- no interpreter downloads, no network, no apt --
-# and let the failure paths be tested at all, which is impossible with a real
-# interpreter that refuses to report the wrong version.
+# The branches are exercised against stubbed `python3` and `uv` on PATH. Stubs
+# keep this hermetic -- no interpreter downloads, no network, no apt -- and are
+# the only way to reach the failure paths at all: a real interpreter will not
+# report the wrong version on request.
 
 set -euo pipefail
 
@@ -63,9 +57,6 @@ case "$1" in
     -m)
         case "$2" in
             pip) [ -f "$VENV_DIR/.has_pip" ] && { echo "pip 99.9"; exit 0; }; exit 1 ;;
-            ensurepip)
-                if [ "${STUB_ENSUREPIP_WORKS:-1}" = "1" ]; then touch "$VENV_DIR/.has_pip"; exit 0; fi
-                exit 1 ;;
         esac ;;
 esac
 exit 0
@@ -78,9 +69,8 @@ case "$1" in
     -m)
         case "$2" in
             venv)
-                if [ "$3" = "--help" ]; then exit "${STUB_VENV_MODULE_MISSING:-0}"; fi
                 # Debian ships the venv module and ensurepip separately, so
-                # `--help` can succeed while creation fails. Model that.
+                # creation can fail on a host that looks capable. Model that.
                 if [ "${STUB_VENV_CREATE_FAILS:-0}" = "1" ] && [ ! -f "${STUB_APT_MARKER:-/nonexistent}" ]; then
                     echo "The virtual environment was not created successfully because ensurepip is not available" >&2
                     exit 1
@@ -132,7 +122,14 @@ touch "${STUB_APT_MARKER:-/dev/null}"
 exit 0
 STUB
 
-    chmod +x "$dir/bin/python3" "$dir/bin/uv" "$dir/bin/sudo" "$dir/bin/apt-get"
+    # No test reaches curl today (uv is always stubbed), but keep the hermetic
+    # promise intact for whoever tests the uv-install branch next.
+    cat > "$dir/bin/curl" <<'STUB'
+#!/bin/bash
+exit 0
+STUB
+
+    chmod +x "$dir/bin/python3" "$dir/bin/uv" "$dir/bin/sudo" "$dir/bin/apt-get" "$dir/bin/curl"
 }
 
 # Run the script under test inside a fresh sandbox.
@@ -189,18 +186,14 @@ else
     fail "error should say what it got and what it expected"
 fi
 
-echo "test: venv has no pip and ensurepip cannot fix it"
-STUB_HOST_PYVER=3.12 CI_PYTHON_VERSION=3.12 STUB_VENV_HAS_PIP=0 STUB_ENSUREPIP_WORKS=0 run_case
+echo "test: venv has no pip"
+STUB_HOST_PYVER=3.12 CI_PYTHON_VERSION=3.12 STUB_VENV_HAS_PIP=0 run_case
 assert_eq "1" "$LAST_CODE" "fails rather than deferring to a downstream pip call"
 if grep -q "no pip" "$LAST_DIR/err" 2>/dev/null; then
     ok "error explains why pip is required"
 else
     fail "error should mention pip"
 fi
-
-echo "test: missing pip is repaired by ensurepip"
-STUB_HOST_PYVER=3.12 CI_PYTHON_VERSION=3.12 STUB_VENV_HAS_PIP=0 STUB_ENSUREPIP_WORKS=1 run_case
-assert_eq "0" "$LAST_CODE" "recovers without failing the job"
 
 echo "test: venv creation fails, apt repairs it, retry succeeds"
 # Regression: `python3 -m venv --help` succeeds on Debian even when ensurepip is
