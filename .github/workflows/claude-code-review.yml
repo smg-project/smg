@@ -191,7 +191,7 @@ jobs:
                Do NOT approve on "synchronize" (incremental) reviews — only
                full reviews have enough context to approve.
           claude_args: |
-            --model claude-opus-4-6
+            --model claude-opus-5
             --max-turns 50
             --allowedTools "Read,Glob,Grep,Bash,Agent,Skill,ToolSearch,TaskCreate,TaskUpdate,TaskGet,mcp__github_inline_comment__create_inline_comment"
           show_full_output: true
@@ -330,7 +330,7 @@ jobs:
         with:
           anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
           claude_args: |
-            --model claude-opus-4-6
+            --model claude-opus-5
             --max-turns 30
             --allowedTools "Read,Glob,Grep,Bash,Agent,Skill,ToolSearch,TaskCreate,TaskUpdate,TaskGet,mcp__github_inline_comment__create_inline_comment"
           plugins: "pr-review-toolkit@claude-plugins-official"
