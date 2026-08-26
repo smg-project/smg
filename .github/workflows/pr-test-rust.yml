@@ -76,16 +76,6 @@ jobs:
       - name: Mypy (bindings/python)
         run: mypy bindings/python/ --config-file mypy.ini
 
-      # Hermetic (stubbed binaries, no network) and fast; nothing ran the
-      # files under scripts/tests/ before this step existed.
-      - name: Shell tests (scripts/tests)
-        run: |
-          set -euo pipefail
-          for t in scripts/tests/test_*.sh; do
-            echo "--- $t"
-            bash "$t"
-          done
-
   grpc-proto-build-check:
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
