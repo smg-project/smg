@@ -192,10 +192,13 @@ jobs:
                full reviews have enough context to approve.
           claude_args: |
             --model claude-opus-5
+            --effort xhigh
             --max-turns 50
             --allowedTools "Read,Glob,Grep,Bash,Agent,Skill,ToolSearch,TaskCreate,TaskUpdate,TaskGet,mcp__github_inline_comment__create_inline_comment"
           show_full_output: true
-          plugins: "pr-review-toolkit@claude-plugins-official"
+          plugins: |
+            pr-review-toolkit@claude-plugins-official
+            smg@smg-dev-guide
           plugin_marketplaces: |
             https://github.com/anthropics/claude-plugins-official.git
             https://github.com/smg-project/smg-dev-guide.git
@@ -333,7 +336,9 @@ jobs:
             --model claude-opus-5
             --max-turns 30
             --allowedTools "Read,Glob,Grep,Bash,Agent,Skill,ToolSearch,TaskCreate,TaskUpdate,TaskGet,mcp__github_inline_comment__create_inline_comment"
-          plugins: "pr-review-toolkit@claude-plugins-official"
+          plugins: |
+            pr-review-toolkit@claude-plugins-official
+            smg@smg-dev-guide
           plugin_marketplaces: |
             https://github.com/anthropics/claude-plugins-official.git
             https://github.com/smg-project/smg-dev-guide.git
