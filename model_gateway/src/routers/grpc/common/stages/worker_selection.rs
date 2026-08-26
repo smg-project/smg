@@ -12,7 +12,10 @@ use tracing::{error, warn};
 use super::PipelineStage;
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
+    policies::{
+        policy_filters_unavailable_workers, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo,
+        WorkerLeg,
+    },
     routers::{
         common::overload,
         error,
@@ -22,8 +25,8 @@ use crate::{
         },
     },
     worker::{
-        ConnectionMode, ConnectionModeExt, HashRing, RuntimeType, Worker, WorkerRegistry,
-        WorkerType, UNKNOWN_MODEL_ID,
+        ConnectionMode, ConnectionModeExt, HashRing, RoutingPool, RuntimeType, Worker,
+        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
 };
 
@@ -273,35 +276,29 @@ impl WorkerSelectionStage {
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
     ) -> Option<Arc<dyn Worker>> {
-        // Treat "unknown" model as wildcard (match any worker)
-        let model_filter = if model_id == UNKNOWN_MODEL_ID {
-            None
-        } else {
-            Some(model_id)
-        };
-
         // Get workers for the specified model. The gRPC router serves both gRPC
         // and direct-ZMQ workers, so accept either transport (not HTTP).
-        let workers = self.worker_registry.get_workers_filtered(
-            model_filter,
-            Some(WorkerType::Regular),
-            None,  // grpc + zmq, filtered below
-            None,  // any runtime type
-            false, // get all workers, we'll filter by is_available() next
-        );
-
-        // Use into_iter() to take ownership of Arcs without cloning (avoids atomic inc/dec)
-        let available: Vec<Arc<dyn Worker>> = workers
-            .into_iter()
-            .filter(|w| w.connection_mode().uses_grpc_pipeline() && w.is_available())
-            .collect();
-
-        if available.is_empty() {
-            return None;
-        }
+        let candidates = self
+            .worker_registry
+            .get_routing_pool(model_id, RoutingPool::GrpcPipelineRegular);
 
         // Get the appropriate policy for this model
         let policy = self.policy_registry.get_policy_or_default(model_id);
+
+        let filtered;
+        let available: &[Arc<dyn Worker>] = if policy_filters_unavailable_workers(policy.as_ref()) {
+            &candidates
+        } else {
+            filtered = candidates
+                .iter()
+                .filter(|worker| worker.is_available())
+                .cloned()
+                .collect::<Vec<_>>();
+            &filtered
+        };
+        if available.is_empty() {
+            return None;
+        }
 
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
@@ -310,7 +307,7 @@ impl WorkerSelectionStage {
         // when enabled; otherwise delegates to the configured policy).
         let idx = self.policy_registry.select_worker(
             &policy,
-            &available,
+            available,
             &SelectWorkerInfo {
                 request_text: text,
                 tokens,

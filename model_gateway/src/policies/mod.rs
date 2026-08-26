@@ -108,6 +108,19 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
+/// Whether a built-in policy applies the complete [`Worker::is_available`]
+/// predicate before selecting. Other policies keep the caller-side filter.
+pub(crate) fn policy_filters_unavailable_workers(policy: &dyn LoadBalancingPolicy) -> bool {
+    let policy = policy.as_any();
+    policy.is::<RandomPolicy>()
+        || policy.is::<RoundRobinPolicy>()
+        || policy.is::<LeastLoadPolicy>()
+        || policy.is::<PowerOfTwoPolicy>()
+        || policy.is::<CacheAwarePolicy>()
+        || policy.is::<ManualPolicy>()
+        || policy.is::<PassthroughPolicy>()
+}
+
 pub trait DPRankLoadPolicy: Send + Sync + Debug {
     fn select_dp_rank(&self, worker: &dyn Worker, estimated_cost: isize) -> Option<isize>;
 }
@@ -419,5 +432,32 @@ mod tests {
         assert_eq!(WorkerLeg::Single.routing_id_prefix(), "");
         assert_eq!(WorkerLeg::Prefill.routing_id_prefix(), "prefill:");
         assert_eq!(WorkerLeg::Decode.routing_id_prefix(), "decode:");
+    }
+
+    #[test]
+    fn only_policies_with_complete_availability_checks_skip_prefiltering() {
+        for name in [
+            "random",
+            "round_robin",
+            "least_load",
+            "power_of_two",
+            "cache_aware",
+            "manual",
+            "passthrough",
+        ] {
+            let policy = PolicyFactory::create_by_name(name).unwrap();
+            assert!(
+                policy_filters_unavailable_workers(policy.as_ref()),
+                "{name}"
+            );
+        }
+
+        for name in ["bucket", "consistent_hashing", "prefix_hash"] {
+            let policy = PolicyFactory::create_by_name(name).unwrap();
+            assert!(
+                !policy_filters_unavailable_workers(policy.as_ref()),
+                "{name}"
+            );
+        }
     }
 }

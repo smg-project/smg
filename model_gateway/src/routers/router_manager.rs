@@ -346,13 +346,17 @@ impl RouterManager {
             }
         }
 
-        let workers = if let Some(model) = model_id {
-            self.worker_registry.get_by_model(model).to_vec()
+        let by_model;
+        let all;
+        let workers: &[Arc<dyn Worker>] = if let Some(model) = model_id {
+            by_model = self.worker_registry.get_by_model(model);
+            &by_model
         } else {
-            self.worker_registry.get_all()
+            all = self.worker_registry.get_routing_workers();
+            &all
         };
 
-        self.select_router_for_workers(&workers, model_id)
+        self.select_router_for_workers(workers, model_id)
             .or_else(|| {
                 let default = self
                     .default_router

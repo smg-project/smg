@@ -47,7 +47,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{PolicyRegistry, SelectWorkerInfo},
+    policies::{policy_filters_unavailable_workers, PolicyRegistry, SelectWorkerInfo},
     routers::{
         common::{
             attach_sized_body,
@@ -76,7 +76,10 @@ use crate::{
         BodyPolicy, RouterTrait,
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
-    worker::{AttachedBody, ConnectionMode, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType},
+    worker::{
+        AttachedBody, ConnectionMode, RoutingPool, Worker, WorkerLoadGuard, WorkerRegistry,
+        WorkerType,
+    },
 };
 
 /// Max body size for a WebRTC `/v1/realtime/calls` SDP offer (10 MiB).
@@ -180,13 +183,12 @@ impl Router {
     }
 
     fn select_first_worker(&self) -> Result<String, String> {
-        let workers = self.worker_registry.get_all();
-        let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
-        if healthy_workers.is_empty() {
-            Err("No workers are available".to_string())
-        } else {
-            Ok(healthy_workers[0].url().to_string())
-        }
+        self.worker_registry
+            .get_routing_workers()
+            .iter()
+            .find(|worker| worker.is_healthy())
+            .map(|worker| worker.url().to_string())
+            .ok_or_else(|| "No workers are available".to_string())
     }
 
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
@@ -241,38 +243,38 @@ impl Router {
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
     ) -> Option<Arc<dyn Worker>> {
-        // UNKNOWN_MODEL_ID means caller didn't specify a model — find any available worker
-        let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
-            None
-        } else {
-            Some(model_id)
-        };
-        let workers = self.worker_registry.get_workers_filtered(
-            model_filter,
-            Some(WorkerType::Regular),
-            Some(ConnectionMode::Http),
-            None,  // any runtime type
-            false, // get all workers, we'll filter by is_available() next
-        );
-
-        let available: Vec<Arc<dyn Worker>> = workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-        if available.is_empty() {
-            return None;
-        }
+        let candidates = self
+            .worker_registry
+            .get_routing_pool(model_id, RoutingPool::HttpRegular);
 
         // Get the appropriate policy for this model
         let policy = self.policy_registry.get_policy_or_default(model_id);
+
+        // Most policies already apply the complete availability predicate.
+        // Give them the shared registry snapshot directly instead of cloning
+        // every available worker into a second per-request Vec. Hash policies
+        // currently use a weaker health predicate and retain the pre-filter.
+        let filtered;
+        let available: &[Arc<dyn Worker>] = if policy_filters_unavailable_workers(policy.as_ref()) {
+            &candidates
+        } else {
+            filtered = candidates
+                .iter()
+                .filter(|worker| worker.is_available())
+                .cloned()
+                .collect::<Vec<_>>();
+            &filtered
+        };
+        if available.is_empty() {
+            return None;
+        }
 
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
         let idx = self.policy_registry.select_worker(
             &policy,
-            &available,
+            available,
             &SelectWorkerInfo {
                 request_text: text,
                 tokens,
@@ -529,18 +531,9 @@ impl Router {
             Some(w) => w,
             None => {
                 // Distinguish "no workers for this model" from "workers exist but unavailable"
-                let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
-                    None
-                } else {
-                    Some(model_id)
-                };
-                let total = self.worker_registry.get_workers_filtered(
-                    model_filter,
-                    Some(WorkerType::Regular),
-                    Some(ConnectionMode::Http),
-                    None,
-                    false,
-                );
+                let total = self
+                    .worker_registry
+                    .get_routing_pool(model_id, RoutingPool::HttpRegular);
                 // `total` is exactly the pool selection drew from, wildcard
                 // model included — classifying from it rather than from the
                 // model index is what makes the shed fire for a model-less
@@ -814,18 +807,9 @@ impl Router {
         // workers. Pre-filter DP-aware workers out of the candidate pool so
         // the policy can pick a non-DP worker when one exists; only fall back
         // to model_not_found / 400 when every candidate is DP-aware.
-        let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
-            None
-        } else {
-            Some(model_id)
-        };
-        let all_workers = self.worker_registry.get_workers_filtered(
-            model_filter,
-            Some(WorkerType::Regular),
-            Some(ConnectionMode::Http),
-            None,
-            false,
-        );
+        let all_workers = self
+            .worker_registry
+            .get_routing_pool(model_id, RoutingPool::HttpRegular);
         if all_workers.is_empty() {
             let resp = error::model_not_found(model_id);
             record_pre_send_error(&resp);
@@ -844,11 +828,18 @@ impl Router {
             record_pre_send_error(&resp);
             return resp;
         }
-        let available: Vec<Arc<dyn Worker>> = non_dp_workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
+        let policy = self.policy_registry.get_policy_or_default(model_id);
+        let filtered;
+        let available: &[Arc<dyn Worker>] = if policy_filters_unavailable_workers(policy.as_ref()) {
+            &non_dp_workers
+        } else {
+            filtered = non_dp_workers
+                .iter()
+                .filter(|worker| worker.is_available())
+                .cloned()
+                .collect::<Vec<_>>();
+            &filtered
+        };
         if available.is_empty() {
             let resp =
                 overload::shed_if_all_overloaded(&non_dp_workers, model_id).unwrap_or_else(|| {
@@ -861,11 +852,10 @@ impl Router {
             return resp;
         }
 
-        let policy = self.policy_registry.get_policy_or_default(model_id);
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
         let idx = match self.policy_registry.select_worker(
             &policy,
-            &available,
+            available,
             &SelectWorkerInfo {
                 request_text: text.as_deref(),
                 tokens: hinted_tokens.as_deref(),
@@ -1645,13 +1635,9 @@ impl Router {
     /// Gather this router's per-request state for the shared decision matrix
     /// in [`crate::routers::common::body_policy`].
     fn request_body_path(&self, headers: &HeaderMap, wasm_request_hooks: bool) -> BodyPath {
-        let candidates = self.worker_registry.get_workers_filtered(
-            None,
-            Some(WorkerType::Regular),
-            Some(ConnectionMode::Http),
-            None,
-            false,
-        );
+        let candidates = self
+            .worker_registry
+            .get_routing_pool(crate::worker::UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
         decide_body_path(&BodyPathInputs {
             policy_needs_text: self
                 .policy_registry
@@ -2325,6 +2311,23 @@ mod tests {
 
         let worker = router.worker_registry.get_by_url(&url).unwrap();
         assert!(worker.is_healthy());
+    }
+
+    #[test]
+    fn model_less_selection_uses_live_availability_from_shared_pool() {
+        let router = create_test_unhealthy_router();
+
+        let selected = router
+            .select_worker_for_model(crate::worker::UNKNOWN_MODEL_ID, None, None, None, None)
+            .unwrap();
+        assert!(selected.is_available());
+
+        for worker in router.worker_registry.get_all() {
+            worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        }
+        assert!(router
+            .select_worker_for_model(crate::worker::UNKNOWN_MODEL_ID, None, None, None, None)
+            .is_none());
     }
 
     fn rerank_request() -> RerankRequest {

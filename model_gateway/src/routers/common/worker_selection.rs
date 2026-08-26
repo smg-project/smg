@@ -70,6 +70,17 @@ impl<'a> WorkerSelector<'a> {
         Self { registry, client }
     }
 
+    fn matches_worker_filters(worker: &Arc<dyn Worker>, req: &SelectWorkerRequest<'_>) -> bool {
+        req.worker_type
+            .is_none_or(|worker_type| *worker.worker_type() == worker_type)
+            && req
+                .connection_mode
+                .is_none_or(|mode| *worker.connection_mode() == mode)
+            && req
+                .runtime_type
+                .is_none_or(|runtime| worker.metadata().spec.runtime_type == runtime)
+    }
+
     /// Select the best worker for a model with refresh-on-miss.
     ///
     /// 1. Filter available workers by the request criteria.
@@ -129,18 +140,14 @@ impl<'a> WorkerSelector<'a> {
         req: &SelectWorkerRequest<'_>,
         require_available: bool,
     ) -> Vec<Arc<dyn Worker>> {
-        let workers = self.registry.get_workers_filtered(
-            None, // model_id index lookup not used — we filter via supports_model
-            req.worker_type,
-            req.connection_mode,
-            req.runtime_type,
-            false,
-        );
-        let workers: Vec<_> = if require_available {
-            workers.into_iter().filter(|w| w.is_available()).collect()
-        } else {
-            workers
-        };
+        let workers: Vec<_> = self
+            .registry
+            .get_routing_workers()
+            .iter()
+            .filter(|worker| Self::matches_worker_filters(worker, req))
+            .filter(|worker| !require_available || worker.is_available())
+            .cloned()
+            .collect();
         let candidates = match &req.provider {
             Some(provider) => filter_by_provider(workers, provider),
             None => workers,
@@ -168,13 +175,14 @@ impl<'a> WorkerSelector<'a> {
     /// Check if any healthy worker supports the model (regardless of circuit breaker).
     /// Used to distinguish "model not found" from "all workers circuit-broken".
     fn any_worker_supports_model(&self, req: &SelectWorkerRequest<'_>) -> bool {
-        let workers = self.registry.get_workers_filtered(
-            None,
-            req.worker_type,
-            req.connection_mode,
-            req.runtime_type,
-            true, // healthy only — model exists even if circuit-broken
-        );
+        let workers: Vec<_> = self
+            .registry
+            .get_routing_workers()
+            .iter()
+            .filter(|worker| Self::matches_worker_filters(worker, req))
+            .filter(|worker| worker.is_healthy())
+            .cloned()
+            .collect();
         let candidates = match &req.provider {
             Some(p) => filter_by_provider(workers, p),
             None => workers,
@@ -195,9 +203,15 @@ impl<'a> WorkerSelector<'a> {
         auth_header: Option<&HeaderValue>,
         provider: Option<&ProviderType>,
     ) {
-        let mut external_workers =
-            self.registry
-                .get_workers_filtered(None, None, None, Some(RuntimeType::External), true);
+        let mut external_workers: Vec<_> = self
+            .registry
+            .get_routing_workers()
+            .iter()
+            .filter(|worker| {
+                worker.metadata().spec.runtime_type == RuntimeType::External && worker.is_healthy()
+            })
+            .cloned()
+            .collect();
 
         // Only refresh workers matching the request's provider to avoid sending
         // e.g. an OpenAI key to Anthropic workers during model discovery.
