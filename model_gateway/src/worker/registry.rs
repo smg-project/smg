@@ -93,18 +93,37 @@ pub struct WorkerDescriptor {
 pub(crate) enum RoutingPool {
     HttpRegular,
     GrpcPipelineRegular,
+    /// Strictly gRPC, unlike [`Self::GrpcPipelineRegular`]: the ZMQ wire
+    /// carries no KV-transfer rendezvous, so a ZMQ worker must never join a
+    /// PD leg even though it rides the gRPC pipeline elsewhere.
+    GrpcPrefill,
+    /// Strictly gRPC (see [`Self::GrpcPrefill`]).
+    GrpcDecode,
+    /// Strictly gRPC: encode dispatch is a gRPC encoder RPC the direct-ZMQ
+    /// worker has no path for.
+    GrpcEncode,
+    /// Transport-blind prefill pool: the HTTP PD router has always selected
+    /// PD legs by worker type alone.
+    AnyPrefill,
+    /// Transport-blind decode pool (same contract as [`Self::AnyPrefill`]).
+    AnyDecode,
 }
 
 type WorkerSnapshot = Arc<[Arc<dyn Worker>]>;
 type LazyRoutingPool = OnceLock<WorkerSnapshot>;
 
 impl RoutingPool {
-    const COUNT: usize = 2;
+    const COUNT: usize = 7;
 
     const fn index(self) -> usize {
         match self {
             Self::HttpRegular => 0,
             Self::GrpcPipelineRegular => 1,
+            Self::GrpcPrefill => 2,
+            Self::GrpcDecode => 3,
+            Self::GrpcEncode => 4,
+            Self::AnyPrefill => 5,
+            Self::AnyDecode => 6,
         }
     }
 
@@ -118,6 +137,20 @@ impl RoutingPool {
                 *worker.worker_type() == WorkerType::Regular
                     && worker.connection_mode().uses_grpc_pipeline()
             }
+            Self::GrpcPrefill => {
+                *worker.worker_type() == WorkerType::Prefill
+                    && *worker.connection_mode() == ConnectionMode::Grpc
+            }
+            Self::GrpcDecode => {
+                *worker.worker_type() == WorkerType::Decode
+                    && *worker.connection_mode() == ConnectionMode::Grpc
+            }
+            Self::GrpcEncode => {
+                *worker.worker_type() == WorkerType::Encode
+                    && *worker.connection_mode() == ConnectionMode::Grpc
+            }
+            Self::AnyPrefill => *worker.worker_type() == WorkerType::Prefill,
+            Self::AnyDecode => *worker.worker_type() == WorkerType::Decode,
         }
     }
 }
@@ -3084,6 +3117,11 @@ mod tests {
             ("zmq://regular", WorkerType::Regular, ConnectionMode::Zmq),
             ("http://prefill", WorkerType::Prefill, ConnectionMode::Http),
             ("grpc://prefill", WorkerType::Prefill, ConnectionMode::Grpc),
+            ("zmq://prefill", WorkerType::Prefill, ConnectionMode::Zmq),
+            ("http://decode", WorkerType::Decode, ConnectionMode::Http),
+            ("grpc://decode", WorkerType::Decode, ConnectionMode::Grpc),
+            ("grpc://encode", WorkerType::Encode, ConnectionMode::Grpc),
+            ("http://encode", WorkerType::Encode, ConnectionMode::Http),
         ];
         for (url, worker_type, connection_mode) in workers {
             registry
@@ -3113,6 +3151,33 @@ mod tests {
         assert_eq!(
             urls(RoutingPool::GrpcPipelineRegular),
             HashSet::from(["grpc://regular".to_string(), "zmq://regular".to_string()])
+        );
+        // PD/EPD legs are strictly gRPC: a ZMQ prefill worker that slipped
+        // past registration must not appear.
+        assert_eq!(
+            urls(RoutingPool::GrpcPrefill),
+            HashSet::from(["grpc://prefill".to_string()])
+        );
+        assert_eq!(
+            urls(RoutingPool::GrpcDecode),
+            HashSet::from(["grpc://decode".to_string()])
+        );
+        assert_eq!(
+            urls(RoutingPool::GrpcEncode),
+            HashSet::from(["grpc://encode".to_string()])
+        );
+        // The HTTP PD router selects legs by worker type alone.
+        assert_eq!(
+            urls(RoutingPool::AnyPrefill),
+            HashSet::from([
+                "http://prefill".to_string(),
+                "grpc://prefill".to_string(),
+                "zmq://prefill".to_string(),
+            ])
+        );
+        assert_eq!(
+            urls(RoutingPool::AnyDecode),
+            HashSet::from(["http://decode".to_string(), "grpc://decode".to_string()])
         );
     }
 

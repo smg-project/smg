@@ -55,7 +55,7 @@ use crate::{
         RouterTrait,
     },
     worker::{
-        HashRing, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
+        HashRing, RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
         UNKNOWN_MODEL_ID,
     },
 };
@@ -1317,39 +1317,16 @@ impl PDRouter {
     ) -> Result<PdPair, Box<PdSelectionFailure>> {
         debug!("Selecting PD pair: model_id={:?}", model_id);
 
-        let is_unknown_model = model_id == UNKNOWN_MODEL_ID;
-
-        let prefill_workers = {
-            let by_model: Vec<_> = self
-                .worker_registry
-                .get_by_model(model_id)
-                .iter()
-                .filter(|w| matches!(w.worker_type(), WorkerType::Prefill))
-                .cloned()
-                .collect();
-            if by_model.is_empty() && is_unknown_model {
-                // "auto" means pick any — fall back to all prefill workers
-                self.worker_registry.get_prefill_workers().to_vec()
-            } else {
-                by_model
-            }
-        };
-
-        let decode_workers = {
-            let by_model: Vec<_> = self
-                .worker_registry
-                .get_by_model(model_id)
-                .iter()
-                .filter(|w| matches!(w.worker_type(), WorkerType::Decode))
-                .cloned()
-                .collect();
-            if by_model.is_empty() && is_unknown_model {
-                // Only fall back to all workers when model is "unknown" (wildcard)
-                self.worker_registry.get_decode_workers().to_vec()
-            } else {
-                by_model
-            }
-        };
+        // Shared type-only projections (the HTTP PD legs have always been
+        // selected by worker type alone). `get_routing_pool` maps the
+        // wildcard model to the global snapshot — the "auto means pick any"
+        // fallback the explicit typed getters used to provide.
+        let prefill_workers = self
+            .worker_registry
+            .get_routing_pool(model_id, RoutingPool::AnyPrefill);
+        let decode_workers = self
+            .worker_registry
+            .get_routing_pool(model_id, RoutingPool::AnyDecode);
 
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();

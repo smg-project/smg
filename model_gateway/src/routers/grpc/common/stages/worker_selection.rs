@@ -331,6 +331,17 @@ impl WorkerSelectionStage {
         Some(selected)
     }
 
+    /// Workers from one shared routing-pool projection that also pass the
+    /// live `is_available()` check (health, circuit breaker, overload veto).
+    fn available_pool_workers(&self, model_id: &str, pool: RoutingPool) -> Vec<Arc<dyn Worker>> {
+        self.worker_registry
+            .get_routing_pool(model_id, pool)
+            .iter()
+            .filter(|w| w.is_available())
+            .cloned()
+            .collect()
+    }
+
     fn select_pd_pair(
         &self,
         model_id: &str,
@@ -339,43 +350,12 @@ impl WorkerSelectionStage {
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
     ) -> Option<PdWorkerPair> {
-        // Treat "unknown" model as wildcard (match any worker)
-        let model_filter = if model_id == UNKNOWN_MODEL_ID {
-            None
-        } else {
-            Some(model_id)
-        };
-
-        // Filtered to gRPC below: PD legs cannot ride the ZMQ transport.
-        let all_workers = self.worker_registry.get_workers_filtered(
-            model_filter,
-            None,
-            None, // filtered below
-            None, // any runtime type
-            false,
-        );
-
-        let (all_prefill, all_decode): (Vec<_>, Vec<_>) =
-            all_workers
-                .into_iter()
-                .fold((Vec::new(), Vec::new()), |mut acc, w| {
-                    // Only gRPC legs, not every grpc-pipeline mode: the ZMQ
-                    // wire carries no KV-transfer rendezvous, so a ZMQ leg
-                    // would silently drop the PD bootstrap info. Registration
-                    // rejects such workers; this keeps any that slipped in
-                    // (remote/service-discovery paths) out of PD pairs.
-                    if *w.connection_mode() == ConnectionMode::Grpc && w.is_available() {
-                        match w.metadata().spec.worker_type {
-                            WorkerType::Prefill => acc.0.push(w),
-                            WorkerType::Decode => acc.1.push(w),
-                            WorkerType::Regular => {}
-                            // Encode-prefill-decode selection is handled in select_encode_prefill_decode_workers;
-                            // the PD pair fold ignores encode workers.
-                            WorkerType::Encode => {}
-                        }
-                    }
-                    acc
-                });
+        // Membership comes from the shared per-leg projections (strictly
+        // gRPC — a ZMQ leg would silently drop the PD bootstrap info, see
+        // `RoutingPool::GrpcPrefill`; the wildcard model maps to the global
+        // snapshot). Availability stays a live per-request check.
+        let all_prefill = self.available_pool_workers(model_id, RoutingPool::GrpcPrefill);
+        let all_decode = self.available_pool_workers(model_id, RoutingPool::GrpcDecode);
 
         if all_prefill.is_empty() {
             warn!("No available prefill workers");
@@ -494,38 +474,14 @@ impl WorkerSelectionStage {
         rid_key: Option<&str>,
         encode_item_hashes: &[Vec<u8>],
     ) -> Option<EncodePrefillDecodeWorkerSelection> {
-        // Treat "unknown" model as wildcard (match any worker)
-        let model_filter = if model_id == UNKNOWN_MODEL_ID {
-            None
-        } else {
-            Some(model_id)
-        };
-
-        // Filtered to gRPC below: no EPD leg can ride the ZMQ transport.
-        let all_workers = self.worker_registry.get_workers_filtered(
-            model_filter,
-            None,
-            None, // filtered below
-            None, // any runtime type
-            false,
-        );
-
-        let (all_encode, all_prefill, all_decode): (Vec<_>, Vec<_>, Vec<_>) = all_workers
-            .into_iter()
-            .fold((Vec::new(), Vec::new(), Vec::new()), |mut acc, w| {
-                // Only gRPC legs: encode dispatch is a gRPC encoder RPC the
-                // direct-ZMQ worker has no path for, and the ZMQ wire carries
-                // no KV-transfer rendezvous for the prefill/decode legs.
-                if *w.connection_mode() == ConnectionMode::Grpc && w.is_available() {
-                    match w.metadata().spec.worker_type {
-                        WorkerType::Encode => acc.0.push(w),
-                        WorkerType::Prefill => acc.1.push(w),
-                        WorkerType::Decode => acc.2.push(w),
-                        WorkerType::Regular => {}
-                    }
-                }
-                acc
-            });
+        // Membership comes from the shared per-leg projections (strictly
+        // gRPC — encode dispatch is a gRPC encoder RPC the direct-ZMQ worker
+        // has no path for, and the ZMQ wire carries no KV-transfer
+        // rendezvous for the prefill/decode legs; the wildcard model maps to
+        // the global snapshot). Availability stays a live per-request check.
+        let all_encode = self.available_pool_workers(model_id, RoutingPool::GrpcEncode);
+        let all_prefill = self.available_pool_workers(model_id, RoutingPool::GrpcPrefill);
+        let all_decode = self.available_pool_workers(model_id, RoutingPool::GrpcDecode);
 
         let needs_encode = !encode_item_hashes.is_empty();
         if needs_encode && all_encode.is_empty() {
