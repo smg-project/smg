@@ -460,4 +460,53 @@ mod tests {
             );
         }
     }
+
+    /// The allowlist above is only sound if every listed policy actually
+    /// applies the availability predicate itself: callers skip the
+    /// `is_available()` pre-filter for them. Prove it behaviorally with the
+    /// overload veto (health stays green, so a policy that ignored
+    /// availability would happily select).
+    #[test]
+    fn allowlisted_policies_reject_unavailable_workers() {
+        use std::sync::Arc;
+
+        use openai_protocol::worker::WorkerStatus;
+
+        use crate::worker::{BasicWorkerBuilder, Worker};
+
+        fn worker(url: &str, overloaded: bool) -> Arc<dyn Worker> {
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+            worker.set_status(WorkerStatus::Ready);
+            worker.set_overloaded(overloaded);
+            worker
+        }
+
+        for name in [
+            "random",
+            "round_robin",
+            "least_load",
+            "power_of_two",
+            "cache_aware",
+            "manual",
+            "passthrough",
+        ] {
+            let policy = PolicyFactory::create_by_name(name).unwrap();
+
+            // Every worker vetoed: the policy must come up empty on its own.
+            let vetoed = [worker("http://a:1", true), worker("http://b:1", true)];
+            assert_eq!(
+                policy.select_worker(&vetoed, &SelectWorkerInfo::default()),
+                None,
+                "{name} selected an unavailable worker"
+            );
+
+            // Mixed pool: any selection must land on the available worker.
+            let mixed = [worker("http://a:1", false), worker("http://b:1", true)];
+            for _ in 0..16 {
+                if let Some(idx) = policy.select_worker(&mixed, &SelectWorkerInfo::default()) {
+                    assert_eq!(idx, 0, "{name} selected the vetoed worker");
+                }
+            }
+        }
+    }
 }

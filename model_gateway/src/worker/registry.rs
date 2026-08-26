@@ -489,11 +489,16 @@ impl WorkerRegistry {
         if model_id == UNKNOWN_MODEL_ID {
             return self.global_routing_snapshot.load_full().pool(pool);
         }
-        if let Some(snapshot) = self
+        // Bind the clone via a `let` so the shard `Ref` drops at the end of
+        // the statement (edition 2021 keeps `if let` scrutinee temporaries
+        // alive through the body): the first post-change `pool()` call does
+        // an O(workers) projection build that must not run under the shard
+        // read guard.
+        let snapshot = self
             .model_index
             .get(model_id)
-            .map(|workers| Arc::clone(workers.value()))
-        {
+            .map(|workers| Arc::clone(workers.value()));
+        if let Some(snapshot) = snapshot {
             return snapshot.pool(pool);
         }
         let canonical_id = self

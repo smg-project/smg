@@ -183,8 +183,11 @@ impl Router {
     }
 
     fn select_first_worker(&self) -> Result<String, String> {
+        // proxy_get_request sends a plain HTTP GET to the returned URL, so
+        // only HTTP-transport workers are eligible: a gRPC or ZMQ worker's
+        // URL cannot serve it.
         self.worker_registry
-            .get_routing_workers()
+            .get_routing_pool(crate::worker::UNKNOWN_MODEL_ID, RoutingPool::HttpRegular)
             .iter()
             .find(|worker| worker.is_healthy())
             .map(|worker| worker.url().to_string())
@@ -868,10 +871,18 @@ impl Router {
         ) {
             Some(i) => i,
             None => {
-                let resp = error::service_unavailable(
-                    "no_available_workers",
-                    "Policy returned no eligible worker",
-                );
+                // Self-filtering policies see the unfiltered pool, so "all
+                // workers overloaded" surfaces here as a policy miss instead
+                // of an empty pre-filter above. Classify the shed on this arm
+                // too, or the 503 loses Retry-After, retryability marking,
+                // and the overload-shed metric.
+                let resp = overload::shed_if_all_overloaded(&non_dp_workers, model_id)
+                    .unwrap_or_else(|| {
+                        error::service_unavailable(
+                            "no_available_workers",
+                            "Policy returned no eligible worker",
+                        )
+                    });
                 record_pre_send_error(&resp);
                 return resp;
             }
@@ -2299,6 +2310,34 @@ mod tests {
         let url = result.unwrap();
         // DashMap doesn't guarantee order, so just check we get one of the workers
         assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
+    }
+
+    #[test]
+    fn select_first_worker_skips_non_http_transports() {
+        let router = create_test_regular_router();
+        // A healthy gRPC-pipeline worker must never receive the plain HTTP
+        // GET that proxy_get_request sends to the selected URL.
+        let grpc = BasicWorkerBuilder::new("grpc://grpc-worker:9000")
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .build();
+        router.worker_registry.register_or_replace(Arc::new(grpc));
+
+        let url = router.select_first_worker().unwrap();
+        assert!(
+            url.starts_with("http://worker"),
+            "picked a non-HTTP transport: {url}"
+        );
+
+        // With every HTTP worker unhealthy the proxy has no eligible target,
+        // even though the gRPC worker is still healthy.
+        for worker in router.worker_registry.get_all() {
+            if *worker.connection_mode() == ConnectionMode::Http {
+                worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+            }
+        }
+        assert!(router.select_first_worker().is_err());
     }
 
     #[test]
