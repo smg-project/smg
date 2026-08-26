@@ -203,6 +203,7 @@ impl VisionProcessorRegistry {
     /// - `qwen2.5-vl` -> Qwen2VLProcessor (same preprocessing as Qwen2-VL)
     /// - `qwen3-vl` -> Qwen3VLProcessor (patch_size=16, [0.5,0.5,0.5] normalization)
     /// - `qwen3.5` / `qwen3_5` -> Qwen3VLProcessor (Qwen3.5 reuses Qwen3-VL preprocessing)
+    /// - `qwen4_exp` / `qwen4-exp` -> Qwen3VLProcessor (same vision tower as Qwen3.5)
     /// - `phi-3-vision` -> Phi3VisionProcessor (HD transform with 336x336 tiles)
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
@@ -269,6 +270,16 @@ impl VisionProcessorRegistry {
         );
         registry.register(
             "qwen3_6",
+            Box::new(super::processors::Qwen3VLProcessor::new()),
+        );
+
+        // Qwen4-Exp: same vision tower as Qwen3.5
+        registry.register(
+            "qwen4_exp",
+            Box::new(super::processors::Qwen3VLProcessor::new()),
+        );
+        registry.register(
+            "qwen4-exp",
             Box::new(super::processors::Qwen3VLProcessor::new()),
         );
 
@@ -470,5 +481,15 @@ mod tests {
             .find("custom-model", Some("phi3_v"))
             .expect("phi3 processor by model_type");
         assert_eq!(processor.model_name(), "phi3-vision");
+    }
+
+    #[test]
+    fn test_registry_find_qwen4_exp_model_type_fallback() {
+        let registry = VisionProcessorRegistry::with_defaults();
+
+        let processor = registry
+            .find("custom-model", Some("qwen4_exp"))
+            .expect("qwen3 processor by qwen4_exp model_type");
+        assert_eq!(processor.model_name(), "qwen3-vl");
     }
 }
