@@ -188,12 +188,20 @@ impl ParserRegistry {
     /// If `configured_parser` supports structural tags → `StructuralTag(json)`.
     /// Otherwise → `JsonSchema(schema)` for required/function tool_choice.
     /// Returns `Ok(None)` for auto/none tool_choice.
+    /// `parallel_tool_calls` is the request's setting (OpenAI
+    /// `parallel_tool_calls`, or the inverse of Anthropic
+    /// `disable_parallel_tool_use`); `Some(false)` bounds the JSON-schema
+    /// fallback to a single call. Named-function constraints are single-call
+    /// by construction; structural tags are unaffected (tag grammars carry no
+    /// repeat bound).
     pub fn generate_tool_constraint(
         &self,
         configured_parser: Option<&str>,
         tools: &[Tool],
         tool_choice: &ToolChoice,
+        parallel_tool_calls: Option<bool>,
     ) -> Result<Option<ToolConstraint>, String> {
+        let single_tool_call = parallel_tool_calls == Some(false);
         if tools.is_empty() {
             return Ok(None);
         }
@@ -226,7 +234,7 @@ impl ParserRegistry {
                 Ok(Some(ToolConstraint::JsonSchema(params_schema)))
             }
             _ => {
-                let schema = build_required_array_schema(tools)?;
+                let schema = build_required_array_schema(tools, single_tool_call)?;
                 Ok(Some(ToolConstraint::JsonSchema(schema)))
             }
         }
@@ -532,8 +540,9 @@ impl Default for ParserFactory {
     }
 }
 
-/// Build JSON schema for required tool calls (array with minItems: 1).
-fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
+/// Build JSON schema for required tool calls (array with minItems: 1; also
+/// maxItems: 1 when the request disables parallel tool calls).
+fn build_required_array_schema(tools: &[Tool], single_call: bool) -> Result<String, String> {
     let mut any_of_schemas = Vec::with_capacity(tools.len());
     for tool in tools {
         let tool_schema = json!({
@@ -577,6 +586,12 @@ fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
             "anyOf": any_of_schemas
         }
     });
+
+    if single_call {
+        if let serde_json::Value::Object(ref mut obj) = array_schema {
+            obj.insert("maxItems".to_string(), json!(1));
+        }
+    }
 
     if !all_defs.is_empty() {
         if let serde_json::Value::Object(ref mut obj) = array_schema {

@@ -183,7 +183,12 @@ pub unsafe extern "C" fn sgl_client_chat_completion_stream(
         chat_request.tools.as_ref(),
         chat_request.tool_choice.as_ref(),
     ) {
-        match registry.generate_tool_constraint(None, tools, tool_choice) {
+        match registry.generate_tool_constraint(
+            None,
+            tools,
+            tool_choice,
+            chat_request.parallel_tool_calls,
+        ) {
             Ok(Some(c)) => Some(c.to_tuple()),
             Ok(None) => None,
             Err(e) => {

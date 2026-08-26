@@ -786,3 +786,75 @@ mod qwen_mapping_tests {
         }
     }
 }
+
+mod constraint_limit_tests {
+    use openai_protocol::common::{Function, FunctionChoice, Tool, ToolChoice, ToolChoiceValue};
+
+    use crate::{factory::ParserFactory, ToolConstraint};
+
+    fn tools() -> Vec<Tool> {
+        vec![Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_weather".to_string(),
+                description: Some("Get weather information".to_string()),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"}
+                    }
+                }),
+                strict: None,
+            },
+        }]
+    }
+
+    fn schema_for(choice: &ToolChoice, parallel_tool_calls: Option<bool>) -> serde_json::Value {
+        let factory = ParserFactory::new();
+        let constraint = factory
+            .registry()
+            .generate_tool_constraint(None, &tools(), choice, parallel_tool_calls)
+            .unwrap()
+            .expect("constraint expected");
+        match constraint {
+            ToolConstraint::JsonSchema(s) => serde_json::from_str(&s).unwrap(),
+            ToolConstraint::StructuralTag(_) => panic!("expected JSON schema constraint"),
+        }
+    }
+
+    #[test]
+    fn required_bounds_to_single_call_when_parallel_disabled() {
+        let schema = schema_for(&ToolChoice::Value(ToolChoiceValue::Required), Some(false));
+        assert_eq!(schema["minItems"], 1);
+        assert_eq!(schema["maxItems"], 1);
+    }
+
+    #[test]
+    fn required_stays_unbounded_unless_parallel_disabled() {
+        // Unspecified and explicitly-true behave identically: no upper bound.
+        for parallel in [None, Some(true)] {
+            let schema = schema_for(&ToolChoice::Value(ToolChoiceValue::Required), parallel);
+            assert_eq!(schema["minItems"], 1);
+            assert!(
+                schema.get("maxItems").is_none(),
+                "schema must not carry maxItems for parallel_tool_calls={parallel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_choice_is_unaffected_by_parallel_setting() {
+        let named = ToolChoice::Function {
+            tool_type: "function".to_string(),
+            function: FunctionChoice {
+                name: "get_weather".to_string(),
+            },
+        };
+        let bounded = schema_for(&named, Some(false));
+        let unbounded = schema_for(&named, None);
+        // Named choice constrains to the single tool's parameters object —
+        // single-call by construction, so the setting must be a no-op.
+        assert_eq!(bounded, unbounded);
+        assert_eq!(bounded["type"], "object");
+    }
+}
