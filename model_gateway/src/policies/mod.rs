@@ -462,22 +462,50 @@ mod tests {
     }
 
     /// The allowlist above is only sound if every listed policy actually
-    /// applies the availability predicate itself: callers skip the
-    /// `is_available()` pre-filter for them. Prove it behaviorally with the
-    /// overload veto (health stays green, so a policy that ignored
-    /// availability would happily select).
+    /// applies the complete `is_available()` predicate itself: callers skip
+    /// the pre-filter for them. Two scenarios pin the two halves:
+    /// the overload veto (shared with the weaker `is_healthy_and_eligible`
+    /// predicate) and an open circuit breaker — the one signal that
+    /// separates the full predicate from the weak one, so a policy that
+    /// regresses to the weak predicate fails here.
     #[test]
     fn allowlisted_policies_reject_unavailable_workers() {
-        use std::sync::Arc;
+        use std::{sync::Arc, time::Duration};
 
         use openai_protocol::worker::WorkerStatus;
 
-        use crate::worker::{BasicWorkerBuilder, Worker};
+        use crate::worker::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, Worker};
 
-        fn worker(url: &str, overloaded: bool) -> Arc<dyn Worker> {
-            let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+        fn worker(url: &str) -> Arc<dyn Worker> {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .circuit_breaker_config(CircuitBreakerConfig {
+                        failure_threshold: 1,
+                        success_threshold: 1,
+                        timeout_duration: Duration::from_secs(600),
+                        window_duration: Duration::from_secs(600),
+                    })
+                    .build(),
+            );
             worker.set_status(WorkerStatus::Ready);
-            worker.set_overloaded(overloaded);
+            worker
+        }
+
+        fn overloaded(url: &str) -> Arc<dyn Worker> {
+            let worker = worker(url);
+            worker.set_overloaded(true);
+            worker
+        }
+
+        fn breaker_open(url: &str) -> Arc<dyn Worker> {
+            let worker = worker(url);
+            worker.record_outcome(500);
+            assert!(!worker.is_available(), "breaker must be open");
+            assert!(
+                worker.is_healthy_and_eligible(),
+                "the weak predicate must still accept it — that contrast is \
+                 what this scenario tests"
+            );
             worker
         }
 
@@ -492,19 +520,32 @@ mod tests {
         ] {
             let policy = PolicyFactory::create_by_name(name).unwrap();
 
-            // Every worker vetoed: the policy must come up empty on its own.
-            let vetoed = [worker("http://a:1", true), worker("http://b:1", true)];
-            assert_eq!(
-                policy.select_worker(&vetoed, &SelectWorkerInfo::default()),
-                None,
-                "{name} selected an unavailable worker"
-            );
+            // Every worker vetoed or circuit-broken: the policy must come up
+            // empty on its own.
+            for unavailable in [
+                [overloaded("http://a:1"), overloaded("http://b:1")],
+                [breaker_open("http://a:1"), breaker_open("http://b:1")],
+            ] {
+                assert_eq!(
+                    policy.select_worker(&unavailable, &SelectWorkerInfo::default()),
+                    None,
+                    "{name} selected an unavailable worker"
+                );
+            }
 
-            // Mixed pool: any selection must land on the available worker.
-            let mixed = [worker("http://a:1", false), worker("http://b:1", true)];
-            for _ in 0..16 {
-                if let Some(idx) = policy.select_worker(&mixed, &SelectWorkerInfo::default()) {
-                    assert_eq!(idx, 0, "{name} selected the vetoed worker");
+            // Mixed pools: the selection must exist and land on the
+            // available worker.
+            for mixed in [
+                [worker("http://a:1"), overloaded("http://b:1")],
+                [worker("http://a:1"), breaker_open("http://b:1")],
+            ] {
+                for _ in 0..16 {
+                    let idx = policy
+                        .select_worker(&mixed, &SelectWorkerInfo::default())
+                        .unwrap_or_else(|| {
+                            panic!("{name} found no worker despite an available one")
+                        });
+                    assert_eq!(idx, 0, "{name} selected the unavailable worker");
                 }
             }
         }

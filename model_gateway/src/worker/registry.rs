@@ -102,11 +102,12 @@ pub(crate) enum RoutingPool {
     /// Strictly gRPC: encode dispatch is a gRPC encoder RPC the direct-ZMQ
     /// worker has no path for.
     GrpcEncode,
-    /// Transport-blind prefill pool: the HTTP PD router has always selected
-    /// PD legs by worker type alone.
-    AnyPrefill,
-    /// Transport-blind decode pool (same contract as [`Self::AnyPrefill`]).
-    AnyDecode,
+    /// HTTP-transport prefill pool for the HTTP PD router: it proxies plain
+    /// HTTP to the selected worker's URL, so a gRPC or ZMQ worker must never
+    /// be selectable (the same rule `select_first_worker` follows).
+    HttpPrefill,
+    /// HTTP-transport decode pool (same contract as [`Self::HttpPrefill`]).
+    HttpDecode,
 }
 
 type WorkerSnapshot = Arc<[Arc<dyn Worker>]>;
@@ -122,8 +123,8 @@ impl RoutingPool {
             Self::GrpcPrefill => 2,
             Self::GrpcDecode => 3,
             Self::GrpcEncode => 4,
-            Self::AnyPrefill => 5,
-            Self::AnyDecode => 6,
+            Self::HttpPrefill => 5,
+            Self::HttpDecode => 6,
         }
     }
 
@@ -149,8 +150,14 @@ impl RoutingPool {
                 *worker.worker_type() == WorkerType::Encode
                     && *worker.connection_mode() == ConnectionMode::Grpc
             }
-            Self::AnyPrefill => *worker.worker_type() == WorkerType::Prefill,
-            Self::AnyDecode => *worker.worker_type() == WorkerType::Decode,
+            Self::HttpPrefill => {
+                *worker.worker_type() == WorkerType::Prefill
+                    && *worker.connection_mode() == ConnectionMode::Http
+            }
+            Self::HttpDecode => {
+                *worker.worker_type() == WorkerType::Decode
+                    && *worker.connection_mode() == ConnectionMode::Http
+            }
         }
     }
 }
@@ -522,6 +529,20 @@ impl WorkerRegistry {
         if model_id == UNKNOWN_MODEL_ID {
             return self.global_routing_snapshot.load_full().pool(pool);
         }
+        self.get_model_routing_pool(model_id, pool)
+    }
+
+    /// Like [`Self::get_routing_pool`] but never widens to the global
+    /// snapshot: the wildcard id resolves through the literal `"unknown"`
+    /// model-index entry (untagged workers index there), yielding an empty
+    /// slice when no such entry exists. The HTTP PD router uses this to keep
+    /// its conditional wildcard fallback — untagged workers win when present,
+    /// and only an empty entry widens to the global pool.
+    pub(crate) fn get_model_routing_pool(
+        &self,
+        model_id: &str,
+        pool: RoutingPool,
+    ) -> Arc<[Arc<dyn Worker>]> {
         // Bind the clone via a `let` so the shard `Ref` drops at the end of
         // the statement (edition 2021 keeps `if let` scrutinee temporaries
         // alive through the body): the first post-change `pool()` call does
@@ -3166,18 +3187,15 @@ mod tests {
             urls(RoutingPool::GrpcEncode),
             HashSet::from(["grpc://encode".to_string()])
         );
-        // The HTTP PD router selects legs by worker type alone.
+        // The HTTP PD legs are HTTP-only: the router proxies plain HTTP to
+        // the selected URL, so gRPC and ZMQ workers must never be selectable.
         assert_eq!(
-            urls(RoutingPool::AnyPrefill),
-            HashSet::from([
-                "http://prefill".to_string(),
-                "grpc://prefill".to_string(),
-                "zmq://prefill".to_string(),
-            ])
+            urls(RoutingPool::HttpPrefill),
+            HashSet::from(["http://prefill".to_string()])
         );
         assert_eq!(
-            urls(RoutingPool::AnyDecode),
-            HashSet::from(["http://decode".to_string(), "grpc://decode".to_string()])
+            urls(RoutingPool::HttpDecode),
+            HashSet::from(["http://decode".to_string()])
         );
     }
 

@@ -1317,16 +1317,37 @@ impl PDRouter {
     ) -> Result<PdPair, Box<PdSelectionFailure>> {
         debug!("Selecting PD pair: model_id={:?}", model_id);
 
-        // Shared type-only projections (the HTTP PD legs have always been
-        // selected by worker type alone). `get_routing_pool` maps the
-        // wildcard model to the global snapshot — the "auto means pick any"
-        // fallback the explicit typed getters used to provide.
-        let prefill_workers = self
-            .worker_registry
-            .get_routing_pool(model_id, RoutingPool::AnyPrefill);
-        let decode_workers = self
-            .worker_registry
-            .get_routing_pool(model_id, RoutingPool::AnyDecode);
+        // Shared HTTP-transport projections: this router proxies plain HTTP
+        // to the selected worker's URL, so a gRPC or ZMQ worker must never
+        // be selectable. The wildcard fallback stays conditional, matching
+        // the old code: untagged workers index under the literal "unknown"
+        // entry and win when present; only an empty entry widens to every
+        // HTTP prefill/decode worker ("auto" means pick any).
+        let is_unknown_model = model_id == UNKNOWN_MODEL_ID;
+
+        let prefill_workers = {
+            let by_model = self
+                .worker_registry
+                .get_model_routing_pool(model_id, RoutingPool::HttpPrefill);
+            if by_model.is_empty() && is_unknown_model {
+                self.worker_registry
+                    .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpPrefill)
+            } else {
+                by_model
+            }
+        };
+
+        let decode_workers = {
+            let by_model = self
+                .worker_registry
+                .get_model_routing_pool(model_id, RoutingPool::HttpDecode);
+            if by_model.is_empty() && is_unknown_model {
+                self.worker_registry
+                    .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpDecode)
+            } else {
+                by_model
+            }
+        };
 
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();

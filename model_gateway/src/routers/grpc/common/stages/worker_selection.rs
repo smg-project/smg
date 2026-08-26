@@ -25,8 +25,7 @@ use crate::{
         },
     },
     worker::{
-        ConnectionMode, ConnectionModeExt, HashRing, RoutingPool, RuntimeType, Worker,
-        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
+        ConnectionModeExt, HashRing, RoutingPool, RuntimeType, Worker, WorkerRegistry, WorkerType,
     },
 };
 
@@ -249,23 +248,20 @@ impl WorkerSelectionStage {
     /// under the same worker-type and transport rules selection applied.
     /// Failure path only.
     fn leg_candidates(&self, model_id: &str, worker_type: WorkerType) -> Vec<Arc<dyn Worker>> {
-        // The wildcard model selects across every model, so its candidate pool
-        // is the unfiltered one — not the `unknown` model-index entry.
-        let model_filter = if model_id == UNKNOWN_MODEL_ID {
-            None
-        } else {
-            Some(model_id)
+        // One definition shared with selection: the same routing-pool
+        // projection, before the `is_available()` filter. Regular selection
+        // takes either gRPC-pipeline transport; the disaggregated legs are
+        // gRPC-only (no KV rendezvous on ZMQ). The wildcard model maps to
+        // the global snapshot — not the `unknown` model-index entry.
+        let pool = match worker_type {
+            WorkerType::Regular => RoutingPool::GrpcPipelineRegular,
+            WorkerType::Prefill => RoutingPool::GrpcPrefill,
+            WorkerType::Decode => RoutingPool::GrpcDecode,
+            WorkerType::Encode => RoutingPool::GrpcEncode,
         };
         self.worker_registry
-            .get_workers_filtered(model_filter, Some(worker_type), None, None, false)
-            .into_iter()
-            .filter(|w| match worker_type {
-                // Regular selection takes either gRPC-pipeline transport; the
-                // disaggregated legs are gRPC-only (no KV rendezvous on ZMQ).
-                WorkerType::Regular => w.connection_mode().uses_grpc_pipeline(),
-                _ => *w.connection_mode() == ConnectionMode::Grpc,
-            })
-            .collect()
+            .get_routing_pool(model_id, pool)
+            .to_vec()
     }
 
     fn select_single_worker(
