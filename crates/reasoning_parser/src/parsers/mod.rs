@@ -1,6 +1,7 @@
 pub mod base;
 pub mod cohere_cmd;
 pub mod deepseek_r1;
+pub mod gemma4;
 pub mod glm45;
 pub mod inkling;
 pub mod kimi;
@@ -14,6 +15,7 @@ pub mod step3;
 pub use base::BaseReasoningParser;
 pub use cohere_cmd::CohereCmdParser;
 pub use deepseek_r1::DeepSeekR1Parser;
+pub use gemma4::Gemma4Parser;
 pub use glm45::Glm45Parser;
 pub use inkling::InklingParser;
 pub use kimi::KimiParser;
