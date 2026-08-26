@@ -1,9 +1,9 @@
 //! Per-endpoint response specs: the pipeline contract between request
 //! building and response processing.
 //!
-//! Request building is the terminal consumer of the parsed request; the spec
-//! it produces is the only request-derived channel available to response
-//! processing and streaming tasks. The Harmony variant is the one sanctioned
+//! Request building is the last reader of the parsed request; the spec it
+//! produces is the only request-derived input available to response
+//! processing and streaming tasks. The Harmony variant is the one deliberate
 //! exception: its tool loop re-reads the request across iterations, so its
 //! spec explicitly owns a handle to it.
 
@@ -24,7 +24,7 @@ use crate::routers::grpc::utils;
 /// Response-phase contract for one request, produced by request building.
 #[derive(Clone)]
 pub(crate) enum ResponseSpec {
-    Chat(ChatResponseSpec),
+    Chat(Box<ChatResponseSpec>),
     Generate(GenerateResponseSpec),
     Completion(CompletionResponseSpec),
     Messages(MessagesResponseSpec),

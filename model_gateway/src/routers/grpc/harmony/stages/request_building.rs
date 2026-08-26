@@ -84,7 +84,7 @@ impl BuildStage for HarmonyRequestBuildingStage {
 
         // Generate request_id based on request type. The Harmony spec owns a
         // handle to the request: the tool loop legitimately re-reads it
-        // across iterations (the one sanctioned post-build request holder).
+        // across iterations (the one deliberate post-build request holder).
         let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
         let (request_id, id_stamp, harmony_spec) = match &ctx.input.request_type {
             RequestType::Chat(request) => {

@@ -179,7 +179,7 @@ impl BuildStage for ChatRequestBuildingStage {
 
         Ok(BuildOutput {
             plan: ExecutionPlan::generate(self.plan_kind, proto_request),
-            spec: ResponseSpec::Chat(ChatResponseSpec::from(chat_request.as_ref())),
+            spec: ResponseSpec::Chat(Box::new(ChatResponseSpec::from(chat_request.as_ref()))),
             stamp: AttemptStamp {
                 id: id_stamp,
                 sampling_mask,

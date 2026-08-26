@@ -20,7 +20,7 @@ use crate::routers::{
 ///
 /// Takes output tokens from execution and parses them using HarmonyParserAdapter
 /// to extract analysis, tool calls, and final response text from Harmony channels.
-/// The Harmony spec owns its request handle — the sanctioned post-build reader.
+/// The Harmony spec owns its request handle — the one deliberate post-build reader.
 pub(crate) struct HarmonyResponseProcessingStage {
     processor: HarmonyResponseProcessor,
     streaming_processor: Arc<HarmonyStreamingProcessor>,

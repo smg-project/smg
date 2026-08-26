@@ -2,10 +2,10 @@
 //!
 //! Ingress phase (owns the parsed request): preparation → rate-limit reserve
 //! → worker selection → client acquisition → encode (EPD) → request building.
-//! Request building is the terminal consumer: it yields `(ExecutionPlan,
+//! Request building is the last reader: it yields `(ExecutionPlan,
 //! ResponseSpec)` and the request drops at [`RequestContext::into_dispatch`].
 //!
-//! Dispatch phase (no request, by type structure): per-attempt worker
+//! Dispatch phase (no request, by construction): per-attempt worker
 //! re-selection + dispatch of the retained plan, then response processing.
 //! The plan is held until the retry window closes (first non-retryable
 //! response).
@@ -443,9 +443,11 @@ impl RequestPipeline {
                 )
             })?;
             dctx.clients = Some(acquire_clients(workers, &dctx.model_id).await?);
-            if let Some(plan) = plan.as_mut() {
-                helpers::restamp_plan_for_attempt(plan, stamp, workers)?;
-            }
+            let retained = plan.as_mut().ok_or_else(|| {
+                error!(function = "run_attempt", "Execution plan already consumed");
+                error::internal_error("execution_plan_consumed", "Execution plan already consumed")
+            })?;
+            helpers::restamp_plan_for_attempt(retained, stamp, workers)?;
             if let Some(decoder) = dctx.response.stop_decoder.as_mut() {
                 decoder.reset();
             }

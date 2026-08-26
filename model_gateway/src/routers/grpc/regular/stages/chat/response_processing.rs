@@ -114,7 +114,7 @@ impl ProcessStage for ChatResponseProcessingStage {
                 .clone()
                 .process_streaming_response(
                     execution_result,
-                    chat_request,
+                    *chat_request,
                     dispatch,
                     tokenizer,
                     skip_special_tokens,
@@ -148,7 +148,7 @@ impl ProcessStage for ChatResponseProcessingStage {
             .processor
             .process_non_streaming_chat_response(
                 execution_result,
-                chat_request,
+                *chat_request,
                 dispatch,
                 tokenizer,
                 stop_decoder,

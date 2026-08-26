@@ -1,7 +1,7 @@
 //! Request context types for the two-phase gRPC router pipeline.
 //!
 //! [`RequestContext`] owns the parsed request through the ingress phase;
-//! request building is its terminal consumer and [`RequestContext::into_dispatch`]
+//! request building is its last reader and [`RequestContext::into_dispatch`]
 //! yields the request-free [`DispatchContext`] the dispatch phase runs on.
 
 use std::sync::Arc;
@@ -238,11 +238,11 @@ impl WireConstraint {
 
 /// Post-build request context.
 ///
-/// Invariant, by type structure: there is no request field here, so the
+/// Invariant, by construction: there is no request field here, so the
 /// dispatch phase (worker re-selection, dispatch, response processing,
 /// streaming) cannot reach the parsed request — it dropped in
 /// [`RequestContext::into_dispatch`]. `ResponseSpec` is the only
-/// request-derived channel past this point.
+/// request-derived input past this point.
 pub(crate) struct DispatchContext {
     /// Canonical model ID (routing, registries).
     pub model_id: String,
@@ -399,10 +399,6 @@ impl ExecutionPlan {
     /// Set the engine request id on a non-batch plan. A batch plan here is a
     /// build-stage wiring bug (its sub ids are stamped individually): fail
     /// rather than let a retry re-dispatch the previous attempt's ids.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Response is the standard error type in the pipeline stage pattern"
-    )]
     pub(crate) fn set_request_id(
         &mut self,
         request_id: String,
@@ -716,10 +712,6 @@ impl RequestContext {
     /// Fails loudly when worker selection's outputs (routing snapshot, wire)
     /// are absent: a retry context with defaulted routing inputs could
     /// re-select a worker the retained plan cannot be dispatched to.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Response is the standard error type in the pipeline stage pattern"
-    )]
     pub fn into_dispatch(self) -> Result<DispatchContext, axum::response::Response> {
         let RequestContext {
             input,

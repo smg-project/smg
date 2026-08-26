@@ -21,7 +21,7 @@ pub trait PipelineStage: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
-/// Terminal ingress stage: the last reader of the parsed request. Produces
+/// Final ingress stage: the last reader of the parsed request. Produces
 /// the retained execution plan, the response spec, and the per-attempt stamp.
 #[async_trait]
 pub trait BuildStage: Send + Sync {
