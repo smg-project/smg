@@ -21,7 +21,9 @@ use std::ops::Deref;
 
 use image::DynamicImage;
 
-use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
+use super::qwen_vl_base::{
+    QwenSpatialResizeMode, QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode,
+};
 use crate::vision::{
     preprocessor_config::PreProcessorConfig,
     processor::{PreprocessedEncoderInputs, VisionPreProcessor},
@@ -87,6 +89,7 @@ impl Qwen2VLProcessor {
                 video_min_pixels: DEFAULT_MIN_PIXELS,
                 video_max_pixels: DEFAULT_MAX_PIXELS,
                 video_resize_mode: QwenVideoResizeMode::TotalVolume,
+                spatial_resize_mode: QwenSpatialResizeMode::Stretch,
                 temporal_patch_size: DEFAULT_TEMPORAL_PATCH_SIZE,
                 mean: CLIP_MEAN,
                 std: CLIP_STD,
@@ -112,6 +115,7 @@ impl Qwen2VLProcessor {
                 video_min_pixels: min_pixels,
                 video_max_pixels: max_pixels,
                 video_resize_mode: QwenVideoResizeMode::TotalVolume,
+                spatial_resize_mode: QwenSpatialResizeMode::Stretch,
                 temporal_patch_size,
                 mean: CLIP_MEAN,
                 std: CLIP_STD,
@@ -131,6 +135,7 @@ impl Qwen2VLProcessor {
                 video_min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
                 video_max_pixels: config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS),
                 video_resize_mode: QwenVideoResizeMode::TotalVolume,
+                spatial_resize_mode: QwenSpatialResizeMode::Stretch,
                 temporal_patch_size: config
                     .temporal_patch_size
                     .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),

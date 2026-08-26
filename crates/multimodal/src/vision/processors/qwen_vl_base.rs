@@ -23,7 +23,7 @@
 
 use std::borrow::Cow;
 
-use image::{imageops::FilterType, DynamicImage, GenericImageView};
+use image::{imageops::FilterType, DynamicImage, GenericImageView, RgbImage};
 use ndarray::{Array2, Array3};
 
 use crate::{
@@ -74,6 +74,8 @@ pub struct QwenVLConfig {
     pub video_max_pixels: usize,
     /// Whether the video budget applies per frame or to the sampled volume.
     pub video_resize_mode: QwenVideoResizeMode,
+    /// Spatial resize behavior shared by images and video frames.
+    pub spatial_resize_mode: QwenSpatialResizeMode,
     /// Temporal patch size for video
     pub temporal_patch_size: usize,
     /// Normalization mean values
@@ -90,6 +92,14 @@ pub enum QwenVideoResizeMode {
     PerFrame,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QwenSpatialResizeMode {
+    /// Resize directly to the aligned target dimensions.
+    Stretch,
+    /// Preserve aspect ratio and pad the right/bottom edges with zero-valued pixels.
+    AlignedCanvas { patch_expand_factor: usize },
+}
+
 #[derive(Clone)]
 struct VideoFrameRgb<'a> {
     width: usize,
@@ -100,7 +110,10 @@ struct VideoFrameRgb<'a> {
 struct QwenImagePlan {
     target_width: u32,
     target_height: u32,
+    content_width: u32,
+    content_height: u32,
     needs_resize: bool,
+    needs_pad: bool,
     grid_t: usize,
     grid_h: usize,
     grid_w: usize,
@@ -113,6 +126,8 @@ struct QwenVideoPlan {
     original_size: (u32, u32),
     target_width: u32,
     target_height: u32,
+    content_width: u32,
+    content_height: u32,
     grid_t: usize,
     grid_h: usize,
     grid_w: usize,
@@ -216,31 +231,89 @@ fn resize_rgb_frame_to_raw(
     Ok(resized.into_raw())
 }
 
+fn pad_rgb_canvas(
+    data: &[u8],
+    content_width: u32,
+    content_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> Result<Vec<u8>, TransformError> {
+    if content_width > target_width || content_height > target_height {
+        return Err(TransformError::InvalidShape {
+            expected: format!("content no larger than {target_width}x{target_height}"),
+            actual: vec![content_width as usize, content_height as usize],
+        });
+    }
+
+    let content_row = (content_width as usize)
+        .checked_mul(3)
+        .ok_or_else(|| TransformError::ShapeError("RGB content row overflow".to_string()))?;
+    let expected_len = content_row
+        .checked_mul(content_height as usize)
+        .ok_or_else(|| TransformError::ShapeError("RGB content size overflow".to_string()))?;
+    if data.len() != expected_len {
+        return Err(TransformError::InvalidShape {
+            expected: format!("RGB byte length {expected_len}"),
+            actual: vec![data.len()],
+        });
+    }
+    if content_width == target_width && content_height == target_height {
+        return Ok(data.to_vec());
+    }
+
+    let target_row = (target_width as usize)
+        .checked_mul(3)
+        .ok_or_else(|| TransformError::ShapeError("RGB target row overflow".to_string()))?;
+    let target_len = target_row
+        .checked_mul(target_height as usize)
+        .ok_or_else(|| TransformError::ShapeError("RGB target size overflow".to_string()))?;
+    let mut padded = vec![0; target_len];
+    for row in 0..content_height as usize {
+        let src = row * content_row;
+        let dst = row * target_row;
+        padded[dst..dst + content_row].copy_from_slice(&data[src..src + content_row]);
+    }
+    Ok(padded)
+}
+
 fn prepare_video_rgb_frame<'a>(
     frame: RgbFrameRef<'a>,
     target_width: u32,
     target_height: u32,
+    content_width: u32,
+    content_height: u32,
     filter: FilterType,
     do_resize: bool,
 ) -> Result<VideoFrameRgb<'a>, TransformError> {
-    if do_resize && (frame.width != target_width || frame.height != target_height) {
-        Ok(VideoFrameRgb {
-            width: target_width as usize,
-            height: target_height as usize,
-            data: Cow::Owned(resize_rgb_frame_to_raw(
-                frame,
-                target_width,
-                target_height,
-                filter,
-            )?),
-        })
-    } else {
-        Ok(VideoFrameRgb {
+    if !do_resize
+        || (frame.width == target_width
+            && frame.height == target_height
+            && content_width == target_width
+            && content_height == target_height)
+    {
+        return Ok(VideoFrameRgb {
             width: frame.width as usize,
             height: frame.height as usize,
             data: Cow::Borrowed(frame.data),
-        })
+        });
     }
+
+    let resized = if frame.width == content_width && frame.height == content_height {
+        frame.data.to_vec()
+    } else {
+        resize_rgb_frame_to_raw(frame, content_width, content_height, filter)?
+    };
+    Ok(VideoFrameRgb {
+        width: target_width as usize,
+        height: target_height as usize,
+        data: Cow::Owned(pad_rgb_canvas(
+            &resized,
+            content_width,
+            content_height,
+            target_width,
+            target_height,
+        )?),
+    })
 }
 
 fn prepare_video_rgb_chunk<'a>(
@@ -249,6 +322,8 @@ fn prepare_video_rgb_chunk<'a>(
     temporal_patch_size: usize,
     target_width: u32,
     target_height: u32,
+    content_width: u32,
+    content_height: u32,
     filter: FilterType,
     do_resize: bool,
 ) -> Result<Vec<VideoFrameRgb<'a>>, TransformError> {
@@ -263,6 +338,8 @@ fn prepare_video_rgb_chunk<'a>(
                 frames[frame_index],
                 target_width,
                 target_height,
+                content_width,
+                content_height,
                 filter,
                 do_resize,
             )
@@ -295,19 +372,40 @@ fn prepare_video_frame_chunk<'a>(
     Ok(())
 }
 
-fn resize_dynamic_frame_to_raw(
+fn prepare_dynamic_frame_to_raw(
     frame: &DynamicImage,
     target_width: u32,
     target_height: u32,
+    content_width: u32,
+    content_height: u32,
     filter: FilterType,
-) -> (usize, usize, Vec<u8>) {
-    let resized = if filter == FilterType::CatmullRom {
-        resize_bicubic_pil(frame, target_width, target_height)
+    do_resize: bool,
+) -> Result<(usize, usize, Vec<u8>), TransformError> {
+    if !do_resize {
+        let (width, height, data) = rgb_bytes(frame);
+        return Ok((width, height, data.into_owned()));
+    }
+
+    let content = if frame.width() == content_width && frame.height() == content_height {
+        let (_, _, data) = rgb_bytes(frame);
+        data.into_owned()
     } else {
-        resize(frame, target_width, target_height, filter)
+        let resized = if filter == FilterType::CatmullRom {
+            resize_bicubic_pil(frame, content_width, content_height)
+        } else {
+            resize(frame, content_width, content_height, filter)
+        };
+        let (_, _, data) = rgb_bytes(&resized);
+        data.into_owned()
     };
-    let (width, height, data) = rgb_bytes(&resized);
-    (width, height, data.into_owned())
+    let padded = pad_rgb_canvas(
+        &content,
+        content_width,
+        content_height,
+        target_width,
+        target_height,
+    )?;
+    Ok((target_width as usize, target_height as usize, padded))
 }
 
 /// Generic Qwen VL image processor.
@@ -372,8 +470,8 @@ impl QwenVLProcessorBase {
     ) -> Result<QwenVideoPlan, TransformError> {
         let temporal_patch_size = self.config.temporal_patch_size;
         let padded_frames = frame_count.div_ceil(temporal_patch_size) * temporal_patch_size;
-        let (target_height, target_width) =
-            self.smart_resize_video(frame_count, height as usize, width as usize)?;
+        let (target_height, target_width, content_height, content_width) =
+            self.video_resize_geometry(frame_count, height as usize, width as usize)?;
         let (grid_t, grid_h, grid_w) =
             self.calculate_grid_thw(target_height, target_width, padded_frames);
         let patch_features =
@@ -404,6 +502,8 @@ impl QwenVLProcessorBase {
             original_size: (width, height),
             target_width: target_width as u32,
             target_height: target_height as u32,
+            content_width: content_width as u32,
+            content_height: content_height as u32,
             grid_t,
             grid_h,
             grid_w,
@@ -463,30 +563,18 @@ impl QwenVLProcessorBase {
     }
 
     /// Get the factor for dimension alignment.
-    ///
-    /// Dimensions must be divisible by (patch_size * merge_size).
     #[inline]
     pub fn get_factor(&self) -> usize {
-        self.config.patch_size * self.config.merge_size
+        let patch_expand_factor = match self.config.spatial_resize_mode {
+            QwenSpatialResizeMode::Stretch => 1,
+            QwenSpatialResizeMode::AlignedCanvas {
+                patch_expand_factor,
+            } => patch_expand_factor,
+        };
+        self.config.patch_size * self.config.merge_size * patch_expand_factor
     }
 
-    /// Smart resize algorithm for Qwen VL models.
-    ///
-    /// Resizes image dimensions to fit within min/max pixel bounds while:
-    /// - Preserving aspect ratio
-    /// - Aligning to (patch_size * merge_size) boundaries
-    ///
-    /// # Arguments
-    /// * `height` - Original image height
-    /// * `width` - Original image width
-    ///
-    /// # Returns
-    /// (new_height, new_width) or error if aspect ratio is too extreme
-    ///
-    /// # Errors
-    /// - If height or width is zero
-    /// - If aspect ratio exceeds 200:1
-    pub fn smart_resize(
+    fn qwen_smart_resize(
         &self,
         height: usize,
         width: usize,
@@ -541,12 +629,7 @@ impl QwenVLProcessorBase {
         Ok((h_bar, w_bar))
     }
 
-    /// Smart resize for Qwen3-style video processors.
-    ///
-    /// `TotalVolume` applies the pixel budget to the padded sampled video
-    /// volume (`T * H * W`), while `PerFrame` applies it to each frame's
-    /// spatial area (`H * W`).
-    pub fn smart_resize_video(
+    fn qwen_smart_resize_video(
         &self,
         num_frames: usize,
         height: usize,
@@ -608,6 +691,150 @@ impl QwenVLProcessorBase {
         }
 
         Ok((h_bar, w_bar))
+    }
+
+    fn aligned_canvas_geometry(
+        &self,
+        num_frames: usize,
+        height: usize,
+        width: usize,
+        min_pixels: usize,
+        max_pixels: usize,
+    ) -> Result<(usize, usize, usize, usize), TransformError> {
+        let temporal_factor = self.config.temporal_patch_size;
+        let factor = self.get_factor();
+        if num_frames == 0 || height == 0 || width == 0 || temporal_factor == 0 || factor == 0 {
+            return Err(TransformError::InvalidShape {
+                expected: "positive frame count, dimensions, and alignment factors".to_string(),
+                actual: vec![num_frames, height, width, temporal_factor, factor],
+            });
+        }
+        if min_pixels == 0 || min_pixels > max_pixels {
+            return Err(TransformError::ShapeError(format!(
+                "invalid aligned-canvas pixel budget: min={min_pixels}, max={max_pixels}"
+            )));
+        }
+
+        let align = |value: usize| value.div_ceil(factor) * factor;
+        let aligned_frames = (round_half_to_even(num_frames as f64 / temporal_factor as f64)
+            as usize
+            * temporal_factor)
+            .max(temporal_factor);
+        let volume = |frames: usize, h: usize, w: usize| frames as u128 * h as u128 * w as u128;
+
+        let fit_within_budget = || -> Result<(usize, usize), TransformError> {
+            let minimum = volume(aligned_frames, factor, factor);
+            if minimum > max_pixels as u128 {
+                return Err(TransformError::ShapeError(format!(
+                    "max_pixels={max_pixels} is smaller than one aligned patch volume {minimum}"
+                )));
+            }
+
+            let mut low = 1usize;
+            let mut high = height;
+            let mut best = (factor, factor);
+            while low <= high {
+                let content_height = low + (high - low) / 2;
+                let content_width =
+                    ((width as u128 * content_height as u128) / height as u128).max(1) as usize;
+                let candidate = (align(content_height), align(content_width));
+                if volume(aligned_frames, candidate.0, candidate.1) <= max_pixels as u128 {
+                    best = candidate;
+                    low = content_height + 1;
+                } else {
+                    high = content_height - 1;
+                }
+            }
+            Ok(best)
+        };
+
+        let mut target_height = align(height);
+        let mut target_width = align(width);
+        let target_volume = volume(aligned_frames, target_height, target_width);
+        if target_volume > max_pixels as u128 {
+            (target_height, target_width) = fit_within_budget()?;
+        } else if target_volume < min_pixels as u128 {
+            let source_volume = num_frames as f64 * height as f64 * width as f64;
+            let scale = (min_pixels as f64 / source_volume).sqrt();
+            target_height = align(((height as f64 * scale).ceil() as usize).max(1));
+            target_width = align(((width as f64 * scale).ceil() as usize).max(1));
+            if volume(aligned_frames, target_height, target_width) > max_pixels as u128 {
+                (target_height, target_width) = fit_within_budget()?;
+            }
+        }
+
+        let mut scale =
+            (target_height as f64 / height as f64).min(target_width as f64 / width as f64);
+        if volume(num_frames, height, width) >= min_pixels as u128 {
+            scale = scale.min(1.0);
+        }
+        let content_height = ((height as f64 * scale).floor() as usize).clamp(1, target_height);
+        let content_width = ((width as f64 * scale).floor() as usize).clamp(1, target_width);
+
+        Ok((target_height, target_width, content_height, content_width))
+    }
+
+    fn image_resize_geometry(
+        &self,
+        height: usize,
+        width: usize,
+    ) -> Result<(usize, usize, usize, usize), TransformError> {
+        match self.config.spatial_resize_mode {
+            QwenSpatialResizeMode::Stretch => {
+                let (target_height, target_width) = self.qwen_smart_resize(height, width)?;
+                Ok((target_height, target_width, target_height, target_width))
+            }
+            QwenSpatialResizeMode::AlignedCanvas { .. } => self.aligned_canvas_geometry(
+                self.config.temporal_patch_size,
+                height,
+                width,
+                self.config.min_pixels,
+                self.config.max_pixels,
+            ),
+        }
+    }
+
+    fn video_resize_geometry(
+        &self,
+        num_frames: usize,
+        height: usize,
+        width: usize,
+    ) -> Result<(usize, usize, usize, usize), TransformError> {
+        match self.config.spatial_resize_mode {
+            QwenSpatialResizeMode::Stretch => {
+                let (target_height, target_width) =
+                    self.qwen_smart_resize_video(num_frames, height, width)?;
+                Ok((target_height, target_width, target_height, target_width))
+            }
+            QwenSpatialResizeMode::AlignedCanvas { .. } => self.aligned_canvas_geometry(
+                num_frames,
+                height,
+                width,
+                self.config.video_min_pixels,
+                self.config.video_max_pixels,
+            ),
+        }
+    }
+
+    /// Compute the aligned image canvas dimensions.
+    pub fn smart_resize(
+        &self,
+        height: usize,
+        width: usize,
+    ) -> Result<(usize, usize), TransformError> {
+        self.image_resize_geometry(height, width)
+            .map(|(target_height, target_width, _, _)| (target_height, target_width))
+    }
+
+    /// Compute the aligned video-frame canvas dimensions.
+    pub fn smart_resize_video(
+        &self,
+        num_frames: usize,
+        height: usize,
+        width: usize,
+    ) -> Result<(usize, usize), TransformError> {
+        self.video_resize_geometry(num_frames, height, width)
+            .map(|(target_height, target_width, _, _)| (target_height, target_width))
     }
 
     /// Calculate the grid dimensions (T, H, W) for an image.
@@ -1103,8 +1330,10 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         for image in images {
             let (w, h) = image.dimensions();
             item_sizes.push((w, h));
-            let (target_h, target_w) = self.smart_resize(h as usize, w as usize)?;
+            let (target_h, target_w, content_h, content_w) =
+                self.image_resize_geometry(h as usize, w as usize)?;
             let (tw32, th32) = (target_w as u32, target_h as u32);
+            let (cw32, ch32) = (content_w as u32, content_h as u32);
             let (grid_t, grid_h, grid_w) = self.calculate_grid_thw(target_h, target_w, 1);
             let num_patches = grid_t
                 .checked_mul(grid_h)
@@ -1132,7 +1361,10 @@ impl VisionPreProcessor for QwenVLProcessorBase {
             image_plans.push(QwenImagePlan {
                 target_width: tw32,
                 target_height: th32,
-                needs_resize: do_resize && (w != tw32 || h != th32),
+                content_width: cw32,
+                content_height: ch32,
+                needs_resize: do_resize && (w != cw32 || h != ch32),
+                needs_pad: do_resize && (cw32 != tw32 || ch32 != th32),
                 grid_t,
                 grid_h,
                 grid_w,
@@ -1150,13 +1382,33 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         for (image, plan) in images.iter().zip(image_plans) {
             // Resize to the image's own target size (skip if dimensions match)
             let resized;
-            let img_ref = if plan.needs_resize {
+            let padded;
+            let img_ref = if plan.needs_pad {
+                let (_, _, data) = prepare_dynamic_frame_to_raw(
+                    image,
+                    plan.target_width,
+                    plan.target_height,
+                    plan.content_width,
+                    plan.content_height,
+                    filter,
+                    true,
+                )?;
+                let rgb = RgbImage::from_raw(plan.target_width, plan.target_height, data)
+                    .ok_or_else(|| {
+                        TransformError::ShapeError(format!(
+                            "failed to build padded RGB image {}x{}",
+                            plan.target_width, plan.target_height
+                        ))
+                    })?;
+                padded = DynamicImage::ImageRgb8(rgb);
+                &padded
+            } else if plan.needs_resize {
                 // BICUBIC (Qwen default) uses the PIL-compatible path; other
                 // filters keep the SIMD path.
                 resized = if filter == FilterType::CatmullRom {
-                    resize_bicubic_pil(image, plan.target_width, plan.target_height)
+                    resize_bicubic_pil(image, plan.content_width, plan.content_height)
                 } else {
-                    resize(image, plan.target_width, plan.target_height, filter)
+                    resize(image, plan.content_width, plan.content_height, filter)
                 };
                 &resized
             } else {
@@ -1231,27 +1483,32 @@ impl VisionPreProcessor for QwenVLProcessorBase {
                 &mut frame_rgbs,
                 |frame_index| {
                     let frame = &frames[frame_index];
-                    let needs_resize = plan.do_resize
-                        && (frame.width() != plan.target_width
-                            || frame.height() != plan.target_height);
-                    if needs_resize {
-                        let (width, height, data) = resize_dynamic_frame_to_raw(
-                            frame,
-                            plan.target_width,
-                            plan.target_height,
-                            plan.filter,
-                        );
-                        Ok(VideoFrameRgb {
-                            width,
-                            height,
-                            data: Cow::Owned(data),
-                        })
-                    } else {
+                    if !plan.do_resize
+                        || (frame.width() == plan.target_width
+                            && frame.height() == plan.target_height
+                            && plan.content_width == plan.target_width
+                            && plan.content_height == plan.target_height)
+                    {
                         let (width, height, data) = rgb_bytes(frame);
                         Ok(VideoFrameRgb {
                             width,
                             height,
                             data,
+                        })
+                    } else {
+                        let (width, height, data) = prepare_dynamic_frame_to_raw(
+                            frame,
+                            plan.target_width,
+                            plan.target_height,
+                            plan.content_width,
+                            plan.content_height,
+                            plan.filter,
+                            true,
+                        )?;
+                        Ok(VideoFrameRgb {
+                            width,
+                            height,
+                            data: Cow::Owned(data),
                         })
                     }
                 },
@@ -1326,6 +1583,8 @@ impl VisionPreProcessor for QwenVLProcessorBase {
                                 temporal_patch_size,
                                 plan.target_width,
                                 plan.target_height,
+                                plan.content_width,
+                                plan.content_height,
                                 plan.filter,
                                 plan.do_resize,
                             )?;
@@ -1395,6 +1654,7 @@ mod tests {
             video_min_pixels: 256 * 28 * 28,
             video_max_pixels: 1280 * 28 * 28,
             video_resize_mode: QwenVideoResizeMode::TotalVolume,
+            spatial_resize_mode: QwenSpatialResizeMode::Stretch,
             temporal_patch_size: 2,
             mean: [0.5, 0.5, 0.5],
             std: [0.5, 0.5, 0.5],
@@ -1411,6 +1671,7 @@ mod tests {
             video_min_pixels: 1,
             video_max_pixels: 1024 * 1024,
             video_resize_mode: QwenVideoResizeMode::TotalVolume,
+            spatial_resize_mode: QwenSpatialResizeMode::Stretch,
             temporal_patch_size: 2,
             mean: [0.5, 0.25, 0.75],
             std: [0.5, 0.25, 0.5],
@@ -1737,6 +1998,7 @@ mod tests {
             video_min_pixels: 1,
             video_max_pixels: 16_777_216,
             video_resize_mode: QwenVideoResizeMode::TotalVolume,
+            spatial_resize_mode: QwenSpatialResizeMode::Stretch,
             temporal_patch_size: 2,
             mean: [0.5; 3],
             std: [0.5; 3],

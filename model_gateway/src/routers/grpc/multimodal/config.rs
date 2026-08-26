@@ -93,16 +93,13 @@ impl MultimodalConfigRegistry {
         // its own model-specific defaults, so missing/unparsable files fall
         // back to `PreProcessorConfig::default()`. This matches the bundle
         // preload path in `try_load_multimodal_config`.
-        let pp_config_path = base_dir.join("preprocessor_config.json");
-        let preprocessor_config =
-            load_preprocessor_config_file(&pp_config_path, "preprocessor_config.json")
-                .unwrap_or_else(|| {
-                    debug!(
-                        path = %pp_config_path.display(),
-                        "No preprocessor_config.json found; using PreProcessorConfig defaults"
-                    );
-                    PreProcessorConfig::default()
-                });
+        let preprocessor_config = load_image_preprocessor_config(&base_dir).unwrap_or_else(|| {
+            debug!(
+                path = %base_dir.display(),
+                "No image preprocessor config found; using PreProcessorConfig defaults"
+            );
+            PreProcessorConfig::default()
+        });
         let video_preprocessor_config = load_video_preprocessor_config(&base_dir);
 
         let model_config = Arc::new(MultimodalModelConfig {
@@ -164,6 +161,16 @@ pub(crate) fn load_video_preprocessor_config(base_dir: &Path) -> Option<PreProce
         return Some(config);
     }
 
+    load_nested_preprocessor_config(base_dir, "video_processor")
+}
+
+pub(crate) fn load_image_preprocessor_config(base_dir: &Path) -> Option<PreProcessorConfig> {
+    let image_path = base_dir.join("preprocessor_config.json");
+    load_preprocessor_config_file(&image_path, "preprocessor_config.json")
+        .or_else(|| load_nested_preprocessor_config(base_dir, "image_processor"))
+}
+
+fn load_nested_preprocessor_config(base_dir: &Path, section: &str) -> Option<PreProcessorConfig> {
     let processor_path = base_dir.join("processor_config.json");
     if !processor_path.exists() {
         return None;
@@ -177,20 +184,20 @@ pub(crate) fn load_video_preprocessor_config(base_dir: &Path) -> Option<PreProce
         None => {
             warn!(
                 path = %processor_path.display(),
-                "Failed to load processor_config.json for video_processor"
+                "Failed to load processor_config.json for {section}"
             );
             return None;
         }
     };
 
-    let video_processor = processor_config.get("video_processor")?;
-    match PreProcessorConfig::from_value(video_processor.clone()) {
+    let nested = processor_config.get(section)?;
+    match PreProcessorConfig::from_value(nested.clone()) {
         Ok(config) => Some(config),
         Err(error) => {
             warn!(
                 path = %processor_path.display(),
                 error = %error,
-                "Failed to parse video_processor from processor_config.json"
+                "Failed to parse {section} from processor_config.json"
             );
             None
         }
@@ -309,6 +316,33 @@ mod tests {
             Some("Qwen3VLVideoProcessor")
         );
         assert_eq!(config.do_resize, Some(true));
+    }
+
+    #[test]
+    fn load_image_preprocessor_config_reads_nested_processor_key() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("processor_config.json"),
+            r#"{
+                "image_processor": {
+                    "image_processor_type": "Glm5NextImageProcessor",
+                    "min_image_tokens": 16,
+                    "max_image_tokens": 8000,
+                    "patch_expand_factor": 1
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = load_image_preprocessor_config(tmp.path())
+            .expect("nested image_processor should parse");
+        assert_eq!(
+            config.image_processor_type.as_deref(),
+            Some("Glm5NextImageProcessor")
+        );
+        assert_eq!(config.min_image_tokens, Some(16));
+        assert_eq!(config.max_image_tokens, Some(8000));
+        assert_eq!(config.patch_expand_factor, Some(1));
     }
 
     #[tokio::test]
