@@ -11,6 +11,7 @@ use openai_protocol::{
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
+use super::discover_dp::DpInfo;
 use crate::{
     routers::grpc::zmq_client::zmq_handshake_address,
     worker::{
@@ -225,18 +226,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         let health_endpoint = &app_context.router_config.health_check.endpoint;
 
         let dp_ranks: Vec<Option<(usize, usize)>> = if app_context.router_config.dp_aware {
-            // dp_info == None means the engine advertised no dp_size label
-            // (it cannot honor a rank pin): register a plain single worker
-            // instead of failing; discover_dp already logged the degradation.
-            match context.data.dp_info.as_ref() {
-                Some(dp_info) => {
-                    validate_zmq_dp(*connection_mode, dp_info.dp_size, &config.url)?;
-                    (0..dp_info.dp_size)
-                        .map(|r| Some((r, dp_info.dp_size)))
-                        .collect()
-                }
-                None => vec![None],
-            }
+            dp_rank_expansion(context.data.dp_info.as_ref(), *connection_mode, &config.url)?
         } else {
             vec![None] // single worker, no DP
         };
@@ -709,6 +699,28 @@ fn validate_zmq_worker_type(
 /// on the worker spec: one worker, one socket set, N engines dialing in), so
 /// reject the expansion loudly and point at the grouped form. gRPC/HTTP
 /// expansion and single-engine ZMQ are fine.
+/// Ranks to register for a dp-aware worker. A width above one expands into
+/// one dp-annotated worker per rank. A width-1 advertisement (older
+/// servicers emit it as a capability signal) and a missing one both
+/// register a plain worker: there is no placement to choose, and pinning
+/// rank 0 anyway still alters engine-side scheduling. discover_dp already
+/// logged the degradation for the missing-label case.
+fn dp_rank_expansion(
+    dp_info: Option<&DpInfo>,
+    connection_mode: ConnectionMode,
+    url: &str,
+) -> Result<Vec<Option<(usize, usize)>>, WorkflowError> {
+    match dp_info {
+        Some(dp_info) if dp_info.dp_size > 1 => {
+            validate_zmq_dp(connection_mode, dp_info.dp_size, url)?;
+            Ok((0..dp_info.dp_size)
+                .map(|r| Some((r, dp_info.dp_size)))
+                .collect())
+        }
+        Some(_) | None => Ok(vec![None]),
+    }
+}
+
 fn validate_zmq_dp(
     connection_mode: ConnectionMode,
     dp_size: usize,
@@ -729,6 +741,33 @@ fn validate_zmq_dp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dp_expansion_pins_only_multi_rank_widths() {
+        let multi = DpInfo {
+            dp_size: 3,
+            model_id: "m".to_string(),
+        };
+        assert_eq!(
+            dp_rank_expansion(Some(&multi), ConnectionMode::Grpc, "grpc://w:1").unwrap(),
+            vec![Some((0, 3)), Some((1, 3)), Some((2, 3))]
+        );
+
+        // Width 1 is a capability-only advertisement: no placement exists,
+        // and a rank-0 pin would still alter engine scheduling.
+        let single = DpInfo {
+            dp_size: 1,
+            model_id: "m".to_string(),
+        };
+        assert_eq!(
+            dp_rank_expansion(Some(&single), ConnectionMode::Grpc, "grpc://w:1").unwrap(),
+            vec![None]
+        );
+        assert_eq!(
+            dp_rank_expansion(None, ConnectionMode::Grpc, "grpc://w:1").unwrap(),
+            vec![None]
+        );
+    }
 
     #[test]
     fn normalize_url_preserves_existing_schemes() {

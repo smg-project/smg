@@ -115,13 +115,15 @@ class TestGetServerInfoDpSizeAdvertisement:
         )
         assert "dp_size" not in info.server_args
 
-    def test_dp_off_still_advertises_single_rank(self, monkeypatch):
-        # Under a dp-aware gateway a missing label is a hard registration
-        # failure, so a pin-capable engine with DP off advertises width 1.
+    def test_single_rank_width_is_not_advertised(self, monkeypatch):
+        # A width-1 pin has no placement to choose, and an explicit pin
+        # still changes engine-side scheduling. Dp-aware gateways degrade
+        # a missing label to a plain worker, so DP-off engines stay
+        # label-free.
         monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: True)
         info = asyncio.run(
             _make_info_servicer(1).GetServerInfo(
                 tokenspeed_scheduler_pb2.GetServerInfoRequest(), None
             )
         )
-        assert info.server_args["dp_size"] == 1
+        assert "dp_size" not in info.server_args

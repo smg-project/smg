@@ -573,9 +573,11 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 "dp_size",
                 None,
             )
-            # >= 1 (not > 1): a pin-capable engine advertises even a
-            # single-rank width, keeping label semantics = capability.
-            if isinstance(dp_size, int) and dp_size >= 1:
+            # > 1 only: a width-1 pin has no placement to choose, yet an
+            # explicit pin still changes engine-side scheduling. Dp-aware
+            # gateways degrade a missing label to a plain worker, so
+            # single-rank engines simply stay label-free.
+            if isinstance(dp_size, int) and dp_size > 1:
                 server_args_dict["dp_size"] = dp_size
 
         server_args_struct = Struct()
