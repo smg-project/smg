@@ -7,7 +7,10 @@ use axum::response::Response;
 use futures::future::{join_all, try_join_all};
 use tracing::{debug, error, info_span, Instrument};
 
-use super::PipelineStage;
+use super::{
+    pd_protocol::{DpPlacement, PdDispatch, PdProtocol},
+    PipelineStage,
+};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
@@ -29,7 +32,7 @@ use crate::{
             utils::tonic_ext::{TonicResultExt, TonicStatusExt},
         },
     },
-    worker::{ConnectionModeExt, RuntimeType},
+    worker::ConnectionModeExt,
 };
 
 type StreamResult = Result<ProtoStream, tonic::Status>;
@@ -171,45 +174,39 @@ impl RequestExecutionStage {
         workers: &WorkerSelection,
         model: &str,
     ) -> Result<ExecutionResult, Response> {
-        // Dispatch based on runtime type:
-        // - SGLang: parallel prefill/decode dispatch with bootstrap metadata
-        // - vLLM: sequential prefill-then-decode with kv_transfer_params relay
-        let runtime_type = workers.disaggregated_runtime_type();
-        match runtime_type {
-            Some(RuntimeType::Vllm) => {
+        let Some(runtime_type) = workers.disaggregated_runtime_type() else {
+            error!(
+                function = "RequestExecutionStage::execute",
+                "PD mode requires disaggregated worker selection"
+            );
+            return Err(error::internal_error(
+                "pd_mode_requires_disaggregated_workers",
+                "PD mode requires disaggregated worker selection",
+            ));
+        };
+        let Some(protocol) = PdProtocol::for_runtime(*runtime_type) else {
+            error!(
+                function = "RequestExecutionStage::execute",
+                runtime_type = ?runtime_type,
+                "Runtime does not support PD disaggregated mode"
+            );
+            return Err(error::bad_request(
+                "runtime_pd_not_supported",
+                "This runtime does not support PD disaggregated mode",
+            ));
+        };
+        // Dispatch shape comes from the per-runtime PD protocol table (see
+        // `PdProtocol::for_runtime`): sequential legs relay the KV handoff
+        // through the router, parallel legs rendezvous on bootstrap info
+        // carried in the request.
+        match protocol.dispatch {
+            PdDispatch::Sequential => {
                 self.execute_sequential_pd(proto_request, clients, workers, model)
                     .await
             }
-            Some(RuntimeType::Sglang) | Some(RuntimeType::TokenSpeed) => {
-                // These runtimes carry bootstrap rendezvous in the request
-                // and use parallel prefill/decode dispatch.
-                self.execute_parallel_pd(proto_request, clients, workers)
+            PdDispatch::Parallel => {
+                self.execute_parallel_pd(proto_request, clients, workers, protocol)
                     .await
-            }
-            Some(RuntimeType::Trtllm)
-            | Some(RuntimeType::Mlx)
-            | Some(RuntimeType::Generic)
-            | Some(RuntimeType::External)
-            | Some(RuntimeType::Unspecified) => {
-                error!(
-                    function = "RequestExecutionStage::execute",
-                    runtime_type = ?runtime_type,
-                    "Runtime does not support PD disaggregated mode"
-                );
-                Err(error::bad_request(
-                    "runtime_pd_not_supported",
-                    "This runtime does not support PD disaggregated mode",
-                ))
-            }
-            None => {
-                error!(
-                    function = "RequestExecutionStage::execute",
-                    "PD mode requires disaggregated worker selection"
-                );
-                Err(error::internal_error(
-                    "pd_mode_requires_disaggregated_workers",
-                    "PD mode requires disaggregated worker selection",
-                ))
             }
         }
     }
@@ -376,6 +373,7 @@ impl RequestExecutionStage {
         proto_request: ProtoGenerateRequest,
         clients: &mut ClientSelection,
         workers: &WorkerSelection,
+        protocol: PdProtocol,
     ) -> Result<ExecutionResult, Response> {
         let runtime = workers
             .disaggregated_runtime_type()
@@ -400,11 +398,11 @@ impl RequestExecutionStage {
         let mut prefill_request = proto_request;
         let mut decode_request = prefill_request.clone_without_mm_pixels();
         decode_request.clear_encode_bootstrap_info();
-        // TokenSpeed disaggregation engines route both sides by
-        // `bootstrap_room % dp_size` (minted residue-aligned in
-        // maybe_inject_pd_rendezvous); a pin is ignored there, and a
-        // mismatched decode-leg pin would spam conflict warnings.
-        if workers.disaggregated_runtime_type().copied() != Some(RuntimeType::TokenSpeed) {
+        // Pin each leg's DP rank only when the engine reads placement from
+        // the request field; `RoomResidue` engines take it from the bootstrap
+        // room minted in maybe_inject_pd_rendezvous, ignore the pin, and spam
+        // conflict warnings on a mismatched decode-leg pin.
+        if protocol.dp_placement == DpPlacement::PinField {
             if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
                 prefill_request.set_data_parallel_rank(rank as i32);
             }
@@ -751,7 +749,7 @@ mod tests {
     use smg_grpc_client::{tokenspeed_proto as ts, vllm_proto as vllm};
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerType};
+    use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType};
 
     #[test]
     fn pd_leg_labels_reflect_each_legs_transport() {
