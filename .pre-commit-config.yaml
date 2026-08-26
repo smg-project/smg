@@ -94,6 +94,22 @@ repos:
         stages: [commit-msg]
         always_run: true
 
+      - id: check-action-pins
+        name: Action SHA pins
+        description: Third-party GitHub Actions must be pinned to commit SHAs
+        entry: python3 scripts/check_action_pins.py
+        language: system
+        files: ^\.github/
+        pass_filenames: false
+
+      - id: check-action-pins-selftest
+        name: Action SHA pins (self-test)
+        description: Run the pin checker's case table when the checker itself changes
+        entry: python3 scripts/check_action_pins.py --test
+        language: system
+        files: ^scripts/check_action_pins\.py$
+        pass_filenames: false
+
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.0
     hooks:

@@ -42,7 +42,7 @@ jobs:
           - crate: engine-zmq-client
             path: crates/engine_zmq_client
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/publish-crate
         with:
           crate: ${{ matrix.crate }}
@@ -70,7 +70,7 @@ jobs:
           - crate: llm-tokenizer
             path: crates/tokenizer
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/publish-crate
         with:
           crate: ${{ matrix.crate }}
@@ -82,7 +82,7 @@ jobs:
     needs: tier2
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/publish-crate
         with:
           crate: llm-multimodal
@@ -94,7 +94,7 @@ jobs:
     needs: tier3
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/publish-crate
         with:
           crate: smg

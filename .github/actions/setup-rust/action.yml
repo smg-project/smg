@@ -19,13 +19,13 @@ runs:
       run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
 
     - name: Configure sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
+      uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       with:
         version: ${{ inputs.sccache-version }}
         disable_annotations: true
 
     - name: Rust cache
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         workspaces: .
         # The Go FFI build (bindings/golang/Makefile) overrides CARGO_TARGET_DIR
