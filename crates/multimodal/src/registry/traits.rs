@@ -1,6 +1,5 @@
 use std::{collections::HashMap, sync::OnceLock};
 
-use llm_tokenizer::TokenizerTrait;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -112,10 +111,28 @@ pub enum MediaPartOrder {
     Authored,
 }
 
+/// The tokenizer surface the registry needs: resolving placeholder and
+/// structural token ids, and encoding the short text fragments some families
+/// splice into their media wrappers (e.g. an `image {W}x{H}` header).
+///
+/// Deliberately local: callers adapt whatever tokenizer they hold to this
+/// trait, and this crate stays free of any tokenizer crate's dependency tree.
+pub trait Tokenizer: Send + Sync {
+    /// The token id for a token string, if the vocabulary knows it.
+    fn token_to_id(&self, token: &str) -> Option<u32>;
+
+    /// The token string for a token id, if the vocabulary knows it.
+    fn id_to_token(&self, id: u32) -> Option<String>;
+
+    /// Encode plain text (no special tokens) into token ids; `None` when the
+    /// text cannot be encoded.
+    fn encode_text(&self, text: &str) -> Option<Vec<u32>>;
+}
+
 /// Metadata about the current model used to derive tokenizer/config dependent fields.
 pub struct ModelMetadata<'a> {
     pub model_id: &'a str,
-    pub tokenizer: &'a dyn TokenizerTrait,
+    pub tokenizer: &'a dyn Tokenizer,
     pub config: &'a Value,
 }
 

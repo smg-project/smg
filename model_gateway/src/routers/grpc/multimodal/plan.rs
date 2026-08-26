@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use llm_multimodal::{MediaContentPart, MediaPartOrder, Modality, ModelMetadata};
 use llm_tokenizer::TokenizerTrait;
 
-use super::config::MultimodalComponents;
+use super::{config::MultimodalComponents, RegistryTokenizer};
 
 /// Ordered media extracted from an API request.
 ///
@@ -105,9 +105,10 @@ pub(crate) async fn prepare_placeholder_tokens(
         .config_registry
         .get_or_load(tokenizer_id, tokenizer_source)
         .await?;
+    let registry_tokenizer = RegistryTokenizer(tokenizer);
     let metadata = ModelMetadata {
         model_id,
-        tokenizer,
+        tokenizer: &registry_tokenizer,
         config: &model_config.config,
     };
     let spec = components
@@ -161,9 +162,10 @@ pub(crate) async fn resolve_media_part_order(
         Ok(config) => config,
         Err(_) => return MediaPartOrder::MediaFirst,
     };
+    let registry_tokenizer = RegistryTokenizer(tokenizer);
     let metadata = ModelMetadata {
         model_id,
-        tokenizer,
+        tokenizer: &registry_tokenizer,
         config: &model_config.config,
     };
     components

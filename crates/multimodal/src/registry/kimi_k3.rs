@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use llm_tokenizer::Encoding;
 use serde_json::{json, Value};
 
 use crate::{
@@ -45,18 +44,13 @@ impl KimiK3VisionSpec {
     /// segment boundaries for the encoder, so encoding it alone yields the same
     /// ids as the reference's one-shot encoding of the whole block.
     fn encode_plain_text(metadata: &ModelMetadata, text: &str) -> RegistryResult<Vec<TokenId>> {
-        let encoding = metadata.tokenizer.encode(text, false).map_err(|_| {
+        let ids = metadata.tokenizer.encode_text(text).ok_or_else(|| {
             ModelRegistryError::TextEncodingFailed {
                 spec: "kimi_k3",
                 text: text.to_string(),
             }
         })?;
-        Ok(match encoding {
-            Encoding::Hf(inner) => inner.get_ids().iter().map(|&id| id as TokenId).collect(),
-            Encoding::Plain(ids) | Encoding::Tiktoken(ids) => {
-                ids.into_iter().map(|id| id as TokenId).collect()
-            }
-        })
+        Ok(ids.into_iter().map(|id| id as TokenId).collect())
     }
 }
 

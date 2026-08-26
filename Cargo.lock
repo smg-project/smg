@@ -3882,7 +3882,6 @@ dependencies = [
  "http",
  "image",
  "libloading",
- "llm-tokenizer",
  "ndarray",
  "npyz",
  "once_cell",

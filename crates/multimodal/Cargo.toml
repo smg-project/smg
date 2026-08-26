@@ -48,7 +48,6 @@ tracing.workspace = true
 url = "2.5.8"
 
 # Workspace crates
-llm-tokenizer.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 

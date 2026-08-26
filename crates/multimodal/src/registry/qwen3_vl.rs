@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use llm_tokenizer::Encoding;
 use serde_json::{json, Value};
 
 use crate::{
@@ -69,18 +68,8 @@ impl Qwen3VLVisionSpec {
     fn encode_plain_text(metadata: &ModelMetadata, text: &str) -> Vec<TokenId> {
         metadata
             .tokenizer
-            .encode(text, false)
-            .ok()
-            .map(|encoding| match encoding {
-                Encoding::Hf(inner) => inner
-                    .get_ids()
-                    .iter()
-                    .map(|&id| id as TokenId)
-                    .collect::<Vec<_>>(),
-                Encoding::Plain(ids) | Encoding::Tiktoken(ids) => {
-                    ids.into_iter().map(|id| id as TokenId).collect()
-                }
-            })
+            .encode_text(text)
+            .map(|ids| ids.into_iter().map(|id| id as TokenId).collect())
             .unwrap_or_default()
     }
 
