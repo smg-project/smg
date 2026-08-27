@@ -196,8 +196,8 @@ pub(crate) fn load_video_preprocessor_config(base_dir: &Path) -> Option<PreProce
 
 pub(crate) fn load_image_preprocessor_config(base_dir: &Path) -> Option<PreProcessorConfig> {
     let image_path = base_dir.join("preprocessor_config.json");
-    if image_path.exists() {
-        return load_preprocessor_config_file(&image_path, "preprocessor_config.json");
+    if let Some(config) = load_preprocessor_config_file(&image_path, "preprocessor_config.json") {
+        return Some(config);
     }
 
     let processor_path = base_dir.join("processor_config.json");
@@ -352,11 +352,19 @@ mod tests {
             Some("LegacyImageProcessor")
         );
 
-        fs::remove_file(legacy_path).unwrap();
+        fs::write(&legacy_path, "{malformed-json").unwrap();
         let nested = load_image_preprocessor_config(tmp.path())
-            .expect("nested image_processor fallback should parse");
+            .expect("malformed legacy config should fall back to nested image_processor");
         assert_eq!(
             nested.image_processor_type.as_deref(),
+            Some("NestedImageProcessor")
+        );
+
+        fs::remove_file(legacy_path).unwrap();
+        let nested_without_legacy = load_image_preprocessor_config(tmp.path())
+            .expect("missing legacy config should fall back to nested image_processor");
+        assert_eq!(
+            nested_without_legacy.image_processor_type.as_deref(),
             Some("NestedImageProcessor")
         );
     }

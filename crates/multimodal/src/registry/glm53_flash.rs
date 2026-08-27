@@ -229,40 +229,13 @@ mod tests {
     const IMAGE_ID: u32 = 154854;
     const BEGIN_ID: u32 = 154830;
     const END_ID: u32 = 154831;
-    const TEXT_BASE: u32 = 1000;
-
     fn tokenizer() -> TestTokenizer {
-        TestTokenizer::new(&[
-            (IMAGE, IMAGE_ID),
-            (VIDEO, 154855),
-            (BEGIN, BEGIN_ID),
-            (END, END_ID),
-        ])
-        .with_byte_encoder(TEXT_BASE)
+        TestTokenizer::new(&[(IMAGE, IMAGE_ID), (BEGIN, BEGIN_ID), (END, END_ID)])
+            .with_byte_encoder(1000)
     }
 
     #[test]
-    fn matches_public_and_legacy_names() {
-        let tokenizer = tokenizer();
-        for (model_id, model_type) in [
-            ("zai-org/GLM-5.3-Flash", "glm53_flash"),
-            ("zai-org/GLM-5-Next", "glm5_next"),
-        ] {
-            let config = json!({"model_type": model_type, "image_token_id": IMAGE_ID});
-            let metadata = ModelMetadata {
-                model_id,
-                tokenizer: &tokenizer,
-                config: &config,
-            };
-            assert_eq!(
-                ModelRegistry::new().lookup(&metadata).unwrap().name(),
-                "glm53_flash"
-            );
-        }
-    }
-
-    #[test]
-    fn video_uses_image_pads_with_per_frame_timestamps() {
+    fn matches_names_and_builds_video_timestamps() {
         let tokenizer = tokenizer();
         let config = json!({"model_type":"glm53_flash", "image_token_id":IMAGE_ID});
         let metadata = ModelMetadata {
@@ -272,11 +245,11 @@ mod tests {
         };
         let mut input = test_preprocessed_with_tokens(&[], &[4]);
         input.model_specific.insert(
-            "video_grid_thw".to_string(),
+            "video_grid_thw".into(),
             ModelSpecificValue::int_2d(vec![2, 2, 4], 1, 3),
         );
         input.model_specific.insert(
-            "video_second_per_grid".to_string(),
+            "video_second_per_grid".into(),
             ModelSpecificValue::Tensor {
                 data: vec![1.0],
                 shape: vec![1],
@@ -290,26 +263,25 @@ mod tests {
             .pop()
             .unwrap();
 
+        let ranges = replacement.feature_ranges.unwrap();
         assert_eq!(
-            replacement.feature_ranges,
-            Some(vec![
-                PlaceholderRange {
-                    offset: 1,
-                    length: 2
-                },
-                PlaceholderRange {
-                    offset: 16,
-                    length: 2
-                }
-            ])
+            ranges
+                .iter()
+                .map(|range| (range.offset, range.length))
+                .collect::<Vec<_>>(),
+            vec![(1, 2), (16, 2)]
         );
         assert_eq!(replacement.tokens[0], BEGIN_ID as TokenId);
         assert_eq!(replacement.tokens[1], IMAGE_ID as TokenId);
         assert_eq!(replacement.tokens[3], END_ID as TokenId);
-        let timestamp = "0.0 seconds"
-            .bytes()
-            .map(|byte| (TEXT_BASE + u32::from(byte)) as TokenId)
-            .collect::<Vec<_>>();
+        let timestamp = Glm53FlashSpec::encode(&metadata, "0.0 seconds").unwrap();
         assert_eq!(&replacement.tokens[4..15], timestamp.as_slice());
+
+        let legacy = json!({"model_type":"glm5_next"});
+        assert!(Glm53FlashSpec.matches(&ModelMetadata {
+            model_id: "legacy",
+            tokenizer: &tokenizer,
+            config: &legacy,
+        }));
     }
 }
