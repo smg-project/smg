@@ -1943,7 +1943,7 @@ mod native_loads_tests {
     #[tokio::test]
     async fn disable_load_monitoring_restores_the_conditional_gate() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
-        let (registry, monitor) = monitor_with(cache_aware_policy_config(0.0), true);
+        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, true);
         let worker = vllm_worker(&stub.url);
         worker.set_status(WorkerStatus::Ready);
         registry.register(worker).unwrap();

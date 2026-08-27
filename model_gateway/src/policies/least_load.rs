@@ -8,7 +8,7 @@ use rand::RngExt;
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
-use crate::worker::Worker;
+use crate::worker::{load_state::LoadSnapshot, Worker};
 
 /// Default KV-pressure weight `λ_t` (seconds): the time-cost of KV contention,
 /// chosen commensurate with the expected-queue-wait term so the two add cleanly.
@@ -170,6 +170,25 @@ impl LeastLoadPolicy {
         )
     }
 
+    /// Test-only view of one worker's backend-snapshot presence and atomic
+    /// since-poll dispatch credit: `(has_load, tokens, requests)`.
+    #[cfg(test)]
+    pub(super) fn load_state_for_test(&self, url: &str) -> (bool, u64, u64) {
+        let has_load = self
+            .cached_loads
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(url);
+        let dispatch = self
+            .inflight_tokens
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(url)
+            .copied()
+            .unwrap_or_default();
+        (has_load, dispatch.tokens, dispatch.requests)
+    }
+
     /// Expected-wait score for a worker (lower is better).
     ///
     /// `inflight` maps worker URL -> token-work dispatched since its last poll.
@@ -182,12 +201,13 @@ impl LeastLoadPolicy {
         &self,
         worker: &Arc<dyn Worker>,
         loads: Option<&HashMap<String, WorkerLoadResponse>>,
+        complete_snapshot: Option<&LoadSnapshot>,
         inflight: &HashMap<String, SincePollDispatch>,
         nominal_throughput: f64,
         fleet_has_loads: bool,
     ) -> f64 {
         let url = worker.url();
-        match loads.and_then(|m| m.get(url)) {
+        match Self::fresh_load(loads, complete_snapshot, url) {
             Some(load) => {
                 let inflight_tokens = inflight.get(url).copied().unwrap_or_default().tokens as f64;
                 let queued_tokens = self.queued_tokens(load);
@@ -211,6 +231,21 @@ impl LeastLoadPolicy {
             // loads): join-shortest-queue on live in-flight.
             None => worker.load() as f64,
         }
+    }
+
+    /// Look up a poll-fed load only while the complete WorkerMonitor snapshot
+    /// still contains that URL. The published values are deliberately not used
+    /// for scoring: `update_loads` is the boundary that pairs each successful
+    /// worker's new load with its since-poll credit reset.
+    fn fresh_load<'a>(
+        loads: Option<&'a HashMap<String, WorkerLoadResponse>>,
+        complete_snapshot: Option<&LoadSnapshot>,
+        url: &str,
+    ) -> Option<&'a WorkerLoadResponse> {
+        if complete_snapshot.is_some_and(|snapshot| snapshot.get(url).is_none()) {
+            return None;
+        }
+        loads.and_then(|map| map.get(url))
     }
 
     /// Waiting-queue token-work for a worker.
@@ -250,6 +285,21 @@ impl LeastLoadPolicy {
         info: &SelectWorkerInfo,
         policy: &'static str,
     ) -> Option<usize> {
+        self.select_min_expected_wait_with_freshness(workers, candidates, info, policy, None)
+    }
+
+    /// CacheAware supplies the complete WorkerMonitor snapshot so an
+    /// absent report cannot survive in this scorer's incremental poll cache.
+    /// Only candidate URLs are checked; this does not scan the snapshot or the
+    /// fleet, and selection plus winner credit remains one atomic operation.
+    pub(super) fn select_min_expected_wait_with_freshness(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        candidates: &[usize],
+        info: &SelectWorkerInfo,
+        policy: &'static str,
+        complete_snapshot: Option<&LoadSnapshot>,
+    ) -> Option<usize> {
         let loads_guard = self.cached_loads.read().ok();
         let loads = loads_guard.as_deref();
 
@@ -271,7 +321,7 @@ impl LeastLoadPolicy {
                 .copied()
                 .filter(|&i| {
                     let url = workers[i].url();
-                    match loads.and_then(|m| m.get(url)) {
+                    match Self::fresh_load(loads, complete_snapshot, url) {
                         Some(load) => {
                             let since_poll = inflight_guard
                                 .get(url)
@@ -294,7 +344,7 @@ impl LeastLoadPolicy {
         // from a fully dark fleet (fall back to join-shortest-queue).
         let (tp_sum, tp_count) = candidates
             .iter()
-            .filter_map(|&i| loads.and_then(|m| m.get(workers[i].url())))
+            .filter_map(|&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()))
             .map(|l| l.total_gen_throughput())
             .filter(|t| *t > 0.0)
             .fold((0.0, 0u32), |(s, n), t| (s + t, n + 1));
@@ -303,9 +353,9 @@ impl LeastLoadPolicy {
         } else {
             self.default_throughput
         };
-        let fleet_has_loads = loads
-            .map(|m| candidates.iter().any(|&i| m.contains_key(workers[i].url())))
-            .unwrap_or(false);
+        let fleet_has_loads = candidates
+            .iter()
+            .any(|&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()).is_some());
 
         // Held across selection so the in-flight estimate stays consistent and
         // the chosen worker can be credited before the guard is released.
@@ -322,6 +372,7 @@ impl LeastLoadPolicy {
         let mut best_score = self.score(
             &workers[best],
             loads,
+            complete_snapshot,
             &inflight,
             nominal_throughput,
             fleet_has_loads,
@@ -331,6 +382,7 @@ impl LeastLoadPolicy {
             let s = self.score(
                 &workers[idx],
                 loads,
+                complete_snapshot,
                 &inflight,
                 nominal_throughput,
                 fleet_has_loads,
@@ -366,6 +418,28 @@ impl LeastLoadPolicy {
         workers[best].increment_processed();
         Some(best)
     }
+
+    fn update_loads_inner<F>(&self, loads: &HashMap<String, WorkerLoadResponse>, after_publish: F)
+    where
+        F: FnOnce(),
+    {
+        // Selectors acquire these in the same order and retain the snapshot
+        // guard through winner credit. Holding both before either mutation
+        // makes snapshot publication and since-poll reset one critical section.
+        let Ok(mut cached) = self.cached_loads.write() else {
+            return;
+        };
+        let Ok(mut inflight) = self.inflight_tokens.write() else {
+            return;
+        };
+        cached.extend(loads.iter().map(|(k, v)| (k.clone(), v.clone())));
+        after_publish();
+        // A fresh snapshot already reflects work up to the poll, so reset the
+        // since-poll in-flight estimate for the workers it covers.
+        for url in loads.keys() {
+            inflight.insert(url.clone(), SincePollDispatch::default());
+        }
+    }
 }
 
 impl LoadBalancingPolicy for LeastLoadPolicy {
@@ -386,16 +460,7 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
     }
 
     fn update_loads(&self, loads: &HashMap<String, WorkerLoadResponse>) {
-        if let Ok(mut cached) = self.cached_loads.write() {
-            cached.extend(loads.iter().map(|(k, v)| (k.clone(), v.clone())));
-        }
-        // A fresh snapshot already reflects work up to the poll, so reset the
-        // since-poll in-flight estimate for the workers it covers.
-        if let Ok(mut inflight) = self.inflight_tokens.write() {
-            for url in loads.keys() {
-                inflight.insert(url.clone(), SincePollDispatch::default());
-            }
-        }
+        self.update_loads_inner(loads, || {});
     }
 
     fn needs_backend_loads(&self) -> bool {
@@ -403,12 +468,25 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
     }
 
     fn remove_worker(&self, url: &str) {
-        if let Ok(mut cached) = self.cached_loads.write() {
-            cached.remove(url);
-        }
-        if let Ok(mut inflight) = self.inflight_tokens.write() {
-            inflight.remove(url);
-        }
+        let Ok(mut cached) = self.cached_loads.write() else {
+            return;
+        };
+        let Ok(mut inflight) = self.inflight_tokens.write() else {
+            return;
+        };
+        cached.remove(url);
+        inflight.remove(url);
+    }
+
+    fn reset(&self) {
+        let Ok(mut cached) = self.cached_loads.write() else {
+            return;
+        };
+        let Ok(mut inflight) = self.inflight_tokens.write() else {
+            return;
+        };
+        cached.clear();
+        inflight.clear();
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -907,6 +985,79 @@ mod tests {
             .unwrap()
             .values()
             .all(|v| v.tokens == 0));
+    }
+
+    #[test]
+    fn update_publishes_snapshot_and_resets_credit_as_one_critical_section() {
+        use std::sync::mpsc::sync_channel;
+
+        let policy = Arc::new(LeastLoadPolicy::new());
+        let workers = vec![mk("http://a:8000")];
+        assert_eq!(
+            policy.select_min_expected_wait(&workers, &[0], &SelectWorkerInfo::default(), "test"),
+            Some(0)
+        );
+        assert_eq!(
+            policy.load_state_for_test("http://a:8000"),
+            (false, 1024, 1)
+        );
+
+        let loads = HashMap::from([("http://a:8000".to_string(), make_load(0, 0.1, 100.0))]);
+        let (published_tx, published_rx) = sync_channel::<()>(0);
+        let (resume_tx, resume_rx) = sync_channel::<()>(0);
+        let updater_policy = Arc::clone(&policy);
+        let updater = std::thread::spawn(move || {
+            updater_policy.update_loads_inner(&loads, || {
+                published_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+        });
+
+        published_rx.recv().unwrap();
+        let inflight_was_locked = policy.inflight_tokens.try_write().is_err();
+        resume_tx.send(()).unwrap();
+        updater.join().unwrap();
+
+        assert!(
+            inflight_was_locked,
+            "a selector could credit against the new snapshot before its reset"
+        );
+        assert_eq!(policy.load_state_for_test("http://a:8000"), (true, 0, 0));
+        assert_eq!(
+            policy.select_min_expected_wait(&workers, &[0], &SelectWorkerInfo::default(), "test"),
+            Some(0)
+        );
+        assert_eq!(policy.load_state_for_test("http://a:8000"), (true, 1024, 1));
+    }
+
+    #[test]
+    fn reset_discards_backend_loads_and_inflight_credit() {
+        // Backend snapshots say a is badly queued and b is idle, even though
+        // live request counts say the opposite. Before reset expected wait
+        // must choose b; after reset the dark-fleet fallback must see only the
+        // live counts and choose a. Keeping either cached map makes the second
+        // assertion fail.
+        let policy = LeastLoadPolicy::new();
+        let a = mk("http://a:8000");
+        let b = mk("http://b:8000");
+        for _ in 0..5 {
+            b.increment_load();
+        }
+        let workers = vec![a, b];
+        let mut loads = HashMap::new();
+        loads.insert("http://a:8000".to_string(), make_load(100_000, 0.1, 100.0));
+        loads.insert("http://b:8000".to_string(), make_load(0, 0.1, 100.0));
+        policy.update_loads(&loads);
+
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(1)
+        );
+        policy.reset();
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(0)
+        );
     }
 
     #[test]
