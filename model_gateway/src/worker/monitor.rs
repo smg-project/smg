@@ -61,16 +61,17 @@ use openai_protocol::worker::{
 };
 use parking_lot::{Mutex, RwLock};
 use reqwest::StatusCode;
-use tokio::{
-    sync::{broadcast, watch},
-    task::JoinHandle,
-};
+use tokio::{sync::broadcast, task::JoinHandle};
 use tracing::{debug, info, warn};
 
 use crate::{
     observability::metrics::Metrics,
     policies::PolicyRegistry,
-    worker::{event::WorkerEvent, ConnectionMode, Worker, WorkerRegistry},
+    worker::{
+        event::WorkerEvent,
+        load_state::{LoadReceiver, LoadState},
+        ConnectionMode, Worker, WorkerRegistry,
+    },
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -232,8 +233,9 @@ pub struct WorkerMonitor {
     /// group member still forces the poll) instead of polling every group
     /// unconditionally from registration onward.
     conditional_polling: bool,
-    load_tx: watch::Sender<HashMap<String, WorkerLoadResponse>>,
-    load_rx: watch::Receiver<HashMap<String, WorkerLoadResponse>>,
+    /// Shared immutable load snapshots: group ticks and the eviction flusher
+    /// publish here; routing readers grab `Arc` snapshots.
+    load_state: Arc<LoadState>,
     /// Worker URLs that answered definitively that they do not serve
     /// `/v1/loads`, so the probe is not repeated every tick. Cleared by
     /// [`Self::evict_worker_loads`], which also runs on `Replaced` — an
@@ -241,7 +243,14 @@ pub struct WorkerMonitor {
     native_loads_absent: Arc<DashSet<String>>,
     group_handles: Mutex<HashMap<WorkerGroupKey, GroupState>>,
     event_task: Mutex<Option<JoinHandle<()>>>,
+    eviction_flush_task: Mutex<Option<JoinHandle<()>>>,
 }
+
+/// Debounce window for batching worker evictions into one snapshot rebuild.
+/// Registry churn (a rollout, a scale-down) emits removals as a gradual
+/// stream; waiting a beat lets the whole wave land in a single publish while
+/// staying far below the polling cadence that refreshes live entries.
+const EVICTION_DEBOUNCE: Duration = Duration::from_millis(20);
 
 impl Debug for WorkerMonitor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -265,7 +274,7 @@ impl WorkerMonitor {
         engine_metrics: bool,
         conditional_polling: bool,
     ) -> Self {
-        let (load_tx, load_rx) = watch::channel(HashMap::new());
+        let load_state = Arc::new(LoadState::new(Arc::clone(&worker_registry)));
         Self {
             worker_registry,
             policy_registry,
@@ -274,11 +283,11 @@ impl WorkerMonitor {
             default_interval: Duration::from_secs(default_interval_secs.max(1)),
             engine_metrics,
             conditional_polling,
-            load_tx,
-            load_rx,
+            load_state,
             native_loads_absent: Arc::new(DashSet::new()),
             group_handles: Mutex::new(HashMap::new()),
             event_task: Mutex::new(None),
+            eviction_flush_task: Mutex::new(None),
         }
     }
 
@@ -288,12 +297,14 @@ impl WorkerMonitor {
         &self.native_loads_absent
     }
 
-    /// Subscribe to the snapshot of per-worker loads.
+    /// Subscribe to the shared per-worker load snapshots.
     ///
-    /// The watch receiver returns the most recent fully merged map;
-    /// stale entries are pruned on each tick of the relevant group.
-    pub fn subscribe(&self) -> watch::Receiver<HashMap<String, WorkerLoadResponse>> {
-        self.load_rx.clone()
+    /// Each received value is an immutable `Arc<LoadSnapshot>`: clone the
+    /// `Arc` out of `borrow()` and scan without holding the watch guard.
+    /// Stale entries are pruned on each tick of the relevant group and by
+    /// the batched eviction flusher.
+    pub(crate) fn subscribe(&self) -> LoadReceiver {
+        self.load_state.subscribe()
     }
 
     /// Subscribe to registry events, run a synchronous bootstrap
@@ -331,6 +342,21 @@ impl WorkerMonitor {
         });
 
         *self.event_task.lock() = Some(handle);
+
+        // The debounced eviction flusher: holds the load state strongly (it
+        // is cheap and monitor-independent) and the monitor weakly, for the
+        // same cycle-breaking reason as the event loop.
+        let load_state = Arc::clone(&self.load_state);
+        let monitor = Arc::downgrade(self);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "eviction flusher runs for the monitor's lifetime; the JoinHandle is stored on the monitor and aborted in Drop"
+        )]
+        let flush_handle = tokio::spawn(async move {
+            eviction_flush_loop(load_state, monitor).await;
+        });
+
+        *self.eviction_flush_task.lock() = Some(flush_handle);
     }
 
     /// Stop every per-group polling loop and clear the shared load
@@ -364,7 +390,7 @@ impl WorkerMonitor {
         // per live URL: workers removed during the lag window would
         // otherwise leak entries, and the cost is one re-probe per
         // worker on a path that only runs on lag recovery.
-        self.load_tx.send_modify(|map| map.clear());
+        self.load_state.clear();
         self.worker_load_manager.clear();
         self.native_loads_absent.clear();
         // The feed that would clear the vetoes is being torn down: fail open,
@@ -472,29 +498,34 @@ impl WorkerMonitor {
         }
     }
 
-    /// Evict a single worker's cached loads from both the watch
-    /// channel snapshot and the DP cache. Used by the event loop on
+    /// Evict a single worker's cached loads. Used by the event loop on
     /// `Removed`, `Replaced`, and `StatusChanged` away from `Ready`.
     ///
-    /// Also sentinels the worker's `smg_engine_*` series after this monitor has
-    /// published a load for it, since metrics-rs cannot delete series.
+    /// The overload flag, DP cache, and probe memo are cleared synchronously;
+    /// the shared snapshot removal is queued so a removal wave costs one
+    /// batched rebuild instead of one per worker (see
+    /// [`Self::flush_pending_evictions`]).
     fn evict_worker_loads(&self, worker: &Arc<dyn Worker>) {
         let url = worker.url();
         // No load feed, no verdict: a flag left set would strand the worker
         // out of routing with nothing to ever clear it.
         self.worker_registry.set_worker_overloaded(worker, false);
-        let had_published_load = self.load_tx.borrow().contains_key(url);
-        self.load_tx.send_modify(|map| {
-            map.remove(url);
-        });
         self.worker_load_manager.remove_worker(url);
         self.native_loads_absent.remove(url);
-        if had_published_load {
+        self.load_state.enqueue_eviction(Arc::clone(worker));
+    }
+
+    /// Apply every queued eviction in one snapshot rebuild, and sentinel the
+    /// `smg_engine_*` series of workers whose own entry was removed —
+    /// metrics-rs cannot delete series. A same-URL replacement that already
+    /// republished keeps its entry, and its series continues uninterrupted.
+    pub(crate) fn flush_pending_evictions(&self) {
+        for worker in self.load_state.apply_pending_evictions() {
             // A worker can serve multiple models (one load group per model),
             // so sentinel every model's series — not just the primary.
             let dp_size = worker.dp_size().unwrap_or(1);
-            for model_id in WorkerRegistry::worker_model_ids(worker) {
-                Metrics::remove_engine_load_metrics(url, &model_id, dp_size);
+            for model_id in WorkerRegistry::worker_model_ids(&worker) {
+                Metrics::remove_engine_load_metrics(worker.url(), &model_id, dp_size);
             }
         }
     }
@@ -749,9 +780,32 @@ impl Drop for WorkerMonitor {
         if let Some(handle) = self.event_task.get_mut().take() {
             handle.abort();
         }
+        if let Some(handle) = self.eviction_flush_task.get_mut().take() {
+            handle.abort();
+        }
         for (_, state) in self.group_handles.get_mut().drain() {
             state.handle.abort();
         }
+    }
+}
+
+/// Debounced eviction flusher: waits for the first queued eviction, lets a
+/// gradual removal stream accumulate for [`EVICTION_DEBOUNCE`], then applies
+/// the whole backlog in one snapshot rebuild.
+///
+/// Holds the monitor weakly (same cycle-breaking rationale as the other
+/// loops); holding the `LoadState` strongly is fine — it owns no task
+/// handles back into the monitor.
+async fn eviction_flush_loop(load_state: Arc<LoadState>, monitor: Weak<WorkerMonitor>) {
+    loop {
+        load_state.eviction_wakeup().await;
+        tokio::time::sleep(EVICTION_DEBOUNCE).await;
+        let Some(monitor) = monitor.upgrade() else {
+            debug!("WorkerMonitor was dropped; exiting eviction flush loop");
+            return;
+        };
+        monitor.flush_pending_evictions();
+        drop(monitor);
     }
 }
 
@@ -1001,11 +1055,9 @@ async fn group_monitor_loop(
 
         if group_loads.is_empty() {
             debug!("No loads fetched for group {group_key}, pruning stale entries");
-            monitor.load_tx.send_modify(|map| {
-                for url in &all_group_urls {
-                    map.remove(url);
-                }
-            });
+            monitor
+                .load_state
+                .publish_group(&all_group_urls, Vec::new());
             // The DP cache deliberately keeps last-known-good entries
             // so routing decisions still have a hint to fall back to
             // when the upstream is briefly unreachable.
@@ -1036,16 +1088,24 @@ async fn group_monitor_loop(
             Metrics::record_engine_load(url, &group_key.model_id, load);
         }
 
-        // Atomically merge into the shared watch channel: clear stale
-        // entries for *this group's* URLs first, then insert the fresh
-        // loads. Workers that failed this tick get their stale entries
-        // pruned along with the rest.
-        monitor.load_tx.send_modify(|map| {
-            for url in &all_group_urls {
-                map.remove(url);
-            }
-            map.extend(group_loads);
-        });
+        // Merge into the shared snapshot in one rebuild: clear stale entries
+        // for *this group's* URLs first, then insert the fresh loads — each
+        // paired with the worker that produced it so the incarnation fence
+        // can drop reports that raced a removal or replacement. Workers that
+        // failed this tick get their stale entries pruned along with the
+        // rest. The responses move (no deep clones): the policy push and the
+        // metrics pass above already took their references.
+        let worker_by_url: HashMap<&str, &Arc<dyn Worker>> =
+            workers.iter().map(|w| (w.url(), w)).collect();
+        let fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)> = group_loads
+            .into_iter()
+            .filter_map(|(url, load)| {
+                worker_by_url
+                    .get(url.as_str())
+                    .map(|worker| (Arc::clone(worker), Arc::new(load)))
+            })
+            .collect();
+        monitor.load_state.publish_group(&all_group_urls, fresh);
 
         // Drop the temporary strong reference so we do not keep the
         // monitor alive across the next `interval_timer.tick().await`.
@@ -1239,12 +1299,14 @@ mod worker_monitor_tests {
         let (registry, monitor) = build_monitor();
         let worker = ready_worker("http://w:8080", "llama-3");
         let url = worker.url().to_string();
-        let id = registry.register(worker).unwrap();
+        let id = registry.register(Arc::clone(&worker)).unwrap();
         monitor.start_event_loop();
 
-        monitor.load_tx.send_modify(|map| {
-            map.insert(url.clone(), WorkerLoadResponse::default());
-        });
+        monitor.load_state.publish_group(
+            &[],
+            vec![(Arc::clone(&worker), Arc::new(WorkerLoadResponse::default()))],
+        );
+        assert!(monitor.load_state.snapshot().contains(&url));
         monitor.native_loads_absent.insert(url.clone());
         let mut dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
         let mut inner = HashMap::new();
@@ -1255,11 +1317,14 @@ mod worker_monitor_tests {
         registry.remove(&id);
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
+        // The event loop has queued the eviction; apply it deterministically
+        // instead of racing the debounced flusher.
+        monitor.flush_pending_evictions();
 
-        let snapshot = monitor.load_rx.borrow().clone();
+        let snapshot = monitor.load_state.snapshot();
         assert!(
-            !snapshot.contains_key(&url),
-            "load_tx must not retain entries for removed workers"
+            !snapshot.contains(&url),
+            "the load snapshot must not retain entries for removed workers"
         );
         let cached = monitor.worker_load_manager.dp_cached_loads.read();
         assert!(
@@ -1304,7 +1369,7 @@ mod worker_monitor_tests {
 
         monitor.stop_all_groups();
 
-        assert!(monitor.load_rx.borrow().is_empty());
+        assert!(monitor.load_state.snapshot().is_empty());
         assert!(monitor
             .worker_load_manager
             .dp_cached_loads
@@ -1317,13 +1382,15 @@ mod worker_monitor_tests {
         let (registry, monitor) = build_monitor();
         let worker = ready_worker("http://w:8080", "llama-3");
         let url = worker.url().to_string();
-        let id = registry.register(worker).unwrap();
+        let id = registry.register(Arc::clone(&worker)).unwrap();
         monitor.start_event_loop();
 
-        // Seed the watch channel + DP cache as if a poll had succeeded.
-        monitor.load_tx.send_modify(|map| {
-            map.insert(url.clone(), WorkerLoadResponse::default());
-        });
+        // Seed the load snapshot + DP cache as if a poll had succeeded.
+        monitor.load_state.publish_group(
+            &[],
+            vec![(Arc::clone(&worker), Arc::new(WorkerLoadResponse::default()))],
+        );
+        assert!(monitor.load_state.snapshot().contains(&url));
         let mut dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
         let mut inner = HashMap::new();
         inner.insert(0, 5);
@@ -1333,10 +1400,13 @@ mod worker_monitor_tests {
         registry.transition_status(&id, WorkerStatus::NotReady);
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
+        // The event loop has queued the eviction; apply it deterministically
+        // instead of racing the debounced flusher.
+        monitor.flush_pending_evictions();
 
-        // Watch channel entry pruned.
-        let snapshot = monitor.load_rx.borrow().clone();
-        assert!(!snapshot.contains_key(&url));
+        // Load snapshot entry pruned.
+        let snapshot = monitor.load_state.snapshot();
+        assert!(!snapshot.contains(&url));
 
         // DP cache entry pruned.
         let cached = monitor.worker_load_manager.dp_cached_loads.read();
@@ -1702,7 +1772,7 @@ mod native_loads_tests {
         // Wait for the feed to actually land, then assert the verdict.
         let mut rx = monitor.subscribe();
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !rx.borrow().contains_key(&stub.url) {
+            while !rx.borrow().contains(&stub.url) {
                 rx.changed().await.expect("watch sender alive");
             }
         })
@@ -1758,7 +1828,7 @@ mod native_loads_tests {
 
         let mut rx = monitor.subscribe();
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !rx.borrow().contains_key(&stub.url) {
+            while !rx.borrow().contains(&stub.url) {
                 rx.changed().await.expect("watch sender alive");
             }
         })
@@ -1882,7 +1952,7 @@ mod native_loads_tests {
         // Covers the immediate first tick plus one full 1s interval.
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(stub.probes.load(Ordering::SeqCst), 0);
-        assert!(monitor.load_rx.borrow().is_empty());
+        assert!(monitor.load_state.snapshot().is_empty());
     }
 
     #[tokio::test]

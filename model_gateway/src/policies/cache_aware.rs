@@ -64,26 +64,23 @@ use std::{
 
 use dashmap::DashMap;
 use kv_index::{compute_request_content_hashes, PositionalIndexer, TenantId, TokenTree, Tree};
-use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use super::{
     normalize_model_key, utils::PeriodicTask, CacheAwareConfig, LoadBalancingPolicy,
     SelectWorkerInfo,
 };
+/// Latest per-worker backend load snapshot stream, keyed by worker URL.
+pub(crate) use crate::worker::load_state::{LoadReceiver, LoadSnapshot};
 use crate::{
     config::CacheIndexKind,
     mesh::adapters::tree_sync::{RepairEntry, TreeDelta, TreeRepairPage, TreeSyncAdapter},
     observability::metrics::Metrics,
     worker::{KvEventMonitor, Worker},
 };
-
-/// Latest per-worker backend load snapshot stream, keyed by worker URL.
-pub(crate) type LoadReceiver = watch::Receiver<HashMap<String, WorkerLoadResponse>>;
 
 /// Cache-aware routing policy
 ///
@@ -459,7 +456,7 @@ impl CacheAwarePolicy {
     /// Set the backend load-snapshot receiver (thread-safe, after construction).
     /// Wired from the `WorkerMonitor` via the `PolicyRegistry` so the KV-usage
     /// imbalance trigger can read fresh per-worker `token_usage`.
-    pub fn set_load_receiver(&self, rx: Option<LoadReceiver>) {
+    pub(crate) fn set_load_receiver(&self, rx: Option<LoadReceiver>) {
         *self.load_rx.write() = rx;
     }
 
@@ -515,9 +512,15 @@ impl CacheAwarePolicy {
         workers: &[Arc<dyn Worker>],
         healthy_indices: &[usize],
     ) -> Option<(f64, f64)> {
-        let guard = self.load_rx.read();
-        let rx = guard.as_ref()?;
-        let loads = rx.borrow();
+        // One Arc clone of the immutable snapshot; the receiver guard and the
+        // watch borrow are both released before the scan so publishers are
+        // never blocked by it.
+        let loads = {
+            let guard = self.load_rx.read();
+            let rx = guard.as_ref()?;
+            let snapshot = rx.borrow().clone();
+            snapshot
+        };
         let mut bounds: Option<(f64, f64)> = None;
         for &idx in healthy_indices {
             if let Some(load) = loads.get(workers[idx].url()) {
@@ -1025,14 +1028,15 @@ struct OverlapCandidate {
 }
 
 /// Pressure-tuning inputs for [`CacheAwarePolicy::score_overlap`]: the two
-/// config knobs plus a waiting-prefill backlog snapshot (worker URL → queued
-/// uncached tokens, clamped non-negative) captured from the load receiver at
-/// selection time. `waiting_prefill_tokens` is `None` when decay is off or no
-/// load receiver is wired; workers absent from the map are never decayed.
+/// config knobs plus the immutable load snapshot captured from the load
+/// receiver at selection time, from which each worker's waiting-prefill
+/// backlog (queued uncached tokens, clamped non-negative) is derived at
+/// lookup. `waiting_prefill_tokens` is `None` when decay is off or no load
+/// receiver is wired; workers absent from the snapshot are never decayed.
 struct OverlapTuning<'a> {
     overlap_decay: f32,
     selection_temperature: f32,
-    waiting_prefill_tokens: Option<&'a HashMap<String, i64>>,
+    waiting_prefill_tokens: Option<&'a LoadSnapshot>,
 }
 
 impl LoadBalancingPolicy for CacheAwarePolicy {
@@ -1182,20 +1186,16 @@ impl CacheAwarePolicy {
             .is_some_and(|indexer| indexer.current_size() > 0)
     }
 
-    /// Waiting-prefill backlog snapshot (worker URL → queued uncached tokens),
-    /// or `None` when decay is off or no load receiver is wired. The clone is
-    /// per-selection; with decay off the map is never read.
-    fn waiting_prefill_snapshot(&self) -> Option<HashMap<String, i64>> {
+    /// The shared load snapshot for waiting-prefill decay, or `None` when
+    /// decay is off or no load receiver is wired. One `Arc` clone per
+    /// selection — no per-request map is built; backlog values are derived
+    /// at lookup from the same frozen snapshot.
+    fn waiting_prefill_snapshot(&self) -> Option<Arc<LoadSnapshot>> {
         if self.config.overlap_decay <= 0.0 {
             return None;
         }
         let guard = self.load_rx.read();
-        guard.as_ref().map(|rx| {
-            rx.borrow()
-                .iter()
-                .map(|(url, load)| (url.clone(), load.total_waiting_uncached_tokens().max(0)))
-                .collect::<HashMap<String, i64>>()
-        })
+        guard.as_ref().map(|rx| rx.borrow().clone())
     }
 
     /// Per-request count-pressure gate on the selected candidate: over
@@ -1258,7 +1258,7 @@ impl CacheAwarePolicy {
         let tuning = OverlapTuning {
             overlap_decay: self.config.overlap_decay,
             selection_temperature: self.config.selection_temperature,
-            waiting_prefill_tokens: waiting.as_ref(),
+            waiting_prefill_tokens: waiting.as_deref(),
         };
         let request_blocks = (request_units / self.config.block_size).max(1);
         Self::apply_overlap_decay(
@@ -1303,7 +1303,7 @@ impl CacheAwarePolicy {
         let tuning = OverlapTuning {
             overlap_decay: self.config.overlap_decay,
             selection_temperature: self.config.selection_temperature,
-            waiting_prefill_tokens: waiting_prefill_tokens.as_ref(),
+            waiting_prefill_tokens: waiting_prefill_tokens.as_deref(),
         };
 
         if let Some(idx) = Self::score_overlap(
@@ -1422,7 +1422,11 @@ impl CacheAwarePolicy {
         else {
             return;
         };
-        let backlog_of = |c: &OverlapCandidate| waiting.get(workers[c.idx].url()).copied();
+        let backlog_of = |c: &OverlapCandidate| {
+            waiting
+                .get(workers[c.idx].url())
+                .map(|load| load.total_waiting_uncached_tokens().max(0))
+        };
         let Some(min_backlog) = candidates.iter().filter_map(&backlog_of).min() else {
             return;
         };
@@ -2026,7 +2030,10 @@ impl Default for CacheAwarePolicy {
 #[cfg(test)]
 mod tests {
     use kv_index::{compute_content_hash, SequenceHash, StoredBlock, WorkerBlockMap};
-    use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerStatus};
+    use openai_protocol::worker::{
+        HealthCheckConfig, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus,
+    };
+    use tokio::sync::watch;
     use tracing_test::traced_test;
 
     use super::*;
@@ -2261,6 +2268,17 @@ mod tests {
 
     // ---- is_kv_imbalanced: KV triggers (overload ∨ KV-spread) ----
 
+    /// Single-DP load snapshot with the given waiting-prefill backlog.
+    fn waiting_load(waiting_uncached: i32) -> WorkerLoadResponse {
+        WorkerLoadResponse {
+            loads: vec![SchedulerLoadSnapshot {
+                num_waiting_uncached_tokens: waiting_uncached,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
     /// Single-DP load snapshot reporting the given KV utilization (0.0–1.0).
     fn kv_load(token_usage: f64) -> WorkerLoadResponse {
         WorkerLoadResponse {
@@ -2292,13 +2310,15 @@ mod tests {
         policy: &CacheAwarePolicy,
         workers: &[Arc<dyn Worker>],
         usages: &[f64],
-    ) -> watch::Sender<HashMap<String, WorkerLoadResponse>> {
-        let map: HashMap<String, WorkerLoadResponse> = workers
-            .iter()
-            .zip(usages)
-            .map(|(w, &u)| (w.url().to_string(), kv_load(u)))
-            .collect();
-        let (tx, rx) = watch::channel(map);
+    ) -> watch::Sender<Arc<LoadSnapshot>> {
+        let snapshot = LoadSnapshot::from_loads_for_test(
+            workers
+                .iter()
+                .zip(usages)
+                .map(|(w, &u)| (w.url().to_string(), kv_load(u)))
+                .collect(),
+        );
+        let (tx, rx) = watch::channel(snapshot);
         policy.set_load_receiver(Some(rx));
         tx
     }
@@ -3206,9 +3226,9 @@ mod tests {
         // With decay on, the fleet-floor worker keeps full credit and must
         // win every draw (previously this tie was a coin flip).
         let (workers, indexer) = equal_overlap_fixture();
-        let waiting = HashMap::from([
-            ("http://w1:8000".to_string(), 0),
-            ("http://w2:8000".to_string(), 8),
+        let waiting = LoadSnapshot::from_loads_for_test(vec![
+            ("http://w1:8000".to_string(), waiting_load(0)),
+            ("http://w2:8000".to_string(), waiting_load(8)),
         ]);
         let tuning = OverlapTuning {
             overlap_decay: 4.0,
@@ -3235,7 +3255,10 @@ mod tests {
         // no entry. Neither may be decayed, so the equal-score tie — and its
         // random spreading — must survive.
         let (workers, indexer) = equal_overlap_fixture();
-        let waiting = HashMap::from([("http://w1:8000".to_string(), 0)]);
+        let waiting = LoadSnapshot::from_loads_for_test(vec![(
+            "http://w1:8000".to_string(),
+            waiting_load(0),
+        )]);
         let tuning = OverlapTuning {
             overlap_decay: 4.0,
             selection_temperature: 0.0,

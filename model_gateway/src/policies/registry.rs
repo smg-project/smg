@@ -377,7 +377,7 @@ impl PolicyRegistry {
 
     /// Set the backend load-snapshot receiver (thread-safe, can be called after
     /// initialization). Propagates to all existing cache-aware policies.
-    pub fn set_load_receiver(&self, rx: Option<LoadReceiver>) {
+    pub(crate) fn set_load_receiver(&self, rx: Option<LoadReceiver>) {
         {
             let mut guard = self.load_rx.write();
             guard.clone_from(&rx);
