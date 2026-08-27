@@ -1,6 +1,6 @@
 [package]
 name = "smg"
-version = "1.10.0"
+version = "1.10.1"
 edition = "2021"
 description = "High-performance model-routing gateway for large-scale LLM deployments"
 license = "Apache-2.0"

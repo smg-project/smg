@@ -3868,7 +3868,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "llm-multimodal"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4876,7 +4876,7 @@ dependencies = [
 
 [[package]]
 name = "openai-protocol"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "axum",
  "bitflags 2.13.1",
@@ -7383,7 +7383,7 @@ dependencies = [
 
 [[package]]
 name = "smg"
-version = "1.10.0"
+version = "1.10.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -7534,7 +7534,7 @@ dependencies = [
 
 [[package]]
 name = "smg-golang"
-version = "1.10.0"
+version = "1.10.1"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -7556,7 +7556,7 @@ dependencies = [
 
 [[package]]
 name = "smg-grpc-client"
-version = "1.11.0"
+version = "1.12.0"
 dependencies = [
  "futures",
  "hyper-util",
@@ -7659,7 +7659,7 @@ dependencies = [
 
 [[package]]
 name = "smg-python"
-version = "1.10.0"
+version = "1.10.1"
 dependencies = [
  "once_cell",
  "pyo3",
