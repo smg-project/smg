@@ -26,6 +26,7 @@ TOKENIZER_FILES = [
     "tiktoken.model",  # tiktoken
     "chat_template.json",
     "preprocessor_config.json",  # multimodal image preprocessor
+    "processor_config.json",  # Transformers v5 nested multimodal processors
 ]
 
 # Glob patterns for additional tokenizer-related files

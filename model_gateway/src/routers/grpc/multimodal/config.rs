@@ -161,16 +161,6 @@ pub(crate) fn load_video_preprocessor_config(base_dir: &Path) -> Option<PreProce
         return Some(config);
     }
 
-    load_nested_preprocessor_config(base_dir, "video_processor")
-}
-
-pub(crate) fn load_image_preprocessor_config(base_dir: &Path) -> Option<PreProcessorConfig> {
-    let image_path = base_dir.join("preprocessor_config.json");
-    load_preprocessor_config_file(&image_path, "preprocessor_config.json")
-        .or_else(|| load_nested_preprocessor_config(base_dir, "image_processor"))
-}
-
-fn load_nested_preprocessor_config(base_dir: &Path, section: &str) -> Option<PreProcessorConfig> {
     let processor_path = base_dir.join("processor_config.json");
     if !processor_path.exists() {
         return None;
@@ -184,24 +174,46 @@ fn load_nested_preprocessor_config(base_dir: &Path, section: &str) -> Option<Pre
         None => {
             warn!(
                 path = %processor_path.display(),
-                "Failed to load processor_config.json for {section}"
+                "Failed to load processor_config.json for video_processor"
             );
             return None;
         }
     };
 
-    let nested = processor_config.get(section)?;
-    match PreProcessorConfig::from_value(nested.clone()) {
+    let video_processor = processor_config.get("video_processor")?;
+    match PreProcessorConfig::from_value(video_processor.clone()) {
         Ok(config) => Some(config),
         Err(error) => {
             warn!(
                 path = %processor_path.display(),
                 error = %error,
-                "Failed to parse {section} from processor_config.json"
+                "Failed to parse video_processor from processor_config.json"
             );
             None
         }
     }
+}
+
+pub(crate) fn load_image_preprocessor_config(base_dir: &Path) -> Option<PreProcessorConfig> {
+    let image_path = base_dir.join("preprocessor_config.json");
+    if image_path.exists() {
+        return load_preprocessor_config_file(&image_path, "preprocessor_config.json");
+    }
+
+    let processor_path = base_dir.join("processor_config.json");
+    let processor_config = std::fs::read_to_string(&processor_path)
+        .ok()
+        .and_then(|config| serde_json::from_str::<serde_json::Value>(&config).ok())?;
+    let image_processor = processor_config.get("image_processor")?;
+    PreProcessorConfig::from_value(image_processor.clone())
+        .inspect_err(|error| {
+            warn!(
+                path = %processor_path.display(),
+                error = %error,
+                "Failed to parse image_processor from processor_config.json"
+            );
+        })
+        .ok()
 }
 
 /// Shared multimodal components injected at router creation time.
@@ -319,30 +331,34 @@ mod tests {
     }
 
     #[test]
-    fn load_image_preprocessor_config_reads_nested_processor_key() {
+    fn load_image_preprocessor_config_preserves_legacy_precedence_and_falls_back() {
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("processor_config.json"),
-            r#"{
-                "image_processor": {
-                    "image_processor_type": "Glm5NextImageProcessor",
-                    "min_image_tokens": 16,
-                    "max_image_tokens": 8000,
-                    "patch_expand_factor": 1
-                }
-            }"#,
+            r#"{"image_processor":{"image_processor_type":"NestedImageProcessor"}}"#,
+        )
+        .unwrap();
+        let legacy_path = tmp.path().join("preprocessor_config.json");
+        fs::write(
+            &legacy_path,
+            r#"{"image_processor_type":"LegacyImageProcessor"}"#,
         )
         .unwrap();
 
-        let config = load_image_preprocessor_config(tmp.path())
-            .expect("nested image_processor should parse");
+        let legacy =
+            load_image_preprocessor_config(tmp.path()).expect("legacy image config should parse");
         assert_eq!(
-            config.image_processor_type.as_deref(),
-            Some("Glm5NextImageProcessor")
+            legacy.image_processor_type.as_deref(),
+            Some("LegacyImageProcessor")
         );
-        assert_eq!(config.min_image_tokens, Some(16));
-        assert_eq!(config.max_image_tokens, Some(8000));
-        assert_eq!(config.patch_expand_factor, Some(1));
+
+        fs::remove_file(legacy_path).unwrap();
+        let nested = load_image_preprocessor_config(tmp.path())
+            .expect("nested image_processor fallback should parse");
+        assert_eq!(
+            nested.image_processor_type.as_deref(),
+            Some("NestedImageProcessor")
+        );
     }
 
     #[tokio::test]
