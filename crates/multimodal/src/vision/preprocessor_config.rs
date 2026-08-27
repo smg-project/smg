@@ -176,18 +176,6 @@ pub struct PreProcessorConfig {
     #[serde(default)]
     pub max_pixels: Option<usize>,
 
-    /// GLM-5.3-Flash: minimum number of merged image tokens.
-    #[serde(default)]
-    pub min_image_tokens: Option<usize>,
-
-    /// GLM-5.3-Flash: maximum number of merged image tokens.
-    #[serde(default)]
-    pub max_image_tokens: Option<usize>,
-
-    /// GLM-5.3-Flash: additional spatial canvas-alignment factor.
-    #[serde(default)]
-    pub patch_expand_factor: Option<usize>,
-
     /// Qwen-VL: temporal patch size for video
     #[serde(default)]
     pub temporal_patch_size: Option<usize>,
@@ -323,9 +311,6 @@ impl PreProcessorConfig {
             || self.merge_size.is_some()
             || self.min_pixels.is_some()
             || self.max_pixels.is_some()
-            || self.min_image_tokens.is_some()
-            || self.max_image_tokens.is_some()
-            || self.patch_expand_factor.is_some()
             || self.temporal_patch_size.is_some()
             || self.size.is_some()
     }
@@ -522,24 +507,6 @@ mod tests {
         assert_eq!(config.get_patch_size(0), 14);
         assert_eq!(config.merge_size, Some(2));
         assert!((config.get_rescale_factor() - 1.0 / 255.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_parse_glm53_flash_token_budgets() {
-        let config = PreProcessorConfig::from_json(
-            r#"{
-                "image_processor_type": "Glm5NextImageProcessor",
-                "min_image_tokens": 16,
-                "max_image_tokens": 8000,
-                "patch_expand_factor": 1
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(config.min_image_tokens, Some(16));
-        assert_eq!(config.max_image_tokens, Some(8000));
-        assert_eq!(config.patch_expand_factor, Some(1));
-        assert!(config.has_structural_overrides());
     }
 
     #[test]
