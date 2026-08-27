@@ -207,6 +207,18 @@ impl Deref for ModelWorkerSnapshot {
     }
 }
 
+/// The global membership snapshot together with the epoch it was built at.
+///
+/// Carrying the epoch inside the published object makes the read fast path
+/// self-validating: load the object, compare its epoch to the live counter.
+/// A bump installs a marker with `epoch: usize::MAX`, which can never match
+/// and therefore can never be served.
+#[derive(Debug)]
+struct GlobalRoutingSnapshot {
+    epoch: usize,
+    snapshot: Arc<ModelWorkerSnapshot>,
+}
+
 /// Model index using immutable snapshots for lock-free reads.
 /// Updates create new snapshots (copy-on-write semantics); route projections
 /// are cached lazily inside each immutable snapshot.
@@ -225,27 +237,31 @@ pub struct WorkerRegistry {
     /// Uses Arc<[T]> instead of Arc<RwLock<Vec<T>>> for lock-free reads.
     model_index: ModelIndex,
 
-    /// Immutable snapshot spanning every registered worker. Model-less routes
-    /// use its lazy route projections instead of scanning the worker map and
-    /// cloning every matching `Arc` on each request.
+    /// Immutable snapshot spanning every registered worker, tagged with the
+    /// `global_epoch` it was built at. Model-less routes use its lazy route
+    /// projections instead of scanning the worker map and cloning every
+    /// matching `Arc` on each request.
     ///
-    /// Rebuilt lazily: membership mutations only bump `global_epoch` (O(1)),
-    /// and the first read after a change rebuilds once from the worker map.
-    /// A registration or removal storm therefore costs one rebuild total,
-    /// not one full-fleet copy per worker.
-    global_routing_snapshot: ArcSwap<ModelWorkerSnapshot>,
+    /// Rebuilt lazily: membership mutations only bump `global_epoch` and
+    /// install the shared empty marker (O(1) amortized), and the first read
+    /// after a change rebuilds once from the worker map. A registration or
+    /// removal storm therefore costs one rebuild total, not one full-fleet
+    /// copy per worker.
+    global_routing_snapshot: ArcSwap<GlobalRoutingSnapshot>,
 
     /// Monotonic membership generation; bumped on every register / replace /
     /// remove.
     global_epoch: AtomicUsize,
 
-    /// The `global_epoch` value `global_routing_snapshot` was built at. When
-    /// it trails `global_epoch` the snapshot is stale and the next read
-    /// rebuilds it.
-    global_published_epoch: AtomicUsize,
+    /// Orders membership writes against rebuild scans. Mutators hold the
+    /// (shared, O(1)) read side across the worker-map write and the epoch
+    /// bump; the rebuild scan holds the write side, so a published snapshot
+    /// is always a map state that truly existed — DashMap iteration alone
+    /// locks shard by shard and can capture a mixture of generations.
+    global_membership_order: parking_lot::RwLock<()>,
 
-    /// Serializes the cold rebuild path. Routing reads take it only when the
-    /// snapshot is stale; mutations never take it.
+    /// Serializes the cold rebuild path so concurrent stale readers rebuild
+    /// once. Mutations never take it.
     global_routing_update: parking_lot::Mutex<()>,
 
     /// Alias index kept separate from `model_index` so aliases do not appear as
@@ -330,11 +346,12 @@ impl WorkerRegistry {
         Self {
             workers: Arc::new(DashMap::new()),
             model_index: Arc::new(DashMap::new()),
-            global_routing_snapshot: ArcSwap::from_pointee(ModelWorkerSnapshot::new(Arc::from(
-                Vec::<Arc<dyn Worker>>::new().into_boxed_slice(),
-            ))),
+            global_routing_snapshot: ArcSwap::from_pointee(GlobalRoutingSnapshot {
+                epoch: 0,
+                snapshot: Self::empty_routing_snapshot(),
+            }),
             global_epoch: AtomicUsize::new(0),
-            global_published_epoch: AtomicUsize::new(0),
+            global_membership_order: parking_lot::RwLock::new(()),
             global_routing_update: parking_lot::Mutex::new(()),
             model_alias_index: Arc::new(DashMap::new()),
             hash_rings: Arc::new(DashMap::new()),
@@ -1311,9 +1328,13 @@ impl WorkerRegistry {
             );
         }
 
-        // Overwrite worker object atomically
-        self.workers.insert(worker_id.clone(), new_worker.clone());
-        self.bump_global_routing_epoch();
+        // Overwrite worker object atomically. The membership-order read
+        // guard keeps the rebuild scan from interleaving with this write.
+        {
+            let _order = self.global_membership_order.read();
+            self.workers.insert(worker_id.clone(), new_worker.clone());
+            self.bump_global_routing_epoch();
+        }
 
         // The replacement carries its own backend-client slot, so the old
         // instance's ZMQ handshake driver can now only hold its socket binds
@@ -1574,22 +1595,31 @@ impl WorkerRegistry {
             }
         }
 
-        // Release the overload count before the worker leaves `self.workers` —
-        // stale-handle writes are dropped, so clearing afterwards would leak it.
+        // Release the overload count and demote the worker before it leaves
+        // `self.workers` — stale-handle writes are dropped after removal, so
+        // clearing afterwards would leak the count, and routing snapshots
+        // that still hold this worker must already see it ineligible by the
+        // time the removal becomes visible.
         if let Some(entry) = self.workers.get(worker_id) {
             let worker = Arc::clone(entry.value());
             drop(entry);
             self.set_worker_overloaded(&worker, false);
-        }
-
-        if let Some((_, worker)) = self.workers.remove(worker_id) {
-            // Readers may still hold an immutable routing snapshot containing
-            // this worker. Make those stale handles ineligible before
-            // publishing snapshots without it.
             if worker.status() == WorkerStatus::Ready {
                 worker.set_status(WorkerStatus::NotReady);
             }
-            self.bump_global_routing_epoch();
+        }
+
+        // The membership-order read guard keeps the rebuild scan from
+        // interleaving with this write.
+        let removed = {
+            let _order = self.global_membership_order.read();
+            let removed = self.workers.remove(worker_id);
+            if removed.is_some() {
+                self.bump_global_routing_epoch();
+            }
+            removed
+        };
+        if let Some((_, worker)) = removed {
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
@@ -1817,8 +1847,13 @@ impl WorkerRegistry {
         // mesh-imported (peer state could mutate a local worker's status).
         self.worker_origins.insert(worker_id.clone(), origin);
 
-        self.workers.insert(worker_id.clone(), worker.clone());
-        self.bump_global_routing_epoch();
+        // The membership-order read guard keeps the rebuild scan from
+        // interleaving with this write.
+        {
+            let _order = self.global_membership_order.read();
+            self.workers.insert(worker_id.clone(), worker.clone());
+            self.bump_global_routing_epoch();
+        }
 
         // Update model index for O(1) lookups using copy-on-write.
         for model_id in Self::worker_model_ids(&worker) {
@@ -1966,56 +2001,75 @@ impl WorkerRegistry {
         drop(previous);
     }
 
-    /// Mark the global routing snapshot stale. O(1): the next routing read
-    /// rebuilds it once from the worker map, so a registration or removal
-    /// storm costs one rebuild total instead of one full-fleet copy per
-    /// worker.
+    /// Mark the global routing snapshot stale and release the superseded
+    /// generation. O(1) amortized: the first bump after a published
+    /// generation drops it (otherwise model-scoped-only traffic would retain
+    /// a full-fleet generation until a model-less read that may never come),
+    /// and every further bump in a storm drops only the shared marker. The
+    /// marker's `usize::MAX` epoch can never match the live counter, so a
+    /// racing fast-path reader can never serve it.
+    ///
+    /// Callers must hold a `global_membership_order` read guard across the
+    /// worker-map mutation and this bump, so the rebuild scan cannot observe
+    /// a half-applied write.
     fn bump_global_routing_epoch(&self) {
         self.global_epoch.fetch_add(1, Ordering::Release);
+        let previous = self
+            .global_routing_snapshot
+            .swap(Arc::new(GlobalRoutingSnapshot {
+                epoch: usize::MAX,
+                snapshot: Self::empty_routing_snapshot(),
+            }));
+        drop(previous);
     }
 
     /// The current global membership snapshot, rebuilt first when membership
     /// changed since it was last published.
     ///
-    /// A reader arriving between a membership write and its epoch bump can
-    /// still see the previous snapshot for an instant. Removal tolerates
-    /// that by demoting the worker to NotReady before bumping, so stale
-    /// handles fail the live availability check; an addition is simply not
-    /// routable for that instant.
+    /// The fast path is self-validating: the published object carries the
+    /// epoch it was built at, so a snapshot superseded between the counter
+    /// load and the pointer load fails the comparison and falls through to
+    /// the rebuild. The rebuild scans the worker map under the
+    /// `global_membership_order` write side, so every published snapshot is
+    /// a membership state that truly existed at one instant — never a
+    /// mixture of generations from interleaved shard reads.
     fn current_global_routing_snapshot(&self) -> Arc<ModelWorkerSnapshot> {
-        let epoch = self.global_epoch.load(Ordering::Acquire);
-        if self.global_published_epoch.load(Ordering::Acquire) == epoch {
-            return self.global_routing_snapshot.load_full();
+        let published = self.global_routing_snapshot.load_full();
+        if published.epoch == self.global_epoch.load(Ordering::Acquire) {
+            return Arc::clone(&published.snapshot);
         }
-        let previous = {
-            let _update = self.global_routing_update.lock();
-            // Re-read under the lock: a concurrent reader may have already
-            // rebuilt for this epoch.
+        drop(published);
+        let _update = self.global_routing_update.lock();
+        // Re-check under the rebuild lock: a concurrent reader may have
+        // already rebuilt for the current epoch.
+        let published = self.global_routing_snapshot.load_full();
+        if published.epoch == self.global_epoch.load(Ordering::Acquire) {
+            return Arc::clone(&published.snapshot);
+        }
+        drop(published);
+        let (epoch, fresh) = {
+            let _order = self.global_membership_order.write();
             let epoch = self.global_epoch.load(Ordering::Acquire);
-            if self.global_published_epoch.load(Ordering::Acquire) == epoch {
-                None
-            } else {
-                let members: Vec<Arc<dyn Worker>> = self
-                    .workers
-                    .iter()
-                    .map(|entry| Arc::clone(entry.value()))
-                    .collect();
-                let previous =
-                    self.global_routing_snapshot
-                        .swap(Arc::new(ModelWorkerSnapshot::new(Arc::from(
-                            members.into_boxed_slice(),
-                        ))));
-                // A mutation landing during the rebuild bumps `global_epoch`
-                // past the value stored here, so the next read rebuilds
-                // again — updates cannot be lost, only repeated.
-                self.global_published_epoch.store(epoch, Ordering::Release);
-                Some(previous)
-            }
+            let members: Vec<Arc<dyn Worker>> = self
+                .workers
+                .iter()
+                .map(|entry| Arc::clone(entry.value()))
+                .collect();
+            let fresh = Arc::new(ModelWorkerSnapshot::new(Arc::from(
+                members.into_boxed_slice(),
+            )));
+            (epoch, fresh)
         };
-        // Cached projections can own large slices; drop them outside the
-        // rebuild lock.
+        let previous = self
+            .global_routing_snapshot
+            .swap(Arc::new(GlobalRoutingSnapshot {
+                epoch,
+                snapshot: Arc::clone(&fresh),
+            }));
+        // Superseded generations can own large projection slices; drop them
+        // outside the membership-order guard.
         drop(previous);
-        self.global_routing_snapshot.load_full()
+        fresh
     }
 
     /// Drop `worker_url` from the copy-on-write model index slice for `model_id`
@@ -3204,6 +3258,76 @@ mod tests {
                 .len(),
             8
         );
+    }
+
+    /// The writer replaces the prefill worker before the decode worker on
+    /// every generation, so in every membership state that ever truly
+    /// existed, generation(prefill) >= generation(decode). A rebuild scan
+    /// that interleaved with the writer could publish the reverse — an old
+    /// prefill paired with a newer decode — which is exactly the torn pair a
+    /// live PD selection must never draw from.
+    #[test]
+    fn global_snapshot_never_publishes_a_torn_generation() {
+        use std::sync::atomic::AtomicBool;
+
+        fn pd_worker(url: &str, worker_type: WorkerType, generation: usize) -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new("model"))
+                    .worker_type(worker_type)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .label("generation", generation.to_string())
+                    .health_config(no_health_check())
+                    .build(),
+            )
+        }
+
+        fn generation(pool: &[Arc<dyn Worker>]) -> usize {
+            pool[0]
+                .metadata()
+                .spec
+                .labels
+                .get("generation")
+                .and_then(|generation| generation.parse().ok())
+                .expect("every test worker carries a generation label")
+        }
+
+        let registry = WorkerRegistry::new();
+        registry.register_or_replace(pd_worker("grpc://prefill:1", WorkerType::Prefill, 0));
+        registry.register_or_replace(pd_worker("grpc://decode:1", WorkerType::Decode, 0));
+
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for generation in 1..=300 {
+                    registry.register_or_replace(pd_worker(
+                        "grpc://prefill:1",
+                        WorkerType::Prefill,
+                        generation,
+                    ));
+                    registry.register_or_replace(pd_worker(
+                        "grpc://decode:1",
+                        WorkerType::Decode,
+                        generation,
+                    ));
+                }
+                done.store(true, Ordering::Release);
+            });
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    let snapshot = registry.get_routing_snapshot(UNKNOWN_MODEL_ID);
+                    let prefill = snapshot.pool(RoutingPool::GrpcPrefill);
+                    let decode = snapshot.pool(RoutingPool::GrpcDecode);
+                    if prefill.is_empty() || decode.is_empty() {
+                        continue;
+                    }
+                    assert!(
+                        generation(&prefill) >= generation(&decode),
+                        "torn snapshot: decode generation passed prefill"
+                    );
+                }
+            });
+        });
     }
 
     #[test]
