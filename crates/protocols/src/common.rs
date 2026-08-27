@@ -4,7 +4,7 @@ use serde::{
     de::{self, value::SeqAccessDeserializer, SeqAccess, Visitor},
     Deserialize, Deserializer, Serialize,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use validator;
 
 // ============================================================================
@@ -300,6 +300,12 @@ pub struct StreamOptions {
     /// to normalize payload sizes. Defaults to `true` upstream when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_obfuscation: Option<bool>,
+
+    /// Additional fields not explicitly defined above (e.g. engine-specific
+    /// streaming options). Without this, the gateway silently drops them while
+    /// re-serializing the request for the backend.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 #[serde_with::skip_serializing_none]
@@ -453,7 +459,7 @@ pub struct Tool {
 /// Per the OpenAI spec, omitting `parameters` defines a function with an
 /// empty parameter list, so a missing field deserializes to an empty schema.
 fn empty_parameters_schema() -> Value {
-    Value::Object(serde_json::Map::new())
+    Value::Object(Map::new())
 }
 
 #[serde_with::skip_serializing_none]
@@ -962,6 +968,35 @@ mod tests {
     fn test_deserialize_null_as_false_rejects_non_bool() {
         let result = serde_json::from_value::<NullableBoolTest>(json!({"field": "yes"}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn stream_options_preserve_unknown_fields() {
+        let raw = json!({
+            "include_usage": true,
+            "continuous_usage_stats": true,
+            "step_usage_chunks": "all",
+            "engine_specific": {"nested": 1},
+        });
+
+        let opts: StreamOptions = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(opts.include_usage, Some(true));
+        assert_eq!(opts.continuous_usage_stats, Some(true));
+        assert_eq!(opts.other.get("step_usage_chunks"), Some(&json!("all")));
+
+        // Re-serializing must round-trip the engine-specific keys, otherwise the
+        // gateway would strip them on the way to the backend.
+        assert_eq!(serde_json::to_value(&opts).unwrap(), raw);
+    }
+
+    #[test]
+    fn stream_options_without_unknown_fields_stay_compact() {
+        let opts: StreamOptions = serde_json::from_value(json!({"include_usage": true})).unwrap();
+        assert!(opts.other.is_empty());
+        assert_eq!(
+            serde_json::to_value(&opts).unwrap(),
+            json!({"include_usage": true})
+        );
     }
 
     #[test]

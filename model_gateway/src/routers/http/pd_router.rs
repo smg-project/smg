@@ -2216,6 +2216,56 @@ mod tests {
     }
 
     #[test]
+    fn engine_specific_stream_options_survive_bootstrap_injection() {
+        use openai_protocol::{
+            chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+            common::StreamOptions,
+        };
+
+        // An engine-specific streaming option the gateway knows nothing about.
+        // It must reach the backend untouched; dropping it silently disables the
+        // feature the client asked for.
+        let mut extra = serde_json::Map::new();
+        extra.insert("step_usage_chunks".to_string(), json!("all"));
+
+        let request = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: MessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: Some(true),
+                continuous_usage_stats: Some(true),
+                other: extra,
+                ..StreamOptions::default()
+            }),
+            ..Default::default()
+        };
+
+        let prefill = BasicWorkerBuilder::new("http://prefill:30000".to_string())
+            .worker_type(WorkerType::Prefill)
+            .bootstrap_port(Some(8998))
+            .build();
+
+        let body = PDRouter::inject_bootstrap_into_value(
+            serde_json::to_value(&request).unwrap(),
+            &prefill,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(body["stream_options"]["step_usage_chunks"], json!("all"));
+        assert_eq!(body["stream_options"]["include_usage"], json!(true));
+        assert_eq!(
+            body["stream_options"]["continuous_usage_stats"],
+            json!(true)
+        );
+        assert_eq!(body["bootstrap_port"], json!(8998));
+    }
+
+    #[test]
     fn test_done_event_detection() {
         // Production-incident payload: a delta whose arguments contained the
         // literal sentinel text; the old substring scan treated it as
