@@ -43,7 +43,7 @@ pub use openai_protocol::{
     worker::{ProviderType, WorkerGroupKey},
 };
 pub use overload::OverloadThresholds;
-pub(crate) use registry::RoutingPool;
+pub(crate) use registry::{ModelWorkerSnapshot, RoutingPool};
 pub use registry::{WorkerOrigin, WorkerRegistry};
 pub use resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_STATUS_CODES};
 pub use sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL;

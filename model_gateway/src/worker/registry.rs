@@ -165,8 +165,12 @@ impl RoutingPool {
 /// Immutable membership snapshot. Route-specific projections are populated
 /// lazily once and then shared by every request until membership changes
 /// publish a replacement snapshot.
+///
+/// Multi-leg selection (PD/EPD) must derive every leg from ONE snapshot: two
+/// separate registry lookups can straddle a concurrent membership change and
+/// pair workers that never coexisted.
 #[derive(Debug)]
-struct ModelWorkerSnapshot {
+pub(crate) struct ModelWorkerSnapshot {
     all: WorkerSnapshot,
     pools: [LazyRoutingPool; RoutingPool::COUNT],
 }
@@ -179,7 +183,7 @@ impl ModelWorkerSnapshot {
         }
     }
 
-    fn pool(&self, pool: RoutingPool) -> WorkerSnapshot {
+    pub(crate) fn pool(&self, pool: RoutingPool) -> WorkerSnapshot {
         self.pools[pool.index()]
             .get_or_init(|| {
                 if self.all.iter().all(|worker| pool.matches(worker)) {
@@ -224,11 +228,24 @@ pub struct WorkerRegistry {
     /// Immutable snapshot spanning every registered worker. Model-less routes
     /// use its lazy route projections instead of scanning the worker map and
     /// cloning every matching `Arc` on each request.
+    ///
+    /// Rebuilt lazily: membership mutations only bump `global_epoch` (O(1)),
+    /// and the first read after a change rebuilds once from the worker map.
+    /// A registration or removal storm therefore costs one rebuild total,
+    /// not one full-fleet copy per worker.
     global_routing_snapshot: ArcSwap<ModelWorkerSnapshot>,
 
-    /// Serializes the cold membership-copy path. Routing reads never take this
-    /// lock; it only avoids repeated full-snapshot CAS retries when many
-    /// workers register or leave concurrently.
+    /// Monotonic membership generation; bumped on every register / replace /
+    /// remove.
+    global_epoch: AtomicUsize,
+
+    /// The `global_epoch` value `global_routing_snapshot` was built at. When
+    /// it trails `global_epoch` the snapshot is stale and the next read
+    /// rebuilds it.
+    global_published_epoch: AtomicUsize,
+
+    /// Serializes the cold rebuild path. Routing reads take it only when the
+    /// snapshot is stale; mutations never take it.
     global_routing_update: parking_lot::Mutex<()>,
 
     /// Alias index kept separate from `model_index` so aliases do not appear as
@@ -316,6 +333,8 @@ impl WorkerRegistry {
             global_routing_snapshot: ArcSwap::from_pointee(ModelWorkerSnapshot::new(Arc::from(
                 Vec::<Arc<dyn Worker>>::new().into_boxed_slice(),
             ))),
+            global_epoch: AtomicUsize::new(0),
+            global_published_epoch: AtomicUsize::new(0),
             global_routing_update: parking_lot::Mutex::new(()),
             model_alias_index: Arc::new(DashMap::new()),
             hash_rings: Arc::new(DashMap::new()),
@@ -527,7 +546,7 @@ impl WorkerRegistry {
         pool: RoutingPool,
     ) -> Arc<[Arc<dyn Worker>]> {
         if model_id == UNKNOWN_MODEL_ID {
-            return self.global_routing_snapshot.load_full().pool(pool);
+            return self.current_global_routing_snapshot().pool(pool);
         }
         self.get_model_routing_pool(model_id, pool)
     }
@@ -543,38 +562,72 @@ impl WorkerRegistry {
         model_id: &str,
         pool: RoutingPool,
     ) -> Arc<[Arc<dyn Worker>]> {
+        self.model_routing_snapshot(model_id).map_or_else(
+            || Arc::from(Self::EMPTY_WORKERS),
+            |snapshot| snapshot.pool(pool),
+        )
+    }
+
+    /// One membership snapshot for a model (alias-aware), from which several
+    /// leg pools can be derived atomically: a PD/EPD selection must draw all
+    /// its legs from a single generation, and two separate pool lookups could
+    /// straddle a concurrent membership change.
+    pub(crate) fn model_routing_snapshot(
+        &self,
+        model_id: &str,
+    ) -> Option<Arc<ModelWorkerSnapshot>> {
         // Bind the clone via a `let` so the shard `Ref` drops at the end of
         // the statement (edition 2021 keeps `if let` scrutinee temporaries
-        // alive through the body): the first post-change `pool()` call does
-        // an O(workers) projection build that must not run under the shard
-        // read guard.
+        // alive through the body): the caller's first post-change `pool()`
+        // call does an O(workers) projection build that must not run under
+        // the shard read guard.
         let snapshot = self
             .model_index
             .get(model_id)
             .map(|workers| Arc::clone(workers.value()));
-        if let Some(snapshot) = snapshot {
-            return snapshot.pool(pool);
+        if snapshot.is_some() {
+            return snapshot;
         }
         let canonical_id = self
             .model_alias_index
             .get(model_id)
             .map(|canonical_id| Arc::clone(canonical_id.value()));
-        canonical_id
-            .and_then(|canonical_id| {
-                self.model_index
-                    .get(canonical_id.as_ref())
-                    .map(|workers| Arc::clone(workers.value()))
-            })
-            .map_or_else(
-                || Arc::from(Self::EMPTY_WORKERS),
-                |snapshot| snapshot.pool(pool),
-            )
+        canonical_id.and_then(|canonical_id| {
+            self.model_index
+                .get(canonical_id.as_ref())
+                .map(|workers| Arc::clone(workers.value()))
+        })
+    }
+
+    /// One membership snapshot for multi-leg selection, with the wildcard
+    /// model mapping to the global snapshot and an unknown model to a shared
+    /// empty one.
+    pub(crate) fn get_routing_snapshot(&self, model_id: &str) -> Arc<ModelWorkerSnapshot> {
+        if model_id == UNKNOWN_MODEL_ID {
+            return self.current_global_routing_snapshot();
+        }
+        self.model_routing_snapshot(model_id)
+            .unwrap_or_else(Self::empty_routing_snapshot)
+    }
+
+    /// Shared empty candidate slice.
+    pub(crate) fn empty_pool() -> Arc<[Arc<dyn Worker>]> {
+        Arc::from(Self::EMPTY_WORKERS)
+    }
+
+    /// Shared empty snapshot for unknown models.
+    fn empty_routing_snapshot() -> Arc<ModelWorkerSnapshot> {
+        static EMPTY: OnceLock<Arc<ModelWorkerSnapshot>> = OnceLock::new();
+        Arc::clone(
+            EMPTY
+                .get_or_init(|| Arc::new(ModelWorkerSnapshot::new(Arc::from(Self::EMPTY_WORKERS)))),
+        )
     }
 
     /// Return the immutable global membership snapshot used by routing paths
     /// whose model/provider filters are evaluated dynamically.
     pub(crate) fn get_routing_workers(&self) -> Arc<[Arc<dyn Worker>]> {
-        Arc::clone(&self.global_routing_snapshot.load_full().all)
+        Arc::clone(&self.current_global_routing_snapshot().all)
     }
 
     /// Apply the absolute overload veto to `worker`, returning `true` when the
@@ -1260,7 +1313,7 @@ impl WorkerRegistry {
 
         // Overwrite worker object atomically
         self.workers.insert(worker_id.clone(), new_worker.clone());
-        self.add_worker_to_global_routing_snapshot(new_worker.clone());
+        self.bump_global_routing_epoch();
 
         // The replacement carries its own backend-client slot, so the old
         // instance's ZMQ handshake driver can now only hold its socket binds
@@ -1536,7 +1589,7 @@ impl WorkerRegistry {
             if worker.status() == WorkerStatus::Ready {
                 worker.set_status(WorkerStatus::NotReady);
             }
-            self.remove_worker_from_global_routing_snapshot(worker.url());
+            self.bump_global_routing_epoch();
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
@@ -1765,7 +1818,7 @@ impl WorkerRegistry {
         self.worker_origins.insert(worker_id.clone(), origin);
 
         self.workers.insert(worker_id.clone(), worker.clone());
-        self.add_worker_to_global_routing_snapshot(worker.clone());
+        self.bump_global_routing_epoch();
 
         // Update model index for O(1) lookups using copy-on-write.
         for model_id in Self::worker_model_ids(&worker) {
@@ -1885,6 +1938,10 @@ impl WorkerRegistry {
     /// Replaces any existing entry with the same URL so updates via replace()
     /// do not leave duplicate rows.
     fn add_worker_to_model_index(&self, model_id: &str, worker: Arc<dyn Worker>) {
+        // The replaced snapshot (and its cached projections) must not drop
+        // under the shard write guard: capture it and let it fall after the
+        // entry expression releases the lock.
+        let mut previous = None;
         self.model_index
             .entry(model_id.to_string())
             .and_modify(|existing| {
@@ -1894,69 +1951,80 @@ impl WorkerRegistry {
                     .cloned()
                     .collect();
                 new_workers.push(worker.clone());
-                *existing = Arc::new(ModelWorkerSnapshot::new(Arc::from(
-                    new_workers.into_boxed_slice(),
-                )));
+                previous = Some(std::mem::replace(
+                    existing,
+                    Arc::new(ModelWorkerSnapshot::new(Arc::from(
+                        new_workers.into_boxed_slice(),
+                    ))),
+                ));
             })
             .or_insert_with(|| {
                 Arc::new(ModelWorkerSnapshot::new(Arc::from(
                     vec![worker].into_boxed_slice(),
                 )))
             });
-    }
-
-    /// Add or replace one worker in the global copy-on-write snapshot.
-    fn add_worker_to_global_routing_snapshot(&self, worker: Arc<dyn Worker>) {
-        let previous = {
-            let _update = self.global_routing_update.lock();
-            let existing = self.global_routing_snapshot.load_full();
-            let mut new_workers = Vec::with_capacity(existing.len() + 1);
-            let mut replaced = false;
-            for current in existing.iter() {
-                if current.url() == worker.url() {
-                    new_workers.push(worker.clone());
-                    replaced = true;
-                } else {
-                    new_workers.push(current.clone());
-                }
-            }
-            if !replaced {
-                new_workers.push(worker);
-            }
-            self.global_routing_snapshot
-                .swap(Arc::new(ModelWorkerSnapshot::new(Arc::from(
-                    new_workers.into_boxed_slice(),
-                ))))
-        };
-        // Cached projections can own large slices; release them after the
-        // writer lock so their final drop cannot delay the next mutation.
         drop(previous);
     }
 
-    /// Remove one worker from the global copy-on-write snapshot.
-    fn remove_worker_from_global_routing_snapshot(&self, worker_url: &str) {
+    /// Mark the global routing snapshot stale. O(1): the next routing read
+    /// rebuilds it once from the worker map, so a registration or removal
+    /// storm costs one rebuild total instead of one full-fleet copy per
+    /// worker.
+    fn bump_global_routing_epoch(&self) {
+        self.global_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    /// The current global membership snapshot, rebuilt first when membership
+    /// changed since it was last published.
+    ///
+    /// A reader arriving between a membership write and its epoch bump can
+    /// still see the previous snapshot for an instant. Removal tolerates
+    /// that by demoting the worker to NotReady before bumping, so stale
+    /// handles fail the live availability check; an addition is simply not
+    /// routable for that instant.
+    fn current_global_routing_snapshot(&self) -> Arc<ModelWorkerSnapshot> {
+        let epoch = self.global_epoch.load(Ordering::Acquire);
+        if self.global_published_epoch.load(Ordering::Acquire) == epoch {
+            return self.global_routing_snapshot.load_full();
+        }
         let previous = {
             let _update = self.global_routing_update.lock();
-            let existing = self.global_routing_snapshot.load_full();
-            let new_workers: Vec<_> = existing
-                .iter()
-                .filter(|worker| worker.url() != worker_url)
-                .cloned()
-                .collect();
-            self.global_routing_snapshot
-                .swap(Arc::new(ModelWorkerSnapshot::new(Arc::from(
-                    new_workers.into_boxed_slice(),
-                ))))
+            // Re-read under the lock: a concurrent reader may have already
+            // rebuilt for this epoch.
+            let epoch = self.global_epoch.load(Ordering::Acquire);
+            if self.global_published_epoch.load(Ordering::Acquire) == epoch {
+                None
+            } else {
+                let members: Vec<Arc<dyn Worker>> = self
+                    .workers
+                    .iter()
+                    .map(|entry| Arc::clone(entry.value()))
+                    .collect();
+                let previous =
+                    self.global_routing_snapshot
+                        .swap(Arc::new(ModelWorkerSnapshot::new(Arc::from(
+                            members.into_boxed_slice(),
+                        ))));
+                // A mutation landing during the rebuild bumps `global_epoch`
+                // past the value stored here, so the next read rebuilds
+                // again — updates cannot be lost, only repeated.
+                self.global_published_epoch.store(epoch, Ordering::Release);
+                Some(previous)
+            }
         };
-        // See the add path above: destruction is not part of the critical
-        // section.
+        // Cached projections can own large slices; drop them outside the
+        // rebuild lock.
         drop(previous);
+        self.global_routing_snapshot.load_full()
     }
 
     /// Drop `worker_url` from the copy-on-write model index slice for `model_id`
     /// and rebuild the hash ring. Evicts the whole model entry when empty.
     fn remove_worker_from_model_index(&self, model_id: &str, worker_url: &str) {
         let mut should_remove_entry = false;
+        // As in add_worker_to_model_index: the replaced snapshot drops after
+        // the shard guard, not under it.
+        let mut previous = None;
 
         if let Some(mut entry) = self.model_index.get_mut(model_id) {
             let new_workers: Vec<Arc<dyn Worker>> = entry
@@ -1966,16 +2034,23 @@ impl WorkerRegistry {
                 .collect();
 
             if new_workers.is_empty() {
-                *entry = Arc::new(ModelWorkerSnapshot::new(Arc::from(
-                    Vec::<Arc<dyn Worker>>::new().into_boxed_slice(),
-                )));
+                previous = Some(std::mem::replace(
+                    &mut *entry,
+                    Arc::new(ModelWorkerSnapshot::new(Arc::from(
+                        Vec::<Arc<dyn Worker>>::new().into_boxed_slice(),
+                    ))),
+                ));
                 should_remove_entry = true;
             } else {
-                *entry = Arc::new(ModelWorkerSnapshot::new(Arc::from(
-                    new_workers.into_boxed_slice(),
-                )));
+                previous = Some(std::mem::replace(
+                    &mut *entry,
+                    Arc::new(ModelWorkerSnapshot::new(Arc::from(
+                        new_workers.into_boxed_slice(),
+                    ))),
+                ));
             }
         }
+        drop(previous);
 
         if should_remove_entry {
             self.model_index
@@ -3106,13 +3181,15 @@ mod tests {
             for i in 0..8 {
                 let registry = Arc::clone(&registry);
                 scope.spawn(move || {
-                    registry.add_worker_to_global_routing_snapshot(Arc::new(
-                        BasicWorkerBuilder::new(format!("http://worker{i}:8080"))
-                            .worker_type(WorkerType::Regular)
-                            .connection_mode(ConnectionMode::Http)
-                            .health_config(no_health_check())
-                            .build(),
-                    ));
+                    registry
+                        .register(Arc::new(
+                            BasicWorkerBuilder::new(format!("http://worker{i}:8080"))
+                                .worker_type(WorkerType::Regular)
+                                .connection_mode(ConnectionMode::Http)
+                                .health_config(no_health_check())
+                                .build(),
+                        ))
+                        .unwrap();
                 });
             }
         });

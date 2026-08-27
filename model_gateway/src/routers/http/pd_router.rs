@@ -101,8 +101,14 @@ impl PDRouter {
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
-        let workers = self.worker_registry.get_prefill_workers();
-        let first_worker_url = workers.first().map(|w| w.url().to_string());
+        // Plain HTTP GET to the selected URL: only healthy HTTP-transport
+        // prefill workers are eligible (same rule as the PD legs).
+        let first_worker_url = self
+            .worker_registry
+            .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpPrefill)
+            .iter()
+            .find(|w| w.is_healthy())
+            .map(|w| w.url().to_string());
 
         if let Some(worker_url) = first_worker_url {
             self.proxy_to_worker(worker_url, endpoint, headers).await
@@ -1319,33 +1325,37 @@ impl PDRouter {
 
         // Shared HTTP-transport projections: this router proxies plain HTTP
         // to the selected worker's URL, so a gRPC or ZMQ worker must never
-        // be selectable. The wildcard fallback stays conditional, matching
-        // the old code: untagged workers index under the literal "unknown"
-        // entry and win when present; only an empty entry widens to every
-        // HTTP prefill/decode worker ("auto" means pick any).
+        // be selectable. Both legs derive from ONE model snapshot (and, for
+        // the wildcard fallback, ONE global snapshot) — separate lookups
+        // could straddle a concurrent membership change and pair workers
+        // that never coexisted. The fallback stays conditional, matching the
+        // old code: untagged workers index under the literal "unknown" entry
+        // and win when present; only an empty entry widens to every HTTP
+        // prefill/decode worker ("auto" means pick any).
         let is_unknown_model = model_id == UNKNOWN_MODEL_ID;
+        let model_snapshot = self.worker_registry.model_routing_snapshot(model_id);
+        let global_snapshot =
+            is_unknown_model.then(|| self.worker_registry.get_routing_snapshot(UNKNOWN_MODEL_ID));
 
         let prefill_workers = {
-            let by_model = self
-                .worker_registry
-                .get_model_routing_pool(model_id, RoutingPool::HttpPrefill);
-            if by_model.is_empty() && is_unknown_model {
-                self.worker_registry
-                    .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpPrefill)
-            } else {
-                by_model
+            let by_model = match &model_snapshot {
+                Some(snapshot) => snapshot.pool(RoutingPool::HttpPrefill),
+                None => WorkerRegistry::empty_pool(),
+            };
+            match &global_snapshot {
+                Some(global) if by_model.is_empty() => global.pool(RoutingPool::HttpPrefill),
+                _ => by_model,
             }
         };
 
         let decode_workers = {
-            let by_model = self
-                .worker_registry
-                .get_model_routing_pool(model_id, RoutingPool::HttpDecode);
-            if by_model.is_empty() && is_unknown_model {
-                self.worker_registry
-                    .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpDecode)
-            } else {
-                by_model
+            let by_model = match &model_snapshot {
+                Some(snapshot) => snapshot.pool(RoutingPool::HttpDecode),
+                None => WorkerRegistry::empty_pool(),
+            };
+            match &global_snapshot {
+                Some(global) if by_model.is_empty() => global.pool(RoutingPool::HttpDecode),
+                _ => by_model,
             }
         };
 

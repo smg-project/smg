@@ -25,7 +25,8 @@ use crate::{
         },
     },
     worker::{
-        ConnectionModeExt, HashRing, RoutingPool, RuntimeType, Worker, WorkerRegistry, WorkerType,
+        ConnectionModeExt, HashRing, ModelWorkerSnapshot, RoutingPool, RuntimeType, Worker,
+        WorkerRegistry, WorkerType,
     },
 };
 
@@ -327,11 +328,14 @@ impl WorkerSelectionStage {
         Some(selected)
     }
 
-    /// Workers from one shared routing-pool projection that also pass the
-    /// live `is_available()` check (health, circuit breaker, overload veto).
-    fn available_pool_workers(&self, model_id: &str, pool: RoutingPool) -> Vec<Arc<dyn Worker>> {
-        self.worker_registry
-            .get_routing_pool(model_id, pool)
+    /// Workers from one leg pool of `snapshot` that also pass the live
+    /// `is_available()` check (health, circuit breaker, overload veto).
+    fn available_workers(
+        snapshot: &ModelWorkerSnapshot,
+        pool: RoutingPool,
+    ) -> Vec<Arc<dyn Worker>> {
+        snapshot
+            .pool(pool)
             .iter()
             .filter(|w| w.is_available())
             .cloned()
@@ -346,12 +350,15 @@ impl WorkerSelectionStage {
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
     ) -> Option<PdWorkerPair> {
-        // Membership comes from the shared per-leg projections (strictly
-        // gRPC — a ZMQ leg would silently drop the PD bootstrap info, see
-        // `RoutingPool::GrpcPrefill`; the wildcard model maps to the global
-        // snapshot). Availability stays a live per-request check.
-        let all_prefill = self.available_pool_workers(model_id, RoutingPool::GrpcPrefill);
-        let all_decode = self.available_pool_workers(model_id, RoutingPool::GrpcDecode);
+        // Both legs derive from ONE membership snapshot: separate pool
+        // lookups could straddle a concurrent replacement and pair workers
+        // that never coexisted. The pools are strictly gRPC (a ZMQ leg would
+        // silently drop the PD bootstrap info, see `RoutingPool::GrpcPrefill`;
+        // the wildcard model maps to the global snapshot), and availability
+        // stays a live per-request check.
+        let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+        let all_prefill = Self::available_workers(&snapshot, RoutingPool::GrpcPrefill);
+        let all_decode = Self::available_workers(&snapshot, RoutingPool::GrpcDecode);
 
         if all_prefill.is_empty() {
             warn!("No available prefill workers");
@@ -470,14 +477,16 @@ impl WorkerSelectionStage {
         rid_key: Option<&str>,
         encode_item_hashes: &[Vec<u8>],
     ) -> Option<EncodePrefillDecodeWorkerSelection> {
-        // Membership comes from the shared per-leg projections (strictly
-        // gRPC — encode dispatch is a gRPC encoder RPC the direct-ZMQ worker
-        // has no path for, and the ZMQ wire carries no KV-transfer
-        // rendezvous for the prefill/decode legs; the wildcard model maps to
-        // the global snapshot). Availability stays a live per-request check.
-        let all_encode = self.available_pool_workers(model_id, RoutingPool::GrpcEncode);
-        let all_prefill = self.available_pool_workers(model_id, RoutingPool::GrpcPrefill);
-        let all_decode = self.available_pool_workers(model_id, RoutingPool::GrpcDecode);
+        // All three legs derive from ONE membership snapshot (see
+        // select_pd_pair). The pools are strictly gRPC — encode dispatch is
+        // a gRPC encoder RPC the direct-ZMQ worker has no path for, and the
+        // ZMQ wire carries no KV-transfer rendezvous for the prefill/decode
+        // legs; the wildcard model maps to the global snapshot. Availability
+        // stays a live per-request check.
+        let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+        let all_encode = Self::available_workers(&snapshot, RoutingPool::GrpcEncode);
+        let all_prefill = Self::available_workers(&snapshot, RoutingPool::GrpcPrefill);
+        let all_decode = Self::available_workers(&snapshot, RoutingPool::GrpcDecode);
 
         let needs_encode = !encode_item_hashes.is_empty();
         if needs_encode && all_encode.is_empty() {
