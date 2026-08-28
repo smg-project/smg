@@ -140,11 +140,11 @@ lto = "fat"         # Full LTO for smaller binaries
 codegen-units = 1   # Better optimization, slower compile
 strip = false       # Keep symbols so production CPU profiles/flamegraphs are readable (#1575)
 
-# Optimize tokenizer hot paths for runtime performance.
+# Optimize hot dependencies in the tiktoken encode path.
 [profile.release.package.tiktoken-rs]
 opt-level = 2
 
-[profile.release.package."fancy-regex:0.17.0"]
+[profile.release.package.fancy-regex]
 opt-level = 2
 
 [profile.release.package.regex-automata]
