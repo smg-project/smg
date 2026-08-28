@@ -251,8 +251,22 @@ async fn send_turn(ctx: &Ctx, req: &TurnRequest<'_>) -> Option<Vec<u32>> {
     let mut status: u16 = 0;
     let mut ttft_ms: Option<f64> = None;
     let mut response: Option<Value> = None;
+    let mut index_source: Option<String> = None;
+    let mut index_predicted_tokens: Option<u64> = None;
     if let Ok(resp) = request.body(body).send().await {
         status = resp.status().as_u16();
+        // Remote-index echo headers (absent unless the gateway runs with
+        // --kv-indexer-url); captured before the body consumes `resp`.
+        index_source = resp
+            .headers()
+            .get("x-smg-index-source")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        index_predicted_tokens = resp
+            .headers()
+            .get("x-smg-index-predicted-tokens")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok());
         if resp.status().is_success() {
             if args.stream {
                 match consume_sse(resp, started).await {
@@ -333,6 +347,8 @@ async fn send_turn(ctx: &Ctx, req: &TurnRequest<'_>) -> Option<Vec<u32>> {
         e2e_ms,
         status,
         start_ms,
+        index_source,
+        index_predicted_tokens,
     };
     // A send error means the collector is gone (shutdown); nothing to do.
     let _ = ctx.records.send(record);

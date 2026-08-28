@@ -552,6 +552,21 @@ def cmd_compare(args):
             json.dump(seed_rows, f, indent=2)
         leg_results.append((label, aggregate_seed_rows(seed_rows)))
 
+    # Leg-to-leg binary identity: when no leg deliberately uses a prebuilt
+    # slot (revision A/B does), every leg must have run the SAME gateway
+    # binary — otherwise the comparison silently includes a build delta.
+    if all(slot is None for _, _, slot in legs):
+        smg_shas = set()
+        for label, _, _ in legs:
+            for meta_path in sorted((scenario_dir / label).glob("seed-*/meta.json")):
+                with open(meta_path) as f:
+                    smg_shas.add(json.load(f)["binary_sha256"]["smg"])
+        if len(smg_shas) > 1:
+            raise SystemExit(
+                "scenario %s legs ran different gateway binaries: %s"
+                % (args.scenario, sorted(smg_shas))
+            )
+
     write_compare_md(args.scenario, leg_results, scenario_dir / "compare.md")
     sim.log("compare: %s" % (scenario_dir / "compare.md"))
 

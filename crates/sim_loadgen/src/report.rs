@@ -31,6 +31,14 @@ pub struct RequestRecord {
     pub status: u16,
     /// Request start, milliseconds since the Unix epoch.
     pub start_ms: u64,
+    /// Gateway's remote-index echo (`x-smg-index-source`): what the
+    /// prefetch resolved for this decision. `None` when the gateway runs
+    /// without a remote index.
+    pub index_source: Option<String>,
+    /// Gateway's predicted cached tokens for the served worker
+    /// (`x-smg-index-predicted-tokens`); comparing against the worker's
+    /// actual `cached_tokens` separates index error from policy spill.
+    pub index_predicted_tokens: Option<u64>,
 }
 
 impl RequestRecord {
@@ -66,6 +74,8 @@ impl RequestRecord {
             "e2e_ms": self.e2e_ms,
             "status": self.status,
             "start_ms": self.start_ms,
+            "index_source": self.index_source,
+            "index_predicted_tokens": self.index_predicted_tokens,
         })
     }
 }
@@ -420,6 +430,8 @@ mod tests {
             e2e_ms: 100.0,
             status: 200,
             start_ms: 1000,
+            index_source: None,
+            index_predicted_tokens: None,
         }
     }
 
