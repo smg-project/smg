@@ -208,6 +208,13 @@ impl PolicyRegistry {
         })
     }
 
+    /// Whether sticky routing may derive its preferred key from the request
+    /// body's `rid`, requiring automatic body-path selection to keep the body
+    /// readable.
+    pub(crate) fn routing_key_override_enabled(&self) -> bool {
+        self.routing_key_sticky.is_some()
+    }
+
     /// Resolve the effective sticky key: the rid-derived key wins, the
     /// configured routing-key headers are the fallback when no rid is
     /// present. Header keys get the same lineage stripping as rid keys, so a

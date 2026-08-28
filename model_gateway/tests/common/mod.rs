@@ -348,7 +348,10 @@ async fn build_test_app_context(
 
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
+    let policy_registry = Arc::new(PolicyRegistry::with_override(
+        config.policy.clone(),
+        config.routing_key_override.clone(),
+    ));
 
     // Initialize storage backends (Memory for tests).
     let response_storage = Arc::new(MemoryResponseStorage::new());

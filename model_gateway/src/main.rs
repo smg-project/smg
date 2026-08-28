@@ -428,8 +428,9 @@ struct CliArgs {
     /// Sticky sessions: route every request of a conversation to the same
     /// worker, on any policy. The key is derived from the request body's rid
     /// with per-turn/per-retry suffixes stripped (conv_t2_r1 -> conv),
-    /// falling back to the routing-key headers when no rid is present;
-    /// raw-streamed requests carry no readable rid and use the headers only.
+    /// falling back to the routing-key headers when no rid is present.
+    /// Enabling this keeps automatic body forwarding buffered so body rid
+    /// precedence is preserved.
     /// Reuses the manual eviction/idle/assignment knobs for the sticky map
     #[arg(
         long,

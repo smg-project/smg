@@ -517,8 +517,8 @@ pub enum ManualAssignmentMode {
 /// `_t<n>` and per-retry `_r<n>` suffixes stripped, so every turn of a
 /// conversation shares one key) wins over the routing-key headers; the first
 /// configured header carrying a valid value is the fallback when no rid is
-/// present. Raw-streamed requests have no readable body and therefore derive
-/// keys from the headers only.
+/// present. An enabled override keeps automatic body forwarding buffered so
+/// body `rid` precedence is preserved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingKeyOverrideConfig {
     /// When false, policies are used unchanged.

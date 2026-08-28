@@ -1650,6 +1650,7 @@ impl Router {
             .worker_registry
             .get_routing_pool(crate::worker::UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
         decide_body_path(&BodyPathInputs {
+            routing_key_override: self.policy_registry.routing_key_override_enabled(),
             policy_needs_text: self
                 .policy_registry
                 .any_policy_needs_request_text(Some(headers)),
@@ -1688,8 +1689,8 @@ impl Router {
         let model_id = crate::worker::UNKNOWN_MODEL_ID;
         // Buffered-path parity: a valid tokens hint is exactly what selection
         // would have received there (text is never extracted alongside it).
-        // Streamed requests have no readable body, hence no rid key; the
-        // sticky override keys them by the header alone.
+        // Streamed requests have no readable body, hence no rid key;
+        // routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
         let Some(worker) = self.select_worker_for_model(
             model_id,
@@ -2167,7 +2168,7 @@ mod tests {
         routers::common::{
             body_policy::{
                 REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT, REASON_RETRYABLE,
-                REASON_RETRY_FORFEITED, REASON_WASM_REQUEST_HOOK,
+                REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE, REASON_WASM_REQUEST_HOOK,
             },
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
         },
@@ -3038,61 +3039,35 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn key_hint_streams_under_cache_aware_only_with_override() {
-        // Without the sticky override nothing consumes the key content-blind.
-        let router = streaming_router(
+    #[test]
+    fn routing_key_override_always_decides_buffer() {
+        let cache_aware = streaming_router_with_key_override(
             cache_aware_policy(),
             1024 * 1024,
             vec![plain_worker("http://worker1:8080")],
         );
-        let req = with_header(
-            streamed_request(&[b"{\"text\":\"hello\"}"]),
-            "x-smg-routing-key",
-            "media-1",
-        );
-        assert!(router
-            .route_streaming_request(req, "/generate", false)
-            .await
-            .is_err());
 
-        let (url_a, _cap_a) = spawn_capture_stub("application/json", "{}").await;
-        let (url_b, _cap_b) = spawn_capture_stub("application/json", "{}").await;
-        let router = streaming_router_with_key_override(
-            cache_aware_policy(),
+        let no_hint = headers_with_content_length(Some("64"));
+        let mut key_hint = no_hint.clone();
+        key_hint.insert("x-smg-routing-key", "request-unique-key".parse().unwrap());
+        let mut tokens_hint = no_hint.clone();
+        tokens_hint.insert("x-smg-routing-tokens", "1,2,3".parse().unwrap());
+        for headers in [&no_hint, &key_hint, &tokens_hint] {
+            assert_eq!(
+                cache_aware.request_body_path(headers, false),
+                BodyPath::Buffer(REASON_ROUTING_KEY_OVERRIDE)
+            );
+        }
+
+        let text_free = streaming_router_with_key_override(
+            least_load_policy(),
             1024 * 1024,
-            vec![plain_worker(&url_a), plain_worker(&url_b)],
+            vec![plain_worker("http://worker1:8080")],
         );
-        let first = routed_worker_id(
-            &router,
-            with_header(
-                streamed_request(&[b"{\"text\":\"hello\"}"]),
-                "x-smg-routing-key",
-                "media-1",
-            ),
-        )
-        .await;
-        let second = routed_worker_id(
-            &router,
-            with_header(
-                streamed_request(&[b"{\"text\":\"other\"}"]),
-                "x-smg-routing-key",
-                "media-1",
-            ),
-        )
-        .await;
-        assert_eq!(first, second, "keyed requests must stick to one worker");
-
-        // Over-cap keys are ignored by the same extractor selection uses.
-        let req = with_header(
-            streamed_request(&[b"{\"text\":\"hello\"}"]),
-            "x-smg-routing-key",
-            &"k".repeat(129),
+        assert_eq!(
+            text_free.request_body_path(&no_hint, false),
+            BodyPath::Buffer(REASON_ROUTING_KEY_OVERRIDE)
         );
-        assert!(router
-            .route_streaming_request(req, "/generate", false)
-            .await
-            .is_err());
     }
 
     /// With retries disabled the parsed request must be freed at dispatch:
