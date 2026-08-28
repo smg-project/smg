@@ -14,6 +14,11 @@ on:
         description: 'Image tag (e.g. v1.0.1). Leave empty to use version from pyproject.toml'
         required: false
         type: string
+      mirror_existing:
+        description: 'Mirror the existing Docker Hub release to GHCR without rebuilding'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -27,6 +32,9 @@ jobs:
     runs-on: ${{ vars.SMG_RUNNER_DOCKER || 'cpu-e5' }}
     permissions:
       contents: read
+      packages: write
+    env:
+      MIRROR_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.mirror_existing }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -73,6 +81,7 @@ jobs:
           echo "Will push: ${PUSH}"
 
       - name: Set up QEMU
+        if: env.MIRROR_EXISTING != 'true'
         uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
@@ -85,8 +94,17 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Log in to GitHub Container Registry
+        if: steps.should-push.outputs.push == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build and push
         id: build
+        if: env.MIRROR_EXISTING != 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -95,34 +113,61 @@ jobs:
           tags: |
             lightseekorg/smg:${{ steps.version.outputs.version }}
             lightseekorg/smg:latest
+            ghcr.io/${{ github.repository_owner }}/smg:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/smg:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
+
+      - name: Mirror existing release image
+        id: mirror
+        if: env.MIRROR_EXISTING == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          CURRENT_VERSION=$(grep -m1 '^version = ' bindings/python/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          if [[ "${VERSION}" != "${CURRENT_VERSION}" ]]; then
+            echo "::error::Mirror mode only supports the current release (${CURRENT_VERSION})."
+            exit 1
+          fi
+          SOURCE="lightseekorg/smg:${VERSION}"
+          GHCR_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:${VERSION}"
+          GHCR_LATEST="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:latest"
+          docker buildx imagetools create \
+            --tag "${GHCR_IMAGE}" \
+            --tag "${GHCR_LATEST}" \
+            "${SOURCE}"
+          DIGEST=$(docker buildx imagetools inspect "${GHCR_IMAGE}" --format '{{.Manifest.Digest}}')
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
 
       - name: Summary
         if: always()
         env:
           PUSH: ${{ steps.should-push.outputs.push }}
-          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          PUBLISH_OUTCOME: ${{ env.MIRROR_EXISTING == 'true' && steps.mirror.outcome || steps.build.outcome }}
           VERSION: ${{ steps.version.outputs.version }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ env.MIRROR_EXISTING == 'true' && steps.mirror.outputs.digest || steps.build.outputs.digest }}
         run: |
           IMAGE="lightseekorg/smg:${VERSION}"
           LATEST="lightseekorg/smg:latest"
-          if [[ "${BUILD_OUTCOME}" == "success" && "${PUSH}" == "true" ]]; then
+          GHCR_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:${VERSION}"
+          GHCR_LATEST="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:latest"
+          if [[ "${PUBLISH_OUTCOME}" == "success" && "${PUSH}" == "true" ]]; then
             {
-              echo "### ✅ Docker image pushed successfully"
+              echo "### ✅ Release images available"
               echo ""
-              echo "| Tag | Reference |"
-              echo "| --- | --- |"
-              echo "| \`${VERSION}\` | \`${IMAGE}\` |"
-              echo "| \`latest\` | \`${LATEST}\` |"
+              echo "| Registry | Tag | Reference |"
+              echo "| --- | --- | --- |"
+              echo "| Docker Hub | \`${VERSION}\` | \`${IMAGE}\` |"
+              echo "| Docker Hub | \`latest\` | \`${LATEST}\` |"
+              echo "| GHCR | \`${VERSION}\` | \`${GHCR_IMAGE}\` |"
+              echo "| GHCR | \`latest\` | \`${GHCR_LATEST}\` |"
               if [[ -n "${DIGEST}" ]]; then
                 echo ""
                 echo "Digest: \`${DIGEST}\`"
               fi
             } >> "$GITHUB_STEP_SUMMARY"
-          elif [[ "${BUILD_OUTCOME}" == "success" ]]; then
+          elif [[ "${PUBLISH_OUTCOME}" == "success" ]]; then
             {
               echo "### ⚠️ Docker image built but NOT pushed"
               echo ""
@@ -130,10 +175,19 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             echo "::warning::Docker image ${IMAGE} was built but not pushed."
           else
-            {
-              echo "### ❌ Docker image build failed"
-              echo ""
-              echo "\`${IMAGE}\` was **not** pushed because the build did not succeed (outcome: \`${BUILD_OUTCOME}\`)."
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "::warning::Docker image ${IMAGE} was not pushed (build outcome: ${BUILD_OUTCOME})."
+            if [[ "${MIRROR_EXISTING}" == "true" ]]; then
+              {
+                echo "### ❌ GitHub Container Registry mirror failed"
+                echo ""
+                echo "\`${GHCR_IMAGE}\` was **not** published (outcome: \`${PUBLISH_OUTCOME}\`)."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::GitHub Container Registry mirror failed for ${GHCR_IMAGE} (outcome: ${PUBLISH_OUTCOME})."
+            else
+              {
+                echo "### ❌ Release image publishing failed"
+                echo ""
+                echo "Release images were **not** published (outcome: \`${PUBLISH_OUTCOME}\`)."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Release images were not published (outcome: ${PUBLISH_OUTCOME})."
+            fi
           fi

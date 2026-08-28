@@ -24,7 +24,7 @@ fi
 VERSION="${VERSION#v}"
 
 PACKAGE="smg"
-ORG="lightseekorg"
+ORG="smg-project"
 REGISTRY="ghcr.io/${ORG}/${PACKAGE}"
 
 # ---------------------------------------------------------------------------
@@ -36,15 +36,44 @@ fetch_tags_oci() {
     token=$(curl -sf "https://ghcr.io/token?scope=repository:${ORG}/${PACKAGE}:pull" \
         | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])" 2>/dev/null) || return 1
 
-    # List tags from the OCI registry
-    curl -sf -H "Authorization: Bearer ${token}" \
-        "https://ghcr.io/v2/${ORG}/${PACKAGE}/tags/list" \
-        | python3 -c "
+    # List tags from the OCI registry, following rel=next pagination links.
+    local url="https://ghcr.io/v2/${ORG}/${PACKAGE}/tags/list?n=1000"
+    while [[ -n "$url" ]]; do
+        local headers body next
+        headers=$(mktemp)
+        body=$(curl -sf -D "$headers" -H "Authorization: Bearer ${token}" "$url") || {
+            rm -f "$headers"
+            return 1
+        }
+        printf '%s' "$body" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 for tag in sorted(data.get('tags', [])):
     print(tag)
-" 2>/dev/null
+" 2>/dev/null || {
+            rm -f "$headers"
+            return 1
+        }
+        next=$(python3 - "$headers" <<'PY'
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as headers:
+    for line in headers:
+        if line.lower().startswith("link:"):
+            match = re.search(r'<([^>]+)>;\s*rel="next"', line, re.IGNORECASE)
+            if match:
+                print(match.group(1))
+                break
+PY
+)
+        rm -f "$headers"
+        if [[ -n "$next" ]]; then
+            url="https://ghcr.io${next}"
+        else
+            url=""
+        fi
+    done
 }
 
 fetch_tags_gh() {
@@ -100,7 +129,7 @@ labels = {'sglang': 'SGLang', 'vllm': 'vLLM', 'trtllm': 'TensorRT-LLM', 'other':
 
 print('### Docker Images')
 print()
-print(f'Pre-built engine images on [GitHub Container Registry](https://github.com/orgs/lightseekorg/packages/container/package/smg):')
+print(f'Pre-built engine images on [GitHub Container Registry](https://github.com/orgs/smg-project/packages/container/package/smg):')
 print()
 
 for engine in ['sglang', 'vllm', 'trtllm', 'other']:
