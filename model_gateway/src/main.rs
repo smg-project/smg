@@ -12,11 +12,11 @@ use openai_protocol::worker::TransportMode;
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        validate_mesh_server_name, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
-        DiscoveryConfig, HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig,
-        OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
-        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
-        TokenizerCacheConfig, TraceConfig,
+        resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
+        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
+        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
+        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
+        RoutingMode, SchemaConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
     },
     observability::{
         metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
@@ -825,14 +825,20 @@ struct CliArgs {
     /// unhealthy long enough is removed from the registry so service
     /// discovery re-registers and re-probes it once its engine returns
     /// (without this, a worker unreachable for ~12 minutes reaches a
-    /// terminal Failed state and is never probed again)
+    /// terminal Failed state and is never probed again). Defaults to the
+    /// --service-discovery setting: recovery works by removal plus
+    /// discovery re-registration, so discovery-managed fleets get it for
+    /// free, while without discovery nothing would re-add the worker and
+    /// removal would permanently shrink a static fleet. Pass =false to
+    /// keep it off under discovery.
     #[arg(
         long,
         visible_alias = "worker-auto-recovery",
-        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
         help_heading = "Health Checks"
     )]
-    remove_unhealthy_workers: bool,
+    remove_unhealthy_workers: Option<bool>,
 
     /// Seconds to keep a Ready worker in `Draining` before removing it from
     /// the registry. Applies to all RemoveWorker submissions (K8s deletion,
@@ -1821,7 +1827,10 @@ impl CliArgs {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
                 disable_health_check: self.disable_health_check,
-                remove_unhealthy_workers: self.remove_unhealthy_workers,
+                remove_unhealthy_workers: resolve_worker_auto_recovery(
+                    self.remove_unhealthy_workers,
+                    self.service_discovery,
+                ),
                 drain_settle_secs: self.drain_settle_secs,
             })
             .tokenizer_cache(TokenizerCacheConfig {
@@ -2332,6 +2341,37 @@ mod tests {
         .to_router_config(vec![], vec![])
         .unwrap();
         assert_eq!(format!("{canonical:?}"), format!("{aliased:?}"));
+    }
+
+    /// `--worker-auto-recovery` defaults to the `--service-discovery`
+    /// setting: recovery works by removal plus discovery re-registration, so
+    /// it is on exactly when discovery can complete that loop, and off when
+    /// removal would permanently shrink a static fleet. Explicit values win
+    /// in both directions.
+    #[test]
+    fn worker_auto_recovery_follows_service_discovery_by_default() {
+        let derived_on = cli_args_from(&["--service-discovery", "--selector", "app=w"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert!(derived_on.health_check.remove_unhealthy_workers);
+
+        let derived_off = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(!derived_off.health_check.remove_unhealthy_workers);
+
+        let forced_off = cli_args_from(&[
+            "--service-discovery",
+            "--selector",
+            "app=w",
+            "--remove-unhealthy-workers=false",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        assert!(!forced_off.health_check.remove_unhealthy_workers);
+
+        let forced_on = cli_args_from(&["--remove-unhealthy-workers"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert!(forced_on.health_check.remove_unhealthy_workers);
     }
 
     /// `--health-check-port` must flow into BOTH conversion paths

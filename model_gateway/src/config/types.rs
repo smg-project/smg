@@ -954,6 +954,19 @@ fn default_drain_settle_secs() -> u64 {
     5
 }
 
+/// Resolve `--worker-auto-recovery`'s conditional default: an explicit
+/// setting always wins; otherwise it follows service discovery.
+///
+/// The recovery mechanism is removal — a terminally failed worker is dropped
+/// from the registry so discovery re-registers and re-probes it once its
+/// engine returns. With discovery on, that loop completes and recovery is
+/// pure upside; with discovery off, nothing re-adds the worker, so removal
+/// would silently and permanently shrink a static fleet and must stay
+/// opt-in.
+pub fn resolve_worker_auto_recovery(explicit: Option<bool>, service_discovery: bool) -> bool {
+    explicit.unwrap_or(service_discovery)
+}
+
 impl Default for HealthCheckConfig {
     fn default() -> Self {
         Self {

@@ -1237,6 +1237,18 @@ class TestFlagAliases:
         assert router_args.routing_key_override is True
         assert router_args.remove_unhealthy_workers is True
 
+    def test_worker_auto_recovery_is_tri_state(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        # Absent: undecided — the Rust core derives the default from the
+        # service-discovery setting (recovery works by removal + discovery
+        # re-registration, so it is on exactly when discovery is).
+        absent = RouterArgs.from_cli_args(parser.parse_args([]))
+        assert absent.remove_unhealthy_workers is None
+        # The --no- form pins it off even under service discovery.
+        pinned_off = RouterArgs.from_cli_args(parser.parse_args(["--no-remove-unhealthy-workers"]))
+        assert pinned_off.remove_unhealthy_workers is False
+
 
 class TestRouterArgsFieldOrder:
     """RouterArgs generates a positional __init__, so field order is a public

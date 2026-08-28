@@ -454,7 +454,7 @@ struct Router {
     health_check_interval_secs: u64,
     health_check_endpoint: String,
     disable_health_check: bool,
-    remove_unhealthy_workers: bool,
+    remove_unhealthy_workers: Option<bool>,
     enable_igw: bool,
     queue_size: usize,
     queue_timeout_secs: u64,
@@ -866,7 +866,12 @@ impl Router {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
                 disable_health_check: self.disable_health_check,
-                remove_unhealthy_workers: self.remove_unhealthy_workers,
+                // Explicit setting wins; otherwise recovery-by-removal follows
+                // service discovery, which is what re-adds a removed worker.
+                remove_unhealthy_workers: config::resolve_worker_auto_recovery(
+                    self.remove_unhealthy_workers,
+                    self.service_discovery,
+                ),
                 drain_settle_secs: self.drain_settle_secs,
             })
             .tokenizer_cache(config::TokenizerCacheConfig {
@@ -1009,7 +1014,7 @@ impl Router {
         health_check_interval_secs = 60,
         health_check_endpoint = String::from("/health"),
         disable_health_check = false,
-        remove_unhealthy_workers = false,
+        remove_unhealthy_workers = None,
         enable_igw = false,
         queue_size = 100,
         queue_timeout_secs = 60,
@@ -1160,7 +1165,7 @@ impl Router {
         health_check_interval_secs: u64,
         health_check_endpoint: String,
         disable_health_check: bool,
-        remove_unhealthy_workers: bool,
+        remove_unhealthy_workers: Option<bool>,
         enable_igw: bool,
         queue_size: usize,
         queue_timeout_secs: u64,

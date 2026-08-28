@@ -136,7 +136,10 @@ class RouterArgs:
     health_check_interval_secs: int = 60
     health_check_endpoint: str = "/health"
     disable_health_check: bool = False
-    remove_unhealthy_workers: bool = False
+    # None = follow service_discovery: recovery works by removal + discovery
+    # re-registration, so it defaults on exactly when discovery can complete
+    # the loop (resolved by the Rust core).
+    remove_unhealthy_workers: bool | None = None
     # Circuit breaker configuration
     cb_failure_threshold: int = 10
     cb_success_threshold: int = 3
@@ -1206,12 +1209,15 @@ class RouterArgs:
         health_group.add_argument(
             f"--{prefix}remove-unhealthy-workers",
             f"--{prefix}worker-auto-recovery",
-            action="store_true",
+            action=argparse.BooleanOptionalAction,
             default=RouterArgs.remove_unhealthy_workers,
             help=(
                 "Let workers recover after prolonged failure: unhealthy workers"
                 " are removed so service discovery re-registers and re-probes"
-                " them once their engine returns"
+                " them once their engine returns. Defaults to the"
+                " service-discovery setting (recovery-by-removal needs"
+                " discovery to re-add the worker); use the --no- form to keep"
+                " it off under discovery"
             ),
         )
         # Tokenizer configuration
