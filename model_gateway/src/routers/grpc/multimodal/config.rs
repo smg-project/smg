@@ -93,16 +93,13 @@ impl MultimodalConfigRegistry {
         // its own model-specific defaults, so missing/unparsable files fall
         // back to `PreProcessorConfig::default()`. This matches the bundle
         // preload path in `try_load_multimodal_config`.
-        let pp_config_path = base_dir.join("preprocessor_config.json");
-        let preprocessor_config =
-            load_preprocessor_config_file(&pp_config_path, "preprocessor_config.json")
-                .unwrap_or_else(|| {
-                    debug!(
-                        path = %pp_config_path.display(),
-                        "No preprocessor_config.json found; using PreProcessorConfig defaults"
-                    );
-                    PreProcessorConfig::default()
-                });
+        let preprocessor_config = load_image_preprocessor_config(&base_dir).unwrap_or_else(|| {
+            debug!(
+                path = %base_dir.display(),
+                "No image preprocessor config found; using PreProcessorConfig defaults"
+            );
+            PreProcessorConfig::default()
+        });
         let video_preprocessor_config = load_video_preprocessor_config(&base_dir);
 
         let model_config = Arc::new(MultimodalModelConfig {
@@ -195,6 +192,44 @@ pub(crate) fn load_video_preprocessor_config(base_dir: &Path) -> Option<PreProce
             None
         }
     }
+}
+
+pub(crate) fn load_image_preprocessor_config(base_dir: &Path) -> Option<PreProcessorConfig> {
+    let image_path = base_dir.join("preprocessor_config.json");
+    if let Some(config) = load_preprocessor_config_file(&image_path, "preprocessor_config.json") {
+        return Some(config);
+    }
+
+    let processor_path = base_dir.join("processor_config.json");
+    if !processor_path.exists() {
+        return None;
+    }
+    let processor_config = match std::fs::read_to_string(&processor_path)
+        .ok()
+        .and_then(|config| serde_json::from_str::<serde_json::Value>(&config).ok())
+    {
+        Some(config) => config,
+        None => {
+            // Symmetric with load_video_preprocessor_config: a present but
+            // unreadable file silently degrading to defaults is the worst
+            // outcome — wrong normalization with nothing in the logs.
+            warn!(
+                path = %processor_path.display(),
+                "Failed to read or parse processor_config.json for the image fallback"
+            );
+            return None;
+        }
+    };
+    let image_processor = processor_config.get("image_processor")?;
+    PreProcessorConfig::from_value(image_processor.clone())
+        .inspect_err(|error| {
+            warn!(
+                path = %processor_path.display(),
+                error = %error,
+                "Failed to parse image_processor from processor_config.json"
+            );
+        })
+        .ok()
 }
 
 /// Shared multimodal components injected at router creation time.
@@ -309,6 +344,45 @@ mod tests {
             Some("Qwen3VLVideoProcessor")
         );
         assert_eq!(config.do_resize, Some(true));
+    }
+
+    #[test]
+    fn load_image_preprocessor_config_preserves_legacy_precedence_and_falls_back() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("processor_config.json"),
+            r#"{"image_processor":{"image_processor_type":"NestedImageProcessor"}}"#,
+        )
+        .unwrap();
+        let legacy_path = tmp.path().join("preprocessor_config.json");
+        fs::write(
+            &legacy_path,
+            r#"{"image_processor_type":"LegacyImageProcessor"}"#,
+        )
+        .unwrap();
+
+        let legacy =
+            load_image_preprocessor_config(tmp.path()).expect("legacy image config should parse");
+        assert_eq!(
+            legacy.image_processor_type.as_deref(),
+            Some("LegacyImageProcessor")
+        );
+
+        fs::write(&legacy_path, "{malformed-json").unwrap();
+        let nested = load_image_preprocessor_config(tmp.path())
+            .expect("malformed legacy config should fall back to nested image_processor");
+        assert_eq!(
+            nested.image_processor_type.as_deref(),
+            Some("NestedImageProcessor")
+        );
+
+        fs::remove_file(legacy_path).unwrap();
+        let nested_without_legacy = load_image_preprocessor_config(tmp.path())
+            .expect("missing legacy config should fall back to nested image_processor");
+        assert_eq!(
+            nested_without_legacy.image_processor_type.as_deref(),
+            Some("NestedImageProcessor")
+        );
     }
 
     #[tokio::test]

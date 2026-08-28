@@ -34,28 +34,10 @@ use crate::{
         processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
         transforms::{
             par_threads, pil_to_filter, resize, resize_bicubic_pil, resize_bicubic_pil_rgb,
-            resize_rgb_bytes, rgb_bytes, TransformError,
+            resize_rgb_bytes, rgb_bytes, round_half_to_even, TransformError,
         },
     },
 };
-
-/// Python-compatible rounding (banker's rounding / round half to even).
-///
-/// This matches Python's `round()` behavior where 0.5 is rounded to the nearest
-/// even number (e.g. `12.5 -> 12`, `13.5 -> 14`), unlike Rust's `f64::round()`
-/// which rounds half away from zero.
-#[inline]
-fn round_half_to_even(x: f64) -> f64 {
-    let rounded = x.round();
-    // Check if we're exactly at a .5 case
-    if (x - x.floor() - 0.5).abs() < 1e-9 {
-        // Round to nearest even
-        if rounded as i64 % 2 != 0 {
-            return rounded - 1.0;
-        }
-    }
-    rounded
-}
 
 /// Configuration for a Qwen VL processor variant.
 #[derive(Debug, Clone)]

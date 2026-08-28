@@ -666,6 +666,36 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_options_unknown_fields_survive_grpc_chat_builder() {
+        // Regression: the gRPC path rebuilds a ChatCompletionRequest field by
+        // field, so engine-specific streaming options carried in the catch-all
+        // map must survive the conversion and reach the SSE assembler, which is
+        // what renders usage chunks in gRPC mode.
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "step_usage_chunks".to_string(),
+            serde_json::Value::String("all".to_string()),
+        );
+
+        let req = ResponsesRequest {
+            input: ResponseInput::Text("hi".to_string()),
+            stream: Some(true),
+            stream_options: Some(StreamOptions {
+                include_usage: Some(true),
+                other: extra,
+                ..StreamOptions::default()
+            }),
+            ..Default::default()
+        };
+
+        let opts = responses_to_chat(&req).unwrap().stream_options.unwrap();
+        assert_eq!(
+            opts.other.get("step_usage_chunks").and_then(|v| v.as_str()),
+            Some("all")
+        );
+    }
+
+    #[test]
     fn test_stream_options_non_streaming_dropped() {
         // stream=false must produce None stream_options even if caller set it.
         let req = ResponsesRequest {

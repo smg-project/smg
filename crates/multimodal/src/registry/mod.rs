@@ -1,3 +1,4 @@
+mod glm53_flash;
 mod inkling;
 mod kimi_k25;
 mod kimi_k3;
@@ -10,6 +11,7 @@ mod qwen3_vl;
 mod qwen_vl;
 mod traits;
 
+use glm53_flash::Glm53FlashSpec;
 use inkling::InklingSpec;
 use kimi_k25::KimiK25VisionSpec;
 use kimi_k3::KimiK3VisionSpec;
@@ -35,6 +37,7 @@ impl ModelRegistry {
     pub fn new() -> Self {
         Self {
             specs: vec![
+                LazySpec::new(|| Box::new(Glm53FlashSpec)),
                 LazySpec::new(|| Box::new(InklingSpec)),
                 // Kimi-K3 must be registered before Kimi-K2.5: the two families
                 // share a transport layout but not a prompt shape.

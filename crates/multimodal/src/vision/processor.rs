@@ -197,6 +197,7 @@ impl VisionProcessorRegistry {
     /// Create a registry with all built-in processors registered.
     ///
     /// Currently registers:
+    /// - `glm-5.3-flash` / `glm5_next` -> Glm53FlashProcessor
     /// - `llava-next` -> LlavaNextProcessor
     /// - `llava-1.5` / `llava-v1.5` -> LlavaProcessor
     /// - `qwen2-vl` -> Qwen2VLProcessor
@@ -207,6 +208,20 @@ impl VisionProcessorRegistry {
     /// - `phi-3-vision` -> Phi3VisionProcessor (HD transform with 336x336 tiles)
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
+
+        for pattern in [
+            "glm-5.3-flash",
+            "glm5.3-flash",
+            "glm53_flash",
+            "glm-5-next",
+            "glm5-next",
+            "glm5_next",
+        ] {
+            registry.register(
+                pattern,
+                Box::new(super::processors::Glm53FlashProcessor::new()),
+            );
+        }
 
         // LLaVA-NeXT (v1.6+, anyres multi-crop)
         registry.register(
@@ -405,6 +420,17 @@ mod tests {
             .find("org/inkling-chat", None)
             .expect("Inkling model family");
         assert_eq!(processor.model_name(), "inkling");
+
+        for (model_id, model_type) in [
+            ("zai-org/GLM-5.3-Flash", None),
+            ("internal/checkpoint", Some("glm53_flash")),
+            ("internal/checkpoint", Some("glm5_next")),
+        ] {
+            let processor = registry
+                .find(model_id, model_type)
+                .expect("GLM-5.3-Flash processor");
+            assert_eq!(processor.model_name(), "glm-5.3-flash");
+        }
     }
 
     #[test]

@@ -62,7 +62,7 @@ pub(crate) use assemble::{
 };
 pub(crate) use capability::ensure_backend_supports_modalities;
 pub(crate) use config::{
-    load_preprocessor_config_file, load_video_preprocessor_config, MultimodalComponents,
+    load_image_preprocessor_config, load_video_preprocessor_config, MultimodalComponents,
     MultimodalConfigRegistry, MultimodalModelConfig,
 };
 pub(crate) use detect::{media_plan_chat, media_plan_messages};
