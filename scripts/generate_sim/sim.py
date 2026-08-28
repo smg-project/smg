@@ -361,7 +361,13 @@ def launch_index_service(profile, logs_dir, index_bin, bridge_bin):
         peers = ",".join(u for j, u in enumerate(urls) if j != i)
         if peers:
             cmd += ["--peers", peers]
-        for key in ("inferred_ttl_secs", "default_capacity_blocks", "sweep_interval_secs"):
+        for key in (
+            "inferred_ttl_secs",
+            "default_capacity_blocks",
+            "sweep_interval_secs",
+            "apply_delay_stored_ms",
+            "apply_delay_removed_ms",
+        ):
             if key in cfg:
                 cmd += ["--" + key.replace("_", "-"), str(cfg[key])]
         children.append(
@@ -1184,6 +1190,58 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
         log("loadgen: %ds run" % duration)
         loadgen = spawn("loadgen", cmd, logs_dir / "loadgen.log")
         children.append(loadgen)
+
+        # Optional index-replica failover drill: kill replica N at t, and
+        # (optionally) relaunch it after a gap; timestamps recorded into
+        # meta so analysis can bin around the kill instant. The leg FAILS
+        # if the kill was never observed.
+        drill = profile.get("kill_index_replica")
+        if drill:
+
+            def _kill_index_replica():
+                at = float(drill.get("at_secs", 60))
+                replica = int(drill.get("replica", 1))
+                time.sleep(at)
+                name = "index-%d" % replica
+                victims = [c for c in children if c["name"] == name and c["proc"].poll() is None]
+                if not victims:
+                    meta["index_kill_failed"] = name
+                    return
+                for child in victims:
+                    child["proc"].kill()
+                meta["index_killed_at_ms"] = int(time.time() * 1000)
+                meta["index_killed_replica"] = replica
+                relaunch_after = drill.get("relaunch_after_secs")
+                if relaunch_after is not None:
+                    time.sleep(float(relaunch_after))
+                    cfg = profile.get("index_service", {})
+                    urls = [
+                        "http://127.0.0.1:%d" % (INDEX_BASE_PORT + i)
+                        for i in range(int(cfg.get("replicas", 2)))
+                    ]
+                    cmd = [
+                        str(index_bin),
+                        "--port",
+                        str(INDEX_BASE_PORT + replica),
+                        "--bootstrap-from",
+                        urls[0 if replica != 0 else 1],
+                    ]
+                    peers = ",".join(u for j, u in enumerate(urls) if j != replica)
+                    if peers:
+                        cmd += ["--peers", peers]
+                    env = dict(os.environ)
+                    env["RUST_LOG"] = "info"
+                    children.append(
+                        spawn(
+                            "index-%d" % replica,
+                            cmd,
+                            logs_dir / ("index-%d-relaunch.log" % replica),
+                            env=env,
+                        )
+                    )
+                    meta["index_relaunched_at_ms"] = int(time.time() * 1000)
+
+            threading.Thread(target=_kill_index_replica, daemon=True).start()
 
         # Optional mid-window gateway restart: sticky pins and hash
         # placements are process state, so affinity must rebuild from

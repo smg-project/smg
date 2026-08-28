@@ -97,6 +97,38 @@ def patch_smg_flags(flags, patches):
     return out
 
 
+REMOTE_INDEX_FLAGS = {
+    "--enable-igw": None,
+    "--kv-indexer-url": "http://127.0.0.1:40000",
+    "--kv-indexer-block-size": "256",
+}
+
+
+def remote_leg(index_overrides, extra=None):
+    """A sprayed remote-index leg; sweep legs vary ONLY index_overrides."""
+    leg = {
+        **KV_EVENT_OVERRIDES,
+        "loadgen.ingress": "random",
+        "loadgen.turn2_ingress": "random",
+        "index_service": {
+            "replicas": 2,
+            "bridge": True,
+            "inferred_ttl_secs": 18,
+            "sweep_interval_secs": 1,
+            "default_capacity_blocks": 4688,
+            **index_overrides,
+        },
+        "smg_flag_overrides": {
+            **RADIX_TREE_FLAGS,
+            **COMPRESSED_CLOCK_FLAGS,
+            **REMOTE_INDEX_FLAGS,
+        },
+    }
+    if extra:
+        leg.update(extra)
+    return leg
+
+
 # Leg: (label, {dotted override: value}, smg_bin slot: None | "a" | "b").
 # The special override key "smg_flag_overrides" patches individual gateway
 # flags via patch_smg_flags. smg1-vs-smg8 keeps the same session_rps:
@@ -383,6 +415,50 @@ SCENARIOS = {
                     **COMPRESSED_CLOCK_FLAGS,
                 },
             },
+            None,
+        ),
+    ],
+    # Staleness sweep (event feed; the placement feed has no Removed to
+    # delay): constant injected apply lag, reported against the 3 s
+    # compressed think time (= 30 s production). Stored and Removed are
+    # delayed in SEPARATE legs — they fail in opposite directions.
+    "index-staleness": [
+        ("stored-30ms", remote_leg({"apply_delay_stored_ms": 30}), None),
+        ("stored-300ms", remote_leg({"apply_delay_stored_ms": 300}), None),
+        ("stored-3000ms", remote_leg({"apply_delay_stored_ms": 3000}), None),
+        ("removed-3000ms", remote_leg({"apply_delay_removed_ms": 3000}), None),
+    ],
+    # Capacity-model sensitivity for the inferred feed (placement-only):
+    # 0.5x / 2x of the 1x=4688 blocks used by the core matrix leg.
+    "index-capacity": [
+        (
+            "capacity-half",
+            remote_leg({"bridge": False, "default_capacity_blocks": 2344}),
+            None,
+        ),
+        (
+            "capacity-double",
+            remote_leg({"bridge": False, "default_capacity_blocks": 9375}),
+            None,
+        ),
+    ],
+    # Failover drill: kill replica 0 (the endpoint every gateway and
+    # publisher dials) mid-window, relaunch 30 s later bootstrapping from
+    # the survivor. Placement-fed (the harder case: no replayable feed).
+    # Run with --seeds 6: timing nondeterminism needs the wider n.
+    "index-failover": [
+        (
+            "kill-replica0",
+            remote_leg(
+                {"bridge": False},
+                {
+                    "kill_index_replica": {
+                        "at_secs": 60,
+                        "replica": 0,
+                        "relaunch_after_secs": 30,
+                    }
+                },
+            ),
             None,
         ),
     ],
