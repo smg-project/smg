@@ -50,7 +50,9 @@ impl Glm53FlashSpec {
                 field: "video_grid_thw".to_string(),
             });
         }
-        data.chunks_exact(3)
+        data.as_chunks::<3>()
+            .0
+            .iter()
             .map(|row| {
                 usize::try_from(row[0]).map_err(|_| ModelRegistryError::InvalidPreprocessedField {
                     field: "video_grid_thw".to_string(),
