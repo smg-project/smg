@@ -133,6 +133,66 @@ class ScenarioConstruction(unittest.TestCase):
         )
         self.assertIn("--routing-key-override", flags, "input must not be mutated")
 
+    def test_worker_segments_normalize_and_validate(self):
+        whole = sim.worker_segments({"workers_total": 10, "worker_mode": "grpc"})
+        self.assertEqual(whole, [("grpc", sim.MOCK_BASE_PORT, 10)])
+        default = sim.worker_segments({"workers_total": 4})
+        self.assertEqual(default, [("http", sim.MOCK_BASE_PORT, 4)])
+        mixed = sim.worker_segments(
+            {
+                "workers_total": 6,
+                "worker_mode": [
+                    {"mode": "grpc", "count": 4},
+                    {"mode": "http", "count": 2},
+                ],
+            }
+        )
+        self.assertEqual(
+            mixed,
+            [
+                ("grpc", sim.MOCK_BASE_PORT, 4),
+                ("http", sim.MOCK_BASE_PORT + 4, 2),
+            ],
+        )
+        with self.assertRaises(SystemExit):
+            sim.worker_segments(
+                {"workers_total": 5, "worker_mode": [{"mode": "grpc", "count": 4}]}
+            )
+
+    def test_analyze_requests_applies_steady_state_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "requests.jsonl"
+            t0 = 1_000_000
+            rows = [
+                # warmup (dropped), in-window, drain tail (dropped)
+                {"turn": 1, "session": 1, "worker_port": 9000,
+                 "prompt_tokens": 100, "cached_tokens": 0, "start_ms": t0},
+                {"turn": 1, "session": 2, "worker_port": 9001,
+                 "prompt_tokens": 100, "cached_tokens": 50,
+                 "start_ms": t0 + 15_000},
+                {"turn": 1, "session": 3, "worker_port": 9002,
+                 "prompt_tokens": 100, "cached_tokens": 0,
+                 "start_ms": t0 + 65_000},
+            ]
+            with open(path, "w") as f:
+                for row in rows:
+                    f.write(json.dumps(row) + "\n")
+            out = sim.analyze_requests(path, 3, window=(10, 60))
+            self.assertTrue(out["windowed"])
+            self.assertEqual(out["window_dropped_requests"], 2)
+            self.assertEqual(out["turns"]["turn1"]["requests"], 1)
+            # Unwindowed keeps everything (back-compat for old run dirs).
+            out = sim.analyze_requests(path, 3)
+            self.assertEqual(out["turns"]["turn1"]["requests"], 3)
+
+    def test_compressed_clock_flags_patch_cleanly(self):
+        flags = scenarios.patch_smg_flags(
+            ["--policy", "cache_aware"], scenarios.COMPRESSED_CLOCK_FLAGS
+        )
+        self.assertIn("--load-monitor-interval", flags)
+        self.assertIn("--eviction-interval", flags)
+        self.assertIn("--cache-ttl-secs", flags)
+
     def test_kv_event_legs_run_grpc_nonstreaming_with_igw(self):
         for label, overrides, _ in scenarios.SCENARIOS["kv-events"]:
             self.assertEqual(overrides["worker_mode"], "grpc", label)

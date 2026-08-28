@@ -42,6 +42,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 MOCK_BASE_PORT = 9000
 SMG_BASE_PORT = 30000
 PROM_BASE_PORT = 39000
+INDEX_BASE_PORT = 40000
 
 # Cache-aware decision branches are DEBUG logs only (no branch metric), scoped
 # so the rest of the gateway stays at warn.
@@ -242,7 +243,9 @@ def ensure_local_tokenizer():
 
 
 def build_binaries(target_dir, build_gateway):
-    packages = ["mock-worker", "sim-loadgen"] + (["smg"] if build_gateway else [])
+    packages = ["mock-worker", "sim-loadgen", "radix-index"] + (
+        ["smg"] if build_gateway else []
+    )
     cmd = ["cargo", "build", "--release"]
     for pkg in packages:
         cmd += ["-p", pkg]
@@ -253,42 +256,139 @@ def build_binaries(target_dir, build_gateway):
     subprocess.run(cmd, cwd=str(REPO_ROOT), env=env, check=True)
 
 
+def worker_segments(profile):
+    """Normalize `worker_mode` to [(mode, start_port, count)]. Accepts a
+    plain "http" / "grpc" (whole fleet) or a list of
+    {"mode": ..., "count": ...} segments summing to workers_total, so one
+    fleet can mix gRPC-event and HTTP workers (per-worker feed selection
+    is only measurable on a mixed fleet)."""
+    total = int(profile["workers_total"])
+    mode = profile.get("worker_mode", "http")
+    if isinstance(mode, str):
+        return [(mode, MOCK_BASE_PORT, total)]
+    segments = []
+    start = MOCK_BASE_PORT
+    for seg in mode:
+        count = int(seg["count"])
+        segments.append((seg["mode"], start, count))
+        start += count
+    if sum(c for _, _, c in segments) != total:
+        raise SystemExit("worker_mode segments must sum to workers_total")
+    return segments
+
+
 def launch_mocks(profile, logs_dir, mock_bin):
     total = int(profile["workers_total"])
     procs = int(profile["mock_processes"])
-    grpc = profile.get("worker_mode", "http") == "grpc"
-    port_flags = ("--grpc-base-port", "--grpc-count") if grpc else (
-        "--http-base-port", "--http-count")
-    per_proc = (total + procs - 1) // procs
+    segments = worker_segments(profile)
     children = []
-    started = 0
-    for j in range(procs):
-        count = min(per_proc, total - started)
-        base = MOCK_BASE_PORT + started
-        cmd = [
-            str(mock_bin),
-            "--host",
-            "127.0.0.1",
-            port_flags[0],
-            str(base),
-            port_flags[1],
-            str(count),
-            "--model",
-            profile.get("model_id", "mock-model"),
-        ] + flags_from(profile.get("mock", {}))
-        children.append(spawn("mock-%d" % j, cmd, logs_dir / ("mock-%d.log" % j)))
-        started += count
-    log("mock fleet: %d %s workers over %d processes (ports %d-%d)"
-        % (total, "grpc" if grpc else "http", procs,
-           MOCK_BASE_PORT, MOCK_BASE_PORT + total - 1))
+    proc_idx = 0
+    for mode, seg_start, seg_count in segments:
+        # Processes split across segments proportionally, at least one.
+        seg_procs = max(1, round(procs * seg_count / max(1, total)))
+        per_proc = (seg_count + seg_procs - 1) // seg_procs
+        port_flags = (
+            ("--grpc-base-port", "--grpc-count")
+            if mode == "grpc"
+            else ("--http-base-port", "--http-count")
+        )
+        started = 0
+        while started < seg_count:
+            count = min(per_proc, seg_count - started)
+            base = seg_start + started
+            cmd = [
+                str(mock_bin),
+                "--host",
+                "127.0.0.1",
+                port_flags[0],
+                str(base),
+                port_flags[1],
+                str(count),
+                "--model",
+                profile.get("model_id", "mock-model"),
+            ] + flags_from(profile.get("mock", {}))
+            children.append(
+                spawn("mock-%d" % proc_idx, cmd, logs_dir / ("mock-%d.log" % proc_idx))
+            )
+            proc_idx += 1
+            started += count
+    log(
+        "mock fleet: %d workers (%s) over %d processes (ports %d-%d)"
+        % (
+            total,
+            ", ".join("%d %s" % (c, m) for m, _, c in segments),
+            proc_idx,
+            MOCK_BASE_PORT,
+            MOCK_BASE_PORT + total - 1,
+        )
+    )
     time.sleep(2)
     for child in children:
         if child["proc"].poll() is not None:
             raise RuntimeError("%s exited early; see its log" % child["name"])
-    if grpc:
-        wait_tcp(MOCK_BASE_PORT, 30, "mock fleet")
-    else:
-        wait_health("http://127.0.0.1:%d/health" % MOCK_BASE_PORT, 30, "mock fleet")
+    for mode, seg_start, _ in segments:
+        if mode == "grpc":
+            wait_tcp(seg_start, 30, "mock fleet (grpc segment)")
+        else:
+            wait_health("http://127.0.0.1:%d/health" % seg_start, 30, "mock fleet")
+    return children
+
+
+def launch_index_service(profile, logs_dir, index_bin, bridge_bin):
+    """Optional radix index service + event bridge, from the profile's
+    `index_service` block:
+      {"replicas": 2, "inferred_ttl_secs": 18, "default_capacity_blocks": N,
+       "sweep_interval_secs": 1, "bridge": true}
+    Replicas relay to each other (single-endpoint topology); the bridge
+    subscribes to every gRPC worker segment and publishes to replica 0
+    (the relay carries updates to the rest)."""
+    cfg = profile.get("index_service")
+    if not cfg:
+        return []
+    env = dict(os.environ)
+    env["RUST_LOG"] = "info"
+    replicas = int(cfg.get("replicas", 2))
+    urls = ["http://127.0.0.1:%d" % (INDEX_BASE_PORT + i) for i in range(replicas)]
+    children = []
+    for i in range(replicas):
+        cmd = [str(index_bin), "--port", str(INDEX_BASE_PORT + i)]
+        peers = ",".join(u for j, u in enumerate(urls) if j != i)
+        if peers:
+            cmd += ["--peers", peers]
+        for key in ("inferred_ttl_secs", "default_capacity_blocks", "sweep_interval_secs"):
+            if key in cfg:
+                cmd += ["--" + key.replace("_", "-"), str(cfg[key])]
+        children.append(
+            spawn("index-%d" % i, cmd, logs_dir / ("index-%d.log" % i), env=env)
+        )
+    for i in range(replicas):
+        wait_tcp(INDEX_BASE_PORT + i, 30, "index-%d" % i)
+    bridged = 0
+    if cfg.get("bridge", True):
+        grpc_workers = [
+            "grpc://127.0.0.1:%d" % port
+            for mode, seg_start, seg_count in worker_segments(profile)
+            if mode == "grpc"
+            for port in range(seg_start, seg_start + seg_count)
+        ]
+        if grpc_workers:
+            cmd = [
+                str(bridge_bin),
+                "--workers",
+                ",".join(grpc_workers),
+                "--index",
+                urls[0],
+                "--model",
+                profile.get("model_id", "mock-model"),
+                "--block-size",
+                str(profile.get("mock", {}).get("block_size", 128)),
+            ]
+            children.append(spawn("bridge", cmd, logs_dir / "bridge.log", env=env))
+            bridged = len(grpc_workers)
+    log(
+        "index service: %d replicas on ports %d.. (bridging %d grpc workers)"
+        % (replicas, INDEX_BASE_PORT, bridged)
+    )
     return children
 
 
@@ -326,12 +426,17 @@ def register_workers(profile):
     """
     total = int(profile["workers_total"])
     model_id = profile.get("model_id", "mock-model")
-    grpc = profile.get("worker_mode", "http") == "grpc"
+    segments = worker_segments(profile)
+    mode_by_port = {}
+    for mode, seg_start, seg_count in segments:
+        for port in range(seg_start, seg_start + seg_count):
+            mode_by_port[port] = mode
+    any_grpc = any(mode == "grpc" for mode, _, _ in segments)
     smg_ports = [SMG_BASE_PORT + i for i in range(int(profile["smg_count"]))]
-    tokenizer_path = str(ensure_local_tokenizer()) if grpc else None
+    tokenizer_path = str(ensure_local_tokenizer()) if any_grpc else None
 
     def register_one(smg_port, worker_port):
-        if grpc:
+        if mode_by_port.get(worker_port) == "grpc":
             # The URL scheme selects the connection mode; runtime picks the
             # proto dialect the mock implements. weight_version is relayed
             # verbatim in every response's meta_info — it is how the
@@ -534,13 +639,20 @@ def imbalance(counter, workers_total):
     }
 
 
-def analyze_requests(path, workers_total):
+def analyze_requests(path, workers_total, window=None):
+    """Aggregate requests.jsonl. With `window` = (warmup_secs,
+    duration_secs), only requests STARTED inside the steady-state window
+    count — mirroring the loadgen summary's finish-time filter, so the
+    turn/CoV rows here no longer mix warmup and the drain tail into
+    otherwise-windowed compare tables."""
     per_worker = Counter()
     per_turn_worker = {}
     turn_stats = {}
     session_turn_worker = {}
     if not path.exists():
         return {"error": "requests.jsonl missing"}
+    records = []
+    t0 = None
     with open(path, errors="replace") as f:
         for line in f:
             line = line.strip()
@@ -550,25 +662,38 @@ def analyze_requests(path, workers_total):
                 rec = json.loads(line)
             except ValueError:
                 continue
-            turn = int(rec.get("turn", 1))
-            ts = turn_stats.setdefault(
-                turn, {"n": 0, "prompt": 0, "cached": 0, "hits": 0}
-            )
-            ts["n"] += 1
-            prompt = rec.get("prompt_tokens") or 0
-            cached = rec.get("cached_tokens") or 0
-            ts["prompt"] += prompt
-            ts["cached"] += cached
-            # Request-level "hit" per the design doc: cached/prompt >= 0.3.
-            if prompt and cached / prompt >= 0.3:
-                ts["hits"] += 1
-            port = rec.get("worker_port")
-            if port is not None:
-                per_worker[port] += 1
-                per_turn_worker.setdefault(turn, Counter())[port] += 1
-                session = rec.get("session")
-                if session is not None:
-                    session_turn_worker.setdefault(session, {})[turn] = port
+            start_ms = rec.get("start_ms")
+            if start_ms is not None:
+                t0 = start_ms if t0 is None else min(t0, start_ms)
+            records.append(rec)
+    lo_ms, hi_ms = None, None
+    if window and t0 is not None:
+        lo_ms = t0 + float(window[0]) * 1000.0
+        hi_ms = t0 + float(window[1]) * 1000.0
+    dropped = 0
+    for rec in records:
+        if lo_ms is not None:
+            start_ms = rec.get("start_ms")
+            if start_ms is None or not (lo_ms <= start_ms < hi_ms):
+                dropped += 1
+                continue
+        turn = int(rec.get("turn", 1))
+        ts = turn_stats.setdefault(turn, {"n": 0, "prompt": 0, "cached": 0, "hits": 0})
+        ts["n"] += 1
+        prompt = rec.get("prompt_tokens") or 0
+        cached = rec.get("cached_tokens") or 0
+        ts["prompt"] += prompt
+        ts["cached"] += cached
+        # Request-level "hit" per the design doc: cached/prompt >= 0.3.
+        if prompt and cached / prompt >= 0.3:
+            ts["hits"] += 1
+        port = rec.get("worker_port")
+        if port is not None:
+            per_worker[port] += 1
+            per_turn_worker.setdefault(turn, Counter())[port] += 1
+            session = rec.get("session")
+            if session is not None:
+                session_turn_worker.setdefault(session, {})[turn] = port
     both = [s for s in session_turn_worker.values() if 1 in s and 2 in s]
     same = sum(1 for s in both if s[1] == s[2])
     turns = {}
@@ -587,6 +712,8 @@ def analyze_requests(path, workers_total):
         "turns": turns,
         "t2_sessions": len(both),
         "t2_same_worker_rate": round(same / len(both), 4) if both else None,
+        "windowed": lo_ms is not None,
+        "window_dropped_requests": dropped,
     }
 
 
@@ -701,7 +828,14 @@ def build_report(run_dir):
         "profile": profile,
         "run_dir": str(run_dir),
         "loadgen_summary": loadgen_summary,
-        "requests": analyze_requests(run_dir / "requests.jsonl", workers_total),
+        "requests": analyze_requests(
+            run_dir / "requests.jsonl",
+            workers_total,
+            window=(
+                int(profile.get("warmup_secs", 0)),
+                int(profile["duration_secs"]),
+            ),
+        ),
         "samples": summarize_samples(
         run_dir / "samples.jsonl",
         smg_count,
@@ -913,7 +1047,12 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
     smg_bin = Path(smg_bin) if smg_bin else target_dir / "release" / "smg"
     mock_bin = target_dir / "release" / "mock-worker"
     loadgen_bin = target_dir / "release" / "sim-loadgen"
-    for path in (smg_bin, mock_bin, loadgen_bin):
+    index_bin = target_dir / "release" / "radix-index-service"
+    bridge_bin = target_dir / "release" / "radix-index-bridge"
+    required = [smg_bin, mock_bin, loadgen_bin]
+    if profile.get("index_service"):
+        required += [index_bin, bridge_bin]
+    for path in required:
         if not os.access(str(path), os.X_OK):
             raise SystemExit("binary missing: %s (drop --skip-build?)" % path)
 
@@ -924,7 +1063,7 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
         json.dump(profile, f, indent=2)
 
     raise_nofile_limit()
-    all_bins = [smg_bin, mock_bin, loadgen_bin]
+    all_bins = [smg_bin, mock_bin, loadgen_bin, index_bin, bridge_bin]
     teardown([], all_bins)  # clear leftovers from prior runs so ports are free
     time.sleep(1)
 
@@ -940,6 +1079,8 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
             "smg": _sha256(smg_bin),
             "mock-worker": _sha256(mock_bin),
             "sim-loadgen": _sha256(loadgen_bin),
+            "radix-index-service": _sha256(index_bin) if index_bin.exists() else None,
+            "radix-index-bridge": _sha256(bridge_bin) if bridge_bin.exists() else None,
         },
         "profile_sha256": hashlib.sha256(
             json.dumps(profile, sort_keys=True).encode()
@@ -951,6 +1092,7 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
     sampler = None
     try:
         children += launch_mocks(profile, logs_dir, mock_bin)
+        children += launch_index_service(profile, logs_dir, index_bin, bridge_bin)
         children += launch_smgs(profile, logs_dir, smg_bin)
         meta["registered"] = register_workers(profile)
         meta["ready"] = wait_ready(profile)

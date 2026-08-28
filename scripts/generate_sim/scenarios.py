@@ -36,6 +36,17 @@ MULTITURN = {
 }
 
 
+# 10x-compressed gateway clocks for timing-sensitive legs. The profiles
+# compress request time 10x (itl/think/prefill), but the gateway's
+# wall-clock timers keep production defaults (load monitor 10 s,
+# eviction 120 s, cache TTL 180 s) — uncompressed they distort any leg
+# whose behavior depends on load freshness, tree eviction, or TTL.
+COMPRESSED_CLOCK_FLAGS = {
+    "--load-monitor-interval": "1",
+    "--eviction-interval": "12",
+    "--cache-ttl-secs": "18",
+}
+
 # Shared gateway-flag patch for the radix-replica legs: route on the
 # approximate radix tree with no sticky short-circuit. False removes a flag.
 RADIX_TREE_FLAGS = {
