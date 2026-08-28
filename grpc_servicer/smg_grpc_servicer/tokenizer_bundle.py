@@ -27,6 +27,7 @@ TOKENIZER_FILES = [
     "chat_template.json",
     "preprocessor_config.json",  # multimodal image preprocessor
     "processor_config.json",  # Transformers v5 nested multimodal processors
+    "video_preprocessor_config.json",  # dedicated video preprocessor
 ]
 
 # Glob patterns for additional tokenizer-related files

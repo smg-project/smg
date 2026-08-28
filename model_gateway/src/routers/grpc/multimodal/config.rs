@@ -201,9 +201,25 @@ pub(crate) fn load_image_preprocessor_config(base_dir: &Path) -> Option<PreProce
     }
 
     let processor_path = base_dir.join("processor_config.json");
-    let processor_config = std::fs::read_to_string(&processor_path)
+    if !processor_path.exists() {
+        return None;
+    }
+    let processor_config = match std::fs::read_to_string(&processor_path)
         .ok()
-        .and_then(|config| serde_json::from_str::<serde_json::Value>(&config).ok())?;
+        .and_then(|config| serde_json::from_str::<serde_json::Value>(&config).ok())
+    {
+        Some(config) => config,
+        None => {
+            // Symmetric with load_video_preprocessor_config: a present but
+            // unreadable file silently degrading to defaults is the worst
+            // outcome — wrong normalization with nothing in the logs.
+            warn!(
+                path = %processor_path.display(),
+                "Failed to read or parse processor_config.json for the image fallback"
+            );
+            return None;
+        }
+    };
     let image_processor = processor_config.get("image_processor")?;
     PreProcessorConfig::from_value(image_processor.clone())
         .inspect_err(|error| {

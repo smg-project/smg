@@ -336,6 +336,23 @@ pub fn rescale(tensor: &mut Array3<f32>, factor: f64) {
     tensor.mapv_inplace(|v| v * factor);
 }
 
+/// Python-compatible rounding (banker's rounding / round half to even).
+/// Matches Python's `round()` where 0.5 rounds to the nearest even number
+/// (`12.5 -> 12`, `13.5 -> 14`), unlike Rust's `f64::round()` which rounds
+/// half away from zero.
+#[inline]
+pub fn round_half_to_even(x: f64) -> f64 {
+    let rounded = x.round();
+    // Check if we're exactly at a .5 case
+    if (x - x.floor() - 0.5).abs() < 1e-9 {
+        // Round to nearest even
+        if rounded as i64 % 2 != 0 {
+            return rounded - 1.0;
+        }
+    }
+    rounded
+}
+
 /// Map `image` crate filter types to `fast_image_resize` algorithm.
 fn to_fir_algorithm(filter: FilterType) -> ResizeAlg {
     use fast_image_resize::FilterType as FirFilter;

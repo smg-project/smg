@@ -121,9 +121,21 @@ impl ModelProcessorSpec for Glm53FlashSpec {
 
     fn modality_limits(
         &self,
-        _metadata: &ModelMetadata,
+        metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
-        Ok(HashMap::from([(Modality::Image, 10), (Modality::Video, 1)]))
+        // Advertise only what the checkpoint can serve, so an incapable
+        // derivative is rejected at validate_media_request instead of after
+        // a full media fetch + preprocess. Images need the placeholder id;
+        // video additionally splices <|begin_of_image|>/<|end_of_image|>
+        // frame markers into the prompt.
+        let mut limits = HashMap::new();
+        if Self::image_id(metadata).is_ok() {
+            limits.insert(Modality::Image, 10);
+            if metadata.token_id(BEGIN).is_ok() && metadata.token_id(END).is_ok() {
+                limits.insert(Modality::Video, 1);
+            }
+        }
+        Ok(limits)
     }
 
     fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
@@ -165,9 +177,17 @@ impl ModelProcessorSpec for Glm53FlashSpec {
         let image_id = Self::image_id(metadata)?;
         let begin = metadata.token_id(BEGIN)?;
         let end = metadata.token_id(END)?;
+        // The paired vision processor always emits this; a missing or
+        // wrongly-typed value means the pipeline is broken, and defaulting
+        // would silently caption every frame with wrong timestamps while
+        // the grid field next to it fails loudly.
         let seconds = match input.model_specific.get("video_second_per_grid") {
-            Some(ModelSpecificValue::Tensor { data, .. }) => data.first().copied().unwrap_or(1.0),
-            _ => 1.0,
+            Some(ModelSpecificValue::Tensor { data, .. }) if !data.is_empty() => data[0],
+            _ => {
+                return Err(ModelRegistryError::InvalidPreprocessedField {
+                    field: "video_second_per_grid".to_string(),
+                })
+            }
         };
 
         input
@@ -285,5 +305,102 @@ mod tests {
             tokenizer: &tokenizer,
             config: &legacy,
         }));
+    }
+
+    #[test]
+    fn modality_adverts_follow_checkpoint_capability() {
+        // Full capability: image placeholder id + frame-marker tokens.
+        let full = tokenizer();
+        let config = json!({"model_type":"glm53_flash", "image_token_id":IMAGE_ID});
+        let limits = Glm53FlashSpec
+            .modality_limits(&ModelMetadata {
+                model_id: "capable",
+                tokenizer: &full,
+                config: &config,
+            })
+            .unwrap();
+        assert_eq!(limits.get(&Modality::Image), Some(&10));
+        assert_eq!(limits.get(&Modality::Video), Some(&1));
+
+        // No frame markers in the vocab: image-only, video rejected up
+        // front instead of after a full clip fetch + preprocess.
+        let no_markers = TestTokenizer::new(&[(IMAGE, IMAGE_ID)]).with_byte_encoder(1000);
+        let limits = Glm53FlashSpec
+            .modality_limits(&ModelMetadata {
+                model_id: "image-only",
+                tokenizer: &no_markers,
+                config: &config,
+            })
+            .unwrap();
+        assert_eq!(limits.get(&Modality::Image), Some(&10));
+        assert!(!limits.contains_key(&Modality::Video));
+
+        // No image token id in the config: nothing advertised.
+        let no_id = json!({"model_type":"glm53_flash"});
+        let limits = Glm53FlashSpec
+            .modality_limits(&ModelMetadata {
+                model_id: "text-only",
+                tokenizer: &full,
+                config: &no_id,
+            })
+            .unwrap();
+        assert!(limits.is_empty());
+    }
+
+    #[test]
+    fn video_error_branches_fail_loudly() {
+        let tokenizer = tokenizer();
+        let config = json!({"model_type":"glm53_flash", "image_token_id":IMAGE_ID});
+        let metadata = ModelMetadata {
+            model_id: "zai-org/GLM-5.3-Flash",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let spec = Glm53FlashSpec;
+
+        // Missing video_second_per_grid: the paired processor always emits
+        // it, so absence is a broken pipeline, not a 1.0 default.
+        let mut input = test_preprocessed_with_tokens(&[], &[4]);
+        input.model_specific.insert(
+            "video_grid_thw".into(),
+            ModelSpecificValue::int_2d(vec![2, 2, 4], 1, 3),
+        );
+        let err = spec
+            .prompt_replacements_for(&metadata, &input, Modality::Video)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ModelRegistryError::InvalidPreprocessedField { ref field }
+                if field == "video_second_per_grid"
+        ));
+
+        // Wrong grid shape (row width != 3).
+        let mut input = test_preprocessed_with_tokens(&[], &[4]);
+        input.model_specific.insert(
+            "video_grid_thw".into(),
+            ModelSpecificValue::int_2d(vec![2, 2], 1, 2),
+        );
+        assert!(matches!(
+            spec.prompt_replacements_for(&metadata, &input, Modality::Video),
+            Err(ModelRegistryError::InvalidPreprocessedField { .. })
+        ));
+
+        // Token count not divisible by grid_t.
+        let mut input = test_preprocessed_with_tokens(&[], &[5]);
+        input.model_specific.insert(
+            "video_grid_thw".into(),
+            ModelSpecificValue::int_2d(vec![2, 2, 4], 1, 3),
+        );
+        input.model_specific.insert(
+            "video_second_per_grid".into(),
+            ModelSpecificValue::Tensor {
+                data: vec![1.0],
+                shape: vec![1],
+            },
+        );
+        assert!(matches!(
+            spec.prompt_replacements_for(&metadata, &input, Modality::Video),
+            Err(ModelRegistryError::InvalidPreprocessedField { .. })
+        ));
     }
 }

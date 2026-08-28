@@ -12,7 +12,8 @@ use crate::{
         preprocessor_config::PreProcessorConfig,
         processor::{PreprocessedEncoderInputs, VisionPreProcessor},
         transforms::{
-            pil_to_filter, resize_bicubic_pil_rgb, resize_rgb_bytes, rgb_bytes, TransformError,
+            pil_to_filter, resize_bicubic_pil_rgb, resize_rgb_bytes, rgb_bytes, round_half_to_even,
+            TransformError,
         },
     },
 };
@@ -36,7 +37,7 @@ struct Params {
     std: [f64; 3],
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Geometry {
     target: (usize, usize),
     content: (usize, usize),
@@ -76,14 +77,51 @@ impl RgbSource for RgbFrameRef<'_> {
     }
 }
 
+/// Read a `usize` extra key strictly: absent falls back to `default`, but a
+/// present-yet-unusable value is a config error. `get_extra` swallows type
+/// mismatches into `None`, and a silent default here changes the alignment
+/// factor and token geometry — the gateway's placeholder count would then
+/// disagree with the serving engine with no trace. Integral JSON floats
+/// (`2.0`) are accepted for interop with float-serializing toolchains.
+fn extra_usize(
+    config: &PreProcessorConfig,
+    key: &str,
+    default: usize,
+) -> Result<usize, TransformError> {
+    let Some(value) = config.extra.get(key) else {
+        return Ok(default);
+    };
+    if let Some(n) = value.as_u64() {
+        return Ok(n as usize);
+    }
+    if let Some(f) = value.as_f64() {
+        if f >= 0.0 && f.fract() == 0.0 && f <= u32::MAX as f64 {
+            return Ok(f as usize);
+        }
+    }
+    Err(shape(format!(
+        "GLM preprocessor key {key} must be a non-negative integer, got {value}"
+    )))
+}
+
+/// `extra_usize`'s float sibling: absent -> default, wrong type -> error.
+fn extra_f32(config: &PreProcessorConfig, key: &str, default: f32) -> Result<f32, TransformError> {
+    let Some(value) = config.extra.get(key) else {
+        return Ok(default);
+    };
+    value.as_f64().map(|f| f as f32).ok_or_else(|| {
+        shape(format!(
+            "GLM preprocessor key {key} must be a number, got {value}"
+        ))
+    })
+}
+
 impl Params {
     fn from_config(config: &PreProcessorConfig, video: bool) -> Result<Self, TransformError> {
         let patch = config.get_patch_size(PATCH_SIZE);
         let merge = config.merge_size.unwrap_or(MERGE_SIZE);
         let temporal = config.temporal_patch_size.unwrap_or(TEMPORAL_PATCH_SIZE);
-        let expand = config
-            .get_extra::<usize>("patch_expand_factor")
-            .unwrap_or(1);
+        let expand = extra_usize(config, "patch_expand_factor", 1)?;
         if [patch, merge, temporal, expand].contains(&0) {
             return Err(shape(
                 "GLM patch, merge, temporal, and expand factors must be positive",
@@ -95,26 +133,23 @@ impl Params {
             pixels.map_or_else(
                 || {
                     product(
-                        &[
-                            config.get_extra::<usize>(key).unwrap_or(fallback),
-                            pixels_per_token,
-                        ],
+                        &[extra_usize(config, key, fallback)?, pixels_per_token],
                         "GLM pixel budget",
                     )
                 },
                 Ok,
             )
         };
-        let min_pixels = budget(config.min_pixels, "min_image_tokens", MIN_IMAGE_TOKENS)?;
-        let max_pixels = budget(
-            config.max_pixels,
-            "max_image_tokens",
-            if video {
-                MAX_VIDEO_TOKENS
-            } else {
-                MAX_IMAGE_TOKENS
-            },
-        )?;
+        // Video budgets read video-named token keys only: an image-scale
+        // `max_image_tokens` must not silently become a clip's volume cap
+        // when the gateway falls back to the image config for video.
+        let (min_key, max_key, max_fallback) = if video {
+            ("min_video_tokens", "max_video_tokens", MAX_VIDEO_TOKENS)
+        } else {
+            ("min_image_tokens", "max_image_tokens", MAX_IMAGE_TOKENS)
+        };
+        let min_pixels = budget(config.min_pixels, min_key, MIN_IMAGE_TOKENS)?;
+        let max_pixels = budget(config.max_pixels, max_key, max_fallback)?;
         if min_pixels == 0 || min_pixels > max_pixels {
             return Err(shape("GLM pixel budget must be positive with min <= max"));
         }
@@ -145,6 +180,15 @@ impl Params {
     ) -> Result<Geometry, TransformError> {
         if frames == 0 || height == 0 || width == 0 {
             return Err(shape("GLM dimensions must be positive"));
+        }
+        // Matches the reference family's guard (see qwen smart_resize):
+        // beyond 200:1 the budget search degenerates to a 1-pixel strip on a
+        // (factor, factor) canvas, silently destroying the image.
+        let (long, short) = (height.max(width) as f64, height.min(width) as f64);
+        if long / short > 200.0 {
+            return Err(shape(format!(
+                "GLM aspect ratio must be below 200:1, got {height}x{width}"
+            )));
         }
         let align =
             |value: usize| product(&[value.div_ceil(self.factor), self.factor], "GLM alignment");
@@ -391,7 +435,7 @@ fn preprocess_video_frames<F: RgbSource>(
         .dimensions();
     let params = Params::from_config(config, true)?;
     let patches = encode(frames, frames.len(), params, config)?;
-    let fps = config.get_extra::<f32>("fps").unwrap_or(2.0);
+    let fps = extra_f32(config, "fps", 2.0)?;
     if !fps.is_finite() || fps <= 0.0 {
         return Err(shape(format!("GLM video fps must be positive, got {fps}")));
     }
@@ -443,15 +487,6 @@ fn validate_rgb(width: usize, height: usize, actual: usize) -> Result<(), Transf
         });
     }
     Ok(())
-}
-
-fn round_half_to_even(value: f64) -> f64 {
-    let rounded = value.round();
-    if (value.fract() - 0.5).abs() < 1e-9 && rounded as i64 % 2 != 0 {
-        rounded - 1.0
-    } else {
-        rounded
-    }
 }
 
 fn shape(message: impl Into<String>) -> TransformError {
@@ -678,5 +713,113 @@ mod tests {
         config.image_std = None;
         config.rescale_factor = Some(f64::NAN);
         assert!(first(&config).is_err());
+    }
+
+    #[test]
+    fn extreme_aspect_ratio_is_rejected() {
+        // Without the guard a 1x250000 strip degenerates to a 1-pixel
+        // content on a (factor, factor) canvas instead of erroring.
+        let params = Params::from_config(&config(MAX_IMAGE_TOKENS), false).unwrap();
+        let err = params.geometry(1, 1, 250_000).unwrap_err();
+        assert!(err.to_string().contains("aspect ratio"), "{err}");
+        // Just inside the limit still resolves.
+        assert!(params.geometry(1, 10, 1990).is_ok());
+    }
+
+    #[test]
+    fn mistyped_extra_keys_error_instead_of_silently_defaulting() {
+        // A wrongly-typed budget key must not silently become the default:
+        // the resulting token geometry would desync gateway and engine.
+        let mut bad = config(MAX_IMAGE_TOKENS);
+        bad.extra
+            .insert("max_image_tokens".into(), serde_json::json!("8000"));
+        assert!(Params::from_config(&bad, false).is_err());
+
+        // Integral JSON floats are accepted (float-happy toolchains).
+        let mut float_expand = config(MAX_IMAGE_TOKENS);
+        float_expand
+            .extra
+            .insert("patch_expand_factor".into(), serde_json::json!(2.0));
+        let params = Params::from_config(&float_expand, false).unwrap();
+        assert_eq!(params.factor, 14 * 2 * 2, "2.0 must read as expand=2");
+
+        // Non-numeric fps fails the video path loudly.
+        let mut bad_fps = config(MAX_VIDEO_TOKENS);
+        bad_fps.extra.insert("fps".into(), serde_json::json!("2"));
+        let frames = [DynamicImage::ImageRgb8(RgbImage::from_pixel(
+            56,
+            56,
+            Rgb([1, 2, 3]),
+        ))];
+        assert!(Glm53FlashProcessor::new()
+            .preprocess_video(&frames, &bad_fps)
+            .is_err());
+    }
+
+    #[test]
+    fn video_budget_ignores_image_token_caps() {
+        // With no dedicated video config the gateway falls back to the
+        // image config; an image-scale max_image_tokens must not cap a
+        // clip's volume. pixels_per_token = factor^2 * temporal.
+        let ppt = 28 * 28 * 2;
+        let capped = config(100);
+        let image = Params::from_config(&capped, false).unwrap();
+        assert_eq!(image.max_pixels, 100 * ppt);
+        let video = Params::from_config(&capped, true).unwrap();
+        assert_eq!(video.max_pixels, MAX_VIDEO_TOKENS * ppt);
+    }
+
+    #[test]
+    fn video_frames_with_mismatched_dimensions_error() {
+        let frames = [
+            DynamicImage::ImageRgb8(RgbImage::from_pixel(56, 56, Rgb([1, 2, 3]))),
+            DynamicImage::ImageRgb8(RgbImage::from_pixel(28, 56, Rgb([1, 2, 3]))),
+        ];
+        let err = Glm53FlashProcessor::new()
+            .preprocess_video(&frames, &config(MAX_VIDEO_TOKENS))
+            .unwrap_err();
+        assert!(err.to_string().contains("identical dimensions"), "{err}");
+    }
+
+    #[test]
+    fn degenerate_budgets_and_unaligned_no_resize_error() {
+        // max_pixels smaller than one aligned patch can fit nothing.
+        let mut tiny = config(MAX_IMAGE_TOKENS);
+        tiny.min_pixels = Some(1);
+        tiny.max_pixels = Some(1);
+        let params = Params::from_config(&tiny, false).unwrap();
+        let err = params.geometry(1, 100, 100).unwrap_err();
+        assert!(err.to_string().contains("aligned patch"), "{err}");
+
+        // do_resize=false hands the canvas alignment burden to the caller.
+        let mut no_resize = config(MAX_IMAGE_TOKENS);
+        no_resize.do_resize = Some(false);
+        let unaligned = DynamicImage::ImageRgb8(RgbImage::from_pixel(30, 30, Rgb([1, 2, 3])));
+        let err = Glm53FlashProcessor::new()
+            .preprocess(&[unaligned], &no_resize)
+            .unwrap_err();
+        assert!(err.to_string().contains("not aligned"), "{err}");
+    }
+
+    #[test]
+    fn multi_image_batches_accumulate_grids_and_patches() {
+        let images = [
+            DynamicImage::ImageRgb8(RgbImage::from_pixel(56, 56, Rgb([10, 20, 30]))),
+            DynamicImage::ImageRgb8(RgbImage::from_pixel(112, 56, Rgb([40, 50, 60]))),
+        ];
+        let output = Glm53FlashProcessor::new()
+            .preprocess(&images, &config(MAX_IMAGE_TOKENS))
+            .unwrap();
+        let grids = grid(&output, "image_grid_thw");
+        assert_eq!(grids.len(), 6, "one [t,h,w] row per image");
+        let rows: usize = grids
+            .chunks(3)
+            .map(|row| (row[0] * row[1] * row[2]) as usize)
+            .sum();
+        assert_eq!(
+            output.encoder_input.shape()[0],
+            rows,
+            "patch rows must equal the summed grid volumes"
+        );
     }
 }
