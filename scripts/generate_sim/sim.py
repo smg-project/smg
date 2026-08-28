@@ -43,6 +43,7 @@ MOCK_BASE_PORT = 9000
 SMG_BASE_PORT = 30000
 PROM_BASE_PORT = 39000
 INDEX_BASE_PORT = 40000
+MESH_BASE_PORT = 41000
 
 # Cache-aware decision branches are DEBUG logs only (no branch metric), scoped
 # so the rest of the gateway stays at warn.
@@ -58,6 +59,11 @@ METRIC_PREFIXES = (
     # cache-aware debug lines then cover only delegated (turn-1) decisions.
     "smg_manual_policy_branch_total",
     "smg_routing_key_source_total",
+    # Remote radix-index query outcomes + placement publishes
+    # (--kv-indexer-url legs); deadline-miss and fallback rates come
+    # straight from these.
+    "smg_remote_index_query_total",
+    "smg_remote_index_publish_total",
     # Buffered vs streamed body routing, per path/reason — the direct
     # verification of which request-body regime a leg actually ran in.
     "smg_router_request_body_path_total",
@@ -409,6 +415,27 @@ def launch_smgs(profile, logs_dir, smg_bin):
             "--prometheus-port",
             str(PROM_BASE_PORT + i),
         ] + list(profile["smg_flags"])
+        if profile.get("mesh_smgs"):
+            # Gateway-to-gateway mesh (TreeSync of approximate-tree inserts):
+            # per-instance port, full peer list minus self.
+            peers = [
+                "http://127.0.0.1:%d" % (MESH_BASE_PORT + j)
+                for j in range(count)
+                if j != i
+            ]
+            cmd += [
+                "--enable-mesh",
+                "--mesh-host",
+                "127.0.0.1",
+                "--mesh-advertise-host",
+                "127.0.0.1",
+                "--mesh-port",
+                str(MESH_BASE_PORT + i),
+                "--mesh-server-name",
+                "smg-%d" % i,
+            ]
+            if peers:
+                cmd += ["--mesh-peer-urls"] + peers
         children.append(spawn("smg-%d" % i, cmd, logs_dir / ("smg-%d.log" % i), env=env))
     log("gateways: %d on ports %d.. (prometheus %d..)"
         % (count, SMG_BASE_PORT, PROM_BASE_PORT))
@@ -649,6 +676,8 @@ def analyze_requests(path, workers_total, window=None):
     per_turn_worker = {}
     turn_stats = {}
     session_turn_worker = {}
+    index_sources = Counter()
+    prediction_errors = []
     if not path.exists():
         return {"error": "requests.jsonl missing"}
     records = []
@@ -687,6 +716,13 @@ def analyze_requests(path, workers_total, window=None):
         # Request-level "hit" per the design doc: cached/prompt >= 0.3.
         if prompt and cached / prompt >= 0.3:
             ts["hits"] += 1
+        source = rec.get("index_source")
+        if source:
+            index_sources[source] += 1
+            predicted = rec.get("index_predicted_tokens")
+            cached = rec.get("cached_tokens")
+            if predicted is not None and cached is not None:
+                prediction_errors.append(predicted - cached)
         port = rec.get("worker_port")
         if port is not None:
             per_worker[port] += 1
@@ -714,6 +750,22 @@ def analyze_requests(path, workers_total, window=None):
         "t2_same_worker_rate": round(same / len(both), 4) if both else None,
         "windowed": lo_ms is not None,
         "window_dropped_requests": dropped,
+        # Remote-index echo (only on --kv-indexer-url legs): what each
+        # decision resolved to, and predicted-vs-actual cached tokens —
+        # the direct index-accuracy signal, separable from policy spill.
+        "index_sources": dict(index_sources),
+        "index_prediction_error_tokens": (
+            {
+                "n": len(prediction_errors),
+                "mean": round(statistics.mean(prediction_errors), 1),
+                "median": statistics.median(prediction_errors),
+                "p95_abs": sorted(abs(e) for e in prediction_errors)[
+                    int(len(prediction_errors) * 0.95)
+                ],
+            }
+            if prediction_errors
+            else None
+        ),
     }
 
 

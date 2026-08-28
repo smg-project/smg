@@ -300,6 +300,92 @@ SCENARIOS = {
             None,
         ),
     ],
+    # M2 core matrix (02-experiment-plan.md): sprayed ingress everywhere
+    # (the regime that breaks per-replica state), one variable per
+    # comparison. local-event = per-gateway event indexers (round-3
+    # architecture); remote-event = same feed, ONE shared index (parity =
+    # location only); remote-placement = shared index fed ONLY by gateway
+    # placements (bridge off — the eventless-engine thesis, the number
+    # that does not exist yet); mesh-tree = the in-repo TreeSync
+    # alternative (approximate trees synced gateway-to-gateway).
+    # Compressed gateway clocks on every leg (held constant).
+    "remote-index": [
+        (
+            "local-event-sprayed",
+            {
+                **KV_EVENT_OVERRIDES,
+                "loadgen.ingress": "random",
+                "loadgen.turn2_ingress": "random",
+                "smg_flag_overrides": {
+                    **RADIX_TREE_FLAGS,
+                    "--enable-igw": None,
+                    **COMPRESSED_CLOCK_FLAGS,
+                },
+            },
+            None,
+        ),
+        (
+            "remote-event-sprayed",
+            {
+                **KV_EVENT_OVERRIDES,
+                "loadgen.ingress": "random",
+                "loadgen.turn2_ingress": "random",
+                "index_service": {
+                    "replicas": 2,
+                    "bridge": True,
+                    "inferred_ttl_secs": 18,
+                    "sweep_interval_secs": 1,
+                    "default_capacity_blocks": 4688,
+                },
+                "smg_flag_overrides": {
+                    **RADIX_TREE_FLAGS,
+                    "--enable-igw": None,
+                    **COMPRESSED_CLOCK_FLAGS,
+                    "--kv-indexer-url": "http://127.0.0.1:40000",
+                    "--kv-indexer-block-size": "256",
+                },
+            },
+            None,
+        ),
+        (
+            "remote-placement-sprayed",
+            {
+                **KV_EVENT_OVERRIDES,
+                "loadgen.ingress": "random",
+                "loadgen.turn2_ingress": "random",
+                "index_service": {
+                    "replicas": 2,
+                    "bridge": False,
+                    "inferred_ttl_secs": 18,
+                    "sweep_interval_secs": 1,
+                    "default_capacity_blocks": 4688,
+                },
+                "smg_flag_overrides": {
+                    **RADIX_TREE_FLAGS,
+                    "--enable-igw": None,
+                    **COMPRESSED_CLOCK_FLAGS,
+                    "--kv-indexer-url": "http://127.0.0.1:40000",
+                    "--kv-indexer-block-size": "256",
+                },
+            },
+            None,
+        ),
+        (
+            "mesh-tree-sprayed",
+            {
+                **KV_EVENT_OVERRIDES,
+                "loadgen.ingress": "random",
+                "loadgen.turn2_ingress": "random",
+                "mesh_smgs": True,
+                "smg_flag_overrides": {
+                    **RADIX_TREE_FLAGS,
+                    "--enable-igw": None,
+                    **COMPRESSED_CLOCK_FLAGS,
+                },
+            },
+            None,
+        ),
+    ],
     # Kill and relaunch every SMG mid-window: sticky pins and placements are
     # process state, so affinity must rebuild; errors during the blackout
     # are part of the result.
@@ -463,6 +549,23 @@ def extract_rows(report):
             paths[name] = paths.get(name, 0) + count
     path_total = sum(paths.values())
     streamed = sum(v for k, v in paths.items() if k.startswith("streamed"))
+    # Remote-index rows (--kv-indexer-url legs): per-request echo shares
+    # and the direct accuracy signal (predicted-vs-actual cached tokens).
+    sources = req.get("index_sources") or {}
+    total_sourced = sum(sources.values())
+    if total_sourced:
+        rows["index remote_hit share"] = round(
+            sources.get("remote_hit", 0) / total_sourced, 4
+        )
+        misses = total_sourced - sources.get("remote_hit", 0) - sources.get("remote_empty", 0)
+        rows["index degraded share (timeout+disconnect)"] = round(
+            misses / total_sourced, 4
+        )
+    pred = req.get("index_prediction_error_tokens")
+    if pred:
+        rows["index prediction error mean (tokens)"] = pred.get("mean")
+        rows["index prediction error p95 abs (tokens)"] = pred.get("p95_abs")
+
     rows["body path streamed share"] = (
         round(streamed / path_total, 4) if path_total else None
     )
