@@ -31,8 +31,8 @@ git clone https://github.com/sierra-research/tau2-bench ~/tau/tau2-bench
 cd ~/tau/tau2-bench && uv sync
 ~/vllm-env/bin/pip install ninja          # then ensure ~/vllm-env/bin is on PATH
 
-# 1) bring up both arms (here: Qwen3.6-27B, TP=2, one arm per GPU pair)
-export TAU2_MODEL=Qwen/Qwen3.6-27B VLLM_BIN=~/vllm-env/bin/vllm \
+# 1) bring up both arms (here: Qwen3.8-27B, TP=2, one arm per GPU pair)
+export TAU2_MODEL=Qwen/Qwen3.8-27B VLLM_BIN=~/vllm-env/bin/vllm \
        VLLM_PYTHON=~/vllm-env/bin/python SMG_LAUNCH="$HOME/smg/target/ci/smg launch" \
        TAU2_TP=2 TAU2_MAX_MODEL_LEN=16384 PATH=~/vllm-env/bin:$PATH
 A_URL=$(TAU2_GPU=0,1 TAU2_VLLM_TOOL_PARSER=qwen3_xml TAU2_VLLM_REASONING_PARSER=qwen3 bash launch_arms.sh a)
@@ -46,7 +46,7 @@ export OPENAI_API_KEY=sk-...
 python scripts/tau2/run_ab.py \
     --baseline  "vllm=$A_URL" \
     --candidate "smg=$B_URL" \
-    --agent-model Qwen/Qwen3.6-27B \
+    --agent-model Qwen/Qwen3.8-27B \
     --user-llm gpt-5.2 \
     --tau2 ~/tau/tau2-bench/.venv/bin/tau2 \
     --data-dir ~/tau/tau2-bench/data \
@@ -95,7 +95,7 @@ dominated by model-load time, serialized by a host lock, so a PR run is not fast
 
 | leg | model | runner (TP) | vLLM tool/reason | SMG tool/reason |
 |---|---|---|---|---|
-| qwen3.6 | Qwen/Qwen3.6-27B | 4-gpu-h100 (2) | `qwen3_xml` / `qwen3` | `qwen_xml` / `qwen3` |
+| qwen3.8 | Qwen/Qwen3.8-27B | 4-gpu-h100 (2) | `qwen3_xml` / `qwen3` | `qwen_xml` / `qwen3` |
 | gpt-oss | openai/gpt-oss-120b | 4-gpu-h100 (2) | `openai` / — | — / — (harmony auto) |
 | deepseek-v4 | deepseek-ai/DeepSeek-V4-Flash-0731 | blackwell (4) | `deepseek_v4` / `deepseek_v4` | `deepseek_v4` / `deepseek_v4` |
 | minimax-m2.7 | MiniMaxAI/MiniMax-M2.7 | blackwell (4) | `minimax_m2` / `minimax_m2` | `minimax_m2` / `minimax` |

@@ -8,7 +8,7 @@
 # the ONLY variable is the frontend (tokenization + tool/reasoning parsing).
 #
 # Runs nightly across retail, airline, and telecom domains over a 6-model matrix
-# (qwen3.6 + gpt-oss on H100; deepseek-v4, minimax-m2.7, kimi-k2.6, glm-5.2 on
+# (qwen3.8 + gpt-oss on H100; deepseek-v4, minimax-m2.7, kimi-k2.6, glm-5.2 on
 # Blackwell). The 4 Blackwell legs are num_tasks-capped to bound GPU time and
 # gpt-5.2 spend (tau2 is far heavier per-leg than bfcl: multi-turn + per-turn API
 # spend). On PRs that touch this pipeline ALL legs run on a tiny retail / 1-trial /
@@ -31,7 +31,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run only this matrix leg (qwen3.6|gpt-oss|deepseek-v4|minimax-m2.7|kimi-k2.6|glm-5.2); empty = all"
+        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4|minimax-m2.7|kimi-k2.6|glm-5.2); empty = all"
         required: false
         default: ""
       model:
@@ -145,9 +145,9 @@ jobs:
           # run_timeout x len(domains). 5400 is the default.
           legs = [
               # H100 legs (TP=2 per arm, both arms concurrent: GPUs 0,1 + 2,3).
-              {"name": "qwen3.6", "runner": "4-gpu-h100", "tp": 2,
+              {"name": "qwen3.8", "runner": "4-gpu-h100", "tp": 2,
                "gpu_a": "0,1", "gpu_b": "2,3",
-               "model": "Qwen/Qwen3.6-27B",
+               "model": "Qwen/Qwen3.8-27B",
                "vllm_tool": "qwen3_xml", "vllm_reason": "qwen3",
                "smg_tool": "qwen_xml", "smg_reason": "qwen3",
                "vllm_extra": "", "gpu_mem": "0.85", "startup_timeout": "600",
