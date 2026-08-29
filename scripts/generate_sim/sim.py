@@ -425,9 +425,7 @@ def launch_smgs(profile, logs_dir, smg_bin):
             # Gateway-to-gateway mesh (TreeSync of approximate-tree inserts):
             # per-instance port, full peer list minus self.
             peers = [
-                "http://127.0.0.1:%d" % (MESH_BASE_PORT + j)
-                for j in range(count)
-                if j != i
+                "127.0.0.1:%d" % (MESH_BASE_PORT + j) for j in range(count) if j != i
             ]
             cmd += [
                 "--enable-mesh",

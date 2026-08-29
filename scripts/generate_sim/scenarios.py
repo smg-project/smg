@@ -418,6 +418,25 @@ SCENARIOS = {
             None,
         ),
     ],
+    # Mesh TreeSync leg alone (the core matrix's first three legs already
+    # completed; peer-url format fix made this rerunnable separately).
+    "remote-index-mesh": [
+        (
+            "mesh-tree-sprayed",
+            {
+                **KV_EVENT_OVERRIDES,
+                "loadgen.ingress": "random",
+                "loadgen.turn2_ingress": "random",
+                "mesh_smgs": True,
+                "smg_flag_overrides": {
+                    **RADIX_TREE_FLAGS,
+                    "--enable-igw": None,
+                    **COMPRESSED_CLOCK_FLAGS,
+                },
+            },
+            None,
+        ),
+    ],
     # Staleness sweep (event feed; the placement feed has no Removed to
     # delay): constant injected apply lag, reported against the 3 s
     # compressed think time (= 30 s production). Stored and Removed are
