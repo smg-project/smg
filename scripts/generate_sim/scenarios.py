@@ -437,6 +437,35 @@ SCENARIOS = {
             None,
         ),
     ],
+    # Placement-fed leg alone: rerunnable after the prompt-plus-output
+    # placement-chain fix to measure how much of the 1.6-point gap to the
+    # event feed it closes (the routing-time chain covered only the
+    # prompt; the worker's blocks span the generated tail too).
+    "remote-index-placement": [
+        (
+            "remote-placement-sprayed",
+            {
+                **KV_EVENT_OVERRIDES,
+                "loadgen.ingress": "random",
+                "loadgen.turn2_ingress": "random",
+                "index_service": {
+                    "replicas": 2,
+                    "bridge": False,
+                    "inferred_ttl_secs": 18,
+                    "sweep_interval_secs": 1,
+                    "default_capacity_blocks": 4688,
+                },
+                "smg_flag_overrides": {
+                    **RADIX_TREE_FLAGS,
+                    "--enable-igw": None,
+                    **COMPRESSED_CLOCK_FLAGS,
+                    "--kv-indexer-url": "http://127.0.0.1:40000",
+                    "--kv-indexer-block-size": "256",
+                },
+            },
+            None,
+        ),
+    ],
     # Staleness sweep (event feed; the placement feed has no Removed to
     # delay): constant injected apply lag, reported against the 3 s
     # compressed think time (= 30 s production). Stored and Removed are
