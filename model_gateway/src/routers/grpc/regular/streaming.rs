@@ -66,10 +66,12 @@ struct CompletionStreamOutcome {
     reasoning_tokens: u32,
     completion_tokens: u32,
     first_token_time: Option<Instant>,
-    /// Whether *every* expected `n>1` choice in this unit received a
-    /// `Complete` message (the only source of authoritative usage) -- a
-    /// clean EOF partway through leaves this `false` even if some choices
-    /// did complete, so a partial result is never mistaken for full usage.
+    /// Whether *every* expected `n>1` choice in this unit reached a terminal
+    /// state with authoritative usage: a `Complete` message, or a
+    /// router-matched string stop whose terminal chunk carries the prompt
+    /// count. A clean EOF partway through leaves this `false` even if some
+    /// choices did complete, so a partial result is never mistaken for full
+    /// usage.
     saw_complete: bool,
 }
 
@@ -293,6 +295,10 @@ impl StreamingProcessor {
         let mut completion_tokens = CompletionTokenTracker::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
         let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut terminal_indices: HashSet<u32> = HashSet::new();
+        let expected_choices = original_request.n.unwrap_or(1).max(1) as usize;
+        let mut has_router_stop = false;
+        let mut router_terminated = false;
 
         // Parser state (lazy initialization per index)
         type PooledReasoningParser = Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>;
@@ -459,7 +465,26 @@ impl StreamingProcessor {
                         stopped_indices.insert(index);
                     }
 
+                    // A router-matched string stop is terminal for the public
+                    // request but not for the backend (it never saw the string).
+                    // Track it so the stream can be aborted — rather than drained —
+                    // once every choice is terminal.
+                    let router_string_stop = should_stop && stop_decoder.matched_stop().is_some();
+                    if router_string_stop {
+                        has_router_stop = true;
+                        prompt_tokens.insert(index, chunk.prompt_tokens());
+                        cached_tokens.insert(index, chunk.cached_tokens());
+                        reasoning_tokens.insert(index, chunk.reasoning_tokens());
+                        terminal_indices.insert(index);
+                    }
+                    let all_terminal =
+                        has_router_stop && terminal_indices.len() >= expected_choices;
+
                     if chunk_text.is_empty() {
+                        if all_terminal {
+                            router_terminated = true;
+                            break;
+                        }
                         continue;
                     }
 
@@ -498,6 +523,7 @@ impl StreamingProcessor {
                         finish_reasons.insert(index, complete.finish_reason().to_string());
                         matched_stops.insert(index, complete.matched_stop_json());
                     }
+                    terminal_indices.insert(index);
 
                     // Don't break - continue reading all Complete messages for n>1
                     flushed.map(|text| (index, text, None))
@@ -506,6 +532,13 @@ impl StreamingProcessor {
             };
 
             let Some((index, text, choice_logprobs)) = pending else {
+                // A Complete that releases no buffered text can still be the
+                // final terminal choice after a router-side string stop; abort
+                // rather than drain the backend's post-stop generation.
+                if has_router_stop && terminal_indices.len() >= expected_choices {
+                    router_terminated = true;
+                    break;
+                }
                 continue;
             };
 
@@ -606,6 +639,14 @@ impl StreamingProcessor {
                             .map_err(|_| "Failed to send tool call chunk".to_string())?;
                     }
 
+                    // A router-matched string stop is terminal for the public
+                    // request once every choice is done; the pre-stop text fed
+                    // to the parser above is the last input it sees.
+                    if has_router_stop && terminal_indices.len() >= expected_choices {
+                        router_terminated = true;
+                        break;
+                    }
+
                     // Always skip regular content when tool parsing is active
                     // Parser either emitted chunks or buffered content
                     continue;
@@ -623,6 +664,15 @@ impl StreamingProcessor {
                 tx.send(Ok(Bytes::from(sse_buffer.clone())))
                     .await
                     .map_err(|_| "Failed to send content chunk".to_string())?;
+            }
+
+            // A router-matched string stop is terminal for the public request
+            // but not for the backend (it never saw the string): once every
+            // choice is terminal, break and leave the stream to abort on drop
+            // instead of draining post-stop generation.
+            if has_router_stop && terminal_indices.len() >= expected_choices {
+                router_terminated = true;
+                break;
             }
         }
 
@@ -738,8 +788,12 @@ impl StreamingProcessor {
             }
         }
 
-        // Mark stream as completed successfully to prevent abort on drop
-        grpc_stream.mark_completed();
+        // A router-side string stop is terminal for the public request but not
+        // for the backend. Leave the stream unmarked so Drop sends its exact-ID
+        // Abort RPC instead of silently draining post-stop generation.
+        if !router_terminated {
+            grpc_stream.mark_completed();
+        }
 
         // Record streaming metrics
         let total_prompt: u32 = prompt_tokens.values().copied().max().unwrap_or(0);
@@ -1909,16 +1963,21 @@ impl StreamingProcessor {
         // Token tracking
         let mut completion_tokens = CompletionTokenTracker::new();
         let mut prompt_tokens: u32 = 0;
-        // Authoritative usage only ever arrives via a `Complete` message; a
-        // clean EOF without one leaves `prompt_tokens` at its 0 initializer,
-        // which is indistinguishable from a genuinely empty prompt -- track
-        // separately so settle can tell "no usage" from "zero tokens".
+        // Authoritative usage arrives via a `Complete` message, or — for a
+        // router-matched string stop — via the terminal chunk that triggers
+        // it; a clean EOF with neither leaves `prompt_tokens` at its 0
+        // initializer, which is indistinguishable from a genuinely empty
+        // prompt -- track separately so settle can tell "no usage" from
+        // "zero tokens".
         let mut saw_complete = false;
         let mut finish_reason_str = String::new();
         let mut matched_stop: Option<Value> = None;
         // Set once the local stop decoder fires: pins "stop" and ignores later
         // engine output (the backend has no stop-string detection over ZMQ).
         let mut stopped = false;
+        // Set when a router-matched string stop terminates the request: the
+        // backend stream is left unmarked so Drop aborts it instead of draining.
+        let mut router_terminated = false;
 
         // Per-request effective parser names (model-card override → configured).
         let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
@@ -2069,7 +2128,27 @@ impl StreamingProcessor {
                             .map(|s| Value::String(s.to_string()));
                     }
 
+                    // A router-matched string stop is terminal for the public
+                    // request but not for the backend (it never saw the string):
+                    // emit any pre-stop text below, then break and leave the
+                    // stream to abort on drop instead of draining it. No
+                    // Complete will be read after the abort, so capture usage
+                    // from the terminal chunk itself.
+                    let router_string_stop = should_stop && matched_stop.is_some();
+                    if router_string_stop {
+                        prompt_tokens = chunk.prompt_tokens();
+                        // The terminal chunk's prompt count stands in for the
+                        // Complete this request will never read; without this
+                        // the terminal usage emit reports no input tokens and
+                        // the reservation settles on the estimate.
+                        saw_complete = true;
+                    }
+
                     if chunk_text.is_empty() {
+                        if router_string_stop {
+                            router_terminated = true;
+                            break;
+                        }
                         continue;
                     }
 
@@ -2330,6 +2409,14 @@ impl StreamingProcessor {
                         }
                     }
                 }
+
+                // A router-matched string stop fired on this chunk: the
+                // pre-stop text fed to the parser above is the last input it
+                // sees; abort rather than drain the backend.
+                if stopped && matched_stop.is_some() {
+                    router_terminated = true;
+                    break;
+                }
                 continue;
             }
 
@@ -2359,6 +2446,14 @@ impl StreamingProcessor {
                     },
                 )
                 .await?;
+            }
+
+            // A router-matched string stop is terminal for the public request
+            // but not for the backend (it never saw the string): break and
+            // leave the stream to abort on drop instead of draining it.
+            if stopped && matched_stop.is_some() {
+                router_terminated = true;
+                break;
             }
         }
 
@@ -2540,8 +2635,9 @@ impl StreamingProcessor {
         // Phase 5: Emit message_stop
         Self::send_messages_event(tx, &mut sse_buffer, &MessageStreamEvent::MessageStop).await?;
 
-        // Mark stream completed
-        grpc_stream.mark_completed();
+        if !router_terminated {
+            grpc_stream.mark_completed();
+        }
 
         if let Some(handle) = reservation {
             if saw_complete {
@@ -2871,6 +2967,10 @@ impl StreamingProcessor {
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
         let mut stopped_indices: HashSet<u32> = HashSet::new();
+        let mut terminal_indices: HashSet<u32> = HashSet::new();
+        let expected_choices = completion_request.n.unwrap_or(1).max(1) as usize;
+        let mut has_router_stop = false;
+        let mut router_terminated = false;
         let mut sse_buffer = Vec::with_capacity(512);
         let mut chunk_text = String::new();
         // For n>1, each index shares the same prompt — use max across Complete
@@ -2924,6 +3024,9 @@ impl StreamingProcessor {
 
                     let (decoded_text, stopped) =
                         Self::process_chunk_tokens(stop_decoder, chunk.token_ids())?;
+                    // `matched_stop` is only set for router-matched string stops;
+                    // token-level stops leave the backend to terminate itself.
+                    let matched_sequence = stopped && stop_decoder.matched_stop().is_some();
                     chunk_text.clear();
                     chunk_text.push_str(&decoded_text);
 
@@ -2961,6 +3064,19 @@ impl StreamingProcessor {
                         // the backend's eventual Complete carries "length". This is
                         // intentional — the local stop sequence fired first.
                         stopped_indices.insert(index);
+                        terminal_indices.insert(index);
+                        has_router_stop |= matched_sequence;
+                        if matched_sequence {
+                            // No Complete will be read for a router-stopped
+                            // choice; count it as completed so this unit still
+                            // reports the terminal chunk's usage as
+                            // authoritative instead of settling on the
+                            // reserved estimate.
+                            completed_indices.insert(index);
+                        }
+                        total_prompt = total_prompt.max(chunk.prompt_tokens());
+                        total_cached = total_cached.max(chunk.cached_tokens());
+                        reasoning_tokens.insert(index, chunk.reasoning_tokens());
 
                         if let Some(sfx) = suffix {
                             let suffix_chunk = CompletionStreamResponse {
@@ -3001,6 +3117,11 @@ impl StreamingProcessor {
                         tx.send(Ok(Bytes::from(sse_buffer.clone())))
                             .await
                             .map_err(|_| "Channel closed".to_string())?;
+
+                        if has_router_stop && terminal_indices.len() >= expected_choices {
+                            router_terminated = true;
+                            break;
+                        }
                     }
                 }
                 ProtoResponseVariant::Complete(complete) => {
@@ -3131,17 +3252,27 @@ impl StreamingProcessor {
                     tx.send(Ok(Bytes::from(sse_buffer.clone())))
                         .await
                         .map_err(|_| "Channel closed".to_string())?;
+
+                    terminal_indices.insert(index);
+                    if has_router_stop && terminal_indices.len() >= expected_choices {
+                        router_terminated = true;
+                        break;
+                    }
                 }
                 ProtoResponseVariant::None => continue,
             }
         }
 
-        grpc_stream.mark_completed();
+        if !router_terminated {
+            grpc_stream.mark_completed();
+        }
 
-        // `completed_indices` counts distinct indices that finished cleanly
-        // via a `Complete` message. A clean EOF partway through this unit's
-        // `n>1` choices (some completed, others didn't) must not be treated
-        // as full usage.
+        // `completed_indices` counts distinct indices that reached a terminal
+        // state with authoritative usage: finished cleanly via a `Complete`
+        // message, or stopped on a router-matched string stop (whose terminal
+        // chunk carries the prompt count the skipped Complete would have).
+        // A clean EOF partway through this unit's `n>1` choices (some
+        // completed, others didn't) must not be treated as full usage.
         let expected_choices = completion_request.n.unwrap_or(1).max(1);
         let saw_complete = completed_indices.len() as u32 >= expected_choices;
 
