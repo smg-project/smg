@@ -39,13 +39,18 @@ def launch_router(args: argparse.Namespace | RouterArgs) -> None:
 
         if Router is None:
             raise RuntimeError("Rust Router is not installed")
+
+        if router_args.service_discovery and not router_args.enable_igw:
+            logger.info("IGW mode automatically enabled because service discovery is turned on")
+            router_args.enable_igw = True
+
         router_args._validate_router_args()
 
         # Determine mode for banner
-        if getattr(router_args, "pd_disaggregation", False):
-            mode = "PD Disaggregated"
-        elif getattr(router_args, "enable_igw", False):
+        if getattr(router_args, "enable_igw", False):
             mode = "IGW"
+        elif getattr(router_args, "pd_disaggregation", False):
+            mode = "PD Disaggregated"
         else:
             mode = "Regular"
         print_banner(router_args.host, router_args.port, mode)

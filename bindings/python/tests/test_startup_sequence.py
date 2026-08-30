@@ -199,6 +199,7 @@ class TestRouterInitialization:
                         selector=router_args.selector,
                         service_discovery_port=router_args.service_discovery_port,
                         service_discovery_namespace=router_args.service_discovery_namespace,
+                        enable_igw=router_args.enable_igw,
                     )
                 )
                 return mock_router_instance
@@ -213,6 +214,7 @@ class TestRouterInitialization:
             assert captured_args["selector"] == {"app": "worker", "env": "prod"}
             assert captured_args["service_discovery_port"] == 8080
             assert captured_args["service_discovery_namespace"] == "default"
+            assert captured_args["enable_igw"] is True
 
             # Verify router.start() was called
             mock_router_instance.start.assert_called_once()
