@@ -934,11 +934,13 @@ class RouterArgs:
         k8s_group.add_argument(
             f"--{prefix}kv-connector-annotation",
             type=str,
+            default=RouterArgs.kv_connector_annotation,
             help="vLLM KV connector Pod annotation (default: smg.ai/kv-connector)",
         )
         k8s_group.add_argument(
             f"--{prefix}kv-engine-id-annotation",
             type=str,
+            default=RouterArgs.kv_engine_id_annotation,
             help="Per-worker KV engine ID Pod annotation (default: smg.ai/kv-engine-id)",
         )
         k8s_group.add_argument(

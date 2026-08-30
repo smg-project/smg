@@ -807,6 +807,12 @@ class TestParseRouterArgs:
             assert router_args.kv_connector_annotation == "example.com/connector"
             assert router_args.kv_engine_id_annotation == "example.com/engine-id"
 
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        defaults = parser.parse_args([])
+        assert defaults.kv_connector_annotation == RouterArgs.kv_connector_annotation
+        assert defaults.kv_engine_id_annotation == RouterArgs.kv_engine_id_annotation
+
     def test_repeated_list_flags_accumulate(self):
         """Repeated occurrences of list flags append, matching the Rust CLI."""
         router_args = parse_router_args(
