@@ -1337,6 +1337,16 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// Whether the request carries any multimodal inputs.
+    pub fn has_mm_inputs(&self) -> bool {
+        match self {
+            Self::Sglang(req) => req.mm_inputs.is_some(),
+            Self::Vllm(req) => req.mm_inputs.is_some(),
+            Self::TokenSpeed(req) => req.mm_inputs.is_some(),
+            Self::Trtllm(_) | Self::Mlx(_) => false,
+        }
+    }
+
     /// Drop raw multimodal encoder tensors while keeping item metadata.
     ///
     /// Used by the EPD prefill leg: multimodal embeddings arrive from encode workers,

@@ -484,7 +484,7 @@ impl RequestExecutionStage {
     /// then relays the kv_transfer_params returned by the prefill engine to decode.
     async fn execute_sequential_pd(
         &self,
-        mut proto_request: ProtoGenerateRequest,
+        proto_request: ProtoGenerateRequest,
         clients: &mut ClientSelection,
         workers: &WorkerSelection,
         model: &str,
@@ -545,6 +545,16 @@ impl RequestExecutionStage {
         // siblings (same hazard for NIXL and Mooncake)
         let relay_kv_params = proto_request.sampling_n() <= 1;
 
+        // A fan-out request cannot consume the handoff, so its prefill leg is
+        // pure wasted GPU work plus serial latency. Skip it when nothing else
+        // needs that leg: EPD hands encoded embeddings to prefill, multimodal
+        // pixels ride only the prefill leg, and legacy Mooncake still points
+        // decode at the prefill bootstrap addr.
+        let skip_prefill = !relay_kv_params
+            && workers.encode_assignments().is_none()
+            && !proto_request.has_mm_inputs()
+            && matches!(mode, KvConnectorMode::Nixl | KvConnectorMode::Passthrough);
+
         // Mooncake is push-based: the engine returns nothing, so the router mints
         // the transfer correlation id and synthesizes decode params from metadata
         let mooncake_transfer_id = match &mode {
@@ -559,87 +569,104 @@ impl RequestExecutionStage {
         // reused ShmHandle would be unreadable. Same request_id on both legs
         // is load-bearing for NIXL P/D correlation on vLLM < 0.13. The
         // pixel-free leg is the clone, so pixel tensors are never duplicated
-        // and die with the prefill send.
-        let mut decode_request = proto_request.clone_without_mm_pixels();
-        // Sanitize prefill sampling (max_tokens=1, n=1), stream=false.
-        let mut prefill_request = proto_request;
-        prefill_request.sanitize_sampling_for_prefill(1);
-        prefill_request.set_stream(false);
-        if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
-            prefill_request.set_data_parallel_rank(rank as i32);
-        }
-        if mode == KvConnectorMode::Nixl {
-            if relay_kv_params {
-                prefill_request.set_kv_transfer_params_json(NIXL_PREFILL_KV_PARAMS.to_string());
-            } else {
-                debug!(
-                    request_id = %prefill_request.request_id(),
-                    "vLLM PD (NIXL): n>1 request, skipping kv_transfer_params relay \
-                     (decode recomputes the prompt locally)"
-                );
+        // and die with the prefill send. When the prefill leg is skipped the
+        // decode leg owns the whole request instead.
+        let (mut decode_request, prefill_request) = if skip_prefill {
+            (proto_request, None)
+        } else {
+            let mut prefill_request = proto_request;
+            let decode_request = prefill_request.clone_without_mm_pixels();
+            // Sanitize prefill sampling (max_tokens=1, n=1), stream=false.
+            prefill_request.sanitize_sampling_for_prefill(1);
+            prefill_request.set_stream(false);
+            if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
+                prefill_request.set_data_parallel_rank(rank as i32);
             }
-        }
-        if let Some(ref transfer_id) = mooncake_transfer_id {
-            prefill_request.set_kv_transfer_params_json(mooncake_prefill_params(transfer_id));
-        }
-
-        debug!(
-            request_id = %prefill_request.request_id(),
-            "vLLM PD: sending prefill request (max_tokens=1)"
-        );
-
-        // Send to prefill, wait for completion
-        let (prefill_label, decode_label) = pd_leg_labels(workers);
-        let prefill_start = Instant::now();
-        let mut prefill_stream = prefill_client
-            .generate(prefill_request)
-            .await
-            .map_err(|e| {
-                workers.record_outcome_prefill(e.http_status().as_u16());
-                Metrics::record_worker_error(
-                    metrics_labels::WORKER_PREFILL,
-                    prefill_label,
-                    metrics_labels::ERROR_BACKEND,
-                );
-                error!(function = "execute_sequential_pd", error = %e, "Prefill worker failed to start");
-                e.to_http_error("prefill_worker_failed_to_start", format!("Prefill worker failed to start: {}", e.message()))
-            })?;
-
-        // Drain prefill response, harvesting connector params from the Complete frame
-        let mut prefill_kv_params: Option<String> = None;
-        while let Some(result) = prefill_stream.next().await {
-            match result {
-                Ok(response) => {
-                    if let ProtoResponseVariant::Complete(complete) = response.into_response() {
-                        if let Some(json) = complete.kv_transfer_params_json() {
-                            prefill_kv_params = Some(json.to_owned());
-                        }
-                    }
+            if mode == KvConnectorMode::Nixl {
+                if relay_kv_params {
+                    prefill_request.set_kv_transfer_params_json(NIXL_PREFILL_KV_PARAMS.to_string());
+                } else {
+                    debug!(
+                        request_id = %prefill_request.request_id(),
+                        "vLLM PD (NIXL): n>1 request, skipping kv_transfer_params relay \
+                         (decode recomputes the prompt locally)"
+                    );
                 }
-                Err(e) => {
+            }
+            if let Some(ref transfer_id) = mooncake_transfer_id {
+                prefill_request.set_kv_transfer_params_json(mooncake_prefill_params(transfer_id));
+            }
+            (decode_request, Some(prefill_request))
+        };
+
+        let (prefill_label, decode_label) = pd_leg_labels(workers);
+        let mut prefill_kv_params: Option<String> = None;
+        let mut prefill_duration = std::time::Duration::ZERO;
+        if let Some(prefill_request) = prefill_request {
+            debug!(
+                request_id = %prefill_request.request_id(),
+                "vLLM PD: sending prefill request (max_tokens=1)"
+            );
+
+            // Send to prefill, wait for completion
+            let prefill_start = Instant::now();
+            let mut prefill_stream = prefill_client
+                .generate(prefill_request)
+                .await
+                .map_err(|e| {
                     workers.record_outcome_prefill(e.http_status().as_u16());
                     Metrics::record_worker_error(
                         metrics_labels::WORKER_PREFILL,
                         prefill_label,
                         metrics_labels::ERROR_BACKEND,
                     );
-                    error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
-                    return Err(e.to_http_error(
-                        "prefill_stream_error",
-                        format!("Prefill stream error: {}", e.message()),
-                    ));
+                    error!(function = "execute_sequential_pd", error = %e, "Prefill worker failed to start");
+                    e.to_http_error("prefill_worker_failed_to_start", format!("Prefill worker failed to start: {}", e.message()))
+                })?;
+
+            // Drain prefill response, harvesting connector params from the Complete frame
+            while let Some(result) = prefill_stream.next().await {
+                match result {
+                    Ok(response) => {
+                        if let ProtoResponseVariant::Complete(complete) = response.into_response() {
+                            if let Some(json) = complete.kv_transfer_params_json() {
+                                prefill_kv_params = Some(json.to_owned());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        workers.record_outcome_prefill(e.http_status().as_u16());
+                        Metrics::record_worker_error(
+                            metrics_labels::WORKER_PREFILL,
+                            prefill_label,
+                            metrics_labels::ERROR_BACKEND,
+                        );
+                        error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
+                        return Err(e.to_http_error(
+                            "prefill_stream_error",
+                            format!("Prefill stream error: {}", e.message()),
+                        ));
+                    }
                 }
             }
+            prefill_stream.mark_completed();
+            workers.record_outcome_prefill(200);
+            // Captured at drain; recorded below only once decode is established.
+            prefill_duration = prefill_start.elapsed();
+        } else {
+            debug!(
+                request_id = %decode_request.request_id(),
+                "vLLM PD: n>1 fan-out cannot consume a KV handoff; dispatching \
+                 to decode only"
+            );
         }
-        prefill_stream.mark_completed();
-        workers.record_outcome_prefill(200);
-        // Captured at drain; recorded below only once decode is established.
-        let prefill_duration = prefill_start.elapsed();
 
         // KV-transfer window: prefill drain complete to decode send complete.
         let kv_window_start = Instant::now();
 
-        debug!("vLLM PD: prefill completed, sending decode request");
+        if !skip_prefill {
+            debug!("vLLM PD: prefill completed, sending decode request");
+        }
 
         if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
             decode_request.set_data_parallel_rank(rank as i32);
@@ -714,20 +741,27 @@ impl RequestExecutionStage {
         })?;
 
         workers.record_outcome_decode(200);
-        // Decode established: record the success-only PD metrics here.
+        // Decode established: record the success-only PD metrics here. A
+        // skipped prefill leg must not record a zero into the histogram.
         Metrics::record_pd_kv_connector_mode(kv_connector_label);
-        Metrics::record_pd_prefill_duration(
-            metrics_labels::BACKEND_PD,
-            model,
-            runtime,
-            prefill_duration,
-        );
-        Metrics::record_pd_kv_transfer_duration(
-            metrics_labels::BACKEND_PD,
-            model,
-            runtime,
-            kv_window_start.elapsed(),
-        );
+        if !skip_prefill {
+            Metrics::record_pd_prefill_duration(
+                metrics_labels::BACKEND_PD,
+                model,
+                runtime,
+                prefill_duration,
+            );
+        }
+        // No prefill leg means no KV handoff: a decode-only dispatch must not
+        // put its near-zero send window into the transfer histogram either.
+        if !skip_prefill {
+            Metrics::record_pd_kv_transfer_duration(
+                metrics_labels::BACKEND_PD,
+                model,
+                runtime,
+                kv_window_start.elapsed(),
+            );
+        }
 
         // Prefill has completed and its KV blocks are held pending decode's
         // transfer; aborting decode mid-transfer on a client disconnect can
@@ -811,6 +845,18 @@ mod tests {
         assert_eq!(value["do_remote_decode"], true);
         assert_eq!(value["do_remote_prefill"], false);
         assert_eq!(value.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn has_mm_inputs_reflects_multimodal_payload() {
+        let with_mm = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            mm_inputs: Some(vllm::MultimodalInputs::default()),
+            ..Default::default()
+        }));
+        assert!(with_mm.has_mm_inputs());
+
+        let text_only = ProtoGenerateRequest::Vllm(Box::default());
+        assert!(!text_only.has_mm_inputs());
     }
 
     #[test]
