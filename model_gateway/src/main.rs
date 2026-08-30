@@ -1651,6 +1651,8 @@ impl CliArgs {
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                 worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+                kv_connector_annotation: "smg.ai/kv-connector".to_string(),
+                kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
                 router_selector: Self::parse_selector(&self.router_selector),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source: self.model_id_from.clone(),
@@ -1895,16 +1897,30 @@ impl CliArgs {
     fn to_server_config(&self, router_config: RouterConfig) -> ConfigResult<ServerConfig> {
         let service_discovery_config = if self.service_discovery {
             // Get router discovery config from router_config.discovery if available
-            let (router_selector, router_mesh_port_annotation) = router_config
+            let (
+                router_selector,
+                router_mesh_port_annotation,
+                kv_connector_annotation,
+                kv_engine_id_annotation,
+            ) = router_config
                 .discovery
                 .as_ref()
                 .map(|d| {
                     (
                         d.router_selector.clone(),
                         d.router_mesh_port_annotation.clone(),
+                        d.kv_connector_annotation.clone(),
+                        d.kv_engine_id_annotation.clone(),
                     )
                 })
-                .unwrap_or_else(|| (HashMap::new(), "sglang.ai/mesh-port".to_string()));
+                .unwrap_or_else(|| {
+                    (
+                        HashMap::new(),
+                        "sglang.ai/mesh-port".to_string(),
+                        "smg.ai/kv-connector".to_string(),
+                        "smg.ai/kv-engine-id".to_string(),
+                    )
+                });
 
             let model_id_source = self
                 .model_id_from
@@ -1936,6 +1952,8 @@ impl CliArgs {
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                 worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+                kv_connector_annotation,
+                kv_engine_id_annotation,
                 router_selector,
                 router_mesh_port_annotation,
                 model_id_source,

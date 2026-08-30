@@ -64,10 +64,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             labels.insert(key.clone(), value.clone());
         }
 
-        // Extract KV transfer config (dedicated metadata fields, not labels)
-        let kv_connector = labels.remove("kv_connector");
-        let kv_role = labels.remove("kv_role");
-        let kv_engine_id = labels.remove("kv_engine_id").filter(|s| !s.is_empty());
+        let (kv_connector, kv_role, kv_engine_id) = take_kv_transfer_metadata(config, &mut labels);
 
         let model_id = resolve_model_id(config, &labels);
         // ZMQ EngineCore does not report a served model name over the wire, so a
@@ -303,6 +300,29 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         false
     }
+}
+
+fn take_kv_transfer_metadata(
+    config: &WorkerSpec,
+    labels: &mut HashMap<String, String>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let connector_label = labels.remove("kv_connector");
+    let role = labels.remove("kv_role");
+    let engine_id_label = labels.remove("kv_engine_id");
+    (
+        config
+            .kv_connector
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or(connector_label),
+        role,
+        config
+            .kv_engine_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or(engine_id_label)
+            .filter(|s| !s.is_empty()),
+    )
 }
 
 /// Resolve the canonical model ID before aliases are applied.
@@ -741,6 +761,39 @@ fn validate_zmq_dp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dedicated_kv_metadata_wins_and_legacy_labels_are_removed() {
+        let mut spec = WorkerSpec::new("http://worker:8080");
+        spec.kv_connector = Some("NixlConnector".to_string());
+        spec.kv_engine_id = Some("engine-direct".to_string());
+        let mut labels = HashMap::from([
+            ("kv_connector".to_string(), "legacy".to_string()),
+            ("kv_role".to_string(), "kv_consumer".to_string()),
+            ("kv_engine_id".to_string(), "engine-legacy".to_string()),
+        ]);
+
+        let metadata = take_kv_transfer_metadata(&spec, &mut labels);
+        assert_eq!(
+            metadata,
+            (
+                Some("NixlConnector".to_string()),
+                Some("kv_consumer".to_string()),
+                Some("engine-direct".to_string()),
+            )
+        );
+        assert!(labels.is_empty());
+
+        spec.kv_connector = Some(String::new());
+        spec.kv_engine_id = Some(String::new());
+        labels.insert("kv_connector".to_string(), "legacy".to_string());
+        labels.insert("kv_engine_id".to_string(), "engine-legacy".to_string());
+        let metadata = take_kv_transfer_metadata(&spec, &mut labels);
+        assert_eq!(
+            (metadata.0.as_deref(), metadata.2.as_deref()),
+            (Some("legacy"), Some("engine-legacy"))
+        );
+    }
 
     #[test]
     fn dp_expansion_pins_only_multi_rank_widths() {

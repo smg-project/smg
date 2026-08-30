@@ -862,6 +862,10 @@ pub struct DiscoveryConfig {
     /// Absent on a pod = single worker at `port`.
     #[serde(default = "default_worker_ports_annotation")]
     pub worker_ports_annotation: String,
+    #[serde(default = "default_kv_connector_annotation")]
+    pub kv_connector_annotation: String,
+    #[serde(default = "default_kv_engine_id_annotation")]
+    pub kv_engine_id_annotation: String,
     /// Router node discovery for HA (Kubernetes label selector)
     #[serde(default)]
     pub router_selector: HashMap<String, String>,
@@ -881,6 +885,14 @@ fn default_worker_ports_annotation() -> String {
     "smg.ai/worker-ports".to_string()
 }
 
+fn default_kv_connector_annotation() -> String {
+    "smg.ai/kv-connector".to_string()
+}
+
+fn default_kv_engine_id_annotation() -> String {
+    "smg.ai/kv-engine-id".to_string()
+}
+
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
@@ -894,6 +906,8 @@ impl Default for DiscoveryConfig {
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
             worker_ports_annotation: default_worker_ports_annotation(),
+            kv_connector_annotation: default_kv_connector_annotation(),
+            kv_engine_id_annotation: default_kv_engine_id_annotation(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: default_router_mesh_port_annotation(),
             model_id_source: None,
@@ -1843,6 +1857,8 @@ mod tests {
         assert!(config.prefill_selector.is_empty());
         assert!(config.decode_selector.is_empty());
         assert_eq!(config.bootstrap_port_annotation, "sglang.ai/bootstrap-port");
+        assert_eq!(config.kv_connector_annotation, "smg.ai/kv-connector");
+        assert_eq!(config.kv_engine_id_annotation, "smg.ai/kv-engine-id");
     }
 
     #[test]
@@ -1862,6 +1878,8 @@ mod tests {
             decode_selector: selector.clone(),
             bootstrap_port_annotation: "custom.io/port".to_string(),
             worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+            kv_connector_annotation: "custom.io/kv-connector".to_string(),
+            kv_engine_id_annotation: "custom.io/kv-engine-id".to_string(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
@@ -2143,6 +2161,8 @@ mod tests {
                 decode_selector: selectors,
                 bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
                 worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+                kv_connector_annotation: "smg.ai/kv-connector".to_string(),
+                kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
                 router_selector: HashMap::new(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source: None,

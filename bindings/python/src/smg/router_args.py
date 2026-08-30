@@ -247,6 +247,8 @@ class RouterArgs:
     # Most bytes the router may buffer for a request it holds only to keep
     # it retryable; larger eligible requests stream and forfeit router retries
     max_buffered_request_bytes: int = 1048576
+    kv_connector_annotation: str = "smg.ai/kv-connector"
+    kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
 
     @staticmethod
     def add_cli_args(
@@ -1676,6 +1678,8 @@ class RouterArgs:
         # Mooncake-specific annotation
         args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
         args_dict["worker_ports_annotation"] = "smg.ai/worker-ports"
+        args_dict["kv_connector_annotation"] = "smg.ai/kv-connector"
+        args_dict["kv_engine_id_annotation"] = "smg.ai/kv-engine-id"
 
         # Parse control plane API keys
         args_dict["control_plane_api_keys"] = cls._parse_control_plane_api_keys(
