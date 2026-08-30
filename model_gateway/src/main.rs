@@ -583,6 +583,22 @@ struct CliArgs {
     #[arg(long, help_heading = "Service Discovery (Kubernetes)")]
     service_discovery_namespace: Option<String>,
 
+    /// Pod annotation containing the vLLM KV connector name
+    #[arg(
+        long,
+        default_value = "smg.ai/kv-connector",
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    kv_connector_annotation: String,
+
+    /// Pod annotation containing per-worker KV engine IDs
+    #[arg(
+        long,
+        default_value = "smg.ai/kv-engine-id",
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    kv_engine_id_annotation: String,
+
     /// Label selector for encode server pods in EPD mode
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
     encode_selector: Vec<String>,
@@ -1651,8 +1667,8 @@ impl CliArgs {
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                 worker_ports_annotation: "smg.ai/worker-ports".to_string(),
-                kv_connector_annotation: "smg.ai/kv-connector".to_string(),
-                kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
+                kv_connector_annotation: self.kv_connector_annotation.clone(),
+                kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
                 router_selector: Self::parse_selector(&self.router_selector),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source: self.model_id_from.clone(),
@@ -1917,8 +1933,8 @@ impl CliArgs {
                     (
                         HashMap::new(),
                         "sglang.ai/mesh-port".to_string(),
-                        "smg.ai/kv-connector".to_string(),
-                        "smg.ai/kv-engine-id".to_string(),
+                        self.kv_connector_annotation.clone(),
+                        self.kv_engine_id_annotation.clone(),
                     )
                 });
 
@@ -2360,6 +2376,35 @@ mod tests {
         .to_router_config(vec![], vec![])
         .unwrap();
         assert_eq!(format!("{canonical:?}"), format!("{aliased:?}"));
+    }
+
+    #[test]
+    fn kv_annotation_flags_flow_into_both_configs() {
+        let cli = cli_args_from(&[
+            "--service-discovery",
+            "--selector",
+            "app=worker",
+            "--kv-connector-annotation",
+            "example.com/connector",
+            "--kv-engine-id-annotation",
+            "example.com/engine-id",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let discovery = router.discovery.as_ref().unwrap();
+        assert_eq!(discovery.kv_connector_annotation, "example.com/connector");
+        assert_eq!(discovery.kv_engine_id_annotation, "example.com/engine-id");
+
+        let server = cli.to_server_config(router).unwrap();
+        let discovery = server.service_discovery_config.as_ref().unwrap();
+        assert_eq!(discovery.kv_connector_annotation, "example.com/connector");
+        assert_eq!(discovery.kv_engine_id_annotation, "example.com/engine-id");
+
+        let defaults = cli_args_from(&["--service-discovery", "--selector", "app=worker"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        let defaults = defaults.discovery.as_ref().unwrap();
+        assert_eq!(defaults.kv_connector_annotation, "smg.ai/kv-connector");
+        assert_eq!(defaults.kv_engine_id_annotation, "smg.ai/kv-engine-id");
     }
 
     /// `--worker-auto-recovery` defaults to the `--service-discovery`

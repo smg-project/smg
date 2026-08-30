@@ -932,6 +932,16 @@ class RouterArgs:
             ),
         )
         k8s_group.add_argument(
+            f"--{prefix}kv-connector-annotation",
+            type=str,
+            help="vLLM KV connector Pod annotation (default: smg.ai/kv-connector)",
+        )
+        k8s_group.add_argument(
+            f"--{prefix}kv-engine-id-annotation",
+            type=str,
+            help="Per-worker KV engine ID Pod annotation (default: smg.ai/kv-engine-id)",
+        )
+        k8s_group.add_argument(
             f"--{prefix}encode-selector",
             type=str,
             nargs="+",
@@ -1678,8 +1688,6 @@ class RouterArgs:
         # Mooncake-specific annotation
         args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
         args_dict["worker_ports_annotation"] = "smg.ai/worker-ports"
-        args_dict["kv_connector_annotation"] = "smg.ai/kv-connector"
-        args_dict["kv_engine_id_annotation"] = "smg.ai/kv-engine-id"
 
         # Parse control plane API keys
         args_dict["control_plane_api_keys"] = cls._parse_control_plane_api_keys(

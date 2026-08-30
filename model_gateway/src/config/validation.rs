@@ -849,6 +849,25 @@ impl ConfigValidator {
             });
         }
 
+        for (field, value) in [
+            (
+                "discovery.kv_connector_annotation",
+                &discovery.kv_connector_annotation,
+            ),
+            (
+                "discovery.kv_engine_id_annotation",
+                &discovery.kv_engine_id_annotation,
+            ),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: value.clone(),
+                    reason: "Annotation name must not be empty".to_string(),
+                });
+            }
+        }
+
         match mode {
             RoutingMode::Regular { .. } => {
                 if discovery.selector.is_empty() {
@@ -1511,6 +1530,23 @@ mod tests {
 
         // Should pass validation since service discovery is enabled
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_empty_kv_annotation_name() {
+        let mut config = regular_mode_config();
+        config.discovery = Some(DiscoveryConfig {
+            enabled: true,
+            selector: [("app".to_string(), "worker".to_string())].into(),
+            kv_connector_annotation: " ".to_string(),
+            ..Default::default()
+        });
+
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. })
+                if field == "discovery.kv_connector_annotation"
+        ));
     }
 
     #[test]
