@@ -1358,6 +1358,12 @@ impl ProtoGenerateRequest {
                                     flat_keys.insert(key.clone(), sizes_key.clone());
                                 }
                                 None => {
+                                    tracing::warn!(
+                                        grid_key = %key,
+                                        sizes_key = %sizes_key,
+                                        "dropping grid tensor from the PD decode leg: its \
+                                         sizes tensor is not inline"
+                                    );
                                     grid_tensors.remove(key);
                                 }
                             }

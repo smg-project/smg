@@ -199,6 +199,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 # remote KV: a local recompute would schedule the vision
                 # encoder with no pixels and crash the engine.
                 if not request.mm_inputs.HasField("pixel_values") and kv_transfer_params is None:
+                    logger.warning(
+                        "Request %s: pixel-less multimodal payload with no kv_transfer_params; "
+                        "rejecting (prefill worker did not hand off KV?)",
+                        request_id,
+                    )
                     raise ValueError(
                         "multimodal payload carries grid tensors but no pixel_values and "
                         "no kv_transfer_params; a pixel-less leg requires remote KV"
