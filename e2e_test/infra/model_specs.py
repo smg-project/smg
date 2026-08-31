@@ -162,6 +162,14 @@ MODEL_SPECS: dict[str, dict] = {
         "tp": 1,
         "features": ["chat", "streaming", "multimodal"],
     },
+    # Standard-RoPE vision model for the PD multimodal KV-isolation test:
+    # M-RoPE models (Qwen-VL) cannot decode on the tensor-stripped PD leg.
+    "microsoft/Phi-3.5-vision-instruct": {
+        "model": _resolve_model_path("microsoft/Phi-3.5-vision-instruct"),
+        "tp": 1,
+        "features": ["chat", "streaming", "multimodal"],
+        "vllm_args": ["--trust-remote-code"],
+    },
     # TokenSpeed EPD multimodal model. Qwen3.5-9B is a vision-language model
     # (hybrid Gated DeltaNet + sparse MoE); BF16 ~18GB fits one 80GB H100 at
     # tp=1, so every EPD topology (1e1p1d/1e2p1d/2e1p1d/1e1p2d) runs on the

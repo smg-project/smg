@@ -559,7 +559,8 @@ impl RequestExecutionStage {
         // reused ShmHandle would be unreadable. Same request_id on both legs
         // is load-bearing for NIXL P/D correlation on vLLM < 0.13. The
         // pixel-free leg is the clone, so pixel tensors are never duplicated
-        // and die with the prefill send.
+        // and die with the prefill send. Per-image mm hashes stay in the
+        // clone and become the decode leg's cache_salt.
         let mut decode_request = proto_request.clone_without_mm_pixels();
         // Sanitize prefill sampling (max_tokens=1, n=1), stream=false.
         let mut prefill_request = proto_request;
@@ -830,9 +831,60 @@ mod tests {
         assert!(original.mm_inputs.is_some(), "prefill leg keeps pixels");
         assert!(
             decode.mm_inputs.is_none(),
-            "decode leg never carries pixels"
+            "hash-less mm payload is dropped whole on the decode leg"
         );
         assert_eq!(decode.request_id, "pd-1");
+    }
+
+    #[test]
+    fn clone_without_mm_pixels_keeps_vllm_identity() {
+        // The decode leg drops the tensors but keeps the per-image identity —
+        // downstream it becomes the engine cache_salt.
+        let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: "pd-2".to_string(),
+            mm_inputs: Some(vllm::MultimodalInputs {
+                pixel_values: Some(vllm::TensorData::default()),
+                model_specific_tensors: std::collections::HashMap::from([(
+                    "image_grid_thw".to_string(),
+                    vllm::TensorData::default(),
+                )]),
+                im_token_id: Some(151_655),
+                mm_placeholders: vec![vllm::PlaceholderRange {
+                    offset: 3,
+                    length: 4,
+                }],
+                mm_hashes: vec!["h1".to_string()],
+                batched_keys: vec!["pixel_values".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        let clone = request.clone_without_mm_pixels();
+        let ProtoGenerateRequest::Vllm(original) = request else {
+            panic!("expected vLLM request");
+        };
+        let ProtoGenerateRequest::Vllm(decode) = clone else {
+            panic!("expected vLLM clone");
+        };
+        let original_mm = original.mm_inputs.expect("prefill leg keeps mm_inputs");
+        assert!(
+            original_mm.pixel_values.is_some(),
+            "prefill leg keeps pixels"
+        );
+        assert_eq!(original_mm.model_specific_tensors.len(), 1);
+        assert_eq!(original_mm.batched_keys, vec!["pixel_values".to_string()]);
+        let decode_mm = decode.mm_inputs.expect("decode leg keeps identity");
+        assert!(
+            decode_mm.pixel_values.is_none(),
+            "decode leg never carries pixels"
+        );
+        assert!(decode_mm.model_specific_tensors.is_empty());
+        assert!(decode_mm.batched_keys.is_empty());
+        assert!(decode_mm.flat_keys.is_empty());
+        assert!(decode_mm.keep_on_cpu_keys.is_empty());
+        assert_eq!(decode_mm.mm_hashes, vec!["h1".to_string()]);
+        assert_eq!(decode_mm.mm_placeholders.len(), 1);
+        assert_eq!(decode_mm.im_token_id, Some(151_655));
     }
 
     #[test]

@@ -45,6 +45,7 @@ from smg_grpc_servicer.vllm.kv_events import (
     stream_kv_events,
 )
 from smg_grpc_servicer.vllm.kv_transfer import params_from_request, params_to_response_fields
+from smg_grpc_servicer.vllm.mm_salt import mm_identity_cache_salt
 
 logger = init_logger(__name__)
 SAMPLING_DEFAULT_KEYS = (
@@ -201,6 +202,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 prompt: TokensPrompt = {"prompt_token_ids": list(request.tokenized.input_ids)}
                 if request.tokenized.original_text:
                     prompt["prompt"] = request.tokenized.original_text
+                # PD decode leg: tensors stripped, mm hashes kept — salt the
+                # block hashes per-image so different images cannot alias.
+                if request.HasField("mm_inputs") and not request.mm_inputs.HasField("pixel_values"):
+                    cache_salt = mm_identity_cache_salt(request.mm_inputs.mm_hashes)
+                    if cache_salt is not None:
+                        prompt["cache_salt"] = cache_salt
                 prompt = self.engine.renderer.process_for_engine(prompt, arrival_time=arrival_time)
             else:
                 prompt = request.text

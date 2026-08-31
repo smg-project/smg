@@ -1298,7 +1298,10 @@ impl ProtoGenerateRequest {
 
     /// Clone for a PD leg that carries no multimodal pixels (see
     /// `clear_mm_pixel_values`), without ever duplicating them: detach,
-    /// clone, reattach to `self`.
+    /// clone, reattach to `self`. vLLM keeps `mm_hashes`/placeholders in the
+    /// clone: the servicer folds them into the engine `cache_salt`, so
+    /// decode-side block hashes stay per-image and different images behind
+    /// the same text prefix cannot alias in the decode prefix cache.
     pub fn clone_without_mm_pixels(&mut self) -> Self {
         match self {
             Self::Sglang(req) => {
@@ -1309,7 +1312,20 @@ impl ProtoGenerateRequest {
             }
             Self::Vllm(req) => {
                 let mm = req.mm_inputs.take();
-                let clone = Self::Vllm(req.clone());
+                let mut clone = Self::Vllm(req.clone());
+                // Rebuild the identity (no tensors or layout keys) on the
+                // clone; a hash-less payload carries no identity worth keeping.
+                if let (Self::Vllm(clone_req), Some(mm_ref)) = (&mut clone, mm.as_ref()) {
+                    if !mm_ref.mm_hashes.is_empty() {
+                        clone_req.mm_inputs = Some(vllm::MultimodalInputs {
+                            im_token_id: mm_ref.im_token_id,
+                            mm_placeholders: mm_ref.mm_placeholders.clone(),
+                            mm_hashes: mm_ref.mm_hashes.clone(),
+                            modality: mm_ref.modality,
+                            ..Default::default()
+                        });
+                    }
+                }
                 req.mm_inputs = mm;
                 clone
             }
