@@ -568,6 +568,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 return str(obj)
 
         serializable_args = make_serializable(server_args_dict)
+        # Decode constraints (json_schema/regex/ebnf) are enforced by the
+        # grammar backend from the first output token; `require_reasoning`
+        # does not delay grammar activation in gRPC mode. Declared so the
+        # router knows constrained completions cannot contain reasoning.
+        serializable_args["constrained_decoding_mode"] = "from_first_token"
         server_args_struct.update(serializable_args)
 
         # Convert scheduler_info to Struct
