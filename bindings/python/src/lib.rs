@@ -662,11 +662,9 @@ impl Router {
             })
         };
 
-        let mode = if self.enable_igw {
-            RoutingMode::Regular {
-                worker_urls: vec![],
-            }
-        } else if matches!(self.backend, BackendType::Openai) {
+        // IGW does not override backend or disaggregated modes; IGW-only keeps
+        // the Python binding's existing empty startup-worker behavior.
+        let mode = if matches!(self.backend, BackendType::Openai) {
             RoutingMode::OpenAI {
                 worker_urls: self.worker_urls.clone(),
             }
@@ -712,7 +710,11 @@ impl Router {
             }
         } else {
             RoutingMode::Regular {
-                worker_urls: self.worker_urls.clone(),
+                worker_urls: if self.enable_igw {
+                    vec![]
+                } else {
+                    self.worker_urls.clone()
+                },
             }
         };
 
