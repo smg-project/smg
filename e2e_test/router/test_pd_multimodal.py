@@ -44,36 +44,45 @@ _DOG_IMAGE = _fixture_image_data_url("dog.jpg")  # black lab, no blanket -> "no"
 _PUG_IMAGE = _fixture_image_data_url("pug.jpg")  # pug in a blanket -> "yes"
 
 
+def _blanket_messages(image_url: str) -> list[dict]:
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _PROMPT},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        }
+    ]
+
+
+def _first_word(answer: str | None) -> str:
+    words = (answer or "").lower().split()
+    return words[0].strip(".,!?\"'") if words else ""
+
+
 def _ask_blanket(client, model: str, image_url: str) -> str:
     response = client.chat.completions.create(
         model=model,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _PROMPT},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ],
-            }
-        ],
+        messages=_blanket_messages(image_url),
         temperature=0,
         max_tokens=16,
     )
-    return (response.choices[0].message.content or "").lower()
+    return _first_word(response.choices[0].message.content)
 
 
 def _assert_no_cross_image_aliasing(client, model: str) -> None:
     # Seed the decode worker's prefix cache with the blanket-less dog's KV.
     first = _ask_blanket(client, model, _DOG_IMAGE)
     logger.info("PD multimodal seed answer (dog, no blanket): %s", first)
-    assert "no" in first, f"Expected 'no' for the seed image, got: {first}"
+    assert first == "no", f"Expected 'no' for the seed image, got: {first}"
 
     # Same text prefix, same-resolution image, different pixels. Without
     # per-image decode-side block hashes this aliases onto the seed
     # request's cached KV and answers 'no'.
     second = _ask_blanket(client, model, _PUG_IMAGE)
     logger.info("PD multimodal probe answer (pug in blanket): %s", second)
-    assert "yes" in second, (
+    assert second == "yes", (
         f"Expected 'yes', got: {second} — a 'no' answer means the decode "
         "worker served this request from the other image's KV "
         "(prefix-cache contamination across images)"
@@ -84,7 +93,7 @@ def _assert_no_cross_image_aliasing(client, model: str) -> None:
     # land on the right KV.
     third = _ask_blanket(client, model, _DOG_IMAGE)
     logger.info("PD multimodal reuse answer (dog, no blanket): %s", third)
-    assert "no" in third, f"Expected 'no' on same-image reuse, got: {third}"
+    assert third == "no", f"Expected 'no' on same-image reuse, got: {third}"
 
 
 @pytest.mark.engine("vllm")
@@ -116,3 +125,22 @@ class TestPDMultimodalMrope:
     def test_mrope_decode_answers_and_does_not_alias(self, setup_backend):
         backend, model, client, *_ = setup_backend
         _assert_no_cross_image_aliasing(client, model)
+
+    def test_parallel_sampling_keeps_vision_on_decode(self, setup_backend):
+        # n>1 skips the KV handoff, so the decode leg recomputes the prompt
+        # locally and must carry the full multimodal payload to run the
+        # vision encoder (a pixel-less leg would answer image-blind).
+        backend, model, client, *_ = setup_backend
+        response = client.chat.completions.create(
+            model=model,
+            messages=_blanket_messages(_PUG_IMAGE),
+            # Near-greedy: vLLM rejects n>1 with temperature=0.
+            temperature=0.1,
+            max_tokens=16,
+            n=2,
+        )
+        assert len(response.choices) == 2
+        for choice in response.choices:
+            answer = _first_word(choice.message.content)
+            logger.info("PD multimodal n=2 answer (pug in blanket): %s", answer)
+            assert answer == "yes", f"Expected 'yes' from each sample, got: {answer}"

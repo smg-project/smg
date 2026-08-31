@@ -294,17 +294,19 @@ impl VllmMultimodalData {
             .model_specific_tensors
             .into_iter()
             .map(|(k, v)| {
+                // Grid tensors are a few ints and must survive the PD decode
+                // clone's inline-only retention: never route them via SHM.
+                let payload = if VLLM_MROPE_GRID_KEYS.contains(&k.as_str()) {
+                    vllm::tensor_data::Payload::Inline(v.data)
+                } else {
+                    vllm_tensor_payload(v.data, shm_enabled, shm_min_bytes, None)
+                };
                 (
                     k,
                     vllm::TensorData {
                         shape: v.shape,
                         dtype: v.dtype,
-                        payload: Some(vllm_tensor_payload(
-                            v.data,
-                            shm_enabled,
-                            shm_min_bytes,
-                            None,
-                        )),
+                        payload: Some(payload),
                     },
                 )
             })

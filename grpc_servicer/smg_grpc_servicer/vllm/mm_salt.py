@@ -1,6 +1,16 @@
-"""Multimodal identity cache salt for tensor-stripped (PD decode) legs."""
+"""Engine-free multimodal helpers for tensor-stripped (PD decode) legs."""
 
 from collections.abc import Sequence
+
+
+def has_preprocessed_mm_payload(mm_inputs) -> bool:
+    """True when the payload carries tensors the preprocessed path can use.
+
+    A grid-only payload (model-specific tensors, no pixels) is the PD decode
+    leg's form; a bare identity payload (hashes only) is not preprocessable
+    and falls back to the cache-salt path.
+    """
+    return mm_inputs.HasField("pixel_values") or bool(mm_inputs.model_specific_tensors)
 
 
 def mm_identity_cache_salt(mm_hashes: Sequence[str]) -> str | None:

@@ -554,14 +554,22 @@ impl RequestExecutionStage {
             _ => None,
         };
 
-        // Decode reuses the request minus pixels: it receives KV via the P/D
-        // transfer, and prefill reads and unlinks any /dev/shm segments, so a
-        // reused ShmHandle would be unreadable. Same request_id on both legs
-        // is load-bearing for NIXL P/D correlation on vLLM < 0.13. The
-        // pixel-free leg is the clone, so pixel tensors are never duplicated
-        // and die with the prefill send. Per-image mm hashes stay in the
-        // clone and become the decode leg's cache_salt.
-        let mut decode_request = proto_request.clone_without_mm_pixels();
+        // Decode normally reuses the request minus pixels: it receives KV via
+        // the P/D transfer, and prefill reads and unlinks any /dev/shm
+        // segments, so a reused ShmHandle would be unreadable. Same request_id
+        // on both legs is load-bearing for NIXL P/D correlation on vLLM <
+        // 0.13. The pixel-free leg is the clone, so pixel tensors are never
+        // duplicated and die with the prefill send; the per-image mm identity
+        // and grid tensors survive for decode-side hashing and positions.
+        // Without a KV handoff (n>1) decode recomputes the prompt locally and
+        // must run the vision encoder, so that leg keeps the full multimodal
+        // payload (SHM-backed tensors cannot serve both legs and fail loudly
+        // on the decode read).
+        let mut decode_request = if relay_kv_params {
+            proto_request.clone_without_mm_pixels()
+        } else {
+            proto_request.clone()
+        };
         // Sanitize prefill sampling (max_tokens=1, n=1), stream=false.
         let mut prefill_request = proto_request;
         prefill_request.sanitize_sampling_for_prefill(1);
