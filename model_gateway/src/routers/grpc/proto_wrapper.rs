@@ -296,11 +296,8 @@ impl VllmMultimodalData {
             .map(|(k, v)| {
                 // Grid tensors are a few ints and must survive the PD decode
                 // clone's inline-only retention: never route them via SHM.
-                let payload = if VLLM_MROPE_GRID_KEYS.contains(&k.as_str()) {
-                    vllm::tensor_data::Payload::Inline(v.data)
-                } else {
-                    vllm_tensor_payload(v.data, shm_enabled, shm_min_bytes, None)
-                };
+                let via_shm = shm_enabled && !VLLM_MROPE_GRID_KEYS.contains(&k.as_str());
+                let payload = vllm_tensor_payload(v.data, via_shm, shm_min_bytes, None);
                 (
                     k,
                     vllm::TensorData {
@@ -1329,18 +1326,42 @@ impl ProtoGenerateRequest {
                         // compute decode-side positions; they are a few ints
                         // per item, so keep them (inline payloads only — an
                         // SHM segment is unreadable after the prefill send).
-                        let grid_tensors: HashMap<_, _> = mm_ref
-                            .model_specific_tensors
-                            .iter()
-                            .filter(|(key, tensor)| {
-                                VLLM_MROPE_GRID_KEYS.contains(&key.as_str())
-                                    && matches!(
+                        let inline_tensor = |key: &str| {
+                            mm_ref
+                                .model_specific_tensors
+                                .get(key)
+                                .filter(|tensor| {
+                                    matches!(
                                         tensor.payload,
                                         Some(vllm::tensor_data::Payload::Inline(_))
                                     )
-                            })
-                            .map(|(key, tensor)| (key.clone(), tensor.clone()))
-                            .collect();
+                                })
+                                .cloned()
+                        };
+                        let mut grid_tensors: HashMap<String, vllm::TensorData> =
+                            VLLM_MROPE_GRID_KEYS
+                                .iter()
+                                .filter_map(|key| {
+                                    inline_tensor(key).map(|tensor| (key.to_string(), tensor))
+                                })
+                                .collect();
+                        // A flat-classified grid key needs its sizes tensor to
+                        // keep per-item slicing on the decode leg.
+                        let mut flat_keys = HashMap::new();
+                        for (key, sizes_key) in &mm_ref.flat_keys {
+                            if !grid_tensors.contains_key(key) {
+                                continue;
+                            }
+                            match inline_tensor(sizes_key) {
+                                Some(sizes) => {
+                                    grid_tensors.insert(sizes_key.clone(), sizes);
+                                    flat_keys.insert(key.clone(), sizes_key.clone());
+                                }
+                                None => {
+                                    grid_tensors.remove(key);
+                                }
+                            }
+                        }
                         let retained = |keys: &[String]| {
                             keys.iter()
                                 .filter(|key| grid_tensors.contains_key(*key))
@@ -1354,6 +1375,7 @@ impl ProtoGenerateRequest {
                             modality: mm_ref.modality,
                             batched_keys: retained(&mm_ref.batched_keys),
                             keep_on_cpu_keys: retained(&mm_ref.keep_on_cpu_keys),
+                            flat_keys,
                             model_specific_tensors: grid_tensors,
                             ..Default::default()
                         });

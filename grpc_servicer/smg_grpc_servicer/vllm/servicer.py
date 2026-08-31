@@ -195,6 +195,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             kv_transfer_params = params_from_request(request)
 
             if has_preprocessed_mm and input_type == "tokenized":
+                # A pixel-less payload (PD decode leg) is only decodable with
+                # remote KV: a local recompute would schedule the vision
+                # encoder with no pixels and crash the engine.
+                if not request.mm_inputs.HasField("pixel_values") and kv_transfer_params is None:
+                    raise ValueError(
+                        "multimodal payload carries grid tensors but no pixel_values and "
+                        "no kv_transfer_params; a pixel-less leg requires remote KV"
+                    )
                 # Preprocessed multimodal from Rust router.
                 # Token IDs already have expanded placeholders; tensors are
                 # ready for the model. Bypass the renderer entirely.

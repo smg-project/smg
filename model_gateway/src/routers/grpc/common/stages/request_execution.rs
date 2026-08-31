@@ -861,8 +861,15 @@ mod tests {
                     ("image_grid_thw".to_string(), grid.clone()),
                     // Payload-less grids and non-grid tensors are dropped.
                     ("video_grid_thw".to_string(), vllm::TensorData::default()),
-                    ("aspect_ratios".to_string(), grid),
+                    ("aspect_ratios".to_string(), grid.clone()),
+                    // Flat-classified grid keys keep their sizes tensor.
+                    ("second_per_grid_ts".to_string(), grid.clone()),
+                    ("ts_sizes".to_string(), grid),
                 ]),
+                flat_keys: std::collections::HashMap::from([(
+                    "second_per_grid_ts".to_string(),
+                    "ts_sizes".to_string(),
+                )]),
                 im_token_id: Some(151_655),
                 mm_placeholders: vec![vllm::PlaceholderRange {
                     offset: 3,
@@ -891,23 +898,31 @@ mod tests {
             original_mm.pixel_values.is_some(),
             "prefill leg keeps pixels"
         );
-        assert_eq!(original_mm.model_specific_tensors.len(), 3);
+        assert_eq!(original_mm.model_specific_tensors.len(), 5);
         assert_eq!(original_mm.batched_keys.len(), 3);
         let decode_mm = decode.mm_inputs.expect("decode leg keeps identity");
         assert!(
             decode_mm.pixel_values.is_none(),
             "decode leg never carries pixels"
         );
+        let mut decode_keys: Vec<_> = decode_mm.model_specific_tensors.keys().collect();
+        decode_keys.sort();
         assert_eq!(
-            decode_mm.model_specific_tensors.keys().collect::<Vec<_>>(),
-            vec!["image_grid_thw"]
+            decode_keys,
+            vec!["image_grid_thw", "second_per_grid_ts", "ts_sizes"]
         );
         assert_eq!(decode_mm.batched_keys, vec!["image_grid_thw".to_string()]);
         assert_eq!(
             decode_mm.keep_on_cpu_keys,
             vec!["image_grid_thw".to_string()]
         );
-        assert!(decode_mm.flat_keys.is_empty());
+        assert_eq!(
+            decode_mm.flat_keys,
+            std::collections::HashMap::from([(
+                "second_per_grid_ts".to_string(),
+                "ts_sizes".to_string()
+            )])
+        );
         assert_eq!(decode_mm.mm_hashes, vec!["h1".to_string()]);
         assert_eq!(decode_mm.mm_placeholders.len(), 1);
         assert_eq!(decode_mm.im_token_id, Some(151_655));
