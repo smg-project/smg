@@ -7,8 +7,8 @@ use parking_lot::RwLock;
 use crate::{
     parsers::{
         BaseReasoningParser, CohereCmdParser, DeepSeekR1Parser, Glm45Parser, InklingParser,
-        KimiK3Parser, KimiParser, MiniMaxParser, NanoV3Parser, PassthroughParser, Qwen3Parser,
-        QwenThinkingParser, Step3Parser,
+        KimiK2Parser, KimiK3Parser, KimiParser, MiniMaxParser, NanoV3Parser, PassthroughParser,
+        Qwen3Parser, QwenThinkingParser, Step3Parser,
     },
     traits::{ParserConfig, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE},
 };
@@ -192,6 +192,10 @@ impl ParserFactory {
             };
             Box::new(BaseReasoningParser::new(config).with_model_type("kimi_thinking".to_string()))
         });
+
+        // Unified K2-family parser (vLLM/SGLang `kimi_k2` semantics): starts in
+        // reasoning, ends on </think> or <|tool_calls_section_begin|> (#1873).
+        registry.register_parser("kimi_k2", || Box::new(KimiK2Parser::new()));
 
         // Kimi K3 XTML think channel (structural <|open|>/<|close|>/<|sep|> tokens).
         registry.register_parser("kimi_k3", || Box::new(KimiK3Parser::new()));
