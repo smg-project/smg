@@ -138,6 +138,23 @@ MODEL_SPECS: dict[str, dict] = {
             '{"enable_in_reasoning": true}',
         ],
     },
+    # Muse-Glimmer 30B — channel-segment format (to=self reasoning, to=<tool>
+    # ATEM calls). The only checkpoint the family publishes, so there is no
+    # smaller sibling to exercise the parsers with.
+    "meta-models/Muse-Glimmer-30B": {
+        "model": _resolve_model_path("meta-models/Muse-Glimmer-30B"),
+        # 30B BF16 weights are ~60GB, which leaves too little of one H100 for
+        # the KV cache; two GPUs mirrors the 27B precedent above.
+        "tp": 2,
+        "features": ["chat", "streaming", "function_calling", "reasoning"],
+        # Short context keeps startup quick — these tests exercise parsing, not
+        # long-context behaviour.
+        "sglang_args": ["--context-length=16384"],
+        "startup_timeout": 900,
+        # ~60GB: never pull it in the tier-wide pre-download. The one lane that
+        # runs it fetches it by id via `extra_models`.
+        "skip_tier_download": True,
+    },
     "openai/gpt-oss-120b": {
         "model": _resolve_model_path("openai/gpt-oss-120b"),
         "tp": 4,

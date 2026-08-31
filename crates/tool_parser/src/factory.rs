@@ -11,8 +11,8 @@ use crate::{
     parsers::{
         CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser, Glm4MoeParser,
         InklingParser, JsonParser, KimiK2Parser, KimiK3Parser, LlamaParser, MinimaxM2Parser,
-        MistralParser, PassthroughParser, PythonicParser, QwenParser, QwenXmlParser,
-        SarashinaParser, Step3Parser,
+        MistralParser, MuseGlimmerParser, PassthroughParser, PythonicParser, QwenParser,
+        QwenXmlParser, SarashinaParser, Step3Parser,
     },
     traits::ToolParser,
 };
@@ -346,6 +346,9 @@ impl ParserFactory {
             || Box::new(InklingParser::new()),
             InklingParser::build_structural_tag,
         );
+        // Muse-Glimmer ATEM calls ride channel-scoped segments; see the parser
+        // for why a structural-tag builder is deliberately not registered yet.
+        registry.register_parser("muse_glimmer", || Box::new(MuseGlimmerParser::new()));
         registry.register_parser("minimax_m2", || Box::new(MinimaxM2Parser::new()));
         registry.register_parser("cohere", || Box::new(CohereParser::new()));
 
@@ -454,6 +457,14 @@ impl ParserFactory {
         // Inkling models use TML JSON tool calls.
         registry.map_model("inkling*", "inkling");
         registry.map_model("Inkling*", "inkling");
+
+        // Muse-Glimmer models emit ATEM tool calls inside channel segments.
+        // Matching is case-insensitive substring, so these also cover
+        // org-namespaced ids such as `meta-models/Muse-Glimmer-30B`; a leading
+        // `*/` glob would be dead, since the resolver only strips a trailing
+        // `*` and no model id contains a literal `*/`.
+        registry.map_model("muse-glimmer*", "muse_glimmer");
+        registry.map_model("muse_glimmer*", "muse_glimmer");
 
         // MiniMax models
         registry.map_model("minimax*", "minimax_m2");

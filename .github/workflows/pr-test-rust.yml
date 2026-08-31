@@ -851,13 +851,18 @@ jobs:
       matrix:
         include:
           - engine: sglang
-            timeout: 30
+            # Muse-Glimmer support landed in SGLang 0.5.18, so only this leg
+            # runs those tests — and only this leg pays the ~60GB fetch.
+            timeout: 60
+            extra_models: "meta-models/Muse-Glimmer-30B"
             min_selected: 32 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
             timeout: 30
+            extra_models: ""
             min_selected: 32 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: trtllm
             timeout: 45
+            extra_models: ""
             min_selected: 24 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
@@ -866,6 +871,7 @@ jobs:
       runner: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
       timeout: ${{ matrix.timeout }}
       test_dirs: e2e_test/chat_completions
+      extra_models: ${{ matrix.extra_models }}
       min_selected: ${{ matrix.min_selected }}
     secrets: inherit
 
