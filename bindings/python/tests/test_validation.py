@@ -335,7 +335,10 @@ class TestConfigurationValidation:
 
         # Empty selectors fail native validation before server startup; the
         # mode-specific error proves IGW did not replace PD or EPD with Regular.
-        with pytest.raises(ValueError, match=f"{expected_mode} with service discovery"):
+        with pytest.raises(
+            ValueError,
+            match=rf"^Configuration error: Validation failed: {expected_mode} with service discovery",
+        ):
             Router.from_args(args).start()
 
     def test_policy_validation(self):
