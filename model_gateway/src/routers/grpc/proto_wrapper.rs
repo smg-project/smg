@@ -1115,6 +1115,10 @@ pub enum ProtoGenerateRequest {
     TokenSpeed(Box<tokenspeed::GenerateRequest>),
 }
 
+/// Per-item grid metadata the engine reads to compute M-RoPE positions
+/// (`_get_mrope_input_positions` in vLLM); a few ints per item.
+const VLLM_MROPE_GRID_KEYS: [&str; 3] = ["image_grid_thw", "video_grid_thw", "second_per_grid_ts"];
+
 impl ProtoGenerateRequest {
     /// Append stop token ids to the request's sampling params (TRT-LLM keeps
     /// them on the request itself). Requests without sampling params are left
@@ -1298,10 +1302,12 @@ impl ProtoGenerateRequest {
 
     /// Clone for a PD leg that carries no multimodal pixels (see
     /// `clear_mm_pixel_values`), without ever duplicating them: detach,
-    /// clone, reattach to `self`. vLLM keeps `mm_hashes`/placeholders in the
-    /// clone: the servicer folds them into the engine `cache_salt`, so
-    /// decode-side block hashes stay per-image and different images behind
-    /// the same text prefix cannot alias in the decode prefix cache.
+    /// clone, reattach to `self`. vLLM keeps `mm_hashes`/placeholders and the
+    /// M-RoPE grid tensors in the clone: the servicer rebuilds pixel-less
+    /// mm features from them, so the decode worker computes grid-aware
+    /// positions and per-image block hashes instead of treating the prompt
+    /// as text (which mis-rotates every generated token on Qwen-VL models
+    /// and lets different images alias in the decode prefix cache).
     pub fn clone_without_mm_pixels(&mut self) -> Self {
         match self {
             Self::Sglang(req) => {
@@ -1313,15 +1319,40 @@ impl ProtoGenerateRequest {
             Self::Vllm(req) => {
                 let mm = req.mm_inputs.take();
                 let mut clone = Self::Vllm(req.clone());
-                // Rebuild the identity (no tensors or layout keys) on the
-                // clone; a hash-less payload carries no identity worth keeping.
+                // Rebuild the identity (no pixel tensors) on the clone; a
+                // hash-less payload carries no identity worth keeping.
                 if let (Self::Vllm(clone_req), Some(mm_ref)) = (&mut clone, mm.as_ref()) {
                     if !mm_ref.mm_hashes.is_empty() {
+                        // M-RoPE models (Qwen-VL) need the grid tensors to
+                        // compute decode-side positions; they are a few ints
+                        // per item, so keep them (inline payloads only — an
+                        // SHM segment is unreadable after the prefill send).
+                        let grid_tensors: HashMap<_, _> = mm_ref
+                            .model_specific_tensors
+                            .iter()
+                            .filter(|(key, tensor)| {
+                                VLLM_MROPE_GRID_KEYS.contains(&key.as_str())
+                                    && matches!(
+                                        tensor.payload,
+                                        Some(vllm::tensor_data::Payload::Inline(_))
+                                    )
+                            })
+                            .map(|(key, tensor)| (key.clone(), tensor.clone()))
+                            .collect();
+                        let retained = |keys: &[String]| {
+                            keys.iter()
+                                .filter(|key| grid_tensors.contains_key(*key))
+                                .cloned()
+                                .collect()
+                        };
                         clone_req.mm_inputs = Some(vllm::MultimodalInputs {
                             im_token_id: mm_ref.im_token_id,
                             mm_placeholders: mm_ref.mm_placeholders.clone(),
                             mm_hashes: mm_ref.mm_hashes.clone(),
                             modality: mm_ref.modality,
+                            batched_keys: retained(&mm_ref.batched_keys),
+                            keep_on_cpu_keys: retained(&mm_ref.keep_on_cpu_keys),
+                            model_specific_tensors: grid_tensors,
                             ..Default::default()
                         });
                     }

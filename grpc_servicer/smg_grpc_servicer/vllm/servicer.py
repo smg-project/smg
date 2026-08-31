@@ -174,8 +174,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         """
         request_id = request.request_id
         input_type = request.WhichOneof("input")
-        has_preprocessed_mm = request.HasField("mm_inputs") and request.mm_inputs.HasField(
-            "pixel_values"
+        # A tensor-less mm payload with grid tensors is the PD decode leg's
+        # form: enough to rebuild mm features (positions + block hashing).
+        has_preprocessed_mm = request.HasField("mm_inputs") and (
+            request.mm_inputs.HasField("pixel_values")
+            or bool(request.mm_inputs.model_specific_tensors)
         )
         logger.info(
             "Generate request %s: input_type=%s, stream=%s, preprocessed_mm=%s, dp_rank=%s",
@@ -202,8 +205,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 prompt: TokensPrompt = {"prompt_token_ids": list(request.tokenized.input_ids)}
                 if request.tokenized.original_text:
                     prompt["prompt"] = request.tokenized.original_text
-                # PD decode leg: tensors stripped, mm hashes kept — salt the
-                # block hashes per-image so different images cannot alias.
+                # Grid-less PD decode leg: fold the kept mm hashes into
+                # cache_salt so different images cannot alias. (Grid-carrying
+                # legs take the preprocessed path above instead.)
                 if request.HasField("mm_inputs") and not request.mm_inputs.HasField("pixel_values"):
                     cache_salt = mm_identity_cache_salt(request.mm_inputs.mm_hashes)
                     if cache_salt is not None:
@@ -635,10 +639,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 return "pixel_values_videos"
             return key
 
-        # Deserialize all tensors from proto
-        hf_dict: dict[str, torch.Tensor] = {
-            mm_key("pixel_values"): _tensor_from_proto(mm_proto.pixel_values),
-        }
+        # Deserialize all tensors from proto. The PD decode leg carries no
+        # pixel_values (KV arrives via the P/D transfer), only grid tensors.
+        hf_dict: dict[str, torch.Tensor] = {}
+        if mm_proto.HasField("pixel_values"):
+            hf_dict[mm_key("pixel_values")] = _tensor_from_proto(mm_proto.pixel_values)
         for key, td in mm_proto.model_specific_tensors.items():
             hf_dict[mm_key(key)] = _tensor_from_proto(td)
 
