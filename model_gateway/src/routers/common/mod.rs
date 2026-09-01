@@ -41,6 +41,7 @@ pub mod realtime;
 pub mod request_lease;
 pub mod retry;
 pub mod sse;
+pub(crate) mod sse_rechunk;
 pub mod worker_selection;
 
 /// Threshold above which upstream request bodies are sent as one-shot
