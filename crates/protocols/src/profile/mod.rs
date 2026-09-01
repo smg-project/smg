@@ -59,13 +59,18 @@ impl ProviderProfile {
         ProviderProfile::OpenAi
     }
 
-    /// Shape the request for dispatch under this profile: every message drops
-    /// the extension struct that belongs to another provider, so a foreign
-    /// field never reaches a backend or a chat template. Runs before
-    /// validation and template rendering on every entry point. Only
-    /// message-level extension structs are covered; see the module docs.
-    /// Dropped extensions are logged once per request.
+    /// Shape the request for dispatch under this profile: the provider's own
+    /// normalization first (MiniMax folds a root message into a leading
+    /// system message), then every message drops the extension struct that
+    /// belongs to another provider, so a foreign field never reaches a
+    /// backend or a chat template. Runs before validation and template
+    /// rendering on every entry point. Only message-level extension structs
+    /// are covered; see the module docs. Dropped extensions are logged once
+    /// per request.
     pub fn normalize_chat(self, req: &mut ChatCompletionRequest) {
+        if self == ProviderProfile::Minimax {
+            minimax::normalize_chat(req);
+        }
         let mut dropped: Vec<&'static str> = Vec::new();
         for message in &mut req.messages {
             let role = match message {
@@ -73,7 +78,9 @@ impl ProviderProfile {
                 ChatMessage::User { ext, .. } => retain_if(ext, self).then_some("user"),
                 ChatMessage::Assistant { ext, .. } => retain_if(ext, self).then_some("assistant"),
                 ChatMessage::Developer { ext, .. } => retain_if(ext, self).then_some("developer"),
-                ChatMessage::Tool { .. } | ChatMessage::Function { .. } => None,
+                ChatMessage::Tool { .. }
+                | ChatMessage::Function { .. }
+                | ChatMessage::Root { .. } => None,
             };
             dropped.extend(role);
         }
@@ -101,9 +108,12 @@ impl ProviderProfile {
         req: &ChatCompletionRequest,
     ) -> Result<(), validator::ValidationError> {
         match self {
-            ProviderProfile::Kimi => kimi::validate_chat(req),
+            ProviderProfile::Kimi => {
+                reject_root(req)?;
+                kimi::validate_chat(req)
+            }
             ProviderProfile::Minimax => minimax::validate_chat(req),
-            ProviderProfile::OpenAi => Ok(()),
+            ProviderProfile::OpenAi => reject_root(req),
         }
     }
 }
@@ -112,6 +122,21 @@ impl ProviderProfile {
 fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
     s.get(..prefix.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// The `root` role is a MiniMax-only extension; other dialects reject it the
+/// way their reference APIs do.
+fn reject_root(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
+    if req
+        .messages
+        .iter()
+        .any(|m| matches!(m, ChatMessage::Root { .. }))
+    {
+        let mut e = validator::ValidationError::new("invalid_role");
+        e.message = Some("invalid role: root".into());
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
