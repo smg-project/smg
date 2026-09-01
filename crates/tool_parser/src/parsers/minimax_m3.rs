@@ -78,6 +78,18 @@ impl MinimaxM3Parser {
     /// Parse a leaf value from text, coercing by declared schema type when known,
     /// otherwise inferring the JSON type (number/bool/null) and defaulting to string.
     fn coerce_leaf(text: &str, declared_type: Option<&str>) -> Value {
+        // An empty container renders as an element with no children and no
+        // text, which reaches the leaf path indistinguishable from an empty
+        // string. `coerce_by_schema_type` cannot parse "" as JSON, so without
+        // this the value would be inferred as `""` and fail the tool's schema.
+        if text.trim().is_empty() {
+            match declared_type {
+                Some("array") => return Value::Array(Vec::new()),
+                Some("object") => return Value::Object(Map::new()),
+                _ => {}
+            }
+        }
+
         if let Some(value) = helpers::coerce_by_schema_type(text, declared_type) {
             return value;
         }

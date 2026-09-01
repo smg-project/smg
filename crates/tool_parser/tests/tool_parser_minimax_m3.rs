@@ -809,3 +809,122 @@ async fn test_m3_streaming_incomplete_tool_call_emits_nothing() {
         "tool-call markup must not leak into normal text"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Empty containers
+//
+// The template renders an empty sequence or mapping as an element with no
+// children and no text, which is indistinguishable at the leaf from an empty
+// string. Without the declared type it infers as `""` and fails the tool's
+// schema — observed against MiniMax's Provider-Verifier as
+// "'' is not of type 'array'" on a declared `array` parameter.
+// ---------------------------------------------------------------------------
+
+fn container_tools() -> Vec<Tool> {
+    vec![Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "plan_route".to_string(),
+            description: None,
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "avoid_aisles": {"type": "array", "items": {"type": "string"}},
+                    "options":      {"type": "object"},
+                    "note":         {"type": "string"}
+                }
+            }),
+            strict: None,
+        },
+    }]
+}
+
+#[tokio::test]
+async fn test_empty_leaf_under_array_schema_is_empty_array() {
+    let parser = MinimaxM3Parser::new();
+    let tools = container_tools();
+    let text = tool_block(&[("plan_route", element("avoid_aisles", ""))]);
+
+    let (_, calls) = parser
+        .parse_complete_with_tools(&text, &tools)
+        .await
+        .unwrap();
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+
+    assert_eq!(args["avoid_aisles"], json!([]));
+}
+
+#[tokio::test]
+async fn test_empty_leaf_under_object_schema_is_empty_object() {
+    let parser = MinimaxM3Parser::new();
+    let tools = container_tools();
+    let text = tool_block(&[("plan_route", element("options", ""))]);
+
+    let (_, calls) = parser
+        .parse_complete_with_tools(&text, &tools)
+        .await
+        .unwrap();
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+
+    assert_eq!(args["options"], json!({}));
+}
+
+#[tokio::test]
+async fn test_whitespace_only_leaf_under_array_schema_is_empty_array() {
+    let parser = MinimaxM3Parser::new();
+    let tools = container_tools();
+    let text = tool_block(&[("plan_route", element("avoid_aisles", "\n  "))]);
+
+    let (_, calls) = parser
+        .parse_complete_with_tools(&text, &tools)
+        .await
+        .unwrap();
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+
+    assert_eq!(args["avoid_aisles"], json!([]));
+}
+
+#[tokio::test]
+async fn test_empty_leaf_under_string_schema_stays_empty_string() {
+    let parser = MinimaxM3Parser::new();
+    let tools = container_tools();
+    let text = tool_block(&[("plan_route", element("note", ""))]);
+
+    let (_, calls) = parser
+        .parse_complete_with_tools(&text, &tools)
+        .await
+        .unwrap();
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+
+    // Only container types collapse; a declared string keeps the empty string.
+    assert_eq!(args["note"], json!(""));
+}
+
+#[tokio::test]
+async fn test_empty_leaf_without_schema_is_unchanged() {
+    let parser = MinimaxM3Parser::new();
+    let text = tool_block(&[("plan_route", element("avoid_aisles", ""))]);
+
+    // With no tool schema there is nothing to say the value is a container,
+    // so the previous inference behaviour is preserved.
+    let (_, calls) = parser.parse_complete(&text).await.unwrap();
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+
+    assert_eq!(args["avoid_aisles"], json!(""));
+}
+
+#[tokio::test]
+async fn test_populated_array_still_parses_after_empty_container_fix() {
+    let parser = MinimaxM3Parser::new();
+    let tools = container_tools();
+    let items = format!("{}{}", element("item", "dairy"), element("item", "frozen"));
+    let text = tool_block(&[("plan_route", element("avoid_aisles", &items))]);
+
+    let (_, calls) = parser
+        .parse_complete_with_tools(&text, &tools)
+        .await
+        .unwrap();
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+
+    assert_eq!(args["avoid_aisles"], json!(["dairy", "frozen"]));
+}
