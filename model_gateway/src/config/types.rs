@@ -147,6 +147,10 @@ pub struct RouterConfig {
     /// to `SMG_MM_SHM_MIN_BYTES`, then 64 KiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_shm_min_bytes: Option<usize>,
+    /// Per-request image-count limit applied to every model, replacing each
+    /// spec's built-in limit; beats `SMG_IMAGE_MAX_COUNT`. Unset keeps spec limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_per_request_image_limit: Option<usize>,
     pub dp_aware: bool,
     #[serde(default)]
     pub dp_minimum_tokens_scheduler: bool,
@@ -1094,6 +1098,7 @@ impl Default for RouterConfig {
             engine_metrics: false,
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,
+            mm_per_request_image_limit: None,
             dp_aware: false,
             dp_minimum_tokens_scheduler: false,
             api_key: None,

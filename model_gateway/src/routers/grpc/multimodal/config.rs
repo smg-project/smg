@@ -1,12 +1,12 @@
 //! Multimodal model configuration: the shared config-file registry and the
 //! per-router component bundle (media connector + processor/model registries).
 
-use std::{path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use llm_multimodal::{
-    MediaConnector, MediaConnectorConfig, ModelRegistry, PreProcessorConfig,
+    MediaConnector, MediaConnectorConfig, Modality, ModelRegistry, PreProcessorConfig,
     VisionProcessorRegistry,
 };
 use tracing::{debug, warn};
@@ -241,12 +241,17 @@ pub(crate) struct MultimodalComponents {
     pub config_registry: Arc<MultimodalConfigRegistry>,
     /// Optional host-DRAM cache of preprocessed per-image encoder inputs.
     pub pixel_cache: Option<Arc<PixelCache>>,
+    /// Router-configured per-modality media-count limits replacing spec limits.
+    pub modality_limit_overrides: HashMap<Modality, usize>,
 }
 
 impl MultimodalComponents {
     /// Create multimodal components with default registries and a reference
     /// to the shared `MultimodalConfigRegistry` owned by `AppContext`.
-    pub fn new(config_registry: Arc<MultimodalConfigRegistry>) -> Result<Self> {
+    pub fn new(
+        config_registry: Arc<MultimodalConfigRegistry>,
+        image_limit_override: Option<usize>,
+    ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -260,6 +265,9 @@ impl MultimodalComponents {
             model_registry: Arc::new(ModelRegistry::default()),
             config_registry,
             pixel_cache: pixel_cache_from_env(),
+            modality_limit_overrides: image_limit_override
+                .map(|limit| HashMap::from([(Modality::Image, limit)]))
+                .unwrap_or_default(),
         })
     }
 }

@@ -337,7 +337,10 @@ impl GrpcRouter {
         let policy_registry = ctx.policy_registry.clone();
 
         // Create multimodal components (best-effort; non-fatal if initialization fails)
-        let multimodal = match MultimodalComponents::new(ctx.multimodal_config_registry.clone()) {
+        let multimodal = match MultimodalComponents::new(
+            ctx.multimodal_config_registry.clone(),
+            ctx.router_config.mm_per_request_image_limit,
+        ) {
             Ok(mc) => Some(Arc::new(mc)),
             Err(e) => {
                 tracing::warn!("Multimodal components initialization failed (non-fatal): {e}");

@@ -732,6 +732,14 @@ impl ConfigValidator {
             });
         }
 
+        if config.mm_per_request_image_limit == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "mm_per_request_image_limit".to_string(),
+                value: "0".to_string(),
+                reason: "Must be at least 1".to_string(),
+            });
+        }
+
         // A zero-capacity job channel panics at construction and a
         // zero-permit dispatcher never dequeues; reject both here so a
         // config-file value fails as early as the CLI parsers do.
@@ -1211,6 +1219,24 @@ mod tests {
             ConfigValidator::validate(&config),
             Err(ConfigError::InvalidValue { ref field, .. }) if field == "cache_boundaries"
         ));
+    }
+
+    #[test]
+    fn zero_mm_per_request_image_limit_is_rejected() {
+        let config = RouterConfig {
+            mm_per_request_image_limit: Some(0),
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "mm_per_request_image_limit"
+        ));
+
+        let config = RouterConfig {
+            mm_per_request_image_limit: Some(128),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]

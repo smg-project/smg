@@ -557,6 +557,11 @@ struct CliArgs {
     #[arg(long, help_heading = "Multimodal")]
     multimodal_shm_min_bytes: Option<usize>,
 
+    /// Per-request image-count limit applied to every model, replacing each
+    /// spec's built-in limit (e.g. to match the engine's `--limit-mm-per-prompt`).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Multimodal")]
+    mm_per_request_image_limit: Option<u64>,
+
     // ==================== Service Discovery (Kubernetes) ====================
     /// Enable Kubernetes service discovery
     #[arg(
@@ -1816,6 +1821,7 @@ impl CliArgs {
             .engine_metrics(self.engine_metrics)
             .multimodal_tensor_transport(self.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
+            .mm_per_request_image_limit(self.mm_per_request_image_limit.map(|v| v as usize))
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -2689,6 +2695,8 @@ mod tests {
             "shm",
             "--multimodal-shm-min-bytes",
             "1024",
+            "--mm-per-request-image-limit",
+            "128",
         ]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
@@ -2698,6 +2706,7 @@ mod tests {
             "transport mode must reach RouterConfig via to_router_config"
         );
         assert_eq!(router_config.multimodal_shm_min_bytes, Some(1024));
+        assert_eq!(router_config.mm_per_request_image_limit, Some(128));
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(
@@ -2709,6 +2718,13 @@ mod tests {
             server_config.router_config.multimodal_shm_min_bytes,
             Some(1024)
         );
+        assert_eq!(
+            server_config.router_config.mm_per_request_image_limit,
+            Some(128)
+        );
+
+        // clap rejects a zero limit outright.
+        assert!(Cli::try_parse_from(["smg", "--mm-per-request-image-limit", "0"]).is_err());
     }
 
     /// Default is off: the flag stays false through both conversions so

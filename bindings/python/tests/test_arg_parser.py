@@ -539,6 +539,14 @@ class TestParseRouterArgs:
         assert router_args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert router_args.policy == "round_robin"
 
+    def test_parse_mm_per_request_image_limit(self):
+        """Deployment-wide image-count limit; unset keeps model spec limits."""
+        router_args = parse_router_args(["--mm-per-request-image-limit", "128"])
+        assert router_args.mm_per_request_image_limit == 128
+
+        defaults = parse_router_args([])
+        assert defaults.mm_per_request_image_limit is None
+
     def test_parse_routing_key_headers(self):
         """Ordered list flag; unset keeps the x-smg-routing-key default."""
         router_args = parse_router_args(
@@ -1431,6 +1439,7 @@ class TestRouterArgsFieldOrder:
         "max_buffered_request_bytes",
         "kv_connector_annotation",
         "kv_engine_id_annotation",
+        "mm_per_request_image_limit",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

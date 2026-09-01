@@ -249,6 +249,8 @@ class RouterArgs:
     max_buffered_request_bytes: int = 1048576
     kv_connector_annotation: str = "smg.ai/kv-connector"
     kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
+    # Per-request image-count limit replacing model spec limits; None keeps spec limits
+    mm_per_request_image_limit: int | None = None
 
     @staticmethod
     def add_cli_args(
@@ -878,6 +880,16 @@ class RouterArgs:
             type=int,
             default=RouterArgs.multimodal_shm_min_bytes,
             help="Minimum multimodal tensor size (bytes) before the SHM transport is used",
+        )
+        parser.add_argument(
+            f"--{prefix}mm-per-request-image-limit",
+            type=int,
+            default=RouterArgs.mm_per_request_image_limit,
+            help=(
+                "Per-request image-count limit applied to every model, replacing the"
+                " model spec's built-in limit (e.g. to match the engine's"
+                " --limit-mm-per-prompt). Must be >= 1; unset keeps spec limits."
+            ),
         )
 
         # Logging configuration

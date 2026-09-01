@@ -310,6 +310,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Per-request image-count limit replacing each model spec's built-in limit.
+    pub fn mm_per_request_image_limit(mut self, limit: Option<usize>) -> Self {
+        self.config.mm_per_request_image_limit = limit;
+        self
+    }
+
     // ==================== Rate Limiting ====================
 
     pub fn max_concurrent_requests(mut self, max: i32) -> Self {
