@@ -118,6 +118,7 @@ fn test_llama_style_template() {
         ChatMessage::System {
             content: MessageContent::Text("You are a helpful assistant".to_string()),
             name: None,
+            kimi: Default::default(),
         },
         ChatMessage::User {
             content: MessageContent::Text("What is 2+2?".to_string()),

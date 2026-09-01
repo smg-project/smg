@@ -114,6 +114,7 @@ fn build_chat_request(
             messages.push(ChatMessage::System {
                 content: MessageContent::Text(prompt.to_string()),
                 name: None,
+                kimi: Default::default(),
             });
         }
     }

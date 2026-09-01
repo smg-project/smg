@@ -14,6 +14,7 @@ pub mod common;
 pub mod completion;
 pub mod embedding;
 pub mod event_types;
+pub mod ext;
 pub mod generate;
 pub mod interactions;
 pub mod messages;

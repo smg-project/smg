@@ -15,6 +15,7 @@ use super::{
 };
 use crate::{
     builders::{ChatCompletionResponseBuilder, ChatCompletionStreamResponseBuilder},
+    ext::kimi::KimiSystemExt,
     validated::Normalizable,
 };
 
@@ -30,6 +31,8 @@ pub enum ChatMessage {
     System {
         content: MessageContent,
         name: Option<String>,
+        #[serde(flatten)]
+        kimi: KimiSystemExt,
     },
     #[serde(rename = "user")]
     User {
