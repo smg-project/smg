@@ -303,6 +303,22 @@ impl VisionProcessorRegistry {
             "inkling",
             Box::new(super::processors::InklingImageProcessor::new()),
         );
+        // MiniMax-M3 preprocesses images the Qwen2-VL way but with its own
+        // pixel bounds, so it gets a dedicated processor rather than reusing
+        // the Qwen2-VL defaults.
+        registry.register(
+            "minimax_m3",
+            Box::new(super::processors::MiniMaxM3VisionProcessor::new()),
+        );
+        registry.register(
+            "minimax-m3",
+            Box::new(super::processors::MiniMaxM3VisionProcessor::new()),
+        );
+        registry.register(
+            "minimax_m3_vl",
+            Box::new(super::processors::MiniMaxM3VisionProcessor::new()),
+        );
+
         // Register Qwen2-VL (matches Qwen/Qwen2-VL-*, etc.)
         registry.register(
             "qwen2-vl",
