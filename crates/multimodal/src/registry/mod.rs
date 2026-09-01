@@ -4,6 +4,7 @@ mod kimi_k25;
 mod kimi_k3;
 mod llama4;
 mod llava;
+mod minimax_m3;
 mod phi3_v;
 mod qwen3_asr;
 mod qwen3_omni;
@@ -17,6 +18,7 @@ use kimi_k25::KimiK25VisionSpec;
 use kimi_k3::KimiK3VisionSpec;
 use llama4::Llama4Spec;
 use llava::{LlavaNextSpec, LlavaSpec};
+use minimax_m3::MiniMaxM3VisionSpec;
 use once_cell::sync::Lazy;
 use phi3_v::Phi3VisionSpec;
 use qwen3_asr::Qwen3AsrSpec;
@@ -44,6 +46,7 @@ impl ModelRegistry {
                 LazySpec::new(|| Box::new(KimiK3VisionSpec)),
                 LazySpec::new(|| Box::new(KimiK25VisionSpec)),
                 LazySpec::new(|| Box::new(Llama4Spec)),
+                LazySpec::new(|| Box::new(MiniMaxM3VisionSpec)),
                 // LlavaNext must be registered before Llava so "llava_next" model_type matches first.
                 LazySpec::new(|| Box::new(LlavaNextSpec)),
                 LazySpec::new(|| Box::new(LlavaSpec)),

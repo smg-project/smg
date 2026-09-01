@@ -1,0 +1,419 @@
+use std::collections::HashMap;
+
+use serde_json::{json, Value};
+
+use crate::{
+    encoder_inputs::PreprocessedEncoderInputs,
+    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
+    types::{FieldLayout, Modality, PromptReplacement, TokenId},
+};
+
+/// MiniMax-M3 vision spec.
+///
+/// M3's media tokens carry the same `]<]...[>[` namespace framing as its tool
+/// calls. Unlike the Qwen templates, M3's chat template renders a bare
+/// `]<]image[>[` with no surrounding markers, so this spec owns the whole
+/// wrapper: each placeholder expands to
+/// `]<]start of image[>[` + N * `]<]image[>[` + `]<]end of image[>[`,
+/// with N = `grid_t * grid_h * grid_w / merge_size^2`. That mirrors vLLM's
+/// `_get_prompt_updates`, which builds
+/// `[start_token_id] + [image_token_id] * N + [end_token_id]`.
+pub(super) struct MiniMaxM3VisionSpec;
+
+impl MiniMaxM3VisionSpec {
+    const IMAGE_TOKEN: &'static str = "]<]image[>[";
+    const VIDEO_TOKEN: &'static str = "]<]video[>[";
+    const VISION_START_TOKEN: &'static str = "]<]start of image[>[";
+    const VISION_END_TOKEN: &'static str = "]<]end of image[>[";
+
+    /// The repeated feature token for images.
+    ///
+    /// `image_token_index` is the checkpoint's own declaration; the tokenizer
+    /// lookup is the fallback for checkpoints that omit it.
+    fn image_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
+        match metadata.config_u32(&["image_token_index"]) {
+            Some(id) => Ok(id as TokenId),
+            None => metadata.token_id(Self::IMAGE_TOKEN),
+        }
+    }
+
+    /// The repeated feature token for videos.
+    fn video_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
+        match metadata.config_u32(&["video_token_index"]) {
+            Some(id) => Ok(id as TokenId),
+            None => metadata.token_id(Self::VIDEO_TOKEN),
+        }
+    }
+
+    /// Whether the checkpoint declares video support.
+    fn supports_video(metadata: &ModelMetadata) -> bool {
+        metadata.config_u32(&["video_token_index"]).is_some()
+            || metadata.token_id(Self::VIDEO_TOKEN).is_ok()
+    }
+
+    /// Build `[start] + N * pad + [end]` for one media item.
+    fn wrapped_replacement(
+        metadata: &ModelMetadata,
+        modality: Modality,
+        placeholder_token: &str,
+        pad_token_id: TokenId,
+        num_tokens: usize,
+    ) -> RegistryResult<PromptReplacement> {
+        let start_id = metadata.token_id(Self::VISION_START_TOKEN)?;
+        let end_id = metadata.token_id(Self::VISION_END_TOKEN)?;
+
+        let mut tokens = Vec::with_capacity(num_tokens + 2);
+        tokens.push(start_id);
+        tokens.extend(std::iter::repeat_n(pad_token_id, num_tokens));
+        tokens.push(end_id);
+
+        Ok(
+            PromptReplacement::sequence(modality, placeholder_token, tokens)
+                // The encoder features occupy only the padded middle; the two
+                // markers around them are structural.
+                .with_feature_span(1, num_tokens)
+                .with_structural_prefix(1),
+        )
+    }
+
+    fn replacements_for(
+        metadata: &ModelMetadata,
+        preprocessed: &PreprocessedEncoderInputs,
+        modality: Modality,
+        placeholder_token: &str,
+        pad_token_id: TokenId,
+    ) -> RegistryResult<Vec<PromptReplacement>> {
+        preprocessed
+            .feature_token_counts
+            .iter()
+            .map(|&num_tokens| {
+                Self::wrapped_replacement(
+                    metadata,
+                    modality,
+                    placeholder_token,
+                    pad_token_id,
+                    num_tokens,
+                )
+            })
+            .collect()
+    }
+}
+
+impl ModelProcessorSpec for MiniMaxM3VisionSpec {
+    fn name(&self) -> &'static str {
+        "minimax_m3"
+    }
+
+    fn matches(&self, metadata: &ModelMetadata) -> bool {
+        if metadata
+            .config_model_type()
+            .is_some_and(|mt| mt == "minimax_m3_vl")
+        {
+            return true;
+        }
+        let id = metadata.model_id.to_ascii_lowercase();
+        id.contains("minimax") && id.contains("m3")
+    }
+
+    fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
+        Ok(Self::IMAGE_TOKEN.to_string())
+    }
+
+    fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId> {
+        Self::image_token_id(metadata)
+    }
+
+    fn placeholder_token_for(
+        &self,
+        metadata: &ModelMetadata,
+        modality: Modality,
+    ) -> RegistryResult<String> {
+        match modality {
+            Modality::Image => self.placeholder_token(metadata),
+            Modality::Video => Ok(Self::VIDEO_TOKEN.to_string()),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
+    fn placeholder_token_id_for(
+        &self,
+        metadata: &ModelMetadata,
+        modality: Modality,
+    ) -> RegistryResult<TokenId> {
+        match modality {
+            Modality::Image => Self::image_token_id(metadata),
+            Modality::Video => Self::video_token_id(metadata),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
+    fn modality_limits(
+        &self,
+        metadata: &ModelMetadata,
+    ) -> RegistryResult<HashMap<Modality, usize>> {
+        let mut limits = HashMap::from([(Modality::Image, 10)]);
+        if Self::supports_video(metadata) {
+            limits.insert(Modality::Video, 1);
+        }
+        Ok(limits)
+    }
+
+    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
+        Ok(json!({}))
+    }
+
+    fn prompt_replacements(
+        &self,
+        metadata: &ModelMetadata,
+        preprocessed: &PreprocessedEncoderInputs,
+    ) -> RegistryResult<Vec<PromptReplacement>> {
+        let pad_token_id = Self::image_token_id(metadata)?;
+        let placeholder_token = self.placeholder_token(metadata)?;
+        Self::replacements_for(
+            metadata,
+            preprocessed,
+            Modality::Image,
+            &placeholder_token,
+            pad_token_id,
+        )
+    }
+
+    fn prompt_replacements_for(
+        &self,
+        metadata: &ModelMetadata,
+        preprocessed: &PreprocessedEncoderInputs,
+        modality: Modality,
+    ) -> RegistryResult<Vec<PromptReplacement>> {
+        match modality {
+            Modality::Image => self.prompt_replacements(metadata, preprocessed),
+            Modality::Video => {
+                let pad_token_id = Self::video_token_id(metadata)?;
+                let placeholder_token = self.placeholder_token_for(metadata, Modality::Video)?;
+                Self::replacements_for(
+                    metadata,
+                    preprocessed,
+                    Modality::Video,
+                    &placeholder_token,
+                    pad_token_id,
+                )
+            }
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
+    fn field_layouts(&self) -> HashMap<String, FieldLayout> {
+        // Mirrors vLLM's `_get_mm_fields_config` for M3: the pixel tensors are
+        // flat over patches and sliced per item by the grid product, while the
+        // grid triples are batched one row per item.
+        HashMap::from([
+            (
+                "pixel_values".to_string(),
+                FieldLayout::flat("patches_per_image"),
+            ),
+            ("image_grid_thw".to_string(), FieldLayout::Batched),
+            ("patches_per_image".to_string(), FieldLayout::Batched),
+            (
+                "pixel_values_videos".to_string(),
+                FieldLayout::flat("patches_per_video"),
+            ),
+            ("video_grid_thw".to_string(), FieldLayout::Batched),
+            ("patches_per_video".to_string(), FieldLayout::Batched),
+        ])
+    }
+
+    fn keep_on_cpu_keys(&self) -> Vec<String> {
+        // vLLM marks both grid tensors keep_on_cpu=True.
+        vec!["image_grid_thw".to_string(), "video_grid_thw".to_string()]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::registry::{ModelMetadata, Tokenizer};
+
+    /// Vocabulary ids for M3's media markers, as the checkpoint declares them.
+    const IMAGE_ID: TokenId = 200_025;
+    const VIDEO_ID: TokenId = 200_026;
+    const START_ID: TokenId = 200_027;
+    const END_ID: TokenId = 200_028;
+
+    struct M3Tokenizer;
+
+    impl Tokenizer for M3Tokenizer {
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            match token {
+                MiniMaxM3VisionSpec::IMAGE_TOKEN => Some(IMAGE_ID as u32),
+                MiniMaxM3VisionSpec::VIDEO_TOKEN => Some(VIDEO_ID as u32),
+                MiniMaxM3VisionSpec::VISION_START_TOKEN => Some(START_ID as u32),
+                MiniMaxM3VisionSpec::VISION_END_TOKEN => Some(END_ID as u32),
+                _ => None,
+            }
+        }
+
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            match id {
+                id if id == IMAGE_ID as u32 => Some(MiniMaxM3VisionSpec::IMAGE_TOKEN.to_string()),
+                id if id == VIDEO_ID as u32 => Some(MiniMaxM3VisionSpec::VIDEO_TOKEN.to_string()),
+                _ => None,
+            }
+        }
+
+        fn encode_text(&self, text: &str) -> Option<Vec<u32>> {
+            self.token_to_id(text).map(|id| vec![id])
+        }
+    }
+
+    fn metadata() -> ModelMetadata<'static> {
+        static CONFIG: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        static TOKENIZER: M3Tokenizer = M3Tokenizer;
+        let config = CONFIG.get_or_init(|| {
+            json!({
+                "model_type": "minimax_m3_vl",
+                "image_token_index": IMAGE_ID,
+                "video_token_index": VIDEO_ID,
+            })
+        });
+        ModelMetadata {
+            model_id: "MiniMaxAI/MiniMax-M3",
+            config,
+            tokenizer: &TOKENIZER,
+        }
+    }
+
+    fn preprocessed(counts: Vec<usize>) -> PreprocessedEncoderInputs {
+        let item_sizes = vec![(224, 224); counts.len()];
+        PreprocessedEncoderInputs::new(ndarray::Array2::<f32>::zeros((1, 1)), counts, item_sizes)
+    }
+
+    #[test]
+    fn matches_by_model_type_and_id() {
+        let spec = MiniMaxM3VisionSpec;
+        assert!(spec.matches(&metadata()));
+    }
+
+    #[test]
+    fn placeholder_tokens_use_the_m3_namespace() {
+        let spec = MiniMaxM3VisionSpec;
+        let meta = metadata();
+
+        assert_eq!(spec.placeholder_token(&meta).unwrap(), "]<]image[>[");
+        assert_eq!(
+            spec.placeholder_token_for(&meta, Modality::Video).unwrap(),
+            "]<]video[>["
+        );
+        assert_eq!(spec.placeholder_token_id(&meta).unwrap(), IMAGE_ID);
+        assert_eq!(
+            spec.placeholder_token_id_for(&meta, Modality::Video)
+                .unwrap(),
+            VIDEO_ID
+        );
+    }
+
+    #[test]
+    fn image_replacement_is_wrapped_in_start_and_end_markers() {
+        let spec = MiniMaxM3VisionSpec;
+        let meta = metadata();
+        let replacements = spec
+            .prompt_replacements(&meta, &preprocessed(vec![4]))
+            .unwrap();
+
+        assert_eq!(replacements.len(), 1);
+        let replacement = &replacements[0];
+
+        // M3's chat template emits a bare ]<]image[>[, so the spec owns the
+        // surrounding markers.
+        assert_eq!(
+            replacement.tokens,
+            vec![START_ID, IMAGE_ID, IMAGE_ID, IMAGE_ID, IMAGE_ID, END_ID]
+        );
+        assert_eq!(replacement.placeholder_token, "]<]image[>[");
+        assert_eq!(replacement.modality, Modality::Image);
+    }
+
+    #[test]
+    fn feature_span_skips_the_structural_markers() {
+        let spec = MiniMaxM3VisionSpec;
+        let replacements = spec
+            .prompt_replacements(&metadata(), &preprocessed(vec![4]))
+            .unwrap();
+        let ranges = replacements[0].feature_ranges.as_ref().unwrap();
+
+        // The encoder features are the padded middle only.
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].offset, 1);
+        assert_eq!(ranges[0].length, 4);
+        assert_eq!(replacements[0].structural_prefix, 1);
+    }
+
+    #[test]
+    fn one_replacement_per_media_item() {
+        let spec = MiniMaxM3VisionSpec;
+        let replacements = spec
+            .prompt_replacements(&metadata(), &preprocessed(vec![2, 3]))
+            .unwrap();
+
+        assert_eq!(replacements.len(), 2);
+        assert_eq!(replacements[0].tokens.len(), 2 + 2);
+        assert_eq!(replacements[1].tokens.len(), 3 + 2);
+    }
+
+    #[test]
+    fn video_replacement_uses_the_video_pad_token() {
+        let spec = MiniMaxM3VisionSpec;
+        let replacements = spec
+            .prompt_replacements_for(&metadata(), &preprocessed(vec![3]), Modality::Video)
+            .unwrap();
+
+        assert_eq!(
+            replacements[0].tokens,
+            vec![START_ID, VIDEO_ID, VIDEO_ID, VIDEO_ID, END_ID]
+        );
+        assert_eq!(replacements[0].modality, Modality::Video);
+        assert_eq!(replacements[0].placeholder_token, "]<]video[>[");
+    }
+
+    #[test]
+    fn declares_image_and_video_limits() {
+        let spec = MiniMaxM3VisionSpec;
+        let limits = spec.modality_limits(&metadata()).unwrap();
+
+        assert_eq!(limits.get(&Modality::Image), Some(&10));
+        assert_eq!(limits.get(&Modality::Video), Some(&1));
+        assert!(!limits.contains_key(&Modality::Audio));
+    }
+
+    #[test]
+    fn audio_is_rejected() {
+        let spec = MiniMaxM3VisionSpec;
+        let err = spec
+            .prompt_replacements_for(&metadata(), &preprocessed(vec![1]), Modality::Audio)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ModelRegistryError::UnsupportedModality { .. }
+        ));
+    }
+
+    #[test]
+    fn grid_tensors_stay_on_cpu() {
+        // vLLM marks both grid tensors keep_on_cpu=True.
+        let spec = MiniMaxM3VisionSpec;
+        let keys = spec.keep_on_cpu_keys();
+
+        assert!(keys.contains(&"image_grid_thw".to_string()));
+        assert!(keys.contains(&"video_grid_thw".to_string()));
+    }
+}
