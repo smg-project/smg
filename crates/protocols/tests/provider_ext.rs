@@ -186,3 +186,45 @@ fn system_message_without_content_defaults_to_empty() {
         other => panic!("expected system message, got {other:?}"),
     }
 }
+
+#[expect(clippy::expect_used, reason = "test helper")]
+fn request_with_tools_on_role(model: &str, role: &str) -> ChatCompletionRequest {
+    serde_json::from_value(json!({
+        "model": model,
+        "messages": [
+            {"role": role, "content": "hi", "tools": [
+                {"type": "function", "function": {"name": "get_weather"}}
+            ]},
+            {"role": "user", "content": "hello"}
+        ]
+    }))
+    .expect("request deserializes")
+}
+
+#[test]
+fn kimi_profile_rejects_tools_on_user_and_assistant() {
+    for role in ["user", "assistant"] {
+        let req = request_with_tools_on_role("kimi-k3", role);
+        assert!(
+            req.validate().is_err(),
+            "kimi profile must reject tools on role {role}"
+        );
+    }
+}
+
+#[test]
+fn kimi_profile_allows_tools_on_system() {
+    let req = request_with_tools_on_role("kimi-k3", "system");
+    assert!(req.validate().is_ok());
+}
+
+#[test]
+fn non_kimi_models_tolerate_tools_on_any_role() {
+    for model in ["gpt-4o-mini", "MiniMax-M3"] {
+        let req = request_with_tools_on_role(model, "user");
+        assert!(
+            req.validate().is_ok(),
+            "{model} must not enforce the kimi role restriction"
+        );
+    }
+}

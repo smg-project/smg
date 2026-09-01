@@ -127,6 +127,7 @@ fn build_chat_request(
             },
         }]),
         name: None,
+        ext: Default::default(),
     });
 
     let prefill = family
@@ -145,6 +146,7 @@ fn build_chat_request(
             name: None,
             tool_calls: None,
             reasoning_content: None,
+            ext: Default::default(),
         });
     }
 
