@@ -15,6 +15,7 @@ use super::{
 };
 use crate::{
     builders::{ChatCompletionResponseBuilder, ChatCompletionStreamResponseBuilder},
+    ext::kimi::KimiSystemExt,
     validated::Normalizable,
 };
 
@@ -28,8 +29,12 @@ use crate::{
 pub enum ChatMessage {
     #[serde(rename = "system")]
     System {
+        /// Defaults to empty text: K3 tools-only system messages omit content entirely
+        #[serde(default)]
         content: MessageContent,
         name: Option<String>,
+        #[serde(flatten)]
+        ext: KimiSystemExt,
     },
     #[serde(rename = "user")]
     User {
@@ -64,6 +69,12 @@ pub enum ChatMessage {
 pub enum MessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+}
+
+impl Default for MessageContent {
+    fn default() -> Self {
+        MessageContent::Text(String::new())
+    }
 }
 
 impl MessageContent {
@@ -467,14 +478,21 @@ fn validate_chat_cross_parameters(
         }
     }
 
-    // 7. Validate tool_choice requires tools (except for "none")
+    // 7. Validate tool_choice requires tools — except "none" and "auto", which are valid without tools
     if let Some(ref tool_choice) = req.tool_choice {
-        let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+        // Dynamic tools on system messages count as tools (Kimi K3)
+        let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty())
+            || req.messages.iter().any(|m| {
+                matches!(m, ChatMessage::System { ext, .. }
+                    if ext.tools.as_ref().is_some_and(|t| !t.is_empty()))
+            });
 
-        // Check if tool_choice is anything other than "none"
-        let is_some_choice = !matches!(tool_choice, ToolChoice::Value(ToolChoiceValue::None));
+        let requires_tools = !matches!(
+            tool_choice,
+            ToolChoice::Value(ToolChoiceValue::None) | ToolChoice::Value(ToolChoiceValue::Auto)
+        );
 
-        if is_some_choice && !has_tools {
+        if requires_tools && !has_tools {
             let mut e = validator::ValidationError::new("tool_choice_requires_tools");
             e.message = Some("Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.".into());
             return Err(e);

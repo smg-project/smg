@@ -7,6 +7,8 @@ use serde::{
 use serde_json::{Map, Value};
 use validator;
 
+use crate::ext::minimax::{MinimaxImageExt, MinimaxVideoExt};
+
 // ============================================================================
 // Default value helpers
 // ============================================================================
@@ -238,6 +240,8 @@ pub struct ImageUrl {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>, // "auto", "low", or "high"
+    #[serde(flatten)]
+    pub ext: MinimaxImageExt,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
@@ -256,6 +260,8 @@ pub struct InputAudio {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct VideoUrl {
     pub url: String,
+    #[serde(flatten)]
+    pub ext: MinimaxVideoExt,
 }
 
 // ============================================================================

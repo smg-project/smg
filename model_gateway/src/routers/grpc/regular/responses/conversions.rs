@@ -39,6 +39,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
         messages.push(ChatMessage::System {
             content: MessageContent::Text(instructions.clone()),
             name: None,
+            ext: Default::default(),
         });
     }
 
@@ -303,6 +304,7 @@ fn role_to_chat_message(role: &str, text: String) -> ChatMessage {
         "system" => ChatMessage::System {
             content: MessageContent::Text(text),
             name: None,
+            ext: Default::default(),
         },
         _ => {
             // Unknown role, treat as user message
