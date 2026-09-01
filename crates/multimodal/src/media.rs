@@ -82,12 +82,15 @@ impl Default for MediaConnectorConfig {
 #[derive(Clone, Copy, Debug)]
 pub struct ImageFetchConfig {
     pub detail: ImageDetail,
+    /// MiniMax-M3 extension: cap the decoded image's long side.
+    pub max_long_side_pixel: Option<u32>,
 }
 
 impl Default for ImageFetchConfig {
     fn default() -> Self {
         Self {
             detail: ImageDetail::Auto,
+            max_long_side_pixel: None,
         }
     }
 }
@@ -157,8 +160,13 @@ impl MediaConnector {
             MediaSource::Url(url) => self.fetch_http_image(url, cfg).await,
             MediaSource::DataUrl(data_url) => self.fetch_data_url(data_url, cfg).await,
             MediaSource::InlineBytes(bytes) => {
-                self.decode_image(bytes.into(), cfg.detail, ImageSource::InlineBytes)
-                    .await
+                self.decode_image(
+                    bytes.into(),
+                    cfg.detail,
+                    cfg.max_long_side_pixel,
+                    ImageSource::InlineBytes,
+                )
+                .await
             }
             MediaSource::File(path) => self.fetch_file(path, cfg).await,
         }
@@ -221,6 +229,7 @@ impl MediaConnector {
         self.decode_image(
             bytes,
             cfg.detail,
+            cfg.max_long_side_pixel,
             ImageSource::Url {
                 url: parsed.to_string(),
             },
@@ -245,8 +254,13 @@ impl MediaConnector {
 
         let data = data.trim();
         let decoded = decode_base64_with_limit(data, image_max_input_bytes(), "image")?;
-        self.decode_image(decoded.into(), cfg.detail, ImageSource::DataUrl)
-            .await
+        self.decode_image(
+            decoded.into(),
+            cfg.detail,
+            cfg.max_long_side_pixel,
+            ImageSource::DataUrl,
+        )
+        .await
     }
 
     async fn fetch_video_data_url(
@@ -308,8 +322,13 @@ impl MediaConnector {
         }
 
         let bytes = read_file_with_limit(&canonical, image_max_input_bytes(), "image").await?;
-        self.decode_image(bytes, cfg.detail, ImageSource::File { path: canonical })
-            .await
+        self.decode_image(
+            bytes,
+            cfg.detail,
+            cfg.max_long_side_pixel,
+            ImageSource::File { path: canonical },
+        )
+        .await
     }
 
     async fn fetch_http_video(
@@ -430,8 +449,10 @@ impl MediaConnector {
         &self,
         bytes: Bytes,
         detail: ImageDetail,
+        max_long_side_pixel: Option<u32>,
         source: ImageSource,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
+        validate_max_long_side_pixel(max_long_side_pixel)?;
         ensure_input_byte_limit(bytes.len(), image_max_input_bytes(), "image")?;
         let hash = crate::hasher::hash_image(&bytes);
 
@@ -453,6 +474,8 @@ impl MediaConnector {
         )
         .await
         .map_err(MediaConnectorError::Blocking)??;
+
+        let image = apply_max_long_side_pixel(image, max_long_side_pixel);
 
         Ok(Arc::new(ImageFrame::new(
             image, bytes, detail, source, hash,
@@ -2357,5 +2380,118 @@ mod tests {
         assert_eq!(super::adaptive_opencv_decoder_threads(224, 32), 6);
         assert_eq!(super::adaptive_opencv_decoder_threads(8, 32), 1);
         assert_eq!(super::adaptive_opencv_decoder_threads(1, 0), 2);
+    }
+}
+
+/// The vision patch factor MiniMax-M3's `max_long_side_pixel` must align to
+/// (patch_size 14 * spatial merge 2).
+pub const MAX_LONG_SIDE_PIXEL_FACTOR: u32 = 28;
+
+/// Reject a `max_long_side_pixel` that is zero or not a multiple of the patch
+/// factor, so the value cannot silently round to a different resolution tier.
+fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnectorError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value == 0 || value % MAX_LONG_SIDE_PIXEL_FACTOR != 0 {
+        return Err(MediaConnectorError::InvalidMaxLongSidePixel {
+            value,
+            factor: MAX_LONG_SIDE_PIXEL_FACTOR,
+        });
+    }
+    Ok(())
+}
+
+/// Downscale so the longer side is at most `max_long_side_pixel`.
+///
+/// Images already within the bound are returned untouched, so the cap only
+/// ever removes resolution. The aspect ratio is preserved; the vision
+/// processor's own `smart_resize` then aligns the result to the patch grid.
+fn apply_max_long_side_pixel(
+    image: image::DynamicImage,
+    max_long_side_pixel: Option<u32>,
+) -> image::DynamicImage {
+    let Some(cap) = max_long_side_pixel else {
+        return image;
+    };
+    let (width, height) = (image.width(), image.height());
+    if width.max(height) <= cap {
+        return image;
+    }
+    // `resize` fits within the box while preserving aspect ratio.
+    image.resize(cap, cap, image::imageops::FilterType::CatmullRom)
+}
+
+#[cfg(test)]
+mod max_long_side_pixel_tests {
+    use super::*;
+
+    fn image(width: u32, height: u32) -> image::DynamicImage {
+        image::DynamicImage::new_rgb8(width, height)
+    }
+
+    #[test]
+    fn accepts_multiples_of_the_patch_factor() {
+        for value in [28, 252, 504, 1008] {
+            assert!(validate_max_long_side_pixel(Some(value)).is_ok(), "{value}");
+        }
+        // Absent is always fine.
+        assert!(validate_max_long_side_pixel(None).is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_and_non_multiples() {
+        // The tiers the M3 contract suite exercises as invalid.
+        for value in [0, 100, 251, 1009] {
+            let err = validate_max_long_side_pixel(Some(value)).unwrap_err();
+            assert!(
+                matches!(err, MediaConnectorError::InvalidMaxLongSidePixel { .. }),
+                "expected rejection for {value}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn caps_the_long_side_preserving_aspect_ratio() {
+        // 5000x3000 is the contract suite's stress image.
+        let capped = apply_max_long_side_pixel(image(5000, 3000), Some(504));
+        assert_eq!(capped.width(), 504);
+        // 3000/5000 * 504 = 302.4, floor-ish via the resize box fit.
+        assert!(
+            (302..=303).contains(&capped.height()),
+            "height {} should preserve the 5:3 ratio",
+            capped.height()
+        );
+    }
+
+    #[test]
+    fn caps_the_long_side_when_portrait() {
+        let capped = apply_max_long_side_pixel(image(3000, 5000), Some(504));
+        assert_eq!(capped.height(), 504);
+        assert!((302..=303).contains(&capped.width()));
+    }
+
+    #[test]
+    fn smaller_images_are_left_untouched() {
+        // The cap only ever removes resolution; it must not upscale.
+        let original = apply_max_long_side_pixel(image(200, 100), Some(1008));
+        assert_eq!((original.width(), original.height()), (200, 100));
+    }
+
+    #[test]
+    fn absent_cap_is_a_no_op() {
+        let original = apply_max_long_side_pixel(image(5000, 3000), None);
+        assert_eq!((original.width(), original.height()), (5000, 3000));
+    }
+
+    #[test]
+    fn larger_caps_keep_more_pixels() {
+        // Monotonicity is what the contract suite asserts via prompt_tokens.
+        let low = apply_max_long_side_pixel(image(5000, 3000), Some(252));
+        let mid = apply_max_long_side_pixel(image(5000, 3000), Some(504));
+        let high = apply_max_long_side_pixel(image(5000, 3000), Some(1008));
+
+        assert!(low.width() < mid.width());
+        assert!(mid.width() < high.width());
     }
 }

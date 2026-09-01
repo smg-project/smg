@@ -36,12 +36,22 @@ impl AsyncMultiModalTracker {
     pub fn push_part(&mut self, part: MediaContentPart) -> MultiModalResult<()> {
         match part {
             MediaContentPart::Text { .. } => {}
-            MediaContentPart::ImageUrl { url, detail, uuid } => {
+            MediaContentPart::ImageUrl {
+                url,
+                detail,
+                uuid,
+                max_long_side_pixel,
+            } => {
                 let source = match url::Url::parse(&url) {
                     Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
                     _ => MediaSource::Url(url),
                 };
-                self.enqueue_image(source, detail.unwrap_or_default(), uuid);
+                self.enqueue_image(
+                    source,
+                    detail.unwrap_or_default(),
+                    uuid,
+                    max_long_side_pixel,
+                );
             }
             MediaContentPart::ImageData {
                 data,
@@ -53,6 +63,7 @@ impl AsyncMultiModalTracker {
                     MediaSource::InlineBytes(data),
                     detail.unwrap_or_default(),
                     uuid,
+                    None,
                 );
             }
             MediaContentPart::ImageEmbeds { .. } => {
@@ -107,7 +118,13 @@ impl AsyncMultiModalTracker {
         })
     }
 
-    fn enqueue_image(&mut self, source: MediaSource, detail: ImageDetail, uuid: Option<String>) {
+    fn enqueue_image(
+        &mut self,
+        source: MediaSource,
+        detail: ImageDetail,
+        uuid: Option<String>,
+        max_long_side_pixel: Option<u32>,
+    ) {
         let modality = Modality::Image;
         self.uuids.entry(modality).or_default().push(uuid);
 
@@ -118,7 +135,13 @@ impl AsyncMultiModalTracker {
         )]
         let handle = tokio::spawn(async move {
             let frame = connector
-                .fetch_image(source, ImageFetchConfig { detail })
+                .fetch_image(
+                    source,
+                    ImageFetchConfig {
+                        detail,
+                        max_long_side_pixel,
+                    },
+                )
                 .await?;
             Ok(TrackedMedia::Image(frame))
         });

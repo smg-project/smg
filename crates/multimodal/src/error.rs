@@ -25,6 +25,8 @@ pub enum TransformError {
 
 #[derive(Debug, Error)]
 pub enum MediaConnectorError {
+    #[error("max_long_side_pixel must be a positive multiple of {factor}, got {value}")]
+    InvalidMaxLongSidePixel { value: u32, factor: u32 },
     #[error("unsupported media scheme: {0}")]
     UnsupportedScheme(String),
     #[error("invalid media URL: {0}")]

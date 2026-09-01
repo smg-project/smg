@@ -36,6 +36,7 @@ fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
                             url: image_url.url.clone(),
                             detail,
                             uuid: None,
+                            max_long_side_pixel: image_url.max_long_side_pixel,
                         });
                     }
                     ContentPart::Text { .. } => {}
@@ -111,6 +112,7 @@ fn extract_media_parts_messages(messages: &[InputMessage]) -> Vec<MediaContentPa
                             url: data_url,
                             detail: None,
                             uuid: None,
+                            max_long_side_pixel: None,
                         });
                     }
                     ImageSource::Url { url } => {
@@ -118,6 +120,7 @@ fn extract_media_parts_messages(messages: &[InputMessage]) -> Vec<MediaContentPa
                             url: url.clone(),
                             detail: None,
                             uuid: None,
+                            max_long_side_pixel: None,
                         });
                     }
                 },

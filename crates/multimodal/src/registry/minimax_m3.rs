@@ -18,6 +18,9 @@ use crate::{
 /// with N = `grid_t * grid_h * grid_w / merge_size^2`. That mirrors vLLM's
 /// `_get_prompt_updates`, which builds
 /// `[start_token_id] + [image_token_id] * N + [end_token_id]`.
+/// Maximum images accepted in one request (MiniMax-M3 spec 1.3.6).
+const MAX_IMAGES_PER_REQUEST: usize = 200;
+
 pub(super) struct MiniMaxM3VisionSpec;
 
 impl MiniMaxM3VisionSpec {
@@ -157,7 +160,9 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         &self,
         metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
-        let mut limits = HashMap::from([(Modality::Image, 10)]);
+        // MiniMax-M3 accepts up to 200 images per request (spec 1.3.6), far
+        // above the Qwen-family default of 10.
+        let mut limits = HashMap::from([(Modality::Image, MAX_IMAGES_PER_REQUEST)]);
         if Self::supports_video(metadata) {
             limits.insert(Modality::Video, 1);
         }
@@ -389,7 +394,8 @@ mod tests {
         let spec = MiniMaxM3VisionSpec;
         let limits = spec.modality_limits(&metadata()).unwrap();
 
-        assert_eq!(limits.get(&Modality::Image), Some(&10));
+        assert_eq!(limits.get(&Modality::Image), Some(&MAX_IMAGES_PER_REQUEST));
+        assert_eq!(MAX_IMAGES_PER_REQUEST, 200);
         assert_eq!(limits.get(&Modality::Video), Some(&1));
         assert!(!limits.contains_key(&Modality::Audio));
     }

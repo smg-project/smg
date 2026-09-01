@@ -238,6 +238,12 @@ pub struct ImageUrl {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>, // "auto", "low", or "high"
+    /// MiniMax-M3 extension: cap the image's long side before preprocessing.
+    ///
+    /// Must be a positive multiple of the vision patch factor (28); larger
+    /// values keep more of the image and therefore cost more prompt tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_long_side_pixel: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
