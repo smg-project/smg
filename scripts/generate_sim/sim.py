@@ -43,6 +43,80 @@ MOCK_BASE_PORT = 9000
 SMG_BASE_PORT = 30000
 PROM_BASE_PORT = 39000
 INDEX_BASE_PORT = 40000
+INDEX_METRICS_BASE = 40100
+INDEX_PROXY_BASE = 40300
+
+# Severable TCP proxies for inter-replica links: replica i reaches
+# replica j through proxy port INDEX_PROXY_BASE + i*8 + j, so a drill
+# can partition the pair (close live conns, refuse new ones) and heal
+# it later without touching the processes. Protocol-agnostic byte
+# pumps, so gRPC/HTTP2 rides through untouched.
+INDEX_SEVERED_LINKS = set()  # {(i, j)}
+INDEX_LINK_CONNS = {}  # (i, j) -> [socket, ...]
+
+
+def _proxy_pump(src, dst):
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for sock in (src, dst):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def start_peer_proxy(i, j, real_port):
+    lport = INDEX_PROXY_BASE + i * 8 + j
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", lport))
+    srv.listen(16)
+    INDEX_LINK_CONNS.setdefault((i, j), [])
+
+    def _accept():
+        while True:
+            try:
+                client, _ = srv.accept()
+            except OSError:
+                return
+            if (i, j) in INDEX_SEVERED_LINKS:
+                client.close()
+                continue
+            try:
+                upstream = socket.create_connection(("127.0.0.1", real_port), timeout=5)
+            except OSError:
+                client.close()
+                continue
+            INDEX_LINK_CONNS[(i, j)].append(client)
+            INDEX_LINK_CONNS[(i, j)].append(upstream)
+            threading.Thread(target=_proxy_pump, args=(client, upstream), daemon=True).start()
+            threading.Thread(target=_proxy_pump, args=(upstream, client), daemon=True).start()
+
+    threading.Thread(target=_accept, daemon=True).start()
+    return lport
+
+
+def sever_index_links(pairs):
+    for pair in pairs:
+        INDEX_SEVERED_LINKS.add(tuple(pair))
+        for sock in INDEX_LINK_CONNS.get(tuple(pair), []):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        INDEX_LINK_CONNS[tuple(pair)] = []
+
+
+def heal_index_links(pairs):
+    for pair in pairs:
+        INDEX_SEVERED_LINKS.discard(tuple(pair))
 MESH_BASE_PORT = 41000
 
 # Cache-aware decision branches are DEBUG logs only (no branch metric), scoped
@@ -354,11 +428,24 @@ def launch_index_service(profile, logs_dir, index_bin, bridge_bin):
     env = dict(os.environ)
     env["RUST_LOG"] = "info"
     replicas = int(cfg.get("replicas", 2))
+    deferred = set(cfg.get("deferred_replicas", []))
     urls = ["http://127.0.0.1:%d" % (INDEX_BASE_PORT + i) for i in range(replicas)]
+    partitionable = bool(cfg.get("partitionable"))
     children = []
     for i in range(replicas):
+        if i in deferred:
+            continue
         cmd = [str(index_bin), "--port", str(INDEX_BASE_PORT + i)]
-        peers = ",".join(u for j, u in enumerate(urls) if j != i)
+        cmd += ["--metrics-port", str(INDEX_METRICS_BASE + i)]
+        if partitionable:
+            peer_urls = [
+                "http://127.0.0.1:%d" % start_peer_proxy(i, j, INDEX_BASE_PORT + j)
+                for j in range(replicas)
+                if j != i
+            ]
+            peers = ",".join(peer_urls)
+        else:
+            peers = ",".join(u for j, u in enumerate(urls) if j != i)
         if peers:
             cmd += ["--peers", peers]
         for key in (
@@ -374,6 +461,8 @@ def launch_index_service(profile, logs_dir, index_bin, bridge_bin):
             spawn("index-%d" % i, cmd, logs_dir / ("index-%d.log" % i), env=env)
         )
     for i in range(replicas):
+        if i in deferred:
+            continue
         wait_tcp(INDEX_BASE_PORT + i, 30, "index-%d" % i)
     bridged = 0
     if cfg.get("bridge", True):
@@ -1240,6 +1329,189 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
                     meta["index_relaunched_at_ms"] = int(time.time() * 1000)
 
             threading.Thread(target=_kill_index_replica, daemon=True).start()
+
+        # Partition drill: sever every inter-replica link both ways at
+        # `at_secs`, heal after `heal_after_secs`. Requires
+        # index_service.partitionable so peers ride the proxies.
+        pdrill = profile.get("partition_drill")
+        if pdrill:
+
+            def _partition():
+                cfg = profile.get("index_service", {})
+                replicas = int(cfg.get("replicas", 2))
+                pairs = [
+                    (i, j)
+                    for i in range(replicas)
+                    for j in range(replicas)
+                    if i != j
+                ]
+                time.sleep(float(pdrill.get("at_secs", 60)))
+                sever_index_links(pairs)
+                meta["index_partitioned_at_ms"] = int(time.time() * 1000)
+                heal_after = pdrill.get("heal_after_secs")
+                if heal_after is not None:
+                    time.sleep(float(heal_after))
+                    heal_index_links(pairs)
+                    meta["index_healed_at_ms"] = int(time.time() * 1000)
+
+            threading.Thread(target=_partition, daemon=True).start()
+
+        # Hang drill: SIGSTOP a replica (wedged-but-connected peer —
+        # TCP stays up, nothing drains) and SIGCONT it later.
+        hdrill = profile.get("hang_index_replica")
+        if hdrill:
+
+            def _hang():
+                import signal as _signal
+
+                replica = int(hdrill.get("replica", 1))
+                name = "index-%d" % replica
+                time.sleep(float(hdrill.get("at_secs", 60)))
+                victims = [
+                    c for c in children if c["name"] == name and c["proc"].poll() is None
+                ]
+                if not victims:
+                    meta["index_hang_failed"] = name
+                    return
+                for child in victims:
+                    child["proc"].send_signal(_signal.SIGSTOP)
+                meta["index_hung_at_ms"] = int(time.time() * 1000)
+                resume = hdrill.get("resume_after_secs")
+                if resume is not None:
+                    time.sleep(float(resume))
+                    for child in victims:
+                        child["proc"].send_signal(_signal.SIGCONT)
+                    meta["index_resumed_at_ms"] = int(time.time() * 1000)
+
+            threading.Thread(target=_hang, daemon=True).start()
+
+        # F5: start a DEFERRED replica mid-run (the k8s scale-up
+        # shape: peers were configured for it from the start, so the
+        # running replicas' relay reconnect loops pick it up the
+        # moment it binds; it bootstraps from replica 0 first).
+        sdrill = profile.get("start_deferred_replica")
+        if sdrill:
+
+            def _start_deferred():
+                cfg = profile.get("index_service", {})
+                replicas = int(cfg.get("replicas", 2))
+                replica = int(sdrill.get("replica", replicas - 1))
+                time.sleep(float(sdrill.get("at_secs", 60)))
+                urls = [
+                    "http://127.0.0.1:%d" % (INDEX_BASE_PORT + i)
+                    for i in range(replicas)
+                ]
+                cmd = [
+                    str(index_bin),
+                    "--port",
+                    str(INDEX_BASE_PORT + replica),
+                    "--metrics-port",
+                    str(INDEX_METRICS_BASE + replica),
+                    "--bootstrap-from",
+                    urls[0 if replica != 0 else 1],
+                ]
+                peers = ",".join(u for j, u in enumerate(urls) if j != replica)
+                if peers:
+                    cmd += ["--peers", peers]
+                for key in ("inferred_ttl_secs", "default_capacity_blocks", "sweep_interval_secs"):
+                    if key in cfg:
+                        cmd += ["--" + key.replace("_", "-"), str(cfg[key])]
+                env2 = dict(os.environ)
+                env2["RUST_LOG"] = "info"
+                children.append(
+                    spawn(
+                        "index-%d" % replica,
+                        cmd,
+                        logs_dir / ("index-%d-deferred.log" % replica),
+                        env=env2,
+                    )
+                )
+                meta["index_deferred_started_at_ms"] = int(time.time() * 1000)
+
+            threading.Thread(target=_start_deferred, daemon=True).start()
+
+        # F7: flap a replica — kill -> relaunch(bootstrap) repeatedly.
+        fdrill = profile.get("flap_index_replica")
+        if fdrill:
+
+            def _flap():
+                cfg = profile.get("index_service", {})
+                replicas = int(cfg.get("replicas", 2))
+                replica = int(fdrill.get("replica", 0))
+                cycles = int(fdrill.get("cycles", 3))
+                period = float(fdrill.get("period_secs", 20))
+                time.sleep(float(fdrill.get("at_secs", 45)))
+                urls = [
+                    "http://127.0.0.1:%d" % (INDEX_BASE_PORT + i)
+                    for i in range(replicas)
+                ]
+                flaps = []
+                for cycle in range(cycles):
+                    name = "index-%d" % replica
+                    for child in children:
+                        if child["name"] == name and child["proc"].poll() is None:
+                            child["proc"].kill()
+                    flaps.append({"killed_ms": int(time.time() * 1000)})
+                    time.sleep(period / 2)
+                    cmd = [
+                        str(index_bin),
+                        "--port",
+                        str(INDEX_BASE_PORT + replica),
+                        "--metrics-port",
+                        str(INDEX_METRICS_BASE + replica),
+                        "--bootstrap-from",
+                        urls[0 if replica != 0 else 1],
+                    ]
+                    peers = ",".join(u for j, u in enumerate(urls) if j != replica)
+                    if peers:
+                        cmd += ["--peers", peers]
+                    env2 = dict(os.environ)
+                    env2["RUST_LOG"] = "info"
+                    children.append(
+                        spawn(
+                            name,
+                            cmd,
+                            logs_dir / ("index-%d-flap%d.log" % (replica, cycle)),
+                            env=env2,
+                        )
+                    )
+                    flaps[-1]["relaunched_ms"] = int(time.time() * 1000)
+                    time.sleep(period / 2)
+                meta["index_flaps"] = flaps
+
+            threading.Thread(target=_flap, daemon=True).start()
+
+        # Per-replica admin-metrics timeline: applies/blocks/relay
+        # drops every 2 s, so divergence during a fault and
+        # reconvergence after it are measured, not asserted.
+        if profile.get("index_service"):
+
+            def _index_timeline():
+                cfg = profile.get("index_service", {})
+                replicas = int(cfg.get("replicas", 2))
+                timeline = meta.setdefault("index_timeline", [])
+                while loadgen["proc"].poll() is None:
+                    now_ms = int(time.time() * 1000)
+                    for i in range(replicas):
+                        try:
+                            body = http_get(
+                                "http://127.0.0.1:%d/metrics" % (INDEX_METRICS_BASE + i),
+                                timeout=2,
+                            )
+                        except Exception:
+                            continue
+                        row = {"t_ms": now_ms, "replica": i}
+                        for line in body.splitlines():
+                            if line.startswith("radix_index_applies_total "):
+                                row["applies"] = float(line.split()[1])
+                            elif line.startswith("radix_index_blocks "):
+                                row["blocks"] = float(line.split()[1])
+                            elif line.startswith("radix_index_relay_dropped_total "):
+                                row["relay_dropped"] = float(line.split()[1])
+                        timeline.append(row)
+                    time.sleep(2)
+
+            threading.Thread(target=_index_timeline, daemon=True).start()
 
         # Optional mid-window gateway restart: sticky pins and hash
         # placements are process state, so affinity must rebuild from

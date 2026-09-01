@@ -466,6 +466,50 @@ SCENARIOS = {
             None,
         ),
     ],
+    # Fault injection on the shared index: a full inter-replica network
+    # partition (severable TCP proxies) healed mid-run, and a wedged
+    # replica (SIGSTOP: TCP up, nothing drains) resumed mid-run. Both
+    # on the placement feed with 2 replicas; the per-replica metrics
+    # timeline in meta records divergence and reconvergence.
+    "index-partition": [
+        (
+            "partition-45s",
+            remote_leg(
+                {"bridge": False, "partitionable": True},
+                extra={"partition_drill": {"at_secs": 60, "heal_after_secs": 45}},
+            ),
+            None,
+        ),
+        (
+            "hang-45s",
+            remote_leg(
+                {"bridge": False},
+                extra={"hang_index_replica": {"at_secs": 60, "replica": 1, "resume_after_secs": 45}},
+            ),
+            None,
+        ),
+    ],
+    # F5: scale-up — replica 2 is in everyone's peer list from the
+    # start but only launches at t=60s, bootstrapping from replica 0
+    # under live load. F7: replica 1 flaps (kill+relaunch x3).
+    "index-scaleup-flap": [
+        (
+            "scaleup-r3",
+            remote_leg(
+                {"bridge": False, "replicas": 3, "deferred_replicas": [2]},
+                extra={"start_deferred_replica": {"replica": 2, "at_secs": 60}},
+            ),
+            None,
+        ),
+        (
+            "flap-r1",
+            remote_leg(
+                {"bridge": False},
+                extra={"flap_index_replica": {"replica": 1, "at_secs": 45, "cycles": 3, "period_secs": 20}},
+            ),
+            None,
+        ),
+    ],
     # Staleness sweep (event feed; the placement feed has no Removed to
     # delay): constant injected apply lag, reported against the 3 s
     # compressed think time (= 30 s production). Stored and Removed are
