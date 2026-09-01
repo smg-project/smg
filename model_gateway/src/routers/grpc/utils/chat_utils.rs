@@ -878,6 +878,8 @@ mod tests {
                 ContentPart::VideoUrl {
                     video_url: VideoUrl {
                         url: "https://example.com/video.mp4".to_string(),
+                        fps: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),

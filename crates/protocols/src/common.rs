@@ -262,6 +262,16 @@ pub struct InputAudio {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct VideoUrl {
     pub url: String,
+    /// MiniMax-M3 extension: frames per second to sample the clip at.
+    ///
+    /// Valid range is 0.2 to 5.0 inclusive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f64>,
+    /// MiniMax-M3 extension: cap each sampled frame's long side.
+    ///
+    /// Must be a multiple of the vision patch factor (28) within 150..=3584.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_long_side_pixel: Option<u32>,
 }
 
 // ============================================================================

@@ -100,6 +100,8 @@ pub struct VideoFetchConfig {
     pub min_frames: usize,
     pub max_frames: usize,
     pub sample_fps: f32,
+    /// MiniMax-M3 extension: cap each decoded frame's long side.
+    pub max_long_side_pixel: Option<u32>,
 }
 
 impl Default for VideoFetchConfig {
@@ -108,6 +110,7 @@ impl Default for VideoFetchConfig {
             min_frames: 4,
             max_frames: 768,
             sample_fps: 2.0,
+            max_long_side_pixel: None,
         }
     }
 }
@@ -525,7 +528,13 @@ impl MediaConnector {
             ));
         }
 
-        let hash = crate::hasher::hash_video(&bytes);
+        // The sampling rate and the per-frame cap both change the decoded
+        // frames, so they belong in the identity the caches key off.
+        let hash = crate::hasher::hash_video_with_sampling(
+            &bytes,
+            cfg.sample_fps,
+            cfg.max_long_side_pixel,
+        );
         let decoded = decode_video_frames(bytes.clone(), cfg).await?;
 
         let clip = match decoded {
@@ -1787,13 +1796,26 @@ fn parse_time_base(value: &str) -> Option<f64> {
 }
 
 fn fps_filter_for_metadata(metadata: VideoMetadata, cfg: VideoFetchConfig) -> String {
-    if let Some(duration) = metadata.duration_seconds {
-        if let Some(filter) = fps_filter_for_duration(duration, cfg) {
-            return filter;
-        }
-    }
+    let filter = metadata
+        .duration_seconds
+        .and_then(|duration| fps_filter_for_duration(duration, cfg))
+        .unwrap_or_else(|| format!("fps={}", cfg.sample_fps));
+    with_long_side_cap(filter, cfg)
+}
 
-    format!("fps={}", cfg.sample_fps)
+/// Append a long-side cap to an ffmpeg filter chain.
+///
+/// `force_original_aspect_ratio=decrease` fits each frame inside a
+/// `cap x cap` box while preserving aspect, and the `min(cap, iw/ih)` bounds
+/// stop it ever upscaling a smaller clip. Scaling during decode keeps the raw
+/// RGB path and the `DynamicImage` path on the same geometry.
+fn with_long_side_cap(filter: String, cfg: VideoFetchConfig) -> String {
+    match cfg.max_long_side_pixel {
+        Some(cap) => format!(
+            "{filter},scale=w='min({cap},iw)':h='min({cap},ih)':force_original_aspect_ratio=decrease"
+        ),
+        None => filter,
+    }
 }
 
 fn expected_sampled_frame_count(metadata: VideoMetadata, cfg: VideoFetchConfig) -> usize {
@@ -1837,11 +1859,17 @@ async fn sampling_filter_for_video(
 ) -> (String, f32) {
     if let Ok(duration) = probe_video_duration_seconds(input_path).await {
         if let Some(filter) = fps_filter_for_duration(duration, cfg) {
-            return (filter, effective_sample_fps(Some(duration), cfg));
+            return (
+                with_long_side_cap(filter, cfg),
+                effective_sample_fps(Some(duration), cfg),
+            );
         }
     }
 
-    (format!("fps={}", cfg.sample_fps), cfg.sample_fps)
+    (
+        with_long_side_cap(format!("fps={}", cfg.sample_fps), cfg),
+        cfg.sample_fps,
+    )
 }
 
 async fn probe_video_duration_seconds(
@@ -2162,6 +2190,7 @@ mod tests {
             min_frames: 4,
             max_frames: 8,
             sample_fps: 2.0,
+            max_long_side_pixel: None,
         };
         let metadata = VideoMetadata {
             width: info.width.expect("video width"),
@@ -2223,6 +2252,7 @@ mod tests {
             min_frames: 4,
             max_frames: 8,
             sample_fps: 2.0,
+            max_long_side_pixel: None,
         };
 
         assert_eq!(effective_sample_fps(Some(1.0), cfg), 4.0);
@@ -2361,6 +2391,7 @@ mod tests {
             min_frames: 4,
             max_frames: 8,
             sample_fps: 2.0,
+            max_long_side_pixel: None,
         };
         let indices = super::opencv_frame_indices(1, 30.0, cfg);
         assert_eq!(indices, vec![0, 0, 0, 0]);

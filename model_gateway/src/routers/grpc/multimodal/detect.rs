@@ -59,6 +59,8 @@ fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
                         parts.push(MediaContentPart::VideoUrl {
                             url: video_url.url.clone(),
                             uuid: None,
+                            fps: video_url.fps,
+                            max_long_side_pixel: video_url.max_long_side_pixel,
                         });
                     }
                 }
@@ -172,6 +174,8 @@ mod tests {
             content: MessageContent::Parts(vec![ContentPart::VideoUrl {
                 video_url: VideoUrl {
                     url: "https://example.com/clip.mp4".to_string(),
+                    fps: None,
+                    max_long_side_pixel: None,
                 },
             }]),
             name: None,
@@ -258,6 +262,8 @@ mod tests {
             content: MessageContent::Parts(vec![ContentPart::VideoUrl {
                 video_url: VideoUrl {
                     url: "https://example.com/video.mp4".to_string(),
+                    fps: None,
+                    max_long_side_pixel: None,
                 },
             }]),
             name: None,

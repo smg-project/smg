@@ -35,6 +35,34 @@ pub fn hash_video(raw_bytes: &[u8]) -> String {
     blake3::hash(raw_bytes).to_hex().to_string()
 }
 
+/// Compute a blake3 hex-digest hash for a video whose decoded frames depend on
+/// per-request sampling parameters.
+///
+/// Like [`hash_image_with_resolution_cap`], this identifies the *decoded*
+/// frames rather than the encoded payload: the same clip sampled at a different
+/// fps, or capped to a different long side, yields different frames, and both
+/// the gateway's cache and the backend's `mm_hashes` key off this value.
+/// Default sampling keeps the plain byte hash so existing entries stay valid.
+pub fn hash_video_with_sampling(
+    raw_bytes: &[u8],
+    sample_fps: f32,
+    max_long_side_pixel: Option<u32>,
+) -> String {
+    const DEFAULT_SAMPLE_FPS: f32 = 2.0;
+    if max_long_side_pixel.is_none() && sample_fps == DEFAULT_SAMPLE_FPS {
+        return hash_video(raw_bytes);
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(raw_bytes);
+    hasher.update(b"sample_fps=");
+    hasher.update(&sample_fps.to_le_bytes());
+    if let Some(cap) = max_long_side_pixel {
+        hasher.update(b"max_long_side_pixel=");
+        hasher.update(&cap.to_le_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 /// Compute a blake3 hex-digest hash for a single audio payload's raw bytes.
 pub fn hash_audio(raw_bytes: &[u8]) -> String {
     blake3::hash(raw_bytes).to_hex().to_string()
@@ -91,5 +119,41 @@ mod tests {
         let hash = hash_image(b"test");
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(hash.len(), 64); // blake3 produces 256-bit = 64 hex chars
+    }
+}
+
+#[cfg(test)]
+mod video_sampling_hash_tests {
+    use super::*;
+
+    const CLIP: &[u8] = b"fake-encoded-video-bytes";
+
+    #[test]
+    fn default_sampling_keeps_the_plain_byte_hash() {
+        assert_eq!(hash_video_with_sampling(CLIP, 2.0, None), hash_video(CLIP));
+    }
+
+    #[test]
+    fn different_fps_hashes_differently() {
+        assert_ne!(
+            hash_video_with_sampling(CLIP, 1.0, None),
+            hash_video_with_sampling(CLIP, 5.0, None)
+        );
+    }
+
+    #[test]
+    fn different_long_side_caps_hash_differently() {
+        assert_ne!(
+            hash_video_with_sampling(CLIP, 2.0, Some(504)),
+            hash_video_with_sampling(CLIP, 2.0, Some(1008))
+        );
+    }
+
+    #[test]
+    fn same_sampling_hashes_stably() {
+        assert_eq!(
+            hash_video_with_sampling(CLIP, 1.0, Some(504)),
+            hash_video_with_sampling(CLIP, 1.0, Some(504))
+        );
     }
 }
