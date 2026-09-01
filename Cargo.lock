@@ -3353,9 +3353,9 @@ checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 
 [[package]]
 name = "is"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cff4e962dd367e3b1c478f67c24a35e7120ec767090cb61305b855db9a529c4"
+checksum = "d08f9118d003d441f79c1070e84d0a2a89f35721ca8ae0cd5e1f9026dc4a2517"
 dependencies = [
  "crc",
  "serde",
@@ -6907,9 +6907,9 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sctp-proto"
-version = "0.10.3"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f895c3c33ae20283f9129bd09db2ca69138798b372ef2b98bd2946d23ea4819b"
+checksum = "a22cbe1d867f74fc377b9e63ac74457ea7dcfda23a0deaba6af083ad7e060019"
 dependencies = [
  "bytes",
  "crc",
@@ -7760,9 +7760,9 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "str0m"
-version = "0.21.0"
+version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fed3d9290b349b6da18fd640d81a950e4b256dba80e36982be61ae6ef98fb025"
+checksum = "8522aa06c731cfdc1488e32de7fcebcfc8d9d86d49a6ecc95a64779fe7b545f2"
 dependencies = [
  "arrayvec",
  "base64ct",
@@ -7781,9 +7781,9 @@ dependencies = [
 
 [[package]]
 name = "str0m-openssl"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcdf445983145434702fb35a17ce81f922023ed23950542c6d8d88a4709acda7"
+checksum = "ae33ce33dcd4dd2d9b6c01e7e425b604be9b811f69511b4387e76d5a36fe606b"
 dependencies = [
  "libc",
  "openssl",
@@ -7794,9 +7794,9 @@ dependencies = [
 
 [[package]]
 name = "str0m-proto"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c99c3d805532aebd04585ba54e97e958c382759fb8f52256e289a49233f7e05b"
+checksum = "e8f3d99f2cf6c76a502e45feb896ea71e54787ede8744bcdb215acfbfcb905dd"
 dependencies = [
  "base64ct",
  "dimpl",
