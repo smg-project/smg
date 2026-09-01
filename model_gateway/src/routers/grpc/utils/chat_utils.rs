@@ -810,6 +810,7 @@ mod tests {
     #[test]
     fn test_transform_messages_string_format() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Hello".to_string(),
@@ -847,6 +848,7 @@ mod tests {
     #[test]
     fn test_transform_messages_string_format_without_placeholders_omits_media() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Describe this".to_string(),
@@ -871,6 +873,7 @@ mod tests {
     #[test]
     fn test_transform_messages_string_format_with_video_placeholder() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Watch this".to_string(),
@@ -900,6 +903,7 @@ mod tests {
     #[test]
     fn test_transform_messages_string_format_uses_per_modality_placeholders() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Describe and transcribe".to_string(),
@@ -946,6 +950,7 @@ mod tests {
     #[test]
     fn test_transform_messages_input_audio_uses_audio_placeholder() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Transcribe this".to_string(),
@@ -981,6 +986,7 @@ mod tests {
     #[test]
     fn test_transform_messages_string_format_rejects_missing_modality_placeholder() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![ContentPart::AudioUrl {
                 audio_url: AudioUrl {
                     url: "audio".to_string(),
@@ -1000,6 +1006,7 @@ mod tests {
     #[test]
     fn test_transform_messages_openai_format() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Describe this image:".to_string(),
@@ -1038,6 +1045,7 @@ mod tests {
     #[test]
     fn test_transform_messages_simple_string_content() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("Simple text message".to_string()),
             name: None,
         }];
@@ -1066,6 +1074,7 @@ mod tests {
                 name: None,
             },
             ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Parts(vec![
                     ContentPart::Text {
                         text: "User message".to_string(),
@@ -1104,6 +1113,7 @@ mod tests {
     #[test]
     fn test_transform_messages_empty_text_parts() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     ext: Default::default(),
@@ -1129,10 +1139,12 @@ mod tests {
     fn test_transform_messages_mixed_content_types() {
         let messages = vec![
             ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Text("Plain text".to_string()),
                 name: None,
             },
             ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Parts(vec![
                     ContentPart::Text {
                         text: "With image".to_string(),
@@ -1178,6 +1190,7 @@ mod tests {
     fn test_media_hoisted_before_text_openai() {
         // Real MMBench shape: [question text, image] must render image-first.
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Question: ...\nAnswer with only the option letter.".to_string(),
@@ -1204,6 +1217,7 @@ mod tests {
     fn test_media_hoisted_before_text_string() {
         // String-format template: placeholder prepended, matching vLLM exactly.
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Question?".to_string(),
@@ -1233,6 +1247,7 @@ mod tests {
     fn test_media_first_stable_and_multi() {
         // Multiple media + text keep relative order within each group, media first.
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "a".to_string(),
@@ -1270,6 +1285,7 @@ mod tests {
     #[test]
     fn test_tml_preserves_authored_multipart_order_openai() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "question".to_string(),
@@ -1302,6 +1318,7 @@ mod tests {
     #[test]
     fn test_absent_assistant_content_renders_null() {
         let messages = vec![ChatMessage::Assistant {
+            ext: Default::default(),
             content: None,
             name: None,
             tool_calls: None,
@@ -1321,6 +1338,7 @@ mod tests {
     #[test]
     fn test_tml_preserves_authored_multipart_order_string() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "question".to_string(),
@@ -1352,6 +1370,7 @@ mod tests {
         ChatCompletionRequest {
             model: "inkling-chat".to_string(),
             messages: vec![ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Text("hello".to_string()),
                 name: None,
             }],
@@ -1432,6 +1451,7 @@ mod tests {
         let format = detect_chat_template_content_format(&template);
 
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Question: Which description is correct?\n\

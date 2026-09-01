@@ -210,6 +210,7 @@ fn build_qwen3_asr_chat_request(
         }
     }
     messages.push(ChatMessage::User {
+        ext: Default::default(),
         content: MessageContent::Parts(vec![ContentPart::InputAudio {
             input_audio: InputAudio {
                 data: BASE64_STANDARD.encode(&audio.bytes),
@@ -221,6 +222,7 @@ fn build_qwen3_asr_chat_request(
 
     let continue_final_message = if let Some(language) = language {
         messages.push(ChatMessage::Assistant {
+            ext: Default::default(),
             content: Some(MessageContent::Text(format!(
                 "language {language}<asr_text>"
             ))),

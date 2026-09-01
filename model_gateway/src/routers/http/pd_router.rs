@@ -2239,6 +2239,7 @@ mod tests {
         let request = ChatCompletionRequest {
             model: "test-model".to_string(),
             messages: vec![ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Text("hello".to_string()),
                 name: None,
             }],

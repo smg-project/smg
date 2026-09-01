@@ -15,7 +15,8 @@ use super::{
 };
 use crate::{
     builders::{ChatCompletionResponseBuilder, ChatCompletionStreamResponseBuilder},
-    ext::kimi::KimiSystemExt,
+    ext::kimi::{KimiAssistantExt, KimiSystemExt, KimiUserExt},
+    profile::ProviderProfile,
     validated::Normalizable,
 };
 
@@ -40,6 +41,8 @@ pub enum ChatMessage {
     User {
         content: MessageContent,
         name: Option<String>,
+        #[serde(flatten)]
+        ext: KimiUserExt,
     },
     #[serde(rename = "assistant")]
     Assistant {
@@ -48,6 +51,8 @@ pub enum ChatMessage {
         tool_calls: Option<Vec<ToolCall>>,
         /// Reasoning content for O1-style models (SGLang extension)
         reasoning_content: Option<String>,
+        #[serde(flatten)]
+        ext: KimiAssistantExt,
     },
     #[serde(rename = "tool")]
     Tool {
@@ -577,6 +582,9 @@ fn validate_chat_cross_parameters(
             }
         }
     }
+
+    // 8. Provider-profile contract rules, selected from the model id
+    ProviderProfile::for_model(&req.model).validate_chat(req)?;
 
     Ok(())
 }

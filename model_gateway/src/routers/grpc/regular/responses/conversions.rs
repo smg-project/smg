@@ -48,6 +48,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
         ResponseInput::Text(text) => {
             // Simple text input → user message
             messages.push(ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Text(text.clone()),
                 name: None,
             });
@@ -96,6 +97,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
 
                         // Add assistant message with tool_calls (the LLM's decision)
                         messages.push(ChatMessage::Assistant {
+                            ext: Default::default(),
                             content: None,
                             name: None,
                             tool_calls: Some(vec![ToolCall {
@@ -132,6 +134,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                             name: None,
                             tool_calls: None,
                             reasoning_content: Some(reasoning_text),
+                            ext: Default::default(),
                         });
                     }
                     ResponseInputOutputItem::FunctionCallOutput {
@@ -294,8 +297,10 @@ fn role_to_chat_message(role: &str, text: String) -> ChatMessage {
         "user" => ChatMessage::User {
             content: MessageContent::Text(text),
             name: None,
+            ext: Default::default(),
         },
         "assistant" => ChatMessage::Assistant {
+            ext: Default::default(),
             content: Some(MessageContent::Text(text)),
             name: None,
             tool_calls: None,
@@ -309,6 +314,7 @@ fn role_to_chat_message(role: &str, text: String) -> ChatMessage {
         _ => {
             // Unknown role, treat as user message
             ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Text(text),
                 name: None,
             }

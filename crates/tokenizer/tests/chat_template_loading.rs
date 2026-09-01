@@ -61,10 +61,12 @@ mod tests {
 
         let messages = [
             ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Text("Hello".to_string()),
                 name: None,
             },
             ChatMessage::Assistant {
+                ext: Default::default(),
                 content: Some(MessageContent::Text("Hi there".to_string())),
                 name: None,
                 tool_calls: None,
@@ -143,6 +145,7 @@ mod tests {
         .unwrap();
 
         let messages = [ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("Test".to_string()),
             name: None,
         }];
@@ -204,10 +207,12 @@ mod tests {
 
         let messages = [
             ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Text("Hello".to_string()),
                 name: None,
             },
             ChatMessage::Assistant {
+                ext: Default::default(),
                 content: Some(MessageContent::Text("World".to_string())),
                 name: None,
                 tool_calls: None,
