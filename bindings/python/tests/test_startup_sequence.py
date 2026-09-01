@@ -221,6 +221,39 @@ class TestRouterInitialization:
 
             # Function returns None; ensure start was invoked
 
+    def test_pd_service_discovery_does_not_force_igw(self):
+        """PD mode with service discovery keeps PD routing (no IGW auto-enable)."""
+        args = RouterArgs(
+            service_discovery=True,
+            pd_disaggregation=True,
+            prefill_selector={"component": "engine"},
+            decode_selector={"component": "decoder"},
+            service_discovery_port=8080,
+            service_discovery_namespace="default",
+        )
+
+        with patch("smg.launch_router.Router") as router_mod:
+            captured_args = {}
+            mock_router_instance = MagicMock()
+
+            def fake_from_args(router_args):
+                captured_args.update(
+                    dict(
+                        pd_disaggregation=router_args.pd_disaggregation,
+                        enable_igw=router_args.enable_igw,
+                    )
+                )
+                return mock_router_instance
+
+            router_mod.from_args = MagicMock(side_effect=fake_from_args)
+
+            launch_router(args)
+
+            router_mod.from_args.assert_called_once()
+            assert captured_args["pd_disaggregation"] is True
+            assert captured_args["enable_igw"] is False
+            mock_router_instance.start.assert_called_once()
+
     def test_router_initialization_with_retry_config(self):
         """Test router initialization with retry configuration."""
         args = RouterArgs(
