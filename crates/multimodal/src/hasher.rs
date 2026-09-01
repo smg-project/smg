@@ -1,6 +1,22 @@
 use std::collections::BTreeMap;
 
 /// Compute a blake3 hex-digest hash for a single image's raw bytes.
+/// Domain tag for digests that mix media bytes with request parameters, so a
+/// parameterised digest can never equal a plain byte digest.
+const MEDIA_PARAM_DOMAIN: &[u8] = b"smg.media.params.v1";
+
+/// Absorb `bytes` behind its own length.
+///
+/// Without the length prefix the payload and the trailing parameters are just
+/// concatenated, so a clip carrying crafted trailing bytes hashes the same as a
+/// different clip with different parameters — and this digest keys both the
+/// gateway's pixel cache and the backend's `mm_hashes`. The prefix makes the
+/// `(bytes, params)` encoding unambiguous.
+fn write_len_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
 pub fn hash_image(raw_bytes: &[u8]) -> String {
     blake3::hash(raw_bytes).to_hex().to_string()
 }
@@ -53,13 +69,11 @@ pub fn hash_video_with_sampling(
         return hash_video(raw_bytes);
     }
     let mut hasher = blake3::Hasher::new();
-    hasher.update(raw_bytes);
-    hasher.update(b"sample_fps=");
+    hasher.update(MEDIA_PARAM_DOMAIN);
+    write_len_prefixed(&mut hasher, raw_bytes);
     hasher.update(&sample_fps.to_le_bytes());
-    if let Some(cap) = max_long_side_pixel {
-        hasher.update(b"max_long_side_pixel=");
-        hasher.update(&cap.to_le_bytes());
-    }
+    // `0` marks "no cap" so it cannot alias a real cap value.
+    hasher.update(&max_long_side_pixel.unwrap_or(0).to_le_bytes());
     hasher.finalize().to_hex().to_string()
 }
 
@@ -146,6 +160,40 @@ mod video_sampling_hash_tests {
         assert_ne!(
             hash_video_with_sampling(CLIP, 2.0, Some(504)),
             hash_video_with_sampling(CLIP, 2.0, Some(1008))
+        );
+    }
+
+    /// The concatenation collision the review described: a clip carrying the
+    /// parameter suffix as trailing bytes must not alias a genuine
+    /// (clip, params) pair.
+    #[test]
+    fn crafted_trailing_bytes_do_not_collide() {
+        let mut forged = CLIP.to_vec();
+        forged.extend_from_slice(b"sample_fps=");
+        forged.extend_from_slice(&1.0f32.to_le_bytes());
+
+        assert_ne!(
+            hash_video_with_sampling(CLIP, 1.0, None),
+            hash_video_with_sampling(&forged, 2.0, None)
+        );
+    }
+
+    #[test]
+    fn parameterised_digest_never_equals_a_plain_digest() {
+        // The domain tag keeps the two families disjoint.
+        assert_ne!(hash_video_with_sampling(CLIP, 1.0, None), hash_video(CLIP));
+        assert_ne!(
+            hash_image_with_resolution_cap(CLIP, Some(504)),
+            hash_image(CLIP)
+        );
+    }
+
+    #[test]
+    fn absent_cap_is_distinct_from_any_real_cap() {
+        // "no cap" is encoded as 0, which is not a legal cap value.
+        assert_ne!(
+            hash_video_with_sampling(CLIP, 1.0, None),
+            hash_video_with_sampling(CLIP, 1.0, Some(504))
         );
     }
 

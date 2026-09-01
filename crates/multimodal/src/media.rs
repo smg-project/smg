@@ -536,6 +536,12 @@ impl MediaConnector {
             cfg.max_long_side_pixel,
         );
         let decoded = decode_video_frames(bytes.clone(), cfg).await?;
+        // Cap here rather than in the ffmpeg filter chain: the rawvideo decoder
+        // frames stdout using ffprobe's *pre-scale* dimensions and has no
+        // per-frame header, so rescaling inside ffmpeg would desynchronise the
+        // slicing; and the OpenCV backend never sees the filter chain at all.
+        // Capping the decoded frames keeps every backend on one geometry.
+        let decoded = cap_decoded_frames(decoded, cfg.max_long_side_pixel);
 
         let clip = match decoded {
             DecodedVideoFrames::Images { frames, sample_fps } => {
@@ -1796,26 +1802,10 @@ fn parse_time_base(value: &str) -> Option<f64> {
 }
 
 fn fps_filter_for_metadata(metadata: VideoMetadata, cfg: VideoFetchConfig) -> String {
-    let filter = metadata
+    metadata
         .duration_seconds
         .and_then(|duration| fps_filter_for_duration(duration, cfg))
-        .unwrap_or_else(|| format!("fps={}", cfg.sample_fps));
-    with_long_side_cap(filter, cfg)
-}
-
-/// Append a long-side cap to an ffmpeg filter chain.
-///
-/// `force_original_aspect_ratio=decrease` fits each frame inside a
-/// `cap x cap` box while preserving aspect, and the `min(cap, iw/ih)` bounds
-/// stop it ever upscaling a smaller clip. Scaling during decode keeps the raw
-/// RGB path and the `DynamicImage` path on the same geometry.
-fn with_long_side_cap(filter: String, cfg: VideoFetchConfig) -> String {
-    match cfg.max_long_side_pixel {
-        Some(cap) => format!(
-            "{filter},scale=w='min({cap},iw)':h='min({cap},ih)':force_original_aspect_ratio=decrease"
-        ),
-        None => filter,
-    }
+        .unwrap_or_else(|| format!("fps={}", cfg.sample_fps))
 }
 
 fn expected_sampled_frame_count(metadata: VideoMetadata, cfg: VideoFetchConfig) -> usize {
@@ -1859,17 +1849,11 @@ async fn sampling_filter_for_video(
 ) -> (String, f32) {
     if let Ok(duration) = probe_video_duration_seconds(input_path).await {
         if let Some(filter) = fps_filter_for_duration(duration, cfg) {
-            return (
-                with_long_side_cap(filter, cfg),
-                effective_sample_fps(Some(duration), cfg),
-            );
+            return (filter, effective_sample_fps(Some(duration), cfg));
         }
     }
 
-    (
-        with_long_side_cap(format!("fps={}", cfg.sample_fps), cfg),
-        cfg.sample_fps,
-    )
+    (format!("fps={}", cfg.sample_fps), cfg.sample_fps)
 }
 
 async fn probe_video_duration_seconds(
@@ -2556,5 +2540,191 @@ mod max_long_side_pixel_tests {
 
         assert!(low.width() < mid.width());
         assert!(mid.width() < high.width());
+    }
+}
+
+/// Fit a frame inside a `cap x cap` box, preserving aspect and never upscaling.
+fn capped_dimensions(width: u32, height: u32, cap: u32) -> Option<(u32, u32)> {
+    let longest = width.max(height);
+    if longest <= cap || longest == 0 {
+        return None;
+    }
+    let scale = f64::from(cap) / f64::from(longest);
+    Some((
+        ((f64::from(width) * scale).round() as u32).max(1),
+        ((f64::from(height) * scale).round() as u32).max(1),
+    ))
+}
+
+/// Apply `max_long_side_pixel` to already-decoded frames.
+///
+/// Decoder-independent by construction: whichever backend produced the frames,
+/// the cap is applied to the same representation the processor will consume.
+/// Frames already inside the cap are left untouched, so this only ever removes
+/// resolution.
+fn cap_decoded_frames(
+    decoded: DecodedVideoFrames,
+    max_long_side_pixel: Option<u32>,
+) -> DecodedVideoFrames {
+    let Some(cap) = max_long_side_pixel else {
+        return decoded;
+    };
+
+    match decoded {
+        DecodedVideoFrames::Images { frames, sample_fps } => {
+            let frames = frames
+                .into_iter()
+                .map(
+                    |frame| match capped_dimensions(frame.width(), frame.height(), cap) {
+                        Some((w, h)) => {
+                            frame.resize_exact(w, h, image::imageops::FilterType::CatmullRom)
+                        }
+                        None => frame,
+                    },
+                )
+                .collect();
+            DecodedVideoFrames::Images { frames, sample_fps }
+        }
+        DecodedVideoFrames::Rgb { video, sample_fps } => {
+            let mut data: Vec<u8> = Vec::with_capacity(video.data.len());
+            let mut frames = Vec::with_capacity(video.frames.len());
+
+            for frame in &video.frames {
+                let Some(src) = video.data.get(frame.offset..frame.offset + frame.len) else {
+                    // A frame that does not slice cleanly is left to the
+                    // downstream validation rather than silently reshaped.
+                    return DecodedVideoFrames::Rgb { video, sample_fps };
+                };
+                let (width, height, bytes) = match capped_dimensions(frame.width, frame.height, cap)
+                {
+                    None => (frame.width, frame.height, src.to_vec()),
+                    Some((w, h)) => {
+                        let Some(buf) =
+                            image::RgbImage::from_raw(frame.width, frame.height, src.to_vec())
+                        else {
+                            return DecodedVideoFrames::Rgb { video, sample_fps };
+                        };
+                        let resized = image::DynamicImage::ImageRgb8(buf).resize_exact(
+                            w,
+                            h,
+                            image::imageops::FilterType::CatmullRom,
+                        );
+                        (w, h, resized.to_rgb8().into_raw())
+                    }
+                };
+
+                frames.push(DecodedRgbFrame {
+                    width,
+                    height,
+                    offset: data.len(),
+                    len: bytes.len(),
+                });
+                data.extend_from_slice(&bytes);
+            }
+
+            DecodedVideoFrames::Rgb {
+                video: DecodedRgbVideo::new(Bytes::from(data), frames),
+                sample_fps,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod video_frame_cap_tests {
+    use super::*;
+
+    fn rgb_video(width: u32, height: u32, frames: usize) -> DecodedVideoFrames {
+        let len = (width * height * 3) as usize;
+        let mut data = Vec::with_capacity(len * frames);
+        let mut descs = Vec::with_capacity(frames);
+        for i in 0..frames {
+            descs.push(DecodedRgbFrame {
+                width,
+                height,
+                offset: i * len,
+                len,
+            });
+            data.extend(std::iter::repeat_n(0u8, len));
+        }
+        DecodedVideoFrames::Rgb {
+            video: DecodedRgbVideo::new(Bytes::from(data), descs),
+            sample_fps: 2.0,
+        }
+    }
+
+    #[test]
+    fn capped_dimensions_fits_the_box_and_keeps_aspect() {
+        // 16:9 source, long side capped to 504.
+        assert_eq!(capped_dimensions(1920, 1080, 504), Some((504, 284)));
+        // Portrait caps on height.
+        assert_eq!(capped_dimensions(1080, 1920, 504), Some((284, 504)));
+    }
+
+    #[test]
+    fn capped_dimensions_never_upscales() {
+        assert_eq!(capped_dimensions(320, 240, 1008), None);
+        assert_eq!(capped_dimensions(504, 284, 504), None);
+    }
+
+    #[test]
+    fn rgb_frames_are_rescaled_and_stay_self_consistent() {
+        // The raw path has no per-frame header, so every descriptor must agree
+        // with the buffer it points into.
+        let capped = cap_decoded_frames(rgb_video(1920, 1080, 3), Some(504));
+        let DecodedVideoFrames::Rgb { video, .. } = capped else {
+            panic!("expected the RGB representation to be preserved");
+        };
+
+        assert_eq!(video.frames.len(), 3);
+        let mut expected_offset = 0;
+        for frame in &video.frames {
+            assert_eq!((frame.width, frame.height), (504, 284));
+            assert_eq!(frame.len, (504 * 284 * 3) as usize);
+            assert_eq!(frame.offset, expected_offset);
+            assert!(video
+                .data
+                .get(frame.offset..frame.offset + frame.len)
+                .is_some());
+            expected_offset += frame.len;
+        }
+        assert_eq!(video.data.len(), expected_offset);
+    }
+
+    #[test]
+    fn rgb_frames_within_the_cap_are_untouched() {
+        let original = rgb_video(320, 240, 2);
+        let capped = cap_decoded_frames(original, Some(1008));
+        let DecodedVideoFrames::Rgb { video, .. } = capped else {
+            panic!("expected RGB");
+        };
+        assert_eq!(video.frames[0].width, 320);
+        assert_eq!(video.frames[0].height, 240);
+    }
+
+    #[test]
+    fn absent_cap_leaves_frames_alone() {
+        let capped = cap_decoded_frames(rgb_video(1920, 1080, 1), None);
+        let DecodedVideoFrames::Rgb { video, .. } = capped else {
+            panic!("expected RGB");
+        };
+        assert_eq!(
+            (video.frames[0].width, video.frames[0].height),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn image_frames_are_rescaled_too() {
+        // The PPM/DynamicImage backend must honour the same cap.
+        let decoded = DecodedVideoFrames::Images {
+            frames: vec![image::DynamicImage::new_rgb8(1920, 1080)],
+            sample_fps: 2.0,
+        };
+        let DecodedVideoFrames::Images { frames, .. } = cap_decoded_frames(decoded, Some(504))
+        else {
+            panic!("expected images");
+        };
+        assert_eq!((frames[0].width(), frames[0].height()), (504, 284));
     }
 }
