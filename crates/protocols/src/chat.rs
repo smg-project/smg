@@ -470,14 +470,21 @@ fn validate_chat_cross_parameters(
         }
     }
 
-    // 7. Validate tool_choice requires tools (except for "none")
+    // 7. Validate tool_choice requires tools — except "none" and "auto", which are valid without tools
     if let Some(ref tool_choice) = req.tool_choice {
-        let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+        // Dynamic tools on system messages count as tools (Kimi K3)
+        let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty())
+            || req.messages.iter().any(|m| {
+                matches!(m, ChatMessage::System { kimi, .. }
+                    if kimi.tools.as_ref().is_some_and(|t| !t.is_empty()))
+            });
 
-        // Check if tool_choice is anything other than "none"
-        let is_some_choice = !matches!(tool_choice, ToolChoice::Value(ToolChoiceValue::None));
+        let requires_tools = !matches!(
+            tool_choice,
+            ToolChoice::Value(ToolChoiceValue::None) | ToolChoice::Value(ToolChoiceValue::Auto)
+        );
 
-        if is_some_choice && !has_tools {
+        if requires_tools && !has_tools {
             let mut e = validator::ValidationError::new("tool_choice_requires_tools");
             e.message = Some("Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.".into());
             return Err(e);

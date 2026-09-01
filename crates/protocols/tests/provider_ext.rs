@@ -1,11 +1,13 @@
 //! Provider extension fields must survive the HTTP router's
-//! deserialize→serialize round trip.
+//! deserialize→serialize round trip, and tool_choice validation must
+//! accept "auto"/"none" without tools.
 
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage},
-    common::{ImageUrl, VideoUrl},
+    common::{ImageUrl, ToolChoice, ToolChoiceValue, VideoUrl},
 };
 use serde_json::{json, Value};
+use validator::Validate;
 
 #[expect(clippy::expect_used, reason = "test helper")]
 fn roundtrip(value: Value) -> Value {
@@ -111,4 +113,60 @@ fn parsed_system_message_exposes_dynamic_tools() {
         }
         other => panic!("expected system message, got {other:?}"),
     }
+}
+
+#[expect(clippy::expect_used, reason = "test helper")]
+fn request_with_tool_choice(tool_choice: ToolChoice) -> ChatCompletionRequest {
+    let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "kimi-k3",
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .expect("request deserializes");
+    req.tool_choice = Some(tool_choice);
+    req
+}
+
+#[test]
+fn tool_choice_auto_and_none_valid_without_tools() {
+    for value in [ToolChoiceValue::Auto, ToolChoiceValue::None] {
+        let req = request_with_tool_choice(ToolChoice::Value(value));
+        assert!(
+            req.validate().is_ok(),
+            "{:?} must not require tools",
+            req.tool_choice
+        );
+    }
+}
+
+#[test]
+fn tool_choice_required_and_function_still_require_tools() {
+    let required = request_with_tool_choice(ToolChoice::Value(ToolChoiceValue::Required));
+    assert!(required.validate().is_err());
+
+    let named: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "kimi-k3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+    }))
+    .expect("request deserializes");
+    assert!(named.validate().is_err());
+}
+
+#[test]
+fn tool_choice_required_valid_with_only_dynamic_tools() {
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [
+                {"type": "function", "function": {"name": "get_weather"}}
+            ]},
+            {"role": "user", "content": "weather in beijing?"}
+        ],
+        "tool_choice": "required"
+    }))
+    .expect("request deserializes");
+    assert!(
+        req.validate().is_ok(),
+        "dynamic tools must satisfy tool_choice=required"
+    );
 }
