@@ -8,7 +8,7 @@ pub use smg_data_connector::{
     HistoryBackend, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
 
-use super::{validation::ConfigValidator, ConfigResult};
+use super::{validation::ConfigValidator, ConfigError, ConfigResult};
 use crate::{
     tenant::DEFAULT_TENANT_HEADER_NAME,
     worker::{ConnectionMode, RuntimeType},
@@ -979,6 +979,41 @@ fn default_drain_settle_secs() -> u64 {
 /// opt-in.
 pub fn resolve_worker_auto_recovery(explicit: Option<bool>, service_discovery: bool) -> bool {
     explicit.unwrap_or(service_discovery)
+}
+
+/// Resolve `--connection-mode`: an explicit setting always wins; otherwise
+/// infer from the worker URLs (first `ipc://` or `grpc://` scheme wins,
+/// defaulting to HTTP).
+///
+/// The explicit setting exists because inference has nothing to look at in a
+/// service-discovery-only deployment: with no static URLs the router defaults
+/// to HTTP, discovered gRPC workers never join the HTTP selection pool, and
+/// every request fails with "no workers available". An explicit setting that
+/// contradicts a static URL's scheme is rejected rather than silently ignored.
+pub fn resolve_connection_mode(
+    explicit: Option<ConnectionMode>,
+    worker_urls: &[String],
+) -> ConfigResult<ConnectionMode> {
+    let Some(mode) = explicit else {
+        return Ok(worker_urls
+            .iter()
+            .find_map(|url| match ConnectionMode::from_url(url) {
+                m @ (Some(ConnectionMode::Zmq) | Some(ConnectionMode::Grpc)) => m,
+                _ => None,
+            })
+            .unwrap_or(ConnectionMode::Http));
+    };
+    if let Some(url) = worker_urls
+        .iter()
+        .find(|url| ConnectionMode::from_url(url).is_some_and(|m| m != mode))
+    {
+        return Err(ConfigError::InvalidValue {
+            field: "connection_mode".to_string(),
+            value: mode.to_string(),
+            reason: format!("conflicts with worker URL '{url}'"),
+        });
+    }
+    Ok(mode)
 }
 
 impl Default for HealthCheckConfig {
@@ -2349,5 +2384,66 @@ mod tests {
             PolicyConfig::RoundRobin => {}
             _ => panic!("Expected RoundRobin for regular mode"),
         }
+    }
+
+    #[test]
+    fn test_resolve_connection_mode_infers_from_urls() {
+        let urls = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // No explicit setting: first ipc:// or grpc:// scheme wins, HTTP default.
+        assert_eq!(
+            resolve_connection_mode(None, &[]).unwrap(),
+            ConnectionMode::Http
+        );
+        assert_eq!(
+            resolve_connection_mode(None, &urls(&["http://w1:8000"])).unwrap(),
+            ConnectionMode::Http
+        );
+        assert_eq!(
+            resolve_connection_mode(None, &urls(&["http://w1:8000", "grpc://w2:50051"])).unwrap(),
+            ConnectionMode::Grpc
+        );
+        assert_eq!(
+            resolve_connection_mode(None, &urls(&["ipc:///tmp/engine-0"])).unwrap(),
+            ConnectionMode::Zmq
+        );
+    }
+
+    #[test]
+    fn test_resolve_connection_mode_explicit_override() {
+        // Discovery-only deployment: no URLs to infer from, explicit wins.
+        assert_eq!(
+            resolve_connection_mode(Some(ConnectionMode::Grpc), &[]).unwrap(),
+            ConnectionMode::Grpc
+        );
+        // Schemeless URLs carry no mode; the explicit setting declares it.
+        assert_eq!(
+            resolve_connection_mode(Some(ConnectionMode::Grpc), &["w1:50051".to_string()]).unwrap(),
+            ConnectionMode::Grpc
+        );
+        // Matching schemes are fine.
+        assert_eq!(
+            resolve_connection_mode(
+                Some(ConnectionMode::Http),
+                &["http://w1:8000".to_string(), "https://w2:8000".to_string()]
+            )
+            .unwrap(),
+            ConnectionMode::Http
+        );
+    }
+
+    #[test]
+    fn test_resolve_connection_mode_rejects_url_mismatch() {
+        let err =
+            resolve_connection_mode(Some(ConnectionMode::Http), &["grpc://w1:50051".to_string()])
+                .unwrap_err();
+        assert!(err.to_string().contains("grpc://w1:50051"), "{err}");
+
+        let err = resolve_connection_mode(
+            Some(ConnectionMode::Grpc),
+            &["grpc://w1:50051".to_string(), "http://w2:8000".to_string()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("http://w2:8000"), "{err}");
     }
 }

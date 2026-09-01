@@ -530,19 +530,6 @@ struct Router {
 }
 
 impl Router {
-    fn determine_connection_mode(worker_urls: &[String]) -> worker::ConnectionMode {
-        use worker::ConnectionMode;
-        // First worker URL that declares ipc:// or grpc:// wins; http:// and bare
-        // host:port fall through to the HTTP default. See ConnectionMode::from_url.
-        worker_urls
-            .iter()
-            .find_map(|url| match ConnectionMode::from_url(url) {
-                mode @ (Some(ConnectionMode::Zmq) | Some(ConnectionMode::Grpc)) => mode,
-                _ => None,
-            })
-            .unwrap_or(ConnectionMode::Http)
-    }
-
     fn parse_mesh_socket_addr(
         host: &str,
         port: u16,
@@ -1093,12 +1080,9 @@ impl Router {
         max_buffered_request_bytes = 1_048_576,
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
+        connection_mode = None,
     ))]
     #[expect(clippy::too_many_arguments)]
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "PyO3 #[new] method signature requires PyResult"
-    )]
     fn new(
         worker_urls: Vec<String>,
         policy: PolicyType,
@@ -1245,6 +1229,7 @@ impl Router {
         max_buffered_request_bytes: u64,
         kv_connector_annotation: String,
         kv_engine_id_annotation: String,
+        connection_mode: Option<String>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1264,7 +1249,21 @@ impl Router {
             all_urls.extend(decode_urls.clone());
         }
 
-        let connection_mode = Self::determine_connection_mode(&all_urls);
+        // Explicit --connection-mode wins over URL-scheme inference. "zmq" is
+        // accepted because `smg serve` forwards its own worker transport here.
+        let explicit_mode = match connection_mode.as_deref() {
+            None => None,
+            Some("http") => Some(worker::ConnectionMode::Http),
+            Some("grpc") => Some(worker::ConnectionMode::Grpc),
+            Some("zmq") => Some(worker::ConnectionMode::Zmq),
+            Some(other) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid value for connection_mode='{other}': expected 'http', 'grpc', or 'zmq'"
+                )))
+            }
+        };
+        let connection_mode = config::resolve_connection_mode(explicit_mode, &all_urls)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
         Ok(Router {
             host,

@@ -12,11 +12,12 @@ use openai_protocol::worker::TransportMode;
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
-        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
-        RoutingMode, SchemaConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        resolve_connection_mode, resolve_worker_auto_recovery, validate_mesh_server_name,
+        CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
+        HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig,
+        PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
+        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
+        TokenizerCacheConfig, TraceConfig,
     },
     observability::{
         metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
@@ -227,6 +228,12 @@ struct CliArgs {
     /// List of worker URLs (supports IPv4 and IPv6)
     #[arg(long, num_args = 0.., help_heading = "Worker Configuration")]
     worker_urls: Vec<String>,
+
+    /// Worker connection mode. Defaults to inference from worker URL schemes
+    /// (grpc:// => grpc); a service-discovery-only deployment has no URLs to
+    /// infer from, so declare a discovered gRPC fleet explicitly here.
+    #[arg(long, value_parser = ["http", "grpc"], help_heading = "Worker Configuration")]
+    connection_mode: Option<String>,
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
@@ -1290,18 +1297,6 @@ impl CliArgs {
         }
     }
 
-    fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
-        // First worker URL that declares ipc:// or grpc:// wins; http:// and bare
-        // host:port fall through to the HTTP default. See ConnectionMode::from_url.
-        worker_urls
-            .iter()
-            .find_map(|url| match ConnectionMode::from_url(url) {
-                mode @ (Some(ConnectionMode::Zmq) | Some(ConnectionMode::Grpc)) => mode,
-                _ => None,
-            })
-            .unwrap_or(ConnectionMode::Http)
-    }
-
     fn parse_selector(selector_list: &[String]) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for item in selector_list {
@@ -1723,7 +1718,13 @@ impl CliArgs {
                 all_urls.extend(worker_urls.clone());
             }
         }
-        let connection_mode = Self::determine_connection_mode(&all_urls);
+        // Explicit --connection-mode wins over URL-scheme inference.
+        let explicit_mode = match self.connection_mode.as_deref() {
+            Some("http") => Some(ConnectionMode::Http),
+            Some("grpc") => Some(ConnectionMode::Grpc),
+            _ => None,
+        };
+        let connection_mode = resolve_connection_mode(explicit_mode, &all_urls)?;
 
         // `--backend` normally only steers the routing mode. Over ZMQ it
         // additionally pins the startup workers' runtime: the shared EngineCore

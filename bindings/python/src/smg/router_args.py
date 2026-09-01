@@ -249,6 +249,8 @@ class RouterArgs:
     max_buffered_request_bytes: int = 1048576
     kv_connector_annotation: str = "smg.ai/kv-connector"
     kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
+    # Worker transport; None = infer from worker URL schemes (grpc:// => grpc)
+    connection_mode: str | None = None
 
     @staticmethod
     def add_cli_args(
@@ -367,6 +369,18 @@ class RouterArgs:
             help=(
                 "List of worker URLs. Supports IPv4 and IPv6 addresses"
                 " (use brackets for IPv6, e.g., http://[::1]:8000 http://192.168.1.1:8000)"
+            ),
+        )
+        worker_group.add_argument(
+            f"--{prefix}connection-mode",
+            type=str,
+            choices=["http", "grpc"],
+            default=RouterArgs.connection_mode,
+            help=(
+                "Worker connection mode. By default it is inferred from worker URL"
+                " schemes (grpc:// => grpc); with Kubernetes service discovery and"
+                " no static URLs there is nothing to infer from, so declare a gRPC"
+                " fleet explicitly here."
             ),
         )
         worker_group.add_argument(

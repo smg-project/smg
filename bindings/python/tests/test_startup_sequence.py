@@ -254,6 +254,32 @@ class TestRouterInitialization:
             assert captured_args["enable_igw"] is False
             mock_router_instance.start.assert_called_once()
 
+    def test_connection_mode_survives_startup(self):
+        """Discovery-only PD deployments can declare gRPC workers explicitly."""
+        args = RouterArgs(
+            service_discovery=True,
+            pd_disaggregation=True,
+            prefill_selector={"component": "engine"},
+            decode_selector={"component": "decoder"},
+            connection_mode="grpc",
+        )
+
+        with patch("smg.launch_router.Router") as router_mod:
+            captured_args = {}
+            mock_router_instance = MagicMock()
+
+            def fake_from_args(router_args):
+                captured_args["connection_mode"] = router_args.connection_mode
+                return mock_router_instance
+
+            router_mod.from_args = MagicMock(side_effect=fake_from_args)
+
+            launch_router(args)
+
+            router_mod.from_args.assert_called_once()
+            assert captured_args["connection_mode"] == "grpc"
+            mock_router_instance.start.assert_called_once()
+
     def test_router_initialization_with_retry_config(self):
         """Test router initialization with retry configuration."""
         args = RouterArgs(

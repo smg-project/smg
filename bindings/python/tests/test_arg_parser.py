@@ -539,6 +539,21 @@ class TestParseRouterArgs:
         assert router_args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert router_args.policy == "round_robin"
 
+    def test_parse_connection_mode(self):
+        """Explicit worker transport; unset keeps infer-from-URLs (None)."""
+        router_args = parse_router_args(["--connection-mode", "grpc"])
+        assert router_args.connection_mode == "grpc"
+
+        router_args = parse_router_args(["--connection-mode", "http"])
+        assert router_args.connection_mode == "http"
+
+        defaults = parse_router_args([])
+        assert defaults.connection_mode is None
+
+        # argparse rejects values outside the http/grpc choices
+        with pytest.raises(SystemExit):
+            parse_router_args(["--connection-mode", "zmq"])
+
     def test_parse_routing_key_headers(self):
         """Ordered list flag; unset keeps the x-smg-routing-key default."""
         router_args = parse_router_args(
@@ -1431,6 +1446,7 @@ class TestRouterArgsFieldOrder:
         "max_buffered_request_bytes",
         "kv_connector_annotation",
         "kv_engine_id_annotation",
+        "connection_mode",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

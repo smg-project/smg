@@ -154,6 +154,9 @@ class Router:
         host: Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::,
             ::1), or 0.0.0.0 for all interfaces. Default: '0.0.0.0'
         port: Port number to bind the router server. Default: 3001
+        connection_mode: Worker connection mode ('http' or 'grpc'). None infers
+            the mode from worker URL schemes (grpc:// => grpc); set it explicitly
+            when only service discovery supplies workers. Default: None
         worker_startup_timeout_secs: Timeout in seconds for worker startup and
             registration. Large models can take significant time to load into GPU
             memory. Default: 1800 (30 minutes)
