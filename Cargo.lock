@@ -1722,7 +1722,7 @@ version = "2.3.4"
 dependencies = [
  "async-trait",
  "chrono",
- "deadpool 0.13.0",
+ "deadpool 0.13.1",
  "deadpool-postgres",
  "deadpool-redis",
  "oracle",
@@ -1759,12 +1759,11 @@ dependencies = [
 
 [[package]]
 name = "deadpool"
-version = "0.13.0"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "883466cb8db62725aee5f4a6011e8a5d42912b42632df32aad57fc91127c6e04"
+checksum = "3e98a7e119cd347f4201e1159b19831029e203e2d8b790547708e8157b4acf1e"
 dependencies = [
  "deadpool-runtime 0.3.1",
- "num_cpus",
  "tokio",
 ]
 
@@ -1788,7 +1787,7 @@ version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bafa30c49dafe086d10116074e422ad7fc1c3cf554697e744a3ab112599ebd09"
 dependencies = [
- "deadpool 0.13.0",
+ "deadpool 0.13.1",
  "redis",
 ]
 
