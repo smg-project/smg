@@ -464,10 +464,12 @@ fn build_args_format(params: &Value) -> Value {
         .map(|values| values.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
 
+    let defs = RootDefs::from_params(params);
+
     let elements: Vec<Value> = properties
         .iter()
         .map(|(key, subschema)| {
-            let argument = build_argument_format(key, subschema);
+            let argument = build_argument_format(key, subschema, defs);
             if required.contains(key.as_str()) {
                 argument
             } else {
@@ -481,9 +483,9 @@ fn build_args_format(params: &Value) -> Value {
 
 /// Build the grammar for one `<|open|>argument ...<|close|>argument` block,
 /// pinning `key=`, `type=`, and the value grammar from the property schema.
-fn build_argument_format(key: &str, subschema: &Value) -> Value {
+fn build_argument_format(key: &str, subschema: &Value, defs: RootDefs<'_>) -> Value {
     let esc_key = escape_attr(key);
-    match classify_arg(subschema) {
+    match classify_arg(subschema, defs) {
         ArgShape::Fixed { type_attr, value } => json!({
             "type": "sequence",
             "elements": [
@@ -505,13 +507,176 @@ fn build_argument_format(key: &str, subschema: &Value) -> Value {
     }
 }
 
+/// The definition blocks that sit at the root of a tool's parameter schema,
+/// plus the root schema itself.
+///
+/// Each argument's subschema is compiled as its own standalone grammar
+/// document, but a `$ref` such as `#/$defs/Node` is a pointer from the *root*
+/// of the document it appears in. Without the definition block travelling
+/// alongside the subschema the pointer dangles, and the grammar compiler
+/// rejects the whole tool call rather than just that argument.
+#[derive(Clone, Copy, Default)]
+struct RootDefs<'a> {
+    root: Option<&'a Value>,
+    defs: Option<&'a Value>,
+    definitions: Option<&'a Value>,
+}
+
+impl<'a> RootDefs<'a> {
+    fn from_params(params: &'a Value) -> Self {
+        Self {
+            root: Some(params),
+            defs: params.get("$defs"),
+            definitions: params.get("definitions"),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.defs.is_none() && self.definitions.is_none()
+    }
+
+    fn block(self, name: &str) -> Option<&'a Value> {
+        match name {
+            "$defs" => self.defs,
+            "definitions" => self.definitions,
+            _ => None,
+        }
+    }
+
+    /// Resolve a local JSON pointer against the parameter schema.
+    ///
+    /// `#` addresses the root schema itself, which a root-recursive property
+    /// legitimately names.
+    fn resolve_pointer(self, pointer: &str) -> Option<&'a Value> {
+        if pointer == "#" || pointer == "#/" {
+            return self.root;
+        }
+        let rest = pointer.strip_prefix("#/")?;
+        let mut segments = rest.split('/');
+        let mut node = self.block(segments.next()?)?;
+        for segment in segments {
+            // JSON-pointer escapes, innermost first per RFC 6901.
+            let key = segment.replace("~1", "/").replace("~0", "~");
+            node = node.get(&key)?;
+        }
+        Some(node)
+    }
+
+    /// The schema a subschema's own `$ref` names, if it has one.
+    ///
+    /// Only the pointer is followed — sibling keywords stay with the property
+    /// and take precedence, since in 2020-12 a `$ref` applies *alongside* them
+    /// rather than replacing them. Following a single hop also keeps a `$ref`
+    /// cycle from looping here; a recursive definition still compiles because
+    /// the block below travels with the schema and the compiler expands it.
+    fn resolve_ref(self, subschema: &'a Value) -> Option<&'a Value> {
+        let pointer = subschema.get("$ref")?.as_str()?;
+        self.resolve_pointer(pointer)
+    }
+
+    /// Whether every local pointer inside `schema` names something that exists.
+    ///
+    /// One dangling pointer makes the compiler reject the entire tool call, so
+    /// an argument that contains one is better left permissive.
+    fn local_refs_resolve(self, schema: &Value) -> bool {
+        match schema {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    if matches!(key.as_str(), "$ref" | "$dynamicRef" | "$recursiveRef") {
+                        if let Some(pointer) = value.as_str() {
+                            if pointer.starts_with('#') && self.resolve_pointer(pointer).is_none() {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                map.values().all(|value| self.local_refs_resolve(value))
+            }
+            Value::Array(items) => items.iter().all(|item| self.local_refs_resolve(item)),
+            _ => true,
+        }
+    }
+
+    /// Return `subschema` with the definition blocks merged in, so any local
+    /// pointer inside it still resolves once it is compiled on its own.
+    ///
+    /// A subschema that declares its own block keeps every entry in it; the
+    /// root's entries fill in the names it does not define, so a property with
+    /// a partial block does not lose access to the rest of the tool's
+    /// definitions. Only schemas that actually reference something pay the
+    /// extra bytes.
+    fn attach(self, subschema: &Value) -> Value {
+        if self.is_empty() || !contains_local_ref(subschema) {
+            return subschema.clone();
+        }
+        let mut out = subschema.clone();
+        let Some(object) = out.as_object_mut() else {
+            return subschema.clone();
+        };
+        for (name, block) in [("$defs", self.defs), ("definitions", self.definitions)] {
+            let Some(Value::Object(root_entries)) = block else {
+                continue;
+            };
+            match object.get_mut(name) {
+                Some(Value::Object(own)) => {
+                    for (key, value) in root_entries {
+                        own.entry(key.clone()).or_insert_with(|| value.clone());
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    object.insert(name.to_string(), Value::Object(root_entries.clone()));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Whether `schema` contains a reference pointing inside its own document.
+///
+/// Covers `$ref` plus the `$dynamicRef` / `$recursiveRef` spellings, so a
+/// schema that uses one of the less common forms still gets the definition
+/// block attached rather than silently compiling against a dangling pointer.
+fn contains_local_ref(schema: &Value) -> bool {
+    match schema {
+        Value::Object(map) => {
+            let refs_locally = map.iter().any(|(key, value)| {
+                matches!(key.as_str(), "$ref" | "$dynamicRef" | "$recursiveRef")
+                    && value.as_str().is_some_and(|t| t.starts_with('#'))
+            });
+            refs_locally || map.values().any(contains_local_ref)
+        }
+        Value::Array(items) => items.iter().any(contains_local_ref),
+        _ => false,
+    }
+}
+
 /// Map a property schema to its XTML `type=` attribute and value grammar.
 /// K3 emits string bodies verbatim (no JSON quoting) while every other type is
 /// compact JSON, and it derives `type=` from the *value*, so `integer` becomes
 /// `number`.
-fn classify_arg(subschema: &Value) -> ArgShape {
+fn classify_arg(subschema: &Value, defs: RootDefs<'_>) -> ArgShape {
+    // A pointer naming something the schema does not contain would make the
+    // compiler reject the whole tool call, so keep such an argument permissive
+    // rather than emitting a grammar that cannot compile.
+    if !defs.local_refs_resolve(subschema) {
+        return ArgShape::Permissive;
+    }
+
+    // A `$ref` contributes the keywords its target declares, but a keyword on
+    // the property itself wins: in 2020-12 `$ref` applies *alongside* its
+    // siblings rather than replacing them. The subschema is still embedded
+    // whole further down, so the pointer and every sibling reach the compiler.
+    let target = defs.resolve_ref(subschema);
+    let keyword = |name: &str| {
+        subschema
+            .get(name)
+            .or_else(|| target.and_then(|schema| schema.get(name)))
+    };
+
     // A string `enum` constrains the raw body to one of the literals.
-    if let Some(values) = subschema.get("enum").and_then(Value::as_array) {
+    if let Some(values) = keyword("enum").and_then(Value::as_array) {
         if !values.is_empty() && values.iter().all(Value::is_string) {
             let options: Vec<Value> = values
                 .iter()
@@ -525,7 +690,7 @@ fn classify_arg(subschema: &Value) -> ArgShape {
         }
     }
 
-    match subschema.get("type").and_then(Value::as_str) {
+    match keyword("type").and_then(Value::as_str) {
         // Verbatim body -> json_schema (which expects quotes) cannot be used.
         Some("string") => ArgShape::Fixed {
             type_attr: "string",
@@ -533,7 +698,7 @@ fn classify_arg(subschema: &Value) -> ArgShape {
         },
         Some("integer") | Some("number") => ArgShape::Fixed {
             type_attr: "number",
-            value: json!({ "type": "json_schema", "json_schema": subschema }),
+            value: json!({ "type": "json_schema", "json_schema": defs.attach(subschema) }),
         },
         Some("boolean") => ArgShape::Fixed {
             type_attr: "boolean",
@@ -541,11 +706,11 @@ fn classify_arg(subschema: &Value) -> ArgShape {
         },
         Some("object") => ArgShape::Fixed {
             type_attr: "object",
-            value: json!({ "type": "json_schema", "json_schema": subschema }),
+            value: json!({ "type": "json_schema", "json_schema": defs.attach(subschema) }),
         },
         Some("array") => ArgShape::Fixed {
             type_attr: "array",
-            value: json!({ "type": "json_schema", "json_schema": subschema }),
+            value: json!({ "type": "json_schema", "json_schema": defs.attach(subschema) }),
         },
         Some("null") => ArgShape::Fixed {
             type_attr: "null",
@@ -1005,6 +1170,305 @@ mod tests {
             }
         }]))
         .unwrap()
+    }
+
+    /// Build a structural tag from one tool whose parameters are `params`.
+    fn tag_for_params(params: serde_json::Value) -> Value {
+        let tools: Vec<Tool> = serde_json::from_value(serde_json::json!([{
+            "type": "function",
+            "function": { "name": "f", "parameters": params }
+        }]))
+        .unwrap();
+        KimiK3Parser::build_structural_tag(&tools, true)
+    }
+
+    /// Collect every `json_schema` payload embedded in the structural tag.
+    fn embedded_schemas(node: &Value, out: &mut Vec<Value>) {
+        match node {
+            Value::Object(map) => {
+                if map.get("type").and_then(Value::as_str) == Some("json_schema") {
+                    if let Some(schema) = map.get("json_schema") {
+                        out.push(schema.clone());
+                    }
+                }
+                for value in map.values() {
+                    embedded_schemas(value, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    embedded_schemas(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn schemas_in(tag: &Value) -> Vec<Value> {
+        let mut out = Vec::new();
+        embedded_schemas(tag, &mut out);
+        out
+    }
+
+    // ---- $defs / $ref propagation -------------------------------------
+    //
+    // Every embedded `json_schema` is compiled as its own document, so a
+    // `#/$defs/...` pointer inside one only resolves if the definition block
+    // travels with it. These shapes are taken from the walle validator cases
+    // that the Kimi vendor verifier runs (TestRefInProperties, TestReferences,
+    // TestNestedDefsDepth), each of which failed the whole tool call with
+    // "Cannot find field $defs" before the block was carried across.
+
+    #[test]
+    fn nested_ref_inside_array_items_carries_defs() {
+        let tag = tag_for_params(serde_json::json!({
+            "type": "object",
+            "$defs": { "Tag": {"type": "string"} },
+            "properties": {
+                "tags": {"type": "array", "items": {"$ref": "#/$defs/Tag"}}
+            },
+            "required": ["tags"]
+        }));
+
+        let schemas = schemas_in(&tag);
+        assert!(!schemas.is_empty(), "array argument should embed a schema");
+        for schema in &schemas {
+            assert!(
+                schema.get("$defs").is_some(),
+                "embedded schema must carry $defs: {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_ref_property_resolves_to_its_definition() {
+        let tag = tag_for_params(serde_json::json!({
+            "type": "object",
+            "$defs": {
+                "Address": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}}
+                }
+            },
+            "properties": { "address": {"$ref": "#/$defs/Address"} },
+            "required": ["address"]
+        }));
+
+        // Resolving the ref lets the argument be typed rather than falling
+        // through to the permissive shape.
+        let rendered = serde_json::to_string(&tag).unwrap();
+        assert!(
+            rendered.contains(r#"type=\"object\""#),
+            "bare $ref should classify as object: {rendered}"
+        );
+        assert!(!schemas_in(&tag).is_empty());
+    }
+
+    #[test]
+    fn recursive_definition_does_not_loop() {
+        // `Node.next` points back at `Node`; resolution follows one hop only
+        // and the block travels with the schema for the compiler to expand.
+        let tag = tag_for_params(serde_json::json!({
+            "type": "object",
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "string"},
+                        "next": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/Node"}]}
+                    }
+                }
+            },
+            "properties": { "node": {"$ref": "#/$defs/Node"} },
+            "required": ["node"]
+        }));
+
+        for schema in schemas_in(&tag) {
+            assert!(
+                schema.get("$defs").is_some(),
+                "recursive schema must keep $defs: {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_into_a_definition_subpath_resolves() {
+        // `#/$defs/group/items` addresses a node *inside* a definition.
+        let tag = tag_for_params(serde_json::json!({
+            "type": "object",
+            "$defs": {
+                "group": {
+                    "type": "array",
+                    "items": {"type": "object", "properties": {"data": {"type": "string"}}}
+                }
+            },
+            "properties": { "root": {"$ref": "#/$defs/group/items"} },
+            "required": ["root"]
+        }));
+
+        let rendered = serde_json::to_string(&tag).unwrap();
+        assert!(
+            rendered.contains(r#"type=\"object\""#),
+            "sub-path pointer should resolve to the object it names: {rendered}"
+        );
+    }
+
+    #[test]
+    fn draft07_definitions_block_is_also_carried() {
+        let tag = tag_for_params(serde_json::json!({
+            "type": "object",
+            "definitions": { "Item": {"type": "string"} },
+            "properties": {
+                "items": {"type": "array", "items": {"$ref": "#/definitions/Item"}}
+            },
+            "required": ["items"]
+        }));
+
+        for schema in schemas_in(&tag) {
+            assert!(
+                schema.get("definitions").is_some(),
+                "embedded schema must carry definitions: {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_without_refs_is_left_untouched() {
+        let tag = tag_for_params(serde_json::json!({
+            "type": "object",
+            "$defs": { "Unused": {"type": "string"} },
+            "properties": { "payload": {"type": "object", "properties": {"a": {"type": "string"}}} },
+            "required": ["payload"]
+        }));
+
+        for schema in schemas_in(&tag) {
+            assert!(
+                schema.get("$defs").is_none(),
+                "a schema with no $ref should not be padded with $defs: {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_ref_spelling_also_carries_defs() {
+        // `$dynamicRef` orphans just as `$ref` does when the property is
+        // sliced out of the parameters document.
+        let tag = tag_for_params(serde_json::json!({
+            "type": "object",
+            "$defs": { "Item": {"type": "string"} },
+            "properties": {
+                "items": {"type": "array", "items": {"$dynamicRef": "#/$defs/Item"}}
+            },
+            "required": ["items"]
+        }));
+
+        for schema in schemas_in(&tag) {
+            assert!(
+                schema.get("$defs").is_some(),
+                "$dynamicRef must also pull the block across: {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn child_defs_block_keeps_root_definitions_too() {
+        // A property that declares a partial block of its own must not lose
+        // access to the rest of the tool's definitions.
+        let tag = tag_for_params(serde_json::json!({
+            "type": "object",
+            "$defs": { "Root": {"type": "string"} },
+            "properties": {
+                "p": {
+                    "type": "object",
+                    "$defs": { "Local": {"type": "number"} },
+                    "properties": { "x": {"$ref": "#/$defs/Root"} }
+                }
+            },
+            "required": ["p"]
+        }));
+
+        let schemas = schemas_in(&tag);
+        assert!(!schemas.is_empty());
+        for schema in &schemas {
+            let defs = schema["$defs"].as_object().expect("block present");
+            assert!(defs.contains_key("Local"), "own entry kept: {schema}");
+            assert!(defs.contains_key("Root"), "root entry merged in: {schema}");
+        }
+    }
+
+    #[test]
+    fn root_pointer_resolves_to_the_parameter_schema() {
+        // `"$ref": "#"` names the root schema — a root-recursive property.
+        let tag = tag_for_params(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "child": {"$ref": "#"}
+            },
+            "required": ["child"]
+        }));
+
+        let rendered = serde_json::to_string(&tag).unwrap();
+        assert!(
+            rendered.contains(r#"key=\"child\" type=\"object\""#),
+            "root pointer should classify as object: {rendered}"
+        );
+    }
+
+    #[test]
+    fn sibling_type_wins_over_the_referenced_definition() {
+        // In 2020-12 `$ref` applies alongside its siblings; a `type` on the
+        // property itself must not be discarded with the pointer.
+        let tag = tag_for_params(serde_json::json!({
+            "type": "object",
+            "$defs": { "Payload": {"properties": {"a": {"type": "string"}}} },
+            "properties": {
+                "p": {"$ref": "#/$defs/Payload", "type": "object"}
+            },
+            "required": ["p"]
+        }));
+
+        let rendered = serde_json::to_string(&tag).unwrap();
+        assert!(
+            rendered.contains(r#"key=\"p\" type=\"object\""#),
+            "sibling type should be honoured: {rendered}"
+        );
+        // The pointer itself still reaches the compiler.
+        for schema in schemas_in(&tag) {
+            assert_eq!(schema["$ref"], "#/$defs/Payload");
+            assert!(schema.get("$defs").is_some());
+        }
+    }
+
+    #[test]
+    fn nested_dangling_pointer_falls_back_to_permissive() {
+        // The pointer sits inside `items`, not at the top of the property, and
+        // names something the block does not contain.
+        let tag = tag_for_params(serde_json::json!({
+            "type": "object",
+            "$defs": { "Tag": {"type": "string"} },
+            "properties": {
+                "tags": {"type": "array", "items": {"$ref": "#/$defs/Missing"}}
+            },
+            "required": ["tags"]
+        }));
+
+        assert!(
+            schemas_in(&tag).is_empty(),
+            "an unresolvable nested pointer must not be embedded"
+        );
+    }
+
+    #[test]
+    fn dangling_ref_falls_back_to_permissive() {
+        // Nothing to resolve against: the argument stays unconstrained rather
+        // than emitting a grammar the compiler will reject.
+        let tag = tag_for_params(serde_json::json!({
+            "type": "object",
+            "properties": { "x": {"$ref": "#/$defs/Missing"} },
+            "required": ["x"]
+        }));
+        assert!(schemas_in(&tag).is_empty());
     }
 
     #[test]
