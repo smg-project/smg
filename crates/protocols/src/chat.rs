@@ -70,6 +70,14 @@ pub enum ChatMessage {
         #[serde(flatten)]
         ext: KimiDeveloperExt,
     },
+    /// MiniMax extension: top-priority instruction message, above system.
+    /// Normalized to a system message for dispatch; rejected by other profiles.
+    #[serde(rename = "root")]
+    Root {
+        #[serde(default)]
+        content: MessageContent,
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
@@ -714,7 +722,8 @@ impl GenerationRequest for ChatCompletionRequest {
                 ChatMessage::System { content, .. }
                 | ChatMessage::User { content, .. }
                 | ChatMessage::Tool { content, .. }
-                | ChatMessage::Developer { content, .. } => {
+                | ChatMessage::Developer { content, .. }
+                | ChatMessage::Root { content, .. } => {
                     if has_content && content.has_text() {
                         buffer.push(' ');
                     }

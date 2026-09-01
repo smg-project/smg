@@ -255,6 +255,7 @@ pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<()
     for message in messages {
         let content = match message {
             ChatMessage::System { content, .. }
+            | ChatMessage::Root { content, .. }
             | ChatMessage::User { content, .. }
             | ChatMessage::Tool { content, .. }
             | ChatMessage::Developer { content, .. } => Some(content),
