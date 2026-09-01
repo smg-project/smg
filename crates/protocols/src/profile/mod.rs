@@ -15,6 +15,7 @@
 //! by that pass and are forwarded as sent.
 
 mod kimi;
+mod minimax;
 
 use crate::{
     chat::{ChatCompletionRequest, ChatMessage},
@@ -101,7 +102,8 @@ impl ProviderProfile {
     ) -> Result<(), validator::ValidationError> {
         match self {
             ProviderProfile::Kimi => kimi::validate_chat(req),
-            ProviderProfile::OpenAi | ProviderProfile::Minimax => Ok(()),
+            ProviderProfile::Minimax => minimax::validate_chat(req),
+            ProviderProfile::OpenAi => Ok(()),
         }
     }
 }
