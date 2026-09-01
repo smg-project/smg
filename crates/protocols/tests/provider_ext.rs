@@ -106,8 +106,8 @@ fn parsed_system_message_exposes_dynamic_tools() {
     }))
     .unwrap();
     match msg {
-        ChatMessage::System { kimi, .. } => {
-            let tools = kimi.tools.expect("tools parsed");
+        ChatMessage::System { ext, .. } => {
+            let tools = ext.tools.expect("tools parsed");
             assert_eq!(tools.len(), 1);
             assert_eq!(tools[0].function.name, "get_time");
         }
@@ -179,9 +179,9 @@ fn system_message_without_content_defaults_to_empty() {
     }))
     .expect("tools-only system message deserializes");
     match msg {
-        ChatMessage::System { content, kimi, .. } => {
+        ChatMessage::System { content, ext, .. } => {
             assert_eq!(content.to_simple_string(), "");
-            assert!(kimi.tools.is_some());
+            assert!(ext.tools.is_some());
         }
         other => panic!("expected system message, got {other:?}"),
     }

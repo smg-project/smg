@@ -158,7 +158,6 @@ mod tests {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        minimax: Default::default(),
                         url: "https://example.com/cat.jpg".to_string(),
                         detail: None,
                         max_long_side_pixel: None,
@@ -176,7 +175,6 @@ mod tests {
         let messages = vec![ChatMessage::User {
             content: MessageContent::Parts(vec![ContentPart::VideoUrl {
                 video_url: VideoUrl {
-                    minimax: Default::default(),
                     url: "https://example.com/clip.mp4".to_string(),
                     fps: None,
                     max_long_side_pixel: None,
@@ -228,7 +226,7 @@ mod tests {
     fn extracts_image_media_part() {
         let messages = vec![
             ChatMessage::System {
-                kimi: Default::default(),
+                ext: Default::default(),
                 content: MessageContent::Text("You are helpful".to_string()),
                 name: None,
             },
@@ -239,7 +237,6 @@ mod tests {
                     },
                     ContentPart::ImageUrl {
                         image_url: ImageUrl {
-                            minimax: Default::default(),
                             url: "https://example.com/image.jpg".to_string(),
                             detail: Some("high".to_string()),
                             max_long_side_pixel: None,
@@ -267,7 +264,6 @@ mod tests {
         let messages = vec![ChatMessage::User {
             content: MessageContent::Parts(vec![ContentPart::VideoUrl {
                 video_url: VideoUrl {
-                    minimax: Default::default(),
                     url: "https://example.com/video.mp4".to_string(),
                     fps: None,
                     max_long_side_pixel: None,

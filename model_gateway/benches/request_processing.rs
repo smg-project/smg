@@ -156,7 +156,7 @@ fn create_sample_chat_completion_request() -> ChatCompletionRequest {
         model: "gpt-3.5-turbo".to_string(),
         messages: vec![
             ChatMessage::System {
-                kimi: Default::default(),
+                ext: Default::default(),
                 content: MessageContent::Text("You are a helpful assistant".to_string()),
                 name: None,
             },
@@ -197,7 +197,7 @@ fn create_sample_completion_request() -> CompletionRequest {
 #[allow(deprecated)]
 fn create_large_chat_completion_request() -> ChatCompletionRequest {
     let mut messages = vec![ChatMessage::System {
-        kimi: Default::default(),
+        ext: Default::default(),
         content: MessageContent::Text(
             "You are a helpful assistant with extensive knowledge.".to_string(),
         ),

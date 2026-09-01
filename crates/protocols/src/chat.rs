@@ -34,7 +34,7 @@ pub enum ChatMessage {
         content: MessageContent,
         name: Option<String>,
         #[serde(flatten)]
-        kimi: KimiSystemExt,
+        ext: KimiSystemExt,
     },
     #[serde(rename = "user")]
     User {
@@ -483,8 +483,8 @@ fn validate_chat_cross_parameters(
         // Dynamic tools on system messages count as tools (Kimi K3)
         let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty())
             || req.messages.iter().any(|m| {
-                matches!(m, ChatMessage::System { kimi, .. }
-                    if kimi.tools.as_ref().is_some_and(|t| !t.is_empty()))
+                matches!(m, ChatMessage::System { ext, .. }
+                    if ext.tools.as_ref().is_some_and(|t| !t.is_empty()))
             });
 
         let requires_tools = !matches!(

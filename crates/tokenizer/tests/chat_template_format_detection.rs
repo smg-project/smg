@@ -176,7 +176,7 @@ assistant:
         ChatMessage::System {
             content: MessageContent::Text("You are helpful".to_string()),
             name: None,
-            kimi: Default::default(),
+            ext: Default::default(),
         },
         ChatMessage::User {
             content: MessageContent::Text("Hello".to_string()),
