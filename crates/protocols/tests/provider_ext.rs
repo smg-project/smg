@@ -300,3 +300,37 @@ fn kimi_and_openai_tolerate_loose_tool_history() {
         );
     }
 }
+
+#[test]
+fn minimax_normalizes_root_to_leading_system() {
+    use openai_protocol::validated::Normalizable;
+    let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "MiniMax-M3",
+        "messages": [
+            {"role": "root", "content": "top priority"},
+            {"role": "user", "content": "hi"}
+        ]
+    }))
+    .expect("root role deserializes");
+    req.normalize();
+    assert!(req.validate().is_ok());
+
+    let out = serde_json::to_value(&req).expect("serializes");
+    assert_eq!(out["messages"][0]["role"], json!("system"));
+    assert_eq!(out["messages"][0]["content"], json!("top priority"));
+}
+
+#[test]
+fn kimi_and_openai_reject_root_role() {
+    for model in ["kimi-k3", "gpt-4o-mini"] {
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": model,
+            "messages": [
+                {"role": "root", "content": "x"},
+                {"role": "user", "content": "hi"}
+            ]
+        }))
+        .expect("root role deserializes");
+        assert!(req.validate().is_err(), "{model} must reject role root");
+    }
+}

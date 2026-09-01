@@ -38,7 +38,8 @@ fn reject_chat_audio(messages: &[ChatMessage]) -> Result<(), String> {
         ChatMessage::System { content, .. }
         | ChatMessage::User { content, .. }
         | ChatMessage::Tool { content, .. }
-        | ChatMessage::Developer { content, .. } => content_contains_audio(content),
+        | ChatMessage::Developer { content, .. }
+        | ChatMessage::Root { content, .. } => content_contains_audio(content),
         ChatMessage::Assistant { content, .. } => {
             content.as_ref().is_some_and(content_contains_audio)
         }
@@ -953,7 +954,7 @@ impl HarmonyBuilder {
 
         for msg in messages {
             match msg {
-                ChatMessage::System { content, name, .. } => {
+                ChatMessage::System { content, name, .. } | ChatMessage::Root { content, name } => {
                     // System messages stay as-is
                     let harmony_msg = HarmonyMessage {
                         author: Author {

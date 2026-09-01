@@ -42,11 +42,36 @@ impl ProviderProfile {
         req: &ChatCompletionRequest,
     ) -> Result<(), validator::ValidationError> {
         match self {
-            ProviderProfile::Kimi => kimi::validate_chat(req),
+            ProviderProfile::Kimi => {
+                reject_root(req)?;
+                kimi::validate_chat(req)
+            }
             ProviderProfile::Minimax => minimax::validate_chat(req),
-            ProviderProfile::OpenAi => Ok(()),
+            ProviderProfile::OpenAi => reject_root(req),
         }
     }
+
+    /// Profile-specific request rewrites, applied before validation.
+    pub fn normalize_chat(self, req: &mut ChatCompletionRequest) {
+        if self == ProviderProfile::Minimax {
+            minimax::normalize_chat(req);
+        }
+    }
+}
+
+/// The `root` role is a MiniMax-only extension; other dialects reject it the
+/// way their reference APIs do.
+fn reject_root(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
+    if req
+        .messages
+        .iter()
+        .any(|m| matches!(m, crate::chat::ChatMessage::Root { .. }))
+    {
+        let mut e = validator::ValidationError::new("invalid_role");
+        e.message = Some("invalid role: root".into());
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

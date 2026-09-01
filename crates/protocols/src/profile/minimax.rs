@@ -49,6 +49,21 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
     Ok(())
 }
 
+/// Rewrite `root` messages to system messages for dispatch: upstream MiniMax
+/// serving stacks take the top-priority instruction as the leading system
+/// message, and api.minimax.io itself rejects the literal role.
+pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
+    for msg in &mut req.messages {
+        if let ChatMessage::Root { content, name } = msg {
+            *msg = ChatMessage::System {
+                content: std::mem::take(content),
+                name: name.take(),
+                ext: Default::default(),
+            };
+        }
+    }
+}
+
 fn error(code: &'static str, message: String) -> validator::ValidationError {
     let mut e = validator::ValidationError::new(code);
     e.message = Some(message.into());

@@ -67,6 +67,14 @@ pub enum ChatMessage {
         tools: Option<Vec<Tool>>,
         name: Option<String>,
     },
+    /// MiniMax extension: top-priority instruction message, above system.
+    /// Normalized to a system message for dispatch; rejected by other profiles.
+    #[serde(rename = "root")]
+    Root {
+        #[serde(default)]
+        content: MessageContent,
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
@@ -599,6 +607,8 @@ impl Normalizable for ChatCompletionRequest {
     /// 2. Clear deprecated fields and log warnings
     /// 3. Apply OpenAI defaults for tool_choice
     fn normalize(&mut self) {
+        ProviderProfile::for_model(&self.model).normalize_chat(self);
+
         // Migrate deprecated max_tokens → max_completion_tokens
         #[expect(deprecated)]
         if self.max_completion_tokens.is_none() && self.max_tokens.is_some() {
@@ -680,7 +690,8 @@ impl GenerationRequest for ChatCompletionRequest {
                 ChatMessage::System { content, .. }
                 | ChatMessage::User { content, .. }
                 | ChatMessage::Tool { content, .. }
-                | ChatMessage::Developer { content, .. } => {
+                | ChatMessage::Developer { content, .. }
+                | ChatMessage::Root { content, .. } => {
                     if has_content && content.has_text() {
                         buffer.push(' ');
                     }
