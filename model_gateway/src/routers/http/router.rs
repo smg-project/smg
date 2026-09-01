@@ -22,6 +22,7 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::CreateMessageRequest,
+    profile::ProviderProfile,
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
         RealtimeTranscriptionSessionCreateRequest,
@@ -62,6 +63,7 @@ use crate::{
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, is_retryable_status, RetryExecutor},
             sse::SSE_CHANNEL_BUFFER,
+            sse_rechunk::SseRechunker,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
@@ -90,6 +92,13 @@ const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 const STREAMED_BODY_STALLED: &str = "request_body_stalled";
 const STREAMED_BODY_TOO_LARGE: &str = "request_body_too_large";
 const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
+
+/// How a worker response body is relayed to the client.
+#[derive(Clone, Copy)]
+struct StreamRelayMode {
+    is_stream: bool,
+    rechunk: bool,
+}
 
 /// Regular router that uses injected load balancing policies
 pub struct Router {
@@ -557,12 +566,17 @@ impl Router {
                 // the lease frees the parsed request and its routing
                 // derivatives now when retries are disabled.
                 lease.release_dispatch();
+                let mode = StreamRelayMode {
+                    is_stream,
+                    rechunk: is_stream
+                        && ProviderProfile::for_model(model_id) == ProviderProfile::Minimax,
+                };
                 self.send_serialized_request(
                     headers,
                     body,
                     route,
                     worker.as_ref(),
-                    is_stream,
+                    mode,
                     load_guard,
                 )
                 .await
@@ -1141,7 +1155,7 @@ impl Router {
         body: Bytes,
         route: &'static str,
         worker: &dyn Worker,
-        is_stream: bool,
+        mode: StreamRelayMode,
         load_guard: WorkerLoadGuard,
     ) -> Response {
         let api_key = worker.api_key().cloned();
@@ -1175,20 +1189,23 @@ impl Router {
             }
         };
 
-        self.forward_worker_response(res, is_stream, worker.url(), load_guard)
+        self.forward_worker_response(res, mode, worker.url(), load_guard)
             .await
     }
 
     /// Relay a worker response to the client. A streaming response flows
     /// through a bounded channel with the load guard attached to the body; a
-    /// buffered response is read capped at the ingress payload limit.
+    /// buffered response is read capped at the ingress payload limit. With
+    /// `rechunk`, SSE delta payloads are re-sliced to the provider's
+    /// packet-size contract.
     async fn forward_worker_response(
         &self,
         res: reqwest::Response,
-        is_stream: bool,
+        mode: StreamRelayMode,
         worker_url: &str,
         load_guard: WorkerLoadGuard,
     ) -> Response {
+        let StreamRelayMode { is_stream, rechunk } = mode;
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -1201,6 +1218,12 @@ impl Router {
                     .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
             }
 
+            let upstream_sse = res
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("text/event-stream"));
+            let mut rechunker = (rechunk && upstream_sse).then(SseRechunker::new);
             let stream = res.bytes_stream();
             // Bounded channel applies backpressure: a slow client makes the
             // relay await on `send` instead of buffering the whole response.
@@ -1220,15 +1243,35 @@ impl Router {
                             // not become an empty h2 DATA frame toward the client.
                             Some(Ok(bytes)) if bytes.is_empty() => {}
                             Some(Ok(bytes)) => {
-                                if tx.send(Ok(bytes)).await.is_err() {
+                                let bytes = match rechunker.as_mut() {
+                                    Some(r) => r.feed(&bytes),
+                                    None => bytes,
+                                };
+                                if !bytes.is_empty() && tx.send(Ok(bytes)).await.is_err() {
                                     break;
                                 }
                             }
                             Some(Err(e)) => {
+                                if let Some(tail) =
+                                    rechunker.as_mut().map(SseRechunker::finish)
+                                {
+                                    if !tail.is_empty() {
+                                        let _ = tx.send(Ok(tail)).await;
+                                    }
+                                }
                                 let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                                 break;
                             }
-                            None => break,
+                            None => {
+                                if let Some(tail) =
+                                    rechunker.as_mut().map(SseRechunker::finish)
+                                {
+                                    if !tail.is_empty() {
+                                        let _ = tx.send(Ok(tail)).await;
+                                    }
+                                }
+                                break;
+                            }
                         },
                         // Client gone with no chunk in flight (long prefill,
                         // stalled upstream): break so the reqwest stream drops,
@@ -1371,8 +1414,16 @@ impl Router {
             .get(CONTENT_TYPE)
             .and_then(|ct| ct.to_str().ok())
             .is_some_and(|ct| ct.starts_with("text/event-stream"));
-        self.forward_worker_response(res, is_stream, worker.url(), load_guard)
-            .await
+        self.forward_worker_response(
+            res,
+            StreamRelayMode {
+                is_stream,
+                rechunk: false,
+            },
+            worker.url(),
+            load_guard,
+        )
+        .await
     }
 
     /// Build the public rerank response.

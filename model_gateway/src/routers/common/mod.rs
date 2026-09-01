@@ -49,6 +49,7 @@ pub use smg_external_router::realtime;
 pub mod request_lease;
 pub(crate) use smg_external_router::sglang_fields;
 pub use smg_external_router::{retry, sse};
+pub(crate) mod sse_rechunk;
 pub mod worker_selection;
 
 /// Threshold above which upstream request bodies are sent as one-shot
