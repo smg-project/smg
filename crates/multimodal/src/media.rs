@@ -454,7 +454,9 @@ impl MediaConnector {
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
         validate_max_long_side_pixel(max_long_side_pixel)?;
         ensure_input_byte_limit(bytes.len(), image_max_input_bytes(), "image")?;
-        let hash = crate::hasher::hash_image(&bytes);
+        // The cap changes the decoded pixels, so it has to be part of the
+        // identity the pixel cache and the backend's mm cache key off.
+        let hash = crate::hasher::hash_image_with_resolution_cap(&bytes, max_long_side_pixel);
 
         // Decode JPEGs through libjpeg-turbo (PIL-compatible defaults: accurate
         // IDCT + fancy upsampling) so pixel values match vLLM bit-for-bit; the
@@ -2476,6 +2478,36 @@ mod max_long_side_pixel_tests {
         // The cap only ever removes resolution; it must not upscale.
         let original = apply_max_long_side_pixel(image(200, 100), Some(1008));
         assert_eq!((original.width(), original.height()), (200, 100));
+    }
+
+    #[test]
+    fn different_caps_hash_differently() {
+        // The pixel cache and the backend's mm cache key off this hash; two
+        // tiers of the same bytes must not collide.
+        let bytes = b"fake-encoded-image-bytes";
+        let low = crate::hasher::hash_image_with_resolution_cap(bytes, Some(252));
+        let high = crate::hasher::hash_image_with_resolution_cap(bytes, Some(1008));
+        assert_ne!(low, high);
+    }
+
+    #[test]
+    fn absent_cap_keeps_the_plain_byte_hash() {
+        // Uncapped requests keep their existing identity so cached entries
+        // stay valid.
+        let bytes = b"fake-encoded-image-bytes";
+        assert_eq!(
+            crate::hasher::hash_image_with_resolution_cap(bytes, None),
+            crate::hasher::hash_image(bytes)
+        );
+    }
+
+    #[test]
+    fn same_cap_hashes_stably() {
+        let bytes = b"fake-encoded-image-bytes";
+        assert_eq!(
+            crate::hasher::hash_image_with_resolution_cap(bytes, Some(504)),
+            crate::hasher::hash_image_with_resolution_cap(bytes, Some(504))
+        );
     }
 
     #[test]

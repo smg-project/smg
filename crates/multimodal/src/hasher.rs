@@ -5,6 +5,29 @@ pub fn hash_image(raw_bytes: &[u8]) -> String {
     blake3::hash(raw_bytes).to_hex().to_string()
 }
 
+/// Compute a blake3 hex-digest hash for an image whose decoded pixels depend on
+/// a per-request resolution cap.
+///
+/// The hash identifies the *decoded* image, not the encoded payload: the same
+/// bytes under a different `max_long_side_pixel` preprocess to different
+/// pixels, and both the gateway's pixel cache and the `mm_hashes` handed to the
+/// backend key off this value. Folding the cap in keeps those caches from
+/// serving one resolution tier's tensors for another.
+pub fn hash_image_with_resolution_cap(
+    raw_bytes: &[u8],
+    max_long_side_pixel: Option<u32>,
+) -> String {
+    let Some(cap) = max_long_side_pixel else {
+        // No cap: keep the plain byte hash so existing entries stay valid.
+        return hash_image(raw_bytes);
+    };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(raw_bytes);
+    hasher.update(b"max_long_side_pixel=");
+    hasher.update(&cap.to_le_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 /// TODO(yechan): Decide whether video hashes should cover the full encoded
 /// payload or a normalized representation of the sampled frames.
 /// Compute a blake3 hex-digest hash for a single video's raw bytes.

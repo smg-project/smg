@@ -818,6 +818,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "https://example.com/image.jpg".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
                 ContentPart::Text {
@@ -854,6 +855,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "https://example.com/image.png".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -905,6 +907,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "image".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
                 ContentPart::AudioUrl {
@@ -1004,6 +1007,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "https://example.com/image.jpg".to_string(),
                         detail: Some("high".to_string()),
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -1068,6 +1072,7 @@ mod tests {
                         image_url: ImageUrl {
                             url: "https://example.com/image.jpg".to_string(),
                             detail: None,
+                            max_long_side_pixel: None,
                         },
                     },
                 ]),
@@ -1101,6 +1106,7 @@ mod tests {
                 image_url: ImageUrl {
                     url: "https://example.com/image.jpg".to_string(),
                     detail: None,
+                    max_long_side_pixel: None,
                 },
             }]),
             name: None,
@@ -1133,6 +1139,7 @@ mod tests {
                         image_url: ImageUrl {
                             url: "https://example.com/image.jpg".to_string(),
                             detail: Some("low".to_string()),
+                            max_long_side_pixel: None,
                         },
                     },
                 ]),
@@ -1177,6 +1184,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "data:image/jpeg;base64,XXX".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -1202,6 +1210,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "data:image/jpeg;base64,XXX".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -1230,6 +1239,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "i1".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
                 ContentPart::Text {
@@ -1239,6 +1249,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "i2".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -1265,6 +1276,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "image".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -1315,6 +1327,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "image".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -1427,6 +1440,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "data:image/jpeg;base64,XXX".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),

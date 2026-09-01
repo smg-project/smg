@@ -8,26 +8,47 @@ use crate::{
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
 };
 
+/// Maximum images accepted in one request (MiniMax-M3 spec 1.3.6).
+const MAX_IMAGES_PER_REQUEST: usize = 200;
+
+/// Maximum videos accepted in one request (MiniMax-M3 spec 1.3.6).
+const MAX_VIDEOS_PER_REQUEST: usize = 20;
+
 /// MiniMax-M3 vision spec.
 ///
 /// M3's media tokens carry the same `]<]...[>[` namespace framing as its tool
 /// calls. Unlike the Qwen templates, M3's chat template renders a bare
-/// `]<]image[>[` with no surrounding markers, so this spec owns the whole
-/// wrapper: each placeholder expands to
-/// `]<]start of image[>[` + N * `]<]image[>[` + `]<]end of image[>[`,
-/// with N = `grid_t * grid_h * grid_w / merge_size^2`. That mirrors vLLM's
+/// `]<]image[>[` (or `]<]video[>[`) with no surrounding markers, so this spec
+/// owns the whole wrapper: each placeholder expands to
+/// `<start> + N * <pad> + <end>`, with
+/// N = `grid_t * grid_h * grid_w / merge_size^2`. That mirrors vLLM's
 /// `_get_prompt_updates`, which builds
 /// `[start_token_id] + [image_token_id] * N + [end_token_id]`.
-/// Maximum images accepted in one request (MiniMax-M3 spec 1.3.6).
-const MAX_IMAGES_PER_REQUEST: usize = 200;
-
+///
+/// The start/end markers are modality-specific: M3's vocabulary carries a
+/// separate `]<]start of video[>[` / `]<]end of video[>[` pair alongside the
+/// image one, unlike Qwen's modality-neutral `<|vision_start|>`.
 pub(super) struct MiniMaxM3VisionSpec;
 
 impl MiniMaxM3VisionSpec {
     const IMAGE_TOKEN: &'static str = "]<]image[>[";
     const VIDEO_TOKEN: &'static str = "]<]video[>[";
-    const VISION_START_TOKEN: &'static str = "]<]start of image[>[";
-    const VISION_END_TOKEN: &'static str = "]<]end of image[>[";
+    const IMAGE_START_TOKEN: &'static str = "]<]start of image[>[";
+    const IMAGE_END_TOKEN: &'static str = "]<]end of image[>[";
+    const VIDEO_START_TOKEN: &'static str = "]<]start of video[>[";
+    const VIDEO_END_TOKEN: &'static str = "]<]end of video[>[";
+
+    /// The structural markers wrapping one modality's feature run.
+    fn wrapper_tokens(modality: Modality) -> RegistryResult<(&'static str, &'static str)> {
+        match modality {
+            Modality::Image => Ok((Self::IMAGE_START_TOKEN, Self::IMAGE_END_TOKEN)),
+            Modality::Video => Ok((Self::VIDEO_START_TOKEN, Self::VIDEO_END_TOKEN)),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: "minimax_m3",
+                modality,
+            }),
+        }
+    }
 
     /// The repeated feature token for images.
     ///
@@ -62,8 +83,9 @@ impl MiniMaxM3VisionSpec {
         pad_token_id: TokenId,
         num_tokens: usize,
     ) -> RegistryResult<PromptReplacement> {
-        let start_id = metadata.token_id(Self::VISION_START_TOKEN)?;
-        let end_id = metadata.token_id(Self::VISION_END_TOKEN)?;
+        let (start_token, end_token) = Self::wrapper_tokens(modality)?;
+        let start_id = metadata.token_id(start_token)?;
+        let end_id = metadata.token_id(end_token)?;
 
         let mut tokens = Vec::with_capacity(num_tokens + 2);
         tokens.push(start_id);
@@ -74,8 +96,14 @@ impl MiniMaxM3VisionSpec {
             PromptReplacement::sequence(modality, placeholder_token, tokens)
                 // The encoder features occupy only the padded middle; the two
                 // markers around them are structural.
-                .with_feature_span(1, num_tokens)
-                .with_structural_prefix(1),
+                //
+                // `structural_prefix` stays 0: it counts markers the chat
+                // template emits *before* the placeholder, which `expand_tokens`
+                // folds in by widening the range backwards without re-emitting
+                // them. M3's template emits a bare placeholder and both markers
+                // are inside `tokens`, so a non-zero prefix would report a range
+                // starting one token too early.
+                .with_feature_span(1, num_tokens),
         )
     }
 
@@ -164,7 +192,7 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         // above the Qwen-family default of 10.
         let mut limits = HashMap::from([(Modality::Image, MAX_IMAGES_PER_REQUEST)]);
         if Self::supports_video(metadata) {
-            limits.insert(Modality::Video, 1);
+            limits.insert(Modality::Video, MAX_VIDEOS_PER_REQUEST);
         }
         Ok(limits)
     }
@@ -251,8 +279,10 @@ mod tests {
     /// Vocabulary ids for M3's media markers, as the checkpoint declares them.
     const IMAGE_ID: TokenId = 200_025;
     const VIDEO_ID: TokenId = 200_026;
-    const START_ID: TokenId = 200_027;
-    const END_ID: TokenId = 200_028;
+    const IMAGE_START_ID: TokenId = 200_029;
+    const IMAGE_END_ID: TokenId = 200_030;
+    const VIDEO_START_ID: TokenId = 200_031;
+    const VIDEO_END_ID: TokenId = 200_032;
 
     struct M3Tokenizer;
 
@@ -261,8 +291,10 @@ mod tests {
             match token {
                 MiniMaxM3VisionSpec::IMAGE_TOKEN => Some(IMAGE_ID as u32),
                 MiniMaxM3VisionSpec::VIDEO_TOKEN => Some(VIDEO_ID as u32),
-                MiniMaxM3VisionSpec::VISION_START_TOKEN => Some(START_ID as u32),
-                MiniMaxM3VisionSpec::VISION_END_TOKEN => Some(END_ID as u32),
+                MiniMaxM3VisionSpec::IMAGE_START_TOKEN => Some(IMAGE_START_ID as u32),
+                MiniMaxM3VisionSpec::IMAGE_END_TOKEN => Some(IMAGE_END_ID as u32),
+                MiniMaxM3VisionSpec::VIDEO_START_TOKEN => Some(VIDEO_START_ID as u32),
+                MiniMaxM3VisionSpec::VIDEO_END_TOKEN => Some(VIDEO_END_ID as u32),
                 _ => None,
             }
         }
@@ -341,7 +373,14 @@ mod tests {
         // surrounding markers.
         assert_eq!(
             replacement.tokens,
-            vec![START_ID, IMAGE_ID, IMAGE_ID, IMAGE_ID, IMAGE_ID, END_ID]
+            vec![
+                IMAGE_START_ID,
+                IMAGE_ID,
+                IMAGE_ID,
+                IMAGE_ID,
+                IMAGE_ID,
+                IMAGE_END_ID
+            ]
         );
         assert_eq!(replacement.placeholder_token, "]<]image[>[");
         assert_eq!(replacement.modality, Modality::Image);
@@ -359,7 +398,9 @@ mod tests {
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].offset, 1);
         assert_eq!(ranges[0].length, 4);
-        assert_eq!(replacements[0].structural_prefix, 1);
+        // Both markers live inside `tokens`, so nothing is folded in from
+        // before the placeholder.
+        assert_eq!(replacements[0].structural_prefix, 0);
     }
 
     #[test]
@@ -381,9 +422,10 @@ mod tests {
             .prompt_replacements_for(&metadata(), &preprocessed(vec![3]), Modality::Video)
             .unwrap();
 
+        // Video uses M3's own video markers, not the image pair.
         assert_eq!(
             replacements[0].tokens,
-            vec![START_ID, VIDEO_ID, VIDEO_ID, VIDEO_ID, END_ID]
+            vec![VIDEO_START_ID, VIDEO_ID, VIDEO_ID, VIDEO_ID, VIDEO_END_ID]
         );
         assert_eq!(replacements[0].modality, Modality::Video);
         assert_eq!(replacements[0].placeholder_token, "]<]video[>[");
@@ -396,7 +438,8 @@ mod tests {
 
         assert_eq!(limits.get(&Modality::Image), Some(&MAX_IMAGES_PER_REQUEST));
         assert_eq!(MAX_IMAGES_PER_REQUEST, 200);
-        assert_eq!(limits.get(&Modality::Video), Some(&1));
+        assert_eq!(limits.get(&Modality::Video), Some(&MAX_VIDEOS_PER_REQUEST));
+        assert_eq!(MAX_VIDEOS_PER_REQUEST, 20);
         assert!(!limits.contains_key(&Modality::Audio));
     }
 

@@ -31,10 +31,13 @@ use super::{
     qwen2_vl::{CLIP_MEAN, CLIP_STD},
     qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode},
 };
-use crate::vision::{
-    preprocessor_config::PreProcessorConfig,
-    processor::{PreprocessedEncoderInputs, VisionPreProcessor},
-    transforms::TransformError,
+use crate::{
+    types::RgbFrameRef,
+    vision::{
+        preprocessor_config::PreProcessorConfig,
+        processor::{PreprocessedEncoderInputs, VisionPreProcessor},
+        transforms::TransformError,
+    },
 };
 
 /// Default patch size.
@@ -52,7 +55,8 @@ pub const DEFAULT_MIN_PIXELS: usize = 4 * 28 * 28;
 /// Default maximum pixels for images (576 * 28 * 28 = 451,584).
 ///
 /// 576 is the model's `image_seq_length`: at the bound, an image occupies
-/// exactly `image_seq_length` patches before the 2x2 merge.
+/// exactly `image_seq_length` tokens after the 2x2 merge (2,304 patches before
+/// it).
 pub const DEFAULT_MAX_PIXELS: usize = 576 * 28 * 28;
 
 /// Default maximum pixels per video frame (768 * 28 * 28 = 602,112).
@@ -94,13 +98,15 @@ impl MiniMaxM3VisionProcessor {
         max_pixels: usize,
         temporal_patch_size: usize,
     ) -> Self {
+        // The caller's `max_pixels` governs video too; flooring it at the
+        // video default would ignore a deliberate reduction.
         Self::build(
             patch_size,
             merge_size,
             temporal_patch_size,
             min_pixels,
             max_pixels,
-            max_pixels.max(DEFAULT_VIDEO_MAX_PIXELS),
+            max_pixels,
         )
     }
 
@@ -134,47 +140,78 @@ impl MiniMaxM3VisionProcessor {
     /// M3 nests its merge parameters there rather than exposing the flat
     /// `merge_size` / `temporal_patch_size` keys Qwen models use, so they land
     /// in `PreProcessorConfig::extra` instead of the typed fields.
-    fn compression_usize(config: &PreProcessorConfig, key: &str) -> Option<usize> {
-        config
-            .extra
-            .get(COMPRESSION_CONFIG_KEY)?
-            .get(key)?
-            .as_u64()
-            .map(|value| value as usize)
+    ///
+    /// Returns `Ok(None)` only when the key is genuinely absent. A present but
+    /// malformed value (non-integer, or zero) is an error rather than a silent
+    /// fallback: defaulting there would run every request with tensor geometry
+    /// that disagrees with the checkpoint.
+    fn compression_usize(
+        config: &PreProcessorConfig,
+        key: &str,
+    ) -> Result<Option<usize>, TransformError> {
+        let Some(block) = config.extra.get(COMPRESSION_CONFIG_KEY) else {
+            return Ok(None);
+        };
+        let Some(value) = block.get(key) else {
+            return Ok(None);
+        };
+        match value.as_u64() {
+            Some(parsed) if parsed > 0 => Ok(Some(parsed as usize)),
+            _ => Err(TransformError::ShapeError(format!(
+                "minimax_m3: {COMPRESSION_CONFIG_KEY}.{key} must be a positive integer, got {value}"
+            ))),
+        }
     }
 
     /// Build a processor from a preprocessor config, falling back to M3's
     /// defaults for anything the config does not specify.
     pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
-        // M3's checkpoint carries neither `min_pixels` nor `max_pixels`, so the
-        // defaults above stand unless a deployment overrides them explicitly.
+        Self::new()
+            .layered_over(config)
+            .unwrap_or_else(|_| Self::new())
+    }
+
+    /// Layer a request's config over this processor's settings.
+    ///
+    /// Values the config does not specify keep whatever this processor was
+    /// built with, so settings supplied through [`Self::with_config`] survive
+    /// into `preprocess` and `calculate_num_tokens` instead of being reset to
+    /// the checkpoint defaults.
+    fn layered_over(&self, config: &PreProcessorConfig) -> Result<Self, TransformError> {
         let merge_size = config
             .merge_size
-            .or_else(|| Self::compression_usize(config, "spatial_merge_size"))
-            .unwrap_or(DEFAULT_MERGE_SIZE);
+            .or(Self::compression_usize(config, "spatial_merge_size")?)
+            .unwrap_or_else(|| self.inner.merge_size());
         let temporal_patch_size = config
             .temporal_patch_size
-            .or_else(|| Self::compression_usize(config, "temporal_patch_size"))
-            .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE);
-        let max_pixels = config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS);
+            .or(Self::compression_usize(config, "temporal_patch_size")?)
+            .unwrap_or_else(|| self.inner.temporal_patch_size());
+        let max_pixels = config.max_pixels.unwrap_or_else(|| self.inner.max_pixels());
+        let min_pixels = config.min_pixels.unwrap_or_else(|| self.inner.min_pixels());
+        // Track an explicit `max_pixels` in both directions: flooring the video
+        // budget at the default would leave video six times an image's budget
+        // for an operator who lowered `max_pixels` to bound encoder memory.
+        let video_max_pixels = config
+            .max_pixels
+            .unwrap_or_else(|| self.inner.video_max_pixels());
 
-        Self::build(
-            config.get_patch_size(DEFAULT_PATCH_SIZE),
+        Ok(Self::build(
+            config.get_patch_size(self.inner.patch_size()),
             merge_size,
             temporal_patch_size,
-            config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
+            min_pixels,
             max_pixels,
-            max_pixels.max(DEFAULT_VIDEO_MAX_PIXELS),
-        )
+            video_max_pixels,
+        ))
     }
 
     /// Rebuild for one request so per-request config overrides take effect.
     ///
-    /// Unlike the Qwen processors this always rebuilds: M3's structural
-    /// parameters live in `extra`, which `has_structural_overrides` does not
-    /// account for.
-    fn for_request(config: &PreProcessorConfig) -> Self {
-        Self::from_preprocessor_config(config)
+    /// M3's structural parameters live in `extra`, which
+    /// `has_structural_overrides` does not account for, so this always layers
+    /// rather than checking for overrides first.
+    fn for_request(&self, config: &PreProcessorConfig) -> Result<Self, TransformError> {
+        self.layered_over(config)
     }
 }
 
@@ -200,11 +237,34 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         images: &[DynamicImage],
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        Self::for_request(config).inner.preprocess(images, config)
+        self.for_request(config)?.inner.preprocess(images, config)
+    }
+
+    fn preprocess_video(
+        &self,
+        frames: &[DynamicImage],
+        config: &PreProcessorConfig,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        self.for_request(config)?
+            .inner
+            .preprocess_video(frames, config)
+    }
+
+    fn preprocess_video_rgb(
+        &self,
+        frames: &[RgbFrameRef<'_>],
+        config: &PreProcessorConfig,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        self.for_request(config)?
+            .inner
+            .preprocess_video_rgb(frames, config)
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        Self::for_request(config)
+        // Infallible signature: a malformed config surfaces on the preprocess
+        // call, so fall back to this processor's own settings here.
+        self.for_request(config)
+            .unwrap_or_else(|_| self.clone())
             .inner
             .calculate_num_tokens(width, height, config)
     }
@@ -305,6 +365,79 @@ mod tests {
         // A 448x448 image is 32x32 patches at patch_size 14, which is
         // 16x16 = 256 tokens after the 2x2 merge.
         assert_eq!(processor.calculate_num_tokens(448, 448, &config), 256);
+    }
+
+    #[test]
+    fn with_config_settings_survive_request_layering() {
+        // A processor built with explicit settings must keep them when a
+        // request config does not override them.
+        let processor = MiniMaxM3VisionProcessor::with_config(14, 2, 3136, 200_704, 2);
+        let mut config = m3_config();
+        // The checkpoint block carries merge/temporal but no pixel bounds.
+        config.max_pixels = None;
+        config.min_pixels = None;
+
+        let layered = processor.layered_over(&config).unwrap();
+        assert_eq!(layered.max_pixels(), 200_704);
+        assert_eq!(layered.min_pixels(), 3136);
+    }
+
+    #[test]
+    fn lowering_max_pixels_also_lowers_the_video_budget() {
+        let processor = MiniMaxM3VisionProcessor::new();
+        let mut config = m3_config();
+        config.max_pixels = Some(100_352);
+
+        let layered = processor.layered_over(&config).unwrap();
+        assert_eq!(layered.max_pixels(), 100_352);
+        // Must track downwards, not stay floored at the video default.
+        assert_eq!(layered.video_max_pixels(), 100_352);
+    }
+
+    #[test]
+    fn malformed_compression_values_are_rejected() {
+        for bad in ["\"two\"", "0", "2.5", "null"] {
+            let raw = format!(
+                r#"{{"patch_size": 14,
+                     "img_token_compression_config": {{"spatial_merge_size": {bad}}}}}"#
+            );
+            let config: PreProcessorConfig = serde_json::from_str(&raw).unwrap();
+            let err = MiniMaxM3VisionProcessor::new().layered_over(&config);
+            assert!(
+                err.is_err(),
+                "a present but malformed spatial_merge_size ({bad}) must fail loudly"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_compression_block_uses_defaults() {
+        let config: PreProcessorConfig = serde_json::from_str(r#"{"patch_size": 14}"#).unwrap();
+        let layered = MiniMaxM3VisionProcessor::new()
+            .layered_over(&config)
+            .unwrap();
+        assert_eq!(layered.merge_size(), DEFAULT_MERGE_SIZE);
+        assert_eq!(layered.temporal_patch_size(), DEFAULT_TEMPORAL_PATCH_SIZE);
+    }
+
+    #[test]
+    fn video_preprocessing_is_supported() {
+        use crate::vision::processor::VisionPreProcessor;
+
+        let processor = MiniMaxM3VisionProcessor::new();
+        let config = m3_config();
+        // Two frames so the temporal patch pairing has something to pair.
+        let frames = vec![
+            DynamicImage::new_rgb8(224, 224),
+            DynamicImage::new_rgb8(224, 224),
+        ];
+
+        // The shared Qwen base implements the video path; M3 must delegate to
+        // it rather than falling through to the "unsupported" default.
+        let out = processor
+            .preprocess_video(&frames, &config)
+            .expect("M3 supports video preprocessing");
+        assert!(!out.feature_token_counts.is_empty());
     }
 
     #[test]

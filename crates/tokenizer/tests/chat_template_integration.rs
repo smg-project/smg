@@ -459,6 +459,7 @@ fn test_template_with_multimodal_content() {
                 image_url: ImageUrl {
                     url: "https://example.com/image.jpg".to_string(),
                     detail: None,
+                    max_long_side_pixel: None,
                 },
             },
         ]),

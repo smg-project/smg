@@ -156,6 +156,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "https://example.com/cat.jpg".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -231,6 +232,7 @@ mod tests {
                         image_url: ImageUrl {
                             url: "https://example.com/image.jpg".to_string(),
                             detail: Some("high".to_string()),
+                            max_long_side_pixel: None,
                         },
                     },
                 ]),
