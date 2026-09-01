@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-/// Compute a blake3 hex-digest hash for a single image's raw bytes.
 /// Domain tag for digests that mix media bytes with request parameters, so a
 /// parameterised digest can never equal a plain byte digest.
 const MEDIA_PARAM_DOMAIN: &[u8] = b"smg.media.params.v1";
@@ -17,6 +16,7 @@ fn write_len_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+/// Compute a blake3 hex-digest hash for a single image's raw bytes.
 pub fn hash_image(raw_bytes: &[u8]) -> String {
     blake3::hash(raw_bytes).to_hex().to_string()
 }
@@ -38,8 +38,8 @@ pub fn hash_image_with_resolution_cap(
         return hash_image(raw_bytes);
     };
     let mut hasher = blake3::Hasher::new();
-    hasher.update(raw_bytes);
-    hasher.update(b"max_long_side_pixel=");
+    hasher.update(MEDIA_PARAM_DOMAIN);
+    write_len_prefixed(&mut hasher, raw_bytes);
     hasher.update(&cap.to_le_bytes());
     hasher.finalize().to_hex().to_string()
 }
@@ -178,9 +178,28 @@ mod video_sampling_hash_tests {
         );
     }
 
+    /// The image-side counterpart, using the construction from the review:
+    /// `Y = X ‖ b"max_long_side_pixel=" ‖ le32(504)`. Under plain
+    /// concatenation `hash(X, Some(504))` and `hash(Y, None)` are the same
+    /// digest; the length prefix and domain tag separate them.
+    #[test]
+    fn crafted_image_trailing_bytes_do_not_collide() {
+        let x = b"fake-encoded-image-bytes";
+        let mut y = x.to_vec();
+        y.extend_from_slice(b"max_long_side_pixel=");
+        y.extend_from_slice(&504u32.to_le_bytes());
+
+        assert_ne!(
+            hash_image_with_resolution_cap(x, Some(504)),
+            hash_image_with_resolution_cap(&y, None)
+        );
+    }
+
     #[test]
     fn parameterised_digest_never_equals_a_plain_digest() {
         // The domain tag keeps the two families disjoint.
+        // Same payload both sides, so this tests the domain tag rather than
+        // two different byte strings.
         assert_ne!(hash_video_with_sampling(CLIP, 1.0, None), hash_video(CLIP));
         assert_ne!(
             hash_image_with_resolution_cap(CLIP, Some(504)),

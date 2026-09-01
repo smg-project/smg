@@ -2572,25 +2572,44 @@ fn cap_decoded_frames(
 
     match decoded {
         DecodedVideoFrames::Images { frames, sample_fps } => {
+            // Same policy as the image path — filter, no-upscale rule and
+            // rounding all live in one place.
             let frames = frames
                 .into_iter()
-                .map(
-                    |frame| match capped_dimensions(frame.width(), frame.height(), cap) {
-                        Some((w, h)) => {
-                            frame.resize_exact(w, h, image::imageops::FilterType::CatmullRom)
-                        }
-                        None => frame,
-                    },
-                )
+                .map(|frame| apply_max_long_side_pixel(frame, Some(cap)))
                 .collect();
             DecodedVideoFrames::Images { frames, sample_fps }
         }
         DecodedVideoFrames::Rgb { video, sample_fps } => {
-            let mut data: Vec<u8> = Vec::with_capacity(video.data.len());
+            // Nothing over the cap: keep the original buffer instead of
+            // rebuilding it byte-for-byte.
+            if video
+                .frames
+                .iter()
+                .all(|f| capped_dimensions(f.width, f.height, cap).is_none())
+            {
+                return DecodedVideoFrames::Rgb { video, sample_fps };
+            }
+
+            // Size from the capped geometry; the pre-cap length would leave a
+            // large allocation attached to the clip for its whole lifetime.
+            let capacity: usize = video
+                .frames
+                .iter()
+                .map(|f| match capped_dimensions(f.width, f.height, cap) {
+                    Some((w, h)) => (w as usize) * (h as usize) * 3,
+                    None => f.len,
+                })
+                .sum();
+            let mut data: Vec<u8> = Vec::with_capacity(capacity);
             let mut frames = Vec::with_capacity(video.frames.len());
 
             for frame in &video.frames {
-                let Some(src) = video.data.get(frame.offset..frame.offset + frame.len) else {
+                let Some(src) = frame
+                    .offset
+                    .checked_add(frame.len)
+                    .and_then(|end| video.data.get(frame.offset..end))
+                else {
                     // A frame that does not slice cleanly is left to the
                     // downstream validation rather than silently reshaped.
                     return DecodedVideoFrames::Rgb { video, sample_fps };
