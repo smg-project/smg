@@ -23,6 +23,7 @@ pub mod model_type;
 pub mod models;
 pub mod multipart;
 pub mod parser;
+pub mod profile;
 pub mod realtime_conversation;
 pub mod realtime_events;
 pub mod realtime_response;
