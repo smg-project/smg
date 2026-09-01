@@ -29,6 +29,8 @@ use crate::{
 pub enum ChatMessage {
     #[serde(rename = "system")]
     System {
+        /// Defaults to empty text: K3 tools-only system messages omit content entirely
+        #[serde(default)]
         content: MessageContent,
         name: Option<String>,
         #[serde(flatten)]
@@ -67,6 +69,12 @@ pub enum ChatMessage {
 pub enum MessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+}
+
+impl Default for MessageContent {
+    fn default() -> Self {
+        MessageContent::Text(String::new())
+    }
 }
 
 impl MessageContent {

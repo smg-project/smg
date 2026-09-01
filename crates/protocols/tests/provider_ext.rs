@@ -170,3 +170,19 @@ fn tool_choice_required_valid_with_only_dynamic_tools() {
         "dynamic tools must satisfy tool_choice=required"
     );
 }
+
+#[test]
+fn system_message_without_content_defaults_to_empty() {
+    let msg: ChatMessage = serde_json::from_value(json!({
+        "role": "system",
+        "tools": [{"type": "function", "function": {"name": "get_weather"}}]
+    }))
+    .expect("tools-only system message deserializes");
+    match msg {
+        ChatMessage::System { content, kimi, .. } => {
+            assert_eq!(content.to_simple_string(), "");
+            assert!(kimi.tools.is_some());
+        }
+        other => panic!("expected system message, got {other:?}"),
+    }
+}
