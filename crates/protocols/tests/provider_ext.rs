@@ -228,3 +228,75 @@ fn non_kimi_models_tolerate_tools_on_any_role() {
         );
     }
 }
+
+#[expect(clippy::expect_used, reason = "test helper")]
+fn tool_history_request(model: &str, tool_call_id: &str, arguments: &str) -> ChatCompletionRequest {
+    serde_json::from_value(json!({
+        "model": model,
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "get_weather", "arguments": arguments}}
+            ]},
+            {"role": "tool", "tool_call_id": tool_call_id, "content": "sunny"}
+        ]
+    }))
+    .expect("request deserializes")
+}
+
+#[test]
+fn minimax_profile_enforces_tool_history_strictness() {
+    // MPV 16_08: unknown tool_call_id
+    assert!(tool_history_request("MiniMax-M3", "call_999", "{}")
+        .validate()
+        .is_err());
+    // MPV 16_12: invalid JSON arguments
+    assert!(
+        tool_history_request("MiniMax-M3", "call_1", "{invalid json}")
+            .validate()
+            .is_err()
+    );
+    // valid history passes
+    assert!(
+        tool_history_request("MiniMax-M3", "call_1", "{\"city\":\"Beijing\"}")
+            .validate()
+            .is_ok()
+    );
+}
+
+#[test]
+fn minimax_profile_rejects_unanswered_tool_calls() {
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "MiniMax-M3",
+        "messages": [
+            {"role": "user", "content": "weather in two cities?"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}},
+                {"id": "call_2", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
+        ]
+    }))
+    .expect("request deserializes");
+    assert!(req.validate().is_err());
+}
+
+#[test]
+fn kimi_and_openai_tolerate_loose_tool_history() {
+    // KVV requires invalid-JSON history arguments to be ACCEPTED for Kimi
+    for model in ["kimi-k3", "gpt-4o-mini"] {
+        assert!(
+            tool_history_request(model, "call_1", "{invalid json}")
+                .validate()
+                .is_ok(),
+            "{model} must tolerate loose tool history"
+        );
+        assert!(
+            tool_history_request(model, "call_999", "{}")
+                .validate()
+                .is_ok(),
+            "{model} must tolerate id mismatch"
+        );
+    }
+}
