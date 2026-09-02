@@ -36,6 +36,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The cluster runners share one NAT egress IP and GitHub intermittently
+      # 401s anonymous git from it, even for public repos — pre-commit's
+      # hook-repo fetches die on "could not read Username". Carry the workflow
+      # token on every github.com git operation instead.
+      - name: Authenticate git for github.com
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
+
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
