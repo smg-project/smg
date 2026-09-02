@@ -30,14 +30,13 @@ use super::{
     multimodal::MultimodalComponents,
     pipeline::{Endpoint, PipelineDeps, RequestPipeline},
     regular::responses,
-    transcription,
     utils::ParserResolver,
 };
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
-    routers::{error, RouterTrait},
+    routers::{error, transcription, RouterTrait},
     worker::{WorkerRegistry, WorkerType},
 };
 

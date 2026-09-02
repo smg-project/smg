@@ -1,5 +1,9 @@
-//! Transcription model-family specs — the family seam for the audio
-//! transcription endpoint.
+//! Transcription model-family specs — the family seam for the OpenAI
+//! `/v1/audio/transcriptions` endpoint.
+//!
+//! Lives at the shared `routers` level, not under any one backend: audio
+//! transcription is a `RouterTrait` method, so a router implementation
+//! resolves a family here and drives it through its own execution path.
 //!
 //! The router stays family-blind: it resolves a spec (fail-closed), lets the
 //! spec validate capability limits and build the family's chat request,

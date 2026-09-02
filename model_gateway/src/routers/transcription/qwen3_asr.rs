@@ -186,7 +186,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::routers::grpc::transcription::render;
+    use crate::routers::transcription::render;
 
     fn transcription_request() -> TranscriptionRequest {
         TranscriptionRequest {
