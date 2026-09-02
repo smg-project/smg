@@ -6,7 +6,7 @@ mod llama4;
 mod llava;
 mod minimax_m3;
 mod phi3_v;
-mod qwen3_asr;
+pub mod qwen3_asr;
 mod qwen3_omni;
 mod qwen3_vl;
 mod qwen_vl;
