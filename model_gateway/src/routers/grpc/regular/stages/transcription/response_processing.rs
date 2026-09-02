@@ -92,10 +92,12 @@ impl ProcessStage for TranscriptionResponseProcessingStage {
             )
             .await?;
 
+        // Whitespace-only decode counts as empty, matching the chat path's
+        // assistant-content normalization the old endpoint sat on.
         let raw = responses
             .first()
             .map(|response| response.text.as_str())
-            .filter(|text| !text.is_empty())
+            .filter(|text| !text.trim().is_empty())
             .ok_or_else(|| {
                 error::internal_error(
                     "empty_transcription_response",

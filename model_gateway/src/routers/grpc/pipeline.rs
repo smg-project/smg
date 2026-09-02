@@ -968,7 +968,9 @@ impl RequestPipeline {
             RequestContext::for_transcription(request, audio, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
 
-        const ENDPOINT: &str = metrics_labels::ENDPOINT_TRANSCRIPTIONS;
+        // Same label the HTTP layer records for /v1/audio/transcriptions, so
+        // the endpoint's metrics don't split across backends.
+        const ENDPOINT: &str = metrics_labels::ENDPOINT_AUDIO_TRANSCRIPTIONS;
         match Box::pin(self.run(ctx, Some(ENDPOINT), None)).await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {

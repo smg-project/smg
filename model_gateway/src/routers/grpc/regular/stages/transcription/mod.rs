@@ -24,12 +24,29 @@ pub(crate) use request_building::TranscriptionRequestBuildingStage;
 pub(crate) use response_processing::TranscriptionResponseProcessingStage;
 use serde_json::json;
 
-use crate::{routers::error, worker::WorkerRegistry};
+use crate::{
+    routers::{error, grpc::spec::TranscriptionResponseFormat},
+    worker::WorkerRegistry,
+};
+
+/// Label keys that carry model identity. Family detection through worker
+/// labels consults only these, so a family name mentioned in a free-text
+/// label (a description, lineage note, …) cannot flip a deployment into a
+/// transcription family.
+const MODEL_IDENTITY_LABEL_KEYS: &[&str] = &[
+    "model",
+    "model_path",
+    "model_type",
+    "hf_model_type",
+    "tokenizer",
+    "tokenizer_path",
+];
 
 /// Resolve the transcription family serving `model_id`, or `None` when no
 /// family matches (the endpoint then rejects the request). Detection is the
 /// family's own identifier check against the model id and — for deployments
-/// serving under a neutral alias — the workers' model ids and label values.
+/// serving under a neutral alias — the workers' model ids and model-identity
+/// label values.
 pub(crate) fn resolve_family(
     worker_registry: &WorkerRegistry,
     model_id: &str,
@@ -41,11 +58,9 @@ pub(crate) fn resolve_family(
         worker_registry.get_by_model(model_id).iter().any(|worker| {
             let metadata = worker.metadata();
             family.is_identifier(metadata.model_id())
-                || metadata
-                    .spec
-                    .labels
-                    .values()
-                    .any(|value| family.is_identifier(value))
+                || metadata.spec.labels.iter().any(|(key, value)| {
+                    MODEL_IDENTITY_LABEL_KEYS.contains(&key.as_str()) && family.is_identifier(value)
+                })
         })
     })
 }
@@ -58,8 +73,6 @@ pub(crate) fn supported_families() -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
-
-use crate::routers::grpc::spec::TranscriptionResponseFormat;
 
 /// Parse the requested response format, rejecting the timestamp-bearing
 /// formats no chat-based transcription family produces.
@@ -111,10 +124,13 @@ pub(crate) fn audio_format(audio: &AudioFile) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
     use axum::http::StatusCode;
     use bytes::Bytes;
 
     use super::*;
+    use crate::worker::{BasicWorkerBuilder, ModelCard, Worker};
 
     fn audio(file_name: &str, content_type: Option<&str>) -> AudioFile {
         AudioFile {
@@ -124,12 +140,53 @@ mod tests {
         }
     }
 
+    fn labeled_worker(url: &str, model: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
+        let labels: HashMap<String, String> = labels
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(model))
+                .labels(labels)
+                .build(),
+        )
+    }
+
     #[test]
     fn family_registry_resolves_qwen3_asr_by_identifier() {
         assert!(FAMILIES
             .iter()
             .any(|f| f.is_identifier("Qwen/Qwen3-ASR-1.7B")));
         assert!(supported_families().contains("Qwen3-ASR"));
+    }
+
+    #[test]
+    fn resolves_family_from_model_identity_labels_only() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(labeled_worker(
+                "http://asr:9000",
+                "asr-prod",
+                &[("model_path", "/models/qwen3_asr_1.7b")],
+            ))
+            .unwrap();
+        registry
+            .register(labeled_worker(
+                "http://chat:9000",
+                "chat-prod",
+                &[("description", "distilled from qwen3-asr")],
+            ))
+            .unwrap();
+
+        // A family-identifying model id needs no worker evidence.
+        assert!(resolve_family(&registry, "Qwen/Qwen3-ASR-1.7B").is_some());
+        // A neutral alias resolves through a model-identity label…
+        assert!(resolve_family(&registry, "asr-prod").is_some());
+        // …but a free-text label mentioning the family must not.
+        assert!(resolve_family(&registry, "chat-prod").is_none());
+        // No workers, no identifier match: rejected.
+        assert!(resolve_family(&registry, "unknown-model").is_none());
     }
 
     #[test]
