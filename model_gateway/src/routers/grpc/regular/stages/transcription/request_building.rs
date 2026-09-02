@@ -16,17 +16,15 @@ use crate::routers::{
 };
 
 /// Transcription request building stage.
-pub(crate) struct TranscriptionRequestBuildingStage {
-    inject_pd_metadata: bool,
-    plan_kind: ExecutionPlanKind,
-}
+///
+/// Transcription is Regular-only (the pipeline is never built under PD/EPD),
+/// so the backend plan is always a single request with no PD metadata — this
+/// stage carries no disaggregation parameters.
+pub(crate) struct TranscriptionRequestBuildingStage;
 
 impl TranscriptionRequestBuildingStage {
-    pub fn new(inject_pd_metadata: bool, plan_kind: ExecutionPlanKind) -> Self {
-        Self {
-            inject_pd_metadata,
-            plan_kind,
-        }
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -57,8 +55,8 @@ impl BuildStage for TranscriptionRequestBuildingStage {
         };
 
         // The backend request is chat-shaped: reuse the chat build path on the
-        // request synthesized in preparation. Transcription carries no tool
-        // constraints.
+        // request synthesized in preparation. Regular-only, so a single-plan
+        // request with no PD metadata and no tool constraints.
         let (plan, stamp) = build_chat_backed_plan(
             ctx,
             &chat_request,
@@ -66,8 +64,8 @@ impl BuildStage for TranscriptionRequestBuildingStage {
             token_ids,
             None,
             "transcription-",
-            self.inject_pd_metadata,
-            self.plan_kind,
+            /* inject_pd_metadata */ false,
+            ExecutionPlanKind::Single,
         )
         .await?;
 
@@ -84,9 +82,6 @@ impl BuildStage for TranscriptionRequestBuildingStage {
 
     #[cfg(test)]
     fn signature(&self) -> String {
-        format!(
-            "TranscriptionRequestBuildingStage(inject_pd_metadata={}, {:?})",
-            self.inject_pd_metadata, self.plan_kind
-        )
+        "TranscriptionRequestBuildingStage".to_string()
     }
 }

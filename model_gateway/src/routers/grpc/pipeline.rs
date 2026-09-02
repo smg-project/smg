@@ -380,10 +380,8 @@ impl RequestPipeline {
                     rate_limit: None,
                     worker_selection,
                     encode: None,
-                    request_building: Box::new(TranscriptionRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
-                    )),
+                    // Regular-only: no PD metadata, single-plan (see the stage).
+                    request_building: Box::new(TranscriptionRequestBuildingStage::new()),
                     response_processing: Box::new(TranscriptionResponseProcessingStage::new(
                         processor,
                     )),
@@ -1230,9 +1228,7 @@ mod build_parity_tests {
             Endpoint::Embeddings | Endpoint::Classify => {
                 "EmbeddingRequestBuildingStage".to_string()
             }
-            Endpoint::Transcription => {
-                format!("TranscriptionRequestBuildingStage(inject_pd_metadata={inject}, {plan})")
-            }
+            Endpoint::Transcription => "TranscriptionRequestBuildingStage".to_string(),
         };
         let rate_limit = !matches!(
             endpoint,
