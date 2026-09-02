@@ -55,6 +55,26 @@ fetching on the worker. Related knobs: `SMG_VLLM_MM_MAX_INFLIGHT` (default 64)
 bounds concurrent media jobs; `SMG_VLLM_MM_MAX_ITEM_BYTES` (default 32 MiB) caps
 inline `data:` payloads.
 
+To move fetching and processing out of the vLLM process, run the GPU-free
+sidecar next to a private Redis and point the worker at it
+(`pip install smg-grpc-servicer[vllm,vllm-redis]`):
+
+```bash
+python -m smg_grpc_servicer.vllm.mm_sidecar --model Qwen/Qwen3-VL-8B-Instruct \
+    --redis-url redis://127.0.0.1:6379/0 --allowed-media-domains example.com
+SMG_VLLM_MM_PROCESSOR=redis SMG_VLLM_MM_REDIS_URL=redis://127.0.0.1:6379/0 \
+    vllm serve Qwen/Qwen3-VL-8B-Instruct --grpc
+```
+
+The sidecar and the worker must run the same model, vLLM version and dtype:
+the worker advertises `mm_processor=redis` only while a sidecar with a
+matching fingerprint keeps its `hello` key alive, and rejects results that
+disagree. Jobs and results travel over Redis lists under
+`smg:mm:v1:{namespace}`; results carry full tensors keyed by a per-attempt job
+id and expire after 120 s. Knobs: `SMG_VLLM_MM_SIDECAR_TIMEOUT_MS` (30000),
+`SMG_VLLM_MM_SIDECAR_MAX_QUEUE` (256, fail fast when the queue is deeper),
+`SMG_VLLM_MM_SIDECAR_NAMESPACE` (override the derived namespace).
+
 ### MLX
 
 ```bash

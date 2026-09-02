@@ -91,11 +91,6 @@ class TestBuildProcessor:
         env = {"SMG_VLLM_MM_PROCESSOR": "inprocess"}
         assert mm_processor.build_mm_processor(self._Engine(multimodal=False), env=env) is None
 
-    def test_redis_not_available_yet(self):
-        env = {"SMG_VLLM_MM_PROCESSOR": "redis"}
-        with pytest.raises(ValueError, match="not available"):
-            mm_processor.build_mm_processor(self._Engine(), env=env)
-
     def test_invalid_item_cap_is_rejected_before_construction(self):
         env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_ITEM_BYTES": "0"}
         with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEM_BYTES"):

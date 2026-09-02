@@ -237,6 +237,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                             request.tokenized.original_text or None,
                             items,
                             arrival_time,
+                            request_id=request_id,
                         )
                     except RuntimeError as e:
                         # vLLM's placeholder validation: anchor/count mismatch is

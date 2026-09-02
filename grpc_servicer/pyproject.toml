@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smg-grpc-servicer"
-version = "0.10.0"
+version = "0.11.0"
 description = "SMG gRPC servicer implementations for LLM inference engines (vLLM, MLX, TokenSpeed, SGLang)"
 requires-python = ">=3.10"
 dependencies = [
@@ -32,6 +32,8 @@ classifiers = [
 [project.optional-dependencies]
 # vllm>=0.20.0: first release with renderer.process_for_engine_async(skip_mm_cache=).
 vllm = ["vllm>=0.20.0", "pyzmq>=25.0.0", "msgspec>=0.18.0"]
+# Redis media-processing sidecar backend for vLLM (SMG_VLLM_MM_PROCESSOR=redis).
+vllm-redis = ["redis>=5.0", "msgspec>=0.18.0"]
 # 0.5.18 dropped the server_args parameter from
 # create_load_snapshot_reader(); the floor tracks that signature, which the
 # request manager calls unconditionally. (Earlier floors recorded the shmem
