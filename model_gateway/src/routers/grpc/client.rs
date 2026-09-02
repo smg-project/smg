@@ -362,7 +362,7 @@ impl GrpcClient {
             Self::Sglang(client) => Ok(ServerInfo::Sglang(Box::new(
                 client.get_server_info().await?,
             ))),
-            Self::Vllm(client) => Ok(ServerInfo::Vllm(client.get_server_info().await?)),
+            Self::Vllm(client) => Ok(ServerInfo::Vllm(Box::new(client.get_server_info().await?))),
             Self::Trtllm(client) => Ok(ServerInfo::Trtllm(client.get_server_info().await?)),
             Self::Mlx(client) => Ok(ServerInfo::Mlx(client.get_server_info().await?)),
             Self::TokenSpeed(client) => Ok(ServerInfo::TokenSpeed(Box::new(
@@ -780,7 +780,7 @@ pub enum ModelInfo {
 
 pub enum ServerInfo {
     Sglang(Box<smg_grpc_client::sglang_proto::GetServerInfoResponse>),
-    Vllm(smg_grpc_client::vllm_proto::GetServerInfoResponse),
+    Vllm(Box<smg_grpc_client::vllm_proto::GetServerInfoResponse>),
     Trtllm(smg_grpc_client::trtllm_proto::GetServerInfoResponse),
     Mlx(smg_grpc_client::mlx_proto::GetServerInfoResponse),
     TokenSpeed(Box<smg_grpc_client::tokenspeed_proto::GetServerInfoResponse>),

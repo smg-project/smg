@@ -737,11 +737,11 @@ impl ZmqEngineClient {
             .map(|e| e.ready_response.data_parallel_size)
             .unwrap_or(1);
         match &self.backend {
-            ZmqBackend::Vllm(_) => ServerInfo::Vllm(vllm::GetServerInfoResponse {
+            ZmqBackend::Vllm(_) => ServerInfo::Vllm(Box::new(vllm::GetServerInfoResponse {
                 data_parallel_size: i32::try_from(data_parallel_size).unwrap_or(i32::MAX),
                 server_type: "vllm".to_string(),
                 ..Default::default()
-            }),
+            })),
             // TokenSpeed's server-info proto carries no data-parallel size or
             // server-type field; the ZMQ handshake supplies no `server_args`
             // either, so only the fields it does expose are surfaced.
