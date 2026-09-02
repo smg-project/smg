@@ -83,6 +83,11 @@ impl ModelProcessorSpec for Llama4Spec {
         "llama4"
     }
 
+    /// `<|image|>` is vLLM's single-token target for Llama 4.
+    fn worker_expandable(&self, modality: Modality) -> bool {
+        matches!(modality, Modality::Image)
+    }
+
     fn matches(&self, metadata: &ModelMetadata) -> bool {
         let id = metadata.model_id.to_ascii_lowercase();
         id.contains("llama-4")

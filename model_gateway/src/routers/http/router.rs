@@ -272,6 +272,7 @@ impl Router {
                 headers,
                 rid_key,
                 cache_namespace,
+                candidate_filter: None,
             },
         )
     }
@@ -836,6 +837,7 @@ impl Router {
                 headers,
                 rid_key: None,
                 cache_namespace: None,
+                candidate_filter: None,
             },
         ) else {
             // Judged from the same candidates whether the pre-filter emptied

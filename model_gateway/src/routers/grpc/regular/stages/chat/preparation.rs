@@ -218,41 +218,62 @@ pub(crate) async fn prepare_chat_like(
             })?;
         }
 
-        // Step 4: Full multimodal processing (fetch + preprocess + expand tokens + hash)
+        // Step 4: Full multimodal processing (fetch + preprocess + expand tokens + hash),
+        // or keep the media references for a worker that processes them itself.
         let mut multimodal_intermediate = None;
-        if let Some((mm_components, model_id, tokenizer_id, tokenizer_source, media_plan)) =
-            mm_context
+        let mut multimodal_refs = None;
+        if let (
+            Some(placeholders),
+            Some((mm_components, model_id, tokenizer_id, tokenizer_source, media_plan)),
+        ) = (placeholder_tokens.as_ref(), mm_context)
         {
-            match multimodal::process_multimodal_plan(
-                media_plan,
-                model_id,
-                &*tokenizer,
-                token_ids,
+            let processing = multimodal::resolve_mm_processing(
                 mm_components,
-                &tokenizer_id,
-                &tokenizer_source,
+                &ctx.components.worker_registry,
+                model_id,
+                &media_plan,
+                placeholders,
             )
-            .await
-            {
-                Ok(output) => {
-                    debug!(
-                        function = "ChatPreparationStage::execute",
-                        expanded_tokens = output.expanded_token_ids.len(),
-                        "Multimodal processing complete"
-                    );
-                    token_ids = output.expanded_token_ids;
-                    multimodal_intermediate = Some(output.intermediate);
-                }
-                Err(e) => {
-                    error!(
-                        function = "ChatPreparationStage::execute",
-                        error = %e,
-                        "Multimodal processing failed"
-                    );
-                    return Err(error::bad_request(
-                        "multimodal_processing_failed",
-                        format!("Multimodal processing failed: {e}"),
-                    ));
+            .map_err(|e| error::bad_request(e.code(), e.to_string()))?;
+            if processing == multimodal::MmProcessing::Worker {
+                debug!(
+                    function = "ChatPreparationStage::execute",
+                    media_items = media_plan.parts().len(),
+                    "Forwarding media references for worker-side processing"
+                );
+                multimodal_refs = Some(media_plan);
+            } else {
+                match multimodal::process_multimodal_plan(
+                    media_plan,
+                    model_id,
+                    &*tokenizer,
+                    token_ids,
+                    mm_components,
+                    &tokenizer_id,
+                    &tokenizer_source,
+                )
+                .await
+                {
+                    Ok(output) => {
+                        debug!(
+                            function = "ChatPreparationStage::execute",
+                            expanded_tokens = output.expanded_token_ids.len(),
+                            "Multimodal processing complete"
+                        );
+                        token_ids = output.expanded_token_ids;
+                        multimodal_intermediate = Some(output.intermediate);
+                    }
+                    Err(e) => {
+                        error!(
+                            function = "ChatPreparationStage::execute",
+                            error = %e,
+                            "Multimodal processing failed"
+                        );
+                        return Err(error::bad_request(
+                            "multimodal_processing_failed",
+                            format!("Multimodal processing failed: {e}"),
+                        ));
+                    }
                 }
             }
         }
@@ -338,6 +359,7 @@ pub(crate) async fn prepare_chat_like(
         // ctx (PreparationOutput is consumed by request_building before
         // response_processing runs); hand the rest to the caller.
         ctx.state.multimodal_intermediate = multimodal_intermediate;
+        ctx.state.multimodal_refs = multimodal_refs;
         ctx.state.response.stop_decoder = Some(stop_decoder);
         ctx.state.response.skip_special_tokens = Some(skip_special_tokens);
 

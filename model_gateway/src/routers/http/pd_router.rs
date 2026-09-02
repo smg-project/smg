@@ -1353,6 +1353,7 @@ impl PDRouter {
                 headers,
                 rid_key,
                 cache_namespace,
+                candidate_filter: None,
             },
         )
         .map_err(|failure| Box::new(Self::pair_failure(*failure)))?;
