@@ -1098,14 +1098,15 @@ impl ConfigValidator {
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
         let invalid_decode_policy = match &config.mode {
-            RoutingMode::PrefillDecode { decode_policy, .. } => {
-                (config.enable_igw || !has_service_discovery)
-                    && matches!(decode_policy, Some(PolicyConfig::Bucket { .. }))
+            RoutingMode::PrefillDecode { decode_policy, .. } if !config.enable_igw => {
+                !has_service_discovery && matches!(decode_policy, Some(PolicyConfig::Bucket { .. }))
             }
-            RoutingMode::EncodePrefillDecode { decode_policy, .. } => matches!(
-                decode_policy.as_ref().unwrap_or(&config.policy),
-                PolicyConfig::Bucket { .. }
-            ),
+            RoutingMode::PrefillDecode { .. } | RoutingMode::EncodePrefillDecode { .. } => {
+                matches!(
+                    config.mode.get_decode_policy(&config.policy),
+                    PolicyConfig::Bucket { .. }
+                )
+            }
             _ => false,
         };
         if invalid_decode_policy {
@@ -1213,35 +1214,40 @@ mod tests {
             balance_rel_threshold: 1.1,
             bucket_adjust_interval_secs: 5,
         };
-        let modes = [
-            RoutingMode::PrefillDecode {
+        let mut config = RouterConfig {
+            discovery: Some(DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            mode: RoutingMode::PrefillDecode {
                 prefill_urls: vec![],
                 decode_urls: vec![],
                 prefill_policy: None,
                 decode_policy: Some(bucket()),
             },
-            RoutingMode::EncodePrefillDecode {
-                encode_urls: vec![],
-                prefill_urls: vec![],
-                decode_urls: vec![],
-                encode_policy: None,
-                prefill_policy: None,
-                decode_policy: Some(bucket()),
-            },
-        ];
+            ..Default::default()
+        };
 
-        for mode in modes {
-            let config = RouterConfig {
-                enable_igw: true,
-                mode,
-                ..RouterConfig::default()
-            };
-            assert!(matches!(
-                ConfigValidator::validate(&config),
-                Err(ConfigError::IncompatibleConfig { ref reason })
-                    if reason == "Decode policy should not be allowed to be bucket"
-            ));
+        assert!(ConfigValidator::validate_compatibility(&config).is_ok());
+        config.enable_igw = true;
+        assert!(ConfigValidator::validate_compatibility(&config).is_err());
+
+        if let RoutingMode::PrefillDecode { decode_policy, .. } = &mut config.mode {
+            *decode_policy = None;
         }
+        config.policy = bucket();
+        assert!(ConfigValidator::validate_compatibility(&config).is_err());
+
+        config.policy = PolicyConfig::Random;
+        config.mode = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![],
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: Some(bucket()),
+        };
+        assert!(ConfigValidator::validate_compatibility(&config).is_err());
     }
 
     #[test]

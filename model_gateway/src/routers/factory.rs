@@ -433,36 +433,30 @@ mod grpc_router_type_tests {
     #[tokio::test]
     async fn igw_routers_preserve_disaggregated_role_policies() {
         let modes = [
-            (
-                RoutingMode::PrefillDecode {
-                    prefill_urls: vec![],
-                    decode_urls: vec![],
-                    prefill_policy: Some(PolicyConfig::ConsistentHashing),
-                    decode_policy: Some(PolicyConfig::ConsistentHashing),
-                },
-                "consistent_hashing",
-            ),
-            (
-                RoutingMode::EncodePrefillDecode {
-                    encode_urls: vec![],
-                    prefill_urls: vec![],
-                    decode_urls: vec![],
-                    encode_policy: Some(PolicyConfig::RoundRobin),
-                    prefill_policy: Some(PolicyConfig::ConsistentHashing),
-                    decode_policy: Some(PolicyConfig::ConsistentHashing),
-                },
-                "round_robin",
-            ),
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: Some(PolicyConfig::Passthrough),
+            },
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![],
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                encode_policy: Some(PolicyConfig::ConsistentHashing),
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: Some(PolicyConfig::Passthrough),
+            },
         ];
 
-        for (mode, expected_encode_policy) in modes {
+        for mode in modes {
             let ctx = grpc_ctx(mode).await;
             RouterFactory::create_igw_routers(&ctx.router_config.policy, &ctx).await;
 
             let policies = &ctx.policy_registry;
-            assert_eq!(policies.get_encode_policy().name(), expected_encode_policy);
-            assert_eq!(policies.get_prefill_policy().name(), "consistent_hashing");
-            assert_eq!(policies.get_decode_policy().name(), "consistent_hashing");
+            assert_eq!(policies.get_encode_policy().name(), "consistent_hashing");
+            assert_eq!(policies.get_prefill_policy().name(), "round_robin");
+            assert_eq!(policies.get_decode_policy().name(), "passthrough");
         }
     }
 }
