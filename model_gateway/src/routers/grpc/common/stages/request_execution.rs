@@ -804,6 +804,31 @@ mod tests {
     }
 
     #[test]
+    fn clone_without_mm_pixels_keeps_vllm_media_refs() {
+        // Both PD legs process the references themselves.
+        let refs = vllm::MediaRefs {
+            items: vec![vllm::MediaRef {
+                modality: smg_grpc_client::common_proto::Modality::Image as i32,
+                url: "https://a/1.png".to_string(),
+            }],
+        };
+        let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: "pd-refs".to_string(),
+            ..Default::default()
+        }));
+        request
+            .set_vllm_media_refs(refs.clone())
+            .expect("vLLM request accepts media refs");
+        assert!(request.has_vllm_media_refs());
+        let clone = request.clone_without_mm_pixels();
+        let ProtoGenerateRequest::Vllm(decode) = clone else {
+            panic!("expected vLLM clone");
+        };
+        assert_eq!(decode.media_refs, Some(refs));
+        assert!(decode.mm_inputs.is_none());
+    }
+
+    #[test]
     fn clone_without_mm_pixels_keeps_vllm_identity_and_grid_tensors() {
         // The decode leg drops the pixel tensors but keeps the per-image
         // identity and the inline M-RoPE grid tensors.

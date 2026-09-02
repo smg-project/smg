@@ -644,7 +644,8 @@ fn env_byte_limit(cache: &'static OnceLock<usize>, env_var: &str, default: usize
     })
 }
 
-fn image_max_input_bytes() -> usize {
+/// Byte cap for one decoded image input (`SMG_IMAGE_MAX_INPUT_BYTES`).
+pub fn image_max_input_bytes() -> usize {
     env_byte_limit(
         &IMAGE_MAX_INPUT_BYTES,
         "SMG_IMAGE_MAX_INPUT_BYTES",
@@ -652,7 +653,8 @@ fn image_max_input_bytes() -> usize {
     )
 }
 
-fn video_max_input_bytes() -> usize {
+/// Byte cap for one decoded video input (`SMG_VIDEO_MAX_INPUT_BYTES`).
+pub fn video_max_input_bytes() -> usize {
     env_byte_limit(
         &VIDEO_MAX_INPUT_BYTES,
         "SMG_VIDEO_MAX_INPUT_BYTES",

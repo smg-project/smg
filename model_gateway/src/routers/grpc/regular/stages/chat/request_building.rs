@@ -13,7 +13,9 @@ use crate::routers::{
             AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
             PreparationOutput, RequestContext,
         },
-        multimodal::{assemble_multimodal_data, assemble_multimodal_data_after_encode},
+        multimodal::{
+            assemble_media_refs, assemble_multimodal_data, assemble_multimodal_data_after_encode,
+        },
         spec::{ChatResponseSpec, ResponseSpec},
         utils,
     },
@@ -175,6 +177,23 @@ impl BuildStage for ChatRequestBuildingStage {
         // both prefill and decode carry the same room.
         if let Some(workers) = ctx.state.workers.as_ref() {
             helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
+        }
+
+        // Worker-side multimodal processing: attach the media references now
+        // that the wire is known, before the PD clone so both legs carry them.
+        if let Some(plan) = ctx.state.multimodal_refs.take() {
+            if builder_client.is_zmq() {
+                return Err(error::bad_request(
+                    "multimodal_not_supported",
+                    "media references require a gRPC vLLM worker",
+                ));
+            }
+            let refs = assemble_media_refs(plan)
+                .map_err(|e| error::bad_request(e.code(), e.to_string()))?;
+            proto_request
+                .set_vllm_media_refs(refs)
+                .map_err(|e| error::bad_request("multimodal_not_supported", e))?;
+            ctx.state.media_refs_forwarded = true;
         }
 
         Ok(BuildOutput {

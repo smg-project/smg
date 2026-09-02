@@ -830,6 +830,60 @@ impl std::str::FromStr for TransportMode {
     }
 }
 
+/// Where media is fetched and preprocessed for vLLM gRPC workers.
+///
+/// - `Auto`: forward media references when every worker serving the model
+///   advertises worker-side processing; otherwise preprocess on the router.
+/// - `Router`: always preprocess on the router (kill switch).
+/// - `Worker`: always forward references; fail when no capable worker exists.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum MmProcessingMode {
+    #[default]
+    Auto,
+    Router,
+    Worker,
+}
+
+impl MmProcessingMode {
+    /// Parse from a case-insensitive string (`auto` | `router` | `worker`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "router" => Some(Self::Router),
+            "worker" => Some(Self::Worker),
+            _ => None,
+        }
+    }
+
+    /// Canonical lowercase name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Router => "router",
+            Self::Worker => "worker",
+        }
+    }
+}
+
+impl std::fmt::Display for MmProcessingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for MmProcessingMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| {
+            format!("invalid multimodal processing mode '{s}'; expected auto|router|worker")
+        })
+    }
+}
+
 // ── API types ───────────────────────────────────────────────────────
 
 /// Worker information for API responses.

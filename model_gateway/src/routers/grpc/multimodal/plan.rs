@@ -67,6 +67,28 @@ impl MediaPlan {
     pub(crate) fn into_parts(self) -> Vec<MediaContentPart> {
         self.parts
     }
+
+    pub(crate) fn parts(&self) -> &[MediaContentPart] {
+        &self.parts
+    }
+
+    /// Whether every part is a plain image/video URL without per-item
+    /// processing hints, i.e. something a worker can fetch and process itself.
+    pub(crate) fn is_forwardable(&self) -> bool {
+        self.parts.iter().all(|part| {
+            matches!(
+                part,
+                MediaContentPart::ImageUrl {
+                    max_long_side_pixel: None,
+                    ..
+                } | MediaContentPart::VideoUrl {
+                    fps: None,
+                    max_long_side_pixel: None,
+                    ..
+                }
+            )
+        })
+    }
 }
 
 /// Model-specific structural anchor strings keyed by modality.
@@ -78,6 +100,8 @@ impl MediaPlan {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PlaceholderTokens {
     tokens: HashMap<Modality, String>,
+    /// Modalities whose anchor a vLLM worker can expand itself.
+    worker_expandable: HashMap<Modality, bool>,
 }
 
 impl PlaceholderTokens {
@@ -87,6 +111,17 @@ impl PlaceholderTokens {
 
     pub(crate) fn get(&self, modality: Modality) -> Option<&str> {
         self.tokens.get(&modality).map(String::as_str)
+    }
+
+    pub(crate) fn set_worker_expandable(&mut self, modality: Modality, expandable: bool) {
+        self.worker_expandable.insert(modality, expandable);
+    }
+
+    pub(crate) fn worker_expandable(&self, modality: Modality) -> bool {
+        self.worker_expandable
+            .get(&modality)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -141,6 +176,7 @@ pub(crate) async fn prepare_placeholder_tokens(
             "{modality} placeholder token '{token}' is missing from the tokenizer vocabulary"
         );
         placeholders.insert(modality, token);
+        placeholders.set_worker_expandable(modality, spec.worker_expandable(modality));
     }
 
     Ok(placeholders)

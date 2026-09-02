@@ -518,6 +518,10 @@ pub(crate) fn init_metrics() {
         "smg_mm_shm_write_failures_total",
         "SHM tensor write attempts that failed and fell back to inline, by runtime"
     );
+    describe_counter!(
+        "smg_mm_processing_total",
+        "Multimodal requests by processing location (router/worker) and resolution reason"
+    );
 
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
     super::runtime_metrics::describe();
@@ -904,6 +908,18 @@ impl Metrics {
     /// Record a SHM tensor write that failed and fell back to inline, for `runtime`.
     pub fn record_mm_shm_write_failure(runtime: &'static str) {
         counter!("smg_mm_shm_write_failures_total", "runtime" => runtime).increment(1);
+    }
+
+    /// Record where a multimodal request's media is processed and why.
+    pub fn record_mm_processing(model_id: &str, mode: &'static str, reason: &'static str) {
+        let model = intern_model_label(model_id);
+        counter!(
+            "smg_mm_processing_total",
+            "model" => model,
+            "mode" => mode,
+            "reason" => reason
+        )
+        .increment(1);
     }
 
     // ========================================================================
