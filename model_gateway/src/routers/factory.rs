@@ -443,7 +443,9 @@ mod grpc_router_type_tests {
                 encode_urls: vec![],
                 prefill_urls: vec![],
                 decode_urls: vec![],
-                encode_policy: Some(PolicyConfig::RoundRobin),
+                encode_policy: Some(PolicyConfig::PowerOfTwo {
+                    load_check_interval_secs: 5,
+                }),
                 prefill_policy: Some(PolicyConfig::RoundRobin),
                 decode_policy: Some(PolicyConfig::Passthrough),
             },
