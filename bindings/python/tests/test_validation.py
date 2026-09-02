@@ -319,6 +319,7 @@ class TestConfigurationValidation:
     @pytest.mark.parametrize(
         ("epd_disaggregation", "pd_disaggregation", "expected_mode"),
         [
+            (False, False, "Regular mode"),
             (False, True, "PD mode"),
             (True, False, "EPD mode"),
         ],
