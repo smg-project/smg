@@ -1096,6 +1096,24 @@ impl ConfigValidator {
     }
 
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        let invalid_decode_policy = match &config.mode {
+            RoutingMode::PrefillDecode { decode_policy, .. } => {
+                matches!(decode_policy, Some(PolicyConfig::Bucket { .. }))
+            }
+            RoutingMode::EncodePrefillDecode { decode_policy, .. } => matches!(
+                decode_policy.as_ref().unwrap_or(&config.policy),
+                PolicyConfig::Bucket { .. }
+            ),
+            _ => false,
+        };
+        if invalid_decode_policy {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "Decode policy should not be allowed to be bucket".to_string(),
+            });
+        }
+
+        // IGW may receive workers dynamically, so worker-count validation cannot
+        // reason about its eventual topology. Mode-level compatibility still applies.
         if config.enable_igw {
             return Ok(());
         }
@@ -1103,15 +1121,6 @@ impl ConfigValidator {
         Self::validate_mtls(config)?;
 
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
-
-        if let RoutingMode::EncodePrefillDecode { decode_policy, .. } = &config.mode {
-            let effective_decode_policy = decode_policy.as_ref().unwrap_or(&config.policy);
-            if matches!(effective_decode_policy, PolicyConfig::Bucket { .. }) {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "Decode policy should not be allowed to be bucket".to_string(),
-                });
-            }
-        }
 
         if !has_service_discovery {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
@@ -1146,13 +1155,6 @@ impl ConfigValidator {
                                     .to_string(),
                         });
                     }
-                }
-
-                // Check bucket for decode
-                if let Some(PolicyConfig::Bucket { .. }) = decode_policy {
-                    return Err(ConfigError::IncompatibleConfig {
-                        reason: "Decode policy should not be allowed to be bucket".to_string(),
-                    });
                 }
             }
 
@@ -1203,6 +1205,44 @@ impl ConfigValidator {
 mod tests {
     use super::*;
     use crate::worker::ConnectionMode;
+
+    #[test]
+    fn igw_disaggregated_modes_reject_bucket_decode_policy() {
+        let bucket = || PolicyConfig::Bucket {
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            bucket_adjust_interval_secs: 5,
+        };
+        let modes = [
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: Some(bucket()),
+            },
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![],
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: Some(bucket()),
+            },
+        ];
+
+        for mode in modes {
+            let config = RouterConfig {
+                enable_igw: true,
+                mode,
+                ..RouterConfig::default()
+            };
+            assert!(matches!(
+                ConfigValidator::validate(&config),
+                Err(ConfigError::IncompatibleConfig { ref reason })
+                    if reason == "Decode policy should not be allowed to be bucket"
+            ));
+        }
+    }
 
     #[test]
     fn prefix_hash_policy_cache_boundaries_are_validated() {
