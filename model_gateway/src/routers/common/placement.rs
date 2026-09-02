@@ -37,6 +37,9 @@ use crate::{
 pub(crate) struct WireConstraint {
     pub runtime: RuntimeType,
     pub connection: ConnectionMode,
+    /// The plan carries media references: candidates must advertise
+    /// worker-side multimodal processing.
+    pub requires_media_refs: bool,
 }
 
 /// Everything a single-worker placement reads from the request.
@@ -52,6 +55,9 @@ pub(crate) struct PlacementInputs<'a> {
     pub rid_key: Option<&'a str>,
     /// The request's cache partition, when set.
     pub cache_namespace: Option<CacheNamespace>,
+    /// Extra per-request candidate predicate; a worker it rejects is never
+    /// selected (e.g. only workers that process media references themselves).
+    pub candidate_filter: Option<fn(&dyn Worker) -> bool>,
 }
 
 /// The pool a placement draws from, before the availability filter.
@@ -146,7 +152,20 @@ pub(crate) fn select_single(
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
     let candidates = candidates(registry, model_id, pool, wire);
-    select_from(registry, policies, model_id, candidates.as_slice(), inputs)
+    let filtered;
+    let candidates: &[Arc<dyn Worker>] = match inputs.candidate_filter {
+        Some(accepts) => {
+            filtered = candidates
+                .as_slice()
+                .iter()
+                .filter(|w| accepts(w.as_ref()))
+                .cloned()
+                .collect::<Vec<_>>();
+            &filtered
+        }
+        None => candidates.as_slice(),
+    };
+    select_from(registry, policies, model_id, candidates, inputs)
 }
 
 /// [`select_single`] over an explicit candidate slice: the entry for a caller
@@ -261,6 +280,9 @@ pub(crate) fn select_pair(
                 w.metadata().spec.runtime_type == wire.runtime
                     && *w.connection_mode() == wire.connection
             })
+            && inputs
+                .candidate_filter
+                .is_none_or(|accepts| accepts(w.as_ref()))
     };
     let fail = |leg: WorkerLeg, verdict: PlacementFailure| Box::new(PairFailure { leg, verdict });
 
@@ -826,6 +848,7 @@ mod tests {
         let wire = Some(WireConstraint {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
+            requires_media_refs: false,
         });
 
         assert_eq!(
@@ -942,6 +965,7 @@ mod tests {
             Some(WireConstraint {
                 runtime: RuntimeType::Sglang,
                 connection: ConnectionMode::Grpc,
+                requires_media_refs: false,
             }),
             false,
             PlacementInputs::default(),

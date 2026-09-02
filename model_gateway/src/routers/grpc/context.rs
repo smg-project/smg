@@ -30,7 +30,7 @@ use super::{
         helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask},
         RateLimitCell,
     },
-    multimodal::{MultimodalComponents, MultimodalIntermediate},
+    multimodal::{MediaPlan, MultimodalComponents, MultimodalIntermediate},
     proto_wrapper::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
         ProtoRequest, ProtoStream,
@@ -187,6 +187,14 @@ pub(crate) struct ProcessingState {
     /// building `take()`s it for the prefill serialization.
     pub multimodal_intermediate: Option<MultimodalIntermediate>,
 
+    /// Media references kept for a worker that processes them itself; never
+    /// `Some` together with `multimodal_intermediate`. Request building takes it.
+    pub multimodal_refs: Option<MediaPlan>,
+
+    /// Set once request building attached media references, so retry
+    /// re-selection stays pinned to workers that accept them.
+    pub media_refs_forwarded: bool,
+
     /// `Some` iff the request is multimodal EPD and worker selection produced
     /// encode assignments. Request building injects the bootstrap info and drops
     /// prefill pixels; request execution `take()`s the dispatch plan.
@@ -231,16 +239,18 @@ pub(crate) struct RoutingSnapshot {
 pub(crate) use crate::routers::common::placement::WireConstraint;
 
 impl WireConstraint {
-    fn of(workers: &WorkerSelection) -> Self {
+    fn of(workers: &WorkerSelection, requires_media_refs: bool) -> Self {
         match workers {
             WorkerSelection::Single { worker } => Self {
                 runtime: worker.metadata().spec.runtime_type,
                 connection: *worker.connection_mode(),
+                requires_media_refs,
             },
             // Disaggregated legs are gRPC-only.
             WorkerSelection::Disaggregated { runtime_type, .. } => Self {
                 runtime: *runtime_type,
                 connection: ConnectionMode::Grpc,
+                requires_media_refs,
             },
         }
     }
@@ -806,7 +816,7 @@ impl RequestContext {
         let wire = state
             .workers
             .as_ref()
-            .map(WireConstraint::of)
+            .map(|workers| WireConstraint::of(workers, state.media_refs_forwarded))
             .ok_or_else(|| {
                 error!(
                     function = "RequestContext::into_dispatch",
