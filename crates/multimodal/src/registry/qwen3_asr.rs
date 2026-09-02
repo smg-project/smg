@@ -13,14 +13,86 @@ use crate::{
 const AUDIO_PAD_TOKEN: &str = "<|audio_pad|>";
 
 /// Transcription-side family knowledge, consumed by the gateway's
-/// transcription endpoint adapter.
+/// transcription endpoint pipeline.
 ///
 /// Protocol-free on purpose: this crate owns what is true of the family —
-/// identifiers, the language set, prompt sanitation, output framing — while
-/// how that surfaces on an HTTP endpoint (request shapes, error codes)
-/// stays the gateway's business. Errors here are plain data for the caller
-/// to render.
+/// identifiers, the language set, prompt sanitation, prefill convention,
+/// output framing, capability limits — while how that surfaces on an HTTP
+/// endpoint (request shapes, error codes, the chat pipeline) stays the
+/// gateway's business. Errors here are plain data for the caller to render.
+///
+/// A family is resolved via [`FAMILIES`]; the gateway's generic transcription
+/// preparation stage reads a family's data to shape the request and its
+/// output parser, so no per-model code lives in the router.
 pub mod transcription {
+    /// One transcription-capable model family. Everything a family knows,
+    /// expressed protocol-free so the gateway's generic pipeline stage can
+    /// consume it without a per-model branch.
+    pub trait TranscriptionFamily: Send + Sync {
+        /// Family name, as rendered in user-facing errors.
+        fn name(&self) -> &'static str;
+
+        /// Whether a model id, path, or worker-label value names this family.
+        fn is_identifier(&self, value: &str) -> bool;
+
+        /// Sanitize a caller-supplied prompt (size cap + control-token strip).
+        fn sanitize_prompt(&self, text: String) -> Result<String, PromptTooLong>;
+
+        /// The assistant continuation string that forces the transcript for a
+        /// requested language, or `None` when no language was given. `Err` for
+        /// an unsupported language.
+        fn assistant_prefill(
+            &self,
+            language: Option<&str>,
+        ) -> Result<Option<String>, UnsupportedLanguage>;
+
+        /// Post-process raw model output into the transcript text.
+        fn parse_transcript(&self, raw: &str) -> String;
+
+        /// Whether the family serves streaming transcription.
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+
+        /// Whether the family produces word/segment timestamps.
+        fn supports_timestamps(&self) -> bool {
+            false
+        }
+    }
+
+    /// Every supported transcription family; first match wins. New families
+    /// append here.
+    pub static FAMILIES: &[&dyn TranscriptionFamily] = &[&Qwen3Asr];
+
+    /// Qwen3-ASR: transcript forced via a `language {name}<asr_text>`
+    /// assistant continuation; `<asr_text>` framing stripped from the output.
+    pub struct Qwen3Asr;
+
+    impl TranscriptionFamily for Qwen3Asr {
+        fn name(&self) -> &'static str {
+            "Qwen3-ASR"
+        }
+
+        fn is_identifier(&self, value: &str) -> bool {
+            is_qwen3_asr_identifier(value)
+        }
+
+        fn sanitize_prompt(&self, text: String) -> Result<String, PromptTooLong> {
+            sanitize_prompt(text)
+        }
+
+        fn assistant_prefill(
+            &self,
+            language: Option<&str>,
+        ) -> Result<Option<String>, UnsupportedLanguage> {
+            Ok(normalize_language(language)?.map(|name| format!("language {name}{ASR_TEXT_TAG}")))
+        }
+
+        fn parse_transcript(&self, raw: &str) -> String {
+            parse_transcript(raw)
+        }
+    }
+
     /// The tag Qwen3-ASR emits (and the continuation prompt pre-seeds)
     /// between the language header and the transcript body.
     pub const ASR_TEXT_TAG: &str = "<asr_text>";
@@ -155,6 +227,31 @@ pub mod transcription {
             assert!(is_qwen3_asr_identifier("Qwen/Qwen3-ASR-1.7B"));
             assert!(is_qwen3_asr_identifier("/models/qwen3_asr_0.6b"));
             assert!(!is_qwen3_asr_identifier("Qwen/Qwen3-Omni-30B-A3B-Thinking"));
+        }
+
+        #[test]
+        fn family_trait_exposes_detection_prefill_and_limits() {
+            let family = FAMILIES
+                .iter()
+                .copied()
+                .find(|f| f.is_identifier("Qwen/Qwen3-ASR-1.7B"))
+                .expect("Qwen3-ASR family resolves");
+            assert_eq!(family.name(), "Qwen3-ASR");
+            // Language → forced-transcript continuation; absent → no prefill.
+            assert_eq!(
+                family.assistant_prefill(Some("english")).unwrap(),
+                Some("language English<asr_text>".to_string())
+            );
+            assert_eq!(family.assistant_prefill(None).unwrap(), None);
+            assert!(family.assistant_prefill(Some("xx")).is_err());
+            // Capability limits are family-owned and default-closed.
+            assert!(!family.supports_streaming());
+            assert!(!family.supports_timestamps());
+            // Delegates to the shared free functions.
+            assert_eq!(
+                family.parse_transcript("language Chinese<asr_text>hi<|im_end|>"),
+                "hi"
+            );
         }
 
         #[test]

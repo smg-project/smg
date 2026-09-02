@@ -36,7 +36,7 @@ use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
-    routers::{error, transcription, RouterTrait},
+    routers::RouterTrait,
     worker::{WorkerRegistry, WorkerType},
 };
 
@@ -64,6 +64,7 @@ pub struct GrpcRouter {
     harmony_pipeline: Option<RequestPipeline>,
     embedding_pipeline: Option<RequestPipeline>,
     classify_pipeline: Option<RequestPipeline>,
+    transcription_pipeline: Option<RequestPipeline>,
     messages_pipeline: RequestPipeline,
     completion_pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
@@ -151,6 +152,8 @@ impl GrpcRouter {
         let harmony_pipeline = RequestPipeline::build(Endpoint::Harmony, mode, &configured_deps);
         let embedding_pipeline = RequestPipeline::build(Endpoint::Embeddings, mode, &pair_deps);
         let classify_pipeline = RequestPipeline::build(Endpoint::Classify, mode, &pair_deps);
+        let transcription_pipeline =
+            RequestPipeline::build(Endpoint::Transcription, mode, &pair_deps);
 
         // Responses contexts are the sole consumer of the MCP orchestrator; EPD
         // builds neither (it doesn't serve /v1/responses).
@@ -197,6 +200,7 @@ impl GrpcRouter {
             harmony_pipeline,
             embedding_pipeline,
             classify_pipeline,
+            transcription_pipeline,
             messages_pipeline,
             completion_pipeline,
             shared_components,
@@ -647,56 +651,22 @@ impl RouterTrait for GrpcRouter {
         audio: AudioFile,
         model_id: &str,
     ) -> Response {
-        // Transcription is Regular-only.
-        if self.mode != Mode::Regular {
+        // Transcription is a first-class pipeline endpoint (Regular-only, so
+        // `None` in PD/EPD). Detection, the chat-shaped request synthesis, and
+        // output parsing all live inside the pipeline's transcription stages.
+        let Some(pipeline) = self.transcription_pipeline.as_ref() else {
             return not_implemented("Audio transcriptions not implemented");
-        }
-        // Family-blind from here: the resolved spec owns detection, capability
-        // limits, the chat request shape, and output post-processing.
-        let Some(spec) = transcription::resolve(&self.worker_registry, model_id) else {
-            return error::bad_request(
-                "audio_transcription_model_not_supported",
-                format!(
-                    "The TokenSpeed gRPC transcription adapter currently supports {} only",
-                    transcription::supported_families()
-                ),
-            );
         };
-        let response_format = match spec.response_format(body) {
-            Ok(format) => format,
-            Err(response) => return *response,
-        };
-        let chat_request = match spec.build_chat_request(body, &audio) {
-            Ok(request) => request,
-            Err(response) => return *response,
-        };
-
-        let chat_response = match self
-            .pipeline
-            .execute_chat_for_responses(
-                Arc::new(chat_request),
+        pipeline
+            .execute_transcription(
+                Arc::new(body.clone()),
+                Arc::new(audio),
                 headers.cloned(),
                 model_id.to_string(),
                 Arc::clone(&self.shared_components),
                 Some(tenant_meta.clone()),
             )
             .await
-        {
-            Ok(response) => response,
-            Err(response) => return response,
-        };
-        let Some(content) = chat_response
-            .choices
-            .first()
-            .and_then(|choice| choice.message.content.as_deref())
-        else {
-            return error::internal_error(
-                "empty_transcription_response",
-                format!("{} returned no transcription text", spec.name()),
-            );
-        };
-        let text = spec.parse_output(content);
-        transcription::render(response_format, text)
     }
 
     async fn route_completion(

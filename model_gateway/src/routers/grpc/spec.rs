@@ -9,6 +9,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use llm_multimodal::registry::qwen3_asr::transcription::TranscriptionFamily;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{StreamOptions, StringOrArray, Tool, ToolChoice},
@@ -32,6 +33,24 @@ pub(crate) enum ResponseSpec {
     Embedding,
     Classify,
     Harmony(HarmonyResponseSpec),
+    Transcription(TranscriptionResponseSpec),
+}
+
+/// Wire format of a `/v1/audio/transcriptions` response body.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TranscriptionResponseFormat {
+    Json,
+    Text,
+}
+
+/// Response-phase contract for a transcription request: the decoded text is
+/// post-processed by the resolved family and rendered in the chosen format.
+#[derive(Clone)]
+pub(crate) struct TranscriptionResponseSpec {
+    pub format: TranscriptionResponseFormat,
+    /// The resolved family, for output post-processing. `'static` — families
+    /// are registry constants.
+    pub family: &'static dyn TranscriptionFamily,
 }
 
 #[derive(Clone)]

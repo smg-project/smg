@@ -48,7 +48,8 @@ use super::{
                 MessageResponseProcessingStage,
             },
             ChatGeneratePreparationStage, ChatGenerateRequestBuildingStage,
-            ChatGenerateResponseProcessingStage,
+            ChatGenerateResponseProcessingStage, TranscriptionPreparationStage,
+            TranscriptionRequestBuildingStage, TranscriptionResponseProcessingStage,
         },
         streaming,
     },
@@ -80,6 +81,7 @@ pub(crate) enum Endpoint {
     Harmony,
     Embeddings,
     Classify,
+    Transcription,
 }
 
 /// Construction dependencies shared by every endpoint pipeline.
@@ -362,6 +364,29 @@ impl RequestPipeline {
                     encode: None,
                     request_building: Box::new(EmbeddingRequestBuildingStage::new()),
                     response_processing: Box::new(ClassifyResponseProcessingStage::new()),
+                }
+            }
+            Endpoint::Transcription => {
+                // Transcription is Regular-only (whole-file, single worker).
+                if !matches!(mode, Mode::Regular) {
+                    return None;
+                }
+                // Plain text decode: no configured parsers needed.
+                let (processor, _streaming) = PipelineDeps::default_processors(backend);
+                PipelineStages {
+                    preparation: Box::new(TranscriptionPreparationStage),
+                    // Whole-file transcription was never tenant rate-limited on
+                    // the old wrapping path; keep that.
+                    rate_limit: None,
+                    worker_selection,
+                    encode: None,
+                    request_building: Box::new(TranscriptionRequestBuildingStage::new(
+                        inject_pd_metadata,
+                        plan_kind,
+                    )),
+                    response_processing: Box::new(TranscriptionResponseProcessingStage::new(
+                        processor,
+                    )),
                 }
             }
         };
@@ -931,6 +956,43 @@ impl RequestPipeline {
         }
     }
 
+    /// Execute the complete pipeline for an audio transcription request.
+    pub async fn execute_transcription(
+        &self,
+        request: Arc<openai_protocol::transcription::TranscriptionRequest>,
+        audio: Arc<openai_protocol::transcription::AudioFile>,
+        headers: Option<http::HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+        tenant_request_meta: Option<TenantRequestMeta>,
+    ) -> Response {
+        let mut ctx =
+            RequestContext::for_transcription(request, audio, headers, model_id, components);
+        ctx.input.tenant_request_meta = tenant_request_meta;
+
+        const ENDPOINT: &str = metrics_labels::ENDPOINT_TRANSCRIPTIONS;
+        match Box::pin(self.run(ctx, Some(ENDPOINT), None)).await {
+            Ok(RunOutcome::Early(response)) => response,
+            Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
+                Some(FinalResponse::Transcription { text, format }) => {
+                    self.record_duration(ENDPOINT, &dctx.model_id, start);
+                    super::regular::stages::transcription::render(format, text)
+                }
+                Some(other) => self.wrong_response_type(
+                    "execute_transcription",
+                    "Transcription",
+                    &other,
+                    &dctx.model_id,
+                    ENDPOINT,
+                ),
+                None => {
+                    self.no_response_produced("execute_transcription", &dctx.model_id, ENDPOINT)
+                }
+            },
+            Err(response) => response,
+        }
+    }
+
     /// Execute the complete pipeline for a classify request
     pub async fn execute_classify(
         &self,
@@ -1168,8 +1230,14 @@ mod build_parity_tests {
             Endpoint::Embeddings | Endpoint::Classify => {
                 "EmbeddingRequestBuildingStage".to_string()
             }
+            Endpoint::Transcription => {
+                format!("TranscriptionRequestBuildingStage(inject_pd_metadata={inject}, {plan})")
+            }
         };
-        let rate_limit = !matches!(endpoint, Endpoint::Embeddings | Endpoint::Classify);
+        let rate_limit = !matches!(
+            endpoint,
+            Endpoint::Embeddings | Endpoint::Classify | Endpoint::Transcription
+        );
         // Harmony never carries the encode stage.
         let encode = encode && !matches!(endpoint, Endpoint::Harmony);
         (
@@ -1217,7 +1285,11 @@ mod build_parity_tests {
         assert_parity(Endpoint::Harmony, Mode::Regular, &deps);
         assert_parity(Endpoint::Harmony, Mode::PrefillDecode, &deps);
 
-        for endpoint in [Endpoint::Embeddings, Endpoint::Classify] {
+        for endpoint in [
+            Endpoint::Embeddings,
+            Endpoint::Classify,
+            Endpoint::Transcription,
+        ] {
             assert!(
                 RequestPipeline::build(endpoint, Mode::PrefillDecode, &deps).is_none(),
                 "{endpoint:?} PD must be invalid"

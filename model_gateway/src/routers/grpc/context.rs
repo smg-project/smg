@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use axum::http::HeaderMap;
+use llm_multimodal::registry::qwen3_asr::transcription::TranscriptionFamily;
 use llm_tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer, TokenizerRegistry};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
@@ -16,6 +17,7 @@ use openai_protocol::{
     generate::{GenerateRequest, GenerateResponse},
     messages::{CreateMessageRequest, Message},
     responses::ResponsesRequest,
+    transcription::{AudioFile, TranscriptionRequest},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use tool_parser::ParserFactory as ToolParserFactory;
@@ -79,6 +81,13 @@ pub(crate) enum RequestType {
     Embedding(Arc<EmbeddingRequest>),
     Classify(Arc<ClassifyRequest>),
     Messages(Arc<CreateMessageRequest>),
+    /// Audio transcription: the request plus its uploaded audio. The
+    /// preparation stage turns these into a chat-shaped backend request
+    /// inside the pipeline (no chat request is synthesized before entry).
+    Transcription {
+        request: Arc<TranscriptionRequest>,
+        audio: Arc<AudioFile>,
+    },
 }
 
 impl RequestType {
@@ -102,6 +111,9 @@ impl RequestType {
             Self::Embedding(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Classify(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Messages(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Transcription { request, .. } => {
+                replace(&mut Arc::make_mut(request).model, model_id);
+            }
         }
     }
 
@@ -115,7 +127,7 @@ impl RequestType {
             Self::Embedding(r) => r.rid.as_deref(),
             Self::Classify(r) => r.rid.as_deref(),
             Self::Messages(r) => r.rid.as_deref(),
-            Self::Responses(_) => None,
+            Self::Responses(_) | Self::Transcription { .. } => None,
         }
     }
 }
@@ -130,6 +142,7 @@ impl std::fmt::Display for RequestType {
             Self::Embedding(_) => write!(f, "Embedding"),
             Self::Classify(_) => write!(f, "Classify"),
             Self::Messages(_) => write!(f, "Messages"),
+            Self::Transcription { .. } => write!(f, "Transcription"),
         }
     }
 }
@@ -143,6 +156,7 @@ impl std::fmt::Display for FinalResponse {
             Self::Embedding(_) => write!(f, "Embedding"),
             Self::Classify(_) => write!(f, "Classify"),
             Self::Messages(_) => write!(f, "Messages"),
+            Self::Transcription { .. } => write!(f, "Transcription"),
         }
     }
 }
@@ -456,6 +470,18 @@ pub(crate) enum PreparationOutput {
         processed_messages: super::ProcessedMessages,
         tool_constraints: Option<(String, String)>,
     },
+    /// Transcription reuses the chat backend request shape. The chat-shaped
+    /// request is synthesized here (inside the pipeline) from the family's
+    /// prompt convention, so request building reads it in place of a
+    /// client-supplied chat request; `format`/`family` flow into the
+    /// response spec.
+    Transcription {
+        token_ids: Vec<u32>,
+        processed_messages: super::ProcessedMessages,
+        chat_request: Arc<ChatCompletionRequest>,
+        format: super::spec::TranscriptionResponseFormat,
+        family: &'static dyn TranscriptionFamily,
+    },
     Completion {
         /// One entry per prompt; scalar requests carry exactly one.
         items: Vec<CompletionItem>,
@@ -496,6 +522,7 @@ impl PreparationOutput {
         match self {
             Self::Chat { token_ids, .. }
             | Self::Messages { token_ids, .. }
+            | Self::Transcription { token_ids, .. }
             | Self::Generate { token_ids, .. }
             | Self::Embedding { token_ids, .. }
             | Self::Harmony { token_ids, .. } => token_ids,
@@ -524,6 +551,9 @@ impl PreparationOutput {
                 processed_messages, ..
             }
             | Self::Messages {
+                processed_messages, ..
+            }
+            | Self::Transcription {
                 processed_messages, ..
             } => Some(&processed_messages.text),
             Self::Completion {
@@ -688,6 +718,9 @@ impl RequestContext {
             RequestType::Completion(req) => req.stream,
             RequestType::Responses(req) => req.stream.unwrap_or(false),
             RequestType::Messages(req) => req.stream.unwrap_or(false),
+            // Transcription is whole-file only; streaming is rejected in
+            // preparation by capability check, never handed off here.
+            RequestType::Transcription { .. } => false,
             // Embeddings and classification never stream.
             RequestType::Embedding(_) | RequestType::Classify(_) => false,
         };
@@ -739,6 +772,7 @@ impl RequestContext {
             RequestType::Embedding(req) => req.model.clone(),
             RequestType::Classify(req) => req.model.clone(),
             RequestType::Messages(req) => req.model.clone(),
+            RequestType::Transcription { request, .. } => request.model.clone(),
         };
         drop(request_type);
         drop(components);
@@ -793,6 +827,22 @@ impl RequestContext {
         components: Arc<SharedComponents>,
     ) -> Self {
         Self::new(RequestType::Chat(request), headers, model_id, components)
+    }
+
+    /// Create context for an audio transcription request.
+    pub fn for_transcription(
+        request: Arc<TranscriptionRequest>,
+        audio: Arc<AudioFile>,
+        headers: Option<HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        Self::new(
+            RequestType::Transcription { request, audio },
+            headers,
+            model_id,
+            components,
+        )
     }
 
     /// Create context for generate request
@@ -894,6 +944,21 @@ impl RequestContext {
         match &self.input.request_type {
             RequestType::Chat(req) => Arc::clone(req),
             _ => panic!("Expected chat request"),
+        }
+    }
+
+    /// Get Arc clones of the transcription request and its audio (panics if
+    /// not a transcription request).
+    #[expect(
+        clippy::panic,
+        reason = "typed accessor: caller guarantees variant via RequestType construction"
+    )]
+    pub fn transcription_input_arc(&self) -> (Arc<TranscriptionRequest>, Arc<AudioFile>) {
+        match &self.input.request_type {
+            RequestType::Transcription { request, audio } => {
+                (Arc::clone(request), Arc::clone(audio))
+            }
+            _ => panic!("Expected transcription request"),
         }
     }
 
@@ -1164,6 +1229,11 @@ pub(crate) enum FinalResponse {
     Classify(ClassifyResponse),
     /// Messages API response
     Messages(Message),
+    /// Transcription: the decoded transcript plus its wire format.
+    Transcription {
+        text: String,
+        format: super::spec::TranscriptionResponseFormat,
+    },
 }
 
 #[cfg(test)]

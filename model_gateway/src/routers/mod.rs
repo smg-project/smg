@@ -41,7 +41,6 @@ pub mod parse;
 pub mod responses;
 pub mod router_manager;
 pub mod tokenize;
-pub(crate) mod transcription;
 
 pub use common::body_policy::BodyPolicy;
 pub use factory::RouterFactory;

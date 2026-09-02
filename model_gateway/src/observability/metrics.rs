@@ -704,6 +704,7 @@ pub mod metrics_labels {
     pub const ENDPOINT_EMBEDDINGS: &str = "embeddings";
     pub const ENDPOINT_CLASSIFY: &str = "classify";
     pub const ENDPOINT_MESSAGES: &str = "messages";
+    pub const ENDPOINT_TRANSCRIPTIONS: &str = "transcriptions";
     pub const ENDPOINT_REALTIME: &str = "realtime";
     pub const ENDPOINT_REALTIME_SESSIONS: &str = "realtime_sessions";
     pub const ENDPOINT_REALTIME_CLIENT_SECRETS: &str = "realtime_client_secrets";
