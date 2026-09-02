@@ -15,6 +15,10 @@
 //! family is a new spec module and one registry row, not another
 //! model-conditional in the router.
 
+// One module per family. Adding a transcription model is exactly: a module
+// here implementing `TranscriptionModelSpec`, one row in `SPECS`, and the
+// family's protocol-free knowledge in that family's `crates/multimodal`
+// registry spec — no edit to the router or to anything generic below.
 mod qwen3_asr;
 
 use axum::{
@@ -57,7 +61,7 @@ pub(crate) trait TranscriptionModelSpec: Send + Sync {
     fn parse_output(&self, raw: &str) -> String;
 }
 
-/// Every supported family; first match wins.
+/// Every supported family; first match wins. New families append here.
 static SPECS: &[&dyn TranscriptionModelSpec] = &[&qwen3_asr::Qwen3AsrSpec];
 
 /// Resolve the family serving `model_id`, or `None` when no spec matches.
