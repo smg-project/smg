@@ -1096,9 +1096,11 @@ impl ConfigValidator {
     }
 
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
         let invalid_decode_policy = match &config.mode {
             RoutingMode::PrefillDecode { decode_policy, .. } => {
-                matches!(decode_policy, Some(PolicyConfig::Bucket { .. }))
+                (config.enable_igw || !has_service_discovery)
+                    && matches!(decode_policy, Some(PolicyConfig::Bucket { .. }))
             }
             RoutingMode::EncodePrefillDecode { decode_policy, .. } => matches!(
                 decode_policy.as_ref().unwrap_or(&config.policy),
@@ -1119,8 +1121,6 @@ impl ConfigValidator {
         }
 
         Self::validate_mtls(config)?;
-
-        let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
 
         if !has_service_discovery {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {

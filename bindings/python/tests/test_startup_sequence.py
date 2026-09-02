@@ -221,13 +221,7 @@ class TestRouterInitialization:
 
             # Function returns None; ensure start was invoked
 
-    @pytest.mark.parametrize(
-        ("pd_disaggregation", "epd_disaggregation"),
-        [
-            (True, False),
-            (False, True),
-        ],
-    )
+    @pytest.mark.parametrize("pd_disaggregation,epd_disaggregation", [(True, False), (False, True)])
     def test_disaggregated_service_discovery_enables_igw_without_replacing_mode(
         self, pd_disaggregation, epd_disaggregation
     ):
