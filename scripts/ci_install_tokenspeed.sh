@@ -82,6 +82,27 @@ export CPLUS_INCLUDE_PATH="${_cuda_inc}${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PAT
 export C_INCLUDE_PATH="${_cuda_inc}${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
 
 # ── Clone TokenSpeed ────────────────────────────────────────────────────────
+# TokenSpeed is the only engine installed from a git clone -- sglang, vllm and
+# trtllm all come from PyPI -- so it is the only one exposed to github.com
+# refusing anonymous git traffic. When the runners started doing that, this
+# fetch died instantly with "could not read Username for 'https://github.com'".
+#
+# Authenticate it when a token is available, matching how every other place in
+# this repo reaches a foreign repo (`secrets.GH_SYNC_TOKEN` for the engine
+# image, `secrets.TOKENSPEED_GITHUB_TOKEN` for the whl index). The repo is
+# public, so the workflow's own read-only token is enough; an unset token
+# leaves the fetch anonymous so local runs keep working.
+GIT_AUTH_ARGS=()
+if [ -n "${TOKENSPEED_GITHUB_TOKEN:-}" ]; then
+    # Same header form actions/checkout uses. Kept out of the remote URL so it
+    # cannot leak through `git remote -v` or an error message.
+    TOKENSPEED_AUTH_HEADER=$(printf 'x-access-token:%s' "$TOKENSPEED_GITHUB_TOKEN" | base64 -w0)
+    GIT_AUTH_ARGS=(-c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${TOKENSPEED_AUTH_HEADER}")
+    echo "Fetching TokenSpeed with an authenticated github.com header"
+else
+    echo "No TOKENSPEED_GITHUB_TOKEN set; fetching TokenSpeed anonymously"
+fi
+
 # ``git clone --branch`` only accepts branch/tag names, not SHAs, so we
 # init+fetch+checkout instead. Works for both SHAs and refs.
 if [ ! -d "$TOKENSPEED_DIR" ]; then
@@ -89,11 +110,13 @@ if [ ! -d "$TOKENSPEED_DIR" ]; then
     git init -q "$TOKENSPEED_DIR"
     (cd "$TOKENSPEED_DIR" \
         && git remote add origin "$TOKENSPEED_REPO" \
-        && git fetch --depth 1 origin "$TOKENSPEED_REF" \
+        && git "${GIT_AUTH_ARGS[@]}" fetch --depth 1 origin "$TOKENSPEED_REF" \
         && git checkout FETCH_HEAD)
 else
     echo "TokenSpeed clone exists at $TOKENSPEED_DIR, reusing"
-    (cd "$TOKENSPEED_DIR" && git fetch --depth 1 origin "$TOKENSPEED_REF" && git checkout "$TOKENSPEED_REF")
+    (cd "$TOKENSPEED_DIR" \
+        && git "${GIT_AUTH_ARGS[@]}" fetch --depth 1 origin "$TOKENSPEED_REF" \
+        && git checkout "$TOKENSPEED_REF")
 fi
 
 cd "$TOKENSPEED_DIR"

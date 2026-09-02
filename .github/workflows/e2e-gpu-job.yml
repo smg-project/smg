@@ -105,6 +105,12 @@ jobs:
       - name: Setup TokenSpeed backend
         if: inputs.engine == 'tokenspeed'
         uses: ./.github/actions/setup-tokenspeed
+        with:
+          # This reusable workflow has no `secrets:` plumbing and its callers do
+          # not pass `secrets: inherit`, so TOKENSPEED_GITHUB_TOKEN is out of
+          # reach here. `github.token` is available automatically and a public
+          # read is all the fetch needs.
+          github-token: ${{ github.token }}
 
       # Artifact downloads
       - name: Download wheel artifact
