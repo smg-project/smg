@@ -455,6 +455,22 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
 
+    // ==================== RL Control Plane ====================
+    /// Mount the RL control plane under /v1/rl (worker discovery,
+    /// engine-route passthrough, fan-out). Off by default; when off, no RL
+    /// code path is reachable.
+    #[arg(long, default_value_t = false, help_heading = "RL Control Plane")]
+    enable_rl: bool,
+
+    /// Total timeout for one proxied engine control call (weight refits can
+    /// take minutes)
+    #[arg(long, default_value_t = 600, help_heading = "RL Control Plane")]
+    rl_control_timeout_secs: u64,
+
+    /// Maximum concurrent engine calls in one fan-out
+    #[arg(long, default_value_t = 32, help_heading = "RL Control Plane")]
+    rl_fanout_concurrency: usize,
+
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
@@ -1910,6 +1926,11 @@ impl CliArgs {
             .enable_wasm(self.enable_wasm)
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .igw(self.enable_igw)
+            .rl(smg_rl::RlConfig {
+                enabled: self.enable_rl,
+                control_timeout_secs: self.rl_control_timeout_secs,
+                fanout_concurrency: self.rl_fanout_concurrency,
+            })
             .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
             .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
 

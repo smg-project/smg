@@ -216,6 +216,9 @@ pub struct RouterConfig {
     pub health_check: HealthCheckConfig,
     #[serde(default)]
     pub enable_igw: bool,
+    /// RL control plane (`/v1/rl/*`); inert unless `rl.enabled`.
+    #[serde(default)]
+    pub rl: smg_rl::RlConfig,
     /// Can be a HuggingFace model ID or local path
     pub model_path: Option<String>,
     /// Overrides model_path tokenizer if provided
@@ -1129,6 +1132,7 @@ impl Default for RouterConfig {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            rl: smg_rl::RlConfig::default(),
             connection_mode: ConnectionMode::Http,
             startup_worker_runtime_type: None,
             zmq_engine_count: None,

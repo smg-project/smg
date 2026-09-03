@@ -680,6 +680,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn rl(mut self, rl: smg_rl::RlConfig) -> Self {
+        self.config.rl = rl;
+        self
+    }
+
     pub fn dp_minimum_tokens_scheduler(mut self, enable: bool) -> Self {
         self.config.dp_minimum_tokens_scheduler = enable;
         self

@@ -7457,6 +7457,7 @@ dependencies = [
  "smg-mcp",
  "smg-mesh",
  "smg-mm-rdma",
+ "smg-rl",
  "smg-wasm",
  "str0m",
  "tempfile",
