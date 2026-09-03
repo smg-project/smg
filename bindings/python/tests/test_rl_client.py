@@ -41,7 +41,7 @@ WORKER = {
 
 class _Stub(BaseHTTPRequestHandler):
     seen: list[dict] = []
-    responses: dict[str, tuple[int, dict]] = {}
+    stub_responses: dict[str, tuple[int, dict]] = {}
 
     def _handle(self):
         length = int(self.headers.get("content-length") or 0)
@@ -56,7 +56,7 @@ class _Stub(BaseHTTPRequestHandler):
                 "body": json.loads(body) if body else None,
             }
         )
-        status, payload = _Stub.responses.get(url.path, (404, {"error": "not_found"}))
+        status, payload = _Stub.stub_responses.get(url.path, (404, {"error": "not_found"}))
         data = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("content-type", "application/json")
@@ -74,7 +74,7 @@ class _Stub(BaseHTTPRequestHandler):
 @pytest.fixture
 def stub():
     _Stub.seen = []
-    _Stub.responses = {}
+    _Stub.stub_responses = {}
     server = HTTPServer(("127.0.0.1", 0), _Stub)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -83,8 +83,8 @@ def stub():
 
 
 def test_workers_and_worker(stub):
-    _Stub.responses["/v1/rl/workers"] = (200, {"workers": [WORKER], "total": 1})
-    _Stub.responses["/v1/rl/workers/w1"] = (200, WORKER)
+    _Stub.stub_responses["/v1/rl/workers"] = (200, {"workers": [WORKER], "total": 1})
+    _Stub.stub_responses["/v1/rl/workers/w1"] = (200, WORKER)
     rl = RL(stub, api_key="k")
     ws = rl.workers()
     assert len(ws) == 1 and ws[0].id == "w1" and ws[0].engine == "sglang"
@@ -94,7 +94,7 @@ def test_workers_and_worker(stub):
 
 
 def test_call_sends_method_params_body(stub):
-    _Stub.responses["/v1/rl/workers/w1/engine/pause"] = (
+    _Stub.stub_responses["/v1/rl/workers/w1/engine/pause"] = (
         200,
         {
             "worker_id": "w1",
@@ -114,7 +114,7 @@ def test_call_sends_method_params_body(stub):
 
 
 def test_fanout_raises_on_partial_unless_allowed(stub):
-    _Stub.responses["/v1/rl/engine/flush_cache"] = (
+    _Stub.stub_responses["/v1/rl/engine/flush_cache"] = (
         207,
         {
             "results": {"w1": {"url": "u", "status": 200, "latency_ms": 1, "body": {}}},
@@ -141,7 +141,7 @@ def test_fanout_raises_on_partial_unless_allowed(stub):
 
 
 def test_smg_errors_raise_rlerror(stub):
-    _Stub.responses["/v1/rl/engine/pause"] = (
+    _Stub.stub_responses["/v1/rl/engine/pause"] = (
         400,
         {"error": "no_workers_match", "message": "none", "selector": "x=y"},
     )
@@ -163,7 +163,7 @@ def test_worker_from_json_defaults_missing_dicts():
 
 
 def test_call_raises_on_smg_error_envelope(stub):
-    _Stub.responses["/v1/rl/workers/w1/engine/pause"] = (
+    _Stub.stub_responses["/v1/rl/workers/w1/engine/pause"] = (
         502,
         {
             "error": "upstream_unreachable",
@@ -179,7 +179,7 @@ def test_call_raises_on_smg_error_envelope(stub):
 
 
 def test_call_returns_mirrored_upstream_error(stub):
-    _Stub.responses["/v1/rl/workers/w1/engine/pause"] = (
+    _Stub.stub_responses["/v1/rl/workers/w1/engine/pause"] = (
         500,
         {
             "worker_id": "w1",
@@ -195,7 +195,7 @@ def test_call_returns_mirrored_upstream_error(stub):
 
 
 def test_fanout_error_reports_response_status(stub):
-    _Stub.responses["/v1/rl/engine/pause"] = (
+    _Stub.stub_responses["/v1/rl/engine/pause"] = (
         200,
         {
             "results": {"w1": {"url": "u", "status": 200, "latency_ms": 1, "body": {}}},
