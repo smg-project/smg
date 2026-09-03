@@ -69,19 +69,22 @@ on:
         type: number
         default: 0
         description: "Minimum effective (selected) test count; exported as E2E_MIN_SELECTED for the pytest harness floor check (0 = disabled)"
-      container_image:
+      tokenspeed_prebuilt_image:
         required: false
         type: string
         default: ""
-        description: "Container image override (e.g. the prebuilt ci-tokenspeed image); empty = the plain GPU CI container"
+        description: "Prebuilt TokenSpeed carrier image to extract onto the runner (resolved by detect-changes); empty = build from source"
 
 jobs:
   run:
     runs-on: ${{ inputs.runner }}
-    container: ${{ inputs.container_image || vars.SMG_CI_GPU_CONTAINER_IMAGE }}
+    container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: ${{ inputs.timeout }}
     permissions:
       contents: read
+      # For the authenticated-ghcr-pull fallback in setup-tokenspeed's
+      # fetch step (scripts/ci_fetch_tokenspeed_prebuilt.sh).
+      packages: read
     env:
       E2E_ENGINE: ${{ inputs.engine }}
       E2E_RUNTIME: ${{ inputs.engine }}
@@ -89,6 +92,7 @@ jobs:
       E2E_VLLM_KV_BACKEND: ${{ inputs.vllm_kv_backend }}
       E2E_CONNECTION_MODE: ${{ inputs.connection_mode }}
       E2E_ZMQ_ENGINE_COUNT: ${{ inputs.zmq_engine_count }}
+      TOKENSPEED_PREBUILT_IMAGE: ${{ inputs.tokenspeed_prebuilt_image }}
       ROUTER_LOCAL_MODEL_PATH: /models
     steps:
       - name: Checkout code
