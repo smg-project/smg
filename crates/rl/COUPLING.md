@@ -10,6 +10,7 @@ that adds a surface must update this file.
 | (d) | route mount | `src/server.rs` `build_app` | `nest("/v1/rl", smg_rl::router(..))` under `apply_control_plane_auth` |
 | (d) | metrics HELP registration | `src/observability/metrics.rs` | `smg_rl::init_rl_metrics()` |
 | (d) | config + flags | `src/config/{types,builder,validation}.rs`, `src/main.rs`, `bindings/python/src/smg/router_args.py`, `bindings/python/src/lib.rs` | `RouterConfig.rl`, three CLI flags |
+| (d) | manifests | `model_gateway/Cargo.toml`, `bindings/python/Cargo.toml` | `smg-rl` pulled in via `workspace = true` (router crate and the pyo3 bindings crate) |
 
 Test-only files that the mount also touches, none of them a new surface:
 `model_gateway/tests/rl_control_plane_test.rs` (gateway-level `/v1/rl` tests),
