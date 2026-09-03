@@ -70,13 +70,19 @@ fn dp_rank(url: &str) -> usize {
 
 /// Collapse DP-aware ranks that share a `base_url` into one row (lowest rank
 /// wins) and sort rows by `base_url`. The count is the number of ranks.
+///
+/// Keyed on `(is_dp_aware, base_url_or_url)` rather than a plain string: a
+/// non-DP worker's `url` and a DP group's `base_url` can be textually
+/// identical (e.g. a non-DP worker at `http://b:1` alongside DP ranks
+/// `http://b:1@0`, `http://b:1@1`), and those are distinct registry
+/// entries that must not be merged.
 pub fn collapse(workers: Vec<RlWorkerInfo>) -> Vec<(RlWorkerInfo, usize)> {
-    let mut groups: HashMap<String, (RlWorkerInfo, usize)> = HashMap::new();
+    let mut groups: HashMap<(bool, String), (RlWorkerInfo, usize)> = HashMap::new();
     for w in workers {
         let key = if w.is_dp_aware {
-            w.base_url.clone()
+            (true, w.base_url.clone())
         } else {
-            w.url.clone()
+            (false, w.url.clone())
         };
         match groups.get_mut(&key) {
             None => {
@@ -159,10 +165,17 @@ pub(crate) async fn get_worker(
 ) -> Response {
     match state.view.get(&id) {
         Some(w) => {
-            let ranks = collapse(state.view.list())
-                .into_iter()
-                .find(|(row, _)| row.base_url == w.base_url)
-                .map_or(1, |(_, n)| n);
+            let ranks = if w.is_dp_aware {
+                state
+                    .view
+                    .list()
+                    .iter()
+                    .filter(|other| other.is_dp_aware && other.base_url == w.base_url)
+                    .count()
+                    .max(1)
+            } else {
+                1
+            };
             (StatusCode::OK, Json(entry(&w, ranks))).into_response()
         }
         None => RlError::WorkerNotFound(id).into_response(),
@@ -203,6 +216,42 @@ mod tests {
         assert_eq!(rows[0].1, 1);
         assert_eq!(rows[1].0.id, "b0", "lowest rank wins");
         assert_eq!(rows[1].1, 3);
+    }
+
+    #[tokio::test]
+    async fn collapse_keeps_non_dp_worker_sharing_a_dp_base_url() {
+        let ws = vec![
+            worker("n", "http://b:1", RuntimeType::Sglang),
+            worker("r0", "http://b:1@0", RuntimeType::Sglang),
+            worker("r1", "http://b:1@1", RuntimeType::Sglang),
+        ];
+        let rows = collapse(ws.clone());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0.id, "n");
+        assert_eq!(rows[0].1, 1);
+        assert_eq!(rows[1].0.id, "r0");
+        assert_eq!(rows[1].1, 2);
+
+        let app = crate::router::<()>(state(ws));
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/workers/r1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["dp_ranks"], 2);
+
+        let resp = app
+            .oneshot(Request::get("/workers/n").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["dp_ranks"], 1);
     }
 
     #[test]
