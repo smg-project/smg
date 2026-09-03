@@ -527,6 +527,7 @@ jobs:
               - 'scripts/ci_install_trtllm.sh'
               - 'scripts/ci_install_tokenspeed.sh'
               - 'scripts/ci_tokenspeed_image_tag.sh'
+              - 'scripts/ci_fetch_tokenspeed_prebuilt.sh'
               - '.github/versions/tokenspeed.ref'
             agentic:
               - 'crates/mcp/**'

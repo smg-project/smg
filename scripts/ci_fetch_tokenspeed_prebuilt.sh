@@ -77,8 +77,15 @@ fi
 rm -rf "$staging"
 
 # The payload was baked as root; the job user needs write access for the
-# per-PR glue installs (uv pip uninstall/install -e into the venv).
-$SUDO chown -R "$(id -u):$(id -g)" /opt/smg-ci /opt/tokenspeed-src || true
+# per-PR glue installs (uv pip uninstall/install -e into the venv). A
+# root-owned payload would still pass venv adoption (world-readable) and the
+# stamp check, and only fail later at the glue writes — a hard lane failure.
+# So a failed repair must remove the payload and fall back instead.
+if ! $SUDO chown -R "$(id -u):$(id -g)" /opt/smg-ci /opt/tokenspeed-src; then
+    log "ownership repair failed; lane will build from source"
+    $SUDO rm -rf /opt/smg-ci /opt/tokenspeed-src
+    exit 0
+fi
 
 if [ -n "${GITHUB_ENV:-}" ]; then
     echo "SMG_BAKED_VENV=/opt/smg-ci/.venv" >> "$GITHUB_ENV"
