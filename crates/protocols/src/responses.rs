@@ -1528,13 +1528,47 @@ fn default_reasoning_effort() -> Option<ReasoningEffort> {
     Some(ReasoningEffort::Medium)
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+/// OpenAI `reasoning.effort` tiers, lowest to highest. `none` turns reasoning
+/// off; it is distinct from an absent field, which defaults to `medium`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    None,
     Minimal,
     Low,
     Medium,
     High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    /// The wire value, which is also the Chat `reasoning_effort` string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// Parse a wire value; `None` for anything outside the OpenAI tiers.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -3974,5 +4008,44 @@ mod tests {
             let serde_tag = serialized.get("type").and_then(|v| v.as_str()).unwrap();
             assert_eq!(tool.as_str(), serde_tag);
         }
+    }
+
+    const REASONING_EFFORT_TIERS: [ReasoningEffort; 7] = [
+        ReasoningEffort::None,
+        ReasoningEffort::Minimal,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::Xhigh,
+        ReasoningEffort::Max,
+    ];
+
+    /// `as_str`/`parse` must agree with the serde tag: the Chat pipeline
+    /// receives the string form, and drift would change a tier in transit.
+    #[test]
+    fn reasoning_effort_str_forms_match_serde_tag() {
+        for effort in REASONING_EFFORT_TIERS {
+            let tag = serde_json::to_value(effort).unwrap();
+            assert_eq!(tag, Value::String(effort.as_str().to_string()));
+            assert_eq!(ReasoningEffort::parse(effort.as_str()), Some(effort));
+            assert_eq!(
+                serde_json::from_value::<ReasoningEffort>(tag).unwrap(),
+                effort
+            );
+        }
+        assert_eq!(ReasoningEffort::parse("bogus"), None);
+    }
+
+    /// Every OpenAI tier deserializes inside `reasoning`; an absent effort
+    /// still defaults to medium.
+    #[test]
+    fn reasoning_param_accepts_every_openai_tier() {
+        for tier in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            let param: ResponseReasoningParam =
+                serde_json::from_value(serde_json::json!({ "effort": tier })).unwrap();
+            assert_eq!(param.effort.map(ReasoningEffort::as_str), Some(tier));
+        }
+        let param: ResponseReasoningParam = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(param.effort, Some(ReasoningEffort::Medium));
     }
 }
