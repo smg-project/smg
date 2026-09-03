@@ -82,9 +82,6 @@ jobs:
     timeout-minutes: ${{ inputs.timeout }}
     permissions:
       contents: read
-      # For the authenticated-ghcr-pull fallback in setup-tokenspeed's
-      # fetch step (scripts/ci_fetch_tokenspeed_prebuilt.sh).
-      packages: read
     env:
       E2E_ENGINE: ${{ inputs.engine }}
       E2E_RUNTIME: ${{ inputs.engine }}
