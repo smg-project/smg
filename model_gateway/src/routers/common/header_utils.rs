@@ -144,17 +144,17 @@ pub fn insert_routed_worker_id(headers: &mut HeaderMap, worker_url: &str) {
     }
 }
 
-/// Whether `name` is reserved for a response created by SMG itself.
+/// Whether `name` is SMG's own error-code response header.
 ///
 /// Backend responses must not mint this marker: downstream gateways use it to
 /// distinguish a gateway decision from an upstream response.
-pub(crate) fn is_smg_owned_response_header(name: &str) -> bool {
+pub(crate) fn is_smg_owned_error_code_header(name: &str) -> bool {
     name.eq_ignore_ascii_case(HEADER_X_SMG_ERROR_CODE)
 }
 
 /// Determine if a header should be forwarded without allocating (case-insensitive)
 fn should_forward_header_no_alloc(name: &str) -> bool {
-    // List of headers that should NOT be forwarded (hop-by-hop or SMG-owned).
+    // List of headers that should NOT be forwarded (hop-by-hop or SMG error-code).
     !(name.eq_ignore_ascii_case("connection")
         || name.eq_ignore_ascii_case("keep-alive")
         || name.eq_ignore_ascii_case("proxy-authenticate")
@@ -165,7 +165,7 @@ fn should_forward_header_no_alloc(name: &str) -> bool {
         || name.eq_ignore_ascii_case("upgrade")
         || name.eq_ignore_ascii_case("content-encoding")
         || name.eq_ignore_ascii_case("host")
-        || is_smg_owned_response_header(name))
+        || is_smg_owned_error_code_header(name))
 }
 
 /// API provider types for provider-specific header handling
@@ -419,7 +419,7 @@ mod tests {
 
         assert!(forwarded.get(HEADER_X_SMG_ERROR_CODE).is_none());
         assert_eq!(forwarded.get("x-upstream-id").unwrap(), "worker-a");
-        assert!(is_smg_owned_response_header("X-SMG-Error-Code"));
+        assert!(is_smg_owned_error_code_header("X-SMG-Error-Code"));
     }
 
     #[test]

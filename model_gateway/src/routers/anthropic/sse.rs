@@ -20,7 +20,7 @@ use tracing::{debug, error, warn};
 use super::mcp::{IterationResult, McpToolCall};
 use crate::routers::{
     common::{
-        header_utils::is_smg_owned_response_header,
+        header_utils::is_smg_owned_error_code_header,
         sse::{SseDecodeError, SseDecoder, SseEncodeError, SseEncoder, SseFrame},
     },
     error::internal_error,
@@ -73,7 +73,7 @@ pub(crate) fn build_sse_response(
 
     for (key, value) in &upstream_headers {
         let key_str = key.as_str();
-        if !is_smg_owned_response_header(key_str)
+        if !is_smg_owned_error_code_header(key_str)
             && !matches!(
                 key_str,
                 "content-type"
