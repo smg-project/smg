@@ -88,6 +88,13 @@ impl Drop for ZmqStreamState {
     }
 }
 
+/// Terminal status of a stream ended by `WorkerInference.Abort`. The Router
+/// distinguishes this from an engine failure and from a stream that merely
+/// ran out of frames.
+fn cancelled_status() -> Status {
+    Status::cancelled("request aborted on the Worker")
+}
+
 #[tonic::async_trait]
 impl EngineTransport for ZmqWorkerTransport {
     async fn generate(
@@ -110,10 +117,22 @@ impl EngineTransport for ZmqWorkerTransport {
         // would find no entry, still answer `success: true`, and leave the
         // engine generating to completion behind an accepted cancellation.
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
-        self.active
-            .lock()
-            .map_err(|_| Status::internal("Worker ZMQ request registry is poisoned"))?
-            .insert(request_id.clone(), cancel_tx);
+        {
+            let mut active = self
+                .active
+                .lock()
+                .map_err(|_| Status::internal("Worker ZMQ request registry is poisoned"))?;
+            // A second stream under the same id would overwrite this sender,
+            // and the first stream's `Drop` would then remove the *new* entry,
+            // turning a later `abort` into a silent no-op. The id is the
+            // Router's cancellation handle, so it has to be unique here.
+            if active.contains_key(&request_id) {
+                return Err(Status::already_exists(format!(
+                    "request {request_id} is already in flight on this Worker"
+                )));
+            }
+            active.insert(request_id.clone(), cancel_tx);
+        }
 
         let stream = match self.client.generate(engine_request).await {
             Ok(stream) => stream,
@@ -127,11 +146,15 @@ impl EngineTransport for ZmqWorkerTransport {
             }
         };
         // An abort that raced the submission has already fired the sender. The
-        // engine has the request by now, so surface it as an immediately
-        // finished stream and let the drop-driven auto-abort reach the engine.
+        // engine has the request by now, so surface the cancellation as the
+        // stream's only item and let the drop-driven auto-abort reach the
+        // engine. A clean EOF here would look to the Router like a stream that
+        // ended without `Complete`, not like the abort it asked for.
         if cancel_rx.try_recv().is_ok() {
             drop(stream);
-            return Ok(Box::pin(futures::stream::empty()));
+            return Ok(Box::pin(futures::stream::once(async {
+                Err(cancelled_status())
+            })));
         }
 
         let state = ZmqStreamState {
@@ -146,7 +169,10 @@ impl EngineTransport for ZmqWorkerTransport {
                 return None;
             }
             tokio::select! {
-                _ = &mut state.cancel => None,
+                _ = &mut state.cancel => {
+                    state.done = true;
+                    Some((Err(cancelled_status()), state))
+                }
                 item = state.stream.next() => match item {
                     Some(Ok(response)) => {
                         let response = from_vllm_response(&state.request_id, response);
@@ -253,6 +279,12 @@ mod tests {
             })
             .await
             .expect("abort");
+        let status = stream
+            .next()
+            .await
+            .expect("cancelled stream reports the abort")
+            .expect_err("cancellation is a status, not a frame");
+        assert_eq!(status.code(), tonic::Code::Cancelled);
         assert!(stream.next().await.is_none(), "cancelled stream must close");
 
         let inbound = tokio::time::timeout(Duration::from_secs(2), engine.recv())
@@ -263,5 +295,26 @@ mod tests {
             panic!("expected abort request, got {inbound:?}");
         };
         assert_eq!(request_ids, vec![request_id]);
+
+        // Checked after the abort above has reached the engine, so the
+        // duplicate's own submission cannot race that inbound frame.
+        // The id is the Router's cancellation handle: a second registration
+        // under it must be refused rather than silently replace the first.
+        let dup = proto::GenerateRequest {
+            request_id: "worker-zmq-dup".to_string(),
+            tokenized: Some(proto::TokenizedInput {
+                original_text: "hello".to_string(),
+                input_ids: vec![1],
+            }),
+            sampling_params: Some(proto::SamplingParams::default()),
+            stream: true,
+            ..Default::default()
+        };
+        let _first = transport.generate(dup.clone()).await.expect("first stream");
+        let code = match transport.generate(dup).await {
+            Ok(_) => panic!("duplicate request id must be rejected"),
+            Err(status) => status.code(),
+        };
+        assert_eq!(code, tonic::Code::AlreadyExists);
     }
 }
