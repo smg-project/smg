@@ -413,6 +413,22 @@ fn try_acquire_worker_permit(
         .map_err(|_| Status::resource_exhausted("Worker request limit reached"))
 }
 
+/// `WorkerInference` v1 has no input-logprobs lane: neither
+/// `GenerateStreamChunk` nor `GenerateComplete` carries them. A request that
+/// asks for prompt logprobs (`return_logprob` with a non-negative
+/// `logprob_start_len`; `-1` means "output logprobs only") would make the
+/// engine compute them and then have the adapter drop them, so the Router
+/// saw a normal stream with the requested data silently missing. Refuse it at
+/// the boundary that can name the gap.
+fn reject_input_logprobs(request: &proto::GenerateRequest) -> Result<(), Status> {
+    if request.return_logprob && request.logprob_start_len.is_some_and(|start| start >= 0) {
+        return Err(Status::unimplemented(
+            "WorkerInference v1 does not carry input (prompt) logprobs",
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_worker_serving(serving: Option<&Arc<AtomicBool>>) -> Result<(), Status> {
     if serving.is_some_and(|serving| !serving.load(Ordering::Acquire)) {
         return Err(Status::unavailable("Worker is not serving"));
@@ -429,8 +445,10 @@ impl proto::worker_inference_server::WorkerInference for EngineWorkerInference {
         request: Request<proto::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         ensure_worker_serving(self.serving.as_ref())?;
+        let request = request.into_inner();
+        reject_input_logprobs(&request)?;
         let permit = try_acquire_worker_permit(self.permits.as_ref())?;
-        let stream = self.transport.generate(request.into_inner()).await?;
+        let stream = self.transport.generate(request).await?;
         let stream = stream.map(move |item| {
             let _permit = &permit;
             item
@@ -450,6 +468,7 @@ impl proto::worker_inference_server::WorkerInference for EngineWorkerInference {
 }
 
 pub fn into_vllm_request(request: proto::GenerateRequest) -> Result<vllm::GenerateRequest, Status> {
+    reject_input_logprobs(&request)?;
     let tokenized = request.tokenized.ok_or_else(missing_tokenized_input)?;
     let sampling_params = request
         .sampling_params
@@ -457,7 +476,6 @@ pub fn into_vllm_request(request: proto::GenerateRequest) -> Result<vllm::Genera
             into_vllm_sampling(
                 params,
                 request.return_logprob,
-                request.logprob_start_len,
                 request.top_logprobs_num,
                 &request.token_ids_logprob,
             )
@@ -483,7 +501,6 @@ pub fn into_vllm_request(request: proto::GenerateRequest) -> Result<vllm::Genera
 fn into_vllm_sampling(
     params: proto::SamplingParams,
     return_logprob: bool,
-    logprob_start_len: Option<i32>,
     top_logprobs_num: i32,
     token_ids_logprob: &[u32],
 ) -> Result<vllm::SamplingParams, Status> {
@@ -498,15 +515,10 @@ fn into_vllm_sampling(
         ));
     }
     let logprobs = return_logprob.then_some(top_logprobs_num.max(0));
-    // SGLang/TokenSpeed semantics: `logprob_start_len` defaults to -1, meaning
-    // "output logprobs only". Only a non-negative offset asks the engine for
-    // input logprobs. The Router populates this field on every request, so
-    // gating on `is_some()` alone made vLLM compute (and V1 skip prefix
-    // caching for) prompt logprobs on every prefill, with the result then
-    // dropped -- `GenerateComplete` has no input-logprobs field.
-    let prompt_logprobs = logprob_start_len
-        .filter(|start| return_logprob && *start >= 0)
-        .map(|_| top_logprobs_num.max(0));
+    // Never ask vLLM for prompt logprobs: the wire cannot carry them back
+    // (`reject_input_logprobs` refuses the requests that want them), and
+    // computing them makes V1 skip prefix caching for the prefill.
+    let prompt_logprobs = None;
     let logit_bias = params
         .logit_bias
         .into_iter()
@@ -1468,11 +1480,11 @@ mod tests {
         assert_eq!(sampling.n, 2);
     }
 
-    fn vllm_sampling_for(
+    fn vllm_logprob_request(
         return_logprob: bool,
         logprob_start_len: Option<i32>,
-    ) -> vllm::SamplingParams {
-        into_vllm_request(proto::GenerateRequest {
+    ) -> proto::GenerateRequest {
+        proto::GenerateRequest {
             request_id: "vllm-logprobs".to_string(),
             tokenized: Some(proto::TokenizedInput {
                 input_ids: vec![1],
@@ -1483,24 +1495,45 @@ mod tests {
             logprob_start_len,
             top_logprobs_num: 3,
             ..Default::default()
-        })
-        .expect("vLLM request")
-        .sampling_params
-        .expect("sampling params")
+        }
     }
 
     #[test]
-    fn vllm_prompt_logprobs_need_a_non_negative_start() {
+    fn input_logprob_requests_are_refused_not_dropped() {
         // The Router populates `logprob_start_len` on every request (-1 means
-        // "output logprobs only"), so keying off its presence alone made vLLM
-        // compute prompt logprobs for all traffic and then discard them --
-        // `GenerateComplete` has no input-logprobs field.
-        assert_eq!(vllm_sampling_for(true, Some(-1)).prompt_logprobs, None);
-        assert_eq!(vllm_sampling_for(false, Some(-1)).prompt_logprobs, None);
-        assert_eq!(vllm_sampling_for(false, Some(0)).prompt_logprobs, None);
-        assert_eq!(vllm_sampling_for(true, None).prompt_logprobs, None);
-        assert_eq!(vllm_sampling_for(true, Some(0)).prompt_logprobs, Some(3));
-        assert_eq!(vllm_sampling_for(true, Some(4)).prompt_logprobs, Some(3));
+        // "output logprobs only"). Only a non-negative start with
+        // `return_logprob` asks for prompt logprobs, which no v1 response
+        // frame can carry -- so that combination is an error at the boundary,
+        // and everything else passes through without asking vLLM for them.
+        for (return_logprob, start) in [
+            (true, Some(-1)),
+            (false, Some(-1)),
+            (false, Some(0)),
+            (true, None),
+        ] {
+            let request = vllm_logprob_request(return_logprob, start);
+            assert!(
+                reject_input_logprobs(&request).is_ok(),
+                "{return_logprob} {start:?}"
+            );
+            let sampling = into_vllm_request(request)
+                .expect("vLLM request")
+                .sampling_params
+                .expect("sampling params");
+            assert_eq!(sampling.prompt_logprobs, None);
+            assert_eq!(sampling.logprobs, return_logprob.then_some(3));
+        }
+        for start in [Some(0), Some(4)] {
+            let request = vllm_logprob_request(true, start);
+            assert_eq!(
+                reject_input_logprobs(&request).expect_err("gate").code(),
+                tonic::Code::Unimplemented
+            );
+            assert_eq!(
+                into_vllm_request(request).expect_err("vLLM lane").code(),
+                tonic::Code::Unimplemented
+            );
+        }
     }
 
     #[test]
