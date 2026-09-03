@@ -31,10 +31,13 @@ FROM ${BASE_IMAGE}
 
 # Build prerequisites the bare base lacks (the runner pods already carry
 # these). python3 is 3.12 on noble, matching the CI interpreter pin.
+# python3-dev: tokenspeed-scheduler's CMake does
+# find_package(Python COMPONENTS Interpreter Development.Module), which
+# needs Python.h — without it the configure step fails.
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git build-essential pkg-config \
-        python3 python3-venv python3-pip \
+        python3 python3-dev python3-venv python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/smg-ci
