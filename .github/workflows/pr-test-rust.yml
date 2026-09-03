@@ -17,11 +17,13 @@ on:
 permissions:
   contents: read
 
-# Per-PR groups cancel superseded runs; pushes to main key on the commit SHA so
-# every commit on main gets its own run and is never cancelled by a later push.
+# One group per PR and one for main: a newer push cancels the superseded run.
+# On main this tests HEAD rather than every intermediate commit: back-to-back
+# merges otherwise stack full GPU matrices on one runner pool and time each
+# other out. Re-run an intermediate commit via workflow_dispatch if needed.
 concurrency:
-  group: gateway-tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: gateway-tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'main' }}
+  cancel-in-progress: true
 
 env:
   RUSTC_WRAPPER: sccache
@@ -354,10 +356,14 @@ jobs:
 
   # --- Benchmarks (standalone) ---
 
+  # Advisory: the thresholds in e2e_test/benchmarks are absolute latencies on
+  # a shared runner pool and sit inside its noise band, so a miss is a warning,
+  # not a merge blocker. Results are still uploaded and summarized.
   benchmarks:
     needs: build-wheel
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
+    continue-on-error: true
     timeout-minutes: 36
     permissions:
       contents: read
@@ -975,12 +981,14 @@ jobs:
             test_path: e2e_test/messages
             timeout: 20
             setup_agentic_deps: true
+            external_tests: true
 
           - name: openai-responses
             vendor: openai
             test_path: e2e_test/responses
             timeout: 30
             setup_agentic_deps: true
+            external_tests: true
 
           - name: openai-realtime
             vendor: openai
@@ -1050,6 +1058,20 @@ jobs:
         run: |
           ROUTER_LOCAL_MODEL_PATH="/models" pytest ${{ matrix.test_path }} \
             -m "not external" \
+            --reruns 2 --reruns-delay 5 \
+            -s -vv
+
+      # Tests that depend on services beyond the vendor API itself (hosted
+      # tool execution, web search) fail for reasons this repo cannot fix, so
+      # they report but never gate.
+      - name: Run external-service E2E tests (advisory)
+        if: matrix.external_tests
+        continue-on-error: true
+        env:
+          BRAVE_MCP_HOST: brave-search-mcp
+        run: |
+          ROUTER_LOCAL_MODEL_PATH="/models" pytest ${{ matrix.test_path }} \
+            -m external \
             --reruns 2 --reruns-delay 5 \
             -s -vv
 
@@ -1301,7 +1323,6 @@ jobs:
                 "${{ needs.build-wheel.result }}" == "failure" || \
                 "${{ needs.python-unit-tests.result }}" == "failure" || \
                 "${{ needs.unit-tests.result }}" == "failure" || \
-                "${{ needs.benchmarks.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat-zmq.result }}" == "failure" || \
                 "${{ needs.e2e-2gpu-chat-zmq-dp.result }}" == "failure" || \
@@ -1326,7 +1347,7 @@ jobs:
   summarize-benchmarks:
     needs: [benchmarks]
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
-    if: success()
+    if: always() && contains(fromJSON('["success", "failure"]'), needs.benchmarks.result)
     permissions:
       contents: read
     steps:
