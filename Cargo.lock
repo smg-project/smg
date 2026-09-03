@@ -4284,10 +4284,12 @@ dependencies = [
  "axum",
  "engine-zmq-client",
  "futures",
+ "prost-types",
  "serde_json",
  "smg-grpc-client",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",
@@ -7661,15 +7663,20 @@ name = "smg-python"
 version = "1.10.1"
 dependencies = [
  "once_cell",
+ "prost-types",
  "pyo3",
  "rand 0.10.2",
  "reasoning-parser",
  "serde_yaml",
  "smg",
  "smg-auth",
+ "smg-grpc-client",
  "smg-mesh",
  "tikv-jemallocator",
  "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-health",
  "tool-parser",
 ]
 
@@ -8599,6 +8606,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "tonic-health"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fcfab99db777fba2802f0dfa861d1628d1ae916fb199d29819941f139ae85082"
+dependencies = [
+ "prost",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]

@@ -1,6 +1,15 @@
 name: 'Setup TokenSpeed Backend'
 description: 'Create Python venv and install TokenSpeed (engine + kernel + scheduler), from the prebuilt CI image when available, from source otherwise.'
 
+inputs:
+  github-token:
+    description: >-
+      Token used to fetch the TokenSpeed source from github.com. Only a public
+      read is needed, so the caller's own GITHUB_TOKEN suffices. Optional: an
+      empty value leaves the fetch anonymous.
+    required: false
+    default: ''
+
 runs:
   using: 'composite'
   steps:
@@ -20,4 +29,6 @@ runs:
 
     - name: Install TokenSpeed
       shell: bash
+      env:
+        TOKENSPEED_GITHUB_TOKEN: ${{ inputs.github-token }}
       run: bash scripts/ci_install_tokenspeed.sh

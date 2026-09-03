@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+// Minimal wire-compatible view of SGLang's native Rust gRPC service. Keep this
+// adapter surface limited to WorkerInference v1 instead of copying the entire
+// engine API into SMG.
+package sglang.runtime.v1;
+
+service SglangService {
+  rpc Generate(GenerateRequest) returns (stream GenerateResponse);
+  rpc Abort(AbortRequest) returns (AbortResponse);
+}
+
+message SamplingParams {
+  optional float temperature = 1;
+  optional float top_p = 2;
+  optional int32 top_k = 3;
+  optional float min_p = 4;
+  optional float frequency_penalty = 5;
+  optional float presence_penalty = 6;
+  optional float repetition_penalty = 7;
+  optional int32 max_new_tokens = 8;
+  optional int32 min_new_tokens = 9;
+  repeated string stop = 10;
+  repeated int32 stop_token_ids = 11;
+  optional bool ignore_eos = 12;
+  optional int32 n = 13;
+  optional int64 seed = 16;
+  optional GuidedDecoding guided_decoding = 17;
+}
+
+message GuidedDecoding {
+  oneof constraint {
+    string json_schema = 1;
+    string regex = 2;
+    string ebnf = 3;
+    string structural_tag = 5;
+  }
+}
+
+message GenerateRequest {
+  repeated int32 input_ids = 1;
+  optional SamplingParams sampling_params = 2;
+  optional bool stream = 3;
+  optional bool return_logprob = 4;
+  optional int32 top_logprobs_num = 5;
+  optional int32 logprob_start_len = 6;
+  optional string rid = 7;
+  optional int32 routed_dp_rank = 10;
+  optional int32 priority = 14;
+  optional bool require_reasoning = 15;
+  optional uint32 max_thinking_tokens = 16;
+}
+
+message GenerateResponse {
+  repeated int32 output_ids = 1;
+  map<string, string> meta_info = 2;
+  bool finished = 3;
+}
+
+message AbortRequest {
+  string rid = 1;
+  bool abort_all = 2;
+}
+
+message AbortResponse {
+  bool success = 1;
+}

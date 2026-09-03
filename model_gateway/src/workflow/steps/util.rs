@@ -4,9 +4,18 @@ use std::{future::Future, time::Duration};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
-use smg_grpc_client::connect_channel_with_timeout;
+use smg_grpc_client::{
+    connect_channel_with_timeout,
+    worker_proto::{
+        worker_control_client::WorkerControlClient, GetCapabilitiesRequest, GetHealthRequest,
+        GetIdentityRequest, GetTopologyRequest, WorkerHealthState,
+    },
+};
 
-use crate::routers::grpc::client::GrpcClient;
+use crate::{
+    routers::grpc::client::GrpcClient,
+    workflow::data::{SmgEngineDiscovery, SmgWorkerDiscovery},
+};
 
 fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
     url.get(..scheme.len())
@@ -135,6 +144,172 @@ async fn grpc_transport_reachable(grpc_url: &str, timeout_secs: u64) -> Result<(
     Ok(())
 }
 
+/// Verify that an endpoint implements the SMG Worker control-plane contract.
+///
+/// Unlike engine gRPC reachability, this is an explicit protocol handshake:
+/// identity prevents an arbitrary tonic service from being registered as an
+/// SMG Worker, capabilities enforce the API compatibility boundary, and
+/// health prevents routing to a Worker before its node-local engine is ready.
+pub(crate) async fn try_smg_worker_reachable(
+    url: &str,
+    timeout_secs: u64,
+) -> Result<SmgWorkerDiscovery, String> {
+    const SUPPORTED_API_MAJOR: u32 = 1;
+
+    let grpc_url = grpc_reachable_url(url)?;
+    let timeout = Duration::from_secs(timeout_secs);
+    // `timeout` below bounds the whole handshake -- connect plus four sequential
+    // RPCs. Handing the connect that same full budget leaves nothing for the
+    // RPCs, so a Worker that is merely slow to accept fails with a spurious
+    // "handshake timeout" while it is serving fine. Reserve half for the RPCs.
+    let connect_timeout = (timeout / 2).max(Duration::from_millis(500)).min(timeout);
+    let handshake = async {
+        let channel = connect_channel_with_timeout(&grpc_url, connect_timeout)
+            .await
+            .map_err(|error| format!("SMG Worker gRPC connection failed: {error}"))?;
+        let mut client = WorkerControlClient::new(channel);
+
+        let identity = client
+            .get_identity(GetIdentityRequest {})
+            .await
+            .map_err(|error| format!("SMG Worker GetIdentity failed: {error}"))?
+            .into_inner()
+            .identity
+            .ok_or_else(|| "SMG Worker GetIdentity returned no identity".to_string())?;
+        if identity.worker_id.trim().is_empty() || identity.instance_id.trim().is_empty() {
+            return Err(
+                "SMG Worker identity must include non-empty worker_id and instance_id".to_string(),
+            );
+        }
+
+        let capabilities = client
+            .get_capabilities(GetCapabilitiesRequest {})
+            .await
+            .map_err(|error| format!("SMG Worker GetCapabilities failed: {error}"))?
+            .into_inner()
+            .capabilities
+            .ok_or_else(|| "SMG Worker GetCapabilities returned no capabilities".to_string())?;
+        if capabilities.api_major != SUPPORTED_API_MAJOR {
+            return Err(format!(
+                "unsupported SMG Worker control API {}.{}; Router supports major {}",
+                capabilities.api_major, capabilities.api_minor, SUPPORTED_API_MAJOR
+            ));
+        }
+
+        let health = client
+            .get_health(GetHealthRequest {
+                include_components: false,
+            })
+            .await
+            .map_err(|error| format!("SMG Worker GetHealth failed: {error}"))?
+            .into_inner();
+        let state =
+            WorkerHealthState::try_from(health.state).unwrap_or(WorkerHealthState::Unspecified);
+        if state != WorkerHealthState::Serving {
+            return Err(format!(
+                "SMG Worker is not ready: state={}, message={}",
+                state.as_str_name(),
+                health.message
+            ));
+        }
+
+        let topology = client
+            .get_topology(GetTopologyRequest {})
+            .await
+            .map_err(|error| format!("SMG Worker GetTopology failed: {error}"))?
+            .into_inner()
+            .topology
+            .ok_or_else(|| "SMG Worker GetTopology returned no topology".to_string())?;
+        if topology.worker_id != identity.worker_id {
+            return Err(format!(
+                "SMG Worker topology worker_id {:?} does not match identity {:?}",
+                topology.worker_id, identity.worker_id
+            ));
+        }
+        if topology.engines.is_empty() {
+            return Err("SMG Worker topology advertises no engines".to_string());
+        }
+        // The Router decides string-stop ownership from this attribute (see
+        // `smg_worker_uses_token_only_wire`); a Worker that omits it cannot
+        // be routed to safely, so refuse it here where the message can say so.
+        for engine in &topology.engines {
+            match engine
+                .attributes
+                .get("engine_transport")
+                .map(|value| value.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("grpc" | "zmq") => {}
+                Some(other) => {
+                    return Err(format!(
+                        "SMG Worker engine {:?} advertises unknown engine_transport {other:?}; \
+                         expected grpc or zmq",
+                        engine.engine_id
+                    ))
+                }
+                None => {
+                    return Err(format!(
+                        "SMG Worker engine {:?} does not advertise its engine_transport \
+                         attribute, so the Router cannot tell whether string stops reach the \
+                         engine",
+                        engine.engine_id
+                    ))
+                }
+            }
+        }
+
+        let engines = topology
+            .engines
+            .into_iter()
+            .map(|engine| {
+                let capability = capabilities
+                    .engines
+                    .iter()
+                    .find(|candidate| candidate.engine_type == engine.engine_type);
+                SmgEngineDiscovery {
+                    engine_id: engine.engine_id,
+                    engine_type: engine.engine_type,
+                    engine_version: capability
+                        .map(|value| value.engine_version.clone())
+                        .unwrap_or_default(),
+                    endpoint: engine.endpoint,
+                    model_ids: if engine.model_ids.is_empty() {
+                        capability
+                            .map(|value| value.model_ids.clone())
+                            .unwrap_or_default()
+                    } else {
+                        engine.model_ids
+                    },
+                    features: capability
+                        .map(|value| value.features.clone())
+                        .unwrap_or_default(),
+                    attributes: engine.attributes,
+                }
+            })
+            .collect();
+
+        Ok(SmgWorkerDiscovery {
+            worker_id: identity.worker_id,
+            instance_id: identity.instance_id,
+            hostname: identity.hostname,
+            zone: identity.zone,
+            version: identity.version,
+            identity_labels: identity.labels,
+            api_major: capabilities.api_major,
+            api_minor: capabilities.api_minor,
+            features: capabilities.features,
+            max_concurrent_requests: capabilities.max_concurrent_requests,
+            capability_attributes: capabilities.attributes,
+            topology_version: topology.topology_version,
+            engines,
+        })
+    };
+
+    tokio::time::timeout(timeout, handshake)
+        .await
+        .map_err(|_| "SMG Worker control-plane handshake timeout".to_string())?
+}
+
 const GRPC_RUNTIME_TYPES: [&str; 5] = ["sglang", "vllm", "trtllm", "mlx", "tokenspeed"];
 
 async fn first_success_or_all_errors<F>(
@@ -217,6 +392,9 @@ mod tests {
             Arc,
         },
     };
+
+    use mock_worker::{config::Config as MockWorkerConfig, engine::EngineParams};
+    use portpicker::pick_unused_port;
 
     use super::*;
 
@@ -334,5 +512,52 @@ mod tests {
                 "error names {runtime}, so a per-runtime probe ran: {err}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn smg_worker_handshake_accepts_the_rust_mock_control_plane() {
+        let port = pick_unused_port().expect("an unused local port");
+        let config = Arc::new(MockWorkerConfig {
+            host: "127.0.0.1".to_string(),
+            http_base_port: 0,
+            http_count: 0,
+            grpc_base_port: port,
+            grpc_count: 1,
+            zmq_handshake: None,
+            zmq_count: 0,
+            zmq_start_index: 0,
+            model_id: "mock-model".to_string(),
+            tokenizer_path: "mock-model".to_string(),
+            gen_delay: Duration::ZERO,
+            output_tokens: 8,
+            realistic: false,
+            engine: EngineParams::default(),
+        });
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(mock_worker::grpc::serve(
+            config,
+            "127.0.0.1".to_string(),
+            port,
+        ));
+
+        let endpoint = format!("grpc://127.0.0.1:{port}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match try_smg_worker_reachable(&endpoint, 1).await {
+                Ok(discovery) => {
+                    assert_eq!(discovery.worker_id, format!("mock-worker-{port}"));
+                    assert_eq!(discovery.engines.len(), 1);
+                    assert_eq!(discovery.engines[0].model_ids, ["mock-model"]);
+                    break;
+                }
+                Err(error) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    tracing::debug!(%error, "waiting for mock Worker control plane");
+                }
+                Err(error) => panic!("SMG Worker handshake did not succeed: {error}"),
+            }
+        }
+
+        servers.abort_all();
     }
 }

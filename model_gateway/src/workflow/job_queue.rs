@@ -9,6 +9,8 @@ use std::{
 };
 
 use dashmap::DashMap;
+#[cfg(test)]
+use openai_protocol::worker::WorkerMode;
 use openai_protocol::worker::{
     ConnectionMode, JobStatus, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
 };
@@ -761,6 +763,7 @@ impl JobQueue {
 /// Identity fields (url, worker type, api key, bootstrap port) are the
 /// caller's.
 fn apply_startup_worker_config(spec: &mut WorkerSpec, router_config: &RouterConfig) {
+    spec.worker_mode = router_config.startup_worker_mode;
     // ZMQ startup workers carry the runtime pinned by `--backend` (the shared
     // handshake cannot be probed for a wire protocol); `None` — HTTP/gRPC or no
     // `--backend` — keeps auto-detection in detect_backend.
@@ -897,6 +900,19 @@ mod tests {
         assert_eq!(
             spec_for("ipc:///tmp/smg/engine", &config).runtime_type,
             default_runtime
+        );
+    }
+
+    #[test]
+    fn startup_worker_mode_is_stamped_on_worker_specs() {
+        let config = RouterConfig {
+            startup_worker_mode: WorkerMode::Smg,
+            ..RouterConfig::default()
+        };
+
+        assert_eq!(
+            spec_for("grpc://127.0.0.1:30000", &config).worker_mode,
+            WorkerMode::Smg
         );
     }
 

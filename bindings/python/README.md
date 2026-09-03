@@ -9,7 +9,7 @@ This directory contains the Python bindings for SMG (Shepherd Model Gateway), bu
 ```bash
 pip install maturin
 cd smg/bindings/python
-maturin develop --features vendored-openssl
+maturin develop --features extension-module,vendored-openssl
 ```
 
 ### Usage
@@ -74,14 +74,14 @@ bindings/python/
 ```bash
 pip install maturin
 cd smg/bindings/python
-maturin develop --features vendored-openssl
+maturin develop --features extension-module,vendored-openssl
 ```
 
 ### Production Build
 
 ```bash
 cd smg/bindings/python
-maturin build --release --out dist --features vendored-openssl
+maturin build --release --out dist --features extension-module,vendored-openssl
 pip install dist/smg-*.whl
 ```
 

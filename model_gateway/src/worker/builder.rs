@@ -3,7 +3,9 @@ use std::{collections::HashMap, sync::Arc};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use openai_protocol::{
     model_card::ModelCard,
-    worker::{HealthCheckConfig, OverloadUpdate, WorkerModels, WorkerSpec, WorkerStatus},
+    worker::{
+        HealthCheckConfig, OverloadUpdate, WorkerMode, WorkerModels, WorkerSpec, WorkerStatus,
+    },
 };
 use tokio::sync::mpsc;
 
@@ -125,6 +127,18 @@ impl BasicWorkerBuilder {
     /// Set the connection mode (HTTP or gRPC)
     pub fn connection_mode(mut self, mode: ConnectionMode) -> Self {
         self.spec.connection_mode = mode;
+        self
+    }
+
+    /// Identify the endpoint as a direct engine or a two-tier SMG worker.
+    pub fn worker_mode(mut self, mode: WorkerMode) -> Self {
+        self.spec.worker_mode = mode;
+        self
+    }
+
+    /// Set the control-plane endpoint for a two-tier SMG Worker.
+    pub fn control_url(mut self, url: Option<String>) -> Self {
+        self.spec.control_url = url;
         self
     }
 
@@ -366,6 +380,8 @@ impl BasicWorkerBuilder {
             )),
             metadata,
             backend_client,
+            worker_control_client: Arc::new(OnceCell::new()),
+            smg_instance_id: Arc::new(ArcSwapOption::empty()),
             zmq_connect_started: Arc::new(AtomicBool::new(false)),
             zmq_connect_abort: Arc::new(ArcSwapOption::empty()),
             connect_signal_tx: self.connect_signal_tx,
@@ -529,6 +545,25 @@ mod tests {
         // Health-checked workers start Pending (not routable until health checker promotes)
         assert!(!worker.is_healthy());
         assert_eq!(worker.status(), WorkerStatus::Pending);
+    }
+
+    #[test]
+    fn smg_worker_mode_survives_spec_based_registration_build() {
+        let mut spec = WorkerSpec::new("grpc://smg-worker:50052");
+        spec.control_url = Some("grpc://smg-worker:50051".to_string());
+        spec.connection_mode = ConnectionMode::Grpc;
+        spec.worker_mode = WorkerMode::Smg;
+        spec.runtime_type = RuntimeType::Vllm;
+
+        let worker = BasicWorkerBuilder::from_spec(spec).build();
+
+        assert_eq!(worker.worker_mode(), WorkerMode::Smg);
+        assert_eq!(
+            worker.metadata().spec.control_url.as_deref(),
+            Some("grpc://smg-worker:50051")
+        );
+        assert_eq!(worker.connection_mode(), &ConnectionMode::Grpc);
+        assert_eq!(worker.metadata().spec.runtime_type, RuntimeType::Vllm);
     }
 
     #[test]

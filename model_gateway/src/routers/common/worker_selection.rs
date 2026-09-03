@@ -19,7 +19,9 @@ use crate::{
         },
         error,
     },
-    worker::{ConnectionMode, ProviderType, RuntimeType, Worker, WorkerRegistry, WorkerType},
+    worker::{
+        ConnectionMode, ProviderType, RuntimeType, Worker, WorkerMode, WorkerRegistry, WorkerType,
+    },
 };
 
 /// Holds references to shared infrastructure needed for worker selection.
@@ -58,6 +60,10 @@ pub struct SelectWorkerRequest<'a> {
     /// Filter by runtime type (External, Sglang, Vllm, Trtllm). `None` = any.
     pub runtime_type: Option<RuntimeType>,
 
+    /// Filter by endpoint identity (direct engine or SMG worker). `None` keeps
+    /// the legacy behavior and considers both modes.
+    pub worker_mode: Option<WorkerMode>,
+
     /// When `true`, restrict candidates to workers advertising realtime
     /// capability (the `realtime` label). Used by the realtime routes so
     /// they never proxy to a worker that can't serve realtime.
@@ -78,6 +84,9 @@ impl<'a> WorkerSelector<'a> {
             && req
                 .runtime_type
                 .is_none_or(|runtime| worker.metadata().spec.runtime_type == runtime)
+            && req
+                .worker_mode
+                .is_none_or(|mode| worker.worker_mode() == mode)
     }
 
     /// Select the best worker for a model with refresh-on-miss.
@@ -355,6 +364,51 @@ mod tests {
         Arc::new(b.build())
     }
 
+    fn worker_with_mode(url: &str, mode: WorkerMode) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .worker_mode(mode)
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    #[tokio::test]
+    async fn worker_mode_filter_selects_only_smg_endpoint() {
+        let registry = WorkerRegistry::new();
+        registry.register_or_replace(worker_with_mode("grpc://engine:50051", WorkerMode::Engine));
+        registry.register_or_replace(worker_with_mode("grpc://smg-worker:50051", WorkerMode::Smg));
+
+        let picked = WorkerSelector::new(&registry)
+            .select_worker(&SelectWorkerRequest {
+                model_id: "m",
+                worker_mode: Some(WorkerMode::Smg),
+                ..Default::default()
+            })
+            .await
+            .expect("an SMG endpoint should be selected");
+
+        assert_eq!(picked.url(), "grpc://smg-worker:50051");
+        assert_eq!(picked.worker_mode(), WorkerMode::Smg);
+    }
+
+    #[test]
+    fn absent_worker_mode_filter_keeps_legacy_mixed_pool() {
+        let registry = WorkerRegistry::new();
+        registry.register_or_replace(worker_with_mode("grpc://engine:50051", WorkerMode::Engine));
+        registry.register_or_replace(worker_with_mode("grpc://smg-worker:50051", WorkerMode::Smg));
+        let selector = WorkerSelector::new(&registry);
+        let request = SelectWorkerRequest {
+            model_id: "m",
+            ..Default::default()
+        };
+
+        assert!(request.worker_mode.is_none());
+        assert_eq!(selector.candidate_pool(&request, true).len(), 2);
+    }
+
     #[tokio::test]
     async fn requires_realtime_selects_only_labeled() {
         let registry = WorkerRegistry::new();
@@ -407,5 +461,6 @@ mod tests {
     #[test]
     fn default_request_does_not_require_realtime() {
         assert!(!SelectWorkerRequest::default().require_realtime_capable);
+        assert!(SelectWorkerRequest::default().worker_mode.is_none());
     }
 }

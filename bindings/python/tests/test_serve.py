@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from smg.serve import (
+    _ZMQ_HANDSHAKE_PORT_SPAN,
     BACKEND_ARG_ADDERS,
     BACKEND_CHOICES,
     BACKEND_LAUNCHERS,
@@ -669,12 +670,21 @@ class TestZmqHandshakePort:
     def test_reject_collisions_raises_and_names_urls(self):
         # Two ports whose ipc paths derive the same handshake port must be
         # rejected before launch, naming both colliding URLs.
-        base = 30000
-        collider = next(
-            p
-            for p in range(base + 1, base + 20000)
-            if _zmq_handshake_port(_zmq_ipc_url(p)) == _zmq_handshake_port(_zmq_ipc_url(base))
-        )
+        #
+        # Search for *any* colliding pair rather than one that collides with a
+        # fixed base: the ipc path contains the socket dir, which carries the
+        # uid, so which ports collide differs per machine. Scanning more ports
+        # than the 10000-wide band guarantees a pair by pigeonhole.
+        seen: dict[int, int] = {}
+        for port in range(30000, 30000 + _ZMQ_HANDSHAKE_PORT_SPAN + 1):
+            handshake_port = _zmq_handshake_port(_zmq_ipc_url(port))
+            if handshake_port in seen:
+                base, collider = seen[handshake_port], port
+                break
+            seen[handshake_port] = port
+        else:
+            pytest.fail("no handshake-port collision in a range wider than the band")
+
         with pytest.raises(ValueError) as exc:
             _reject_handshake_port_collisions([base, collider])
         assert _zmq_ipc_url(base) in str(exc.value)
@@ -836,7 +846,18 @@ class TestVllmWorkerLauncher:
 
 
 class TestTokenspeedWorkerLauncher:
-    """Test TokenspeedWorkerLauncher (ZMQ direct-backend only)."""
+    """Test TokenSpeed gRPC and ZMQ launch commands."""
+
+    def test_build_grpc_command(self):
+        launcher = TokenspeedWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="grpc")
+        cmd = launcher.build_command(args, ["--mem-fraction-static", "0.8"], "0.0.0.0", 31000)
+
+        assert "smg_grpc_servicer.tokenspeed" in cmd
+        assert cmd[cmd.index("--model") + 1] == "/tmp/model"
+        assert cmd[cmd.index("--host") + 1] == "0.0.0.0"
+        assert cmd[cmd.index("--port") + 1] == "31000"
+        assert "--mem-fraction-static" in cmd
 
     def test_build_zmq_command(self):
         launcher = TokenspeedWorkerLauncher()
@@ -956,12 +977,11 @@ class TestTokenspeedWorkerLauncher:
         assert "--grammar-backend=none" in cmd
         assert "xgrammar" not in cmd
 
-    def test_build_command_rejects_non_zmq_modes(self):
+    def test_build_command_rejects_http_mode(self):
         launcher = TokenspeedWorkerLauncher()
-        for mode in ("grpc", "http"):
-            args = argparse.Namespace(model="/tmp/model", connection_mode=mode)
-            with pytest.raises(ValueError, match="only supports --connection-mode zmq"):
-                launcher.build_command(args, [], "127.0.0.1", 31000)
+        args = argparse.Namespace(model="/tmp/model", connection_mode="http")
+        with pytest.raises(ValueError, match="supports grpc and zmq"):
+            launcher.build_command(args, [], "127.0.0.1", 31000)
 
     def test_worker_url_is_ipc(self):
         launcher = TokenspeedWorkerLauncher()
@@ -1295,7 +1315,10 @@ def _make_args(**overrides):
         "worker_host": "127.0.0.1",
         "worker_base_port": 31000,
         "worker_startup_timeout": 10,
+        "worker_control_base_port": 41000,
+        "worker_drain_secs": 5.0,
         "model_path": "/tmp/model",
+        "router_worker_mode": "engine",
         # router args with router_ prefix
         "router_policy": "cache_aware",
         "router_pd_disaggregation": False,
@@ -1365,6 +1388,193 @@ class TestServeOrchestrator:
             "grpc://127.0.0.1:32000",
             "grpc://127.0.0.1:32003",
         ]
+
+    def test_build_router_args_two_tier_uses_sidecar_urls(self):
+        args = _make_args(
+            backend="vllm",
+            model="/tmp/m",
+            data_parallel_size=2,
+            router_worker_mode="smg",
+        )
+        orch = ServeOrchestrator("vllm", args, [])
+        orch.workers = [(MagicMock(), 32000), (MagicMock(), 32003)]
+        orch.sidecars = [
+            (MagicMock(), 41000, 32000),
+            (MagicMock(), 41003, 32003),
+        ]
+
+        from types import SimpleNamespace
+
+        router_args = SimpleNamespace(
+            worker_mode="engine",
+            backend="sglang",
+            disable_retries=False,
+            disable_circuit_breaker=False,
+            policy="cache_aware",
+        )
+        with patch("smg.serve.RouterArgs.from_cli_args", return_value=router_args):
+            result = orch._build_router_args()
+
+        assert result.worker_urls == [
+            "grpc://127.0.0.1:41000",
+            "grpc://127.0.0.1:41003",
+        ]
+        assert result.worker_mode == "smg"
+        assert result.backend == "vllm"
+
+    def test_launch_two_tier_sidecars_for_tokenspeed(self):
+        args = _make_args(
+            backend="tokenspeed",
+            model="/tmp/m",
+            data_parallel_size=1,
+            router_worker_mode="smg",
+        )
+        orch = ServeOrchestrator("tokenspeed", args, ["--max-num-seqs", "64"])
+        orch.workers = [(MagicMock(), 31000)]
+        proc = MagicMock(pid=1234)
+
+        with patch("smg.serve._find_available_ports", return_value=[41000]):
+            with patch("smg.serve.subprocess.Popen", return_value=proc) as popen:
+                orch._launch_sidecars()
+
+        command = popen.call_args.args[0]
+        assert "smg.worker_sidecar" in command
+        assert command[command.index("--engine-type") + 1] == "tokenspeed"
+        assert command[command.index("--engine-transport") + 1] == "grpc"
+        assert command[command.index("--engine-endpoint") + 1] == ("grpc://127.0.0.1:31000")
+        assert command[command.index("--engine-count") + 1] == "1"
+        assert command[command.index("--max-concurrent-requests") + 1] == "64"
+        assert orch.sidecars == [(proc, 41000, 31000)]
+
+    def test_launch_two_tier_sidecar_with_zmq_engine_transport(self):
+        args = _make_args(
+            backend="tokenspeed",
+            model="/tmp/m",
+            data_parallel_size=1,
+            connection_mode="zmq",
+            router_worker_mode="smg",
+        )
+        orch = ServeOrchestrator("tokenspeed", args, ["--data-parallel-size", "2"])
+        orch.workers = [(MagicMock(), 31000)]
+        proc = MagicMock(pid=1234)
+
+        with patch("smg.serve._find_available_ports", return_value=[41000]):
+            with patch("smg.serve.subprocess.Popen", return_value=proc) as popen:
+                orch._launch_sidecars()
+
+        command = popen.call_args.args[0]
+        assert command[command.index("--engine-transport") + 1] == "zmq"
+        assert command[command.index("--engine-endpoint") + 1] == _zmq_ipc_url(31000)
+        assert command[command.index("--engine-count") + 1] == "2"
+
+    @pytest.mark.parametrize("connection_mode", ["grpc", "zmq"])
+    def test_two_tier_rejects_sglang(self, connection_mode):
+        """`--grpc-mode` serves SglangScheduler, but the sidecar adapter dials
+        SglangService. Reject at startup instead of failing the first request."""
+        args = _make_args(connection_mode=connection_mode, router_worker_mode="smg")
+        orch = ServeOrchestrator("sglang", args, [])
+        orch.workers = [(MagicMock(), 31000)]
+
+        with pytest.raises(ValueError, match="do not support backend sglang"):
+            orch._launch_sidecars()
+
+    def test_two_tier_is_validated_before_any_engine_launches(self):
+        """A rejected combination must fail before a model is loaded for nothing."""
+        args = _make_args(router_worker_mode="smg")
+        orch = ServeOrchestrator("sglang", args, [])
+
+        with (
+            patch("smg.serve.signal.signal"),
+            patch("smg.serve.atexit.register"),
+            patch.object(orch, "_launch_workers", side_effect=AssertionError("engine launched")),
+            patch.object(orch, "_cleanup_workers"),
+            pytest.raises(ValueError, match="do not support backend sglang"),
+        ):
+            orch.run()
+
+    def test_two_tier_zmq_admission_bound_covers_the_whole_engine_group(self):
+        """`--max-num-seqs` bounds one engine; a grouped ZMQ launch puts
+        `--data-parallel-size` engines behind one sidecar."""
+        args = _make_args(
+            backend="vllm",
+            model="/tmp/m",
+            data_parallel_size=1,
+            connection_mode="zmq",
+            router_worker_mode="smg",
+        )
+        orch = ServeOrchestrator(
+            "vllm", args, ["--max-num-seqs", "64", "--data-parallel-size", "2"]
+        )
+        orch.workers = [(MagicMock(), 31000)]
+        proc = MagicMock(pid=1234)
+
+        with patch("smg.serve._find_available_ports", return_value=[41000]):
+            with patch("smg.serve.subprocess.Popen", return_value=proc) as popen:
+                orch._launch_sidecars()
+
+        command = popen.call_args.args[0]
+        assert command[command.index("--engine-count") + 1] == "2"
+        assert command[command.index("--max-concurrent-requests") + 1] == "128"
+
+    def test_wait_sidecars_healthy_uses_grpc_health_not_tcp(self):
+        """The sidecar listener binds before its engine is usable, so readiness
+        must come from grpc.health.v1, which the Rust side gates on the engine
+        transport."""
+        args = _make_args(backend="vllm", model="/tmp/m", router_worker_mode="smg")
+        orch = ServeOrchestrator("vllm", args, [])
+        proc = MagicMock()
+        proc.poll.return_value = None
+        orch.sidecars = [(proc, 41000, 31000)]
+
+        with (
+            patch("smg.serve._grpc_health_check", side_effect=[False, True]) as health,
+            patch("smg.serve.time.sleep"),
+            patch("smg.serve.socket.create_connection") as tcp,
+        ):
+            orch._wait_sidecars_healthy()
+
+        assert health.call_count == 2
+        assert health.call_args.args[:2] == ("127.0.0.1", 41000)
+        tcp.assert_not_called()
+
+    def test_wait_sidecars_healthy_reports_a_sidecar_that_exited(self):
+        args = _make_args(backend="vllm", model="/tmp/m", router_worker_mode="smg")
+        orch = ServeOrchestrator("vllm", args, [])
+        proc = MagicMock()
+        proc.poll.return_value = 1
+        proc.returncode = 1
+        orch.sidecars = [(proc, 41000, 31000)]
+
+        with (
+            patch("smg.serve._grpc_health_check", return_value=False),
+            pytest.raises(RuntimeError, match="exited with code 1"),
+        ):
+            orch._wait_sidecars_healthy()
+
+    def test_sidecar_shutdown_timeout_covers_the_drain_budget(self):
+        """A long `--worker-drain-secs` must not be SIGKILLed mid-drain."""
+        short = ServeOrchestrator("vllm", _make_args(worker_drain_secs=5.0), [])
+        assert short._sidecar_shutdown_timeout() == 30
+        long = ServeOrchestrator("vllm", _make_args(worker_drain_secs=60.0), [])
+        assert long._sidecar_shutdown_timeout() == 130
+
+    def test_two_tier_grpc_admission_bound_is_per_engine(self):
+        """Over gRPC each sidecar fronts one engine process; no scaling."""
+        args = _make_args(
+            backend="vllm", model="/tmp/m", data_parallel_size=1, router_worker_mode="smg"
+        )
+        orch = ServeOrchestrator(
+            "vllm", args, ["--max-num-seqs", "64", "--data-parallel-size", "2"]
+        )
+        orch.workers = [(MagicMock(), 31000)]
+        proc = MagicMock(pid=1234)
+
+        with patch("smg.serve._find_available_ports", return_value=[41000]):
+            with patch("smg.serve.subprocess.Popen", return_value=proc) as popen:
+                orch._launch_sidecars()
+
+        command = popen.call_args.args[0]
+        assert command[command.index("--max-concurrent-requests") + 1] == "64"
 
     def test_build_router_args_zmq_forwards_backend(self):
         """ZMQ workers cannot be runtime-probed: serve's --backend must reach

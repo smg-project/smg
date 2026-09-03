@@ -89,6 +89,57 @@ pub enum ConnectionMode {
     Zmq,
 }
 
+/// Identity of the service registered as a worker endpoint.
+///
+/// This is intentionally orthogonal to [`ConnectionMode`] and [`RuntimeType`]:
+/// a two-tier SMG worker is reached over gRPC, but it still fronts a concrete
+/// engine runtime such as SGLang or vLLM. Keeping the identity explicit avoids
+/// treating a successful engine-specific health probe as endpoint discovery.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerMode {
+    /// SMG connects directly to an inference engine (legacy/default behavior).
+    #[default]
+    Engine,
+    /// SMG connects to another SMG process running the worker role.
+    Smg,
+}
+
+impl WorkerMode {
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde skip_serializing_if requires a function taking &WorkerMode"
+    )]
+    pub fn is_engine(&self) -> bool {
+        *self == Self::Engine
+    }
+}
+
+impl std::fmt::Display for WorkerMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Engine => write!(f, "engine"),
+            Self::Smg => write!(f, "smg"),
+        }
+    }
+}
+
+impl std::str::FromStr for WorkerMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("engine") {
+            Ok(Self::Engine)
+        } else if s.eq_ignore_ascii_case("smg") {
+            Ok(Self::Smg)
+        } else {
+            Err(format!("Unknown worker mode: {s}"))
+        }
+    }
+}
+
 impl ConnectionMode {
     /// Classify a worker URL by its scheme — the single source of truth for
     /// scheme → connection mode. Returns `None` for a bare `host:port` (no
@@ -609,8 +660,15 @@ impl JsonSchema for WorkerModels {
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkerSpec {
-    /// Worker URL.
+    /// Inference endpoint. For direct-engine workers this is the engine URL;
+    /// for two-tier workers this is the Worker data-plane URL.
     pub url: String,
+
+    /// Optional Worker control-plane endpoint. Only meaningful when
+    /// `worker_mode` is `smg`; if omitted, `url` is used for deployments that
+    /// intentionally host both gRPC services on one listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_url: Option<String>,
 
     /// Models this worker can serve.
     #[serde(default, skip_serializing_if = "WorkerModels::is_wildcard")]
@@ -623,6 +681,13 @@ pub struct WorkerSpec {
     /// Connection mode: http or grpc.
     #[serde(default)]
     pub connection_mode: ConnectionMode,
+
+    /// Service identity at this endpoint: an engine or a two-tier SMG worker.
+    ///
+    /// Defaults to `engine` so existing worker JSON and configuration retain
+    /// their direct-to-engine behavior.
+    #[serde(default, skip_serializing_if = "WorkerMode::is_engine")]
+    pub worker_mode: WorkerMode,
 
     /// Runtime type: sglang, vllm, trtllm, or external.
     #[serde(default, alias = "runtime")]
@@ -740,9 +805,11 @@ impl WorkerSpec {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
+            control_url: None,
             models: WorkerModels::Wildcard,
             worker_type: WorkerType::default(),
             connection_mode: ConnectionMode::default(),
+            worker_mode: WorkerMode::default(),
             runtime_type: RuntimeType::default(),
             provider: None,
             labels: HashMap::new(),
@@ -1528,6 +1595,49 @@ mod connection_mode_tests {
     fn from_url_returns_none_for_bare_or_unknown() {
         assert_eq!(ConnectionMode::from_url("host:30000"), None);
         assert_eq!(ConnectionMode::from_url("ftp://host"), None);
+    }
+}
+
+#[cfg(test)]
+mod worker_mode_tests {
+    use serde_json::json;
+
+    use super::{WorkerMode, WorkerSpec};
+
+    #[test]
+    fn legacy_spec_defaults_to_engine_without_changing_output_shape() {
+        let spec: WorkerSpec = serde_json::from_value(json!({"url": "grpc://worker:50051"}))
+            .expect("legacy worker spec should deserialize");
+
+        assert_eq!(spec.worker_mode, WorkerMode::Engine);
+        let serialized = serde_json::to_value(&spec).expect("worker spec should serialize");
+        assert!(
+            serialized.get("worker_mode").is_none(),
+            "the default engine mode should stay implicit for old API clients"
+        );
+    }
+
+    #[test]
+    fn smg_mode_round_trips_explicitly() {
+        let spec: WorkerSpec = serde_json::from_value(json!({
+            "url": "grpc://smg-worker:50052",
+            "control_url": "grpc://smg-worker:50051",
+            "connection_mode": "grpc",
+            "worker_mode": "smg",
+            "runtime_type": "vllm"
+        }))
+        .expect("SMG worker spec should deserialize");
+
+        assert_eq!(spec.worker_mode, WorkerMode::Smg);
+        assert_eq!(spec.worker_mode.to_string(), "smg");
+        assert_eq!(spec.control_url.as_deref(), Some("grpc://smg-worker:50051"));
+        assert_eq!("SMG".parse::<WorkerMode>().unwrap(), WorkerMode::Smg);
+
+        let serialized = serde_json::to_value(&spec).expect("worker spec should serialize");
+        assert_eq!(serialized["worker_mode"], "smg");
+        assert_eq!(serialized["control_url"], "grpc://smg-worker:50051");
+        assert_eq!(serialized["runtime_type"], "vllm");
+        assert_eq!(serialized["connection_mode"], "grpc");
     }
 }
 

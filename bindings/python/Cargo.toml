@@ -8,10 +8,15 @@ name = "smg_rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py38"] }
+pyo3 = { version = "0.29.0", features = ["abi3-py38"] }
 tokio = { version = "1.52.3", features = ["full"] }
 once_cell = "1.21"
 serde_yaml = "0.9"
+prost-types.workspace = true
+smg-grpc-client.workspace = true
+tonic.workspace = true
+tonic-health.workspace = true
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [dependencies.smg]
 path = "../../model_gateway"
@@ -34,7 +39,13 @@ workspace = true
 workspace = true
 
 [features]
-default = ["pyo3/extension-module"]
+# `extension-module` must NOT be in `default`. It tells PyO3 to leave the
+# libpython symbols undefined (the interpreter supplies them when it dlopens
+# the module), which is right for the cdylib but unlinkable for the test
+# binary `cargo test` builds for this crate. maturin turns it on explicitly
+# via `[tool.maturin] features` in pyproject.toml.
+default = []
+extension-module = ["pyo3/extension-module"]
 opencv-video = ["smg/opencv-video"]
 vendored-openssl = ["smg/vendored-openssl"]
 jemalloc-profiling = ["smg/jemalloc-profiling", "tikv-jemallocator/profiling"]

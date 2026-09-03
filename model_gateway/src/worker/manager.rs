@@ -706,7 +706,7 @@ fn schedule_worker_at(
 ///   - NotReady → Failed on `liveness_failure_threshold` (3 × failure_threshold)
 ///   - Ready → NotReady on `failure_threshold` consecutive failures
 ///   - Failed: terminal (handled outside this function — no transitions)
-fn compute_next_status(
+pub(crate) fn compute_next_status(
     worker: &Arc<dyn Worker>,
     probe_ok: bool,
     health_config: &HealthCheckConfig,

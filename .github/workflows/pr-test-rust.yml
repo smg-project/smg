@@ -55,6 +55,19 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Authenticate git for hook-repo clones
+        # pre-commit clones its hook repos from github.com on every run (there
+        # is no environment cache), and those clones are anonymous. When the
+        # runners' shared egress IP is rate-limited, git gets an auth challenge
+        # instead of the ref list and dies with "could not read Username for
+        # 'https://github.com'", failing the job for reasons unrelated to the
+        # diff. Spending the job's own read-only token on them lifts the
+        # anonymous limit.
+        run: |
+          git config --global \
+            url."https://x-access-token:${{ github.token }}@github.com/".insteadOf \
+            "https://github.com/"
+
       - name: Install pre-commit
         run: pip install pre-commit
 
@@ -338,6 +351,24 @@ jobs:
         run: |
           bash scripts/ci_agentic_svc_deps.sh check --postgres postgres-db
           bash scripts/ci_agentic_svc_deps.sh create-postgres-db postgres-db
+
+      - name: Expose libpython to cargo test
+        # `cargo test` builds a test binary for bindings/python, and unlike the
+        # maturin cdylib -- which enables `extension-module` and deliberately
+        # leaves the libpython symbols undefined -- that binary must link
+        # libpython. `scripts/expose_libpython.sh` resolves (or synthesises) a
+        # directory the `-lpython3.X` PyO3 emits can resolve against; the same
+        # script backs `make test` so local runs are not broken differently.
+        #
+        # Setting RUSTFLAGS changes the cache key and forces a full rebuild --
+        # acceptable for one `-L`, but the reason this is a separate,
+        # documented step.
+        run: |
+          set -euo pipefail
+          libdir=$(bash scripts/expose_libpython.sh)
+          echo "libpython link dir: $libdir"
+          echo "RUSTFLAGS=${RUSTFLAGS:-} -L $libdir" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${libdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
 
       - name: Run Rust tests
         timeout-minutes: 30

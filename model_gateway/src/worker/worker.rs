@@ -16,14 +16,25 @@ pub use openai_protocol::worker::{ConnectionMode, ProfileOptions, RuntimeType, W
 use openai_protocol::{
     model_card::ModelCard,
     model_type::{Endpoint, ModelType},
-    worker::{HealthCheckConfig, ProviderType, WorkerInfo, WorkerModels, WorkerSpec, WorkerStatus},
+    worker::{
+        HealthCheckConfig, ProviderType, WorkerInfo, WorkerMode, WorkerModels, WorkerSpec,
+        WorkerStatus,
+    },
 };
-use smg_grpc_client::common_proto;
+use smg_grpc_client::{
+    common_proto, connect_channel_with_timeout,
+    worker_proto::{
+        worker_control_client::WorkerControlClient, GetHealthRequest, GetIdentityRequest,
+        WorkerHealthState,
+    },
+    WorkerInferenceClient,
+};
 use tokio::{
     sync::{mpsc, OnceCell},
     task::AbortHandle,
     time,
 };
+use tonic::transport::Channel;
 
 use super::{
     event::WorkerConnected, overload::OverloadThresholds, CircuitBreaker, ResolvedResilience,
@@ -33,9 +44,56 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
         common::header_utils::extract_routing_key,
-        grpc::{backend_client::BackendClient, client::GrpcClient, zmq_client},
+        grpc::{
+            backend_client::{BackendClient, SmgBackendClient},
+            client::GrpcClient,
+            zmq_client,
+        },
     },
 };
+
+/// Capability a Worker advertises when its engine wire carries token ids only,
+/// so the Router must resolve string stops and the EOS backstop itself. Public
+/// because the Python `WorkerControlServer` bridge derives it from the engine
+/// transport and has to name the same string.
+pub const TOKEN_ONLY_WIRE_FEATURE: &str = "token_only_wire";
+
+/// Whether an SMG Worker's engine wire is token-only, from its registration
+/// labels. Fails closed: a registration that names no engine transport gives
+/// no basis for the decision, and defaulting to "the engine matches string
+/// stops" would silently forward stops a ZMQ engine cannot see. Every
+/// `WorkerControlServer` advertises the `engine_transport` attribute, so its
+/// absence means the labels did not come from a real discovery.
+fn smg_worker_uses_token_only_wire(
+    labels: &std::collections::HashMap<String, String>,
+) -> Result<bool, String> {
+    let advertises_feature = ["smg.features", "smg.engine_features"].iter().any(|key| {
+        labels.get(*key).is_some_and(|features| {
+            serde_json::from_str::<Vec<String>>(features).is_ok_and(|features| {
+                features
+                    .iter()
+                    .any(|feature| feature == TOKEN_ONLY_WIRE_FEATURE)
+            })
+        })
+    });
+    let transport = labels
+        .get("engine_transport")
+        .or_else(|| labels.get("smg.engine.engine_transport"));
+    match transport.map(|value| value.to_ascii_lowercase()).as_deref() {
+        Some("zmq") => Ok(true),
+        Some("grpc") => Ok(advertises_feature),
+        Some(other) => Err(format!(
+            "SMG Worker advertises unknown engine_transport {other:?}; expected grpc or zmq"
+        )),
+        // The feature alone is an explicit statement too; only silence is refused.
+        None if advertises_feature => Ok(true),
+        None => Err(
+            "SMG Worker registration carries no engine_transport label, so the Router cannot \
+             tell whether string stops reach the engine; re-register from a live discovery"
+                .to_string(),
+        ),
+    }
+}
 
 /// A worker's HTTP client handle, materialized on first use.
 ///
@@ -309,6 +367,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Get the worker's connection mode (HTTP or gRPC)
     /// Returns a reference to avoid cloning on every access
     fn connection_mode(&self) -> &ConnectionMode;
+
+    /// Identify whether this endpoint is an engine or an SMG worker service.
+    fn worker_mode(&self) -> WorkerMode;
 
     /// Get the worker's lifecycle status.
     fn status(&self) -> WorkerStatus;
@@ -669,6 +730,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// until it lands, so an orphaned driver would keep them for up to the
     /// connect timeout and collide with a same-URL re-registration.
     fn abort_background_tasks(&self) {}
+    async fn smg_worker_health_check(&self) -> WorkerResult<bool>;
     async fn grpc_health_check(&self) -> WorkerResult<bool>;
     /// Liveness check for a ZMQ worker. Unlike gRPC there is no health RPC on
     /// the raw wire: liveness is local (handshake completed and the engine has
@@ -1188,6 +1250,16 @@ pub struct BasicWorker {
     /// probe evict a dead client by swapping in a fresh cell (gRPC never
     /// swaps — a failed gRPC worker is removed and re-added instead).
     pub backend_client: Arc<ArcSwap<OnceCell<Arc<BackendClient>>>>,
+    /// Cached channel for the two-tier Worker's control-only listener. It is
+    /// deliberately separate from `backend_client`, which always targets the
+    /// inference endpoint.
+    pub worker_control_client: Arc<OnceCell<WorkerControlClient<Channel>>>,
+    /// Last SMG Worker instance ID this router accepted, seeded lazily from the
+    /// `smg.instance_id` label. Mutable because the label is frozen at
+    /// registration: without a way to adopt the new ID, a Worker that restarts
+    /// would fail every subsequent health probe forever. `None` until the first
+    /// successful identity probe.
+    pub smg_instance_id: Arc<ArcSwapOption<String>>,
     /// Guards the one-shot background ZMQ handshake driver so the health probe
     /// never cancels a long (model-load) handshake. Self-clears on failure to
     /// allow a retry. Unused for HTTP/gRPC.
@@ -1219,6 +1291,8 @@ impl Clone for BasicWorker {
             runtime: ArcSwap::from(self.runtime.load_full()),
             circuit_breaker: ArcSwap::from(self.circuit_breaker.load_full()),
             backend_client: Arc::clone(&self.backend_client),
+            worker_control_client: Arc::clone(&self.worker_control_client),
+            smg_instance_id: Arc::clone(&self.smg_instance_id),
             zmq_connect_started: Arc::clone(&self.zmq_connect_started),
             zmq_connect_abort: Arc::clone(&self.zmq_connect_abort),
             connect_signal_tx: self.connect_signal_tx.clone(),
@@ -1330,6 +1404,33 @@ impl BasicWorker {
         }
 
         self.adopt_backend_client_from(other);
+        self.adopt_smg_instance_id_from(other);
+    }
+
+    /// Carry over an instance ID the replaced worker had already accepted.
+    ///
+    /// `smg.instance_id` is frozen at registration, so a same-URL replacement
+    /// re-reads the *original* label. If the old worker had adopted a restarted
+    /// Worker's ID, dropping that adoption sends the replacement -- which
+    /// inherits `Ready` through the shared runtime above -- straight back into
+    /// failing every identity probe until the readiness state machine demotes
+    /// it, even though the Worker is serving normally.
+    ///
+    /// A replacement that carries a *newer* label wins: that is a genuine
+    /// re-registration, and its label is the authority.
+    fn adopt_smg_instance_id_from(&self, other: &BasicWorker) {
+        if self.metadata.spec.worker_mode != WorkerMode::Smg {
+            return;
+        }
+        let Some(accepted) = other.smg_instance_id.load_full() else {
+            return;
+        };
+        let own_label = self.metadata.spec.labels.get("smg.instance_id");
+        let other_label = other.metadata.spec.labels.get("smg.instance_id");
+        if own_label.is_some() && own_label != other_label {
+            return;
+        }
+        self.smg_instance_id.store(Some(accepted));
     }
 
     /// Adopt the replaced worker's backend-client cell so a same-URL
@@ -1347,6 +1448,7 @@ impl BasicWorker {
         // A transport or runtime change means a different wire protocol, and a
         // replacement that arrived with its own client keeps it.
         if self.metadata.spec.connection_mode != other.metadata.spec.connection_mode
+            || self.metadata.spec.worker_mode != other.metadata.spec.worker_mode
             || self.metadata.spec.runtime_type != other.metadata.spec.runtime_type
             || self.backend_client.load().get().is_some()
         {
@@ -1378,6 +1480,10 @@ impl Worker for BasicWorker {
         &self.metadata.spec.connection_mode
     }
 
+    fn worker_mode(&self) -> WorkerMode {
+        self.metadata.spec.worker_mode
+    }
+
     fn status(&self) -> WorkerStatus {
         self.runtime.load().status()
     }
@@ -1404,10 +1510,14 @@ impl Worker for BasicWorker {
             return Ok(());
         }
 
-        let probe_ok = match &self.metadata.spec.connection_mode {
-            ConnectionMode::Http => self.http_health_check().await?,
-            ConnectionMode::Grpc => self.grpc_health_check().await?,
-            ConnectionMode::Zmq => self.zmq_health_check().await?,
+        let probe_ok = if self.metadata.spec.worker_mode == WorkerMode::Smg {
+            self.smg_worker_health_check().await?
+        } else {
+            match &self.metadata.spec.connection_mode {
+                ConnectionMode::Http => self.http_health_check().await?,
+                ConnectionMode::Grpc => self.grpc_health_check().await?,
+                ConnectionMode::Zmq => self.zmq_health_check().await?,
+            }
         };
 
         if probe_ok {
@@ -1596,21 +1706,48 @@ impl Worker for BasicWorker {
                 let cell = self.backend_client.load_full();
                 let client = cell
                     .get_or_try_init(|| async {
-                        let runtime_str = self.metadata.spec.runtime_type.to_string();
+                        let runtime = self.metadata.spec.runtime_type;
+                        let runtime_str = runtime.to_string();
+                        let worker_mode = self.metadata.spec.worker_mode;
+                        let token_only_wire = if worker_mode == WorkerMode::Smg {
+                            smg_worker_uses_token_only_wire(&self.metadata.spec.labels).map_err(
+                                |reason| WorkerError::ConnectionFailed {
+                                    url: self.metadata.spec.url.clone(),
+                                    reason,
+                                },
+                            )?
+                        } else {
+                            false
+                        };
                         tracing::info!(
                             "Lazily initializing gRPC client ({}) for worker: {}",
                             runtime_str,
                             self.metadata.spec.url
                         );
                         // DP-expanded workers carry a `{base}@{rank}` URL; connect to the base
-                        match GrpcClient::connect(self.metadata.base_url(), &runtime_str).await {
+                        let connected = if worker_mode == WorkerMode::Smg {
+                            WorkerInferenceClient::connect(self.metadata.base_url())
+                                .await
+                                .map(|client| {
+                                    BackendClient::Smg(Arc::new(SmgBackendClient::new(
+                                        client,
+                                        runtime,
+                                        token_only_wire,
+                                    )))
+                                })
+                        } else {
+                            GrpcClient::connect(self.metadata.base_url(), &runtime_str)
+                                .await
+                                .map(BackendClient::Grpc)
+                        };
+                        match connected {
                             Ok(client) => {
                                 tracing::info!(
                                     "Successfully connected gRPC client ({}) for worker: {}",
                                     runtime_str,
                                     self.metadata.spec.url
                                 );
-                                Ok(Arc::new(BackendClient::Grpc(client)))
+                                Ok(Arc::new(client))
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -1689,6 +1826,192 @@ impl Worker for BasicWorker {
             }
             Err(_) => {
                 tracing::warn!("gRPC health timed out for {}", self.metadata.spec.url);
+                Ok(false)
+            }
+        }
+    }
+
+    async fn smg_worker_health_check(&self) -> WorkerResult<bool> {
+        let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
+        let control_url = self
+            .metadata
+            .spec
+            .control_url
+            .as_deref()
+            .unwrap_or(&self.metadata.spec.url);
+        let client = self
+            .worker_control_client
+            .get_or_try_init(|| async {
+                let channel = connect_channel_with_timeout(control_url, timeout)
+                    .await
+                    .map_err(|error| WorkerError::ConnectionFailed {
+                        url: control_url.to_string(),
+                        reason: format!("Failed to connect to SMG Worker control plane: {error}"),
+                    })?;
+                Ok::<_, WorkerError>(WorkerControlClient::new(channel))
+            })
+            .await?;
+        let mut client = client.clone();
+        match time::timeout(
+            timeout,
+            client.get_health(GetHealthRequest {
+                include_components: false,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
+                let health = response.into_inner();
+                let state = WorkerHealthState::try_from(health.state)
+                    .unwrap_or(WorkerHealthState::Unspecified);
+                tracing::debug!(
+                    worker_url = %self.metadata.spec.url,
+                    control_url,
+                    state = state.as_str_name(),
+                    "SMG Worker control health response"
+                );
+                match state {
+                    WorkerHealthState::Serving => {}
+                    // Still serving, with a warning: the Worker keeps taking
+                    // requests, so keep routing to it rather than treat a
+                    // self-reported degradation like a crash.
+                    WorkerHealthState::Degraded => {
+                        tracing::warn!(
+                            worker_url = %self.metadata.spec.url,
+                            control_url,
+                            message = %health.message,
+                            "SMG Worker reports DEGRADED; keeping it in rotation"
+                        );
+                    }
+                    // Draining rejects new work immediately, so take the worker
+                    // out of rotation now instead of after `failure_threshold`
+                    // more probes -- every request placed on it meanwhile is a
+                    // 503. The readiness machine still owns recovery: a Worker
+                    // that comes back SERVING re-admits through NotReady.
+                    WorkerHealthState::Draining => {
+                        if self.status() == WorkerStatus::Ready {
+                            tracing::warn!(
+                                worker_url = %self.metadata.spec.url,
+                                control_url,
+                                "SMG Worker is DRAINING; removing it from rotation"
+                            );
+                            self.set_status(WorkerStatus::NotReady);
+                        }
+                        return Ok(false);
+                    }
+                    WorkerHealthState::Starting
+                    | WorkerHealthState::NotServing
+                    | WorkerHealthState::Unspecified => return Ok(false),
+                }
+
+                let adopted = self.smg_instance_id.load_full();
+                let expected_instance_id = adopted.clone().or_else(|| {
+                    self.metadata
+                        .spec
+                        .labels
+                        .get("smg.instance_id")
+                        .cloned()
+                        .map(Arc::new)
+                });
+                let Some(expected_instance_id) = expected_instance_id else {
+                    return Ok(true);
+                };
+                match time::timeout(timeout, client.get_identity(GetIdentityRequest {})).await {
+                    Ok(Ok(response)) => {
+                        let observed = response
+                            .into_inner()
+                            .identity
+                            .map(|identity| identity.instance_id)
+                            .unwrap_or_default();
+                        if observed != *expected_instance_id {
+                            // Never adopt an empty ID: the next probe would
+                            // match it and report the worker healthy.
+                            // `try_smg_worker_reachable` requires a non-empty
+                            // instance_id at registration, so an empty one here
+                            // means the Worker is misbehaving.
+                            if observed.trim().is_empty() {
+                                tracing::warn!(
+                                    control_url,
+                                    expected_instance_id = %expected_instance_id,
+                                    "SMG Worker returned an empty instance ID; not adopting"
+                                );
+                                return Ok(false);
+                            }
+                            // Keep failing until the readiness state machine has
+                            // actually taken this worker out of rotation
+                            // (`failure_threshold` consecutive failures), and
+                            // only then adopt so it can probe its way back.
+                            // Adopting on the first failed probe would let the
+                            // next probe succeed and call
+                            // `consecutive_failures_reset`, so a restarted
+                            // Worker would never leave `Ready` -- silently
+                            // routing to an instance that lost all its state.
+                            if self.status() == WorkerStatus::Ready {
+                                tracing::warn!(
+                                    control_url,
+                                    expected_instance_id = %expected_instance_id,
+                                    observed_instance_id = %observed,
+                                    "SMG Worker instance changed; failing probes until this \
+                                     worker leaves rotation"
+                                );
+                                return Ok(false);
+                            }
+                            // Out of rotation now. Adopt the new instance so the
+                            // worker is not pinned unhealthy forever: the
+                            // `smg.instance_id` label is frozen at registration
+                            // and static `--worker-urls` deployments have no
+                            // re-registration path at all.
+                            //
+                            // Adoption is deliberately narrow: it lets the
+                            // worker probe its way back, and nothing more. The
+                            // rest of the registration -- `served_model_name`,
+                            // capabilities, `token_only_wire`/`engine_transport`
+                            // -- is not re-derived, so a Worker that came back
+                            // as a *different* engine or model keeps serving
+                            // under the old spec. Re-registration (discovery,
+                            // or the worker-management API) is what fixes that;
+                            // this only avoids the strictly worse outcome of a
+                            // permanently unroutable endpoint.
+                            tracing::warn!(
+                                control_url,
+                                expected_instance_id = %expected_instance_id,
+                                observed_instance_id = %observed,
+                                status = ?self.status(),
+                                "SMG Worker instance changed; adopting the new instance"
+                            );
+                            self.smg_instance_id.store(Some(Arc::new(observed)));
+                            return Ok(false);
+                        }
+                        if adopted.is_none() {
+                            // Seed from the label on the first successful probe
+                            // so later comparisons no longer read it.
+                            self.smg_instance_id.store(Some(expected_instance_id));
+                        }
+                        Ok(true)
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            control_url,
+                            %error,
+                            "SMG Worker identity RPC failed during restart check"
+                        );
+                        Ok(false)
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            control_url,
+                            "SMG Worker identity RPC timed out during restart check"
+                        );
+                        Ok(false)
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(control_url, %error, "SMG Worker control health RPC failed");
+                Ok(false)
+            }
+            Err(_) => {
+                tracing::warn!(control_url, "SMG Worker control health RPC timed out");
                 Ok(false)
             }
         }
@@ -1889,14 +2212,35 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
 
 #[cfg(test)]
 mod tests {
-    use std::{thread, time::Duration};
+    use std::{pin::Pin, thread, time::Duration};
 
+    use futures::{stream, Stream};
+    use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
     use openai_protocol::worker::HealthCheckConfig;
+    use smg_grpc_client::{
+        tokenspeed_proto,
+        worker_inference_proto::{
+            self as inference_proto,
+            worker_inference_server::{
+                WorkerInference as WorkerInferenceService, WorkerInferenceServer,
+            },
+        },
+        worker_proto::{
+            self as worker_proto,
+            worker_control_server::{WorkerControl as WorkerControlService, WorkerControlServer},
+        },
+    };
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{transport::Server, Request, Response, Status};
 
     use super::*;
-    use crate::worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        BasicWorkerBuilder,
+    use crate::{
+        routers::grpc::proto_wrapper::{ProtoGenerateRequest, ProtoResponseVariant},
+        worker::{
+            circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            manager::compute_next_status,
+            BasicWorkerBuilder,
+        },
     };
 
     /// Health config that skips health checks — workers start Ready immediately.
@@ -1959,6 +2303,36 @@ mod tests {
     }
 
     #[test]
+    fn smg_token_only_wire_detects_transport_attribute_and_feature() {
+        let attribute =
+            std::collections::HashMap::from([("engine_transport".to_string(), "zmq".to_string())]);
+        assert_eq!(smg_worker_uses_token_only_wire(&attribute), Ok(true));
+
+        let feature = std::collections::HashMap::from([(
+            "smg.engine_features".to_string(),
+            r#"["generate","token_only_wire"]"#.to_string(),
+        )]);
+        assert_eq!(smg_worker_uses_token_only_wire(&feature), Ok(true));
+
+        let grpc =
+            std::collections::HashMap::from([("engine_transport".to_string(), "grpc".to_string())]);
+        assert_eq!(smg_worker_uses_token_only_wire(&grpc), Ok(false));
+    }
+
+    #[test]
+    fn smg_token_only_wire_refuses_to_guess_without_a_transport_label() {
+        // Silence is not "string stops work": a registration that never named
+        // its transport cannot be assumed to front a stop-matching engine.
+        let none = std::collections::HashMap::new();
+        assert!(smg_worker_uses_token_only_wire(&none).is_err());
+        let unknown = std::collections::HashMap::from([(
+            "smg.engine.engine_transport".to_string(),
+            "carrier-pigeon".to_string(),
+        )]);
+        assert!(smg_worker_uses_token_only_wire(&unknown).is_err());
+    }
+
+    #[test]
     fn test_basic_worker_creation() {
         let worker = BasicWorkerBuilder::new("http://test:8080")
             .worker_type(WorkerType::Regular)
@@ -1969,6 +2343,470 @@ mod tests {
         assert!(worker.is_healthy());
         assert_eq!(worker.load(), 0);
         assert_eq!(worker.processed_requests(), 0);
+    }
+
+    #[derive(Default)]
+    struct ServingWorkerControl;
+
+    #[tonic::async_trait]
+    impl WorkerControlService for ServingWorkerControl {
+        async fn get_identity(
+            &self,
+            _request: Request<GetIdentityRequest>,
+        ) -> Result<Response<worker_proto::GetIdentityResponse>, Status> {
+            Ok(Response::new(worker_proto::GetIdentityResponse {
+                identity: Some(worker_proto::WorkerIdentity {
+                    worker_id: "worker-a".to_string(),
+                    instance_id: "instance-a".to_string(),
+                    ..Default::default()
+                }),
+            }))
+        }
+
+        async fn get_capabilities(
+            &self,
+            _request: Request<worker_proto::GetCapabilitiesRequest>,
+        ) -> Result<Response<worker_proto::GetCapabilitiesResponse>, Status> {
+            Err(Status::unimplemented("not needed by periodic health test"))
+        }
+
+        async fn get_health(
+            &self,
+            _request: Request<GetHealthRequest>,
+        ) -> Result<Response<worker_proto::GetHealthResponse>, Status> {
+            Ok(Response::new(worker_proto::GetHealthResponse {
+                state: WorkerHealthState::Serving.into(),
+                message: "ready".to_string(),
+                ..Default::default()
+            }))
+        }
+
+        async fn get_topology(
+            &self,
+            _request: Request<worker_proto::GetTopologyRequest>,
+        ) -> Result<Response<worker_proto::GetTopologyResponse>, Status> {
+            Err(Status::unimplemented("not needed by periodic health test"))
+        }
+    }
+
+    /// Answers `GetIdentity` with whatever the constructor was handed, so the
+    /// tests can reproduce a Worker that reports no usable instance ID at all:
+    /// `identity: None` (the field is absent on the wire) and an
+    /// all-whitespace `instance_id`.
+    struct BlankIdentityWorkerControl {
+        identity: Option<worker_proto::WorkerIdentity>,
+    }
+
+    impl BlankIdentityWorkerControl {
+        fn absent() -> Self {
+            Self { identity: None }
+        }
+
+        fn whitespace() -> Self {
+            Self {
+                identity: Some(worker_proto::WorkerIdentity {
+                    worker_id: "worker-a".to_string(),
+                    instance_id: "   ".to_string(),
+                    ..Default::default()
+                }),
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl WorkerControlService for BlankIdentityWorkerControl {
+        async fn get_identity(
+            &self,
+            _request: Request<GetIdentityRequest>,
+        ) -> Result<Response<worker_proto::GetIdentityResponse>, Status> {
+            Ok(Response::new(worker_proto::GetIdentityResponse {
+                identity: self.identity.clone(),
+            }))
+        }
+
+        async fn get_capabilities(
+            &self,
+            _request: Request<worker_proto::GetCapabilitiesRequest>,
+        ) -> Result<Response<worker_proto::GetCapabilitiesResponse>, Status> {
+            Err(Status::unimplemented("not needed by identity tests"))
+        }
+
+        async fn get_health(
+            &self,
+            _request: Request<GetHealthRequest>,
+        ) -> Result<Response<worker_proto::GetHealthResponse>, Status> {
+            Ok(Response::new(worker_proto::GetHealthResponse {
+                state: WorkerHealthState::Serving.into(),
+                message: "ready".to_string(),
+                ..Default::default()
+            }))
+        }
+
+        async fn get_topology(
+            &self,
+            _request: Request<worker_proto::GetTopologyRequest>,
+        ) -> Result<Response<worker_proto::GetTopologyResponse>, Status> {
+            Err(Status::unimplemented("not needed by identity tests"))
+        }
+    }
+
+    /// Serve `control` on an ephemeral port until the returned handle is
+    /// aborted, and hand back the address to point a worker at.
+    fn spawn_worker_control<S>(control: S) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>)
+    where
+        S: WorkerControlService,
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only tonic server is explicitly aborted before the test returns"
+        )]
+        let server = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(WorkerControlServer::new(control))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+        (address, server)
+    }
+
+    #[test]
+    fn same_url_replacement_keeps_the_accepted_smg_instance_id() {
+        // `smg.instance_id` is frozen at registration, so a replacement built
+        // from the same spec re-reads the *original* label. It also inherits
+        // `Ready` through the shared runtime -- so without carrying the
+        // adoption over, the replacement would fail every identity probe until
+        // the state machine demoted it again, for a Worker that is serving.
+        let spec = || {
+            BasicWorkerBuilder::new("grpc://127.0.0.1:50051")
+                .worker_mode(WorkerMode::Smg)
+                .connection_mode(ConnectionMode::Grpc)
+                .label("smg.instance_id", "instance-before-restart")
+                .health_config(no_health_check())
+                .build()
+        };
+
+        let original = spec();
+        original
+            .smg_instance_id
+            .store(Some(Arc::new("instance-after-restart".to_string())));
+
+        let replacement = spec();
+        assert!(replacement.smg_instance_id.load().is_none());
+        replacement.install_shared_state_from_basic(&original);
+        assert_eq!(
+            replacement
+                .smg_instance_id
+                .load_full()
+                .as_deref()
+                .map(String::as_str),
+            Some("instance-after-restart")
+        );
+    }
+
+    #[test]
+    fn replacement_with_a_newer_instance_label_wins_over_the_adopted_id() {
+        // A replacement carrying a different label is a real re-registration,
+        // not a metadata-only update: its label is the authority.
+        let original = BasicWorkerBuilder::new("grpc://127.0.0.1:50051")
+            .worker_mode(WorkerMode::Smg)
+            .connection_mode(ConnectionMode::Grpc)
+            .label("smg.instance_id", "instance-a")
+            .health_config(no_health_check())
+            .build();
+        original
+            .smg_instance_id
+            .store(Some(Arc::new("instance-b".to_string())));
+
+        let replacement = BasicWorkerBuilder::new("grpc://127.0.0.1:50051")
+            .worker_mode(WorkerMode::Smg)
+            .connection_mode(ConnectionMode::Grpc)
+            .label("smg.instance_id", "instance-c")
+            .health_config(no_health_check())
+            .build();
+        replacement.install_shared_state_from_basic(&original);
+        assert!(replacement.smg_instance_id.load().is_none());
+    }
+
+    #[tokio::test]
+    async fn smg_health_never_adopts_a_blank_instance_id() {
+        // An adopted blank ID is worse than no adoption: the next probe would
+        // compare blank against blank, match, and report a Worker that lost all
+        // its state as healthy.
+        for control in [
+            BlankIdentityWorkerControl::absent(),
+            BlankIdentityWorkerControl::whitespace(),
+        ] {
+            let (address, server) = spawn_worker_control(control);
+            let worker = BasicWorkerBuilder::new(format!("grpc://{address}"))
+                .worker_mode(WorkerMode::Smg)
+                .connection_mode(ConnectionMode::Grpc)
+                .label("smg.instance_id", "stale-instance")
+                .health_config(HealthCheckConfig {
+                    timeout_secs: 2,
+                    ..HealthCheckConfig::default()
+                })
+                .build();
+            assert_eq!(worker.status(), WorkerStatus::Pending);
+
+            for _ in 0..3 {
+                assert!(worker.check_health_async().await.is_err());
+                assert!(
+                    worker.smg_instance_id.load().is_none(),
+                    "a blank instance ID must never be adopted"
+                );
+            }
+
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn smg_health_uses_control_url_not_inference_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only tonic server is explicitly aborted before the test returns"
+        )]
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(WorkerControlServer::new(ServingWorkerControl))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+        });
+
+        let worker = BasicWorkerBuilder::new("grpc://127.0.0.1:1")
+            .worker_mode(WorkerMode::Smg)
+            .control_url(Some(format!("grpc://{address}")))
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(HealthCheckConfig {
+                timeout_secs: 2,
+                ..HealthCheckConfig::default()
+            })
+            .build();
+        assert!(worker.check_health_async().await.is_ok());
+        assert!(worker.backend_client.load().get().is_none());
+        assert!(worker.worker_control_client.get().is_some());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn smg_health_rejects_restarted_instance() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only tonic server is explicitly aborted before the test returns"
+        )]
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(WorkerControlServer::new(ServingWorkerControl))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+        });
+
+        let worker = BasicWorkerBuilder::new(format!("grpc://{address}"))
+            .worker_mode(WorkerMode::Smg)
+            .connection_mode(ConnectionMode::Grpc)
+            .label("smg.instance_id", "stale-instance")
+            .health_config(HealthCheckConfig {
+                timeout_secs: 2,
+                ..HealthCheckConfig::default()
+            })
+            .build();
+        assert_eq!(worker.status(), WorkerStatus::Pending);
+        assert!(worker.check_health_async().await.is_err());
+
+        // Out of rotation already, so the probe adopts the observed ID: the
+        // registration label is frozen, and leaving it in place would pin the
+        // worker unhealthy forever.
+        assert!(worker.check_health_async().await.is_ok());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn smg_health_drains_a_restarted_ready_worker_before_adopting_it() {
+        let (address, server) = spawn_worker_control(ServingWorkerControl);
+
+        let health_config = HealthCheckConfig {
+            timeout_secs: 2,
+            ..HealthCheckConfig::default()
+        };
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("grpc://{address}"))
+                .worker_mode(WorkerMode::Smg)
+                .connection_mode(ConnectionMode::Grpc)
+                .label("smg.instance_id", "stale-instance")
+                .status(WorkerStatus::Ready)
+                .health_config(health_config.clone())
+                .build(),
+        );
+
+        // Drive the same state machine the manager runs, rather than asserting
+        // a bare probe-failure count: the adoption gate is only correct if the
+        // loop it creates actually terminates, and that depends on
+        // `compute_next_status` demoting the worker after `failure_threshold`
+        // consecutive failures.
+        let mut statuses = vec![worker.status()];
+        let mut left_rotation = false;
+        for _ in 0..(health_config.failure_threshold as usize * 8) {
+            let probe_ok = worker.check_health_async().await.is_ok();
+            if let Some(next) = compute_next_status(&worker, probe_ok, &health_config) {
+                worker.set_status(next);
+            }
+            statuses.push(worker.status());
+            left_rotation |= worker.status() == WorkerStatus::NotReady;
+            if left_rotation && worker.status() == WorkerStatus::Ready {
+                break;
+            }
+        }
+
+        // Ready while the restart is detected, NotReady once it has drained,
+        // then Ready again on the adopted instance -- and never Failed.
+        assert_eq!(statuses.first(), Some(&WorkerStatus::Ready));
+        assert!(
+            statuses.contains(&WorkerStatus::NotReady),
+            "a restarted worker must leave rotation before its new ID is adopted, saw {statuses:?}"
+        );
+        assert_eq!(
+            statuses.last(),
+            Some(&WorkerStatus::Ready),
+            "the worker must probe its way back once the new instance is adopted, saw {statuses:?}"
+        );
+        assert!(
+            !statuses.contains(&WorkerStatus::Failed),
+            "adoption must happen well before the liveness threshold, saw {statuses:?}"
+        );
+        assert_eq!(
+            worker
+                .as_any()
+                .downcast_ref::<BasicWorker>()
+                .unwrap()
+                .smg_instance_id
+                .load_full()
+                .as_deref()
+                .map(String::as_str),
+            Some("instance-a")
+        );
+
+        server.abort();
+    }
+
+    #[derive(Default)]
+    struct OneShotInference;
+
+    #[tonic::async_trait]
+    impl WorkerInferenceService for OneShotInference {
+        type GenerateStream =
+            Pin<Box<dyn Stream<Item = Result<inference_proto::GenerateResponse, Status>> + Send>>;
+
+        async fn generate(
+            &self,
+            request: Request<inference_proto::GenerateRequest>,
+        ) -> Result<Response<Self::GenerateStream>, Status> {
+            let response = inference_proto::GenerateResponse {
+                request_id: request.into_inner().request_id,
+                response: Some(inference_proto::generate_response::Response::Complete(
+                    inference_proto::GenerateComplete {
+                        output_ids: vec![7, 8],
+                        finish_reason: "stop".to_string(),
+                        completion_tokens: 2,
+                        ..Default::default()
+                    },
+                )),
+            };
+            Ok(Response::new(Box::pin(stream::iter([Ok(response)]))))
+        }
+
+        async fn abort(
+            &self,
+            _request: Request<inference_proto::AbortRequest>,
+        ) -> Result<Response<inference_proto::AbortResponse>, Status> {
+            Ok(Response::new(inference_proto::AbortResponse {
+                success: true,
+                message: String::new(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn smg_data_plane_uses_inference_url_not_control_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only tonic server is explicitly aborted before the test returns"
+        )]
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(WorkerInferenceServer::new(OneShotInference))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+        });
+
+        let worker = BasicWorkerBuilder::new(format!("grpc://{address}"))
+            .worker_mode(WorkerMode::Smg)
+            .control_url(Some("grpc://127.0.0.1:1".to_string()))
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::Vllm)
+            .label("engine_transport", "zmq")
+            .health_config(no_health_check())
+            .build();
+        let client = worker
+            .get_backend_client()
+            .await
+            .expect("connect WorkerInference")
+            .expect("gRPC backend");
+        assert!(matches!(client.as_ref(), BackendClient::Smg(_)));
+        assert_eq!(client.runtime_type(), RuntimeType::Vllm);
+        assert!(client.uses_token_only_wire());
+
+        let mut request =
+            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
+                request_id: "smg-data".to_string(),
+                sampling_params: Some(tokenspeed_proto::SamplingParams {
+                    stop: vec!["Hello world".to_string()],
+                    ..Default::default()
+                }),
+                stream: true,
+                ..Default::default()
+            }));
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        assert_eq!(
+            client.finalize_generate_request(&mut request, Some(&tokenizer)),
+            ["Hello world"]
+        );
+        let ProtoGenerateRequest::TokenSpeed(finalized) = &request else {
+            panic!("expected TokenSpeed request");
+        };
+        let sampling = finalized.sampling_params.as_ref().expect("sampling params");
+        assert!(sampling.stop.is_empty());
+        assert_eq!(sampling.stop_token_ids, tokenizer.eos_token_ids());
+
+        let mut client = client.as_ref().clone();
+        let mut response = client
+            .generate(request)
+            .await
+            .expect("WorkerInference generate");
+        let item = response
+            .next()
+            .await
+            .expect("response item")
+            .expect("successful item");
+        let ProtoResponseVariant::Complete(complete) = item.into_response() else {
+            panic!("expected terminal response");
+        };
+        assert_eq!(complete.output_ids(), &[7, 8]);
+        response.mark_completed();
+
+        assert!(worker.worker_control_client.get().is_none());
+        server.abort();
     }
 
     #[test]

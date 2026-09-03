@@ -1,4 +1,5 @@
 use axum::http::HeaderName;
+use openai_protocol::worker::{ConnectionMode, WorkerMode};
 use sha2::{Digest, Sha256};
 
 use super::*;
@@ -130,6 +131,46 @@ impl ConfigValidator {
         }
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+
+        Ok(())
+    }
+
+    /// Reject `--worker-mode smg` combinations the two-tier lane cannot serve.
+    ///
+    /// Both are silent failures rather than errors today: a disaggregated
+    /// request reaches `from_tokenspeed_request`, which rejects
+    /// `kv_bootstrap_info`/`encode_bootstrap_info` per request, and an HTTP
+    /// worker health-checks over WorkerControl gRPC while `get_backend_client`
+    /// returns `None`, so inference falls back to the HTTP path the Worker does
+    /// not serve. Neither is recoverable at runtime, so fail at startup.
+    fn validate_smg_worker_mode(config: &RouterConfig) -> ConfigResult<()> {
+        if config.startup_worker_mode != WorkerMode::Smg {
+            return Ok(());
+        }
+
+        let disaggregation = match &config.mode {
+            RoutingMode::PrefillDecode { .. } => Some("prefill/decode"),
+            RoutingMode::EncodePrefillDecode { .. } => Some("encode/prefill/decode"),
+            _ => None,
+        };
+        if let Some(disaggregation) = disaggregation {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: format!(
+                    "worker_mode=smg cannot be combined with {disaggregation} disaggregation: \
+                     WorkerInference v1 has no bootstrap lane, so the Router would reject every \
+                     disaggregated request at dispatch"
+                ),
+            });
+        }
+
+        if config.connection_mode == ConnectionMode::Http {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "worker_mode=smg cannot be combined with connection_mode=http: an SMG \
+                         Worker serves WorkerControl and WorkerInference over gRPC and has no \
+                         HTTP inference endpoint"
+                    .to_string(),
+            });
+        }
 
         Ok(())
     }
@@ -1122,6 +1163,7 @@ impl ConfigValidator {
         }
 
         Self::validate_mtls(config)?;
+        Self::validate_smg_worker_mode(config)?;
 
         if !has_service_discovery {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
@@ -1280,6 +1322,91 @@ mod tests {
 
         let config = RouterConfig {
             mm_per_request_image_limit: Some(128),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    fn smg_config(mode: RoutingMode, connection_mode: ConnectionMode) -> RouterConfig {
+        RouterConfig {
+            mode,
+            connection_mode,
+            startup_worker_mode: WorkerMode::Smg,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn smg_worker_mode_rejects_disaggregation() {
+        for mode in [
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![("grpc://10.0.0.5:50051".to_string(), None)],
+                decode_urls: vec!["grpc://10.0.0.6:50051".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![("grpc://10.0.0.4:50051".to_string(), None)],
+                prefill_urls: vec![("grpc://10.0.0.5:50051".to_string(), None)],
+                decode_urls: vec!["grpc://10.0.0.6:50051".to_string()],
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            },
+        ] {
+            let config = smg_config(mode, ConnectionMode::Grpc);
+            assert!(
+                matches!(
+                    ConfigValidator::validate(&config),
+                    Err(ConfigError::IncompatibleConfig { ref reason })
+                        if reason.contains("disaggregation")
+                ),
+                "expected {:?} to be rejected under worker_mode=smg",
+                config.mode,
+            );
+        }
+    }
+
+    #[test]
+    fn smg_worker_mode_rejects_http_connection_mode() {
+        let config = smg_config(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://10.0.0.5:8000".to_string()],
+            },
+            ConnectionMode::Http,
+        );
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::IncompatibleConfig { ref reason }) if reason.contains("connection_mode=http")
+        ));
+    }
+
+    #[test]
+    fn smg_worker_mode_accepts_regular_grpc_and_zmq() {
+        for connection_mode in [ConnectionMode::Grpc, ConnectionMode::Zmq] {
+            let config = smg_config(
+                RoutingMode::Regular {
+                    worker_urls: vec!["grpc://10.0.0.5:50051".to_string()],
+                },
+                connection_mode,
+            );
+            assert!(
+                ConfigValidator::validate(&config).is_ok(),
+                "expected worker_mode=smg with {connection_mode:?} to pass"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_worker_mode_still_allows_disaggregation() {
+        let config = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![("grpc://10.0.0.5:50051".to_string(), None)],
+                decode_urls: vec!["grpc://10.0.0.6:50051".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            connection_mode: ConnectionMode::Grpc,
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());

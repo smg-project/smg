@@ -188,14 +188,27 @@ pub(crate) fn fold_tokenizer_eos_backstop(
     let Some(params) = req.sampling_params.as_mut() else {
         return;
     };
-    if params.ignore_eos {
+    fold_eos_into_stop_token_ids(params.ignore_eos, &mut params.stop_token_ids, tokenizer);
+}
+
+/// The policy both EOS backstops share: unless the caller asked to ignore EOS,
+/// every id the tokenizer reports has to reach a tokenizer-less engine as an
+/// explicit stop id. Kept in one place so the direct-ZMQ and two-tier lanes
+/// cannot drift.
+pub(crate) fn fold_eos_into_stop_token_ids(
+    ignore_eos: bool,
+    stop_token_ids: &mut Vec<u32>,
+    tokenizer: Option<&Arc<dyn Tokenizer>>,
+) {
+    if ignore_eos {
         return;
     }
-    if let Some(tokenizer) = tokenizer {
-        for &id in tokenizer.eos_token_ids() {
-            if !params.stop_token_ids.contains(&id) {
-                params.stop_token_ids.push(id);
-            }
+    let Some(tokenizer) = tokenizer else {
+        return;
+    };
+    for &id in tokenizer.eos_token_ids() {
+        if !stop_token_ids.contains(&id) {
+            stop_token_ids.push(id);
         }
     }
 }
@@ -370,7 +383,7 @@ async fn unlink_stale_socket(address: &str) -> Result<(), String> {
 /// is the number of DP engines that will dial this worker's sockets (1 for an
 /// ungrouped worker). Errors are plain reasons; the worker layer wraps them in
 /// its own error type.
-pub(crate) async fn connect_for_worker(
+pub async fn connect_for_worker(
     base_url: &str,
     model_id: String,
     runtime: RuntimeType,
@@ -1503,8 +1516,14 @@ fn translate_sampling(
             }
         }
     }
+    // A caller that knows the primary EOS wins over this client's own lookup: a
+    // two-tier Worker has no tokenizer, so for a repo-id deployment the Router
+    // is the only party that can resolve it. Without this the id reaches the
+    // engine only through `stop_token_ids` and the finish surfaces as
+    // `matched_stop = <eos id>` instead of a plain EOS.
+    let primary_eos = sp.eos_token_id.or(eos.primary);
     let mut all_stop_token_ids: BTreeSet<u32> = stop_token_ids.iter().copied().collect();
-    all_stop_token_ids.extend(eos.primary);
+    all_stop_token_ids.extend(primary_eos);
     all_stop_token_ids.extend(eos.extra.iter().copied());
     let logit_bias = if sp.logit_bias.is_empty() {
         None
@@ -1535,7 +1554,7 @@ fn translate_sampling(
         max_tokens: sp.max_tokens.unwrap_or(default_max_tokens),
         min_tokens: sp.min_tokens,
         stop_token_ids,
-        eos_token_id: (!sp.ignore_eos).then_some(eos.primary).flatten(),
+        eos_token_id: (!sp.ignore_eos).then_some(primary_eos).flatten(),
         all_stop_token_ids,
         seed: sp.seed.map(i64::from),
         logprobs: sp.logprobs,
@@ -2804,6 +2823,48 @@ mod tests {
             ),
             8,
         );
+    }
+
+    #[test]
+    fn a_request_supplied_eos_wins_over_the_clients_own_lookup() {
+        // The two-tier Worker has no tokenizer and its model-dir lookup finds
+        // nothing for a repo-id deployment, so the Router stamps the EOS onto
+        // the request. Without honouring it the id would only ride
+        // `stop_token_ids` and the finish would surface as
+        // `matched_stop = <eos id>` rather than a plain EOS.
+        let sampling = |sp, eos: &EosTokenIds| {
+            translate_request(tokenized_req(sp), 4096, ModelDtype::BFloat16, eos)
+                .expect("request translated")
+                .sampling_params
+                .expect("sampling params present")
+        };
+
+        let sp = sampling(
+            vllm::SamplingParams {
+                eos_token_id: Some(128009),
+                ..Default::default()
+            },
+            &EosTokenIds::default(),
+        );
+        assert_eq!(sp.eos_token_id, Some(128009));
+        assert_eq!(sp.all_stop_token_ids, BTreeSet::from([128009]));
+
+        // A client that resolved its own EOS still defers to the caller's.
+        let sp = sampling(
+            vllm::SamplingParams {
+                eos_token_id: Some(128009),
+                ..Default::default()
+            },
+            &EosTokenIds::new(Some(5), vec![]),
+        );
+        assert_eq!(sp.eos_token_id, Some(128009));
+
+        // And an omitted one leaves the existing behaviour untouched.
+        let sp = sampling(
+            vllm::SamplingParams::default(),
+            &EosTokenIds::new(Some(5), vec![]),
+        );
+        assert_eq!(sp.eos_token_id, Some(5));
     }
 
     #[test]

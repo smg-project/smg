@@ -303,6 +303,9 @@ fn build_harmony_proto(
         (BackendClient::Grpc(GrpcClient::TokenSpeed(_)), body) => {
             build_tokenspeed(body, request_id, text, token_ids, tool_constraints)?
         }
+        (BackendClient::Smg(_), body) => {
+            build_tokenspeed(body, request_id, text, token_ids, tool_constraints)?
+        }
         (BackendClient::Zmq(zmq), body) => match zmq.dialect() {
             ZmqDialect::Vllm => build_vllm(body, request_id, text, token_ids, tool_constraints)?,
             ZmqDialect::TokenSpeed => {

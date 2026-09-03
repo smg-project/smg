@@ -33,6 +33,39 @@ pub enum WorkerKind {
     External,
 }
 
+/// Metadata observed from the versioned SMG WorkerControl handshake.
+///
+/// This is persisted with workflow state so retries and later discovery steps
+/// use one coherent Worker incarnation instead of re-probing and potentially
+/// mixing identity from before a restart with topology from after it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SmgWorkerDiscovery {
+    pub worker_id: String,
+    pub instance_id: String,
+    pub hostname: String,
+    pub zone: String,
+    pub version: String,
+    pub identity_labels: HashMap<String, String>,
+    pub api_major: u32,
+    pub api_minor: u32,
+    pub features: Vec<String>,
+    pub max_concurrent_requests: u32,
+    pub capability_attributes: HashMap<String, String>,
+    pub topology_version: u64,
+    pub engines: Vec<SmgEngineDiscovery>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SmgEngineDiscovery {
+    pub engine_id: String,
+    pub engine_type: String,
+    pub engine_version: String,
+    pub endpoint: String,
+    pub model_ids: Vec<String>,
+    pub features: Vec<String>,
+    pub attributes: HashMap<String, String>,
+}
+
 use super::{
     mcp_registration::McpServerConfigRequest, steps::local::WorkerRemovalRequest,
     tokenizer_registration::TokenizerConfigRequest,
@@ -141,6 +174,8 @@ pub struct WorkerWorkflowData {
     #[serde(skip, default)]
     pub http_client_handle: Option<Arc<reqwest::Client>>,
     pub detected_runtime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smg_worker_discovery: Option<SmgWorkerDiscovery>,
     pub discovered_labels: HashMap<String, String>,
     pub dp_info: Option<super::steps::local::DpInfo>,
     // -- External-only fields --

@@ -13,10 +13,10 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use crate::{
     app_context::AppContext,
-    worker::ConnectionMode,
+    worker::{ConnectionMode, WorkerMode},
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
-        steps::util::{try_grpc_reachable, try_http_reachable},
+        steps::util::{try_grpc_reachable, try_http_reachable, try_smg_worker_reachable},
     },
 };
 
@@ -134,6 +134,70 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
             .health
             .timeout_secs
             .unwrap_or(app_context.router_config.health_check.timeout_secs);
+
+        // A two-tier worker exposes SMG's internal gRPC service rather than an
+        // engine-specific health service. Its explicit identity is the
+        // protocol discriminator; do not race engine probes to infer it.
+        if config.worker_mode == WorkerMode::Smg {
+            if let Some(mode) = ConnectionMode::from_url(&url) {
+                if mode != ConnectionMode::Grpc {
+                    return Err(WorkflowError::StepFailed {
+                        step_id: StepId::new("detect_connection_mode"),
+                        message: format!(
+                            "SMG worker {} must use a grpc:// or grpcs:// URL, got {mode}",
+                            config.url
+                        ),
+                    });
+                }
+            }
+            let control_url = config.control_url.as_deref().unwrap_or(&url);
+            if let Some(mode) = ConnectionMode::from_url(control_url) {
+                if mode != ConnectionMode::Grpc {
+                    return Err(WorkflowError::StepFailed {
+                        step_id: StepId::new("detect_connection_mode"),
+                        message: format!(
+                            "SMG Worker control endpoint {control_url} must use grpc:// or grpcs://, got {mode}"
+                        ),
+                    });
+                }
+            }
+            let discovery = try_smg_worker_reachable(control_url, timeout)
+                .await
+                .map_err(|error| WorkflowError::StepFailed {
+                    step_id: StepId::new("detect_connection_mode"),
+                    message: format!(
+                        "SMG Worker control-plane handshake failed for {control_url}: {error}"
+                    ),
+                })?;
+            if config.runtime_type.is_specified()
+                && !discovery.engines.iter().any(|engine| {
+                    engine
+                        .engine_type
+                        .eq_ignore_ascii_case(&config.runtime_type.to_string())
+                })
+            {
+                return Err(WorkflowError::StepFailed {
+                    step_id: StepId::new("detect_connection_mode"),
+                    message: format!(
+                        "SMG Worker {} does not advertise configured runtime {}; engines={:?}",
+                        discovery.worker_id,
+                        config.runtime_type,
+                        discovery
+                            .engines
+                            .iter()
+                            .map(|engine| engine.engine_type.as_str())
+                            .collect::<Vec<_>>()
+                    ),
+                });
+            }
+            debug!(
+                "{} identified as ready SMG worker {} instance {} over gRPC (inference endpoint {})",
+                control_url, discovery.worker_id, discovery.instance_id, config.url
+            );
+            context.data.connection_mode = Some(ConnectionMode::Grpc);
+            context.data.smg_worker_discovery = Some(discovery);
+            return Ok(StepResult::Success);
+        }
 
         let connection_mode = if let Some(connection_mode) = ConnectionMode::from_url(&url) {
             let result = match connection_mode {

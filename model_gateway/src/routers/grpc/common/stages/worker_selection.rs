@@ -21,15 +21,15 @@ use crate::{
         error,
         grpc::{
             context::{
-                DispatchContext, EncodeWorkerAssignment, RequestContext, RoutingSnapshot,
-                WireConstraint, WorkerSelection,
+                DispatchContext, EncodeWorkerAssignment, RequestContext, RequestType,
+                RoutingSnapshot, WireConstraint, WorkerSelection,
             },
             multimodal,
         },
     },
     worker::{
         ConnectionModeExt, HashRing, ModelWorkerSnapshot, RoutingPool, RuntimeType, Worker,
-        WorkerRegistry, WorkerType,
+        WorkerMode, WorkerRegistry, WorkerType,
     },
 };
 
@@ -59,6 +59,42 @@ pub(crate) enum WorkerSelectionMode {
     PrefillDecode,
     /// EPD mode: select encode + prefill + decode workers
     EncodePrefillDecode,
+}
+
+/// Which candidates a single-worker selection may consider.
+#[derive(Clone, Copy, Debug)]
+enum LaneFilter {
+    /// Any worker in the model's regular gRPC/ZMQ pool.
+    Any,
+    /// Direct engine workers only; see [`smg_ineligible`].
+    EngineOnly,
+    /// A retry: only workers matching the retained plan's wire.
+    Wire(WireConstraint),
+}
+
+impl LaneFilter {
+    fn admits(self, worker: &Arc<dyn Worker>) -> bool {
+        match self {
+            Self::Any => true,
+            Self::EngineOnly => worker.worker_mode() != WorkerMode::Smg,
+            Self::Wire(c) => {
+                worker.metadata().spec.runtime_type == c.runtime
+                    && *worker.connection_mode() == c.connection
+                    && worker.worker_mode() == c.mode
+            }
+        }
+    }
+}
+
+/// Whether a request must stay off two-tier SMG Workers: `WorkerInference` v1
+/// carries text generation only, so embeddings, classify, and multimodal
+/// inputs would fail there with 501 at request building.
+fn smg_ineligible(request_type: &RequestType, has_multimodal: bool) -> bool {
+    has_multimodal
+        || matches!(
+            request_type,
+            RequestType::Embedding(_) | RequestType::Classify(_)
+        )
 }
 
 impl WorkerSelectionStage {
@@ -121,9 +157,19 @@ impl PipelineStage for WorkerSelectionStage {
         let rid_key = rid_key.as_deref();
 
         let model_id = ctx.input.model_id.as_str();
+        // `WorkerInference` v1 is text generation only. In a pool that mixes
+        // two-tier SMG Workers with direct engine workers, an embedding,
+        // classify, or multimodal request placed on an SMG Worker would fail
+        // with 501 at request building instead of reaching an engine that can
+        // serve it -- so keep those requests off SMG Workers here.
+        let lane = if smg_ineligible(&ctx.input.request_type, intermediate.is_some()) {
+            LaneFilter::EngineOnly
+        } else {
+            LaneFilter::Any
+        };
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(model_id, text, tokens, headers, rid_key, None) {
+                match self.select_single_worker(model_id, text, tokens, headers, rid_key, lane) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
                         return Err(self.selection_failure(model_id, &[WorkerType::Regular], None))
@@ -249,7 +295,14 @@ impl WorkerSelectionStage {
 
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(model_id, text, tokens, headers, rid_key, wire) {
+                match self.select_single_worker(
+                    model_id,
+                    text,
+                    tokens,
+                    headers,
+                    rid_key,
+                    LaneFilter::Wire(ctx.wire),
+                ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
                         return Err(self.selection_failure(model_id, &[WorkerType::Regular], wire))
@@ -366,27 +419,23 @@ impl WorkerSelectionStage {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
-        wire: Option<WireConstraint>,
+        lane: LaneFilter,
     ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model. The gRPC router serves both gRPC
         // and direct-ZMQ workers, so accept either transport (not HTTP).
         let pool = self
             .worker_registry
             .get_routing_pool(model_id, RoutingPool::GrpcPipelineRegular);
-        // A retry pins the retained plan's runtime/transport.
-        let wire_pinned;
-        let candidates: &[Arc<dyn Worker>] = match wire {
-            None => &pool,
-            Some(c) => {
-                wire_pinned = pool
+        let filtered_pool;
+        let candidates: &[Arc<dyn Worker>] = match lane {
+            LaneFilter::Any => &pool,
+            lane => {
+                filtered_pool = pool
                     .iter()
-                    .filter(|w| {
-                        w.metadata().spec.runtime_type == c.runtime
-                            && *w.connection_mode() == c.connection
-                    })
+                    .filter(|w| lane.admits(w))
                     .cloned()
                     .collect::<Vec<_>>();
-                &wire_pinned
+                &filtered_pool
             }
         };
 
@@ -1186,7 +1235,14 @@ mod tests {
         let mut poison = HeaderMap::new();
         poison.insert("x-smg-routing-key", "req-unique-1".parse().unwrap());
         let first = stage
-            .select_single_worker(model_id, None, None, Some(&poison), rid_key, None)
+            .select_single_worker(
+                model_id,
+                None,
+                None,
+                Some(&poison),
+                rid_key,
+                LaneFilter::Any,
+            )
             .unwrap();
         for (i, rid) in ["conv7_t2", "conv7_t2_r1", "conv7_t3"].iter().enumerate() {
             let mut rotated = HeaderMap::new();
@@ -1201,7 +1257,7 @@ mod tests {
                     None,
                     Some(&rotated),
                     policy_registry.derive_rid_key(Some(rid)),
-                    None,
+                    LaneFilter::Any,
                 )
                 .unwrap();
             assert_eq!(again.url(), first.url(), "follow-up must pin by rid key");
@@ -1239,13 +1295,13 @@ mod tests {
         );
 
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None)
+            .select_single_worker(model_id, None, None, None, None, LaneFilter::Any)
             .is_some());
 
         worker_registry.set_worker_overloaded(&workers[0], true);
         assert!(
             stage
-                .select_single_worker(model_id, None, None, None, None, None)
+                .select_single_worker(model_id, None, None, None, None, LaneFilter::Any)
                 .is_some(),
             "one eligible worker left still serves"
         );
@@ -1253,7 +1309,7 @@ mod tests {
         worker_registry.set_worker_overloaded(&workers[1], true);
         assert!(
             stage
-                .select_single_worker(model_id, None, None, None, None, None)
+                .select_single_worker(model_id, None, None, None, None, LaneFilter::Any)
                 .is_none(),
             "the veto empties the candidate pool"
         );
@@ -1269,7 +1325,7 @@ mod tests {
         // genuinely absent model.
         worker_registry.set_worker_overloaded(&workers[0], false);
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None)
+            .select_single_worker(model_id, None, None, None, None, LaneFilter::Any)
             .is_some());
         assert_eq!(
             stage
@@ -1350,6 +1406,7 @@ mod tests {
             WireConstraint {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
+                mode: WorkerMode::Engine,
             },
         );
         for _ in 0..8 {
@@ -1416,6 +1473,7 @@ mod tests {
             WireConstraint {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
+                mode: WorkerMode::Engine,
             },
         );
         for _ in 0..8 {
@@ -1474,6 +1532,7 @@ mod tests {
             WireConstraint {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
+                mode: WorkerMode::Engine,
             },
         );
 
@@ -1485,5 +1544,92 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "verdict must reflect the pinned pool, not every runtime"
         );
+    }
+
+    /// `WorkerInference` v1 is text generation only. In a pool mixing two-tier
+    /// SMG Workers with direct engine workers, an embedding request must land
+    /// on an engine worker rather than 501 at request building on an SMG one,
+    /// while generation may use either.
+    #[test]
+    fn requests_the_two_tier_lane_cannot_serve_stay_off_smg_workers() {
+        let model_id = "test-model-mixed-pool";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let smg: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:8470")
+                .model(ModelCard::new(model_id))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .worker_mode(WorkerMode::Smg)
+                .health_config(no_health_check())
+                .build(),
+        );
+        let engine: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:8471")
+                .model(ModelCard::new(model_id))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .build(),
+        );
+        worker_registry.register(Arc::clone(&smg)).unwrap();
+        worker_registry.register(Arc::clone(&engine)).unwrap();
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::Regular,
+        );
+
+        // Generation may use either worker: round-robin over both reaches the
+        // SMG Worker within two picks.
+        let generation_picks: Vec<String> = (0..4)
+            .map(|_| {
+                stage
+                    .select_single_worker(model_id, None, None, None, None, LaneFilter::Any)
+                    .expect("either worker serves generation")
+                    .url()
+                    .to_string()
+            })
+            .collect();
+        assert!(generation_picks.iter().any(|url| url == smg.url()));
+        assert!(generation_picks.iter().any(|url| url == engine.url()));
+
+        for _ in 0..4 {
+            let picked = stage
+                .select_single_worker(model_id, None, None, None, None, LaneFilter::EngineOnly)
+                .expect("the engine worker can serve");
+            assert_eq!(
+                picked.url(),
+                engine.url(),
+                "excluded lane must never be picked"
+            );
+        }
+
+        // A retry pins the mode it planned for: an SMG plan cannot be replayed
+        // against a direct engine worker's proto even on the same runtime and
+        // transport, and vice versa.
+        let pinned = |mode| {
+            stage
+                .select_single_worker(
+                    model_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    LaneFilter::Wire(WireConstraint {
+                        runtime: RuntimeType::Unspecified,
+                        connection: ConnectionMode::Grpc,
+                        mode,
+                    }),
+                )
+                .expect("pinned mode has a worker")
+        };
+        assert_eq!(pinned(WorkerMode::Smg).url(), smg.url());
+        assert_eq!(pinned(WorkerMode::Engine).url(), engine.url());
+
+        // Only SMG Workers left: the excluded request has nowhere to go.
+        worker_registry.remove_by_url(engine.url());
+        assert!(stage
+            .select_single_worker(model_id, None, None, None, None, LaneFilter::EngineOnly)
+            .is_none());
     }
 }

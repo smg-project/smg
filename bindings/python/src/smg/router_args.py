@@ -251,6 +251,8 @@ class RouterArgs:
     kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
     # Per-request image-count limit replacing model spec limits; None keeps spec limits
     mm_per_request_image_limit: int | None = None
+    # Appended to preserve the positional RouterArgs constructor contract.
+    worker_mode: str = "engine"
 
     @staticmethod
     def add_cli_args(
@@ -370,6 +372,12 @@ class RouterArgs:
                 "List of worker URLs. Supports IPv4 and IPv6 addresses"
                 " (use brackets for IPv6, e.g., http://[::1]:8000 http://192.168.1.1:8000)"
             ),
+        )
+        worker_group.add_argument(
+            f"--{prefix}worker-mode",
+            choices=["engine", "smg"],
+            default=RouterArgs.worker_mode,
+            help="Use the direct engine endpoint or the two-tier SMG Worker service",
         )
         worker_group.add_argument(
             f"--{prefix}upstream-http2",

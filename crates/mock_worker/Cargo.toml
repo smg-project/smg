@@ -21,8 +21,10 @@ tonic.workspace = true
 axum.workspace = true
 serde_json.workspace = true
 futures.workspace = true
+prost-types.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+tokio-stream = { version = "0.1", features = ["net"] }

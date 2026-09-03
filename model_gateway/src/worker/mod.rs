@@ -3,6 +3,7 @@
 pub mod builder;
 pub mod capacity;
 pub mod circuit_breaker;
+pub mod engine_transport;
 pub mod error;
 pub mod event;
 pub mod hash_ring;
@@ -30,6 +31,7 @@ pub mod worker;
 pub use builder::BasicWorkerBuilder;
 pub use capacity::{CapacitySource, CapacityTrackerSettings, WorkerCapacity};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+pub use engine_transport::ZmqWorkerTransport;
 pub use error::{WorkerError, WorkerResult};
 pub use hash_ring::HashRing;
 pub use http_client::WorkerHttpClientCache;
@@ -41,7 +43,7 @@ pub use openai_protocol::UNKNOWN_MODEL_ID;
 pub use openai_protocol::{
     model_card::ModelCard,
     model_type::{Endpoint, ModelType},
-    worker::{ProviderType, WorkerGroupKey},
+    worker::{ProviderType, WorkerGroupKey, WorkerMode},
 };
 pub use overload::OverloadThresholds;
 pub(crate) use registry::{ModelWorkerSnapshot, RoutingPool};
@@ -52,5 +54,5 @@ pub use service::WorkerService;
 pub(crate) use worker::ConnectionModeExt;
 pub use worker::{
     AttachedBody, BasicWorker, ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType,
-    DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
+    DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, NIXL_CONNECTOR, TOKEN_ONLY_WIRE_FEATURE,
 };

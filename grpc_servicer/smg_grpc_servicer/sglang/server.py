@@ -6,6 +6,7 @@ Handles server lifecycle, TLS, warmup, and shutdown.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
 from smg_grpc_servicer.sglang.scheduler_launcher import launch_scheduler_process_only
 from smg_grpc_servicer.sglang.servicer import SGLangSchedulerServicer
+from smg_grpc_servicer.worker_control_lifecycle import WorkerControlLifecycle
 
 logger = logging.getLogger(__name__)
 
@@ -306,10 +308,41 @@ async def serve_grpc(
 
     await server.start()
 
+    is_generation = scheduler_info.get("is_generation")
+    if is_generation is None:
+        is_generation = not server_args.is_embedding
+    advertised_model = server_args.served_model_name or server_args.model_path
+    model_ids = (
+        list(advertised_model)
+        if isinstance(advertised_model, (list, tuple))
+        else [advertised_model]
+    )
+    try:
+        worker_control = WorkerControlLifecycle.start_from_env(
+            engine_type="sglang",
+            engine_distribution="sglang",
+            model_ids=model_ids,
+            features=["generate" if is_generation else "embed", "abort"],
+            max_concurrent_requests=getattr(server_args, "max_running_requests", 0) or 0,
+            engine_attributes={
+                "model_path": server_args.model_path,
+                "tokenizer_path": getattr(server_args, "tokenizer_path", None)
+                or server_args.model_path,
+            },
+        )
+    except Exception:
+        logger.exception("Failed to start the Worker control plane")
+        health_servicer.set_not_serving()
+        await server.stop(0)
+        await servicer.shutdown()
+        _terminate_scheduler_processes(scheduler_procs)
+        raise
+
     # Start warmup in a separate thread
+    shutdown_started = threading.Event()
     warmup_thread = threading.Thread(
         target=_wait_and_warmup_grpc,
-        args=(server_args, health_servicer),
+        args=(server_args, health_servicer, worker_control, shutdown_started),
     )
     warmup_thread.start()
 
@@ -324,13 +357,42 @@ async def serve_grpc(
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, signal_handler)
 
+    async def lifecycle_watcher():
+        while not stop_event.is_set():
+            if request_manager.gracefully_exit:
+                logger.info("Request manager requested shutdown")
+                stop_event.set()
+                return
+            if worker_control is not None and not worker_control.running:
+                logger.error(
+                    "Worker control plane exited unexpectedly: %s",
+                    worker_control.last_error or "unknown error",
+                )
+                stop_event.set()
+                return
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=0.25)
+            except TimeoutError:
+                pass
+
+    watcher_task = asyncio.create_task(lifecycle_watcher())
+
     try:
         await stop_event.wait()
     finally:
         logger.info("Shutting down gRPC server")
+        shutdown_started.set()
+        watcher_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher_task
 
         # Mark unhealthy first so probes and load balancers stop routing new
         # requests before we drain.
+        if worker_control is not None:
+            try:
+                worker_control.mark_draining()
+            except Exception:
+                logger.exception("Failed to mark the Worker control plane as draining")
         health_servicer.set_not_serving()
 
         # Drain in-flight RPCs with the request manager's ZMQ sockets still
@@ -338,6 +400,12 @@ async def serve_grpc(
         # backing channel out from under streams that are still draining, so
         # they error instead of completing.
         await server.stop(5.0)
+        if worker_control is not None:
+            try:
+                worker_control.mark_not_serving()
+                await asyncio.to_thread(worker_control.stop, 5.0)
+            except Exception:
+                logger.exception("Failed to stop the Worker control plane cleanly")
         await servicer.shutdown()
 
         # Wait for warmup thread to finish
@@ -347,15 +415,7 @@ async def serve_grpc(
 
         # Terminate scheduler processes before exiting to avoid atexit hang
         # The scheduler processes have SIGINT ignored, so they won't get KeyboardInterrupt
-        for i, proc in enumerate(scheduler_procs):
-            if proc.is_alive():
-                logger.info(f"Terminating scheduler process {i}...")
-                proc.terminate()
-                proc.join(timeout=2.0)
-                if proc.is_alive():
-                    logger.warning(f"Scheduler process {i} did not terminate, killing...")
-                    proc.kill()
-                    proc.join(timeout=1.0)
+        _terminate_scheduler_processes(scheduler_procs)
 
         logger.info("All scheduler processes terminated")
 
@@ -497,6 +557,8 @@ def _execute_grpc_server_warmup(server_args: ServerArgs):
 def _wait_and_warmup_grpc(
     server_args: ServerArgs,
     health_servicer: SGLangHealthServicer | None = None,
+    worker_control: WorkerControlLifecycle | None = None,
+    shutdown_started: threading.Event | None = None,
 ):
     """Wait for gRPC server to be ready and execute warmup."""
     if not server_args.skip_server_warmup:
@@ -508,5 +570,22 @@ def _wait_and_warmup_grpc(
     # Mark health service as SERVING after warmup completes
     if health_servicer:
         health_servicer.set_serving()
+    if worker_control and not (shutdown_started and shutdown_started.is_set()):
+        try:
+            worker_control.mark_serving()
+        except Exception:
+            logger.exception("Failed to mark the Worker control plane as serving")
 
     logger.info("The server is fired up and ready to roll!")
+
+
+def _terminate_scheduler_processes(scheduler_procs):
+    for i, proc in enumerate(scheduler_procs):
+        if proc.is_alive():
+            logger.info("Terminating scheduler process %s...", i)
+            proc.terminate()
+            proc.join(timeout=2.0)
+            if proc.is_alive():
+                logger.warning("Scheduler process %s did not terminate, killing...", i)
+                proc.kill()
+                proc.join(timeout=1.0)

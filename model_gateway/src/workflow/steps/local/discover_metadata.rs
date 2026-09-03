@@ -10,12 +10,78 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use crate::{
     routers::grpc::client::{flat_labels, GrpcClient},
-    worker::{sampling_defaults::SamplingDefaults, ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL},
+    worker::{
+        sampling_defaults::SamplingDefaults, ConnectionMode, WorkerMode,
+        DEFAULT_SAMPLING_PARAMS_LABEL,
+    },
     workflow::{
-        data::{WorkerKind, WorkerWorkflowData},
+        data::{SmgWorkerDiscovery, WorkerKind, WorkerWorkflowData},
         steps::util::{grpc_base_url, http_base_url},
     },
 };
+
+fn smg_discovery_labels(discovery: &SmgWorkerDiscovery) -> HashMap<String, String> {
+    let mut labels = discovery.identity_labels.clone();
+    labels.insert("smg.worker_id".to_string(), discovery.worker_id.clone());
+    labels.insert("smg.instance_id".to_string(), discovery.instance_id.clone());
+    labels.insert("smg.hostname".to_string(), discovery.hostname.clone());
+    labels.insert("smg.zone".to_string(), discovery.zone.clone());
+    labels.insert("smg.version".to_string(), discovery.version.clone());
+    labels.insert(
+        "smg.api_version".to_string(),
+        format!("{}.{}", discovery.api_major, discovery.api_minor),
+    );
+    labels.insert(
+        "smg.topology_version".to_string(),
+        discovery.topology_version.to_string(),
+    );
+    labels.insert(
+        "smg.features".to_string(),
+        serde_json::to_string(&discovery.features).unwrap_or_default(),
+    );
+    labels.insert(
+        "smg.max_concurrent_requests".to_string(),
+        discovery.max_concurrent_requests.to_string(),
+    );
+    for (key, value) in &discovery.capability_attributes {
+        labels.insert(format!("smg.capability.{key}"), value.clone());
+    }
+
+    let mut model_ids = discovery
+        .engines
+        .iter()
+        .flat_map(|engine| engine.model_ids.iter().cloned())
+        .filter(|model_id| !model_id.trim().is_empty())
+        .collect::<Vec<_>>();
+    model_ids.sort();
+    model_ids.dedup();
+    if let Some(model_id) = model_ids.first() {
+        labels.insert("served_model_name".to_string(), model_id.clone());
+    }
+    labels.insert(
+        "smg.model_ids".to_string(),
+        serde_json::to_string(&model_ids).unwrap_or_default(),
+    );
+
+    if let Some(engine) = discovery.engines.first() {
+        labels.insert("smg.engine_id".to_string(), engine.engine_id.clone());
+        labels.insert("smg.engine_type".to_string(), engine.engine_type.clone());
+        labels.insert(
+            "smg.engine_version".to_string(),
+            engine.engine_version.clone(),
+        );
+        labels.insert("smg.engine_endpoint".to_string(), engine.endpoint.clone());
+        labels.insert(
+            "smg.engine_features".to_string(),
+            serde_json::to_string(&engine.features).unwrap_or_default(),
+        );
+        for (key, value) in &engine.attributes {
+            labels.entry(key.clone()).or_insert_with(|| value.clone());
+            labels.insert(format!("smg.engine.{key}"), value.clone());
+        }
+    }
+    labels
+}
 
 /// Per-request deadline for metadata fetches.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
@@ -354,43 +420,54 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
             config.url, connection_mode
         );
 
-        let (discovered_labels, detected_runtime) = match connection_mode {
-            ConnectionMode::Http => {
-                let runtime = context
-                    .data
-                    .detected_runtime_type
-                    .as_deref()
-                    .unwrap_or_else(|| {
-                        warn!(
-                            "No detected_runtime_type for {}, defaulting to sglang",
-                            config.url
-                        );
-                        "sglang"
-                    });
-                let client = context.data.http_client("discover_metadata")?;
-                let api_key = config.api_key.as_deref();
-                let labels = match runtime {
-                    "vllm" => fetch_vllm_http_metadata(&client, &config.url, api_key).await,
-                    _ => fetch_sglang_http_metadata(&client, &config.url, api_key).await,
-                };
-                Ok((labels, None))
+        let (discovered_labels, detected_runtime) = if config.worker_mode == WorkerMode::Smg {
+            let discovery = context.data.smg_worker_discovery.as_ref().ok_or_else(|| {
+                WorkflowError::ContextValueNotFound("smg_worker_discovery".to_string())
+            })?;
+            let runtime = discovery
+                .engines
+                .first()
+                .map(|engine| engine.engine_type.clone());
+            Ok((smg_discovery_labels(discovery), runtime))
+        } else {
+            match connection_mode {
+                ConnectionMode::Http => {
+                    let runtime = context
+                        .data
+                        .detected_runtime_type
+                        .as_deref()
+                        .unwrap_or_else(|| {
+                            warn!(
+                                "No detected_runtime_type for {}, defaulting to sglang",
+                                config.url
+                            );
+                            "sglang"
+                        });
+                    let client = context.data.http_client("discover_metadata")?;
+                    let api_key = config.api_key.as_deref();
+                    let labels = match runtime {
+                        "vllm" => fetch_vllm_http_metadata(&client, &config.url, api_key).await,
+                        _ => fetch_sglang_http_metadata(&client, &config.url, api_key).await,
+                    };
+                    Ok((labels, None))
+                }
+                ConnectionMode::Grpc => {
+                    let config_runtime = config.runtime_type.to_string();
+                    let runtime_type = context
+                        .data
+                        .detected_runtime_type
+                        .as_deref()
+                        .unwrap_or(&config_runtime);
+                    fetch_grpc_metadata(&config.url, runtime_type)
+                        .await
+                        .map(|(labels, rt)| (labels, Some(rt)))
+                }
+                // An EngineCore worker does not report model/tokenizer metadata over
+                // ZMQ; it is configured at worker registration. Return `None` for the
+                // runtime so the explicitly configured / detected runtime is preserved
+                // (the handshake is shared across engines, so it cannot be probed here).
+                ConnectionMode::Zmq => Ok((HashMap::new(), None)),
             }
-            ConnectionMode::Grpc => {
-                let config_runtime = config.runtime_type.to_string();
-                let runtime_type = context
-                    .data
-                    .detected_runtime_type
-                    .as_deref()
-                    .unwrap_or(&config_runtime);
-                fetch_grpc_metadata(&config.url, runtime_type)
-                    .await
-                    .map(|(labels, rt)| (labels, Some(rt)))
-            }
-            // An EngineCore worker does not report model/tokenizer metadata over
-            // ZMQ; it is configured at worker registration. Return `None` for the
-            // runtime so the explicitly configured / detected runtime is preserved
-            // (the handshake is shared across engines, so it cannot be probed here).
-            ConnectionMode::Zmq => Ok((HashMap::new(), None)),
         }
         .unwrap_or_else(|e| {
             warn!("Failed to fetch metadata for {}: {}", config.url, e);
@@ -418,6 +495,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow::data::SmgEngineDiscovery;
 
     #[expect(clippy::print_stderr)]
     fn dump_labels(title: &str, labels: &HashMap<String, String>) {
@@ -427,6 +505,61 @@ mod tests {
         for key in keys {
             eprintln!("  {key}: {}", labels[key]);
         }
+    }
+
+    #[test]
+    fn smg_discovery_preserves_identity_topology_and_all_models() {
+        let discovery = SmgWorkerDiscovery {
+            worker_id: "worker-a".to_string(),
+            instance_id: "instance-a".to_string(),
+            api_major: 1,
+            api_minor: 2,
+            topology_version: 7,
+            features: vec!["generate".to_string()],
+            max_concurrent_requests: 64,
+            engines: vec![SmgEngineDiscovery {
+                engine_id: "engine-a".to_string(),
+                engine_type: "vllm".to_string(),
+                endpoint: "grpc://engine:32000".to_string(),
+                model_ids: vec!["model-b".to_string(), "model-a".to_string()],
+                attributes: HashMap::from([(
+                    "tokenizer_path".to_string(),
+                    "repo/tokenizer".to_string(),
+                )]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let labels = smg_discovery_labels(&discovery);
+        assert_eq!(
+            labels.get("smg.worker_id").map(String::as_str),
+            Some("worker-a")
+        );
+        assert_eq!(
+            labels.get("smg.instance_id").map(String::as_str),
+            Some("instance-a")
+        );
+        assert_eq!(
+            labels.get("smg.api_version").map(String::as_str),
+            Some("1.2")
+        );
+        assert_eq!(
+            labels.get("smg.model_ids").map(String::as_str),
+            Some(r#"["model-a","model-b"]"#)
+        );
+        assert_eq!(
+            labels.get("served_model_name").map(String::as_str),
+            Some("model-a")
+        );
+        assert_eq!(
+            labels.get("smg.engine_type").map(String::as_str),
+            Some("vllm")
+        );
+        assert_eq!(
+            labels.get("tokenizer_path").map(String::as_str),
+            Some("repo/tokenizer")
+        );
     }
 
     #[tokio::test]

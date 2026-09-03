@@ -1,6 +1,10 @@
 //! Local worker creation step.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use openai_protocol::{
@@ -88,36 +92,58 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             model_id
         };
 
-        let model_card = build_model_card(
-            model_id,
-            config,
-            &labels,
-            &app_context.router_config.model_aliases,
-        );
+        let mut model_ids = if config.models.is_wildcard() {
+            labels
+                .get("smg.model_ids")
+                .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+                .unwrap_or_default()
+        } else {
+            config.models.iter().map(|model| model.id.clone()).collect()
+        };
+        if model_ids.is_empty() {
+            model_ids.push(model_id.to_string());
+        }
+        let mut seen_model_ids = HashSet::new();
+        model_ids.retain(|model_id| seen_model_ids.insert(model_id.clone()));
+        let model_cards = model_ids
+            .iter()
+            .map(|model_id| {
+                build_model_card(
+                    model_id,
+                    config,
+                    &labels,
+                    &app_context.router_config.model_aliases,
+                )
+            })
+            .collect::<Vec<_>>();
 
         // A parser override naming an unknown parser would silently ship
         // unparsed output at serve time — fail registration loudly instead
         // (mirrors the fail-fast AppContext applies to the global CLI names).
-        validate_parser_overrides(
-            &model_card,
-            &config.url,
-            app_context.tool_parser_factory.as_ref(),
-            app_context.reasoning_parser_factory.as_ref(),
-        )
-        .map_err(|message| WorkflowError::StepFailed {
-            step_id: StepId::new("create_worker"),
-            message,
-        })?;
+        for model_card in &model_cards {
+            validate_parser_overrides(
+                model_card,
+                &config.url,
+                app_context.tool_parser_factory.as_ref(),
+                app_context.reasoning_parser_factory.as_ref(),
+            )
+            .map_err(|message| WorkflowError::StepFailed {
+                step_id: StepId::new("create_worker"),
+                message,
+            })?;
+        }
 
         // Mixed overrides across same-model workers are a misconfiguration
         // (except transiently during rolling upgrades): resolution picks one
         // deterministically, but only one family parses correctly. Warn, don't
         // fail — failing would block rolling upgrades that change the parser.
-        warn_on_conflicting_parser_overrides(
-            &model_card,
-            &config.url,
-            &app_context.worker_registry,
-        );
+        for model_card in &model_cards {
+            warn_on_conflicting_parser_overrides(
+                model_card,
+                &config.url,
+                &app_context.worker_registry,
+            );
+        }
 
         let runtime_type = match context.data.detected_runtime_type.as_deref() {
             Some(s) => s.parse::<RuntimeType>().unwrap_or(config.runtime_type),
@@ -227,8 +253,10 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             .into_iter()
             .map(|dp| {
                 let mut builder = BasicWorkerBuilder::new(url.clone())
-                    .model(model_card.clone())
+                    .models(model_cards.clone())
                     .worker_type(config.worker_type)
+                    .worker_mode(config.worker_mode)
+                    .control_url(config.control_url.clone())
                     .connection_mode(*connection_mode)
                     .runtime_type(runtime_type)
                     .circuit_breaker_config(circuit_breaker.clone())

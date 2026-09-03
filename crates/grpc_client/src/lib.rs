@@ -1,8 +1,9 @@
-//! gRPC clients for vLLM, TensorRT-LLM, MLX, TokenSpeed, and SGLang backends.
+//! gRPC bindings for the SMG Worker control plane and clients for vLLM,
+//! TensorRT-LLM, MLX, TokenSpeed, and SGLang backends.
 //!
-//! This crate provides gRPC client implementations for communicating with
-//! the vLLM engine, TensorRT-LLM engine, MLX engine, TokenSpeed scheduler,
-//! and SGLang scheduler backends.
+//! The Worker control module includes both tonic client and server bindings;
+//! engine modules provide client implementations for their respective
+//! backend schedulers.
 
 pub mod common_proto {
     #![allow(
@@ -17,11 +18,23 @@ pub mod abort_on_drop;
 pub mod channel;
 pub mod mlx_engine;
 pub mod sglang_scheduler;
+pub mod sglang_runtime {
+    #![allow(
+        clippy::all,
+        clippy::absolute_paths,
+        clippy::allow_attributes,
+        clippy::trivially_copy_pass_by_ref,
+        unused_qualifications
+    )]
+    tonic::include_proto!("sglang.runtime.v1");
+}
 pub mod tokenizer_bundle;
 pub mod tokenspeed_encoder;
 pub mod tokenspeed_scheduler;
 pub mod trtllm_service;
 pub mod vllm_engine;
+pub mod worker_control;
+pub mod worker_inference;
 
 // Re-export clients
 use std::sync::Arc;
@@ -39,6 +52,8 @@ pub use tokenspeed_scheduler::{tokenspeed_proto, TokenSpeedSchedulerClient};
 use tonic::metadata::MetadataMap;
 pub use trtllm_service::{proto as trtllm_proto, TrtllmServiceClient};
 pub use vllm_engine::{proto as vllm_proto, VllmEngineClient};
+pub use worker_control::proto as worker_proto;
+pub use worker_inference::{proto as worker_inference_proto, WorkerInferenceClient};
 
 /// Shared `get_tokenizer()` implementation for all engine clients.
 ///

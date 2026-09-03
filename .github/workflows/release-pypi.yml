@@ -95,7 +95,7 @@ jobs:
           working-directory: smg-repo/bindings/python
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
-          args: --release --out dist --features vendored-openssl --interpreter ${{ matrix.interpreter || '3.9 3.10 3.11 3.12 3.13 3.14' }}
+          args: --release --out dist --features extension-module,vendored-openssl --interpreter ${{ matrix.interpreter || '3.9 3.10 3.11 3.12 3.13 3.14' }}
           rust-toolchain: 1.98.0
           docker-options: -e CI -e JEMALLOC_SYS_WITH_LG_PAGE -e CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc -e CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
           before-script-linux: |

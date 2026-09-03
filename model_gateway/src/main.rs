@@ -92,6 +92,24 @@ pub enum Backend {
     Gemini,
 }
 
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum StartupWorkerMode {
+    #[default]
+    #[value(name = "engine")]
+    Engine,
+    #[value(name = "smg")]
+    Smg,
+}
+
+impl From<StartupWorkerMode> for openai_protocol::worker::WorkerMode {
+    fn from(mode: StartupWorkerMode) -> Self {
+        match mode {
+            StartupWorkerMode::Engine => Self::Engine,
+            StartupWorkerMode::Smg => Self::Smg,
+        }
+    }
+}
+
 impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -227,6 +245,16 @@ struct CliArgs {
     /// List of worker URLs (supports IPv4 and IPv6)
     #[arg(long, num_args = 0.., help_heading = "Worker Configuration")]
     worker_urls: Vec<String>,
+
+    /// Service identity of workers supplied by --worker-urls. Use `smg` when
+    /// the endpoint exposes the two-tier Worker control/inference services.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "engine",
+        help_heading = "Worker Configuration"
+    )]
+    worker_mode: StartupWorkerMode,
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
@@ -1736,7 +1764,20 @@ impl CliArgs {
         // additionally pins the startup workers' runtime: the shared EngineCore
         // handshake carries no engine identity, so the wire protocol cannot be
         // probed and must be declared. HTTP/gRPC keep auto-detection (None).
-        let startup_worker_runtime_type = if connection_mode == ConnectionMode::Zmq {
+        // The two branches stay separate because ZMQ only admits vLLM and
+        // TokenSpeed (`zmq_client::connect_for_worker`) -- folding them
+        // together would pin an unsupported runtime for `--connection-mode zmq
+        // --backend sglang|trtllm`, which auto-detection handles today. Mirrors
+        // `to_router_config` in bindings/python/src/lib.rs.
+        let startup_worker_runtime_type = if self.worker_mode == StartupWorkerMode::Smg {
+            match self.backend {
+                Some(Backend::Sglang) => Some(RuntimeType::Sglang),
+                Some(Backend::Vllm) => Some(RuntimeType::Vllm),
+                Some(Backend::Trtllm) => Some(RuntimeType::Trtllm),
+                Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
+                _ => None,
+            }
+        } else if connection_mode == ConnectionMode::Zmq {
             match self.backend {
                 Some(Backend::Vllm) => Some(RuntimeType::Vllm),
                 Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
@@ -1798,6 +1839,7 @@ impl CliArgs {
             .cache_boundaries(self.cache_boundaries.clone())
             .connection_mode(connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
+            .startup_worker_mode(self.worker_mode.into())
             .zmq_engine_count(self.zmq_engine_count)
             .host(&self.host)
             .port(self.port)

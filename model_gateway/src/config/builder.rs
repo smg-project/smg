@@ -9,7 +9,7 @@ use super::{
     RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
     TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
-use crate::worker::{ConnectionMode, RuntimeType};
+use crate::worker::{ConnectionMode, RuntimeType, WorkerMode};
 
 /// Builder for RouterConfig that wraps the config itself
 /// This eliminates field duplication and stays in sync automatically
@@ -161,6 +161,12 @@ impl RouterConfigBuilder {
     /// auto-detection for HTTP/gRPC; see `RouterConfig::startup_worker_runtime_type`).
     pub fn startup_worker_runtime_type(mut self, runtime: Option<RuntimeType>) -> Self {
         self.config.startup_worker_runtime_type = runtime;
+        self
+    }
+
+    /// Service identity for workers supplied through `--worker-urls`.
+    pub fn startup_worker_mode(mut self, mode: WorkerMode) -> Self {
+        self.config.startup_worker_mode = mode;
         self
     }
 
