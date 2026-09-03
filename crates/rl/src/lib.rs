@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod error;
+pub mod selector;
 pub mod view;
 
 pub use config::RlConfig;
