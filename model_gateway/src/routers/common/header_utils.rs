@@ -7,6 +7,8 @@ use axum::{
 };
 use http::header::HeaderName;
 
+use crate::routers::error::HEADER_X_SMG_ERROR_CODE;
+
 static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-worker");
 static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
 static HEADER_ROUTING_TOKENS: HeaderName = HeaderName::from_static("x-smg-routing-tokens");
@@ -110,14 +112,14 @@ pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Convert headers from reqwest Response to axum HeaderMap
-/// Filters out hop-by-hop headers that shouldn't be forwarded
+/// Convert headers from reqwest Response to axum HeaderMap.
+///
+/// Filters out hop-by-hop and SMG-owned headers that must not be forwarded.
 pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
 
     for (name, value) in reqwest_headers {
-        // Skip hop-by-hop headers that shouldn't be forwarded
-        // Use eq_ignore_ascii_case to avoid string allocation
+        // Use case-insensitive checks to avoid string allocation.
         if should_forward_header_no_alloc(name.as_str()) {
             // The original name and value are already valid, so we can just clone them
             headers.insert(name.clone(), value.clone());
@@ -142,10 +144,17 @@ pub fn insert_routed_worker_id(headers: &mut HeaderMap, worker_url: &str) {
     }
 }
 
+/// Whether `name` is reserved for a response created by SMG itself.
+///
+/// Backend responses must not mint this marker: downstream gateways use it to
+/// distinguish a gateway decision from an upstream response.
+pub(crate) fn is_smg_owned_response_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case(HEADER_X_SMG_ERROR_CODE)
+}
+
 /// Determine if a header should be forwarded without allocating (case-insensitive)
 fn should_forward_header_no_alloc(name: &str) -> bool {
-    // List of headers that should NOT be forwarded (hop-by-hop headers)
-    // Use eq_ignore_ascii_case to avoid to_lowercase() allocation
+    // List of headers that should NOT be forwarded (hop-by-hop or SMG-owned).
     !(name.eq_ignore_ascii_case("connection")
         || name.eq_ignore_ascii_case("keep-alive")
         || name.eq_ignore_ascii_case("proxy-authenticate")
@@ -155,7 +164,8 @@ fn should_forward_header_no_alloc(name: &str) -> bool {
         || name.eq_ignore_ascii_case("transfer-encoding")
         || name.eq_ignore_ascii_case("upgrade")
         || name.eq_ignore_ascii_case("content-encoding")
-        || name.eq_ignore_ascii_case("host"))
+        || name.eq_ignore_ascii_case("host")
+        || is_smg_owned_response_header(name))
 }
 
 /// API provider types for provider-specific header handling
@@ -398,6 +408,19 @@ pub fn should_forward_request_header(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserve_response_headers_drops_smg_owned_error_code() {
+        let mut upstream = HeaderMap::new();
+        upstream.insert(HEADER_X_SMG_ERROR_CODE, HeaderValue::from_static("forged"));
+        upstream.insert("x-upstream-id", HeaderValue::from_static("worker-a"));
+
+        let forwarded = preserve_response_headers(&upstream);
+
+        assert!(forwarded.get(HEADER_X_SMG_ERROR_CODE).is_none());
+        assert_eq!(forwarded.get("x-upstream-id").unwrap(), "worker-a");
+        assert!(is_smg_owned_response_header("X-SMG-Error-Code"));
+    }
 
     #[test]
     fn apply_forwarded_request_headers_user_auth_wins_without_duplicate() {

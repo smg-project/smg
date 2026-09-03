@@ -25,8 +25,9 @@ struct ErrorDetail<'a> {
 pub const HEADER_X_SMG_ERROR_CODE: &str = "X-SMG-Error-Code";
 
 /// Gateway-minted error code, carried as a process-local response extension.
-/// Upstream responses can forge the `X-SMG-Error-Code` header (rebuilt
-/// responses preserve upstream headers) but can never inject an extension.
+///
+/// Keep metrics independent of client-visible headers: only [`create_error`]
+/// adds this extension.
 #[derive(Clone)]
 struct GatewayErrorCode(String);
 
@@ -117,8 +118,7 @@ pub fn model_not_found(model: &str) -> Response {
 /// Error-code metric label for a response.
 ///
 /// Reads only the [`GatewayErrorCode`] extension set by [`create_error`],
-/// never the `X-SMG-Error-Code` header: a backend-supplied header value would
-/// otherwise mint unbounded metric label values.
+/// never the client-visible `X-SMG-Error-Code` header.
 pub fn extract_error_code_from_response<B>(response: &Response<B>) -> &str {
     response
         .extensions()
@@ -194,9 +194,9 @@ mod tests {
     }
 
     #[test]
-    fn extract_error_code_ignores_upstream_supplied_header() {
-        // A response rebuilt from preserved upstream headers carries the
-        // header but no extension; it must not become a metric label.
+    fn extract_error_code_ignores_header_without_gateway_extension() {
+        // A response without a gateway extension must not mint a metric label,
+        // even if another response decorator adds the public header.
         let mut response = StatusCode::INTERNAL_SERVER_ERROR.into_response();
         response.headers_mut().insert(
             HEADER_X_SMG_ERROR_CODE,

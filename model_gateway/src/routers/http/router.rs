@@ -2154,7 +2154,7 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
     };
 
-    use axum::http::header::CONTENT_LENGTH;
+    use axum::http::header::{CONTENT_LENGTH, RETRY_AFTER};
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
@@ -2363,6 +2363,36 @@ mod tests {
         assert!(router
             .select_worker_for_model(crate::worker::UNKNOWN_MODEL_ID, None, None, None, None)
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn unavailable_workers_keep_generic_503_without_retry_after() {
+        let router = create_test_regular_router();
+        for worker in router.worker_registry.get_all() {
+            worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        }
+
+        let response = router
+            .route_typed_request(
+                None,
+                DropProbeRequest {
+                    text: "unavailable".to_string(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .expect("gateway error code header"),
+            "no_available_workers"
+        );
+        assert!(response.headers().get(RETRY_AFTER).is_none());
     }
 
     fn rerank_request() -> RerankRequest {
