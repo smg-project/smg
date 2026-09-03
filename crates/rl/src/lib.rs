@@ -4,13 +4,30 @@
 
 pub mod capability;
 pub mod config;
+pub mod discovery;
 pub mod error;
 pub mod metrics;
 pub mod path;
 pub mod selector;
+pub mod state;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod view;
 
+use std::sync::Arc;
+
+use axum::{routing::get, Router};
 pub use config::RlConfig;
 pub use error::RlError;
 pub use metrics::init_rl_metrics;
+pub use state::RlState;
 pub use view::{RlWorkerInfo, RlWorkerView};
+
+/// Build the `/v1/rl` router. `with_state` returns `Router<S>` for any `S`,
+/// so the gateway can nest this under its own state type.
+pub fn router<S: Clone + Send + Sync + 'static>(state: Arc<RlState>) -> Router<S> {
+    Router::new()
+        .route("/workers", get(discovery::list_workers))
+        .route("/workers/{id}", get(discovery::get_worker))
+        .with_state(state)
+}
