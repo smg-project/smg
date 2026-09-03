@@ -1,11 +1,13 @@
 name: CI TokenSpeed Image
 
-# Bakes the pinned TokenSpeed build (engine + kernel + scheduler) on top of
-# the plain GPU CI container and pushes it under the content-addressed tag
-# printed by scripts/ci_tokenspeed_image_tag.sh (engine ref + a hash of the
-# image tooling). The tokenspeed e2e lanes in pr-test-rust.yml pull this
-# image (resolved in detect-changes) instead of spending ~25
-# GPU-runner-minutes compiling from source in every job.
+# Bakes the pinned TokenSpeed build (engine + kernel + scheduler) into a
+# runner-matched carrier image (ubuntu:24.04 — the GPU e2e jobs run bare on
+# the runner pods, so this is extracted at job time, not used as a job
+# container; see docker/ci-tokenspeed.Dockerfile) and pushes it under the
+# content-addressed tag printed by scripts/ci_tokenspeed_image_tag.sh
+# (engine ref + a hash of the image tooling). The tokenspeed e2e lanes in
+# pr-test-rust.yml pull this image (resolved in detect-changes) instead of
+# spending ~25 GPU-runner-minutes compiling from source in every job.
 #
 # The kernel compile needs nvcc but no GPU (arch list is pinned in
 # scripts/ci_install_tokenspeed.sh), so this runs on the docker runner pool.
@@ -33,7 +35,7 @@ on:
         default: false
         type: boolean
       base_image:
-        description: 'Base image override (default: vars.SMG_CI_GPU_CONTAINER_IMAGE)'
+        description: 'Base image override (default: ubuntu:24.04, matching the runner pods)'
         required: false
         type: string
 
@@ -58,16 +60,13 @@ jobs:
         id: resolve
         env:
           BASE_OVERRIDE: ${{ inputs.base_image }}
-          BASE_DEFAULT: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
         run: |
           # Unlike the tolerant resolution in detect-changes, THIS workflow
           # must fail loudly on a broken ref — its whole job is the image.
           tag="$(bash scripts/ci_tokenspeed_image_tag.sh)"
-          base="${BASE_OVERRIDE:-$BASE_DEFAULT}"
-          if [ -z "$base" ]; then
-            echo "ERROR: no base image (vars.SMG_CI_GPU_CONTAINER_IMAGE unset and no override)" >&2
-            exit 1
-          fi
+          # ubuntu:24.04 matches the runner pods (see the Dockerfile's
+          # portability contract); the dispatch input can override it.
+          base="${BASE_OVERRIDE:-ubuntu:24.04}"
           image="ghcr.io/${{ github.repository_owner }}/smg:${tag}"
           echo "image=${image}" >> "$GITHUB_OUTPUT"
           echo "base=${base}" >> "$GITHUB_OUTPUT"

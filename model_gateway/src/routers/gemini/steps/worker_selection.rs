@@ -35,7 +35,7 @@ pub(crate) async fn worker_selection(ctx: &mut RequestContext) -> Result<StepRes
         }
     };
 
-    let selector = WorkerSelector::new(&ctx.components.worker_registry, &ctx.components.client);
+    let selector = WorkerSelector::new(&ctx.components.worker_registry);
     let worker = selector
         .select_worker(&SelectWorkerRequest {
             model_id: model,

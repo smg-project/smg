@@ -286,6 +286,26 @@ fn has_custom_tools(tool_types: &[&str]) -> bool {
 /// registration).
 pub(crate) struct HarmonyBuilder;
 
+/// Harmony knows only low/medium/high; the outer OpenAI tiers clamp inward.
+fn harmony_reasoning_effort(effort: ResponsesReasoningEffort) -> ReasoningEffort {
+    match effort {
+        ResponsesReasoningEffort::None
+        | ResponsesReasoningEffort::Minimal
+        | ResponsesReasoningEffort::Low => ReasoningEffort::Low,
+        ResponsesReasoningEffort::Medium => ReasoningEffort::Medium,
+        ResponsesReasoningEffort::High
+        | ResponsesReasoningEffort::Xhigh
+        | ResponsesReasoningEffort::Max => ReasoningEffort::High,
+    }
+}
+
+/// Chat carries the tier as a free-form string; unknown values keep the
+/// medium default.
+fn harmony_reasoning_effort_from_str(effort: &str) -> ReasoningEffort {
+    ResponsesReasoningEffort::parse(effort)
+        .map_or(ReasoningEffort::Medium, harmony_reasoning_effort)
+}
+
 impl HarmonyBuilder {
     /// Create a new Harmony builder
     pub fn new() -> Self {
@@ -444,14 +464,7 @@ impl HarmonyBuilder {
         let reasoning_effort = request
             .reasoning_effort
             .as_deref()
-            .map(|effort| match effort {
-                "high" => ReasoningEffort::High,
-                "medium" => ReasoningEffort::Medium,
-                "low" => ReasoningEffort::Low,
-                // Harmony does not support minimal reasoning effort
-                "minimal" => ReasoningEffort::Low,
-                _ => ReasoningEffort::Medium,
-            });
+            .map(harmony_reasoning_effort_from_str);
 
         let has_tools = request.tools.is_some();
         self.build_system_message(reasoning_effort, has_tools)
@@ -470,13 +483,8 @@ impl HarmonyBuilder {
         let reasoning_effort = request
             .reasoning
             .as_ref()
-            .and_then(|r| r.effort.as_ref())
-            .map(|effort| match effort {
-                ResponsesReasoningEffort::High => ReasoningEffort::High,
-                ResponsesReasoningEffort::Medium => ReasoningEffort::Medium,
-                ResponsesReasoningEffort::Low => ReasoningEffort::Low,
-                ResponsesReasoningEffort::Minimal => ReasoningEffort::Low,
-            });
+            .and_then(|r| r.effort)
+            .map(harmony_reasoning_effort);
 
         self.build_system_message(reasoning_effort, with_custom_tools)
     }
@@ -1443,6 +1451,36 @@ mod tests {
             "image_generation must appear exactly once in the rendered \
              function-tools namespace; found {occurrences} occurrences. \
              Decoded prompt:\n{decoded}",
+        );
+    }
+
+    #[test]
+    fn harmony_effort_clamps_outer_openai_tiers_inward() {
+        use ResponsesReasoningEffort as Tier;
+
+        for (tier, expected) in [
+            (Tier::None, ReasoningEffort::Low),
+            (Tier::Minimal, ReasoningEffort::Low),
+            (Tier::Low, ReasoningEffort::Low),
+            (Tier::Medium, ReasoningEffort::Medium),
+            (Tier::High, ReasoningEffort::High),
+            (Tier::Xhigh, ReasoningEffort::High),
+            (Tier::Max, ReasoningEffort::High),
+        ] {
+            assert_eq!(harmony_reasoning_effort(tier), expected, "{tier:?}");
+            assert_eq!(
+                harmony_reasoning_effort_from_str(tier.as_str()),
+                expected,
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn harmony_effort_from_unknown_string_stays_medium() {
+        assert_eq!(
+            harmony_reasoning_effort_from_str("bogus"),
+            ReasoningEffort::Medium
         );
     }
 }

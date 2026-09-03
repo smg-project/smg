@@ -1211,6 +1211,21 @@ fn test_reasoning_param_default() {
     assert!(matches!(parsed.effort, Some(ReasoningEffort::Medium)));
 }
 
+/// Every OpenAI `reasoning.effort` tier deserializes at the request boundary.
+#[test]
+fn test_reasoning_effort_accepts_every_openai_tier() {
+    for tier in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5",
+            "input": "hi",
+            "reasoning": { "effort": tier }
+        }))
+        .unwrap();
+        let effort = request.reasoning.and_then(|r| r.effort);
+        assert_eq!(effort.map(ReasoningEffort::as_str), Some(tier));
+    }
+}
+
 #[test]
 fn test_json_serialization() {
     let request = ResponsesRequest {

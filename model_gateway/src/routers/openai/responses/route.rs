@@ -59,17 +59,14 @@ pub(in crate::routers::openai) async fn route_responses(
         bool_to_static_str(streaming),
     );
 
-    let worker = match WorkerSelector::new(
-        deps.worker_registry,
-        &deps.responses_components.shared.client,
-    )
-    .select_worker(&SelectWorkerRequest {
-        model_id: model,
-        headers,
-        provider: Some(ProviderType::OpenAI),
-        ..Default::default()
-    })
-    .await
+    let worker = match WorkerSelector::new(deps.worker_registry)
+        .select_worker(&SelectWorkerRequest {
+            model_id: model,
+            headers,
+            provider: Some(ProviderType::OpenAI),
+            ..Default::default()
+        })
+        .await
     {
         Ok(w) => w,
         Err(response) => {

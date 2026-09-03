@@ -448,14 +448,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Resolve the prebuilt TokenSpeed CI image (built by
+      # Resolve the prebuilt TokenSpeed carrier image (built by
       # ci-tokenspeed-image.yml, content-addressed by the pinned engine ref +
-      # image-tooling hash — see scripts/ci_tokenspeed_image_tag.sh). Any
-      # failure — a missing image (e.g. a PR that bumps the ref or edits the
-      # tooling before the image exists), a broken ref file, a registry
-      # hiccup — resolves to empty, and the tokenspeed lanes fall back to the
-      # plain CI container + source build. This step must NEVER fail the job:
-      # a failed detect-changes silently skips every gated lane.
+      # image-tooling hash — see scripts/ci_tokenspeed_image_tag.sh). The
+      # lanes run bare on the runner pods, so the image is not a job
+      # container: setup-tokenspeed extracts its payload onto the runner
+      # (scripts/ci_fetch_tokenspeed_prebuilt.sh). Any failure — a missing
+      # image (e.g. a PR that bumps the ref or edits the tooling before the
+      # image exists), a broken ref file, a registry hiccup — resolves to
+      # empty, and the tokenspeed lanes fall back to the source build. This
+      # step must NEVER fail the job: a failed detect-changes silently skips
+      # every gated lane.
       - name: Resolve TokenSpeed CI image
         id: tokenspeed-image
         env:
@@ -525,6 +528,7 @@ jobs:
               - 'scripts/ci_install_trtllm.sh'
               - 'scripts/ci_install_tokenspeed.sh'
               - 'scripts/ci_tokenspeed_image_tag.sh'
+              - 'scripts/ci_fetch_tokenspeed_prebuilt.sh'
               - '.github/versions/tokenspeed.ref'
             agentic:
               - 'crates/mcp/**'
@@ -618,7 +622,7 @@ jobs:
       test_timeout: ${{ matrix.test_timeout }}
       test_dirs: ${{ matrix.test_dirs || 'e2e_test/chat_completions' }}
       min_selected: ${{ matrix.min_selected }}
-      container_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
   e2e-1gpu-chat-zmq:
@@ -661,7 +665,7 @@ jobs:
       test_dirs: e2e_test/chat_completions
       connection_mode: zmq
       min_selected: ${{ matrix.min_selected }}
-      container_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
   e2e-2gpu-chat-zmq-dp:
@@ -709,7 +713,7 @@ jobs:
       connection_mode: zmq
       zmq_engine_count: "2"
       min_selected: ${{ matrix.min_selected }}
-      container_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
   e2e-1gpu-completions:
@@ -945,7 +949,7 @@ jobs:
       test_dirs: e2e_test/chat_completions/test_epd_multimodal.py
       extra_models: "Qwen/Qwen3.5-9B"
       min_selected: 6 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
-      container_image: ${{ needs.detect-changes.outputs.tokenspeed-image }}
+      tokenspeed_prebuilt_image: ${{ needs.detect-changes.outputs.tokenspeed-image }}
     secrets: inherit
 
   # --- Vendor E2E: CPU-only cloud backend tests ---

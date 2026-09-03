@@ -63,7 +63,7 @@ pub(super) async fn route_chat(
         bool_to_static_str(streaming),
     );
 
-    let selector = WorkerSelector::new(deps.worker_registry, &deps.shared_components.client);
+    let selector = WorkerSelector::new(deps.worker_registry);
     let worker = match selector
         .select_worker(&SelectWorkerRequest {
             model_id: model,

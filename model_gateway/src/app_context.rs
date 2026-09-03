@@ -26,10 +26,7 @@ use crate::{
         router_manager::RouterManager,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    worker::{
-        http_client::apply_upstream_http2, KvEventMonitor, WorkerHttpClientCache, WorkerMonitor,
-        WorkerRegistry, WorkerService,
-    },
+    worker::{KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService},
     workflow::{JobQueue, WorkflowEngines},
 };
 
@@ -451,24 +448,14 @@ impl AppContextBuilder {
             .router_config(router_config))
     }
 
-    /// Create HTTP client with TLS/mTLS configuration
+    /// Create the shared HTTP client for upstream calls not addressed to a
+    /// registered worker (external providers, IGW model discovery, worker
+    /// classification). Worker-directed traffic uses each worker's own client
+    /// from [`WorkerHttpClientCache`].
+    ///
+    /// Uses the rustls TLS backend when TLS/mTLS is configured (client cert or
+    /// CA certs provided) for PKCS#8 key support; plain HTTP skips TLS setup.
     fn with_client(mut self, config: &RouterConfig, timeout_secs: u64) -> Result<Self, String> {
-        // FIXME: Current implementation creates a single HTTP client for all workers.
-        // This works well for single security domain deployments where all workers share
-        // the same CA and can accept the same client certificate.
-        //
-        // For multi-domain deployments (e.g., different model families with different CAs),
-        // this architecture needs significant refactoring:
-        // 1. Move client creation into worker registration workflow (per-worker clients)
-        // 2. Store client per worker in WorkerRegistry
-        // 3. Update PDRouter and other routers to fetch client from worker
-        // 4. Add per-worker TLS spec in WorkerConfigRequest
-        //
-        // Current single-domain approach is sufficient for most deployments.
-        //
-        // Use rustls TLS backend when TLS/mTLS is configured (client cert or CA certs provided).
-        // This ensures proper PKCS#8 key format support. For plain HTTP workers, use default
-        // backend to avoid unnecessary TLS initialization overhead.
         let has_tls_config = config.client_identity.is_some() || !config.ca_certificates.is_empty();
 
         // Idle pooled connections must expire before the backend server's
@@ -485,10 +472,6 @@ impl AppContextBuilder {
             .connect_timeout(Duration::from_secs(10))
             .tcp_nodelay(true)
             .tcp_keepalive(Some(Duration::from_secs(30)));
-
-        if config.upstream_http2 {
-            client_builder = apply_upstream_http2(client_builder);
-        }
 
         // Force rustls backend when TLS is configured
         if has_tls_config {
@@ -626,10 +609,6 @@ impl AppContextBuilder {
 
     /// Create load monitor
     fn with_worker_monitor(mut self, config: &RouterConfig) -> Result<Self, String> {
-        let client = self
-            .client
-            .as_ref()
-            .ok_or_else(|| "client must be set before load monitor".to_string())?;
         let policy_registry = self
             .policy_registry
             .as_ref()
@@ -641,7 +620,6 @@ impl AppContextBuilder {
                 .ok_or_else(|| "worker_registry must be set before load monitor".to_string())?
                 .clone(),
             Arc::clone(&policy_registry),
-            client.clone(),
             config.load_monitor_interval_secs,
             config.engine_metrics,
             config.disable_load_monitoring,
@@ -817,15 +795,17 @@ mod tests {
             .expect("client set")
     }
 
+    /// `--upstream-http2` is a worker-client concern; the shared client keeps
+    /// negotiating normally (HTTP/1.1 on cleartext, ALPN on TLS).
     #[tokio::test]
-    async fn upstream_http2_client_speaks_h2c_prior_knowledge() {
+    async fn shared_client_ignores_upstream_http2() {
         let url = spawn_echo_server().await;
         let resp = built_client(true)
             .get(&url)
             .send()
             .await
-            .expect("h2c request");
-        assert_eq!(resp.version(), http::Version::HTTP_2);
+            .expect("h1 request");
+        assert_eq!(resp.version(), http::Version::HTTP_11);
         assert_eq!(resp.text().await.expect("body"), "ok");
     }
 
