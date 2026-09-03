@@ -223,7 +223,6 @@ pub struct WorkerMonitor {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     pub worker_load_manager: Arc<WorkerLoadManager>,
-    client: reqwest::Client,
     default_interval: Duration,
     /// When set, force load polling even if no load-aware routing policy is
     /// active (`--engine-metrics`). Every successful poll is re-exported.
@@ -269,7 +268,6 @@ impl WorkerMonitor {
     pub fn new(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        client: reqwest::Client,
         default_interval_secs: u64,
         engine_metrics: bool,
         conditional_polling: bool,
@@ -279,7 +277,6 @@ impl WorkerMonitor {
             worker_registry,
             policy_registry,
             worker_load_manager: Arc::new(WorkerLoadManager::new()),
-            client,
             default_interval: Duration::from_secs(default_interval_secs.max(1)),
             engine_metrics,
             conditional_polling,
@@ -568,7 +565,6 @@ impl WorkerMonitor {
     /// `native_loads_absent` is the shared probe memo, or `None` for callers
     /// with no monitor to borrow it from (they simply always probe).
     pub(crate) async fn fetch_http_load(
-        client: &reqwest::Client,
         worker: &Arc<dyn Worker>,
         native_loads_absent: Option<&DashSet<String>>,
     ) -> Option<WorkerLoadResponse> {
@@ -576,7 +572,7 @@ impl WorkerMonitor {
         // endpoint" cannot be a warm-up artifact and is safe to memoize.
         let known_absent = native_loads_absent.is_some_and(|memo| memo.contains(worker.url()));
         if !known_absent {
-            match Self::probe_native_loads(client, worker).await {
+            match Self::probe_native_loads(worker).await {
                 NativeLoads::Available(response) => return Some(response),
                 NativeLoads::Absent => {
                     if let Some(memo) = native_loads_absent {
@@ -588,8 +584,8 @@ impl WorkerMonitor {
         }
 
         match worker.metadata().spec.runtime_type {
-            RuntimeType::Vllm => Self::fetch_http_load_vllm(client, worker).await,
-            RuntimeType::Sglang => Self::fetch_http_load_sglang(client, worker).await,
+            RuntimeType::Vllm => Self::fetch_http_load_vllm(worker).await,
+            RuntimeType::Sglang => Self::fetch_http_load_sglang(worker).await,
             // Custom engines expose no gauge schema we can parse; `/v1/loads`
             // above was their only path.
             _ => None,
@@ -605,12 +601,12 @@ impl WorkerMonitor {
     /// is what makes the memo safe. Collapsing both into "unsupported" would
     /// let one timeout demote a healthy backend to the expensive `/metrics`
     /// path permanently.
-    async fn probe_native_loads(client: &reqwest::Client, worker: &Arc<dyn Worker>) -> NativeLoads {
+    async fn probe_native_loads(worker: &Arc<dyn Worker>) -> NativeLoads {
         let url = format!(
             "{}/v1/loads?include=core,disagg,queues,memory",
             worker.url()
         );
-        let resp = match Self::authed_request(client, worker, &url).send().await {
+        let resp = match Self::authed_request(worker, &url).send().await {
             Ok(resp) => resp,
             // Transport error or timeout: says nothing about the route.
             Err(_) => return NativeLoads::Inconclusive,
@@ -642,16 +638,9 @@ impl WorkerMonitor {
     /// The KV-cache usage ratio (0.0–1.0) maps onto `token_usage`; it is
     /// exposed as `vllm:gpu_cache_usage_perc` in vLLM v0 and renamed to
     /// `vllm:kv_cache_usage_perc` in vLLM v1, so accept either.
-    async fn fetch_http_load_vllm(
-        client: &reqwest::Client,
-        worker: &Arc<dyn Worker>,
-    ) -> Option<WorkerLoadResponse> {
+    async fn fetch_http_load_vllm(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
         let url = format!("{}/metrics", worker.url());
-        let body = Self::authed_get(client, worker, &url)
-            .await?
-            .text()
-            .await
-            .ok()?;
+        let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
         let m = PromScrape::parse(&body);
 
         // Require the KV-usage gauge: it is the signal load-aware routing acts
@@ -675,16 +664,9 @@ impl WorkerMonitor {
     /// KV-usage ratio (0.0–1.0) is `<prefix>token_usage`, where SGLang used
     /// the `sglang:` metric prefix through v0.5.3 and switched to `sglang_`
     /// in v0.5.4+, so detect whichever is present and use it throughout.
-    async fn fetch_http_load_sglang(
-        client: &reqwest::Client,
-        worker: &Arc<dyn Worker>,
-    ) -> Option<WorkerLoadResponse> {
+    async fn fetch_http_load_sglang(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
         let url = format!("{}/metrics", worker.url());
-        let body = Self::authed_get(client, worker, &url)
-            .await?
-            .text()
-            .await
-            .ok()?;
+        let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
         let m = PromScrape::parse(&body);
 
         // Require the KV-usage gauge — the load signal routing acts on.
@@ -706,12 +688,8 @@ impl WorkerMonitor {
     }
 
     /// Shared authenticated GET builder with the standard timeout.
-    fn authed_request(
-        client: &reqwest::Client,
-        worker: &Arc<dyn Worker>,
-        url: &str,
-    ) -> reqwest::RequestBuilder {
-        let req = client.get(url).timeout(REQUEST_TIMEOUT);
+    fn authed_request(worker: &Arc<dyn Worker>, url: &str) -> reqwest::RequestBuilder {
+        let req = worker.http_client().get(url).timeout(REQUEST_TIMEOUT);
         match worker.api_key() {
             Some(key) => req.bearer_auth(key),
             None => req,
@@ -720,12 +698,8 @@ impl WorkerMonitor {
 
     /// Shared authenticated GET with the standard timeout. Returns `None` on
     /// transport error or non-success status.
-    async fn authed_get(
-        client: &reqwest::Client,
-        worker: &Arc<dyn Worker>,
-        url: &str,
-    ) -> Option<reqwest::Response> {
-        match Self::authed_request(client, worker, url).send().await {
+    async fn authed_get(worker: &Arc<dyn Worker>, url: &str) -> Option<reqwest::Response> {
+        match Self::authed_request(worker, url).send().await {
             Ok(r) if r.status().is_success() => Some(r),
             _ => None,
         }
@@ -989,19 +963,14 @@ async fn group_monitor_loop(
         let futures: Vec<_> = workers
             .iter()
             .map(|worker| {
-                let client = monitor.client.clone();
                 let native_loads_absent = Arc::clone(&monitor.native_loads_absent);
                 let worker = Arc::clone(worker);
                 let connection_mode = group_key.connection_mode;
                 async move {
                     let response = match connection_mode {
                         ConnectionMode::Http => {
-                            WorkerMonitor::fetch_http_load(
-                                &client,
-                                &worker,
-                                Some(&native_loads_absent),
-                            )
-                            .await
+                            WorkerMonitor::fetch_http_load(&worker, Some(&native_loads_absent))
+                                .await
                         }
                         ConnectionMode::Grpc | ConnectionMode::Zmq => {
                             WorkerMonitor::fetch_backend_load(&worker).await
@@ -1220,7 +1189,6 @@ mod worker_monitor_tests {
         let monitor = Arc::new(WorkerMonitor::new(
             registry.clone(),
             policy_registry,
-            reqwest::Client::new(),
             5,
             false,
             false,
@@ -1704,7 +1672,6 @@ mod native_loads_tests {
         let monitor = Arc::new(WorkerMonitor::new(
             registry.clone(),
             policy_registry,
-            reqwest::Client::new(),
             1,
             false,
             conditional_polling,
@@ -1961,7 +1928,7 @@ mod native_loads_tests {
         let worker = vllm_worker(&stub.url);
         let memo = DashSet::new();
 
-        let resp = WorkerMonitor::fetch_http_load(&reqwest::Client::new(), &worker, Some(&memo))
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
             .await
             .expect("load response");
 
@@ -1976,10 +1943,9 @@ mod native_loads_tests {
         let stub = spawn_engine(StatusCode::NOT_FOUND, "").await;
         let worker = vllm_worker(&stub.url);
         let memo = DashSet::new();
-        let client = reqwest::Client::new();
 
         for _ in 0..3 {
-            let resp = WorkerMonitor::fetch_http_load(&client, &worker, Some(&memo))
+            let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
                 .await
                 .expect("metrics fallback");
             assert_eq!(resp.loads[0].num_running_reqs, 7);
@@ -2001,10 +1967,9 @@ mod native_loads_tests {
         let stub = spawn_engine(StatusCode::SERVICE_UNAVAILABLE, "").await;
         let worker = vllm_worker(&stub.url);
         let memo = DashSet::new();
-        let client = reqwest::Client::new();
 
         for _ in 0..3 {
-            WorkerMonitor::fetch_http_load(&client, &worker, Some(&memo))
+            WorkerMonitor::fetch_http_load(&worker, Some(&memo))
                 .await
                 .expect("metrics fallback");
         }
@@ -2019,7 +1984,7 @@ mod native_loads_tests {
         let worker = vllm_worker(&stub.url);
         let memo = DashSet::new();
 
-        WorkerMonitor::fetch_http_load(&reqwest::Client::new(), &worker, Some(&memo))
+        WorkerMonitor::fetch_http_load(&worker, Some(&memo))
             .await
             .expect("metrics fallback");
 
@@ -2032,10 +1997,9 @@ mod native_loads_tests {
         let stub = spawn_engine(StatusCode::OK, r#"{"loads":[]}"#).await;
         let worker = vllm_worker(&stub.url);
         let memo = DashSet::new();
-        let client = reqwest::Client::new();
 
         for _ in 0..2 {
-            WorkerMonitor::fetch_http_load(&client, &worker, Some(&memo))
+            WorkerMonitor::fetch_http_load(&worker, Some(&memo))
                 .await
                 .expect("metrics fallback");
         }
@@ -2048,10 +2012,9 @@ mod native_loads_tests {
     async fn absent_memo_is_bypassed_when_caller_has_none() {
         let stub = spawn_engine(StatusCode::NOT_FOUND, "").await;
         let worker = vllm_worker(&stub.url);
-        let client = reqwest::Client::new();
 
         for _ in 0..2 {
-            WorkerMonitor::fetch_http_load(&client, &worker, None)
+            WorkerMonitor::fetch_http_load(&worker, None)
                 .await
                 .expect("metrics fallback");
         }

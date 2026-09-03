@@ -512,7 +512,9 @@ struct CliArgs {
     /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext) on all
     /// engine-directed connections — request dispatch and health/probe traffic
     /// alike — multiplexing every request to a worker over one connection.
-    /// Requires every HTTP worker to serve HTTP/2 without an upgrade handshake.
+    /// Negotiated per worker at registration: a worker that does not answer
+    /// HTTP/2 stays on HTTP/1.1, so mixed fleets roll out in any order.
+    /// `http_pool.http2` on a worker spec pins the version instead.
     #[arg(long, default_value_t = false, help_heading = "Worker Configuration")]
     upstream_http2: bool,
 

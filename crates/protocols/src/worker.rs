@@ -862,6 +862,10 @@ pub struct WorkerInfo {
     /// Current load on the worker.
     pub load: usize,
 
+    /// Whether the router speaks HTTP/2 to the worker.
+    #[serde(default)]
+    pub http2: bool,
+
     /// Job status for async operations (if available).
     pub job_status: Option<JobStatus>,
 }
@@ -876,6 +880,7 @@ impl WorkerInfo {
             is_healthy: false,
             status: Some(WorkerStatus::Pending),
             load: 0,
+            http2: false,
             job_status,
         }
     }
@@ -1011,19 +1016,23 @@ impl HealthCheckUpdate {
     }
 }
 
-/// Per-worker HTTP connection pool configuration.
+/// Per-worker HTTP connection configuration.
 /// All fields optional — `None` means "use router/global default".
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HttpPoolConfig {
-    /// Max idle connections per host (default: 8).
+    /// Max idle connections per host (default: 500).
     pub pool_max_idle_per_host: Option<usize>,
-    /// Idle connection timeout in seconds (default: 50).
+    /// Idle connection timeout in seconds (default: the router's
+    /// `upstream_pool_idle_timeout_secs`).
     pub pool_idle_timeout_secs: Option<u64>,
-    /// Request timeout in seconds (default: 30).
+    /// Request timeout in seconds (default: the router's `request_timeout_secs`).
     pub timeout_secs: Option<u64>,
     /// Connect timeout in seconds (default: 10).
     pub connect_timeout_secs: Option<u64>,
+    /// Speak HTTP/2 to this worker via prior knowledge (h2c). `None` lets the
+    /// router negotiate per worker when `upstream_http2` is set.
+    pub http2: Option<bool>,
 }
 
 impl HttpPoolConfig {
@@ -1033,6 +1042,7 @@ impl HttpPoolConfig {
             && self.pool_idle_timeout_secs.is_none()
             && self.timeout_secs.is_none()
             && self.connect_timeout_secs.is_none()
+            && self.http2.is_none()
     }
 }
 

@@ -37,9 +37,6 @@ use crate::{
     },
 };
 
-/// Default HTTP client timeout for worker requests (in seconds)
-pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
-
 /// A worker's HTTP client handle, materialized on first use.
 ///
 /// Registration hands in a shared client from the worker client cache. A
@@ -73,7 +70,9 @@ impl LazyHttpClient {
         self.cell.get().is_none()
     }
 
-    /// The client, building the default one on first use.
+    /// The client, building the default one on first use. The fallback sets
+    /// no total timeout: dispatch deadlines come from the router config via
+    /// the client cache, and every health/admin call site sets its own.
     pub fn client(&self) -> &reqwest::Client {
         self.init()
     }
@@ -86,22 +85,7 @@ impl LazyHttpClient {
     }
 
     fn init(&self) -> &Arc<reqwest::Client> {
-        self.cell.get_or_init(|| {
-            Arc::new(
-                reqwest::Client::builder()
-                    .timeout(Duration::from_secs(DEFAULT_WORKER_HTTP_TIMEOUT_SECS))
-                    .pool_max_idle_per_host(8)
-                    .build()
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            error = %e,
-                            "failed to build the default per-worker HTTP client; \
-                             falling back to reqwest defaults (no request timeout)"
-                        );
-                        reqwest::Client::new()
-                    }),
-            )
-        })
+        self.cell.get_or_init(|| Arc::new(reqwest::Client::new()))
     }
 }
 
@@ -571,6 +555,11 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().endpoint_url(route)
     }
 
+    /// Whether the router speaks HTTP/2 prior knowledge to this worker.
+    fn http2(&self) -> bool {
+        self.metadata().http2()
+    }
+
     /// Check if this worker is DP-aware.
     fn is_dp_aware(&self) -> bool {
         self.metadata().is_dp_aware()
@@ -860,6 +849,10 @@ pub struct WorkerMetadata {
     /// load monitor's ingestion predicate scores every report against these,
     /// so nothing on a request path re-resolves them.
     pub overload: OverloadThresholds,
+    /// Whether the router speaks HTTP/2 prior knowledge to this worker:
+    /// `spec.http_pool.http2` when declared, else negotiated at registration
+    /// under `upstream_http2`.
+    pub http2: bool,
 }
 
 impl WorkerMetadata {
@@ -887,6 +880,11 @@ impl WorkerMetadata {
     /// Compose an endpoint URL for a specific route.
     pub fn endpoint_url(&self, route: &str) -> String {
         format!("{}{}", self.base_url(), route)
+    }
+
+    /// Whether the router speaks HTTP/2 prior knowledge to this worker.
+    pub fn http2(&self) -> bool {
+        self.http2
     }
 
     // ── DP awareness ────────────────────────────────────────────────
@@ -1884,6 +1882,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         is_healthy: status == WorkerStatus::Ready,
         status: Some(status),
         load: worker.load(),
+        http2: metadata.http2,
         job_status: None,
     }
 }
@@ -2699,6 +2698,7 @@ mod tests {
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
             overload: OverloadThresholds::default(),
+            http2: false,
         };
 
         // Empty models list should accept any model
@@ -2723,6 +2723,7 @@ mod tests {
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
             overload: OverloadThresholds::default(),
+            http2: false,
         };
 
         // Find by primary ID

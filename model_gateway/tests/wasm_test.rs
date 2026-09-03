@@ -67,7 +67,6 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
     let worker_monitor = Some(Arc::new(WorkerMonitor::new(
         worker_registry.clone(),
         policy_registry.clone(),
-        client.clone(),
         config.load_monitor_interval_secs,
         config.engine_metrics,
         config.disable_load_monitoring,
