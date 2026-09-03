@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 
 use crate::{
-    engine::{ApplyOutcome, Engine, KeyspaceKey, SymbolKind},
+    engine::{Applied, ApplyOutcome, Engine, KeyspaceKey, SymbolKind},
     proto::{
         self,
         radix_index_client::RadixIndexClient,
@@ -218,7 +218,7 @@ impl RadixIndex for IndexService {
                     tokio::time::sleep_until(*deadline).await;
                 }
                 let msgs: Vec<UpdateMsg> = batch.iter().map(|(_, u)| UpdateMsg::from(u)).collect();
-                let mut results: Vec<(ApplyOutcome, u64, bool)> = Vec::with_capacity(msgs.len());
+                let mut results: Vec<Applied> = Vec::with_capacity(msgs.len());
                 let mut k = 0;
                 while k < msgs.len() {
                     if msgs[k].seq != 0 {
@@ -239,26 +239,36 @@ impl RadixIndex for IndexService {
 
                 let mut closed = false;
                 for (idx, msg) in msgs.iter().enumerate() {
-                    let (outcome, applied_seq, state_changed) = results[idx];
-                    let digest_miss_tip = (outcome == ApplyOutcome::DigestMiss)
-                        .then(|| match msg.events.first() {
-                            Some(WireEvent::StoredDigest { tip, .. }) => Some(tip.0),
-                            _ => None,
+                    let applied = results[idx];
+                    // Find the missed digest's tip ANYWHERE in the batch:
+                    // an events.first()-only probe loses the tip on a
+                    // mixed batch, acking a miss with no tip the
+                    // publisher can resend — a silent under-match.
+                    let digest_miss_tip = (applied.outcome == ApplyOutcome::DigestMiss)
+                        .then(|| {
+                            msg.events.iter().find_map(|event| match event {
+                                WireEvent::StoredDigest { tip, .. } => Some(tip.0),
+                                _ => None,
+                            })
                         })
                         .flatten();
                     // Relay ONLY state-changing applies (echo dies in one
                     // hop; bounded O(K^2) fan-out).
-                    if state_changed {
+                    if applied.changed {
                         for peer in &apply_relay {
                             if peer.try_send(batch[idx].1.clone()).is_err() {
                                 apply_stats.relay_dropped.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
+                    // The ack carries the holder's STORED epoch (from the
+                    // apply), never an echo of the publisher's own — the
+                    // EpochLedger's restart adoption is only sound against
+                    // the index's real epoch.
                     let ack = proto::PublishAck {
                         holder: msg.holder.clone(),
-                        epoch: msg.epoch,
-                        applied_seq,
+                        epoch: applied.epoch,
+                        applied_seq: applied.last_seq,
                         digest_miss_tip,
                     };
                     // Acks are advisory: drop when the publisher is not

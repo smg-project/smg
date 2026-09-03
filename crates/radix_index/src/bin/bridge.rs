@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //!   radix-index-bridge --workers grpc://127.0.0.1:9000,... \
-//!     --index http://127.0.0.1:40000 --model mock-model --block-size 256
+//!     --index http://127.0.0.1:40000 --model mock-model --block-size 128
 
 use radix_index::{bridge, proto};
 use tokio::sync::mpsc;
@@ -34,7 +34,11 @@ async fn main() -> std::process::ExitCode {
     let index: String =
         parse_flag(&args, "--index").unwrap_or_else(|| "http://127.0.0.1:40000".to_string());
     let model: String = parse_flag(&args, "--model").unwrap_or_else(|| "mock-model".to_string());
-    let block_size: u32 = parse_flag(&args, "--block-size").unwrap_or(256);
+    // Shared default with the gateway's --kv-indexer-block-size: the
+    // keyspace key includes block size, so divergent defaults would
+    // silently split the fleet into two keyspaces.
+    let block_size: u32 =
+        parse_flag(&args, "--block-size").unwrap_or(radix_index::DEFAULT_BLOCK_SIZE);
     if workers.is_empty() {
         eprintln!("--workers is required");
         return std::process::ExitCode::from(2);

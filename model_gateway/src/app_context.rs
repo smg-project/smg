@@ -768,7 +768,13 @@ impl AppContextBuilder {
         if let Some(url) = &config.kv_indexer_url {
             let handle = crate::policies::remote_index::RemoteIndexHandle::connect(
                 url,
-                config.kv_indexer_block_size.unwrap_or(128) as usize,
+                // Default shared with the bridge's --block-size: the
+                // keyspace key includes block size, and divergent
+                // defaults would silently split the fleet's state into
+                // two keyspaces that never answer each other.
+                config
+                    .kv_indexer_block_size
+                    .unwrap_or(radix_index::DEFAULT_BLOCK_SIZE) as usize,
             );
             if let Some(ref registry) = self.policy_registry {
                 registry.set_remote_index(Some(Arc::clone(&handle)));

@@ -13,6 +13,10 @@ use radix_index::{
 const MODEL: &str = "lifecycle-model";
 const BLOCK: u32 = 4;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fixture: fire-and-forget server for the test's lifetime"
+)]
 fn spawn_index(cfg: EngineConfig, sweep: Duration) -> String {
     let port = portpicker::pick_unused_port().expect("port");
     let engine = Arc::new(Engine::new(cfg));

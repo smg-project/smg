@@ -20,30 +20,33 @@ use tokio::sync::mpsc;
 
 use crate::proto::{self, radix_index_client::RadixIndexClient};
 
-/// Cross-task view of each holder's highest epoch the INDEX has acked.
-/// `run_publisher` writes it from acks; worker loops consult it, so a
-/// restarted bridge (local epoch back at 1) adopts PAST a surviving
-/// index's higher epoch instead of having every update silently
-/// deduped until the next worker-side cursor loss happens to bump it
+/// Cross-task view of each holder's (epoch, seq) watermark as the
+/// INDEX has acked it — the holder's STORED values, not an echo of our
+/// own sends. `run_publisher` writes it from acks; worker loops consult
+/// it so a restarted bridge (local epoch back at 1) adopts PAST a
+/// surviving index's state instead of feeding dead-on-arrival updates
 /// (liveness review's latent-bug finding — `PublishAck.epoch` exists
 /// on the wire precisely for this and was ignored).
 #[derive(Clone, Default)]
-pub struct EpochLedger(Arc<Mutex<HashMap<String, u64>>>);
+pub struct EpochLedger(Arc<Mutex<HashMap<String, (u64, u64)>>>);
 
 impl EpochLedger {
-    pub fn observe(&self, holder: &str, epoch: u64) {
+    pub fn observe(&self, holder: &str, epoch: u64, seq: u64) {
         let mut map = self.0.lock().expect("epoch ledger lock");
-        let entry = map.entry(holder.to_string()).or_insert(0);
-        *entry = (*entry).max(epoch);
+        let entry = map.entry(holder.to_string()).or_insert((0, 0));
+        // Lexicographic max: a higher epoch supersedes outright; within
+        // one epoch the seq watermark only advances.
+        *entry = (*entry).max((epoch, seq));
     }
 
-    pub fn known(&self, holder: &str) -> u64 {
+    /// The holder's acked (epoch, seq) watermark; (0, 0) if never acked.
+    pub fn known(&self, holder: &str) -> (u64, u64) {
         self.0
             .lock()
             .expect("epoch ledger lock")
             .get(holder)
             .copied()
-            .unwrap_or(0)
+            .unwrap_or((0, 0))
     }
 }
 
@@ -52,9 +55,13 @@ impl EpochLedger {
 /// send a `{tip, len}` digest instead of the full block chain. The
 /// stored full `Update` is the replay source: a `digest_miss_tip` ack
 /// or a reconnect resends it in full — so a digest is NEVER a silent
-/// under-match. Bounded; eviction just forces a future full re-send.
+/// under-match. Keyed by (holder, tip): the engine confirms digests
+/// PER HOLDER, so a tip-only key would treat holder B's first publish
+/// of a chain holder A established as "established" — B's digest then
+/// misses forever while the miss-resend replays A's update.
+/// Bounded; eviction just forces a future full re-send.
 #[derive(Clone, Default)]
-pub struct DigestCache(Arc<Mutex<HashMap<u64, proto::Update>>>);
+pub struct DigestCache(Arc<Mutex<HashMap<(String, u64), proto::Update>>>);
 
 /// Cap on established chains retained per client process. Past it,
 /// eviction forces full re-sends — correctness holds, cost rises.
@@ -66,7 +73,8 @@ impl DigestCache {
     /// instead), or `None` to send `full` as-is (and record it).
     pub fn plan(&self, tip: u64, len: u32, full: &proto::Update) -> Option<proto::Update> {
         let mut map = self.0.lock().expect("digest cache lock");
-        if map.contains_key(&tip) {
+        let key = (full.holder.clone(), tip);
+        if map.contains_key(&key) {
             return Some(proto::Update {
                 keyspace: full.keyspace.clone(),
                 holder: full.holder.clone(),
@@ -84,17 +92,24 @@ impl DigestCache {
             });
         }
         if map.len() >= DIGEST_CACHE_CAP {
-            if let Some(&victim) = map.keys().next() {
+            if let Some(victim) = map.keys().next().cloned() {
                 map.remove(&victim);
             }
         }
-        map.insert(tip, full.clone());
+        map.insert(key, full.clone());
         None
     }
 
-    /// The full chain to resend for a missed digest tip, if retained.
-    pub fn resend(&self, tip: u64) -> Option<proto::Update> {
-        self.0.lock().expect("digest cache lock").get(&tip).cloned()
+    /// The full chain to resend for a holder's missed digest tip, if
+    /// retained. `None` (tip evicted or reset since) is logged by the
+    /// caller: the next request's re-publish re-establishes the chain
+    /// full, so the under-match is bounded to one turn, never permanent.
+    pub fn resend(&self, holder: &str, tip: u64) -> Option<proto::Update> {
+        self.0
+            .lock()
+            .expect("digest cache lock")
+            .get(&(holder.to_string(), tip))
+            .cloned()
     }
 
     /// Forget everything: after a reconnect the peer may be a different
@@ -172,14 +187,31 @@ pub fn convert_batch(
     }
 }
 
-/// If the index has acked an epoch `known >= local`, every update we
-/// send at `local` is deduped on arrival; adopt to one past it (a new
-/// generation, replayed from seq 0). `Some(known + 1)` to adopt, `None`
-/// to keep the local epoch. The `>=` (not `>`) is deliberate: at equal
-/// epochs the index's seq cursor is already ahead of our post-restart
-/// zero, so we must still start a fresh generation.
-fn adopt_epoch(local: u64, known: u64) -> Option<u64> {
-    (known >= local).then_some(known + 1)
+/// Is this feed generation dead on arrival at the index — and if so, the
+/// epoch to restart at? `known` is the holder's acked (epoch, seq)
+/// watermark from the ledger.
+///
+/// - Index on a STRICTLY higher epoch: a previous life of this bridge
+///   (or another authority) advanced the holder, so our sends are
+///   Deduped. Adopt one past it.
+/// - Same epoch but the index's seq cursor is AHEAD of what we sent:
+///   bridge and worker both restarted into an old generation, and the
+///   dedup watermark silently swallows our fresh low seqs. Only a new
+///   epoch (implicit clear + replay from zero) restarts losslessly.
+///
+/// In steady state acks TRAIL our sends (kepoch == local_epoch and
+/// kseq <= local_seq), so this never self-triggers — a `>=` epoch
+/// compare here once bumped the epoch after nearly every acked batch,
+/// wiping and refeeding the holder forever.
+fn adopt_epoch(local_epoch: u64, local_seq: u64, known: (u64, u64)) -> Option<u64> {
+    let (kepoch, kseq) = known;
+    if kepoch > local_epoch {
+        return Some(kepoch + 1);
+    }
+    if kepoch == local_epoch && kseq > local_seq {
+        return Some(local_epoch + 1);
+    }
+    None
 }
 
 /// One worker's subscription loop: resume on plain failures, epoch-bump
@@ -195,11 +227,11 @@ pub async fn worker_loop(
     let mut epoch: u64 = 1;
     let mut last_seq: u64 = 0;
     loop {
-        // Adopt past whatever epoch the index has acked for this
-        // holder: a lower local epoch means every update we send is
-        // dead on arrival. Adoption is a new generation, so replay
-        // from zero (the resubscribe below starts at `last_seq`).
-        if let Some(adopted) = adopt_epoch(epoch, ledger.known(&worker)) {
+        // Adopt past whatever the index has acked for this holder: a
+        // stale local generation means every update we send is dead on
+        // arrival. Adoption is a new generation, so replay from zero
+        // (the resubscribe below starts at `last_seq`).
+        if let Some(adopted) = adopt_epoch(epoch, last_seq, ledger.known(&worker)) {
             epoch = adopted;
             last_seq = 0;
         }
@@ -245,9 +277,10 @@ pub async fn worker_loop(
             }
             // Mid-stream adoption: acks arrive async, and a healthy
             // stream never reconnects on its own — without this check
-            // a stale-epoch bridge would keep feeding deduped updates
-            // forever.
-            if ledger.known(&worker) >= epoch {
+            // a stale-generation bridge would keep feeding deduped
+            // updates forever. Steady-state acks trail `last_seq`, so
+            // this only fires when the index is genuinely ahead of us.
+            if adopt_epoch(epoch, last_seq, ledger.known(&worker)).is_some() {
                 break; // outer loop adopts and resubscribes from zero
             }
         }
@@ -307,13 +340,28 @@ pub async fn run_publisher_with_digest(
                 },
                 ack = acks.next() => match ack {
                     Some(Ok(ack)) => {
-                        ledger.observe(&ack.holder, ack.epoch);
+                        ledger.observe(&ack.holder, ack.epoch, ack.applied_seq);
                         // A digest the index could not confirm: resend
                         // the chain in full — never a silent under-match.
                         if let (Some(cache), Some(tip)) = (&digest, ack.digest_miss_tip) {
-                            if let Some(full) = cache.resend(tip) {
-                                if fwd_tx.send(full).await.is_err() {
-                                    break;
+                            match cache.resend(&ack.holder, tip) {
+                                Some(full) => {
+                                    if fwd_tx.send(full).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                None => {
+                                    // Evicted/reset since the digest was
+                                    // queued: unrecoverable HERE, but the
+                                    // next request's publish re-establishes
+                                    // the chain full (the cache no longer
+                                    // plans a digest for it) — bounded to
+                                    // one turn, and never silent.
+                                    tracing::warn!(
+                                        holder = %ack.holder,
+                                        tip,
+                                        "digest miss with no retained chain; next publish re-establishes full"
+                                    );
                                 }
                             }
                         }
@@ -330,35 +378,48 @@ pub async fn run_publisher_with_digest(
 mod tests {
     use super::*;
 
-    /// Epoch adoption arithmetic: the `>=` comparison and the `+1` are
-    /// the exact off-by-ones that decide whether a restarted bridge's
-    /// updates are deduped away by a surviving index.
+    /// Epoch adoption arithmetic. Two rules, and one absence: adopt one
+    /// past a STRICTLY higher acked epoch; adopt on a same-epoch acked
+    /// seq AHEAD of our sends (the both-restarted collision the dedup
+    /// watermark would otherwise silently swallow); and NEVER
+    /// self-trigger in steady state — a `>=` epoch compare here once
+    /// bumped the epoch after nearly every acked batch, wiping and
+    /// refeeding the holder forever.
     #[test]
-    fn adopt_epoch_moves_one_past_a_known_higher_or_equal_epoch() {
-        // Restarted bridge (local 1) vs an index that acked 7 -> adopt 8.
-        assert_eq!(adopt_epoch(1, 7), Some(8));
-        // Equal epochs still adopt: the index's seq cursor is ahead of
-        // our post-restart zero, so a fresh generation is required.
-        assert_eq!(adopt_epoch(5, 5), Some(6));
-        assert_eq!(adopt_epoch(1, 1), Some(2));
-        // We are already ahead: keep our epoch.
-        assert_eq!(adopt_epoch(8, 7), None);
-        // Nothing acked yet (known 0) while we are at 1: keep ours.
-        assert_eq!(adopt_epoch(1, 0), None);
+    fn adopt_epoch_fires_on_stale_generations_only() {
+        // Restarted bridge (local 1) vs a surviving index whose holder
+        // is stored at epoch 7 -> adopt 8.
+        assert_eq!(adopt_epoch(1, 0, (7, 42)), Some(8));
+        // Both bridge and worker restarted into an old generation: same
+        // epoch, but the index's seq cursor (100) is ahead of what this
+        // generation has sent (1) -> our low seqs are being swallowed;
+        // start a fresh epoch.
+        assert_eq!(adopt_epoch(1, 1, (1, 100)), Some(2));
+        // STEADY STATE never self-triggers: acks trail our sends.
+        assert_eq!(adopt_epoch(5, 40, (5, 40)), None, "ack caught up");
+        assert_eq!(adopt_epoch(5, 40, (5, 38)), None, "acks lagging");
+        // We are already ahead of everything acked: keep our epoch.
+        assert_eq!(adopt_epoch(8, 0, (7, 500)), None);
+        // Nothing acked yet while we are at the initial epoch: keep it.
+        assert_eq!(adopt_epoch(1, 0, (0, 0)), None);
     }
 
-    /// The ledger tracks the running MAX acked epoch per holder — a later
-    /// lower ack (reordered / from a lagging replica) must not lower it.
+    /// The ledger tracks the running lexicographic max (epoch, seq) per
+    /// holder — a later lower/reordered ack must not lower it.
     #[test]
     fn epoch_ledger_keeps_the_running_max() {
         let ledger = EpochLedger::default();
-        assert_eq!(ledger.known("w1"), 0, "unknown holder is 0");
-        ledger.observe("w1", 7);
-        ledger.observe("w1", 3); // stale/reordered: must not lower
-        assert_eq!(ledger.known("w1"), 7);
-        ledger.observe("w1", 9);
-        assert_eq!(ledger.known("w1"), 9);
-        assert_eq!(ledger.known("w2"), 0, "holders are independent");
+        assert_eq!(ledger.known("w1"), (0, 0), "unknown holder is zero");
+        ledger.observe("w1", 7, 10);
+        ledger.observe("w1", 3, 999); // stale epoch: must not lower
+        assert_eq!(ledger.known("w1"), (7, 10));
+        ledger.observe("w1", 7, 8); // reordered seq: must not lower
+        assert_eq!(ledger.known("w1"), (7, 10));
+        ledger.observe("w1", 7, 25);
+        assert_eq!(ledger.known("w1"), (7, 25));
+        ledger.observe("w1", 9, 1); // higher epoch supersedes outright
+        assert_eq!(ledger.known("w1"), (9, 1));
+        assert_eq!(ledger.known("w2"), (0, 0), "holders are independent");
     }
 
     fn full_update(tip: u64, holder: &str) -> proto::Update {
@@ -409,7 +470,7 @@ mod tests {
         assert_eq!(digest.seq, 0, "placements/digests are unsequenced");
 
         // Resend recovers the full chain for a missed tip; unknown -> None.
-        let resent = cache.resend(tip).expect("retained full for resend");
+        let resent = cache.resend("w1", tip).expect("retained full for resend");
         assert!(matches!(
             resent.events.as_slice(),
             [proto::Event {
@@ -417,9 +478,20 @@ mod tests {
             }]
         ));
         assert!(
-            cache.resend(0xDEAD).is_none(),
+            cache.resend("w1", 0xDEAD).is_none(),
             "unknown tip is not resendable"
         );
+
+        // Keying is PER HOLDER: the same chain published for a second
+        // holder is NOT established (the engine confirms per holder), so
+        // its first publish must go out full — and a miss for w2's tip
+        // must never replay w1's update.
+        let full_w2 = full_update(tip, "w2");
+        assert!(
+            cache.plan(tip, 1, &full_w2).is_none(),
+            "same tip under a new holder re-establishes full"
+        );
+        assert_eq!(cache.resend("w2", tip).expect("w2 retained").holder, "w2");
 
         // Reconnect reset: the peer may not hold prior chains, so the
         // next publish must re-establish full.

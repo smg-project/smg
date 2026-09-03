@@ -94,6 +94,24 @@ pub enum ApplyOutcome {
     DigestMiss,
 }
 
+/// What one applied update resolved to — the fields a publisher ack
+/// carries. Named (not a tuple): `last_seq` and `epoch` are both `u64`
+/// and positional confusion between them is exactly how a wrong ack
+/// would silently break the bridge's restart adoption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Applied {
+    pub outcome: ApplyOutcome,
+    /// The holder's event-feed watermark AFTER this apply.
+    pub last_seq: u64,
+    /// The holder's STORED epoch after this apply — deliberately not the
+    /// update's own epoch. Acks echo this so a restarted publisher (local
+    /// epoch back at 1) learns the surviving index's real epoch and
+    /// adopts past it, instead of feeding dead-on-arrival updates.
+    pub epoch: u64,
+    /// Whether state changed (the relay gate: echoes die in one hop).
+    pub changed: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SymbolKind {
     Tokens,
@@ -241,13 +259,18 @@ impl Engine {
     /// symmetric-peer echo dies in one hop instead of ping-ponging
     /// forever (the metrics timeline caught ~190x apply amplification
     /// from exactly that loop).
-    pub fn apply(&self, update: &UpdateMsg) -> (ApplyOutcome, u64, bool) {
+    pub fn apply(&self, update: &UpdateMsg) -> Applied {
         // A keyspace is created on first contact; a later publisher whose
         // key differs only in block_size is a DIFFERENT keyspace by key
         // construction, so mismatch cannot silently merge. Reject only
         // the degenerate block size.
         if update.keyspace.block_size == 0 {
-            return (ApplyOutcome::KeyspaceMismatch, 0, false);
+            return Applied {
+                outcome: ApplyOutcome::KeyspaceMismatch,
+                last_seq: 0,
+                epoch: 0,
+                changed: false,
+            };
         }
         let space = self.space_or_create(&update.keyspace);
 
@@ -257,8 +280,13 @@ impl Engine {
         // NOTHING — resolve it under the read lock (concurrent with
         // queries and with each other) and never touch the write side.
         // Conditions are exactly the shapes whose slow-path outcome is
-        // (Applied, last_seq, changed=false): plain same-epoch
-        // placement Stored for a known non-event-fed holder.
+        // Applied with changed=false: plain same-epoch placement Stored
+        // for a known non-event-fed holder. One deliberate divergence:
+        // the slow path's runaway-capacity truncate is skipped — a
+        // fully-covered duplicate adds zero blocks, so the bound cannot
+        // be NEWLY exceeded here; a bound already exceeded (possible
+        // only via a later capacity shrink) is enforced on the next
+        // non-duplicate store.
         if update.seq == 0 && update.added.is_none() && !update.dropped {
             if let [WireEvent::Stored { parent, blocks }] = update.events.as_slice() {
                 let pairs: Vec<(u64, u64)> = blocks
@@ -286,7 +314,12 @@ impl Engine {
                                 holder
                                     .last_publish_ns
                                     .store(self.now_ns(), std::sync::atomic::Ordering::Relaxed);
-                                return (ApplyOutcome::Applied, holder.last_seq, false);
+                                return Applied {
+                                    outcome: ApplyOutcome::Applied,
+                                    last_seq: holder.last_seq,
+                                    epoch: holder.epoch,
+                                    changed: false,
+                                };
                             }
                             if run > 0 {
                                 split = Some((pairs[run as usize - 1].0, run as usize));
@@ -319,26 +352,51 @@ impl Engine {
                 let shared = space.read().expect(LOCK_MSG);
                 if let Some(holder) = shared.holders.get(&update.holder) {
                     if holder.event_fed || holder.dropped || update.epoch != holder.epoch {
-                        return (ApplyOutcome::DigestMiss, holder.last_seq, false);
+                        return Applied {
+                            outcome: ApplyOutcome::DigestMiss,
+                            last_seq: holder.last_seq,
+                            epoch: holder.epoch,
+                            changed: false,
+                        };
                     }
                     let start_pos = match parent {
                         None => Some(0u32),
                         Some(p) => shared.tree.position_of(holder.id, p.0).map(|pp| pp + 1),
                     };
+                    // `len` is wire-controlled: the tip-position compare
+                    // uses checked arithmetic so an absurd length can
+                    // never wrap into a false confirmation (a wrap in a
+                    // release build would be the exact silent under-match
+                    // digests are forbidden to produce); overflow => miss.
                     let confirmed = *len > 0
                         && start_pos.is_some_and(|start| {
-                            shared.tree.position_of(holder.id, tip.0) == Some(start + *len - 1)
+                            start.checked_add(*len - 1).is_some_and(|tip_pos| {
+                                shared.tree.position_of(holder.id, tip.0) == Some(tip_pos)
+                            })
                         });
                     if confirmed {
                         holder
                             .last_publish_ns
                             .store(self.now_ns(), std::sync::atomic::Ordering::Relaxed);
-                        return (ApplyOutcome::Applied, holder.last_seq, false);
+                        return Applied {
+                            outcome: ApplyOutcome::Applied,
+                            last_seq: holder.last_seq,
+                            epoch: holder.epoch,
+                            changed: false,
+                        };
                     }
                 }
                 // Unknown holder or unconfirmed: force a full resend.
-                let last_seq = shared.holders.get(&update.holder).map_or(0, |h| h.last_seq);
-                return (ApplyOutcome::DigestMiss, last_seq, false);
+                let (last_seq, epoch) = shared
+                    .holders
+                    .get(&update.holder)
+                    .map_or((0, 0), |h| (h.last_seq, h.epoch));
+                return Applied {
+                    outcome: ApplyOutcome::DigestMiss,
+                    last_seq,
+                    epoch,
+                    changed: false,
+                };
             }
         }
 
@@ -358,12 +416,17 @@ impl Engine {
     /// This path is for the SEQUENCED event feed; it deliberately does
     /// not run the read-lock placement/digest fast paths (those updates
     /// go through `apply`), so a digest reaching here is a miss.
-    pub fn apply_batch(&self, updates: &[UpdateMsg]) -> Vec<(ApplyOutcome, u64, bool)> {
+    pub fn apply_batch(&self, updates: &[UpdateMsg]) -> Vec<Applied> {
         let mut out = Vec::with_capacity(updates.len());
         let mut i = 0;
         while i < updates.len() {
             if updates[i].keyspace.block_size == 0 {
-                out.push((ApplyOutcome::KeyspaceMismatch, 0, false));
+                out.push(Applied {
+                    outcome: ApplyOutcome::KeyspaceMismatch,
+                    last_seq: 0,
+                    epoch: 0,
+                    changed: false,
+                });
                 i += 1;
                 continue;
             }
@@ -396,11 +459,7 @@ impl Engine {
 
     /// The exclusive-lock write path: apply one update to an
     /// already-write-locked keyspace.
-    fn apply_locked(
-        &self,
-        space: &mut KeyspaceState,
-        update: &UpdateMsg,
-    ) -> (ApplyOutcome, u64, bool) {
+    fn apply_locked(&self, space: &mut KeyspaceState, update: &UpdateMsg) -> Applied {
         if !space.holders.contains_key(&update.holder) {
             let id = space.tree.create_holder(&update.holder);
             space.holders.insert(
@@ -431,23 +490,33 @@ impl Engine {
         // silently discarded on epoch mismatch is a holder leak (the
         // liveness review caught exactly this: `dropped` at epoch 1
         // vs a bridge on epoch 2 was Deduped).
-        if update.added.is_some() || update.dropped {
-            changed = true;
-        }
+        //
+        // `changed` is gated on ACTUAL transitions, never on the
+        // payload's presence: the relay forwards changing applies to
+        // peers, and a peer re-applying an already-standing added/
+        // dropped must be a no-op or symmetric replicas ping-pong the
+        // lifecycle echo forever (the same loop the ~190x Stored echo
+        // amplification came from).
         if let Some(added) = &update.added {
             // Zero means "no capacity claim" — leave the standing
             // value: a bare lifecycle re-announce must not clobber a
             // worker-declared capacity back to the default.
-            if added.capacity_blocks != 0 {
+            if added.capacity_blocks != 0 && holder.capacity_blocks != added.capacity_blocks {
                 holder.capacity_blocks = added.capacity_blocks;
+                changed = true;
             }
-            if added.event_fed {
+            if added.event_fed && !holder.event_fed {
                 holder.event_fed = true;
+                changed = true;
             }
-            holder.dropped = false;
+            if holder.dropped {
+                holder.dropped = false;
+                changed = true;
+            }
         }
-        if update.dropped {
+        if update.dropped && !holder.dropped {
             holder.dropped = true;
+            changed = true;
         }
 
         // Epoch gate: higher epoch supersedes (implicit clear), lower is
@@ -462,7 +531,12 @@ impl Engine {
             }
             changed = true;
         } else if update.epoch < holder.epoch {
-            return (ApplyOutcome::Deduped, holder.last_seq, changed);
+            return Applied {
+                outcome: ApplyOutcome::Deduped,
+                last_seq: holder.last_seq,
+                epoch: holder.epoch,
+                changed,
+            };
         }
         holder
             .last_publish_ns
@@ -472,7 +546,12 @@ impl Engine {
         let sequenced = update.seq != 0;
         if sequenced {
             if update.seq <= holder.last_seq {
-                return (ApplyOutcome::Deduped, holder.last_seq, changed);
+                return Applied {
+                    outcome: ApplyOutcome::Deduped,
+                    last_seq: holder.last_seq,
+                    epoch: holder.epoch,
+                    changed,
+                };
             }
             holder.last_seq = update.seq;
             if holder.dropped && !update.dropped {
@@ -557,7 +636,12 @@ impl Engine {
                 }
             }
         }
-        (outcome, holder.last_seq, changed)
+        Applied {
+            outcome,
+            last_seq: holder.last_seq,
+            epoch: holder.epoch,
+            changed,
+        }
     }
 
     /// Split placement apply: exclusive work for ONLY the uncovered
@@ -577,7 +661,7 @@ impl Engine {
         pairs: &[(u64, u64)],
         anchor: u64,
         run: usize,
-    ) -> Option<(ApplyOutcome, u64, bool)> {
+    ) -> Option<Applied> {
         let mut space = space.write().expect(LOCK_MSG);
         let space = &mut *space;
         let holder = space.holders.get_mut(&update.holder)?;
@@ -609,7 +693,12 @@ impl Engine {
                 tree.truncate_tail(holder.id, bound);
             }
         }
-        Some((ApplyOutcome::Applied, holder.last_seq, changed))
+        Some(Applied {
+            outcome: ApplyOutcome::Applied,
+            last_seq: holder.last_seq,
+            epoch: holder.epoch,
+            changed,
+        })
     }
 
     /// TTL sweep: clear inferred holders idle beyond the window, and
@@ -683,35 +772,52 @@ impl Engine {
         let Some(space) = self.space(keyspace) else {
             return Vec::new();
         };
-        // SHARED lock with caller-owned scratch: queries run
+        // SHARED lock with THREAD-LOCAL scratch: queries run
         // concurrently with each other and with the duplicate fast
-        // path; only state-changing applies exclude them.
-        let space = space.read().expect(LOCK_MSG);
-        let chain: Vec<u64> = hashes.iter().map(|h| h.0).collect();
-        let KeyspaceState { tree, holders } = &*space;
-        let mut scratch = OverlapScratch::default();
-        let mut answers: Vec<Overlap> = Vec::new();
-        tree.overlap(&chain, &mut scratch, &mut answers);
-        let mut scores = Vec::with_capacity(answers.len());
-        for o in answers.iter() {
-            let Some(name) = tree.holder_name(o.holder) else {
-                continue;
-            };
-            let Some(holder) = holders.get(name) else {
-                continue;
-            };
-            if holder.dropped || o.depth == 0 {
-                continue;
-            }
-            scores.push(HolderScore {
-                holder: name.to_string(),
-                matched_blocks: o.depth,
-                total_blocks: o.total_blocks,
-                event_fed: holder.event_fed,
-            });
+        // path; only state-changing applies exclude them. The scratch
+        // (three Vecs + the answer buffer) is reused per worker thread
+        // so the routing hot path does not pay a fresh allocation set
+        // on every query.
+        thread_local! {
+            static QUERY_SCRATCH: std::cell::RefCell<(OverlapScratch, Vec<Overlap>, Vec<u64>)> =
+                std::cell::RefCell::new((OverlapScratch::default(), Vec::new(), Vec::new()));
         }
-        scores.sort_by_key(|s| std::cmp::Reverse(s.matched_blocks));
-        scores
+        let space = space.read().expect(LOCK_MSG);
+        let KeyspaceState { tree, holders } = &*space;
+        QUERY_SCRATCH.with(|cell| {
+            let (scratch, answers, chain) = &mut *cell.borrow_mut();
+            chain.clear();
+            chain.extend(hashes.iter().map(|h| h.0));
+            tree.overlap(chain, scratch, answers);
+            let mut scores = Vec::with_capacity(answers.len());
+            for o in answers.iter() {
+                let Some(name) = tree.holder_name(o.holder) else {
+                    continue;
+                };
+                let Some(holder) = holders.get(name) else {
+                    continue;
+                };
+                if holder.dropped || o.depth == 0 {
+                    continue;
+                }
+                scores.push(HolderScore {
+                    holder: name.to_string(),
+                    matched_blocks: o.depth,
+                    total_blocks: o.total_blocks,
+                    event_fed: holder.event_fed,
+                });
+            }
+            // Holder name as the tie key: equal depths sort identically
+            // on every replica, so converged replicas answer the same
+            // query with the same Vec (a stable sort alone leaves the
+            // tie order at the mercy of per-replica insertion order).
+            scores.sort_by(|a, b| {
+                b.matched_blocks
+                    .cmp(&a.matched_blocks)
+                    .then_with(|| a.holder.cmp(&b.holder))
+            });
+            scores
+        })
     }
 
     /// Serialize current state as synthetic Updates (for `Pull`): one
@@ -920,7 +1026,7 @@ mod tests {
         // finding: a length-delta heuristic suppressed it and let
         // replicas diverge).
         let engine = Engine::new(EngineConfig::default());
-        let (_, _, changed) = engine.apply(&placement("w1", 21, 4));
+        let changed = engine.apply(&placement("w1", 21, 4)).changed;
         assert!(changed);
         // Same blocks re-anchored under a DIFFERENT prefix: every
         // key moves, block count unchanged.
@@ -944,11 +1050,11 @@ mod tests {
             blocks: chain.clone(),
         }];
         let before = engine.entry_count();
-        let (_, _, changed) = engine.apply(&setup);
+        let changed = engine.apply(&setup).changed;
         assert!(changed, "move-only apply must relay");
         // Re-applying the identical update is a true no-op and must
         // NOT relay (echo suppression).
-        let (_, _, changed) = engine.apply(&setup);
+        let changed = engine.apply(&setup).changed;
         assert!(!changed, "idempotent echo must not relay");
         let _ = before;
     }
@@ -1020,12 +1126,18 @@ mod tests {
 
     #[test]
     fn digest_confirms_held_chain_and_misses_otherwise() {
+        // TTL >> refresh cadence: the freshness loop below refreshes
+        // every 40ms against a 400ms TTL, so a CI-box stall of a few
+        // hundred ms cannot spuriously sweep the holder.
         let engine = Engine::new(EngineConfig {
-            inferred_ttl: Duration::from_millis(30),
+            inferred_ttl: Duration::from_millis(400),
             ..EngineConfig::default()
         });
         // Digest for a chain the index has never seen -> MISS (resend).
-        let (o, _, changed) = engine.apply(&digest("w1", 71, 6));
+        let (o, changed) = {
+            let r = engine.apply(&digest("w1", 71, 6));
+            (r.outcome, r.changed)
+        };
         assert_eq!(o, ApplyOutcome::DigestMiss);
         assert!(!changed);
 
@@ -1033,20 +1145,26 @@ mod tests {
         // is confirmed as a no-op (Applied, no relay) — same observable
         // outcome as a full duplicate placement.
         engine.apply(&placement("w1", 71, 6));
-        let (o, _, changed) = engine.apply(&digest("w1", 71, 6));
+        let (o, changed) = {
+            let r = engine.apply(&digest("w1", 71, 6));
+            (r.outcome, r.changed)
+        };
         assert_eq!(o, ApplyOutcome::Applied);
         assert!(!changed, "confirmed digest must not relay");
         assert_eq!(scores(&engine, 71, 6).len(), 1);
 
         // Wrong length (chain only 6 deep) -> MISS.
-        let (o, _, _) = engine.apply(&digest("w1", 71, 8));
+        let o = engine.apply(&digest("w1", 71, 8)).outcome;
         assert_eq!(o, ApplyOutcome::DigestMiss);
 
         // A confirmed digest refreshes freshness under the TTL: a
         // digest-only-fed holder must not be swept.
         for _ in 0..4 {
-            std::thread::sleep(Duration::from_millis(15));
-            assert_eq!(engine.apply(&digest("w1", 71, 6)).0, ApplyOutcome::Applied);
+            std::thread::sleep(Duration::from_millis(40));
+            assert_eq!(
+                engine.apply(&digest("w1", 71, 6)).outcome,
+                ApplyOutcome::Applied
+            );
             engine.sweep_idle();
         }
         assert_eq!(
@@ -1064,7 +1182,7 @@ mod tests {
                 blocks: placement_chain(&prefix_hashes(72, 4)),
             }],
         ));
-        let (o, _, _) = engine.apply(&digest("w2", 72, 4));
+        let o = engine.apply(&digest("w2", 72, 4)).outcome;
         assert_eq!(
             o,
             ApplyOutcome::DigestMiss,
@@ -1219,12 +1337,12 @@ mod tests {
         // Restarted holder announces epoch 2 with a fresh (shorter) cache.
         let mut restarted = placement("w1", 5, 2);
         restarted.epoch = 2;
-        let (outcome, _, _) = engine.apply(&restarted);
+        let outcome = engine.apply(&restarted).outcome;
         assert_eq!(outcome, ApplyOutcome::Applied);
         assert_eq!(scores(&engine, 5, 6), vec![("w1".into(), 2)]);
 
         // A late epoch-1 update (relay stragglers) is dropped.
-        let (outcome, _, _) = engine.apply(&placement("w1", 5, 6));
+        let outcome = engine.apply(&placement("w1", 5, 6)).outcome;
         assert_eq!(outcome, ApplyOutcome::Deduped);
         assert_eq!(scores(&engine, 5, 6), vec![("w1".into(), 2)]);
     }
@@ -1271,7 +1389,7 @@ mod tests {
         assert_eq!(scores(&engine, 11, 6), vec![("w1".into(), 5)]);
 
         // A placement for the now event-fed holder is rejected.
-        let (outcome, _, _) = engine.apply(&placement("w1", 12, 3));
+        let outcome = engine.apply(&placement("w1", 12, 3)).outcome;
         assert_eq!(outcome, ApplyOutcome::FeedRejected);
         assert!(scores(&engine, 12, 3).is_empty());
 
@@ -1310,7 +1428,9 @@ mod tests {
 
         // The bootstrapped replica keeps the event holder's dedup posture:
         // the watermark seq travels, so a replayed old batch is dropped.
-        let (outcome, _, _) = b.apply(&event_batch("w2", 2, vec![WireEvent::Cleared]));
+        let outcome = b
+            .apply(&event_batch("w2", 2, vec![WireEvent::Cleared]))
+            .outcome;
         assert_eq!(outcome, ApplyOutcome::Deduped);
     }
 
@@ -1343,7 +1463,7 @@ mod tests {
             added: None,
             dropped: true,
         };
-        let (_, _, changed) = engine.apply(&drop_msg);
+        let changed = engine.apply(&drop_msg).changed;
         assert!(changed, "stale-epoch drop must still relay");
         assert!(scores(&engine, 51, 4).is_empty(), "dropped holder scored");
 
@@ -1458,25 +1578,27 @@ mod tests {
 
     #[test]
     fn duplicate_fast_path_matches_slow_path_and_keeps_holders_fresh() {
+        // TTL >> refresh cadence (see digest_confirms_...): stall-proof
+        // margins for a loaded CI box.
         let engine = Engine::new(EngineConfig {
-            inferred_ttl: Duration::from_millis(30),
+            inferred_ttl: Duration::from_millis(400),
             ..EngineConfig::default()
         });
         let first = engine.apply(&placement("w1", 61, 6));
-        assert_eq!(first.0, ApplyOutcome::Applied);
-        assert!(first.2, "fresh placement must relay");
+        assert_eq!(first.outcome, ApplyOutcome::Applied);
+        assert!(first.changed, "fresh placement must relay");
         // Re-publish (another gateway routed the same prefix): covered
         // by the shared-lock fast path — same outcome shape, no relay.
         let dup = engine.apply(&placement("w1", 61, 6));
-        assert_eq!(dup.0, ApplyOutcome::Applied);
-        assert!(!dup.2, "duplicate placement must not relay");
+        assert_eq!(dup.outcome, ApplyOutcome::Applied);
+        assert!(!dup.changed, "duplicate placement must not relay");
         assert_eq!(scores(&engine, 61, 6).len(), 1);
 
         // Duplicate-only traffic is still proof of freshness: the fast
         // path must refresh the TTL stamp without the write lock, or a
         // hot-but-duplicate-fed holder would be swept.
         for _ in 0..4 {
-            std::thread::sleep(Duration::from_millis(15));
+            std::thread::sleep(Duration::from_millis(40));
             engine.apply(&placement("w1", 61, 6));
             engine.sweep_idle();
         }
@@ -1498,7 +1620,7 @@ mod tests {
         ));
         let mut evt_placement = placement("w2", 62, 4);
         evt_placement.epoch = 1;
-        let (outcome, _, _) = engine.apply(&evt_placement);
+        let outcome = engine.apply(&evt_placement).outcome;
         assert_eq!(outcome, ApplyOutcome::FeedRejected);
     }
 
@@ -1656,7 +1778,7 @@ mod tests {
             added: None,
             dropped: false,
         };
-        let (outcome, _, _) = engine.apply(&bad);
+        let outcome = engine.apply(&bad).outcome;
         assert_eq!(outcome, ApplyOutcome::KeyspaceMismatch);
         assert!(
             engine.space(&ks_with_block(0)).is_none(),
@@ -1668,9 +1790,9 @@ mod tests {
         let v1 = placement("w2", 5, 3);
         let v2 = placement("w3", 6, 3);
         let out = engine.apply_batch(&[bad, v1, v2]);
-        assert_eq!(out[0].0, ApplyOutcome::KeyspaceMismatch);
-        assert_eq!(out[1].0, ApplyOutcome::Applied);
-        assert_eq!(out[2].0, ApplyOutcome::Applied);
+        assert_eq!(out[0].outcome, ApplyOutcome::KeyspaceMismatch);
+        assert_eq!(out[1].outcome, ApplyOutcome::Applied);
+        assert_eq!(out[2].outcome, ApplyOutcome::Applied);
         assert_eq!(scores(&engine, 5, 3), vec![("w2".to_string(), 3)]);
         assert_eq!(scores(&engine, 6, 3), vec![("w3".to_string(), 3)]);
     }
@@ -1736,11 +1858,108 @@ mod tests {
             }],
         ));
         // A digest that would "confirm" tip at len 3 must MISS, not confirm.
-        let (outcome, _, _) = engine.apply(&digest("w1", 3, 3));
+        let outcome = engine.apply(&digest("w1", 3, 3)).outcome;
         assert_eq!(
             outcome,
             ApplyOutcome::DigestMiss,
             "an event-fed holder must never confirm a digest against a holed chain"
+        );
+    }
+
+    /// Lifecycle relay echo suppression: a control payload relays only on
+    /// a REAL transition. Re-applying a standing `dropped` (or a standing
+    /// re-announce) reports changed=false — otherwise symmetric replicas
+    /// relay the lifecycle echo back and forth forever (the same loop the
+    /// ~190x Stored echo amplification came from).
+    #[test]
+    fn lifecycle_echo_dies_in_one_hop() {
+        let engine = Engine::new(EngineConfig::default());
+        engine.apply(&placement("w1", 31, 4));
+        let drop_msg = UpdateMsg {
+            keyspace: keyspace(),
+            holder: "w1".into(),
+            epoch: 1,
+            seq: 0,
+            events: vec![],
+            added: None,
+            dropped: true,
+        };
+        assert!(
+            engine.apply(&drop_msg).changed,
+            "first drop is a transition"
+        );
+        assert!(
+            !engine.apply(&drop_msg).changed,
+            "re-applying a standing drop must not relay (echo ping-pong)"
+        );
+
+        let readd = UpdateMsg {
+            added: Some(AddedControl {
+                capacity_blocks: 0,
+                event_fed: false,
+            }),
+            dropped: false,
+            ..drop_msg.clone()
+        };
+        assert!(engine.apply(&readd).changed, "un-drop is a transition");
+        assert!(
+            !engine.apply(&readd).changed,
+            "re-announcing a live holder must not relay"
+        );
+    }
+
+    /// The digest confirm uses checked position arithmetic: an absurd
+    /// wire-controlled `len` must resolve DigestMiss, never wrap into a
+    /// false confirmation (release builds) or panic (debug builds).
+    #[test]
+    fn digest_with_absurd_len_misses_instead_of_wrapping() {
+        let engine = Engine::new(EngineConfig::default());
+        engine.apply(&placement("w1", 41, 4));
+        let chain = placement_chain(&prefix_hashes(41, 4));
+        let absurd = UpdateMsg {
+            keyspace: keyspace(),
+            holder: "w1".into(),
+            epoch: 1,
+            seq: 0,
+            events: vec![WireEvent::StoredDigest {
+                parent: Some(chain[2].seq_hash),
+                tip: chain[3].seq_hash,
+                len: u32::MAX,
+            }],
+            added: None,
+            dropped: false,
+        };
+        assert_eq!(engine.apply(&absurd).outcome, ApplyOutcome::DigestMiss);
+    }
+
+    /// `Applied.epoch` is the holder's STORED epoch, not an echo of the
+    /// update's — the field the publisher ack carries so a restarted
+    /// bridge (back at epoch 1) learns the surviving index's real epoch
+    /// and adopts past it instead of feeding dead-on-arrival updates.
+    #[test]
+    fn apply_reports_the_stored_epoch_not_the_updates() {
+        let engine = Engine::new(EngineConfig::default());
+        // Feed at epoch 7.
+        let mut e7 = event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(51, 2)),
+            }],
+        );
+        e7.epoch = 7;
+        assert_eq!(engine.apply(&e7).epoch, 7);
+
+        // A restarted publisher at epoch 1: Deduped, and the result
+        // carries the STORED epoch (7) — the adoption signal.
+        let mut stale = event_batch("w1", 1, vec![WireEvent::Cleared]);
+        stale.epoch = 1;
+        let r = engine.apply(&stale);
+        assert_eq!(r.outcome, ApplyOutcome::Deduped);
+        assert_eq!(
+            r.epoch, 7,
+            "ack must carry the stored epoch, not the update's"
         );
     }
 
@@ -1762,7 +1981,9 @@ mod tests {
         assert_eq!(scores(&engine, 9, 4), vec![("w1".to_string(), 4)]);
 
         // Fresh seq -> reaches the events loop (not seq-deduped).
-        let (_, _, changed) = engine.apply(&event_batch("w1", 2, vec![WireEvent::Cleared]));
+        let changed = engine
+            .apply(&event_batch("w1", 2, vec![WireEvent::Cleared]))
+            .changed;
         assert!(changed, "a clear changes query answers and must relay");
         assert!(
             scores(&engine, 9, 4).is_empty(),
@@ -1787,13 +2008,15 @@ mod tests {
         assert_eq!(scores(&engine, 11, 4), vec![("w1".to_string(), 4)]);
 
         // Remove the tail block -> prefix match shrinks to 3, and relays.
-        let (_, _, changed) = engine.apply(&event_batch(
-            "w1",
-            2,
-            vec![WireEvent::Removed {
-                seq_hashes: vec![chain[3].seq_hash],
-            }],
-        ));
+        let changed = engine
+            .apply(&event_batch(
+                "w1",
+                2,
+                vec![WireEvent::Removed {
+                    seq_hashes: vec![chain[3].seq_hash],
+                }],
+            ))
+            .changed;
         assert!(changed, "a removal changes query answers and must relay");
         assert_eq!(
             scores(&engine, 11, 4).first().map(|s| s.1),

@@ -63,6 +63,7 @@ the engine page size is what SMG uses today; BYTES exists for text-mode
   | `--peers` | none | sibling replicas to relay Publishes to (comma-separated URLs) |
   | `--bootstrap-from` | none | sibling to Pull state from before serving |
   | `--inferred-ttl-secs` | `180` | idle TTL for placement-fed holders |
+  | `--event-ttl-secs` | `1800` | liveness backstop for EVENT-fed holders: silence past this soft-retires the holder (a lost departure signal must not leak it); `0` disables |
   | `--default-capacity-blocks` | unbounded | RUNAWAY PROTECTION for holders that never sent `Added` — the index truncates only past 2x this value. Leave unbounded or set well above worker KV size: the placement feed carries no removal signal, so an index that races the worker's own eviction under-matches (measured); idle TTL is the freshness bound. |
   | `--sweep-interval-secs` | `5` | idle-sweep cadence |
   | `--apply-delay-stored-ms` / `--apply-delay-removed-ms` | `0` | staleness injection (experiments only) |
@@ -71,7 +72,11 @@ the engine page size is what SMG uses today; BYTES exists for text-mode
   bootstrap pull completes — point the k8s readiness probe at it.
 
 - `radix-index-bridge` — per-fleet event bridge: engine KV event
-  streams in, index Updates out.
+  streams in, index Updates out. Flags: `--workers` (comma-separated
+  worker URLs), `--index` (service URL), `--model`, `--block-size`
+  (MUST match the gateway's `--kv-indexer-block-size` — the keyspace
+  key includes it, and a mismatch silently splits the fleet's state
+  into two keyspaces; both default to the same shared value).
 - `radix-index-bench` — apply/query throughput and memory-per-entry
   microbench.
 

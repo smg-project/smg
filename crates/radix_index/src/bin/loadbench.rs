@@ -133,6 +133,17 @@ struct Percentiles {
 }
 
 fn percentiles(mut ns: Vec<u64>) -> Percentiles {
+    // An empty sample reports zeros instead of panicking on the
+    // `len - 1` underflow (a leg that measured nothing should still
+    // print a legible report).
+    if ns.is_empty() {
+        return Percentiles {
+            n: 0,
+            p50: 0,
+            p90: 0,
+            p99: 0,
+        };
+    }
     ns.sort_unstable();
     let pick = |p: f64| ns[((ns.len() as f64 * p) as usize).min(ns.len() - 1)];
     Percentiles {

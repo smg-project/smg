@@ -466,11 +466,20 @@ impl RadixTree {
 
     /// Read-only: the absolute position at which `holder` holds `key`,
     /// or None. The digest fast path uses this to confirm a placement
-    /// chain is fully present without receiving its contents — sound
-    /// because an inferred (placement-fed) holder's held positions are
-    /// a contiguous prefix per chain (stores add contiguously,
-    /// truncate cuts the tail, no mid-chain removes), so a tip key at
-    /// position p proves positions 0..=p are held.
+    /// chain is fully present without receiving its contents. Two facts
+    /// make that sound:
+    /// - Contiguity: an inferred (placement-fed) holder's held
+    ///   positions are a contiguous prefix per chain (stores add
+    ///   contiguously, truncate cuts the tail, and mid-chain removes
+    ///   only arrive via `Removed`, which pins the holder event-fed —
+    ///   and event-fed holders reject every digest). A tip key at
+    ///   position p therefore proves p+1 blocks are held.
+    /// - Identity: the tip key is a chained seq hash, so it encodes the
+    ///   ENTIRE prefix lineage — a key found at the expected position
+    ///   cannot belong to a different chain that coincidentally aligns
+    ///   (modulo 64-bit hash collision, the same assumption every seq
+    ///   lookup makes). The parent/tip positions need no common-chain
+    ///   check for this reason.
     pub fn position_of(&self, id: HolderId, key: BlockKey) -> Option<u32> {
         self.live(id)?;
         let holder = id.parts().0;

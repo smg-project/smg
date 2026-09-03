@@ -1336,7 +1336,6 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Record worker selection
     /// One remote radix-index overlap query on the selection path.
     /// `outcome`: remote_hit | remote_empty | remote_timeout |
     /// remote_disconnected.
@@ -1351,6 +1350,7 @@ impl Metrics {
         counter!("smg_remote_index_publish_total").increment(1);
     }
 
+    /// Record worker selection
     pub fn record_worker_selection(
         worker_type: &'static str,
         connection_mode: &'static str,

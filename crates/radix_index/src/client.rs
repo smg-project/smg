@@ -37,6 +37,11 @@ pub enum QueryOutcome {
     Disconnected,
 }
 
+/// Bound on a lifecycle send into the publish queue. Generous against a
+/// momentary full queue; small enough that an unreachable index cannot
+/// wedge the worker-removal workflow.
+const LIFECYCLE_SEND_DEADLINE: Duration = Duration::from_secs(2);
+
 struct PendingQuery {
     query: proto::Query,
     reply: oneshot::Sender<proto::Match>,
@@ -276,22 +281,39 @@ impl RemoteIndex {
     /// Fleet-membership lifecycle: soft-retire `holder` (stop scoring
     /// it; state expires by TTL). Published by the gateway's
     /// worker-removal workflow — the same signal that purges the
-    /// local indexer. AWAITED (unlike placements): a lifecycle signal
-    /// must not be droppable on queue overflow.
+    /// local indexer. Awaited under a DEADLINE (unlike placements'
+    /// fire-and-forget): a lifecycle signal should not be droppable on
+    /// a momentarily full queue, but the caller is the worker-removal
+    /// workflow, and an advisory routing index must never wedge the
+    /// control plane behind an unreachable index — on timeout the
+    /// engine's silence backstop (`event_ttl`) is the designed
+    /// self-heal for the lost signal.
     pub async fn publish_dropped(&self, model: &str, block_size: u32, holder: &str) {
-        let _ = self
-            .placements
-            .send(lifecycle(model, block_size, holder, true))
+        self.send_lifecycle(lifecycle(model, block_size, holder, true))
             .await;
     }
 
     /// Fleet-membership lifecycle: (re)announce `holder` — heals a
     /// same-URL rejoin out of a standing soft-retire.
     pub async fn publish_added(&self, model: &str, block_size: u32, holder: &str) {
-        let _ = self
-            .placements
-            .send(lifecycle(model, block_size, holder, false))
+        self.send_lifecycle(lifecycle(model, block_size, holder, false))
             .await;
+    }
+
+    async fn send_lifecycle(&self, update: proto::Update) {
+        let holder = update.holder.clone();
+        let dropped = update.dropped;
+        if tokio::time::timeout(LIFECYCLE_SEND_DEADLINE, self.placements.send(update))
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                %holder,
+                dropped,
+                "remote-index lifecycle signal timed out (queue full / index unreachable); \
+                 the engine's TTL backstop covers the lost signal"
+            );
+        }
     }
 }
 

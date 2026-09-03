@@ -32,6 +32,10 @@ impl RadixIndex for SilentIndex {
     type SubscribeStream = Pin<Box<dyn Stream<Item = Result<proto::Match, Status>> + Send>>;
     type PullStream = Pin<Box<dyn Stream<Item = Result<proto::Update, Status>> + Send>>;
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture: per-stream drainer task for the test's lifetime"
+    )]
     async fn publish(
         &self,
         request: Request<Streaming<proto::Update>>,
@@ -41,6 +45,10 @@ impl RadixIndex for SilentIndex {
         Ok(Response::new(Box::pin(futures::stream::pending())))
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture: per-stream drainer task for the test's lifetime"
+    )]
     async fn subscribe(
         &self,
         request: Request<Streaming<proto::Query>>,
@@ -60,6 +68,10 @@ impl RadixIndex for SilentIndex {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fixture: fire-and-forget server for the test's lifetime"
+)]
 fn spawn_silent_index() -> String {
     let port = portpicker::pick_unused_port().expect("port");
     let addr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -72,6 +84,10 @@ fn spawn_silent_index() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fixture: fire-and-forget server for the test's lifetime"
+)]
 fn spawn_index() -> String {
     let port = portpicker::pick_unused_port().expect("port");
     let engine = Arc::new(Engine::new(EngineConfig::default()));

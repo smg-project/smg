@@ -9,9 +9,18 @@ pub mod engine;
 pub mod server;
 pub mod wire_hash;
 
+/// Default keyspace block size when a deployment does not configure one.
+/// The gateway (`--kv-indexer-block-size`) and the event bridge
+/// (`--block-size`) MUST agree — the keyspace key includes the block
+/// size, so mismatched defaults silently split one fleet's state into
+/// two keyspaces that never answer each other's queries. Always set the
+/// flags to the backend's real block size in production; this default
+/// only guarantees the two halves agree when both are left unset.
+pub const DEFAULT_BLOCK_SIZE: u32 = 128;
+
 pub use engine::{
-    placement_chain, AddedControl, ApplyOutcome, Engine, EngineConfig, HolderScore, KeyspaceKey,
-    SymbolKind, UpdateMsg, WireBlock, WireEvent,
+    placement_chain, AddedControl, Applied, ApplyOutcome, Engine, EngineConfig, HolderScore,
+    KeyspaceKey, SymbolKind, UpdateMsg, WireBlock, WireEvent,
 };
 
 /// Generated protobuf/tonic types.

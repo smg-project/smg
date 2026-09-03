@@ -1507,8 +1507,8 @@ impl CacheAwarePolicy {
                 avg_load,
                 info,
             )?;
-            // "Cache-aware selection" + branch= is the harness's parse
-            // contract (branch_counts in scripts/generate_sim/sim.py);
+            // "Cache-aware selection" + branch= is a parse contract for
+            // external log tooling (the sim harness's branch_counts);
             // event-driven decisions must land in the same breakdown as
             // the tree/hash modes.
             debug!(
