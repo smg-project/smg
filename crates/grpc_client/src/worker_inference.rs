@@ -322,6 +322,30 @@ enum EngineAdapter {
     TokenSpeed(TokenSpeedWorkerInference),
 }
 
+impl EngineAdapter {
+    /// One engine health probe over the adapter's own client. SGLang's
+    /// runtime service has no health RPC, so that adapter can only be trusted
+    /// by whoever launched the engine.
+    async fn verify_engine_ready(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (engine, healthy, message) = match self {
+            Self::Vllm(adapter) => {
+                let health = adapter.client.health_check().await?;
+                ("vLLM", health.healthy, health.message)
+            }
+            Self::TokenSpeed(adapter) => {
+                let health = adapter.client.health_check().await?;
+                ("TokenSpeed", health.healthy, health.message)
+            }
+            Self::Sglang(_) => return Ok(()),
+        };
+        if healthy {
+            Ok(())
+        } else {
+            Err(format!("{engine} engine reports unhealthy: {message}").into())
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl EngineTransport for EngineAdapter {
     async fn generate(
@@ -375,6 +399,11 @@ impl EngineWorkerInference {
                 )
             }
         };
+        // Opening a channel proves only that something listens on the port.
+        // The Worker owns engine readiness, and callers announce SERVING as
+        // soon as this returns, so refuse to come up in front of an engine
+        // that is absent, still loading, or speaks a different service.
+        adapter.verify_engine_ready().await?;
         Ok(Self::from_transport(
             Arc::new(adapter),
             max_concurrent_requests,

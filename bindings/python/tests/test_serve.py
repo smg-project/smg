@@ -1478,6 +1478,62 @@ class TestServeOrchestrator:
         with pytest.raises(ValueError, match="do not support backend sglang"):
             orch._launch_sidecars()
 
+    def test_two_tier_is_validated_before_any_engine_launches(self):
+        """A rejected combination must fail before a model is loaded for nothing."""
+        args = _make_args(router_worker_mode="smg")
+        orch = ServeOrchestrator("sglang", args, [])
+
+        with (
+            patch("smg.serve.signal.signal"),
+            patch("smg.serve.atexit.register"),
+            patch.object(orch, "_launch_workers", side_effect=AssertionError("engine launched")),
+            patch.object(orch, "_cleanup_workers"),
+            pytest.raises(ValueError, match="do not support backend sglang"),
+        ):
+            orch.run()
+
+    def test_two_tier_zmq_admission_bound_covers_the_whole_engine_group(self):
+        """`--max-num-seqs` bounds one engine; a grouped ZMQ launch puts
+        `--data-parallel-size` engines behind one sidecar."""
+        args = _make_args(
+            backend="vllm",
+            model="/tmp/m",
+            data_parallel_size=1,
+            connection_mode="zmq",
+            router_worker_mode="smg",
+        )
+        orch = ServeOrchestrator(
+            "vllm", args, ["--max-num-seqs", "64", "--data-parallel-size", "2"]
+        )
+        orch.workers = [(MagicMock(), 31000)]
+        proc = MagicMock(pid=1234)
+
+        with patch("smg.serve._find_available_ports", return_value=[41000]):
+            with patch("smg.serve.subprocess.Popen", return_value=proc) as popen:
+                orch._launch_sidecars()
+
+        command = popen.call_args.args[0]
+        assert command[command.index("--engine-count") + 1] == "2"
+        assert command[command.index("--max-concurrent-requests") + 1] == "128"
+
+    def test_two_tier_grpc_admission_bound_is_per_engine(self):
+        """Over gRPC each sidecar fronts one engine process; no scaling."""
+        args = _make_args(
+            backend="vllm", model="/tmp/m", data_parallel_size=1, router_worker_mode="smg"
+        )
+        orch = ServeOrchestrator(
+            "vllm", args, ["--max-num-seqs", "64", "--data-parallel-size", "2"]
+        )
+        orch.workers = [(MagicMock(), 31000)]
+        proc = MagicMock(pid=1234)
+
+        with patch("smg.serve._find_available_ports", return_value=[41000]):
+            with patch("smg.serve.subprocess.Popen", return_value=proc) as popen:
+                orch._launch_sidecars()
+
+        command = popen.call_args.args[0]
+        assert command[command.index("--max-concurrent-requests") + 1] == "64"
+
     def test_build_router_args_zmq_forwards_backend(self):
         """ZMQ workers cannot be runtime-probed: serve's --backend must reach
         RouterArgs so the Rust side stamps the startup workers' runtime."""

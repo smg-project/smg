@@ -918,6 +918,9 @@ class ServeOrchestrator:
         signal.signal(signal.SIGTERM, self._signal_handler)
         atexit.register(self._cleanup_workers)
         try:
+            if self._uses_two_tier_workers():
+                # Fail before the engine loads a model it will never serve.
+                self._validate_two_tier()
             self._launch_workers()
             self._wait_healthy()
             if self._uses_two_tier_workers():
@@ -967,7 +970,11 @@ class ServeOrchestrator:
     def _uses_two_tier_workers(self) -> bool:
         return getattr(self.args, "router_worker_mode", "engine") == "smg"
 
-    def _launch_sidecars(self) -> None:
+    def _validate_two_tier(self) -> tuple[str, str]:
+        """Check the two-tier combination before any engine is launched.
+
+        Returns ``(engine_transport, model_id)`` for the sidecar launch.
+        """
         engine_transport = getattr(self.args, "connection_mode", "grpc")
         if engine_transport not in ("grpc", "zmq"):
             raise ValueError("--router-worker-mode smg requires a grpc or zmq engine transport")
@@ -975,18 +982,26 @@ class ServeOrchestrator:
             # SGLang is deliberately excluded: `SglangWorkerLauncher` launches
             # `--grpc-mode`, which serves `sglang.grpc.scheduler.SglangScheduler`
             # (what SMG's existing direct client speaks), while the sidecar's
-            # adapter dials `sglang.runtime.v1.SglangService`. Because
-            # `EngineWorkerInference::connect` only opens a channel, a mismatched
-            # pair would come up SERVING and then `Unimplemented` on the first
+            # adapter dials `sglang.runtime.v1.SglangService`. A mismatched pair
+            # would come up SERVING and then `Unimplemented` on the first
             # request. Fail at startup instead until the launch side is wired up.
             raise ValueError(f"two-tier SMG Workers do not support backend {self.backend}")
-
-        control_ports = _find_available_ports(self.args.worker_control_base_port, len(self.workers))
         model_id = getattr(self.args, "model", None) or getattr(self.args, "model_path", None)
         if not model_id:
             raise ValueError("two-tier SMG Workers require a model identifier")
-        max_concurrent_requests = _backend_arg_int(self.backend_args, "--max-num-seqs", 0)
+        return engine_transport, model_id
+
+    def _launch_sidecars(self) -> None:
+        engine_transport, model_id = self._validate_two_tier()
+        control_ports = _find_available_ports(self.args.worker_control_base_port, len(self.workers))
         engine_count = _backend_arg_int(self.backend_args, "--data-parallel-size", 1)
+        # `--max-num-seqs` bounds one engine. A grouped ZMQ launch puts
+        # `engine_count` engines behind a single sidecar, so its admission
+        # bound has to cover all of them or the Worker under-admits by that
+        # factor. 0 keeps the Worker unbounded.
+        max_concurrent_requests = _backend_arg_int(self.backend_args, "--max-num-seqs", 0)
+        if engine_transport == "zmq":
+            max_concurrent_requests *= engine_count
         for dp_rank, ((_, engine_port), control_port) in enumerate(
             zip(self.workers, control_ports)
         ):

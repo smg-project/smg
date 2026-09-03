@@ -32,8 +32,15 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--drain-secs must be non-negative")
     if args.engine_count <= 0:
         raise ValueError("--engine-count must be positive")
-    if args.engine_transport == "zmq" and args.engine_type == "sglang":
-        raise ValueError("SGLang Worker transport does not support ZMQ yet")
+    if args.engine_type == "sglang":
+        # Same rule as `smg serve`: the Worker's SGLang adapter dials
+        # `sglang.runtime.v1.SglangService`, which no launch path serves yet,
+        # and that service has no health RPC for the sidecar to verify. A
+        # sidecar would come up SERVING and fail every request; refuse instead.
+        raise ValueError(
+            "two-tier SMG Worker sidecars do not support --engine-type sglang yet "
+            "(neither grpc nor zmq transport)"
+        )
     if args.max_concurrent_requests < 0:
         raise ValueError("--max-concurrent-requests must be non-negative")
     stopped = threading.Event()
