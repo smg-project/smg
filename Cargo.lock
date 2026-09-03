@@ -7674,6 +7674,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "smg-rl"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures",
+ "http",
+ "http-body-util",
+ "metrics",
+ "openai-protocol",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "smg-wasm"
 version = "1.1.4"
 dependencies = [

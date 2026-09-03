@@ -1,5 +1,5 @@
 [workspace]
-members = ["model_gateway", "crates/protocols", "crates/reasoning_parser", "crates/tool_parser", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker"]
+members = ["model_gateway", "crates/protocols", "crates/reasoning_parser", "crates/tool_parser", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/rl"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -19,6 +19,7 @@ smg-wasm = { version = "1.1.4", path = "crates/wasm", package = "smg-wasm" }
 smg-mesh = { version = "1.4.3", path = "crates/mesh", package = "smg-mesh" }
 smg-grpc-client = { version = "1.12.0", path = "crates/grpc_client" }
 engine-zmq-client = { version = "0.1.0", path = "crates/engine_zmq_client" }
+smg-rl = { version = "0.1.0", path = "crates/rl" }
 
 # Shared dependencies
 anyhow = "1.0"
