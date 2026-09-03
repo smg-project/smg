@@ -11,8 +11,14 @@ use crate::{
 /// Maximum images accepted in one request (MiniMax-M3 spec 1.3.6).
 const MAX_IMAGES_PER_REQUEST: usize = 200;
 
-/// Maximum videos accepted in one request (MiniMax-M3 spec 1.3.6).
-const MAX_VIDEOS_PER_REQUEST: usize = 20;
+/// Maximum videos accepted in one request.
+///
+/// MiniMax-M3 spec 1.3.6 allows 20, but the gateway preprocesses one clip per
+/// modality batch today (`preprocess_modality` bails on more). Advertising the
+/// spec limit would turn a clean up-front rejection into an internal error
+/// after every clip had been fetched and decoded, so the limit stays at the
+/// pipeline's capacity until batched video preprocessing lands.
+const MAX_VIDEOS_PER_REQUEST: usize = 1;
 
 /// MiniMax-M3 vision spec.
 ///
@@ -108,14 +114,22 @@ impl MiniMaxM3VisionSpec {
     }
 
     /// Temporal grid depth for one video, from `video_grid_thw[0]`.
-    fn video_grid_t(preprocessed: &PreprocessedEncoderInputs) -> Option<usize> {
+    ///
+    /// The video path always emits this tensor and the per-frame layout is
+    /// built from it, so an absent or malformed grid is a broken preprocessing
+    /// output. It is rejected rather than papered over with a flat block the
+    /// model would read differently.
+    fn video_grid_t(preprocessed: &PreprocessedEncoderInputs) -> RegistryResult<usize> {
+        let invalid = || ModelRegistryError::InvalidPreprocessedField {
+            field: "video_grid_thw".to_string(),
+        };
         match preprocessed.model_specific.get("video_grid_thw") {
             Some(ModelSpecificValue::IntTensor { data, shape })
                 if shape == &[1, 3] && !data.is_empty() =>
             {
-                usize::try_from(data[0]).ok()
+                usize::try_from(data[0]).map_err(|_| invalid())
             }
-            _ => None,
+            _ => Err(invalid()),
         }
     }
 
@@ -137,17 +151,23 @@ impl MiniMaxM3VisionSpec {
     /// per-frame metadata, so the timestamp markers are omitted and the frame
     /// blocks alone are emitted.
     ///
-    /// Returns `None` when the layout cannot apply (unknown or single frame, or
-    /// a token count that does not divide evenly), leaving the caller on the
-    /// single-block path.
+    /// Returns `None` for a single-frame clip, where one block is the same
+    /// layout, leaving the caller on the single-block path. A token count that
+    /// does not divide by the frame count means the grid and the features
+    /// disagree; that is rejected rather than flattened.
     fn per_frame_video_tokens(
         metadata: &ModelMetadata,
         pad_token_id: TokenId,
         num_tokens: usize,
         grid_t: usize,
     ) -> RegistryResult<Option<Vec<TokenId>>> {
-        if grid_t <= 1 || num_tokens == 0 || !num_tokens.is_multiple_of(grid_t) {
+        if grid_t <= 1 || num_tokens == 0 {
             return Ok(None);
+        }
+        if !num_tokens.is_multiple_of(grid_t) {
+            return Err(ModelRegistryError::InvalidPreprocessedField {
+                field: "video_grid_thw".to_string(),
+            });
         }
         let start_id = metadata.token_id(Self::VIDEO_START_TOKEN)?;
         let end_id = metadata.token_id(Self::VIDEO_END_TOKEN)?;
@@ -295,29 +315,28 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
             Modality::Video => {
                 let pad_token_id = Self::video_token_id(metadata)?;
                 let placeholder_token = self.placeholder_token_for(metadata, Modality::Video)?;
-                let grid_t = Self::video_grid_t(preprocessed);
+                let grid_t = Self::video_grid_t(preprocessed)?;
 
                 preprocessed
                     .feature_token_counts
                     .iter()
                     .map(|&num_tokens| {
-                        let per_frame = grid_t.and_then(|grid_t| {
-                            Self::per_frame_video_tokens(metadata, pad_token_id, num_tokens, grid_t)
-                                .transpose()
-                                .map(|tokens| tokens.map(|tokens| (tokens, grid_t)))
-                        });
+                        let per_frame = Self::per_frame_video_tokens(
+                            metadata,
+                            pad_token_id,
+                            num_tokens,
+                            grid_t,
+                        )?;
 
                         match per_frame {
-                            Some(Ok((tokens, grid_t))) => Ok(PromptReplacement::sequence(
+                            Some(tokens) => Ok(PromptReplacement::sequence(
                                 Modality::Video,
                                 &placeholder_token,
                                 tokens,
                             )
-                            .with_feature_ranges(Self::per_frame_feature_ranges(
-                                grid_t,
-                                num_tokens / grid_t,
-                            ))),
-                            Some(Err(err)) => Err(err),
+                            .with_feature_ranges(
+                                Self::per_frame_feature_ranges(grid_t, num_tokens / grid_t),
+                            )),
                             None => Self::wrapped_replacement(
                                 metadata,
                                 Modality::Video,
@@ -512,7 +531,11 @@ mod tests {
     fn video_replacement_uses_the_video_pad_token() {
         let spec = MiniMaxM3VisionSpec;
         let replacements = spec
-            .prompt_replacements_for(&metadata(), &preprocessed(vec![3]), Modality::Video)
+            .prompt_replacements_for(
+                &metadata(),
+                &preprocessed_video(vec![3], 1),
+                Modality::Video,
+            )
             .unwrap();
 
         // Video uses M3's own video markers, not the image pair.
@@ -535,8 +558,8 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn multi_frame_video_emits_one_block_per_frame() {
+    #[test]
+    fn multi_frame_video_emits_one_block_per_frame() {
         let spec = MiniMaxM3VisionSpec;
         // 3 temporal frames, 12 tokens total => 4 pad tokens per frame.
         let replacements = spec
@@ -548,20 +571,18 @@ mod tests {
             .unwrap();
 
         let tokens = &replacements[0].tokens;
-        // Each frame is [start] + 4 pads + [end]; vLLM builds the same shape.
-        let frame = |_| {
-            let mut v = vec![VIDEO_START_ID];
-            v.extend(std::iter::repeat_n(VIDEO_ID, 4));
-            v.push(VIDEO_END_ID);
-            v
-        };
-        let expected: Vec<TokenId> = (0..3).flat_map(frame).collect();
+        // Each frame is [start] + 4 pads + [end], repeated once per frame;
+        // vLLM builds the same shape.
+        let mut frame_tokens = vec![VIDEO_START_ID];
+        frame_tokens.extend(std::iter::repeat_n(VIDEO_ID, 4));
+        frame_tokens.push(VIDEO_END_ID);
+        let expected: Vec<TokenId> = std::iter::repeat_n(frame_tokens, 3).flatten().collect();
         assert_eq!(tokens, &expected);
         assert_eq!(tokens.len(), 3 * (4 + 2));
     }
 
-    #[tokio::test]
-    async fn multi_frame_feature_ranges_skip_each_frames_markers() {
+    #[test]
+    fn multi_frame_feature_ranges_skip_each_frames_markers() {
         let spec = MiniMaxM3VisionSpec;
         let replacements = spec
             .prompt_replacements_for(
@@ -579,8 +600,8 @@ mod tests {
         assert_eq!((ranges[2].offset, ranges[2].length), (13, 4));
     }
 
-    #[tokio::test]
-    async fn single_frame_video_stays_one_block() {
+    #[test]
+    fn single_frame_video_stays_one_block() {
         let spec = MiniMaxM3VisionSpec;
         let replacements = spec
             .prompt_replacements_for(
@@ -603,19 +624,40 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn ragged_token_count_falls_back_to_one_block() {
+    #[test]
+    fn ragged_token_count_is_rejected() {
         let spec = MiniMaxM3VisionSpec;
-        // 10 tokens over 3 frames does not divide evenly.
-        let replacements = spec
+        // 10 tokens over 3 frames does not divide evenly, so the grid and the
+        // token count disagree. Falling back to one flat block would silently
+        // hand the model the framing the per-frame layout exists to avoid.
+        let err = spec
             .prompt_replacements_for(
                 &metadata(),
                 &preprocessed_video(vec![10], 3),
                 Modality::Video,
             )
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(replacements[0].tokens.len(), 10 + 2);
+        assert!(matches!(
+            err,
+            ModelRegistryError::InvalidPreprocessedField { ref field } if field == "video_grid_thw"
+        ));
+    }
+
+    #[test]
+    fn missing_video_grid_is_rejected() {
+        let spec = MiniMaxM3VisionSpec;
+        // Without `video_grid_thw` the frame count is unknown, so the layout
+        // cannot be built and a flat block would be wrong for any multi-frame
+        // clip. The video path always emits the grid; its absence is a bug.
+        let err = spec
+            .prompt_replacements_for(&metadata(), &preprocessed(vec![12]), Modality::Video)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ModelRegistryError::InvalidPreprocessedField { ref field } if field == "video_grid_thw"
+        ));
     }
 
     #[test]
@@ -626,7 +668,10 @@ mod tests {
         assert_eq!(limits.get(&Modality::Image), Some(&MAX_IMAGES_PER_REQUEST));
         assert_eq!(MAX_IMAGES_PER_REQUEST, 200);
         assert_eq!(limits.get(&Modality::Video), Some(&MAX_VIDEOS_PER_REQUEST));
-        assert_eq!(MAX_VIDEOS_PER_REQUEST, 20);
+        // The spec allows 20, but preprocessing handles one clip per request
+        // today; advertising more would turn a clean rejection into a 500
+        // after the clips were fetched and decoded.
+        assert_eq!(MAX_VIDEOS_PER_REQUEST, 1);
         assert!(!limits.contains_key(&Modality::Audio));
     }
 

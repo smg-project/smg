@@ -1,7 +1,13 @@
 use std::collections::BTreeMap;
 
-/// Domain tag for digests that mix media bytes with request parameters, so a
-/// parameterised digest can never equal a plain byte digest.
+/// Domain tag for digests that mix media bytes with request parameters.
+///
+/// Together with the length prefix this makes the `(bytes, params)` encoding
+/// injective, so no two distinct parameter sets share a digest. It separates
+/// parameterised digests from plain byte digests only because a plain digest's
+/// payload is a real image or video container, which never begins with this
+/// tag; the plain digests are deliberately left untagged so existing cache
+/// entries stay valid.
 const MEDIA_PARAM_DOMAIN: &[u8] = b"smg.media.params.v1";
 
 /// Absorb `bytes` behind its own length.
@@ -196,10 +202,10 @@ mod video_sampling_hash_tests {
     }
 
     #[test]
-    fn parameterised_digest_never_equals_a_plain_digest() {
-        // The domain tag keeps the two families disjoint.
-        // Same payload both sides, so this tests the domain tag rather than
-        // two different byte strings.
+    fn parameterised_digest_differs_from_the_plain_digest_of_the_same_payload() {
+        // Same payload both sides, so this exercises the domain tag rather
+        // than two different byte strings. It checks this one instance, not a
+        // universal: see the note on `MEDIA_PARAM_DOMAIN`.
         assert_ne!(hash_video_with_sampling(CLIP, 1.0, None), hash_video(CLIP));
         assert_ne!(
             hash_image_with_resolution_cap(CLIP, Some(504)),
