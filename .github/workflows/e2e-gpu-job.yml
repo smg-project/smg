@@ -69,16 +69,11 @@ on:
         type: number
         default: 0
         description: "Minimum effective (selected) test count; exported as E2E_MIN_SELECTED for the pytest harness floor check (0 = disabled)"
-      container_image:
-        required: false
-        type: string
-        default: ""
-        description: "Container image override (e.g. the prebuilt ci-tokenspeed image); empty = the plain GPU CI container"
 
 jobs:
   run:
     runs-on: ${{ inputs.runner }}
-    container: ${{ inputs.container_image || vars.SMG_CI_GPU_CONTAINER_IMAGE }}
+    container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: ${{ inputs.timeout }}
     permissions:
       contents: read
