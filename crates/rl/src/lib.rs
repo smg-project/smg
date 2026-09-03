@@ -5,10 +5,12 @@
 pub mod capability;
 pub mod config;
 pub mod error;
+pub mod metrics;
 pub mod path;
 pub mod selector;
 pub mod view;
 
 pub use config::RlConfig;
 pub use error::RlError;
+pub use metrics::init_rl_metrics;
 pub use view::{RlWorkerInfo, RlWorkerView};
