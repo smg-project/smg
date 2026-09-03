@@ -310,6 +310,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn defaults_content_type_when_body_has_no_header() {
+        let engine = FakeEngine::start(StatusCode::OK, json!({}), 0).await;
+        let app = crate::router::<()>(state(
+            vec![worker("w1", &engine.url, RuntimeType::Sglang)],
+            5,
+        ));
+
+        let req = Request::post("/workers/w1/engine/update_weight_version")
+            .header(
+                "traceparent",
+                "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            )
+            .body(Body::from(r#"{"new_version":"3"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let seen = engine.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].headers["content-type"], "application/json");
+        assert_eq!(
+            seen[0].headers["traceparent"],
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        );
+        assert_eq!(&seen[0].body[..], br#"{"new_version":"3"}"#);
+    }
+
+    #[tokio::test]
     async fn get_is_forwarded_and_text_bodies_are_wrapped() {
         let engine = FakeEngine::start(StatusCode::OK, json!("plain"), 0).await;
         let app = crate::router::<()>(state(
