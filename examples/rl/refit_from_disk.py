@@ -38,7 +38,8 @@ def main() -> int:
     print(f"{len(workers)} worker(s) registered; selector={args.selector!r}")
 
     print("pause_generation ...")
-    rl.fanout("pause_generation", selector=args.selector)
+    # SGLang requires a JSON body on these routes; a bodyless POST is a 400.
+    rl.fanout("pause_generation", {}, selector=args.selector)
     print("update_weights_from_disk ...")
     res = rl.fanout(
         "update_weights_from_disk",
@@ -48,7 +49,7 @@ def main() -> int:
     for wid, r in res.results.items():
         print(f"  {wid}: HTTP {r.status} in {r.latency_ms} ms -> {json.dumps(r.body)[:120]}")
     print("continue_generation ...")
-    rl.fanout("continue_generation", selector=args.selector)
+    rl.fanout("continue_generation", {}, selector=args.selector)
 
     req = urllib.request.Request(
         f"{args.smg}/generate",

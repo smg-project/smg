@@ -20,11 +20,14 @@ rl = RL("http://smg:30000")                     # api_key="..." if control-plane
 for w in rl.workers():
     print(w.id, w.engine, w.tp_size, w.health, w.weight_version)
 rl.call(w.id, "server_info", method="GET")
-rl.fanout("pause_generation", selector="engine=sglang")
+rl.fanout("pause_generation", {}, selector="engine=sglang")
 rl.fanout("update_weights_from_disk", {"model_path": "/ckpt/42", "weight_version": "42"},
           selector="engine=sglang")
-rl.fanout("continue_generation", selector="engine=sglang")
+rl.fanout("continue_generation", {}, selector="engine=sglang")
 ```
+
+SGLang's `pause_generation` and `continue_generation` require a JSON body; pass `{}`
+(a bodyless POST returns 400).
 
 `fanout` raises `FanoutError` (with `.result.failed`) unless `allow_partial=True`.
 Keep the client connected for the whole call: the gateway cancels outstanding
