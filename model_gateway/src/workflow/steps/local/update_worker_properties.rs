@@ -90,6 +90,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             let mut builder = BasicWorkerBuilder::new(worker.base_url())
                 .worker_type(*worker.worker_type())
                 .connection_mode(*worker.connection_mode())
+                .http2(worker.http2())
                 .runtime_type(worker.metadata().spec.runtime_type)
                 .labels(updated_labels)
                 .health_config(updated_health_config.clone())
@@ -417,5 +418,25 @@ mod tests {
             .http_client_handle_if_initialized()
             .expect("materialized client is adopted");
         assert!(Arc::ptr_eq(&adopted, &client));
+    }
+
+    /// The adopted client speaks one HTTP version; the replacement must keep
+    /// describing it correctly.
+    #[tokio::test]
+    async fn http_update_preserves_http2() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w:8080")
+                .http_client(Arc::new(reqwest::Client::new()))
+                .http2(true)
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+        let mut ctx = make_context(app_ctx, Arc::clone(&worker), HashMap::new());
+
+        UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap();
+
+        let updated = &ctx.data.updated_workers.as_ref().expect("updated workers")[0];
+        assert!(updated.http2());
     }
 }

@@ -231,6 +231,7 @@ mod tests {
                 url: "image".to_string(),
                 detail: None,
                 uuid: None,
+                max_long_side_pixel: None,
             },
             MediaContentPart::AudioUrl {
                 url: "audio-2".to_string(),
@@ -265,6 +266,7 @@ mod tests {
                 url: "image".to_string(),
                 detail: None,
                 uuid: None,
+                max_long_side_pixel: None,
             },
             MediaContentPart::AudioUrl {
                 url: "audio".to_string(),

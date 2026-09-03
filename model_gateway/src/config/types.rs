@@ -269,8 +269,9 @@ pub struct RouterConfig {
     /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext) on all
     /// engine-directed connections — request dispatch and health/probe traffic
     /// alike — multiplexing every request to a worker over one connection
-    /// instead of one TCP connection per in-flight request. Requires every
-    /// HTTP worker to serve HTTP/2 without an upgrade handshake.
+    /// instead of one TCP connection per in-flight request. Negotiated per
+    /// worker at registration: a worker that does not answer HTTP/2 stays on
+    /// HTTP/1.1. `http_pool.http2` on a worker spec pins the version instead.
     #[serde(default)]
     pub upstream_http2: bool,
     /// Loaded from mcp_config_path during config creation

@@ -40,12 +40,7 @@ def launch_router(args: argparse.Namespace | RouterArgs) -> None:
         if Router is None:
             raise RuntimeError("Rust Router is not installed")
 
-        if (
-            router_args.service_discovery
-            and not router_args.enable_igw
-            and not router_args.pd_disaggregation
-            and not router_args.epd_disaggregation
-        ):
+        if router_args.service_discovery and not router_args.enable_igw:
             logger.info("IGW mode automatically enabled because service discovery is turned on")
             router_args.enable_igw = True
 

@@ -36,6 +36,7 @@ fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
                             url: image_url.url.clone(),
                             detail,
                             uuid: None,
+                            max_long_side_pixel: image_url.max_long_side_pixel,
                         });
                     }
                     ContentPart::Text { .. } => {}
@@ -58,6 +59,8 @@ fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
                         parts.push(MediaContentPart::VideoUrl {
                             url: video_url.url.clone(),
                             uuid: None,
+                            fps: video_url.fps,
+                            max_long_side_pixel: video_url.max_long_side_pixel,
                         });
                     }
                 }
@@ -111,6 +114,7 @@ fn extract_media_parts_messages(messages: &[InputMessage]) -> Vec<MediaContentPa
                             url: data_url,
                             detail: None,
                             uuid: None,
+                            max_long_side_pixel: None,
                         });
                     }
                     ImageSource::Url { url } => {
@@ -118,6 +122,7 @@ fn extract_media_parts_messages(messages: &[InputMessage]) -> Vec<MediaContentPa
                             url: url.clone(),
                             detail: None,
                             uuid: None,
+                            max_long_side_pixel: None,
                         });
                     }
                 },
@@ -153,6 +158,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "https://example.com/cat.jpg".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -168,6 +174,8 @@ mod tests {
             content: MessageContent::Parts(vec![ContentPart::VideoUrl {
                 video_url: VideoUrl {
                     url: "https://example.com/clip.mp4".to_string(),
+                    fps: None,
+                    max_long_side_pixel: None,
                 },
             }]),
             name: None,
@@ -228,6 +236,7 @@ mod tests {
                         image_url: ImageUrl {
                             url: "https://example.com/image.jpg".to_string(),
                             detail: Some("high".to_string()),
+                            max_long_side_pixel: None,
                         },
                     },
                 ]),
@@ -253,6 +262,8 @@ mod tests {
             content: MessageContent::Parts(vec![ContentPart::VideoUrl {
                 video_url: VideoUrl {
                     url: "https://example.com/video.mp4".to_string(),
+                    fps: None,
+                    max_long_side_pixel: None,
                 },
             }]),
             name: None,

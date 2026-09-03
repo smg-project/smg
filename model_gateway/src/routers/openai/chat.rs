@@ -63,7 +63,7 @@ pub(super) async fn route_chat(
         bool_to_static_str(streaming),
     );
 
-    let selector = WorkerSelector::new(deps.worker_registry, &deps.shared_components.client);
+    let selector = WorkerSelector::new(deps.worker_registry);
     let worker = match selector
         .select_worker(&SelectWorkerRequest {
             model_id: model,
@@ -191,6 +191,7 @@ pub(super) async fn route_chat(
                 // For non-streaming: we record here too — body read errors
                 // are connection issues, not worker health issues.
                 worker.record_outcome(status.as_u16());
+                let content_type = resp.headers().get(CONTENT_TYPE).cloned();
 
                 if is_streaming {
                     let stream = resp.bytes_stream();
@@ -215,12 +216,15 @@ pub(super) async fn route_chat(
                     let mut response =
                         Response::new(Body::from_stream(ReceiverStream::new(rx)));
                     *response.status_mut() = status;
-                    response
-                        .headers_mut()
-                        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                    if let Some(ct) = content_type {
+                        response.headers_mut().insert(CONTENT_TYPE, ct);
+                    } else if status.is_success() {
+                        response
+                            .headers_mut()
+                            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                    }
                     response
                 } else {
-                    let content_type = resp.headers().get(CONTENT_TYPE).cloned();
                     match resp.bytes().await {
                         Ok(body) => {
                             let mut response = Response::new(Body::from(body));

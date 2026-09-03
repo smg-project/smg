@@ -336,6 +336,10 @@ pub(crate) fn init_metrics() {
         "smg_worker_health",
         "Worker health status (1=healthy, 0=unhealthy)"
     );
+    describe_gauge!(
+        "smg_worker_http2",
+        "Whether the router speaks HTTP/2 to the worker (1=HTTP/2, 0=HTTP/1.1)"
+    );
     describe_counter!(
         "smg_worker_health_checks_total",
         "Health check results by worker_type and result"
@@ -1479,6 +1483,15 @@ impl Metrics {
             "worker" => worker_interned
         )
         .set(if healthy { 1.0 } else { 0.0 });
+    }
+
+    pub fn set_worker_http2(worker_url: &str, http2: bool) {
+        let worker_interned = intern_string(worker_url);
+        gauge!(
+            "smg_worker_http2",
+            "worker" => worker_interned
+        )
+        .set(if http2 { 1.0 } else { 0.0 });
     }
 
     /// Record a KV event subscription task failure (panic, join error, or

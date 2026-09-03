@@ -82,12 +82,15 @@ impl Default for MediaConnectorConfig {
 #[derive(Clone, Copy, Debug)]
 pub struct ImageFetchConfig {
     pub detail: ImageDetail,
+    /// MiniMax-M3 extension: cap the decoded image's long side.
+    pub max_long_side_pixel: Option<u32>,
 }
 
 impl Default for ImageFetchConfig {
     fn default() -> Self {
         Self {
             detail: ImageDetail::Auto,
+            max_long_side_pixel: None,
         }
     }
 }
@@ -97,6 +100,8 @@ pub struct VideoFetchConfig {
     pub min_frames: usize,
     pub max_frames: usize,
     pub sample_fps: f32,
+    /// MiniMax-M3 extension: cap each decoded frame's long side.
+    pub max_long_side_pixel: Option<u32>,
 }
 
 impl Default for VideoFetchConfig {
@@ -105,6 +110,7 @@ impl Default for VideoFetchConfig {
             min_frames: 4,
             max_frames: 768,
             sample_fps: 2.0,
+            max_long_side_pixel: None,
         }
     }
 }
@@ -157,8 +163,13 @@ impl MediaConnector {
             MediaSource::Url(url) => self.fetch_http_image(url, cfg).await,
             MediaSource::DataUrl(data_url) => self.fetch_data_url(data_url, cfg).await,
             MediaSource::InlineBytes(bytes) => {
-                self.decode_image(bytes.into(), cfg.detail, ImageSource::InlineBytes)
-                    .await
+                self.decode_image(
+                    bytes.into(),
+                    cfg.detail,
+                    cfg.max_long_side_pixel,
+                    ImageSource::InlineBytes,
+                )
+                .await
             }
             MediaSource::File(path) => self.fetch_file(path, cfg).await,
         }
@@ -221,6 +232,7 @@ impl MediaConnector {
         self.decode_image(
             bytes,
             cfg.detail,
+            cfg.max_long_side_pixel,
             ImageSource::Url {
                 url: parsed.to_string(),
             },
@@ -245,8 +257,13 @@ impl MediaConnector {
 
         let data = data.trim();
         let decoded = decode_base64_with_limit(data, image_max_input_bytes(), "image")?;
-        self.decode_image(decoded.into(), cfg.detail, ImageSource::DataUrl)
-            .await
+        self.decode_image(
+            decoded.into(),
+            cfg.detail,
+            cfg.max_long_side_pixel,
+            ImageSource::DataUrl,
+        )
+        .await
     }
 
     async fn fetch_video_data_url(
@@ -308,8 +325,13 @@ impl MediaConnector {
         }
 
         let bytes = read_file_with_limit(&canonical, image_max_input_bytes(), "image").await?;
-        self.decode_image(bytes, cfg.detail, ImageSource::File { path: canonical })
-            .await
+        self.decode_image(
+            bytes,
+            cfg.detail,
+            cfg.max_long_side_pixel,
+            ImageSource::File { path: canonical },
+        )
+        .await
     }
 
     async fn fetch_http_video(
@@ -430,10 +452,14 @@ impl MediaConnector {
         &self,
         bytes: Bytes,
         detail: ImageDetail,
+        max_long_side_pixel: Option<u32>,
         source: ImageSource,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
+        validate_max_long_side_pixel(max_long_side_pixel)?;
         ensure_input_byte_limit(bytes.len(), image_max_input_bytes(), "image")?;
-        let hash = crate::hasher::hash_image(&bytes);
+        // The cap changes the decoded pixels, so it has to be part of the
+        // identity the pixel cache and the backend's mm cache key off.
+        let hash = crate::hasher::hash_image_with_resolution_cap(&bytes, max_long_side_pixel);
 
         // Decode JPEGs through libjpeg-turbo (PIL-compatible defaults: accurate
         // IDCT + fancy upsampling) so pixel values match vLLM bit-for-bit; the
@@ -453,6 +479,8 @@ impl MediaConnector {
         )
         .await
         .map_err(MediaConnectorError::Blocking)??;
+
+        let image = apply_max_long_side_pixel(image, max_long_side_pixel);
 
         Ok(Arc::new(ImageFrame::new(
             image, bytes, detail, source, hash,
@@ -500,8 +528,20 @@ impl MediaConnector {
             ));
         }
 
-        let hash = crate::hasher::hash_video(&bytes);
+        // The sampling rate and the per-frame cap both change the decoded
+        // frames, so they belong in the identity the caches key off.
+        let hash = crate::hasher::hash_video_with_sampling(
+            &bytes,
+            cfg.sample_fps,
+            cfg.max_long_side_pixel,
+        );
         let decoded = decode_video_frames(bytes.clone(), cfg).await?;
+        // Cap here rather than in the ffmpeg filter chain: the rawvideo decoder
+        // frames stdout using ffprobe's *pre-scale* dimensions and has no
+        // per-frame header, so rescaling inside ffmpeg would desynchronise the
+        // slicing; and the OpenCV backend never sees the filter chain at all.
+        // Capping the decoded frames keeps every backend on one geometry.
+        let decoded = cap_decoded_frames(decoded, cfg.max_long_side_pixel);
 
         let clip = match decoded {
             DecodedVideoFrames::Images { frames, sample_fps } => {
@@ -1762,13 +1802,10 @@ fn parse_time_base(value: &str) -> Option<f64> {
 }
 
 fn fps_filter_for_metadata(metadata: VideoMetadata, cfg: VideoFetchConfig) -> String {
-    if let Some(duration) = metadata.duration_seconds {
-        if let Some(filter) = fps_filter_for_duration(duration, cfg) {
-            return filter;
-        }
-    }
-
-    format!("fps={}", cfg.sample_fps)
+    metadata
+        .duration_seconds
+        .and_then(|duration| fps_filter_for_duration(duration, cfg))
+        .unwrap_or_else(|| format!("fps={}", cfg.sample_fps))
 }
 
 fn expected_sampled_frame_count(metadata: VideoMetadata, cfg: VideoFetchConfig) -> usize {
@@ -2137,6 +2174,7 @@ mod tests {
             min_frames: 4,
             max_frames: 8,
             sample_fps: 2.0,
+            max_long_side_pixel: None,
         };
         let metadata = VideoMetadata {
             width: info.width.expect("video width"),
@@ -2198,6 +2236,7 @@ mod tests {
             min_frames: 4,
             max_frames: 8,
             sample_fps: 2.0,
+            max_long_side_pixel: None,
         };
 
         assert_eq!(effective_sample_fps(Some(1.0), cfg), 4.0);
@@ -2336,6 +2375,7 @@ mod tests {
             min_frames: 4,
             max_frames: 8,
             sample_fps: 2.0,
+            max_long_side_pixel: None,
         };
         let indices = super::opencv_frame_indices(1, 30.0, cfg);
         assert_eq!(indices, vec![0, 0, 0, 0]);
@@ -2357,5 +2397,353 @@ mod tests {
         assert_eq!(super::adaptive_opencv_decoder_threads(224, 32), 6);
         assert_eq!(super::adaptive_opencv_decoder_threads(8, 32), 1);
         assert_eq!(super::adaptive_opencv_decoder_threads(1, 0), 2);
+    }
+}
+
+/// The vision patch factor MiniMax-M3's `max_long_side_pixel` must align to
+/// (patch_size 14 * spatial merge 2).
+pub const MAX_LONG_SIDE_PIXEL_FACTOR: u32 = 28;
+
+/// Reject a `max_long_side_pixel` that is zero or not a multiple of the patch
+/// factor, so the value cannot silently round to a different resolution tier.
+fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnectorError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value == 0 || value % MAX_LONG_SIDE_PIXEL_FACTOR != 0 {
+        return Err(MediaConnectorError::InvalidMaxLongSidePixel {
+            value,
+            factor: MAX_LONG_SIDE_PIXEL_FACTOR,
+        });
+    }
+    Ok(())
+}
+
+/// Downscale so the longer side is at most `max_long_side_pixel`.
+///
+/// Images already within the bound are returned untouched, so the cap only
+/// ever removes resolution. The aspect ratio is preserved; the vision
+/// processor's own `smart_resize` then aligns the result to the patch grid.
+fn apply_max_long_side_pixel(
+    image: image::DynamicImage,
+    max_long_side_pixel: Option<u32>,
+) -> image::DynamicImage {
+    let Some(cap) = max_long_side_pixel else {
+        return image;
+    };
+    let (width, height) = (image.width(), image.height());
+    if width.max(height) <= cap {
+        return image;
+    }
+    // `resize` fits within the box while preserving aspect ratio.
+    image.resize(cap, cap, image::imageops::FilterType::CatmullRom)
+}
+
+#[cfg(test)]
+mod max_long_side_pixel_tests {
+    use super::*;
+
+    fn image(width: u32, height: u32) -> image::DynamicImage {
+        image::DynamicImage::new_rgb8(width, height)
+    }
+
+    #[test]
+    fn accepts_multiples_of_the_patch_factor() {
+        for value in [28, 252, 504, 1008] {
+            assert!(validate_max_long_side_pixel(Some(value)).is_ok(), "{value}");
+        }
+        // Absent is always fine.
+        assert!(validate_max_long_side_pixel(None).is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_and_non_multiples() {
+        // The tiers the M3 contract suite exercises as invalid.
+        for value in [0, 100, 251, 1009] {
+            let err = validate_max_long_side_pixel(Some(value)).unwrap_err();
+            assert!(
+                matches!(err, MediaConnectorError::InvalidMaxLongSidePixel { .. }),
+                "expected rejection for {value}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn caps_the_long_side_preserving_aspect_ratio() {
+        // 5000x3000 is the contract suite's stress image.
+        let capped = apply_max_long_side_pixel(image(5000, 3000), Some(504));
+        assert_eq!(capped.width(), 504);
+        // 3000/5000 * 504 = 302.4, floor-ish via the resize box fit.
+        assert!(
+            (302..=303).contains(&capped.height()),
+            "height {} should preserve the 5:3 ratio",
+            capped.height()
+        );
+    }
+
+    #[test]
+    fn caps_the_long_side_when_portrait() {
+        let capped = apply_max_long_side_pixel(image(3000, 5000), Some(504));
+        assert_eq!(capped.height(), 504);
+        assert!((302..=303).contains(&capped.width()));
+    }
+
+    #[test]
+    fn smaller_images_are_left_untouched() {
+        // The cap only ever removes resolution; it must not upscale.
+        let original = apply_max_long_side_pixel(image(200, 100), Some(1008));
+        assert_eq!((original.width(), original.height()), (200, 100));
+    }
+
+    #[test]
+    fn different_caps_hash_differently() {
+        // The pixel cache and the backend's mm cache key off this hash; two
+        // tiers of the same bytes must not collide.
+        let bytes = b"fake-encoded-image-bytes";
+        let low = crate::hasher::hash_image_with_resolution_cap(bytes, Some(252));
+        let high = crate::hasher::hash_image_with_resolution_cap(bytes, Some(1008));
+        assert_ne!(low, high);
+    }
+
+    #[test]
+    fn absent_cap_keeps_the_plain_byte_hash() {
+        // Uncapped requests keep their existing identity so cached entries
+        // stay valid.
+        let bytes = b"fake-encoded-image-bytes";
+        assert_eq!(
+            crate::hasher::hash_image_with_resolution_cap(bytes, None),
+            crate::hasher::hash_image(bytes)
+        );
+    }
+
+    #[test]
+    fn same_cap_hashes_stably() {
+        let bytes = b"fake-encoded-image-bytes";
+        assert_eq!(
+            crate::hasher::hash_image_with_resolution_cap(bytes, Some(504)),
+            crate::hasher::hash_image_with_resolution_cap(bytes, Some(504))
+        );
+    }
+
+    #[test]
+    fn absent_cap_is_a_no_op() {
+        let original = apply_max_long_side_pixel(image(5000, 3000), None);
+        assert_eq!((original.width(), original.height()), (5000, 3000));
+    }
+
+    #[test]
+    fn larger_caps_keep_more_pixels() {
+        // Monotonicity is what the contract suite asserts via prompt_tokens.
+        let low = apply_max_long_side_pixel(image(5000, 3000), Some(252));
+        let mid = apply_max_long_side_pixel(image(5000, 3000), Some(504));
+        let high = apply_max_long_side_pixel(image(5000, 3000), Some(1008));
+
+        assert!(low.width() < mid.width());
+        assert!(mid.width() < high.width());
+    }
+}
+
+/// Fit a frame inside a `cap x cap` box, preserving aspect and never upscaling.
+fn capped_dimensions(width: u32, height: u32, cap: u32) -> Option<(u32, u32)> {
+    let longest = width.max(height);
+    if longest <= cap || longest == 0 {
+        return None;
+    }
+    let scale = f64::from(cap) / f64::from(longest);
+    Some((
+        ((f64::from(width) * scale).round() as u32).max(1),
+        ((f64::from(height) * scale).round() as u32).max(1),
+    ))
+}
+
+/// Apply `max_long_side_pixel` to already-decoded frames.
+///
+/// Decoder-independent by construction: whichever backend produced the frames,
+/// the cap is applied to the same representation the processor will consume.
+/// Frames already inside the cap are left untouched, so this only ever removes
+/// resolution.
+fn cap_decoded_frames(
+    decoded: DecodedVideoFrames,
+    max_long_side_pixel: Option<u32>,
+) -> DecodedVideoFrames {
+    let Some(cap) = max_long_side_pixel else {
+        return decoded;
+    };
+
+    match decoded {
+        DecodedVideoFrames::Images { frames, sample_fps } => {
+            // Same policy as the image path — filter, no-upscale rule and
+            // rounding all live in one place.
+            let frames = frames
+                .into_iter()
+                .map(|frame| apply_max_long_side_pixel(frame, Some(cap)))
+                .collect();
+            DecodedVideoFrames::Images { frames, sample_fps }
+        }
+        DecodedVideoFrames::Rgb { video, sample_fps } => {
+            // Nothing over the cap: keep the original buffer instead of
+            // rebuilding it byte-for-byte.
+            if video
+                .frames
+                .iter()
+                .all(|f| capped_dimensions(f.width, f.height, cap).is_none())
+            {
+                return DecodedVideoFrames::Rgb { video, sample_fps };
+            }
+
+            // Size from the capped geometry; the pre-cap length would leave a
+            // large allocation attached to the clip for its whole lifetime.
+            let capacity: usize = video
+                .frames
+                .iter()
+                .map(|f| match capped_dimensions(f.width, f.height, cap) {
+                    Some((w, h)) => (w as usize) * (h as usize) * 3,
+                    None => f.len,
+                })
+                .sum();
+            let mut data: Vec<u8> = Vec::with_capacity(capacity);
+            let mut frames = Vec::with_capacity(video.frames.len());
+
+            for frame in &video.frames {
+                let Some(src) = frame
+                    .offset
+                    .checked_add(frame.len)
+                    .and_then(|end| video.data.get(frame.offset..end))
+                else {
+                    // A frame that does not slice cleanly is left to the
+                    // downstream validation rather than silently reshaped.
+                    return DecodedVideoFrames::Rgb { video, sample_fps };
+                };
+                let (width, height, bytes) = match capped_dimensions(frame.width, frame.height, cap)
+                {
+                    None => (frame.width, frame.height, src.to_vec()),
+                    Some((w, h)) => {
+                        let Some(buf) =
+                            image::RgbImage::from_raw(frame.width, frame.height, src.to_vec())
+                        else {
+                            return DecodedVideoFrames::Rgb { video, sample_fps };
+                        };
+                        let resized = image::DynamicImage::ImageRgb8(buf).resize_exact(
+                            w,
+                            h,
+                            image::imageops::FilterType::CatmullRom,
+                        );
+                        (w, h, resized.to_rgb8().into_raw())
+                    }
+                };
+
+                frames.push(DecodedRgbFrame {
+                    width,
+                    height,
+                    offset: data.len(),
+                    len: bytes.len(),
+                });
+                data.extend_from_slice(&bytes);
+            }
+
+            DecodedVideoFrames::Rgb {
+                video: DecodedRgbVideo::new(Bytes::from(data), frames),
+                sample_fps,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod video_frame_cap_tests {
+    use super::*;
+
+    fn rgb_video(width: u32, height: u32, frames: usize) -> DecodedVideoFrames {
+        let len = (width * height * 3) as usize;
+        let mut data = Vec::with_capacity(len * frames);
+        let mut descs = Vec::with_capacity(frames);
+        for i in 0..frames {
+            descs.push(DecodedRgbFrame {
+                width,
+                height,
+                offset: i * len,
+                len,
+            });
+            data.extend(std::iter::repeat_n(0u8, len));
+        }
+        DecodedVideoFrames::Rgb {
+            video: DecodedRgbVideo::new(Bytes::from(data), descs),
+            sample_fps: 2.0,
+        }
+    }
+
+    #[test]
+    fn capped_dimensions_fits_the_box_and_keeps_aspect() {
+        // 16:9 source, long side capped to 504.
+        assert_eq!(capped_dimensions(1920, 1080, 504), Some((504, 284)));
+        // Portrait caps on height.
+        assert_eq!(capped_dimensions(1080, 1920, 504), Some((284, 504)));
+    }
+
+    #[test]
+    fn capped_dimensions_never_upscales() {
+        assert_eq!(capped_dimensions(320, 240, 1008), None);
+        assert_eq!(capped_dimensions(504, 284, 504), None);
+    }
+
+    #[test]
+    fn rgb_frames_are_rescaled_and_stay_self_consistent() {
+        // The raw path has no per-frame header, so every descriptor must agree
+        // with the buffer it points into.
+        let capped = cap_decoded_frames(rgb_video(1920, 1080, 3), Some(504));
+        let DecodedVideoFrames::Rgb { video, .. } = capped else {
+            panic!("expected the RGB representation to be preserved");
+        };
+
+        assert_eq!(video.frames.len(), 3);
+        let mut expected_offset = 0;
+        for frame in &video.frames {
+            assert_eq!((frame.width, frame.height), (504, 284));
+            assert_eq!(frame.len, (504 * 284 * 3) as usize);
+            assert_eq!(frame.offset, expected_offset);
+            assert!(video
+                .data
+                .get(frame.offset..frame.offset + frame.len)
+                .is_some());
+            expected_offset += frame.len;
+        }
+        assert_eq!(video.data.len(), expected_offset);
+    }
+
+    #[test]
+    fn rgb_frames_within_the_cap_are_untouched() {
+        let original = rgb_video(320, 240, 2);
+        let capped = cap_decoded_frames(original, Some(1008));
+        let DecodedVideoFrames::Rgb { video, .. } = capped else {
+            panic!("expected RGB");
+        };
+        assert_eq!(video.frames[0].width, 320);
+        assert_eq!(video.frames[0].height, 240);
+    }
+
+    #[test]
+    fn absent_cap_leaves_frames_alone() {
+        let capped = cap_decoded_frames(rgb_video(1920, 1080, 1), None);
+        let DecodedVideoFrames::Rgb { video, .. } = capped else {
+            panic!("expected RGB");
+        };
+        assert_eq!(
+            (video.frames[0].width, video.frames[0].height),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn image_frames_are_rescaled_too() {
+        // The PPM/DynamicImage backend must honour the same cap.
+        let decoded = DecodedVideoFrames::Images {
+            frames: vec![image::DynamicImage::new_rgb8(1920, 1080)],
+            sample_fps: 2.0,
+        };
+        let DecodedVideoFrames::Images { frames, .. } = cap_decoded_frames(decoded, Some(504))
+        else {
+            panic!("expected images");
+        };
+        assert_eq!((frames[0].width(), frames[0].height()), (504, 284));
     }
 }

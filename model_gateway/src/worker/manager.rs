@@ -59,14 +59,13 @@ struct WorkerResponse {
 /// base worker must dedupe by base URL first (see `get_engine_metrics`).
 async fn fan_out(
     workers: &[Arc<dyn Worker>],
-    client: &reqwest::Client,
     endpoint: &str,
     method: reqwest::Method,
 ) -> Vec<WorkerResponse> {
     let futures: Vec<_> = workers
         .iter()
         .map(|worker| {
-            let client = client.clone();
+            let client = worker.http_client().clone();
             let url = worker.base_url().to_string();
             let full_url = format!("{url}/{endpoint}");
             let api_key = worker.api_key().cloned();
@@ -1068,7 +1067,6 @@ impl WorkerManager {
 
     pub async fn get_all_worker_loads(
         worker_registry: &WorkerRegistry,
-        client: &reqwest::Client,
         native_loads_absent: Option<&DashSet<String>>,
     ) -> WorkerLoadsResult {
         let workers = worker_registry.get_all();
@@ -1084,14 +1082,12 @@ impl WorkerManager {
                     WorkerType::Encode => Some("encode".to_string()),
                 };
                 let connection_mode = worker.connection_mode();
-                let client = client.clone();
                 let worker = Arc::clone(worker);
 
                 async move {
                     let details = match connection_mode {
                         ConnectionMode::Http => {
-                            WorkerMonitor::fetch_http_load(&client, &worker, native_loads_absent)
-                                .await
+                            WorkerMonitor::fetch_http_load(&worker, native_loads_absent).await
                         }
                         ConnectionMode::Grpc | ConnectionMode::Zmq => {
                             WorkerMonitor::fetch_backend_load(&worker).await
@@ -1126,10 +1122,7 @@ impl WorkerManager {
         }
     }
 
-    pub async fn get_engine_metrics(
-        worker_registry: &WorkerRegistry,
-        client: &reqwest::Client,
-    ) -> EngineMetricsResult {
+    pub async fn get_engine_metrics(worker_registry: &WorkerRegistry) -> EngineMetricsResult {
         let workers = worker_registry.get_all();
 
         if workers.is_empty() {
@@ -1145,7 +1138,7 @@ impl WorkerManager {
             .filter(|w| seen.insert(w.base_url().to_string()))
             .collect();
 
-        let responses = fan_out(&workers, client, "metrics", reqwest::Method::GET).await;
+        let responses = fan_out(&workers, "metrics", reqwest::Method::GET).await;
 
         let mut metric_packs = Vec::new();
         for resp in responses {
@@ -1504,8 +1497,7 @@ mod tests {
         registry.register(make_dp_worker(&base, 0, 2)).unwrap();
         registry.register(make_dp_worker(&base, 1, 2)).unwrap();
 
-        let client = reqwest::Client::new();
-        let result = WorkerManager::get_engine_metrics(&registry, &client).await;
+        let result = WorkerManager::get_engine_metrics(&registry).await;
 
         assert!(
             matches!(result, EngineMetricsResult::Ok(_)),
@@ -1530,8 +1522,7 @@ mod tests {
         registry.register(make_dp_worker(&base_a, 1, 2)).unwrap();
         registry.register(make_dp_worker(&base_b, 0, 1)).unwrap();
 
-        let client = reqwest::Client::new();
-        let result = WorkerManager::get_engine_metrics(&registry, &client).await;
+        let result = WorkerManager::get_engine_metrics(&registry).await;
 
         assert!(matches!(result, EngineMetricsResult::Ok(_)));
         assert_eq!(hits_a.load(Ordering::SeqCst), 1);

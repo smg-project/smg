@@ -75,6 +75,7 @@ impl GrpcWorker {
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
             overload: OverloadThresholds::default(),
+            http2: false,
         };
         Self {
             client,

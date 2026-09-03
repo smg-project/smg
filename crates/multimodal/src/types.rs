@@ -50,6 +50,9 @@ pub enum MediaContentPart {
         detail: Option<ImageDetail>,
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
+        /// MiniMax-M3 extension: cap the image's long side before preprocessing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_long_side_pixel: Option<u32>,
     },
     ImageData {
         data: Vec<u8>,
@@ -81,6 +84,12 @@ pub enum MediaContentPart {
         url: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
+        /// MiniMax-M3 extension: frames per second to sample at.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fps: Option<f64>,
+        /// MiniMax-M3 extension: cap each sampled frame's long side.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_long_side_pixel: Option<u32>,
     },
     VideoData {
         data: Vec<u8>,

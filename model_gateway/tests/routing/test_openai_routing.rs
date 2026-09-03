@@ -843,6 +843,75 @@ async fn test_openai_router_chat_streaming_with_mock() {
     assert!(text.contains("[DONE]"));
 }
 
+/// A streaming request must keep the content type of an upstream JSON error.
+#[tokio::test]
+async fn test_openai_router_chat_streaming_preserves_json_error_content_type() {
+    for status in [StatusCode::BAD_REQUEST, StatusCode::INTERNAL_SERVER_ERROR] {
+        assert_streaming_json_error_content_type(status).await;
+    }
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    clippy::unwrap_used,
+    reason = "The test helper uses valid input."
+)]
+async fn assert_streaming_json_error_content_type(status: StatusCode) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || async move {
+            (
+                status,
+                Json(json!({
+                    "object": "error",
+                    "message": "invalid sampling parameter",
+                    "type": "BadRequestError",
+                    "code": status.as_u16()
+                })),
+            )
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let ctx = create_test_app_context().await;
+    register_external_worker(&ctx, &format!("http://{addr}"), None);
+    let router = OpenAIRouter::new(&ctx).await.unwrap();
+    let chat_request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "max_tokens": 10,
+        "stream": true
+    }))
+    .unwrap();
+
+    let response = router
+        .route_chat(
+            None,
+            &test_tenant_meta(),
+            chat_request.clone(),
+            &chat_request.model,
+        )
+        .await;
+
+    assert_eq!(response.status(), status);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/json",
+        "upstream status: {status}"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let response_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response_json["type"], "BadRequestError");
+
+    server.abort();
+}
+
 /// Test circuit breaker functionality
 #[tokio::test]
 async fn test_openai_router_circuit_breaker() {

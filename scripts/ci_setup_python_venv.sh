@@ -17,9 +17,37 @@ PY_VERSION="${CI_PYTHON_VERSION:-3.12}"
 # Pinned so the job's toolchain does not change under it between runs.
 UV_VERSION="${UV_VERSION:-0.12.5}"
 
+# sudo is absent when this runs as root inside `docker build`; degrade to
+# running the commands directly.
+if command -v sudo &> /dev/null; then SUDO="sudo"; else SUDO=""; fi
+
 HOST_VERSION="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "none")"
 
-if [ "$HOST_VERSION" = "$PY_VERSION" ]; then
+# Prebuilt CI images (docker/ci-tokenspeed.Dockerfile) bake a fully-provisioned
+# venv and advertise it via SMG_BAKED_VENV. Adopt it as ./.venv so every
+# downstream step (the GITHUB_PATH entry below, pip installs, pytest) uses the
+# baked interpreter + packages transparently. Adoption is conditional on the
+# interpreter matching the pin: a stale image falls through to a fresh venv
+# here, and scripts/ci_install_tokenspeed.sh then rebuilds from source — slow
+# but correct, never silently broken.
+ADOPTED_VENV=""
+if [ -n "${SMG_BAKED_VENV:-}" ] && [ -x "${SMG_BAKED_VENV}/bin/python" ]; then
+    BAKED_VERSION="$("${SMG_BAKED_VENV}/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    if [ "$BAKED_VERSION" = "$PY_VERSION" ]; then
+        echo "Adopting baked venv ${SMG_BAKED_VENV} (python ${BAKED_VERSION})"
+        # No trailing slash: removes a leftover .venv dir or symlink, never
+        # the baked venv's contents.
+        rm -rf .venv
+        ln -s "${SMG_BAKED_VENV}" .venv
+        ADOPTED_VENV=1
+    else
+        echo "WARNING: baked venv is python ${BAKED_VERSION}, pin is ${PY_VERSION} — ignoring it" >&2
+    fi
+fi
+
+if [ -n "$ADOPTED_VENV" ]; then
+    : # venv adopted above; the assertions below still validate it.
+elif [ "$HOST_VERSION" = "$PY_VERSION" ]; then
     # Use the host interpreter directly: a no-op for every lane that already
     # ships the pinned version -- nothing installed, nothing downloaded.
     echo "Host python3 is $PY_VERSION - creating venv with it"
@@ -33,8 +61,8 @@ if [ "$HOST_VERSION" = "$PY_VERSION" ]; then
             exit 1
         fi
         echo "venv creation failed - installing python3-venv/python3-pip, then retrying"
-        sudo apt-get update
-        sudo apt-get install -y python3-pip python3-venv
+        $SUDO apt-get update
+        $SUDO apt-get install -y python3-pip python3-venv
         rm -rf .venv
         python3 -m venv .venv
     fi

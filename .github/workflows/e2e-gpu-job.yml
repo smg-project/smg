@@ -69,11 +69,16 @@ on:
         type: number
         default: 0
         description: "Minimum effective (selected) test count; exported as E2E_MIN_SELECTED for the pytest harness floor check (0 = disabled)"
+      container_image:
+        required: false
+        type: string
+        default: ""
+        description: "Container image override (e.g. the prebuilt ci-tokenspeed image); empty = the plain GPU CI container"
 
 jobs:
   run:
     runs-on: ${{ inputs.runner }}
-    container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
+    container: ${{ inputs.container_image || vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: ${{ inputs.timeout }}
     permissions:
       contents: read
@@ -88,6 +93,18 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      # The cluster runners share one NAT egress IP and GitHub intermittently
+      # 401s anonymous git from it, even for public repos — the TokenSpeed
+      # source fetch dies on "could not read Username". Carry the workflow
+      # token on every github.com git operation instead.
+      - name: Authenticate git for github.com
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
 
       # Engine-specific setup
       - name: Setup SGLang backend
