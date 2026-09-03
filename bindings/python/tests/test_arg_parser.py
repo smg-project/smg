@@ -46,6 +46,30 @@ class TestRouterArgs:
         assert args.disable_circuit_breaker is False
         assert args.mesh_advertise_host is None
 
+        # RL control plane defaults
+        assert args.enable_rl is False
+        assert args.rl_control_timeout_secs == 600
+        assert args.rl_fanout_concurrency == 32
+
+    def test_rl_flags_parse(self):
+        """RL control-plane flags land on the dataclass."""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        args = RouterArgs.from_cli_args(
+            parser.parse_args(
+                [
+                    "--enable-rl",
+                    "--rl-control-timeout-secs",
+                    "1200",
+                    "--rl-fanout-concurrency",
+                    "8",
+                ]
+            )
+        )
+        assert args.enable_rl is True
+        assert args.rl_control_timeout_secs == 1200
+        assert args.rl_fanout_concurrency == 8
+
     def test_parse_selector_valid(self):
         """Test parsing valid selector arguments."""
         # Test single key-value pair
@@ -1440,6 +1464,9 @@ class TestRouterArgsFieldOrder:
         "kv_connector_annotation",
         "kv_engine_id_annotation",
         "mm_per_request_image_limit",
+        "enable_rl",
+        "rl_control_timeout_secs",
+        "rl_fanout_concurrency",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1474,6 +1501,10 @@ class TestRouterArgsFieldOrder:
             "max_buffered_request_bytes",
             "kv_connector_annotation",
             "kv_engine_id_annotation",
+            "mm_per_request_image_limit",
+            "enable_rl",
+            "rl_control_timeout_secs",
+            "rl_fanout_concurrency",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

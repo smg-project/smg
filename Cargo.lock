@@ -7669,6 +7669,7 @@ dependencies = [
  "smg",
  "smg-auth",
  "smg-mesh",
+ "smg-rl",
  "tikv-jemallocator",
  "tokio",
  "tool-parser",
