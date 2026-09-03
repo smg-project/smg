@@ -2,6 +2,7 @@
 //! engine-native RL routes, and label-selected fan-out. Compiled into the
 //! gateway but inert unless `--enable-rl`.
 
+pub mod capability;
 pub mod config;
 pub mod error;
 pub mod path;
