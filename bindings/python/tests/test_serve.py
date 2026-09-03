@@ -1516,6 +1516,48 @@ class TestServeOrchestrator:
         assert command[command.index("--engine-count") + 1] == "2"
         assert command[command.index("--max-concurrent-requests") + 1] == "128"
 
+    def test_wait_sidecars_healthy_uses_grpc_health_not_tcp(self):
+        """The sidecar listener binds before its engine is usable, so readiness
+        must come from grpc.health.v1, which the Rust side gates on the engine
+        transport."""
+        args = _make_args(backend="vllm", model="/tmp/m", router_worker_mode="smg")
+        orch = ServeOrchestrator("vllm", args, [])
+        proc = MagicMock()
+        proc.poll.return_value = None
+        orch.sidecars = [(proc, 41000, 31000)]
+
+        with (
+            patch("smg.serve._grpc_health_check", side_effect=[False, True]) as health,
+            patch("smg.serve.time.sleep"),
+            patch("smg.serve.socket.create_connection") as tcp,
+        ):
+            orch._wait_sidecars_healthy()
+
+        assert health.call_count == 2
+        assert health.call_args.args[:2] == ("127.0.0.1", 41000)
+        tcp.assert_not_called()
+
+    def test_wait_sidecars_healthy_reports_a_sidecar_that_exited(self):
+        args = _make_args(backend="vllm", model="/tmp/m", router_worker_mode="smg")
+        orch = ServeOrchestrator("vllm", args, [])
+        proc = MagicMock()
+        proc.poll.return_value = 1
+        proc.returncode = 1
+        orch.sidecars = [(proc, 41000, 31000)]
+
+        with (
+            patch("smg.serve._grpc_health_check", return_value=False),
+            pytest.raises(RuntimeError, match="exited with code 1"),
+        ):
+            orch._wait_sidecars_healthy()
+
+    def test_sidecar_shutdown_timeout_covers_the_drain_budget(self):
+        """A long `--worker-drain-secs` must not be SIGKILLed mid-drain."""
+        short = ServeOrchestrator("vllm", _make_args(worker_drain_secs=5.0), [])
+        assert short._sidecar_shutdown_timeout() == 30
+        long = ServeOrchestrator("vllm", _make_args(worker_drain_secs=60.0), [])
+        assert long._sidecar_shutdown_timeout() == 130
+
     def test_two_tier_grpc_admission_bound_is_per_engine(self):
         """Over gRPC each sidecar fronts one engine process; no scaling."""
         args = _make_args(

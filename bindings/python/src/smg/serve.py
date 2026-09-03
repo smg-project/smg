@@ -896,6 +896,8 @@ def parse_serve_args(
 # ---------------------------------------------------------------------------
 
 _WORKER_SHUTDOWN_TIMEOUT = 30
+# Extra headroom on top of a sidecar's own drain budget before SIGKILL.
+_WORKER_SHUTDOWN_GRACE = 10
 
 
 class ServeOrchestrator:
@@ -1146,11 +1148,25 @@ class ServeOrchestrator:
 
         # Sidecars transition to DRAINING on SIGTERM, reject new requests, and
         # keep the engine alive until active streams have had time to finish.
-        self._terminate_processes([(proc, port) for proc, port, _ in self.sidecars])
+        # Their exit is gated on `--worker-drain-secs` plus the tonic shutdown
+        # grace, so the SIGKILL deadline has to cover that or a long drain gets
+        # killed mid-way and the engine below it is torn down under load.
+        self._terminate_processes(
+            [(proc, port) for proc, port, _ in self.sidecars],
+            timeout=self._sidecar_shutdown_timeout(),
+        )
         self._terminate_processes(self.workers)
 
+    def _sidecar_shutdown_timeout(self) -> float:
+        drain_secs = max(0.0, float(getattr(self.args, "worker_drain_secs", 0.0) or 0.0))
+        # Mirrors worker_sidecar.main: sleep(drain_secs), then stop(max(1, drain_secs)).
+        return max(_WORKER_SHUTDOWN_TIMEOUT, 2 * drain_secs + _WORKER_SHUTDOWN_GRACE)
+
     @staticmethod
-    def _terminate_processes(processes: list[tuple[subprocess.Popen, int]]) -> None:
+    def _terminate_processes(
+        processes: list[tuple[subprocess.Popen, int]],
+        timeout: float = _WORKER_SHUTDOWN_TIMEOUT,
+    ) -> None:
         if not processes:
             return
 
