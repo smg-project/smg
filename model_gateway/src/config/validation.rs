@@ -156,14 +156,18 @@ impl ConfigValidator {
         if let Some(disaggregation) = disaggregation {
             return Err(ConfigError::IncompatibleConfig {
                 reason: format!(
-                    "worker_mode=smg cannot be combined with {disaggregation} disaggregation:                      WorkerInference v1 has no bootstrap lane, so the Router would reject every                      disaggregated request at dispatch"
+                    "worker_mode=smg cannot be combined with {disaggregation} disaggregation: \
+                     WorkerInference v1 has no bootstrap lane, so the Router would reject every \
+                     disaggregated request at dispatch"
                 ),
             });
         }
 
         if config.connection_mode == ConnectionMode::Http {
             return Err(ConfigError::IncompatibleConfig {
-                reason: "worker_mode=smg cannot be combined with connection_mode=http: an SMG                          Worker serves WorkerControl and WorkerInference over gRPC and has no                          HTTP inference endpoint"
+                reason: "worker_mode=smg cannot be combined with connection_mode=http: an SMG \
+                         Worker serves WorkerControl and WorkerInference over gRPC and has no \
+                         HTTP inference endpoint"
                     .to_string(),
             });
         }
