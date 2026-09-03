@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::http::HeaderMap;
-use llm_multimodal::registry::qwen3_asr::transcription::TranscriptionFamily;
+use llm_multimodal::registry::transcription::TranscriptionFamily;
 use llm_tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer, TokenizerRegistry};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},

@@ -12,57 +12,13 @@ use crate::{
 
 const AUDIO_PAD_TOKEN: &str = "<|audio_pad|>";
 
-/// Transcription-side family knowledge, consumed by the gateway's
-/// transcription endpoint pipeline.
-///
-/// Protocol-free on purpose: this crate owns what is true of the family —
-/// identifiers, the language set, prompt sanitation, prefill convention,
-/// output framing, capability limits — while how that surfaces on an HTTP
-/// endpoint (request shapes, error codes, the chat pipeline) stays the
-/// gateway's business. Errors here are plain data for the caller to render.
-///
-/// A family is resolved via [`FAMILIES`]; the gateway's generic transcription
-/// preparation stage reads a family's data to shape the request and its
-/// output parser, so no per-model code lives in the router.
+/// Qwen3-ASR's transcription-side knowledge: the family's implementation of
+/// the contract in [`crate::registry::transcription`], plus the identifiers,
+/// language set, prompt sanitation, and output framing behind it. The
+/// contract itself (trait, family registry, error data) lives in that
+/// neutral module so nothing model-named leaks into generic callers.
 pub mod transcription {
-    /// One transcription-capable model family. Everything a family knows,
-    /// expressed protocol-free so the gateway's generic pipeline stage can
-    /// consume it without a per-model branch.
-    pub trait TranscriptionFamily: Send + Sync {
-        /// Family name, as rendered in user-facing errors.
-        fn name(&self) -> &'static str;
-
-        /// Whether a model id, path, or worker-label value names this family.
-        fn is_identifier(&self, value: &str) -> bool;
-
-        /// Sanitize a caller-supplied prompt (size cap + control-token strip).
-        fn sanitize_prompt(&self, text: String) -> Result<String, PromptTooLong>;
-
-        /// The assistant continuation string that forces the transcript for a
-        /// requested language, or `None` when no language was given. `Err` for
-        /// an unsupported language.
-        fn assistant_prefill(
-            &self,
-            language: Option<&str>,
-        ) -> Result<Option<String>, UnsupportedLanguage>;
-
-        /// Post-process raw model output into the transcript text.
-        fn parse_transcript(&self, raw: &str) -> String;
-
-        /// Whether the family serves streaming transcription.
-        fn supports_streaming(&self) -> bool {
-            false
-        }
-
-        /// Whether the family produces word/segment timestamps.
-        fn supports_timestamps(&self) -> bool {
-            false
-        }
-    }
-
-    /// Every supported transcription family; first match wins. New families
-    /// append here.
-    pub static FAMILIES: &[&dyn TranscriptionFamily] = &[&Qwen3Asr];
+    use crate::registry::transcription::{PromptTooLong, TranscriptionFamily, UnsupportedLanguage};
 
     /// Qwen3-ASR: transcript forced via a `language {name}<asr_text>`
     /// assistant continuation; `<asr_text>` framing stripped from the output.
@@ -140,12 +96,6 @@ pub mod transcription {
         value.contains("qwen3-asr") || value.contains("qwen3_asr")
     }
 
-    /// A caller prompt exceeded [`MAX_PROMPT_BYTES`].
-    #[derive(Debug, PartialEq, Eq)]
-    pub struct PromptTooLong {
-        pub max_bytes: usize,
-    }
-
     /// Sanitize a caller prompt: cap its size, then strip ChatML-like
     /// control tokens and the [`ASR_TEXT_TAG`] to a fixpoint, so a prompt
     /// cannot smuggle framing the output parser would misread.
@@ -185,10 +135,6 @@ pub mod transcription {
         output
     }
 
-    /// The requested language is not in [`SUPPORTED_LANGUAGES`].
-    #[derive(Debug, PartialEq, Eq)]
-    pub struct UnsupportedLanguage(pub String);
-
     /// Resolve a language code or English name to the checkpoint's canonical
     /// language name; `None` in and blank map to `None` out.
     pub fn normalize_language(
@@ -221,6 +167,7 @@ pub mod transcription {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::registry::transcription::FAMILIES;
 
         #[test]
         fn recognizes_family_identifiers() {

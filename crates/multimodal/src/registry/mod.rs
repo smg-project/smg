@@ -11,6 +11,7 @@ mod qwen3_omni;
 mod qwen3_vl;
 mod qwen_vl;
 mod traits;
+pub mod transcription;
 
 use glm53_flash::Glm53FlashSpec;
 use inkling::InklingSpec;

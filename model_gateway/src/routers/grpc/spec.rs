@@ -9,7 +9,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use llm_multimodal::registry::qwen3_asr::transcription::TranscriptionFamily;
+use llm_multimodal::registry::transcription::TranscriptionFamily;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{StreamOptions, StringOrArray, Tool, ToolChoice},

@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use axum::response::Response;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use llm_multimodal::registry::qwen3_asr::transcription::TranscriptionFamily;
+use llm_multimodal::registry::transcription::TranscriptionFamily;
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{ContentPart, InputAudio},
@@ -165,7 +165,9 @@ fn build_chat_request(
 mod tests {
     use axum::http::StatusCode;
     use bytes::Bytes;
-    use llm_multimodal::registry::qwen3_asr::transcription::{FAMILIES, MAX_PROMPT_BYTES};
+    use llm_multimodal::registry::{
+        qwen3_asr::transcription::MAX_PROMPT_BYTES, transcription::FAMILIES,
+    };
 
     use super::*;
 

@@ -6,7 +6,7 @@
 //! model family's prompt convention), request building reuses the chat build
 //! path, and response processing extracts plain text — no tool/reasoning
 //! parsing. All model-specific knowledge lives in the family
-//! (`llm_multimodal::registry::qwen3_asr::transcription`); these stages are
+//! (`llm_multimodal::registry::transcription`); these stages are
 //! model-agnostic.
 
 mod preparation;
@@ -17,7 +17,7 @@ use axum::{
     http::header,
     response::{IntoResponse, Response},
 };
-use llm_multimodal::registry::qwen3_asr::transcription::{TranscriptionFamily, FAMILIES};
+use llm_multimodal::registry::transcription::{TranscriptionFamily, FAMILIES};
 use openai_protocol::transcription::AudioFile;
 pub(crate) use preparation::TranscriptionPreparationStage;
 pub(crate) use request_building::TranscriptionRequestBuildingStage;
