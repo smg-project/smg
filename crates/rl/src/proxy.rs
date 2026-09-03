@@ -114,8 +114,21 @@ impl CallOutcome {
 }
 
 /// JSON when the content type says JSON and the bytes parse; otherwise text,
-/// capped at `BODY_CAP`.
-pub(crate) fn parse_body(content_type: Option<&HeaderValue>, bytes: &[u8]) -> (Value, bool) {
+/// capped at `BODY_CAP`. When `truncated_by_read` is true, the bytes were
+/// already cut off while reading the response stream, so JSON parsing is
+/// skipped (the bytes are not valid JSON by construction) and the result is
+/// always reported truncated.
+pub(crate) fn parse_body(
+    content_type: Option<&HeaderValue>,
+    bytes: &[u8],
+    truncated_by_read: bool,
+) -> (Value, bool) {
+    if truncated_by_read {
+        return (
+            Value::String(String::from_utf8_lossy(bytes).into_owned()),
+            true,
+        );
+    }
     let is_json = content_type
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.contains("json"));
@@ -163,7 +176,7 @@ pub async fn call_worker(
 
     let op = op_label(&req.path);
     let started = Instant::now();
-    let response = match builder.send().await {
+    let mut response = match builder.send().await {
         Ok(r) => r,
         Err(e) => {
             let elapsed = started.elapsed();
@@ -187,16 +200,37 @@ pub async fn call_worker(
     };
     let status = response.status().as_u16();
     let content_type = response.headers().get(CONTENT_TYPE).cloned();
-    let bytes = response.bytes().await.map_err(|e| {
-        record_control_call(op, "unreachable", started.elapsed());
-        RlError::UpstreamUnreachable {
-            worker_id: worker.id.clone(),
-            url: worker.url.clone(),
-            message: format!("reading response body: {e}"),
+    // Bounded streaming read: stop once BODY_CAP bytes are collected instead
+    // of buffering an unbounded upstream body.
+    let mut collected: Vec<u8> = Vec::new();
+    let mut truncated_by_read = false;
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) => {
+                record_control_call(op, "unreachable", started.elapsed());
+                return Err(RlError::UpstreamUnreachable {
+                    worker_id: worker.id.clone(),
+                    url: worker.url.clone(),
+                    message: format!("reading response body: {e}"),
+                });
+            }
+        };
+        let remaining = BODY_CAP.saturating_sub(collected.len());
+        if remaining == 0 {
+            truncated_by_read = true;
+            break;
         }
-    })?;
+        if chunk.len() > remaining {
+            collected.extend_from_slice(&chunk[..remaining]);
+            truncated_by_read = true;
+            break;
+        }
+        collected.extend_from_slice(&chunk);
+    }
     let elapsed = started.elapsed();
-    let (body, body_truncated) = parse_body(content_type.as_ref(), &bytes);
+    let (body, body_truncated) = parse_body(content_type.as_ref(), &collected, truncated_by_read);
     let outcome = CallOutcome {
         worker_id: worker.id.clone(),
         url: worker.url.clone(),
@@ -475,8 +509,34 @@ mod tests {
     #[test]
     fn large_text_bodies_are_truncated() {
         let big = vec![b'x'; BODY_CAP + 10];
-        let (v, truncated) = parse_body(None, &big);
+        let (v, truncated) = parse_body(None, &big, false);
         assert!(truncated);
         assert_eq!(v.as_str().unwrap().len(), BODY_CAP);
+    }
+
+    #[tokio::test]
+    async fn large_json_bodies_are_truncated_and_flagged() {
+        let engine = FakeEngine::start(
+            StatusCode::OK,
+            json!({"blob": "x".repeat(BODY_CAP + 4096)}),
+            0,
+        )
+        .await;
+        let app = crate::router::<()>(state(
+            vec![worker("w1", &engine.url, RuntimeType::Sglang)],
+            5,
+        ));
+        let resp = app
+            .oneshot(
+                Request::get("/workers/w1/engine/server_info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["body_truncated"], true);
+        assert!(body["body"].as_str().unwrap().len() <= BODY_CAP);
     }
 }
