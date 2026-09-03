@@ -39,7 +39,7 @@ use super::{
 use crate::{
     middleware::TenantRequestMeta,
     routers::error::internal_error,
-    worker::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
+    worker::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerMode, WorkerRegistry},
 };
 
 /// Ingress-phase request context: owns the parsed request.
@@ -212,12 +212,15 @@ pub(crate) struct RoutingSnapshot {
 }
 
 /// The wire the retained plan was built for. Retry re-selection filters
-/// candidates to this (runtime, transport): the plan's proto flavor and its
-/// stop-resolution are wire-specific and cannot be rebuilt post-drop.
+/// candidates to this (runtime, transport, endpoint mode): the plan's proto
+/// flavor and its stop-resolution are wire-specific and cannot be rebuilt
+/// post-drop. Mode matters because a two-tier SMG Worker and a direct engine
+/// worker can share runtime and transport while speaking different protos.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WireConstraint {
     pub runtime: RuntimeType,
     pub connection: ConnectionMode,
+    pub mode: WorkerMode,
 }
 
 impl WireConstraint {
@@ -226,11 +229,14 @@ impl WireConstraint {
             WorkerSelection::Single { worker } => Self {
                 runtime: worker.metadata().spec.runtime_type,
                 connection: *worker.connection_mode(),
+                mode: worker.worker_mode(),
             },
-            // Disaggregated legs are gRPC-only.
+            // Disaggregated legs are gRPC-only, and never two-tier: config
+            // validation rejects worker_mode=smg with disaggregation.
             WorkerSelection::Disaggregated { runtime_type, .. } => Self {
                 runtime: *runtime_type,
                 connection: ConnectionMode::Grpc,
+                mode: WorkerMode::Engine,
             },
         }
     }
