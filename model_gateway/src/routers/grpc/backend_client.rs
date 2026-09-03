@@ -8,7 +8,7 @@
 //! pipeline (which works against [`ProtoStream`]/[`ProtoGenerateRequest`]) is
 //! shared unchanged.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
@@ -54,12 +54,6 @@ pub struct SmgBackendClient {
     inference: WorkerInferenceClient,
     runtime: RuntimeType,
     token_only_wire: bool,
-    /// Primary EOS id from the Router's tokenizer, carried to the Worker on
-    /// every request. The Worker has no tokenizer, and its own connect-time
-    /// lookup reads the model *directory* -- which a repo-id deployment does
-    /// not have -- so this is the only path by which a tokenizer-less engine
-    /// learns which stop id is EOS rather than a user stop.
-    primary_eos: OnceLock<u32>,
 }
 
 impl SmgBackendClient {
@@ -72,18 +66,6 @@ impl SmgBackendClient {
             inference,
             runtime,
             token_only_wire,
-            primary_eos: OnceLock::new(),
-        }
-    }
-
-    /// Mirror of [`ZmqEngineClient::adopt_tokenizer_eos`] for the two-tier
-    /// lane. Idempotent, and a no-op when the tokenizer reports no EOS.
-    fn adopt_tokenizer_eos(&self, tokenizer: Option<&Arc<dyn llm_tokenizer::traits::Tokenizer>>) {
-        if self.primary_eos.get().is_some() {
-            return;
-        }
-        if let Some(&primary) = tokenizer.and_then(|t| t.eos_token_ids().first()) {
-            let _ = self.primary_eos.set(primary);
         }
     }
 }
@@ -196,10 +178,10 @@ impl BackendClient {
         if let Self::Smg(client) = self {
             if client.token_only_wire && client.runtime == RuntimeType::Vllm {
                 // Both halves, as on the direct-ZMQ path below: the stop set
-                // makes the engine halt, and the primary id (stamped onto the
-                // request in `generate`) makes it report a plain EOS finish
-                // rather than `matched_stop = <eos id>`.
-                client.adopt_tokenizer_eos(tokenizer);
+                // makes the engine halt, and the primary id makes it report a
+                // plain EOS finish rather than `matched_stop = <eos id>`. Both
+                // come from *this request's* tokenizer -- a Worker can serve
+                // several models, so nothing here may be cached per client.
                 fold_smg_vllm_eos_backstop(request, tokenizer);
             }
         } else if let Self::Zmq(client) = self {
@@ -371,12 +353,7 @@ impl BackendClient {
                         "Worker SMG requires the engine-neutral request representation",
                     ));
                 };
-                let mut request = from_tokenspeed_request(*request)?;
-                if let (Some(params), Some(&primary_eos)) =
-                    (request.sampling_params.as_mut(), client.primary_eos.get())
-                {
-                    params.eos_token_id.get_or_insert(primary_eos);
-                }
+                let request = from_tokenspeed_request(*request)?;
                 Ok(ProtoStream::Smg(client.inference.generate(request).await?))
             }
             Self::Zmq(client) => Ok(ProtoStream::Zmq(client.generate(req).await?)),
@@ -570,6 +547,13 @@ fn fold_smg_vllm_eos_backstop(
         return;
     };
     fold_eos_into_stop_token_ids(params.ignore_eos, &mut params.stop_token_ids, tokenizer);
+    // The Worker has no tokenizer, and its own connect-time lookup reads the
+    // model *directory* -- which a repo-id deployment does not have -- so this
+    // is the only path by which a tokenizer-less engine learns which stop id
+    // is EOS rather than a user stop. A caller-supplied id wins.
+    if let Some(&primary) = tokenizer.and_then(|t| t.eos_token_ids().first()) {
+        params.eos_token_id.get_or_insert(primary);
+    }
 }
 
 /// Build a multimodal-carrying request (chat, messages) for a ZMQ backend: one
@@ -716,9 +700,33 @@ mod tests {
         let ProtoGenerateRequest::TokenSpeed(request) = request else {
             panic!("expected TokenSpeed request");
         };
+        let params = request.sampling_params.unwrap();
+        assert_eq!(params.stop_token_ids, tokenizer.eos_token_ids());
+        // The primary id rides the request itself, resolved per request from
+        // that request's tokenizer rather than cached on the client.
         assert_eq!(
-            request.sampling_params.unwrap().stop_token_ids,
-            tokenizer.eos_token_ids()
+            params.eos_token_id,
+            tokenizer.eos_token_ids().first().copied()
         );
+    }
+
+    #[test]
+    fn smg_vllm_eos_backstop_keeps_a_caller_supplied_eos() {
+        let mut request =
+            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
+                sampling_params: Some(tokenspeed_proto::SamplingParams {
+                    eos_token_id: Some(4242),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+
+        fold_smg_vllm_eos_backstop(&mut request, Some(&tokenizer));
+
+        let ProtoGenerateRequest::TokenSpeed(request) = request else {
+            panic!("expected TokenSpeed request");
+        };
+        assert_eq!(request.sampling_params.unwrap().eos_token_id, Some(4242));
     }
 }

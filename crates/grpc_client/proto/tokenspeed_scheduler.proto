@@ -90,6 +90,14 @@ message SamplingParams {
   // Per-request stochastic sampling seed. Omission delegates seed selection
   // to the token engine.
   optional uint64 sampling_seed = 23;
+
+  // Primary end-of-sequence id, resolved by the Router's tokenizer per
+  // request. TokenSpeed's scheduler stops at EOS itself and may ignore this;
+  // it exists so the Router's engine-neutral request can carry the id to a
+  // two-tier Worker fronting a tokenizer-less engine (see
+  // worker_inference.proto), where it must travel with the request rather
+  // than be cached per connection -- one Worker can serve several models.
+  optional uint32 eos_token_id = 24;
 }
 
 // =====================

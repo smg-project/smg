@@ -1118,8 +1118,9 @@ fn from_tokenspeed_sampling(params: ts::SamplingParams) -> proto::SamplingParams
         engine_parameters: params.custom_params,
         no_stop_trim: Some(params.no_stop_trim),
         sampling_seed: params.sampling_seed,
-        // Stamped by the Router after this conversion, from its own tokenizer.
-        eos_token_id: None,
+        // Resolved per request by the Router's tokenizer before this
+        // conversion (`fold_smg_vllm_eos_backstop`).
+        eos_token_id: params.eos_token_id,
     }
 }
 
@@ -1158,6 +1159,7 @@ fn into_tokenspeed_sampling(params: proto::SamplingParams) -> ts::SamplingParams
         custom_params: params.engine_parameters,
         no_stop_trim: params.no_stop_trim.unwrap_or(false),
         sampling_seed: params.sampling_seed,
+        eos_token_id: params.eos_token_id,
     }
 }
 
