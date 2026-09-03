@@ -229,6 +229,34 @@ pub(crate) async fn try_smg_worker_reachable(
         if topology.engines.is_empty() {
             return Err("SMG Worker topology advertises no engines".to_string());
         }
+        // The Router decides string-stop ownership from this attribute (see
+        // `smg_worker_uses_token_only_wire`); a Worker that omits it cannot
+        // be routed to safely, so refuse it here where the message can say so.
+        for engine in &topology.engines {
+            match engine
+                .attributes
+                .get("engine_transport")
+                .map(|value| value.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("grpc" | "zmq") => {}
+                Some(other) => {
+                    return Err(format!(
+                        "SMG Worker engine {:?} advertises unknown engine_transport {other:?}; \
+                         expected grpc or zmq",
+                        engine.engine_id
+                    ))
+                }
+                None => {
+                    return Err(format!(
+                        "SMG Worker engine {:?} does not advertise its engine_transport \
+                         attribute, so the Router cannot tell whether string stops reach the \
+                         engine",
+                        engine.engine_id
+                    ))
+                }
+            }
+        }
 
         let engines = topology
             .engines

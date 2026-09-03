@@ -58,16 +58,16 @@ use crate::{
 /// transport and has to name the same string.
 pub const TOKEN_ONLY_WIRE_FEATURE: &str = "token_only_wire";
 
-fn smg_worker_uses_token_only_wire(labels: &std::collections::HashMap<String, String>) -> bool {
-    if labels
-        .get("engine_transport")
-        .or_else(|| labels.get("smg.engine.engine_transport"))
-        .is_some_and(|transport| transport.eq_ignore_ascii_case("zmq"))
-    {
-        return true;
-    }
-
-    ["smg.features", "smg.engine_features"].iter().any(|key| {
+/// Whether an SMG Worker's engine wire is token-only, from its registration
+/// labels. Fails closed: a registration that names no engine transport gives
+/// no basis for the decision, and defaulting to "the engine matches string
+/// stops" would silently forward stops a ZMQ engine cannot see. Every
+/// `WorkerControlServer` advertises the `engine_transport` attribute, so its
+/// absence means the labels did not come from a real discovery.
+fn smg_worker_uses_token_only_wire(
+    labels: &std::collections::HashMap<String, String>,
+) -> Result<bool, String> {
+    let advertises_feature = ["smg.features", "smg.engine_features"].iter().any(|key| {
         labels.get(*key).is_some_and(|features| {
             serde_json::from_str::<Vec<String>>(features).is_ok_and(|features| {
                 features
@@ -75,7 +75,24 @@ fn smg_worker_uses_token_only_wire(labels: &std::collections::HashMap<String, St
                     .any(|feature| feature == TOKEN_ONLY_WIRE_FEATURE)
             })
         })
-    })
+    });
+    let transport = labels
+        .get("engine_transport")
+        .or_else(|| labels.get("smg.engine.engine_transport"));
+    match transport.map(|value| value.to_ascii_lowercase()).as_deref() {
+        Some("zmq") => Ok(true),
+        Some("grpc") => Ok(advertises_feature),
+        Some(other) => Err(format!(
+            "SMG Worker advertises unknown engine_transport {other:?}; expected grpc or zmq"
+        )),
+        // The feature alone is an explicit statement too; only silence is refused.
+        None if advertises_feature => Ok(true),
+        None => Err(
+            "SMG Worker registration carries no engine_transport label, so the Router cannot \
+             tell whether string stops reach the engine; re-register from a live discovery"
+                .to_string(),
+        ),
+    }
 }
 
 /// A worker's HTTP client handle, materialized on first use.
@@ -1692,8 +1709,16 @@ impl Worker for BasicWorker {
                         let runtime = self.metadata.spec.runtime_type;
                         let runtime_str = runtime.to_string();
                         let worker_mode = self.metadata.spec.worker_mode;
-                        let token_only_wire =
-                            smg_worker_uses_token_only_wire(&self.metadata.spec.labels);
+                        let token_only_wire = if worker_mode == WorkerMode::Smg {
+                            smg_worker_uses_token_only_wire(&self.metadata.spec.labels).map_err(
+                                |reason| WorkerError::ConnectionFailed {
+                                    url: self.metadata.spec.url.clone(),
+                                    reason,
+                                },
+                            )?
+                        } else {
+                            false
+                        };
                         tracing::info!(
                             "Lazily initializing gRPC client ({}) for worker: {}",
                             runtime_str,
@@ -2251,17 +2276,30 @@ mod tests {
     fn smg_token_only_wire_detects_transport_attribute_and_feature() {
         let attribute =
             std::collections::HashMap::from([("engine_transport".to_string(), "zmq".to_string())]);
-        assert!(smg_worker_uses_token_only_wire(&attribute));
+        assert_eq!(smg_worker_uses_token_only_wire(&attribute), Ok(true));
 
         let feature = std::collections::HashMap::from([(
             "smg.engine_features".to_string(),
             r#"["generate","token_only_wire"]"#.to_string(),
         )]);
-        assert!(smg_worker_uses_token_only_wire(&feature));
+        assert_eq!(smg_worker_uses_token_only_wire(&feature), Ok(true));
 
         let grpc =
             std::collections::HashMap::from([("engine_transport".to_string(), "grpc".to_string())]);
-        assert!(!smg_worker_uses_token_only_wire(&grpc));
+        assert_eq!(smg_worker_uses_token_only_wire(&grpc), Ok(false));
+    }
+
+    #[test]
+    fn smg_token_only_wire_refuses_to_guess_without_a_transport_label() {
+        // Silence is not "string stops work": a registration that never named
+        // its transport cannot be assumed to front a stop-matching engine.
+        let none = std::collections::HashMap::new();
+        assert!(smg_worker_uses_token_only_wire(&none).is_err());
+        let unknown = std::collections::HashMap::from([(
+            "smg.engine.engine_transport".to_string(),
+            "carrier-pigeon".to_string(),
+        )]);
+        assert!(smg_worker_uses_token_only_wire(&unknown).is_err());
     }
 
     #[test]

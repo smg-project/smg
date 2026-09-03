@@ -29,6 +29,11 @@ pub struct MockWorkerControl {
 impl MockWorkerControl {
     pub fn new(config: &Config, host: &str, port: u16) -> Self {
         let worker_id = format!("mock-worker-{port}");
+        // Every real WorkerControlServer advertises its engine transport, and
+        // the Router refuses registrations that do not (it decides string-stop
+        // ownership from it). The mock fronts its scheduler over gRPC.
+        let engine_attributes: HashMap<String, String> =
+            [("engine_transport".to_string(), "grpc".to_string())].into();
         let endpoint = format!("grpc://{host}:{port}");
         Self {
             state: Arc::new(State {
@@ -57,7 +62,7 @@ impl MockWorkerControl {
                     }],
                     max_concurrent_requests: u32::try_from(config.engine.max_running)
                         .unwrap_or(u32::MAX),
-                    attributes: HashMap::new(),
+                    attributes: engine_attributes.clone(),
                 },
                 topology: proto::WorkerTopology {
                     worker_id,
@@ -71,7 +76,7 @@ impl MockWorkerControl {
                         data_parallel_rank: Some(0),
                         tensor_parallel_rank: None,
                         pipeline_parallel_rank: None,
-                        attributes: HashMap::new(),
+                        attributes: engine_attributes,
                     }],
                     observed_at: now(),
                 },
