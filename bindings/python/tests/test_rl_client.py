@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from smg.rl import RL, FanoutError, RlError
+from smg.rl import RL, FanoutError, RlError, Worker
 
 WORKER = {
     "id": "w1",
@@ -148,3 +148,40 @@ def test_smg_errors_raise_rlerror(stub):
     with pytest.raises(RlError) as ei:
         RL(stub).fanout("pause", selector="x=y")
     assert ei.value.code == "no_workers_match" and ei.value.status == 400
+
+
+def test_worker_from_json_defaults_missing_dicts():
+    d = dict(WORKER)
+    del d["labels"]
+    del d["capabilities"]
+    del d["role"]
+    d["future_field"] = 1
+    w = Worker.from_json(d)
+    assert w.labels == {}
+    assert w.capabilities == {}
+    assert w.role is None
+
+
+def test_fanout_error_reports_response_status(stub):
+    _Stub.responses["/v1/rl/engine/pause"] = (
+        200,
+        {
+            "results": {"w1": {"url": "u", "status": 200, "latency_ms": 1, "body": {}}},
+            "failed": [
+                {
+                    "worker_id": "w2",
+                    "url": "u2",
+                    "status": 500,
+                    "error": "upstream_error",
+                    "message": "HTTP 500",
+                }
+            ],
+            "total": 2,
+            "succeeded": 1,
+        },
+    )
+    rl = RL(stub)
+    with pytest.raises(FanoutError) as ei:
+        rl.fanout("pause", selector="engine=sglang")
+    assert ei.value.status == 200
+    assert ei.value.result.failed[0].worker_id == "w2"

@@ -49,7 +49,10 @@ class Worker:
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> Worker:
-        return cls(**{k: d.get(k) for k in cls.__dataclass_fields__})  # type: ignore[arg-type]
+        kwargs = {k: d.get(k) for k in cls.__dataclass_fields__}
+        kwargs["labels"] = d.get("labels") or {}
+        kwargs["capabilities"] = d.get("capabilities") or {}
+        return cls(**kwargs)  # type: ignore[arg-type]
 
 
 @dataclass
@@ -114,10 +117,10 @@ class FanoutResult:
 class FanoutError(RlError):
     """Raised by `RL.fanout` when any target failed and `allow_partial` is False."""
 
-    def __init__(self, result: FanoutResult):
+    def __init__(self, result: FanoutResult, status: int = 207):
         self.result = result
         ids = ", ".join(f.worker_id for f in result.failed)
-        super().__init__(207, {"error": "fanout_partial", "message": f"failed workers: {ids}"})
+        super().__init__(status, {"error": "fanout_partial", "message": f"failed workers: {ids}"})
 
 
 class RL:
@@ -200,7 +203,7 @@ class RL:
         if status in (200, 207) and isinstance(payload, dict) and "results" in payload:
             result = FanoutResult.from_json(payload)
             if result.failed and not allow_partial:
-                raise FanoutError(result)
+                raise FanoutError(result, status)
             return result
         _raise_for(status, payload)
         raise RlError(status, {"error": "unexpected_response", "message": str(payload)})
