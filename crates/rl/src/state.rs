@@ -11,9 +11,7 @@ const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 
 pub struct RlState {
     pub(crate) view: Arc<dyn RlWorkerView>,
-    #[expect(dead_code, reason = "used by Task 7's proxy handler")]
     pub(crate) client: reqwest::Client,
-    #[expect(dead_code, reason = "used by Task 8's fan-out handler")]
     pub(crate) config: RlConfig,
 }
 

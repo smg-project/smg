@@ -55,10 +55,6 @@ pub fn worker(id: &str, url: &str, runtime: RuntimeType) -> RlWorkerInfo {
 
 /// One recorded request seen by a fake engine.
 #[derive(Debug, Clone)]
-#[expect(
-    dead_code,
-    reason = "constructed by FakeEngine, consumed starting Task 7's proxy tests"
-)]
 pub struct Seen {
     pub method: Method,
     pub path: String,
@@ -78,19 +74,11 @@ struct EngineState {
 
 /// An in-process engine that answers every route with a fixed status/body,
 /// records requests, and tracks peak concurrency.
-#[expect(
-    dead_code,
-    reason = "used starting Task 7's proxy and Task 8's fan-out tests"
-)]
 pub struct FakeEngine {
     pub url: String,
     state: EngineState,
 }
 
-#[expect(
-    dead_code,
-    reason = "used starting Task 7's proxy and Task 8's fan-out tests"
-)]
 impl FakeEngine {
     #[expect(clippy::disallowed_methods, reason = "test server task")]
     pub async fn start(status: StatusCode, body: serde_json::Value, delay_ms: u64) -> Self {
@@ -119,6 +107,7 @@ impl FakeEngine {
         self.state.seen.lock().expect("seen").clone()
     }
 
+    #[expect(dead_code, reason = "used by Task 8's fan-out tests")]
     pub fn peak_concurrency(&self) -> usize {
         self.state.in_flight.lock().expect("in_flight").1
     }

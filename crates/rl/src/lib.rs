@@ -8,6 +8,7 @@ pub mod discovery;
 pub mod error;
 pub mod metrics;
 pub mod path;
+pub mod proxy;
 pub mod selector;
 pub mod state;
 #[cfg(test)]
@@ -29,5 +30,9 @@ pub fn router<S: Clone + Send + Sync + 'static>(state: Arc<RlState>) -> Router<S
     Router::new()
         .route("/workers", get(discovery::list_workers))
         .route("/workers/{id}", get(discovery::get_worker))
+        .route(
+            "/workers/{id}/engine/{*path}",
+            get(proxy::proxy_handler).post(proxy::proxy_handler),
+        )
         .with_state(state)
 }
