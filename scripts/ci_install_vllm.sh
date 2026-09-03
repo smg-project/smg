@@ -5,6 +5,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RETRY="bash ${SCRIPT_DIR}/ci_retry.sh"
+
 # Activate venv if it exists
 if [ -f ".venv/bin/activate" ]; then
     source .venv/bin/activate
@@ -13,7 +16,7 @@ fi
 # Install uv for faster package management (10-100x faster than pip)
 if ! command -v uv &> /dev/null; then
     echo "Installing uv..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
+    $RETRY 3 5 bash -c 'set -o pipefail; curl -LsSf https://astral.sh/uv/install.sh | sh'
     export PATH="$HOME/.local/bin:$PATH"
 fi
 
@@ -27,7 +30,7 @@ echo "Using uv version: $(uv --version)"
 # route; verified in 0.27.1's dependency constraints).
 # --torch-backend=auto matches the torch CUDA variant to the pod's driver.
 echo "Installing vLLM..."
-uv pip install "vllm==0.27.1" --torch-backend=auto
+$RETRY 3 10 uv pip install "vllm==0.27.1" --torch-backend=auto
 
 # vLLM >=0.25 eagerly imports torchcodec, which dlopens the FFmpeg shared
 # libraries (libavutil/libavcodec/libavformat/...) at import time. The runner
@@ -35,16 +38,16 @@ uv pip install "vllm==0.27.1" --torch-backend=auto
 # (the metapackage pulls the matching libav* sonames; torchcodec supports
 # FFmpeg 4-7). This step is unconditional, so refresh apt lists first.
 echo "Installing FFmpeg for torchcodec..."
-sudo apt-get update
-sudo apt-get install -y --no-install-recommends ffmpeg
+$RETRY 3 10 sudo apt-get update
+$RETRY 3 10 sudo apt-get install -y --no-install-recommends ffmpeg
 
 # NIXL for vLLM PD disaggregation. The bare metapackage pulls both cu12 and
 # cu13 backends, so install the top-level shim alone, then the backend
 # matching torch's CUDA (same normalization as vLLM's own CI).
 echo "Installing nixl..."
 CUDA_MAJOR=$(python3 -c "import torch; print(torch.version.cuda.split('.')[0])")
-uv pip install --no-deps "nixl>=1.2.0"
-uv pip install "nixl-cu${CUDA_MAJOR}>=1.2.0"
+$RETRY 3 10 uv pip install --no-deps "nixl>=1.2.0"
+$RETRY 3 10 uv pip install "nixl-cu${CUDA_MAJOR}>=1.2.0"
 
 # Remove nixl_ep (MoE all-to-all, unused in CI): vLLM imports it eagerly when
 # present, tying every worker startup to its extra native deps
@@ -69,14 +72,14 @@ if [ "${E2E_VLLM_KV_BACKEND:-nixl}" = "mooncake" ]; then
     # when the transfer protocol is tcp — without these the import fails with
     # "libibverbs.so.1: cannot open shared object file".
     echo "Installing mooncake system dependencies..."
-    sudo apt-get install -y --no-install-recommends libnuma1 libibverbs1 ibverbs-providers
+    $RETRY 3 10 sudo apt-get install -y --no-install-recommends libnuma1 libibverbs1 ibverbs-providers
 
     # The cuda13 wheel variant matches vLLM's cu130 torch stack, so no
     # libcudart.so.12 shim is needed (torch's bundled CUDA 13 runtime
     # satisfies it once torch is imported first). Pinned — floating mooncake
     # resolves have broken CI before.
     echo "Installing mooncake-transfer-engine (cuda13)..."
-    uv pip install "mooncake-transfer-engine-cuda13==0.3.11.post1"
+    $RETRY 3 10 uv pip install "mooncake-transfer-engine-cuda13==0.3.11.post1"
 
     # Import canary: fail here (not mid-e2e) if the mooncake install is broken —
     # vLLM swallows this ImportError at module load (torch first for CUDA libs)
@@ -99,12 +102,12 @@ while [ "${CUDA_TAG}" -gt "${CUDA_MAJOR_FLOOR}" ] \
     && ! curl -sfo /dev/null "https://flashinfer.ai/whl/cu${CUDA_TAG}/flashinfer-jit-cache/"; do
     CUDA_TAG=$((CUDA_TAG - 1))
 done
-uv pip install "flashinfer-jit-cache==${FLASHINFER_VERSION}" \
+$RETRY 3 10 uv pip install "flashinfer-jit-cache==${FLASHINFER_VERSION}" \
     --index-url "https://flashinfer.ai/whl/cu${CUDA_TAG}"
 
 # Install gRPC packages from source (not PyPI) so PR changes are always tested
 echo "Installing smg-grpc-proto and smg-grpc-servicer from source..."
-uv pip install -e crates/grpc_client/python/
-uv pip install -e grpc_servicer/
+$RETRY 3 10 uv pip install -e crates/grpc_client/python/
+$RETRY 3 10 uv pip install -e grpc_servicer/
 
 echo "vLLM installation complete"

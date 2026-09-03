@@ -248,14 +248,16 @@ jobs:
           TARGET_IMAGE="ghcr.io/${OWNER}/smg:${IMAGE_TAG}"
           echo "image_name=${TARGET_IMAGE}" >> "$GITHUB_OUTPUT"
           docker tag "${BASE_IMAGE_TAG}" "${TARGET_IMAGE}"
-          docker push "${TARGET_IMAGE}"
+          # GHCR blob uploads time out sporadically on multi-GB layers; a
+          # retry resumes with the layers already accepted.
+          bash scripts/ci_retry.sh 3 30 docker push "${TARGET_IMAGE}"
           echo "**Pushed:** \`${TARGET_IMAGE}\`" >> $GITHUB_STEP_SUMMARY
           # Push any additional (e.g. floating) tags from the same local image.
           while IFS= read -r extra; do
             [ -z "${extra}" ] && continue
             EXTRA_IMAGE="ghcr.io/${OWNER}/smg:${extra}"
             docker tag "${BASE_IMAGE_TAG}" "${EXTRA_IMAGE}"
-            docker push "${EXTRA_IMAGE}"
+            bash scripts/ci_retry.sh 3 30 docker push "${EXTRA_IMAGE}"
             echo "**Pushed:** \`${EXTRA_IMAGE}\`" >> $GITHUB_STEP_SUMMARY
           done <<< "${EXTRA_TAGS}"
 

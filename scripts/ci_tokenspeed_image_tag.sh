@@ -7,7 +7,7 @@
 # drift.
 #
 # The tag covers the pinned engine ref AND a hash of the image tooling
-# (Dockerfile + install/venv scripts + this script): a fix to any of them
+# (Dockerfile + install/venv/retry scripts + this script): a fix to any of them
 # produces a new tag, so the image rebuilds on merge automatically instead
 # of serving stale tooling behind an unchanged ref.
 
@@ -33,6 +33,7 @@ fi
 tooling_hash="$(cat \
     docker/ci-tokenspeed.Dockerfile \
     scripts/ci_install_tokenspeed.sh \
+    scripts/ci_retry.sh \
     scripts/ci_setup_python_venv.sh \
     scripts/ci_tokenspeed_image_tag.sh \
     | "${SHA256[@]}" | cut -c1-12)"

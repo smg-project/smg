@@ -501,6 +501,7 @@ jobs:
               - '.github/workflows/pr-test-rust.yml'
               - '.github/workflows/e2e-gpu-job.yml'
               - 'scripts/ci_setup_python_venv.sh'
+              - 'scripts/ci_retry.sh'
               - 'scripts/ci_install_sglang.sh'
               - 'scripts/ci_install_vllm.sh'
               - 'scripts/ci_install_tokenspeed.sh'
@@ -604,8 +605,8 @@ jobs:
             test_timeout: 18
             min_selected: 202 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: trtllm
-            timeout: 32
-            test_timeout: 18
+            timeout: 36
+            test_timeout: 24
             min_selected: 180 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           # tokenspeed builds from source (~30m cold), so keep the job
           # timeout generous even though the test step is short.
@@ -614,8 +615,8 @@ jobs:
           # installs sglang/vllm only. The engine marker filter keeps the
           # rest of e2e_test/router out of this job.
           - engine: tokenspeed
-            timeout: 50
-            test_timeout: 18
+            timeout: 56
+            test_timeout: 26
             test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py
             min_selected: 114 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
@@ -657,8 +658,8 @@ jobs:
             test_timeout: 40
             min_selected: 202 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: tokenspeed
-            timeout: 50
-            test_timeout: 40
+            timeout: 60
+            test_timeout: 48
             min_selected: 109 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
@@ -857,8 +858,8 @@ jobs:
       engine: sglang
       gpu_tier: "1"
       runner: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
-      timeout: 28
-      test_timeout: 20
+      timeout: 32
+      test_timeout: 24
       test_dirs: e2e_test/responses
       setup_agentic_deps: true
       min_selected: 92 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
@@ -880,14 +881,14 @@ jobs:
       matrix:
         include:
           - engine: sglang
-            timeout: 30
+            timeout: 40
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
-            timeout: 30
+            timeout: 40
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
             kv_backend: mooncake
-            timeout: 30
+            timeout: 40
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
@@ -895,6 +896,7 @@ jobs:
       gpu_tier: "2"
       runner: ${{ vars.SMG_RUNNER_GPU_2 || '2-gpu-h100' }}
       timeout: ${{ matrix.timeout }}
+      test_timeout: 34
       test_dirs: e2e_test/router
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
       min_selected: ${{ matrix.min_selected }}

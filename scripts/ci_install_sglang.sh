@@ -4,6 +4,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RETRY="bash ${SCRIPT_DIR}/ci_retry.sh"
+
 # Activate venv if it exists
 if [ -f ".venv/bin/activate" ]; then
     source .venv/bin/activate
@@ -12,7 +15,7 @@ fi
 # Install uv for faster package management (10-100x faster than pip)
 if ! command -v uv &> /dev/null; then
     echo "Installing uv..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
+    $RETRY 3 5 bash -c 'set -o pipefail; curl -LsSf https://astral.sh/uv/install.sh | sh'
     export PATH="$HOME/.local/bin:$PATH"
 fi
 
@@ -26,12 +29,12 @@ echo "Using uv version: $(uv --version)"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 if [ ! -x "${CUDA_HOME}/bin/nvcc" ] || ! "${CUDA_HOME}/bin/nvcc" --version | grep -q "release 13\."; then
     echo "Installing CUDA 13 toolkit (nvcc 13 not found at ${CUDA_HOME}/bin/nvcc)..."
-    curl -fsSL -o /tmp/cuda-keyring.deb \
+    $RETRY 3 10 curl -fsSL -o /tmp/cuda-keyring.deb \
         https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
     sudo dpkg -i /tmp/cuda-keyring.deb
     rm /tmp/cuda-keyring.deb
-    sudo apt-get update -qq
-    sudo apt-get install -y --no-install-recommends cuda-nvcc-13-0 cuda-cudart-dev-13-0
+    $RETRY 3 10 sudo apt-get update -qq
+    $RETRY 3 10 sudo apt-get install -y --no-install-recommends cuda-nvcc-13-0 cuda-cudart-dev-13-0
     # Ensure CUDA_HOME points to the installed toolkit
     if [ ! -d "${CUDA_HOME}/bin" ] && [ -d "/usr/local/cuda-13.0/bin" ]; then
         sudo ln -sfn /usr/local/cuda-13.0 "${CUDA_HOME}"
@@ -43,7 +46,7 @@ fi
 
 # Install SGLang with all dependencies
 echo "Installing SGLang..."
-uv pip install --prerelease=allow "sglang[all]==0.5.18"
+$RETRY 3 10 uv pip install --prerelease=allow "sglang[all]==0.5.18"
 
 # Install flashinfer-jit-cache: sglang bundles flashinfer_python but only for attention ops.
 # Multi-GPU models need trtllm_comm kernels (fused allreduce + layernorm) which FlashInfer
@@ -64,7 +67,7 @@ if [ -n "$FLASHINFER_VERSION" ]; then
     done
     CU_VERSION="cu${CUDA_TAG}"
     echo "Installing flashinfer-jit-cache==${FLASHINFER_VERSION} (${CU_VERSION})..."
-    uv pip install "flashinfer-jit-cache==${FLASHINFER_VERSION}" \
+    $RETRY 3 10 uv pip install "flashinfer-jit-cache==${FLASHINFER_VERSION}" \
         --index-url "https://flashinfer.ai/whl/${CU_VERSION}"
 else
     echo "WARNING: flashinfer-python not found, skipping flashinfer-jit-cache install"
@@ -76,13 +79,13 @@ fi
 # (cuda13 wheel variant + nvrtc, since torch 2.13 defaults to CUDA 13):
 # https://github.com/sgl-project/sglang/blob/v0.5.18/scripts/ci/cuda/ci_install_dependency.sh
 echo "Installing mooncake system dependencies..."
-sudo apt-get install -y --no-install-recommends libnuma-dev libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
+$RETRY 3 10 sudo apt-get install -y --no-install-recommends libnuma-dev libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
 echo "Installing mooncake..."
-uv pip install mooncake-transfer-engine-cuda13==0.3.12.post1 nvidia-cuda-nvrtc
+$RETRY 3 10 uv pip install mooncake-transfer-engine-cuda13==0.3.12.post1 nvidia-cuda-nvrtc
 
 # Install gRPC packages from source (not PyPI) so PR changes are always tested
 echo "Installing smg-grpc-proto and smg-grpc-servicer from source..."
-uv pip install -e crates/grpc_client/python/
-uv pip install -e grpc_servicer/
+$RETRY 3 10 uv pip install -e crates/grpc_client/python/
+$RETRY 3 10 uv pip install -e grpc_servicer/
 
 echo "SGLang installation complete"

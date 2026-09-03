@@ -25,6 +25,7 @@ on:
       - '.github/versions/tokenspeed.ref'
       - 'docker/ci-tokenspeed.Dockerfile'
       - 'scripts/ci_install_tokenspeed.sh'
+      - 'scripts/ci_retry.sh'
       - 'scripts/ci_setup_python_venv.sh'
       - 'scripts/ci_tokenspeed_image_tag.sh'
       - '.github/workflows/ci-tokenspeed-image.yml'

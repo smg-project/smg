@@ -27,6 +27,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+RETRY="bash ${SCRIPT_DIR}/ci_retry.sh"
 
 # sudo is absent when this runs as root inside `docker build`; degrade to
 # running the commands directly.
@@ -61,7 +62,7 @@ TOKENSPEED_PREBUILT_STAMP="${TOKENSPEED_PREBUILT_STAMP:-/opt/smg-ci/tokenspeed.r
 # Both the source build and the SMG glue below use it.
 if ! command -v uv &> /dev/null; then
     echo "Installing uv..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
+    $RETRY 3 5 bash -c 'set -o pipefail; curl -LsSf https://astral.sh/uv/install.sh | sh'
     export PATH="$HOME/.local/bin:$PATH"
 fi
 echo "uv version: $(uv --version)"
@@ -75,16 +76,16 @@ setup_cuda_env() {
     CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
     if [ ! -x "${CUDA_HOME}/bin/nvcc" ] && [ ! -x "/usr/local/cuda-13.0/bin/nvcc" ]; then
         echo "Installing CUDA toolkit (nvcc not found)..."
-        curl -fsSL -o /tmp/cuda-keyring.deb \
+        $RETRY 3 10 curl -fsSL -o /tmp/cuda-keyring.deb \
             https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
         $SUDO dpkg -i /tmp/cuda-keyring.deb
         rm /tmp/cuda-keyring.deb
-        $SUDO apt-get update -qq
+        $RETRY 3 10 $SUDO apt-get update -qq
         # Install the FULL CUDA 13.0 toolkit (mirrors the proven TRT-LLM lane in
         # ci_install_trtllm.sh) so the system headers -- which the kernel build
         # compiles against -- are a complete, self-consistent 13.0.88 set matching
         # the system nvcc.
-        $SUDO apt-get install -y cuda-toolkit-13-0
+        $RETRY 3 10 $SUDO apt-get install -y cuda-toolkit-13-0
     fi
     # Point CUDA_HOME at the versioned toolkit dir directly (mirrors
     # ci_install_trtllm.sh). The job env sets CUDA_HOME=/usr/local/cuda, but on this
@@ -125,19 +126,19 @@ install_tokenspeed_from_source() {
         git init -q "$TOKENSPEED_DIR"
         (cd "$TOKENSPEED_DIR" \
             && git remote add origin "$TOKENSPEED_REPO" \
-            && git fetch --depth 1 origin "$TOKENSPEED_REF" \
+            && $RETRY 3 10 git fetch --depth 1 origin "$TOKENSPEED_REF" \
             && git checkout FETCH_HEAD)
     else
         echo "TokenSpeed clone exists at $TOKENSPEED_DIR, reusing"
-        (cd "$TOKENSPEED_DIR" && git fetch --depth 1 origin "$TOKENSPEED_REF" && git checkout "$TOKENSPEED_REF")
+        (cd "$TOKENSPEED_DIR" && $RETRY 3 10 git fetch --depth 1 origin "$TOKENSPEED_REF" && git checkout "$TOKENSPEED_REF")
     fi
 
     cd "$TOKENSPEED_DIR"
 
     # ── System dependencies (mirrors docker/Dockerfile) ────────────────────
     export DEBIAN_FRONTEND=noninteractive
-    $SUDO apt-get update -qq
-    $SUDO apt-get install -y --no-install-recommends libssl-dev libopenmpi-dev cmake
+    $RETRY 3 10 $SUDO apt-get update -qq
+    $RETRY 3 10 $SUDO apt-get install -y --no-install-recommends libssl-dev libopenmpi-dev cmake
 
     # ── TokenSpeed packages ────────────────────────────────────────────────
     export MAX_JOBS="${MAX_JOBS:-16}"
@@ -169,13 +170,13 @@ install_tokenspeed_from_source() {
     # Preseed build-time tooling: ``./python`` and ``tokenspeed-kernel`` use
     # ``setuptools.build_meta`` without declaring ``setuptools`` in
     # ``build-system.requires``, and we install with ``--no-build-isolation``.
-    uv pip install setuptools wheel pybind11
+    $RETRY 3 10 uv pip install setuptools wheel pybind11
 
     # Install the CUDA-13 torch build explicitly (the +cu130 local wheel) before the
     # --no-build-isolation kernel compile below, so the build links matching CUDA 13
     # headers instead of the default PyPI (cu12.x) torch. Pin tracks TokenSpeed's
     # torch requirement; bump alongside the ref in .github/versions/tokenspeed.ref.
-    uv pip install "torch==2.11.0+cu130"
+    $RETRY 3 10 uv pip install "torch==2.11.0+cu130"
 
     # The kernel's host-stub compile binds crt/host_runtime.h from torch's bundled
     # cu13 headers (site-packages/nvidia/cu*/include/crt) no matter the -I order,
@@ -204,8 +205,8 @@ install_tokenspeed_from_source() {
     fi
 
     uv pip install -e tokenspeed-kernel/python/ --no-build-isolation
-    uv pip install -e tokenspeed-scheduler/
-    uv pip install -e "./python" --no-build-isolation
+    $RETRY 3 10 uv pip install -e tokenspeed-scheduler/
+    $RETRY 3 10 uv pip install -e "./python" --no-build-isolation
 
     cd "$REPO_ROOT"
 }
@@ -239,8 +240,8 @@ install_smg_glue() {
     # would then serve stale proto descriptors ("Method not found!" for any
     # RPC added in the PR). Drop them first; the source installs replace them.
     uv pip uninstall tokenspeed-smg-grpc-proto tokenspeed-smg-grpc-servicer
-    uv pip install -e crates/grpc_client/python/
-    uv pip install -e grpc_servicer/
+    $RETRY 3 10 uv pip install -e crates/grpc_client/python/
+    $RETRY 3 10 uv pip install -e grpc_servicer/
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────
