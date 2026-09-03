@@ -6,6 +6,7 @@ pub mod capability;
 pub mod config;
 pub mod discovery;
 pub mod error;
+pub mod fanout;
 pub mod metrics;
 pub mod path;
 pub mod proxy;
@@ -33,6 +34,10 @@ pub fn router<S: Clone + Send + Sync + 'static>(state: Arc<RlState>) -> Router<S
         .route(
             "/workers/{id}/engine/{*path}",
             get(proxy::proxy_handler).post(proxy::proxy_handler),
+        )
+        .route(
+            "/engine/{*path}",
+            get(fanout::fanout_handler).post(fanout::fanout_handler),
         )
         .with_state(state)
 }

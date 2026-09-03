@@ -107,7 +107,6 @@ impl FakeEngine {
         self.state.seen.lock().expect("seen").clone()
     }
 
-    #[expect(dead_code, reason = "used by Task 8's fan-out tests")]
     pub fn peak_concurrency(&self) -> usize {
         self.state.in_flight.lock().expect("in_flight").1
     }
