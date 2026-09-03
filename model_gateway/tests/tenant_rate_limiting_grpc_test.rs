@@ -29,7 +29,6 @@ use openai_protocol::{
     completion::CompletionRequest, generate::GenerateRequest, model_card::ModelCard,
     worker::HealthCheckConfig,
 };
-use portpicker::pick_unused_port;
 use smg::{
     config::RouterConfig,
     middleware::TenantRequestMeta,
@@ -37,28 +36,13 @@ use smg::{
     tenant::TenantKey,
     worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
 };
-use tokio::net::TcpStream;
+use tokio::net::TcpListener;
 
 /// "Hello world" through `MockTokenizer`'s fixed vocab ("Hello"=1, "world"=2)
 /// tokenizes to exactly 2 ids -- the gateway's reserve-time estimate.
 const PROMPT_TEXT: &str = "Hello world";
 const ESTIMATED_INPUT_TOKENS: u32 = 2;
 const MODEL: &str = "tenant-rl-test-model";
-
-#[expect(
-    clippy::panic,
-    reason = "test helper - panicking on failure is intentional"
-)]
-async fn wait_for_port(port: u16) {
-    let addr = format!("127.0.0.1:{port}");
-    for _ in 0..100 {
-        if TcpStream::connect(&addr).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("mock gRPC worker on {addr} never came up");
-}
 
 /// Spawn a real (mock) gRPC worker in-process, canned mode: always reports
 /// `prompt_tokens: 1` and `completion_tokens: output_tokens`, regardless of
@@ -70,7 +54,15 @@ async fn wait_for_port(port: u16) {
               mock server task is fire-and-forget for the test process's lifetime"
 )]
 async fn start_mock_grpc_worker(output_tokens: u32) -> u16 {
-    let port = pick_unused_port().expect("no free port for mock gRPC worker");
+    // Bind first and read the port back: picking a free port and binding it
+    // later races the other tests in this binary doing the same.
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock gRPC worker");
+    let port = listener
+        .local_addr()
+        .expect("mock gRPC worker address")
+        .port();
     let cfg = Arc::new(mock_worker::config::Config {
         host: "127.0.0.1".to_string(),
         http_base_port: 0,
@@ -87,8 +79,7 @@ async fn start_mock_grpc_worker(output_tokens: u32) -> u16 {
         realistic: false,
         engine: mock_worker::engine::EngineParams::default(),
     });
-    tokio::spawn(mock_worker::grpc::serve(cfg, "127.0.0.1".to_string(), port));
-    wait_for_port(port).await;
+    tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
     port
 }
 

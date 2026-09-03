@@ -25,6 +25,7 @@ use openai_protocol::{
     generate::GenerateRequest, model_card::ModelCard, worker::HealthCheckConfig,
 };
 use portpicker::pick_unused_port;
+use serial_test::serial;
 use smg::{
     config::RouterConfig,
     middleware::{RouteRequestMeta, TenantKey},
@@ -159,8 +160,9 @@ async fn build_router(fixture: &ZmqFixture, engine_count: usize) -> Box<dyn Rout
         .expect("router should build over a ZMQ worker");
 
     // Acquisition fails fast while the background driver completes the
-    // handshake; wait for it to land so requests hit a connected worker.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // handshake; wait for it to land so requests hit a connected worker. The
+    // budget covers a loaded CI runner, not the local ~100ms case.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !matches!(worker.get_backend_client().await, Ok(Some(_))) {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -194,6 +196,7 @@ fn test_meta() -> RouteRequestMeta {
 /// anywhere in the ipc:// bind, handshake, or output translation fails here on
 /// CPU, without an H100 e2e lane.
 #[tokio::test]
+#[serial]
 async fn non_streaming_generate_over_zmq() {
     let fixture = zmq_fixture();
     start_mock_zmq_engines(&fixture.handshake, 1);
@@ -225,6 +228,7 @@ async fn non_streaming_generate_over_zmq() {
 /// buffers the same outputs, so a stream that stalls mid-generation would pass
 /// the test above and fail here.
 #[tokio::test]
+#[serial]
 async fn streaming_generate_over_zmq() {
     let fixture = zmq_fixture();
     start_mock_zmq_engines(&fixture.handshake, 1);
@@ -259,6 +263,7 @@ async fn streaming_generate_over_zmq() {
 /// connector demultiplexes outputs by request id off a single shared output
 /// socket, so a mix-up here would show as a request never terminating.
 #[tokio::test]
+#[serial]
 async fn concurrent_requests_share_one_zmq_transport() {
     let fixture = zmq_fixture();
     start_mock_zmq_engines(&fixture.handshake, 1);
@@ -278,6 +283,7 @@ async fn concurrent_requests_share_one_zmq_transport() {
 /// balances across them. This is the `dp_size`-on-one-worker topology
 /// `zmq_engine_group` builds, exercised end-to-end through the router.
 #[tokio::test]
+#[serial]
 async fn grouped_zmq_worker_serves_requests_from_either_rank() {
     let fixture = zmq_fixture();
     start_mock_zmq_engines(&fixture.handshake, 2);
