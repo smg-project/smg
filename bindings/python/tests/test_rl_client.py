@@ -162,6 +162,38 @@ def test_worker_from_json_defaults_missing_dicts():
     assert w.role is None
 
 
+def test_call_raises_on_smg_error_envelope(stub):
+    _Stub.responses["/v1/rl/workers/w1/engine/pause"] = (
+        502,
+        {
+            "error": "upstream_unreachable",
+            "message": "connect refused",
+            "worker_id": "w1",
+            "url": "http://e:1",
+        },
+    )
+    with pytest.raises(RlError) as ei:
+        RL(stub).call("w1", "pause")
+    assert ei.value.code == "upstream_unreachable"
+    assert ei.value.status == 502
+
+
+def test_call_returns_mirrored_upstream_error(stub):
+    _Stub.responses["/v1/rl/workers/w1/engine/pause"] = (
+        500,
+        {
+            "worker_id": "w1",
+            "url": "http://e:1",
+            "status": 500,
+            "latency_ms": 2,
+            "body": {"error": "boom"},
+        },
+    )
+    r = RL(stub).call("w1", "pause")
+    assert r.status == 500
+    assert r.body == {"error": "boom"}
+
+
 def test_fanout_error_reports_response_status(stub):
     _Stub.responses["/v1/rl/engine/pause"] = (
         200,

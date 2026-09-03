@@ -180,7 +180,7 @@ class RL:
     ) -> CallResult:
         route = f"/v1/rl/workers/{worker_id}/engine/{path.lstrip('/')}"
         status, payload = self._request(method, route, body, params, timeout)
-        if isinstance(payload, dict) and "worker_id" in payload:
+        if isinstance(payload, dict) and "latency_ms" in payload and "error" not in payload:
             return CallResult.from_json(payload)
         _raise_for(status, payload)
         raise RlError(status, {"error": "unexpected_response", "message": str(payload)})
