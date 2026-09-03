@@ -5,7 +5,7 @@ that adds a surface must update this file.
 
 | # | Surface | model_gateway file | Notes |
 |---|---|---|---|
-| (a) | `RlWorkerView` read-only registry view | `src/rl_adapter.rs` | `RegistryRlView` over `WorkerRegistry::{get_all,get,get_id_by_url}` |
+| (a) | `RlWorkerView` read-only registry view | `src/rl_adapter.rs`, `src/lib.rs` | `RegistryRlView` over `WorkerRegistry::{get_all,get,get_id_by_url}`; `lib.rs` gains `pub mod rl_adapter;` |
 | (d) | `AppContext.rl: Option<Arc<RlState>>` | `src/app_context.rs` | built in `AppContextBuilder::build()` when `router_config.rl.enabled` |
 | (d) | route mount | `src/server.rs` `build_app` | `nest("/v1/rl", smg_rl::router(..))` under `apply_control_plane_auth` |
 | (d) | metrics HELP registration | `src/observability/metrics.rs` | `smg_rl::init_rl_metrics()` |
@@ -17,6 +17,8 @@ Test-only files that the mount also touches, none of them a new surface:
 mock), and the three `#[cfg(test)]` `AppContext { .. }` literals in
 `src/service_discovery.rs`, `src/workflow/steps/local/drain_workers.rs`, and
 `src/workflow/steps/local/update_worker_properties.rs`, which gain `rl: None`
-because the struct grew a field.
+because the struct grew a field. The gateway-level test relies on
+`TestRouterConfig` disabling health checks, so the mock stopped mid-test
+stays registered and the fan-out still targets it.
 
 Not touched: policies, routers, worker trait, response pipeline (M2).
