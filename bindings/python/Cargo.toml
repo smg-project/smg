@@ -15,6 +15,7 @@ serde_yaml = "0.9"
 prost-types.workspace = true
 smg-grpc-client.workspace = true
 tonic.workspace = true
+tonic-health.workspace = true
 tokio-stream = { version = "0.1", features = ["net"] }
 
 [dependencies.smg]

@@ -38,7 +38,17 @@ Worker boundary.
 Workers advertise `token_only_wire` when the engine-facing transport cannot
 match string stops (currently ZMQ). The Router then retains string-stop
 trimming and supplies tokenizer EOS ids as a vLLM EngineCore backstop across
-the otherwise engine-neutral Worker hop.
+the otherwise engine-neutral Worker hop. The primary EOS id travels with each
+request (resolved from that request's tokenizer), never cached per Worker
+connection, because one Worker can serve several models. A Worker must name
+its engine transport in its topology attributes; the Router refuses to
+register one that does not, rather than guess that string stops reach the
+engine.
+
+Router health probes map Worker states rather than collapsing them: DEGRADED
+keeps the worker in rotation with a warning, DRAINING removes it from rotation
+on the first probe (new work is already refused there), and STARTING or
+NOT_SERVING count as failed probes.
 
 The first version deliberately excludes embeddings, multimodal tensors, and
 disaggregated execution until they have explicit contracts.
@@ -49,6 +59,17 @@ Python coordinators use a small PyO3 binding to start the Rust tonic Worker and
 announce lifecycle transitions after scheduler processes fork. SGLang, vLLM,
 and TokenSpeed use the same constructor arguments; Python is not called per
 request.
+
+The binding binds the control listener first and connects the engine
+transport in the background, so STARTING is observable over gRPC for the
+whole handshake (a model load, over ZMQ). Rust owns engine readiness: whatever
+lifecycle Python announces, `GetHealth` reports SERVING only once the
+transport is connected (an engine health probe over gRPC, the HELLO/INIT/READY
+handshake over ZMQ), STARTING while it is connecting, and NOT_SERVING with the
+error if it fails. The same state is served as standard `grpc.health.v1`, so
+`smg serve`, Kubernetes probes, and `grpcurl` can wait for readiness without
+speaking WorkerControl. Requests that arrive before the transport is up are
+refused with UNAVAILABLE.
 
 The hot path is:
 

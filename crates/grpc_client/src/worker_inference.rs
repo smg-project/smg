@@ -322,6 +322,31 @@ enum EngineAdapter {
     TokenSpeed(TokenSpeedWorkerInference),
 }
 
+/// Connect the engine-native gRPC adapter for `engine_type` and return it as a
+/// bare [`EngineTransport`], so a caller can wrap it in its own admission and
+/// lifecycle gates (or install it into a lazily-bound one).
+pub async fn connect_engine_transport(
+    engine_type: &str,
+    endpoint: &str,
+) -> Result<Arc<dyn EngineTransport>, Box<dyn std::error::Error + Send + Sync>> {
+    let adapter = match engine_type.to_ascii_lowercase().as_str() {
+        "sglang" => EngineAdapter::Sglang(SglangWorkerInference::connect(endpoint).await?),
+        "vllm" => EngineAdapter::Vllm(VllmWorkerInference::connect(endpoint).await?),
+        "tokenspeed" | "ts" => {
+            EngineAdapter::TokenSpeed(TokenSpeedWorkerInference::connect(endpoint).await?)
+        }
+        other => {
+            return Err(format!("WorkerInference adapter is not implemented for {other}").into())
+        }
+    };
+    // Opening a channel proves only that something listens on the port. The
+    // Worker owns engine readiness, and callers announce SERVING as soon as
+    // this returns, so refuse to come up in front of an engine that is
+    // absent, still loading, or speaks a different service.
+    adapter.verify_engine_ready().await?;
+    Ok(Arc::new(adapter))
+}
+
 impl EngineAdapter {
     /// One engine health probe over the adapter's own client. SGLang's
     /// runtime service has no health RPC, so that adapter can only be trusted
@@ -387,27 +412,8 @@ impl EngineWorkerInference {
         endpoint: &str,
         max_concurrent_requests: u32,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let adapter = match engine_type.to_ascii_lowercase().as_str() {
-            "sglang" => EngineAdapter::Sglang(SglangWorkerInference::connect(endpoint).await?),
-            "vllm" => EngineAdapter::Vllm(VllmWorkerInference::connect(endpoint).await?),
-            "tokenspeed" | "ts" => {
-                EngineAdapter::TokenSpeed(TokenSpeedWorkerInference::connect(endpoint).await?)
-            }
-            other => {
-                return Err(
-                    format!("WorkerInference adapter is not implemented for {other}").into(),
-                )
-            }
-        };
-        // Opening a channel proves only that something listens on the port.
-        // The Worker owns engine readiness, and callers announce SERVING as
-        // soon as this returns, so refuse to come up in front of an engine
-        // that is absent, still loading, or speaks a different service.
-        adapter.verify_engine_ready().await?;
-        Ok(Self::from_transport(
-            Arc::new(adapter),
-            max_concurrent_requests,
-        ))
+        let transport = connect_engine_transport(engine_type, endpoint).await?;
+        Ok(Self::from_transport(transport, max_concurrent_requests))
     }
 
     /// Wrap an engine-native transport with the common Worker admission and

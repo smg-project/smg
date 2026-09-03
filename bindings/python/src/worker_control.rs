@@ -10,7 +10,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, SystemTime},
@@ -22,8 +22,8 @@ use pyo3::{
 };
 use smg::worker::{RuntimeType, ZmqWorkerTransport, TOKEN_ONLY_WIRE_FEATURE};
 use smg_grpc_client::{
-    worker_inference::{EngineTransport, EngineWorkerInference},
-    worker_inference_proto::worker_inference_server::WorkerInferenceServer,
+    worker_inference::{connect_engine_transport, EngineTransport, EngineWorkerInference},
+    worker_inference_proto::{self, worker_inference_server::WorkerInferenceServer},
     worker_proto::{
         self as proto,
         worker_control_server::{WorkerControl, WorkerControlServer as TonicWorkerControlServer},
@@ -32,6 +32,15 @@ use smg_grpc_client::{
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{transport::Server, Request, Response, Status};
+use tonic_health::pb::{
+    health_check_response::ServingStatus,
+    health_server::{Health, HealthServer},
+    HealthCheckRequest, HealthCheckResponse,
+};
+
+/// How long the server thread may take to bind its listener. Engine
+/// connection no longer happens inside this window; see [`EngineLink`].
+const BIND_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct HealthSnapshot {
@@ -39,11 +48,92 @@ struct HealthSnapshot {
     message: String,
 }
 
+/// Rust-owned readiness of the engine transport, independent of the
+/// lifecycle Python announces. The control listener binds first so that
+/// STARTING is observable over gRPC while the engine handshake (a model load,
+/// for ZMQ) completes in the background; GetHealth reports SERVING only once
+/// both Python has announced it *and* the transport is connected.
+#[derive(Default)]
+struct EngineLink {
+    ready: AtomicBool,
+    error: Mutex<Option<String>>,
+}
+
+impl EngineLink {
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    fn error(&self) -> Option<String> {
+        self.error.lock().ok().and_then(|error| error.clone())
+    }
+}
+
+/// Engine transport that requests can be routed to before it exists. Until
+/// the background connect installs the real transport, every call is refused
+/// with UNAVAILABLE rather than hanging or panicking.
+#[derive(Default)]
+struct LazyEngineTransport {
+    inner: OnceLock<Arc<dyn EngineTransport>>,
+}
+
+impl LazyEngineTransport {
+    fn connected(&self) -> Result<&Arc<dyn EngineTransport>, Status> {
+        self.inner
+            .get()
+            .ok_or_else(|| Status::unavailable("Worker engine transport is still connecting"))
+    }
+}
+
+#[tonic::async_trait]
+impl EngineTransport for LazyEngineTransport {
+    async fn generate(
+        &self,
+        request: worker_inference_proto::GenerateRequest,
+    ) -> Result<smg_grpc_client::worker_inference::EngineTransportStream, Status> {
+        self.connected()?.generate(request).await
+    }
+
+    async fn abort(
+        &self,
+        request: worker_inference_proto::AbortRequest,
+    ) -> Result<worker_inference_proto::AbortResponse, Status> {
+        self.connected()?.abort(request).await
+    }
+}
+
 struct BridgeState {
     identity: proto::WorkerIdentity,
     capabilities: proto::WorkerCapabilities,
     topology: proto::WorkerTopology,
     health: Arc<Mutex<HealthSnapshot>>,
+    engine_link: Option<Arc<EngineLink>>,
+}
+
+/// The health this Worker actually reports: Python's announced lifecycle,
+/// gated on the engine transport when there is one.
+fn effective_health(announced: HealthSnapshot, engine_link: Option<&EngineLink>) -> HealthSnapshot {
+    let Some(link) = engine_link else {
+        return announced;
+    };
+    if let Some(error) = link.error() {
+        return HealthSnapshot {
+            state: proto::WorkerHealthState::NotServing,
+            message: format!("engine transport failed: {error}"),
+        };
+    }
+    if !link.is_ready()
+        && matches!(
+            announced.state,
+            proto::WorkerHealthState::Serving | proto::WorkerHealthState::Degraded
+        )
+    {
+        return HealthSnapshot {
+            state: proto::WorkerHealthState::Starting,
+            message: "waiting for the engine transport to connect".to_string(),
+        };
+    }
+    announced
 }
 
 #[derive(Clone)]
@@ -96,8 +186,53 @@ impl PythonWorkerControl {
                     observed_at: Some(now()),
                 },
                 health: config.health,
+                engine_link: config.engine_link,
             }),
         }
+    }
+
+    fn health_snapshot(&self) -> Result<HealthSnapshot, Status> {
+        let announced = self
+            .state
+            .health
+            .lock()
+            .map_err(|_| Status::internal("Worker health state is poisoned"))?
+            .clone();
+        Ok(effective_health(
+            announced,
+            self.state.engine_link.as_deref(),
+        ))
+    }
+}
+
+/// Standard `grpc.health.v1` view of the same state, so generic probes
+/// (`smg serve`, Kubernetes, grpcurl) can wait for readiness without speaking
+/// WorkerControl. SERVING iff [`PythonWorkerControl::health_snapshot`] is.
+#[tonic::async_trait]
+impl Health for PythonWorkerControl {
+    type WatchStream = tokio_stream::Once<Result<HealthCheckResponse, Status>>;
+
+    async fn check(
+        &self,
+        _request: Request<HealthCheckRequest>,
+    ) -> Result<Response<HealthCheckResponse>, Status> {
+        let status = if self.health_snapshot()?.state == proto::WorkerHealthState::Serving {
+            ServingStatus::Serving
+        } else {
+            ServingStatus::NotServing
+        };
+        Ok(Response::new(HealthCheckResponse {
+            status: status as i32,
+        }))
+    }
+
+    async fn watch(
+        &self,
+        request: Request<HealthCheckRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        // One snapshot, then end: callers that need a live feed poll Check.
+        let response = self.check(request).await?.into_inner();
+        Ok(Response::new(tokio_stream::once(Ok(response))))
     }
 }
 
@@ -125,12 +260,7 @@ impl WorkerControl for PythonWorkerControl {
         &self,
         request: Request<proto::GetHealthRequest>,
     ) -> Result<Response<proto::GetHealthResponse>, Status> {
-        let health = self
-            .state
-            .health
-            .lock()
-            .map_err(|_| Status::internal("Worker health state is poisoned"))?
-            .clone();
+        let health = self.health_snapshot()?;
         let components = request
             .into_inner()
             .include_components
@@ -190,6 +320,7 @@ struct BridgeConfig {
     max_concurrent_requests: u32,
     engine_attributes: HashMap<String, String>,
     health: Arc<Mutex<HealthSnapshot>>,
+    engine_link: Option<Arc<EngineLink>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,6 +395,7 @@ pub struct PyWorkerControlServer {
     done: Mutex<Option<Receiver<()>>>,
     running: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
+    engine_link: Option<Arc<EngineLink>>,
 }
 
 #[pymethods]
@@ -328,6 +460,7 @@ impl PyWorkerControlServer {
         }));
         let serving = Arc::new(AtomicBool::new(false));
         let engine_transport = parse_engine_transport(&engine_transport)?;
+        let engine_link = inference_enabled.then(|| Arc::new(EngineLink::default()));
         if engine_count == 0 {
             return Err(PyValueError::new_err("engine_count must be positive"));
         }
@@ -365,6 +498,7 @@ impl PyWorkerControlServer {
             max_concurrent_requests,
             engine_attributes,
             health: Arc::clone(&health),
+            engine_link: engine_link.clone(),
         };
         py.detach(|| {
             start_server(
@@ -373,8 +507,16 @@ impl PyWorkerControlServer {
                 health,
                 serving,
                 inference,
+                engine_link,
             )
         })
+    }
+
+    /// Whether the engine transport has connected. Health reports STARTING
+    /// until it has, whatever lifecycle Python announced.
+    #[getter]
+    fn engine_ready(&self) -> bool {
+        self.engine_link.as_ref().is_none_or(|link| link.is_ready())
     }
 
     #[getter]
@@ -462,15 +604,8 @@ fn start_server(
     health: Arc<Mutex<HealthSnapshot>>,
     serving: Arc<AtomicBool>,
     inference: Option<InferenceConfig>,
+    engine_link: Option<Arc<EngineLink>>,
 ) -> PyResult<PyWorkerControlServer> {
-    let startup_timeout = if inference
-        .as_ref()
-        .is_some_and(|config| config.engine_transport == WorkerEngineTransport::Zmq)
-    {
-        Duration::from_secs(610)
-    } else {
-        Duration::from_secs(5)
-    };
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let (done_tx, done_rx) = mpsc::sync_channel(1);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -478,6 +613,7 @@ fn start_server(
     let thread_running = Arc::clone(&running);
     let last_error = Arc::new(Mutex::new(None));
     let thread_last_error = Arc::clone(&last_error);
+    let thread_link = engine_link.clone();
     let thread = thread::Builder::new()
         .name("smg-python-worker-control".to_string())
         .spawn(move || {
@@ -493,21 +629,9 @@ fn start_server(
             };
             let runtime_running = Arc::clone(&thread_running);
             runtime.block_on(async move {
-                let inference = match inference {
-                    Some(config) => match connect_inference(&config).await {
-                        Ok(service) => Some(WorkerInferenceServer::new(
-                            service.with_serving_flag(config.serving),
-                        )),
-                        Err(error) => {
-                            let _ = started_tx.send(Err(format!(
-                                "failed to connect {} WorkerInference adapter to {}: {error}",
-                                config.engine_type, config.engine_endpoint
-                            )));
-                            return;
-                        }
-                    },
-                    None => None,
-                };
+                // Bind before touching the engine: the control plane must be
+                // reachable -- and report STARTING -- for the whole time the
+                // engine handshake takes, which for ZMQ is the model load.
                 let listener = match tokio::net::TcpListener::bind(bind_address).await {
                     Ok(listener) => listener,
                     Err(error) => {
@@ -524,13 +648,61 @@ fn start_server(
                         return;
                     }
                 };
+
+                // The inference service is registered now, bound to a transport
+                // that refuses requests with UNAVAILABLE until the background
+                // connect installs the real one.
+                let inference = inference.map(|config| {
+                    let lazy = Arc::new(LazyEngineTransport::default());
+                    let inference_service = EngineWorkerInference::from_transport(
+                        Arc::clone(&lazy) as Arc<dyn EngineTransport>,
+                        config.max_concurrent_requests,
+                    )
+                    .with_serving_flag(Arc::clone(&config.serving));
+                    let link = thread_link
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(EngineLink::default()));
+                    let connect_error = Arc::clone(&thread_last_error);
+                    // Nothing waits on this at shutdown by design: the runtime
+                    // is dropped with the server thread, which cancels a
+                    // still-running connect, and a connect that lands after
+                    // shutdown only fills state nobody reads.
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "engine connect is fire-and-forget; runtime drop cancels it"
+                    )]
+                    let _connect = tokio::spawn(async move {
+                        match connect_inference(&config).await {
+                            Ok(transport) => {
+                                // Only this task ever sets the cell.
+                                let _ = lazy.inner.set(transport);
+                                link.ready.store(true, Ordering::Release);
+                            }
+                            Err(error) => {
+                                let message = format!(
+                                    "failed to connect {} WorkerInference adapter to {}: {error}",
+                                    config.engine_type, config.engine_endpoint
+                                );
+                                if let Ok(mut slot) = link.error.lock() {
+                                    *slot = Some(message.clone());
+                                }
+                                if let Ok(mut slot) = connect_error.lock() {
+                                    *slot = Some(message);
+                                }
+                            }
+                        }
+                    });
+                    WorkerInferenceServer::new(inference_service)
+                });
+
                 runtime_running.store(true, Ordering::Release);
                 if started_tx.send(Ok(address)).is_err() {
                     return;
                 }
                 let incoming = TcpListenerStream::new(listener);
                 if let Err(error) = Server::builder()
-                    .add_service(TonicWorkerControlServer::new(service))
+                    .add_service(TonicWorkerControlServer::new(service.clone()))
+                    .add_service(HealthServer::new(service))
                     .add_optional_service(inference)
                     .serve_with_incoming_shutdown(incoming, async {
                         let _ = shutdown_rx.await;
@@ -550,15 +722,10 @@ fn start_server(
         })?;
 
     let address = started_rx
-        .recv_timeout(startup_timeout)
+        .recv_timeout(BIND_TIMEOUT)
         .map_err(|error| match error {
-            // The two arms mean opposite things -- the server thread died vs. it
-            // is still inside `connect_inference` -- and the ZMQ startup timeout
-            // is over ten minutes, so reporting "exited" for a hang sends an
-            // operator looking in the wrong place.
             RecvTimeoutError::Timeout => PyRuntimeError::new_err(format!(
-                "WorkerControl server did not finish startup within {startup_timeout:.0?}; it \
-                 is still connecting to the engine"
+                "WorkerControl server did not bind {bind_address} within {BIND_TIMEOUT:?}"
             )),
             RecvTimeoutError::Disconnected => {
                 PyRuntimeError::new_err("WorkerControl server exited during startup")
@@ -574,6 +741,7 @@ fn start_server(
         done: Mutex::new(Some(done_rx)),
         running,
         last_error,
+        engine_link,
     })
 }
 
@@ -591,15 +759,10 @@ struct InferenceConfig {
 
 async fn connect_inference(
     config: &InferenceConfig,
-) -> Result<EngineWorkerInference, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Arc<dyn EngineTransport>, Box<dyn std::error::Error + Send + Sync>> {
     match config.engine_transport {
         WorkerEngineTransport::Grpc => {
-            EngineWorkerInference::connect(
-                &config.engine_type,
-                &config.engine_endpoint,
-                config.max_concurrent_requests,
-            )
-            .await
+            connect_engine_transport(&config.engine_type, &config.engine_endpoint).await
         }
         WorkerEngineTransport::Zmq => {
             let runtime = config
@@ -614,11 +777,7 @@ async fn connect_inference(
             )
             .await
             .map_err(std::io::Error::other)?;
-            let transport: Arc<dyn EngineTransport> = Arc::new(transport);
-            Ok(EngineWorkerInference::from_transport(
-                transport,
-                config.max_concurrent_requests,
-            ))
+            Ok(Arc::new(transport) as Arc<dyn EngineTransport>)
         }
     }
 }
@@ -626,6 +785,61 @@ async fn connect_inference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn announced(state: proto::WorkerHealthState) -> HealthSnapshot {
+        HealthSnapshot {
+            state,
+            message: "announced".to_string(),
+        }
+    }
+
+    #[test]
+    fn health_stays_starting_until_the_engine_transport_connects() {
+        // Python announces SERVING as soon as the constructor returns; the
+        // listener is up by then but the engine handshake may still be running.
+        let link = EngineLink::default();
+        let health = effective_health(announced(proto::WorkerHealthState::Serving), Some(&link));
+        assert_eq!(health.state, proto::WorkerHealthState::Starting);
+
+        link.ready.store(true, Ordering::Release);
+        let health = effective_health(announced(proto::WorkerHealthState::Serving), Some(&link));
+        assert_eq!(health.state, proto::WorkerHealthState::Serving);
+        assert_eq!(health.message, "announced");
+    }
+
+    #[test]
+    fn engine_transport_failure_reports_not_serving_whatever_python_announced() {
+        let link = EngineLink::default();
+        *link.error.lock().unwrap() = Some("handshake timed out".to_string());
+        for state in [
+            proto::WorkerHealthState::Starting,
+            proto::WorkerHealthState::Serving,
+            proto::WorkerHealthState::Draining,
+        ] {
+            let health = effective_health(announced(state), Some(&link));
+            assert_eq!(health.state, proto::WorkerHealthState::NotServing);
+            assert!(health.message.contains("handshake timed out"));
+        }
+    }
+
+    #[test]
+    fn lifecycle_states_other_than_serving_pass_through_while_connecting() {
+        // Draining or NotServing announced during the connect window are the
+        // truth already; only an optimistic SERVING gets held back.
+        let link = EngineLink::default();
+        for state in [
+            proto::WorkerHealthState::Starting,
+            proto::WorkerHealthState::Draining,
+            proto::WorkerHealthState::NotServing,
+        ] {
+            assert_eq!(effective_health(announced(state), Some(&link)).state, state);
+        }
+        // No inference service at all: Python's word is final.
+        assert_eq!(
+            effective_health(announced(proto::WorkerHealthState::Serving), None).state,
+            proto::WorkerHealthState::Serving
+        );
+    }
 
     #[test]
     fn zmq_transport_advertises_token_only_wire_without_the_caller_asking() {
@@ -709,6 +923,7 @@ mod tests {
             max_concurrent_requests: 32,
             engine_attributes: HashMap::new(),
             health: Arc::clone(&health),
+            engine_link: None,
         });
 
         let starting = control

@@ -66,11 +66,11 @@ def _backend_arg_int(backend_args: list[str], flag: str, default: int) -> int:
 # collide with SOME worker's handshake listener for the right ipc path.
 _ZMQ_HANDSHAKE_PORT_BASE = 20000
 _ZMQ_HANDSHAKE_PORT_SPAN = 10000
-# Over ZMQ the sidecar binds its control listener only after
-# `ZmqWorkerTransport::connect` completes the engine handshake, and
-# `bindings/python/src/worker_control.rs` deliberately allows 610s for that
-# (model load). Keep the two budgets in sync so a slow-loading model is not
-# torn down by the shorter `--worker-startup-timeout`.
+# Over ZMQ the sidecar binds its control listener immediately and reports
+# STARTING while `ZmqWorkerTransport::connect` completes the engine handshake
+# in the background -- which is the model load, so allow it the same budget
+# the direct-ZMQ path gets. A shorter `--worker-startup-timeout` must not tear
+# down a slow-loading model.
 _ZMQ_SIDECAR_STARTUP_TIMEOUT_SECS = 610
 
 
@@ -1060,16 +1060,14 @@ class ServeOrchestrator:
                         f"SMG Worker sidecar on port {control_port} exited "
                         f"with code {proc.returncode}"
                     )
-                try:
-                    with socket.create_connection((host, control_port), timeout=1.0):
-                        logger.info(
-                            "SMG Worker sidecar on %s:%d is accepting connections",
-                            host,
-                            control_port,
-                        )
-                        break
-                except OSError:
-                    time.sleep(0.2)
+                # The sidecar serves standard grpc.health.v1 alongside
+                # WorkerControl and answers SERVING only once its engine
+                # transport is connected; a bare TCP connect would succeed as
+                # soon as the listener binds, long before the engine is usable.
+                if _grpc_health_check(host, control_port, timeout=2.0):
+                    logger.info("SMG Worker sidecar on %s:%d is serving", host, control_port)
+                    break
+                time.sleep(1.0)
             else:
                 raise TimeoutError(
                     f"SMG Worker sidecar on port {control_port} not healthy within "
@@ -1177,8 +1175,8 @@ class ServeOrchestrator:
             except (ProcessLookupError, OSError):
                 pass
 
-        # Wait up to _WORKER_SHUTDOWN_TIMEOUT seconds for graceful exit
-        deadline = time.monotonic() + _WORKER_SHUTDOWN_TIMEOUT
+        # Wait up to `timeout` seconds for graceful exit
+        deadline = time.monotonic() + timeout
         for proc, _ in processes:
             remaining = max(0, deadline - time.monotonic())
             try:

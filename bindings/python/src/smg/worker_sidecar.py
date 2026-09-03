@@ -75,7 +75,16 @@ def main(argv: list[str] | None = None) -> None:
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
-    stopped.wait()
+    # The control listener is up and reports STARTING while the Rust side
+    # connects the engine transport in the background. Health flips to
+    # SERVING on its own once that succeeds; if it fails, the failure lands in
+    # `last_error` and there is nothing left for this process to do.
+    while not stopped.wait(1.0):
+        error = server.last_error
+        if error:
+            server.set_health("not_serving", error)
+            server.stop(1.0)
+            raise SystemExit(f"SMG Worker sidecar cannot serve: {error}")
     time.sleep(args.drain_secs)
     server.set_health("not_serving", "stopped")
     server.stop(max(1.0, args.drain_secs))
