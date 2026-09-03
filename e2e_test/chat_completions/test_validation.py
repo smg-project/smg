@@ -386,3 +386,47 @@ class TestEosTokenStripping:
         assert has_eos, (
             f"EOS token should be visible with no_stop_trim=true + skip_special_tokens=false: {content}"
         )
+
+
+# =============================================================================
+# Unknown model rejection (gRPC pipeline)
+# =============================================================================
+
+
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.gpu(1)
+@pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
+@pytest.mark.gateway(extra_args=["--history-backend", "memory"])
+@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+@pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
+class TestUnknownModelRejected:
+    """An unknown model must be rejected with 404 before the pipeline runs.
+
+    The gRPC pipeline tokenizes locally, so its preparation stage runs ahead
+    of worker selection. Without an up-front check, an unknown model reaches
+    tokenizer resolution and surfaces as a 500 ``tokenizer_not_found`` — a
+    client error reported as a server fault. The responses endpoint already
+    fails fast with 404 ``model_not_found``; every gRPC entry point should.
+    """
+
+    UNKNOWN = "nonexistent-model-xyz"
+
+    def test_chat_unknown_model_is_404(self, api_client):
+        with pytest.raises((openai.NotFoundError, smg_client.NotFoundError)) as exc_info:
+            api_client.chat.completions.create(
+                model=self.UNKNOWN,
+                messages=[{"role": "user", "content": "Hello"}],
+                max_tokens=8,
+            )
+        assert exc_info.value.status_code == 404
+        assert exc_info.value.code == "model_not_found"
+
+    def test_completions_unknown_model_is_404(self, api_client):
+        with pytest.raises((openai.NotFoundError, smg_client.NotFoundError)) as exc_info:
+            api_client.completions.create(
+                model=self.UNKNOWN,
+                prompt="Hello",
+                max_tokens=8,
+            )
+        assert exc_info.value.status_code == 404
+        assert exc_info.value.code == "model_not_found"

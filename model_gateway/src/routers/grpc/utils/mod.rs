@@ -4,6 +4,7 @@ mod chat_utils;
 mod logprobs;
 pub(crate) mod message_utils;
 mod metrics;
+mod model_guard;
 mod parsers;
 pub(crate) mod tonic_ext;
 
@@ -20,6 +21,7 @@ pub(crate) use logprobs::{
     convert_proto_to_openai_logprobs,
 };
 pub(crate) use metrics::{error_type_from_status, route_to_endpoint};
+pub(crate) use model_guard::validate_worker_availability;
 pub(crate) use parsers::{
     check_reasoning_parser_availability, check_tool_parser_availability, create_reasoning_parser,
     create_tool_parser, get_tool_parser, reasoning_parser_requires_special_tokens, ParserResolver,

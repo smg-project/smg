@@ -22,9 +22,7 @@ use tracing::debug;
 
 use super::{
     common::{
-        responses::{
-            handlers::cancel_response_impl, utils::validate_worker_availability, ResponsesContext,
-        },
+        responses::{handlers::cancel_response_impl, ResponsesContext},
         stages::{RateLimitCell, RateLimitOutcome},
     },
     context::SharedComponents,
@@ -33,14 +31,14 @@ use super::{
     multimodal::MultimodalComponents,
     pipeline::{Endpoint, PipelineDeps, RequestPipeline},
     regular::responses,
-    utils::ParserResolver,
+    utils::{validate_worker_availability, ParserResolver},
 };
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
     routers::{error, RouterTrait},
-    worker::{WorkerRegistry, WorkerType},
+    worker::{WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
 const QWEN3_ASR_LANGUAGES: &[(&str, &str)] = &[
@@ -465,6 +463,17 @@ impl GrpcRouter {
             .unwrap_or_else(|| self.retry_config.clone())
     }
 
+    /// Fail fast on an unknown model, before canonicalization and before the
+    /// pipeline. The gRPC pipeline tokenizes locally, so its preparation stage
+    /// runs ahead of worker selection; without this check an unknown model
+    /// reaches `resolve_tokenizer` and surfaces as a 500 `tokenizer_not_found`
+    /// instead of the 404 the client should see. Alias-safe: `contains_model`
+    /// resolves through `model_alias_index`, so this must run on the
+    /// client-supplied name, before [`Self::resolve_canonical_model_id`].
+    fn reject_unknown_model(&self, model_id: &str) -> Option<Response> {
+        validate_worker_availability(&self.worker_registry, model_id)
+    }
+
     /// Resolve `model_id` to its canonical form once, before the pipeline
     /// runs. Every dispatch attempt for that logical request reuses this
     /// value -- re-resolving mid-request would let an alias repointed during
@@ -505,6 +514,10 @@ impl GrpcRouter {
     ) -> Response {
         if let Err(response) = super::validate_text_only_output(&body) {
             return *response;
+        }
+
+        if let Some(response) = self.reject_unknown_model(model_id) {
+            return response;
         }
 
         // EPD has no Harmony pipeline, so its chat requests all use the single
@@ -563,6 +576,16 @@ impl GrpcRouter {
     ) -> Response {
         debug!("Processing generate request for model: {}", model_id);
 
+        // The wildcard sentinel is not a model name: `GenerateRequest.model`
+        // defaults to it when the body names no model, and worker selection
+        // widens it to the global pool (`get_routing_pool`). Only /generate
+        // carries that default, so only /generate exempts it here.
+        if model_id != UNKNOWN_MODEL_ID {
+            if let Some(response) = self.reject_unknown_model(model_id) {
+                return response;
+            }
+        }
+
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
         // doc comment. Rewrite the body's `model` field to match; see
         // `route_chat_impl`.
@@ -609,9 +632,8 @@ impl GrpcRouter {
         };
 
         // 0. Fast worker validation (fail-fast before expensive operations)
-        if let Some(error_response) = validate_worker_availability(&self.worker_registry, model_id)
-        {
-            return error_response;
+        if let Some(response) = self.reject_unknown_model(model_id) {
+            return response;
         }
 
         let (body, canonical_model_id) =
@@ -675,6 +697,10 @@ impl GrpcRouter {
         };
         debug!("Processing embedding request for model: {}", model_id);
 
+        if let Some(response) = self.reject_unknown_model(model_id) {
+            return response;
+        }
+
         embedding_pipeline
             .execute_embeddings(
                 Arc::new(body),
@@ -695,6 +721,10 @@ impl GrpcRouter {
         model_id: &str,
     ) -> Response {
         debug!("Processing messages request for model: {}", model_id);
+
+        if let Some(response) = self.reject_unknown_model(model_id) {
+            return response;
+        }
 
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
         // doc comment. Rewrite the body's `model` field to match; see
@@ -731,6 +761,10 @@ impl GrpcRouter {
         model_id: &str,
     ) -> Response {
         debug!("Processing completion request for model: {}", model_id);
+
+        if let Some(response) = self.reject_unknown_model(model_id) {
+            return response;
+        }
 
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
         // doc comment. Rewrite the body's `model` field to match; see
@@ -770,6 +804,10 @@ impl GrpcRouter {
             return not_implemented("Classify not implemented");
         };
         debug!("Processing classify request for model: {}", model_id);
+
+        if let Some(response) = self.reject_unknown_model(model_id) {
+            return response;
+        }
 
         classify_pipeline
             .execute_classify(
@@ -1230,6 +1268,12 @@ mod pd_tests {
         }
     }
 
+    fn regular_routing_mode() -> RoutingMode {
+        RoutingMode::Regular {
+            worker_urls: vec![],
+        }
+    }
+
     fn epd_routing_mode() -> RoutingMode {
         RoutingMode::EncodePrefillDecode {
             encode_urls: vec![],
@@ -1447,6 +1491,156 @@ mod pd_tests {
         );
         assert!(matches!(body, Cow::Borrowed(_)));
         assert!(matches!(model_id, Cow::Borrowed(_)));
+    }
+
+    fn json_request<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
+        serde_json::from_value(value).expect("request body")
+    }
+
+    /// Every entry point that tokenizes locally must reject an unknown model
+    /// with 404 before its pipeline runs, without needing a worker or engine.
+    /// The pipeline's preparation stage otherwise reaches `resolve_tokenizer`
+    /// first and surfaces the miss as a 500 `tokenizer_not_found`. Regular
+    /// mode is the one mode that serves all six (embeddings and classify are
+    /// single-worker only).
+    #[tokio::test]
+    async fn unknown_model_is_rejected_before_the_pipeline_on_every_endpoint() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let model = "nonexistent-model-xyz";
+        let user_message = json!([{"role": "user", "content": "hi"}]);
+
+        let responses: Vec<(&str, Response)> = vec![
+            (
+                "chat",
+                router
+                    .route_chat(
+                        None,
+                        &tenant_meta,
+                        json_request(json!({"model": model, "messages": user_message})),
+                        model,
+                    )
+                    .await,
+            ),
+            (
+                "generate",
+                router
+                    .route_generate(
+                        None,
+                        &tenant_meta,
+                        json_request(json!({"model": model, "text": "hi"})),
+                        model,
+                    )
+                    .await,
+            ),
+            (
+                "completion",
+                router
+                    .route_completion(
+                        None,
+                        &tenant_meta,
+                        json_request(json!({"model": model, "prompt": "hi"})),
+                        model,
+                    )
+                    .await,
+            ),
+            (
+                "embeddings",
+                router
+                    .route_embeddings(
+                        None,
+                        &tenant_meta,
+                        json_request(json!({"model": model, "input": "hi"})),
+                        model,
+                    )
+                    .await,
+            ),
+            (
+                "messages",
+                router
+                    .route_messages(
+                        None,
+                        &tenant_meta,
+                        json_request(json!({
+                            "model": model,
+                            "max_tokens": 16,
+                            "messages": user_message,
+                        })),
+                        model,
+                    )
+                    .await,
+            ),
+            (
+                "classify",
+                router
+                    .route_classify(
+                        None,
+                        &tenant_meta,
+                        json_request(json!({"model": model, "input": "hi"})),
+                        model,
+                    )
+                    .await,
+            ),
+        ];
+
+        for (endpoint, response) in responses {
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{endpoint}: unknown model must be rejected before the pipeline"
+            );
+        }
+    }
+
+    /// `/generate` is the one entry point whose `model` defaults to the
+    /// wildcard sentinel, which worker selection widens to the global pool.
+    /// The pre-pipeline guard must not mistake it for a model name.
+    #[tokio::test]
+    async fn generate_wildcard_model_is_not_rejected_as_unknown() {
+        let ctx = grpc_ctx(pd_routing_mode()).await;
+        let worker = BasicWorkerBuilder::new("grpc://decode:30000")
+            .worker_type(WorkerType::Decode)
+            .connection_mode(ConnectionMode::Grpc)
+            .model(ModelCard::new("canonical-model"))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        ctx.worker_registry
+            .register(Arc::new(worker))
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::PrefillDecode).expect("pd router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        // A model-less body deserializes with the wildcard, exactly as the
+        // server hands it to the router.
+        let body: GenerateRequest = json_request(json!({"text": "hi"}));
+        assert_eq!(body.model, UNKNOWN_MODEL_ID);
+        let response = router
+            .route_generate(None, &tenant_meta, body, UNKNOWN_MODEL_ID)
+            .await;
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "the /generate wildcard must reach the pipeline, not be rejected as an unknown model"
+        );
+
+        // The exemption is /generate-only: a literal "unknown" model name on
+        // any other endpoint is still just an unknown model.
+        let response = router
+            .route_chat(
+                None,
+                &tenant_meta,
+                json_request(json!({
+                    "model": UNKNOWN_MODEL_ID,
+                    "messages": [{"role": "user", "content": "hi"}],
+                })),
+                UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// A per-model retry override must survive an alias. The override is keyed
