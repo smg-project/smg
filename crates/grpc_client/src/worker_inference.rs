@@ -275,31 +275,27 @@ impl proto::worker_inference_server::WorkerInference for TokenSpeedWorkerInferen
             .client
             .generate(into_tokenspeed_request(request.into_inner()))
             .await?;
-        // TokenSpeed's gRPC chunks are cumulative, but `GenerateStreamChunk` is
-        // specified as a delta. Drain what has already been emitted per index
-        // here, so every Worker adapter puts the same shape on the wire and the
-        // Router's accumulation does not have to know which engine is behind
-        // this Worker.
-        let emitted_by_index: HashMap<u32, usize> = HashMap::new();
-        let stream = futures::stream::unfold(
-            (stream, emitted_by_index),
-            |(mut stream, mut emitted_by_index)| async move {
-                let item = stream.next().await?;
-                let mapped = item.map(from_tokenspeed_response).and_then(|response| {
-                    drain_emitted_chunk_tokens(response, &mut emitted_by_index)
-                });
-                if matches!(
-                    &mapped,
-                    Ok(proto::GenerateResponse {
-                        response: Some(proto::generate_response::Response::Complete(_)),
-                        ..
-                    })
-                ) {
-                    stream.mark_completed();
-                }
-                Some((mapped, (stream, emitted_by_index)))
-            },
-        );
+        // TokenSpeed's gRPC chunks already carry the delta shape that
+        // `GenerateStreamChunk` specifies: `tokenspeed_scheduler.proto`
+        // documents `token_ids` as "generated tokens since the previous
+        // chunk", and the servicer slices logprobs down to the same frame.
+        // Pass them through unchanged -- re-deriving deltas here would treat
+        // every chunk after the first as an already-emitted prefix and drain
+        // it to nothing. Only `Complete` is cumulative, as on every lane.
+        let stream = futures::stream::unfold(stream, |mut stream| async move {
+            let item = stream.next().await?;
+            let mapped = item.map(from_tokenspeed_response);
+            if matches!(
+                &mapped,
+                Ok(proto::GenerateResponse {
+                    response: Some(proto::generate_response::Response::Complete(_)),
+                    ..
+                })
+            ) {
+                stream.mark_completed();
+            }
+            Some((mapped, stream))
+        });
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -967,27 +963,6 @@ pub fn into_tokenspeed_request(request: proto::GenerateRequest) -> ts::GenerateR
     }
 }
 
-/// Turn a cumulative chunk into the delta `GenerateStreamChunk` specifies, by
-/// dropping the prefix already emitted for that `index`. `Complete` frames are
-/// cumulative by contract and pass through untouched.
-fn drain_emitted_chunk_tokens(
-    mut response: proto::GenerateResponse,
-    emitted_by_index: &mut HashMap<u32, usize>,
-) -> Result<proto::GenerateResponse, Status> {
-    let Some(proto::generate_response::Response::Chunk(chunk)) = response.response.as_mut() else {
-        return Ok(response);
-    };
-    let emitted = emitted_by_index.entry(chunk.index).or_default();
-    if chunk.token_ids.len() < *emitted {
-        return Err(Status::internal(
-            "engine returned a shorter cumulative token sequence",
-        ));
-    }
-    chunk.token_ids.drain(..*emitted);
-    *emitted += chunk.token_ids.len();
-    Ok(response)
-}
-
 pub fn from_tokenspeed_response(response: ts::GenerateResponse) -> proto::GenerateResponse {
     use ts::generate_response::Response;
     proto::GenerateResponse {
@@ -1433,49 +1408,6 @@ mod tests {
             let vllm_shaped = into_vllm_response(response.clone());
             assert_eq!(from_vllm_response(&request_id, vllm_shaped), response);
         }
-    }
-
-    #[test]
-    fn cumulative_engine_chunks_are_drained_into_deltas() {
-        // `GenerateStreamChunk` is specified as a delta. TokenSpeed streams
-        // cumulatively, so its adapter has to drain what it already emitted --
-        // otherwise the Router accumulates each chunk's full prefix again.
-        let chunk = |token_ids: Vec<u32>, index: u32| proto::GenerateResponse {
-            request_id: "cumulative".to_string(),
-            response: Some(proto::generate_response::Response::Chunk(
-                proto::GenerateStreamChunk {
-                    token_ids,
-                    index,
-                    ..Default::default()
-                },
-            )),
-        };
-        let tokens_of = |response: proto::GenerateResponse| match response.response {
-            Some(proto::generate_response::Response::Chunk(chunk)) => chunk.token_ids,
-            other => panic!("expected a chunk, got {other:?}"),
-        };
-
-        let mut emitted = HashMap::new();
-        assert_eq!(
-            tokens_of(drain_emitted_chunk_tokens(chunk(vec![1], 0), &mut emitted).unwrap()),
-            vec![1]
-        );
-        assert_eq!(
-            tokens_of(drain_emitted_chunk_tokens(chunk(vec![1, 2, 3], 0), &mut emitted).unwrap()),
-            vec![2, 3]
-        );
-        // Indices are tracked independently for n>1.
-        assert_eq!(
-            tokens_of(drain_emitted_chunk_tokens(chunk(vec![9], 1), &mut emitted).unwrap()),
-            vec![9]
-        );
-        // A shorter sequence than already emitted is an engine bug, not a delta.
-        assert_eq!(
-            drain_emitted_chunk_tokens(chunk(vec![], 0), &mut emitted)
-                .expect_err("shrinking sequence")
-                .code(),
-            tonic::Code::Internal
-        );
     }
 
     #[test]

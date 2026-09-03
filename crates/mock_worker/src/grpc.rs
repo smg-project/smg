@@ -413,3 +413,103 @@ fn snapshot_to_scheduler_load(s: &engine::LoadSnapshot) -> ts::SchedulerLoad {
         queues: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use smg_grpc_client::worker_inference::TokenSpeedWorkerInference;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use worker_inference::generate_response::Response as WorkerResp;
+
+    use super::*;
+    use crate::engine::EngineParams;
+
+    fn config(output_tokens: u32) -> Arc<Config> {
+        Arc::new(Config {
+            host: "127.0.0.1".to_string(),
+            http_base_port: 0,
+            http_count: 0,
+            grpc_base_port: 19_000,
+            grpc_count: 1,
+            zmq_handshake: None,
+            zmq_count: 0,
+            zmq_start_index: 0,
+            model_id: "mock-model".to_string(),
+            tokenizer_path: "mock-model".to_string(),
+            gen_delay: std::time::Duration::ZERO,
+            output_tokens,
+            realistic: false,
+            engine: EngineParams::default(),
+        })
+    }
+
+    /// Drives the Worker's TokenSpeed gRPC adapter through a real stream. The
+    /// scheduler wire already emits delta chunks (one new token per frame
+    /// here, as `tokenspeed_scheduler.proto` specifies), so every chunk must
+    /// reach the `WorkerInference` wire intact. An adapter that re-derived
+    /// deltas from a cumulative assumption would drain every chunk after the
+    /// first to nothing while `Complete` still looked right.
+    #[tokio::test]
+    async fn tokenspeed_adapter_passes_delta_chunks_through_unchanged() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let scheduler = MockScheduler {
+            cfg: config(4),
+            engine: None,
+        };
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(async move {
+            Server::builder()
+                .add_service(TokenSpeedSchedulerServer::new(scheduler))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+        });
+
+        let adapter = TokenSpeedWorkerInference::connect(&format!("http://{address}"))
+            .await
+            .unwrap();
+        let request = worker_inference::GenerateRequest {
+            request_id: "delta-passthrough".to_string(),
+            tokenized: Some(worker_inference::TokenizedInput {
+                input_ids: vec![1, 2, 3],
+                original_text: String::new(),
+            }),
+            sampling_params: Some(worker_inference::SamplingParams {
+                max_new_tokens: Some(4),
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+        let mut stream = WorkerInference::generate(&adapter, Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let mut chunk_tokens = Vec::new();
+        let mut complete = None;
+        while let Some(item) = stream.next().await {
+            let response = item.unwrap();
+            assert_eq!(response.request_id, "delta-passthrough");
+            match response.response.unwrap() {
+                WorkerResp::Chunk(chunk) => {
+                    assert_eq!(chunk.index, 0);
+                    chunk_tokens.push(chunk.token_ids);
+                }
+                WorkerResp::Complete(done) => {
+                    assert!(complete.replace(done).is_none(), "one Complete per stream");
+                }
+            }
+        }
+
+        // Every frame keeps its own token; nothing is drained as a prefix.
+        assert_eq!(
+            chunk_tokens,
+            vec![vec![100], vec![101], vec![102], vec![103]]
+        );
+        let complete = complete.expect("stream ends with Complete");
+        assert_eq!(complete.output_ids, vec![100, 101, 102, 103]);
+        assert_eq!(complete.finish_reason, "stop");
+        assert_eq!(complete.completion_tokens, 4);
+        servers.abort_all();
+    }
+}
