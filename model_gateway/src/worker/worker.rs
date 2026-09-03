@@ -1870,8 +1870,38 @@ impl Worker for BasicWorker {
                     state = state.as_str_name(),
                     "SMG Worker control health response"
                 );
-                if state != WorkerHealthState::Serving {
-                    return Ok(false);
+                match state {
+                    WorkerHealthState::Serving => {}
+                    // Still serving, with a warning: the Worker keeps taking
+                    // requests, so keep routing to it rather than treat a
+                    // self-reported degradation like a crash.
+                    WorkerHealthState::Degraded => {
+                        tracing::warn!(
+                            worker_url = %self.metadata.spec.url,
+                            control_url,
+                            message = %health.message,
+                            "SMG Worker reports DEGRADED; keeping it in rotation"
+                        );
+                    }
+                    // Draining rejects new work immediately, so take the worker
+                    // out of rotation now instead of after `failure_threshold`
+                    // more probes -- every request placed on it meanwhile is a
+                    // 503. The readiness machine still owns recovery: a Worker
+                    // that comes back SERVING re-admits through NotReady.
+                    WorkerHealthState::Draining => {
+                        if self.status() == WorkerStatus::Ready {
+                            tracing::warn!(
+                                worker_url = %self.metadata.spec.url,
+                                control_url,
+                                "SMG Worker is DRAINING; removing it from rotation"
+                            );
+                            self.set_status(WorkerStatus::NotReady);
+                        }
+                        return Ok(false);
+                    }
+                    WorkerHealthState::Starting
+                    | WorkerHealthState::NotServing
+                    | WorkerHealthState::Unspecified => return Ok(false),
                 }
 
                 let adopted = self.smg_instance_id.load_full();
