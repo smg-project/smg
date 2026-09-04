@@ -241,6 +241,7 @@ impl Router {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
+        remote_overlap: Option<&crate::policies::RemoteOverlap>,
     ) -> Option<Arc<dyn Worker>> {
         let candidates = self
             .worker_registry
@@ -271,7 +272,10 @@ impl Router {
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
-        let idx = self.policy_registry.select_worker(
+        // The remote overlap steers the cache_aware policy toward a prompt
+        // holder when the shared index answered; with `None` this is
+        // identical to the plain `select_worker`.
+        let idx = self.policy_registry.select_worker_with_remote(
             &policy,
             available,
             &SelectWorkerInfo {
@@ -283,6 +287,7 @@ impl Router {
                 hash_ring,
                 leg: crate::policies::WorkerLeg::Single,
             },
+            remote_overlap,
         )?;
 
         // Record worker selection metric (Layer 3)
@@ -522,8 +527,60 @@ impl Router {
         canonical_model: Option<&str>,
         is_stream: bool,
     ) -> Response {
+        // Remote-index prefetch (--kv-indexer-url): resolve the shared-index
+        // overlap before selection so cache_aware can steer to a worker that
+        // already holds the prompt prefix, and keep the prediction for the
+        // post-dispatch placement publish. The routing inputs are hoisted to
+        // owned copies because the query awaits and the lease view cannot be
+        // borrowed across it; gated on the flag so it is zero-cost when the
+        // shared index is off.
+        let mut remote_overlap: Option<crate::policies::RemoteOverlap> = None;
+        let mut index_prediction: Option<crate::policies::remote_index::IndexPrediction> = None;
+        if self.policy_registry.remote_index_enabled() {
+            let (owned_tokens, owned_text, owned_rid) = lease.with_view(|view| {
+                (
+                    view.tokens.map(<[u32]>::to_vec),
+                    view.text.map(str::to_string),
+                    view.rid_key.map(str::to_string),
+                )
+            });
+            // Prefer the token tree (stronger, token-prefix affinity);
+            // fall back to string mode (raw-byte prefix) only when the
+            // request carries text but no tokens.
+            let resolved = if owned_tokens.is_some() {
+                self.policy_registry
+                    .resolve_remote_overlap(
+                        model_id,
+                        owned_tokens.as_deref(),
+                        headers,
+                        owned_rid.as_deref(),
+                    )
+                    .await
+            } else {
+                self.policy_registry
+                    .resolve_remote_overlap_bytes(
+                        model_id,
+                        owned_text.as_deref(),
+                        headers,
+                        owned_rid.as_deref(),
+                    )
+                    .await
+            };
+            if let Some((overlap, prediction)) = resolved {
+                remote_overlap = Some(overlap);
+                index_prediction = Some(prediction);
+            }
+        }
+
         let worker = match lease.with_view(|view| {
-            self.select_worker_for_model(model_id, view.text, view.tokens, headers, view.rid_key)
+            self.select_worker_for_model(
+                model_id,
+                view.text,
+                view.tokens,
+                headers,
+                view.rid_key,
+                remote_overlap.as_ref(),
+            )
         }) {
             Some(w) => w,
             None => {
@@ -604,6 +661,18 @@ impl Router {
 
         let status = response.status();
         worker.record_outcome(status.as_u16());
+
+        // Publish the routing-time prompt chain as a placement for the
+        // dispatched worker on success only (never on error/retry, which
+        // must not advertise a phantom holder). HTTP does not surface the
+        // generated output tokens, so there is no prompt (+) output refine —
+        // the prompt-only placement is final.
+        if status.is_success() {
+            if let Some(prediction) = &index_prediction {
+                self.policy_registry
+                    .publish_placement(prediction, worker.url(), None);
+            }
+        }
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {
@@ -1689,11 +1758,19 @@ impl Router {
         // Streamed requests have no readable body, hence no rid key;
         // routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
+        // The streamed pass-through selects under `UNKNOWN_MODEL_ID` (the
+        // body, and thus the real model, is never read here). The shared
+        // index is keyed by model, so participating from this path would
+        // publish into a different keyspace than the buffered path's real
+        // model — fragmenting the index for mixed buffered/streamed traffic.
+        // It stays on plain selection (overlap `None`) until the streamed
+        // path can resolve the model without buffering.
         let Some(worker) = self.select_worker_for_model(
             model_id,
             None,
             hinted_tokens.as_deref(),
             Some(req.headers()),
+            None,
             None,
         ) else {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
@@ -2353,7 +2430,14 @@ mod tests {
         let router = create_test_unhealthy_router();
 
         let selected = router
-            .select_worker_for_model(crate::worker::UNKNOWN_MODEL_ID, None, None, None, None)
+            .select_worker_for_model(
+                crate::worker::UNKNOWN_MODEL_ID,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert!(selected.is_available());
 
@@ -2361,7 +2445,14 @@ mod tests {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
         }
         assert!(router
-            .select_worker_for_model(crate::worker::UNKNOWN_MODEL_ID, None, None, None, None)
+            .select_worker_for_model(
+                crate::worker::UNKNOWN_MODEL_ID,
+                None,
+                None,
+                None,
+                None,
+                None
+            )
             .is_none());
     }
 

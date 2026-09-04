@@ -105,6 +105,10 @@ pub(crate) struct PipelineDeps {
 impl PipelineDeps {
     /// Full deps for the chat/messages/harmony endpoints, which consume the
     /// configured parser factories/overrides.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one-time deps wiring at router construction"
+    )]
     pub(crate) fn new(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
@@ -231,6 +235,10 @@ pub(crate) struct RequestPipeline {
     backend_type: &'static str,
     /// Disaggregation mode, for per-leg retry metric labels.
     mode: Mode,
+    /// Owns the remote-index placement publish (no-op unless the shared
+    /// index is configured). Held here so the post-dispatch success paths
+    /// can publish without re-plumbing a handle through every router.
+    policy_registry: Arc<PolicyRegistry>,
 }
 
 /// Outcome of one full pipeline run.
@@ -393,6 +401,7 @@ impl RequestPipeline {
             stages: Arc::new(stages),
             backend_type: backend,
             mode,
+            policy_registry: deps.policy_registry.clone(),
         })
     }
 
@@ -588,9 +597,18 @@ impl RequestPipeline {
                             attempt_start.elapsed(),
                         );
                     }
+                    // The selected worker is prefilling this prompt NOW —
+                    // feed the remote index (streaming responses never pass
+                    // through an endpoint's Final arm, and before this,
+                    // streaming/chat traffic queried the index but never
+                    // fed it).
+                    self.publish_dispatch_placement(&dctx);
                     return Ok(RunOutcome::Early(response));
                 }
-                Ok(None) => return Ok(RunOutcome::Final(dctx, attempt_start)),
+                Ok(None) => {
+                    self.publish_dispatch_placement(&dctx);
+                    return Ok(RunOutcome::Final(dctx, attempt_start));
+                }
                 Err(response) => response,
             };
 
@@ -702,6 +720,28 @@ impl RequestPipeline {
             metrics_labels::ERROR_INTERNAL,
         );
         error::internal_error("wrong_response_type", "Internal error: wrong response type")
+    }
+
+    /// Publish the routing-time prompt chain as a placement for the worker
+    /// the successful attempt dispatched to. Runs on both the Early
+    /// (streaming) and Final (buffered) success paths, after dispatch and
+    /// never on shed/retry failures (a failed attempt must not create
+    /// phantom placements). The generated tail lands one turn later inside
+    /// the follow-up prompt's chain.
+    fn publish_dispatch_placement(&self, dctx: &DispatchContext) {
+        let Some(prediction) = &dctx.index_prediction else {
+            return;
+        };
+        // Publish the prompt chain under the worker that holds the prompt
+        // prefix: the sole worker in Regular mode, the prefill worker in
+        // disaggregated PD/EPD (decode/encode never hold the prompt KV).
+        let holder = match &dctx.workers {
+            Some(WorkerSelection::Single { worker }) => worker,
+            Some(WorkerSelection::Disaggregated { prefill, .. }) => prefill,
+            None => return,
+        };
+        self.policy_registry
+            .publish_placement(prediction, holder.url(), None);
     }
 
     fn no_response_produced(
@@ -819,7 +859,47 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    let mut http_response = axum::Json(&response).into_response();
+                    // Buffered generate can refine the run()-published
+                    // prompt placement with the generated tail (the worker's
+                    // KV spans prompt ⊕ output; stores dedupe on the shared
+                    // prefix), and echoes the prediction so the harness can
+                    // separate index error from policy spill. Regular mode
+                    // only: in disaggregated PD/EPD the prefill worker holds
+                    // the prompt but not the generated output, so its
+                    // prompt-only placement (published in run()) is final.
+                    if let Some(prediction) = &dctx.index_prediction {
+                        if let Some(WorkerSelection::Single { worker }) = &dctx.workers {
+                            // Prompt ⊕ output re-hash when both are present;
+                            // otherwise the policy republishes the prompt chain.
+                            let refined: Option<Vec<u32>> =
+                                match (dctx.routing.token_ids.is_empty(), response.first()) {
+                                    (false, Some(first)) => {
+                                        let mut all = dctx.routing.token_ids.clone();
+                                        all.extend_from_slice(&first.output_ids);
+                                        Some(all)
+                                    }
+                                    _ => None,
+                                };
+                            self.policy_registry.publish_placement(
+                                prediction,
+                                worker.url(),
+                                refined.as_deref(),
+                            );
+                            let headers = http_response.headers_mut();
+                            if let Ok(value) = prediction
+                                .predicted_tokens_for(worker.url())
+                                .to_string()
+                                .parse()
+                            {
+                                headers.insert("x-smg-index-predicted-tokens", value);
+                            }
+                            if let Ok(value) = prediction.source().parse() {
+                                headers.insert("x-smg-index-source", value);
+                            }
+                        }
+                    }
+                    http_response
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_generate",

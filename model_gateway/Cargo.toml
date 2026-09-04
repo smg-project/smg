@@ -78,6 +78,7 @@ llm-tokenizer.workspace = true
 smg-auth.workspace = true
 smg-mcp.workspace = true
 kv-index.workspace = true
+radix-index = { path = "../crates/radix_index" }
 smg-data-connector.workspace = true
 llm-multimodal = { workspace = true, default-features = false }
 smg-mm-rdma.workspace = true

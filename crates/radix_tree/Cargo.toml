@@ -1,0 +1,16 @@
+[package]
+name = "radix-tree"
+version = "0.1.0"
+edition = "2021"
+description = "Generic prefix-membership index"
+license = "Apache-2.0"
+
+[dependencies]
+# Zero SMG dependencies. External utility crates only.
+rustc-hash = "2"
+
+
+[dev-dependencies]
+# The differential oracle. Dev-only: the published crate never
+# depends on SMG code.
+kv-index = { path = "../kv_index" }

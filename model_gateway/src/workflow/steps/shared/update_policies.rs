@@ -153,12 +153,29 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
                     .init_cache_aware_policy(&model_id, &all_workers);
             }
 
-            // Start KV event subscription for gRPC workers with cache_aware policy
-            if cache_aware {
+            // Start KV event subscription for gRPC workers with cache_aware
+            // policy — unless a remote radix index is configured, which
+            // REPLACES per-gateway indexing (that duplication is the memory
+            // cost the remote index exists to remove, and a warm local
+            // index would silently absorb remote misses).
+            if cache_aware && app_context.remote_index.is_none() {
                 if let Some(ref monitor) = app_context.kv_event_monitor {
                     if *worker.connection_mode() == ConnectionMode::Grpc {
                         monitor.on_worker_added(worker).await;
                     }
+                }
+            }
+
+            // With a remote index, a (re)registering worker may sit under a
+            // standing soft-retire from a previous same-URL life; announce
+            // it so scoring resumes immediately instead of waiting for its
+            // first event batch.
+            if cache_aware {
+                if let Some(ref handle) = app_context.remote_index {
+                    handle
+                        .client()
+                        .publish_added(&model_id, handle.block_size() as u32, worker.url())
+                        .await;
                 }
             }
 

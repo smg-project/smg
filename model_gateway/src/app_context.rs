@@ -78,6 +78,9 @@ pub struct AppContext {
     pub worker_client_cache: Arc<WorkerHttpClientCache>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    /// Remote radix index client (`--kv-indexer-url`); `None` leaves
+    /// every routing path on local-index behavior.
+    pub remote_index: Option<Arc<crate::policies::remote_index::RemoteIndexHandle>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
     /// Bind address for WebRTC UDP sockets (`None` = `0.0.0.0`, auto-detect).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -114,6 +117,7 @@ pub struct AppContextBuilder {
     mcp_format_registry: Option<FormatRegistry>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    remote_index: Option<Arc<crate::policies::remote_index::RemoteIndexHandle>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
 }
@@ -168,6 +172,7 @@ impl AppContextBuilder {
             mcp_format_registry: None,
             wasm_manager: None,
             kv_event_monitor: None,
+            remote_index: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         }
@@ -403,6 +408,7 @@ impl AppContextBuilder {
             worker_client_cache,
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
+            remote_index: self.remote_index,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
             webrtc_stun_server: self.webrtc_stun_server,
@@ -730,6 +736,28 @@ impl AppContextBuilder {
             }
 
             self.kv_event_monitor = Some(monitor);
+        }
+
+        // Remote radix index: one client handle per process. Kept on the
+        // context for the worker add/drop lifecycle signals, and injected
+        // into the PolicyRegistry so every router shares the routing-time
+        // overlap query + placement publish through one call. Unset leaves
+        // every code path on its exact prior behavior.
+        if let Some(url) = &config.kv_indexer_url {
+            let handle = crate::policies::remote_index::RemoteIndexHandle::connect(
+                url,
+                // Default shared with the bridge's --block-size: the
+                // keyspace key includes block size, and divergent
+                // defaults would silently split the fleet's state into
+                // two keyspaces that never answer each other.
+                config
+                    .kv_indexer_block_size
+                    .unwrap_or(radix_index::DEFAULT_BLOCK_SIZE) as usize,
+            );
+            if let Some(ref registry) = self.policy_registry {
+                registry.set_remote_index(Some(Arc::clone(&handle)));
+            }
+            self.remote_index = Some(handle);
         }
 
         self

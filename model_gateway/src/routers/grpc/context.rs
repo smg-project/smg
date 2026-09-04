@@ -209,6 +209,11 @@ pub(crate) struct ProcessingState {
     // Stage 3: Client acquisition outputs
     pub clients: Option<ClientSelection>,
 
+    /// Remote radix-index prefetch outcome (selection stage), consumed by
+    /// the placement publish and the response echo headers. `None` unless
+    /// `--kv-indexer-url` is set and the request took the prefetch path.
+    pub index_prediction: Option<crate::policies::remote_index::IndexPrediction>,
+
     // Response processing state seeded during ingress (stop decoder, router
     // stop obligations, derived skip_special_tokens).
     pub response: ResponseState,
@@ -277,6 +282,9 @@ pub(crate) struct DispatchContext {
     pub encode_outputs: Option<EncodeOutputs>,
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
+    /// Remote radix-index prefetch outcome, carried across the build
+    /// boundary for the placement publish and response echo headers.
+    pub index_prediction: Option<crate::policies::remote_index::IndexPrediction>,
     pub response: ResponseState,
 }
 
@@ -815,6 +823,7 @@ impl RequestContext {
             encode_outputs: state.encode_outputs,
             dispatch: None,
             load_guards: None,
+            index_prediction: state.index_prediction,
             response: state.response,
         })
     }

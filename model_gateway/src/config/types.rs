@@ -127,6 +127,19 @@ pub struct RouterConfig {
     /// `None`/`0` disables the TTL pass (default, preserving unbounded growth).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_indexer_ttl_secs: Option<u64>,
+    /// Remote radix index endpoint for cache-aware routing. When set, the
+    /// gateway prefetches per-holder overlap scores from the shared index
+    /// service on the selection path (hard per-query deadline, falling
+    /// back to expected-wait) and publishes placements after successful
+    /// dispatch. Unset (default) leaves routing byte-identical to before
+    /// this option existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_indexer_url: Option<String>,
+    /// Keyspace block size for the remote radix index: the ENGINE page
+    /// size the index was fed at (worker events / bridge --block-size),
+    /// which query hashing must match exactly. Default 128.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_indexer_block_size: Option<u32>,
     /// Capacity ceiling per model for the positional indexer, enforced by the
     /// same periodic prune: beyond it, oldest-touched entries are evicted down
     /// to 90% of the ceiling. `None`/`0` disables the ceiling (default).
@@ -1095,6 +1108,8 @@ impl Default for RouterConfig {
             worker_overload_waiting_requests: None,
             worker_overload_token_usage: None,
             kv_indexer_ttl_secs: None,
+            kv_indexer_url: None,
+            kv_indexer_block_size: None,
             kv_indexer_max_entries: None,
             engine_metrics: false,
             multimodal_tensor_transport: None,

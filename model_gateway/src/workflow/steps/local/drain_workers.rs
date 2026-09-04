@@ -178,6 +178,7 @@ mod tests {
             worker_service: Arc::new(WorkerService::new(registry, job_queue, router_config)),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
+            remote_index: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,

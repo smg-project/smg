@@ -1,0 +1,87 @@
+# Reference deployment: 2-replica radix index behind one stable Service
+# name per replica (headless). Gateways point --kv-indexer-url at ONE
+# replica address (or a per-zone one); replicas relay to each other and
+# a restarting replica bootstraps from its sibling before going ready.
+#
+# Sizing note: state is hash-only (no tokens); production-scale fleets
+# measured ~275 B/entry in-process. Set memory limits from your fleet's
+# total block count, and default-capacity-blocks from engine KV size /
+# page size so inferred holders stay bounded.
+apiVersion: v1
+kind: Service
+metadata:
+  name: radix-index
+spec:
+  clusterIP: None
+  selector:
+    app: radix-index
+  ports:
+    - name: grpc
+      port: 40000
+    - name: metrics
+      port: 40100
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: radix-index
+spec:
+  serviceName: radix-index
+  replicas: 2
+  selector:
+    matchLabels:
+      app: radix-index
+  template:
+    metadata:
+      labels:
+        app: radix-index
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: radix-index
+          image: REGISTRY/radix-index-service:VERSION
+          args:
+            - --bind=0.0.0.0
+            - --port=40000
+            - --metrics-port=40100
+            - --inferred-ttl-secs=180
+            # Relay to every sibling; self-relay is not a peer (each pod
+            # templates its own peer list via the ordinal hostname).
+            # For replicas: 2 the two pods are radix-index-0 / radix-index-1;
+            # an init script or an env-substituting entrypoint should drop
+            # the pod's own name from PEERS.
+            - --peers=$(PEERS)
+            - --bootstrap-from=$(BOOTSTRAP_FROM)
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Example for 2 replicas; template these per-ordinal in your
+            # deploy tooling (kustomize/helm) so each pod excludes itself.
+            - name: PEERS
+              value: "http://radix-index-0.radix-index:40000,http://radix-index-1.radix-index:40000"
+            - name: BOOTSTRAP_FROM
+              value: "http://radix-index-0.radix-index:40000"
+          ports:
+            - name: grpc
+              containerPort: 40000
+            - name: metrics
+              containerPort: 40100
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+            limits:
+              memory: 64Gi

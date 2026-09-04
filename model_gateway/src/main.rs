@@ -542,6 +542,18 @@ struct CliArgs {
     #[arg(long, help_heading = "Routing Policy")]
     kv_indexer_ttl_secs: Option<u64>,
 
+    /// Remote radix index endpoint (e.g. http://127.0.0.1:40000) for
+    /// cache-aware routing: overlap scores are prefetched from the shared
+    /// index on selection (hard deadline, expected-wait fallback) and
+    /// placements published after successful dispatch. Unset = off.
+    #[arg(long, help_heading = "Routing Policy")]
+    kv_indexer_url: Option<String>,
+
+    /// Keyspace block size for --kv-indexer-url queries: the ENGINE page
+    /// size the index was fed at (must match the bridge/worker events).
+    #[arg(long, help_heading = "Routing Policy")]
+    kv_indexer_block_size: Option<u32>,
+
     /// Capacity ceiling per model for the event-driven cache-aware indexer;
     /// beyond it, oldest-touched entries are pruned down to 90% of the
     /// ceiling. Unset or 0 disables the ceiling.
@@ -1819,6 +1831,8 @@ impl CliArgs {
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
             .worker_overload_token_usage(self.worker_overload_token_usage)
             .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
+            .kv_indexer_url(self.kv_indexer_url.clone())
+            .kv_indexer_block_size(self.kv_indexer_block_size)
             .kv_indexer_max_entries(self.kv_indexer_max_entries)
             .engine_metrics(self.engine_metrics)
             .multimodal_tensor_transport(self.multimodal_tensor_transport)

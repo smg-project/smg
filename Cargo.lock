@@ -6028,6 +6028,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "radix-index"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "kv-index",
+ "mock-worker",
+ "portpicker",
+ "prost",
+ "radix-tree",
+ "rand 0.10.2",
+ "rustc-hash 2.1.3",
+ "smg-grpc-client",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+ "tracing-subscriber",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "radix-tree"
+version = "0.1.0"
+dependencies = [
+ "kv-index",
+ "rustc-hash 2.1.3",
+]
+
+[[package]]
 name = "rand"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7437,6 +7468,7 @@ dependencies = [
  "portpicker",
  "prost",
  "prost-types",
+ "radix-index",
  "rand 0.10.2",
  "rayon",
  "reasoning-parser",

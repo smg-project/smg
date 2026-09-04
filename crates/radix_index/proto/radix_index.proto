@@ -1,0 +1,146 @@
+// Generic radix membership index: block-quantized prefix chains with
+// per-holder overlap scoring. The service knows nothing about LLMs —
+// symbols are opaque, hashes are the currency, holders carry opaque
+// metadata. Two data verbs (Publish, Subscribe) plus Pull for replica
+// bootstrap, which speaks the same Update vocabulary.
+syntax = "proto3";
+
+package radix_index;
+
+service RadixIndex {
+  // Every mutation, from any publisher: republished holder events
+  // (worker-sequenced), inferred placements (unsequenced, idempotent by
+  // content), and membership control. Acks carry the applied watermark
+  // per holder so publishers can resume after reconnect.
+  rpc Publish(stream Update) returns (stream PublishAck);
+
+  // Routing hot path: persistent bidi stream; each Query is answered by
+  // exactly one Match echoing its query_id. Late answers are the
+  // client's to drop.
+  rpc Subscribe(stream Query) returns (stream Match);
+
+  // Replica bootstrap: current state replayed as synthetic Updates.
+  // A booting replica applies the stream fully before serving.
+  rpc Pull(PullRequest) returns (stream Update);
+}
+
+enum SymbolKind {
+  SYMBOL_KIND_UNSPECIFIED = 0;
+  TOKENS = 1;
+  BYTES = 2;
+}
+
+// Index partition. Chains from different keyspaces never match each
+// other; a holder publishing a mismatched block_size for a keyspace is
+// rejected, never merged.
+message Keyspace {
+  string model = 1;
+  SymbolKind symbol_kind = 2;
+  uint32 block_size = 3;
+  // Wire hash scheme version; 0 (unset) means scheme 1. An index
+  // rejects updates/queries whose scheme it cannot serve, so hash
+  // drift fails loudly instead of matching nothing.
+  uint32 hash_scheme = 4;
+}
+
+message Block {
+  // Position-chained identity: for events, the engine's block_hash; for
+  // placements, the deterministic rolling prefix hash (chain_prefix_hash
+  // over content hashes) so all publishers synthesize identical chains.
+  fixed64 seq_hash = 1;
+  // Position-independent content hash (kv_index::compute_content_hash).
+  fixed64 content_hash = 2;
+}
+
+message Stored {
+  optional fixed64 parent_seq_hash = 1; // absent = sequence start
+  repeated Block blocks = 2;            // ascending positions
+}
+
+message Removed {
+  repeated fixed64 seq_hashes = 1;
+}
+
+// Membership / capacity control. event_fed pins the holder's feed
+// authority immediately (otherwise it flips on the first Removed).
+message Added {
+  uint64 capacity_blocks = 1;
+  bool event_fed = 2;
+  bytes metadata = 3;
+}
+
+// Duplicate-placement digest: re-publish a chain the index already
+// holds WITHOUT resending its blocks. `tip_seq_hash` is the chain's
+// rolling prefix hash at its last block; `len` its block count.
+// Placement holders are prefix-closed (contiguous adds, tail-only
+// truncation, no mid-chain removes), so the index confirms full
+// coverage by checking the tip key sits at position (start+len-1) —
+// one lookup, no contents. A miss (tip absent / wrong position /
+// holder not inferred) is answered with PublishAck.digest_miss so the
+// publisher resends the full chain: never a silent under-match.
+// Digests are unsequenced placement-only (seq 0, inferred holders).
+message StoredDigest {
+  optional fixed64 parent_seq_hash = 1; // absent = chain start
+  fixed64 tip_seq_hash = 2;
+  uint32 len = 3;
+}
+
+message Event {
+  oneof kind {
+    Stored stored = 1;
+    Removed removed = 2;
+    bool cleared = 3;
+    StoredDigest stored_digest = 4;
+  }
+}
+
+message Update {
+  Keyspace keyspace = 1;
+  string holder = 2;
+  // Holder generation (engine boot identity). A higher epoch implicitly
+  // clears all lower-epoch state for the holder; lower-epoch updates
+  // are dropped. Worker restarts and republisher cursor loss are both
+  // epoch bumps.
+  uint64 epoch = 3;
+  // Event feed: the holder's batch number; dedup + ordering key within
+  // (holder, epoch). 0 = unsequenced (placements / control), applied
+  // idempotently.
+  uint64 seq = 4;
+  // Batch-shaped: one seq may carry mixed Stored/Removed, mirroring
+  // engine event batches. Splitting one batch across seqs loses events.
+  repeated Event events = 5;
+  optional Added added = 6;
+  // Soft retire: stop scoring the holder; state expires by TTL.
+  bool dropped = 7;
+}
+
+message PublishAck {
+  string holder = 1;
+  uint64 epoch = 2;
+  uint64 applied_seq = 3;
+  // Set when a StoredDigest could not be confirmed: the publisher must
+  // resend that chain in full. Carries the unconfirmed tip so the
+  // publisher matches it to its buffered chain.
+  optional fixed64 digest_miss_tip = 4;
+}
+
+message Query {
+  uint64 query_id = 1;
+  Keyspace keyspace = 2;
+  // The request prefix as content hashes, block-aligned from position 0.
+  repeated fixed64 content_hashes = 3;
+}
+
+message HolderScore {
+  string holder = 1;
+  uint32 matched_blocks = 2;
+  uint64 total_blocks = 3;
+  bool event_fed = 4;
+}
+
+message Match {
+  uint64 query_id = 1;
+  repeated HolderScore scores = 2;
+}
+
+message PullRequest {}

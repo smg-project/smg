@@ -36,6 +36,18 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// Seed for XXH3 hashing.
 pub const XXH3_SEED: u64 = 1337;
 
+/// Rolling prefix hash over content hashes: `XXH3(prev || current)`, the
+/// same chaining `PositionalIndexer` computes internally. Exported so
+/// out-of-process publishers (the radix index service's placement feed)
+/// can synthesize byte-identical position chains for identical prefixes.
+#[inline]
+pub fn chain_prefix_hash(prev: SequenceHash, current: ContentHash) -> SequenceHash {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&prev.0.to_le_bytes());
+    bytes[8..].copy_from_slice(&current.0.to_le_bytes());
+    SequenceHash(xxhash_rust::xxh3::xxh3_64_with_seed(&bytes, XXH3_SEED))
+}
+
 /// Shard count for the main index DashMap.
 /// Tuned iteratively — higher values reduce per-shard contention under concurrent
 /// reads+writes at the cost of more memory for shard locks.
@@ -184,6 +196,36 @@ pub fn compute_request_content_hashes(tokens: &[u32], block_size: usize) -> Vec<
         .chunks(block_size)
         .filter(|chunk| chunk.len() == block_size)
         .map(compute_content_hash)
+        .collect()
+}
+
+/// Content hash of a raw byte block (position-independent), the byte-mode
+/// analogue of [`compute_content_hash`]. Same XXH3-64 hasher and seed,
+/// fed the bytes directly, so the two symbol kinds live in disjoint
+/// content-hash spaces without any shared state.
+pub fn compute_byte_content_hash(bytes: &[u8]) -> ContentHash {
+    use std::hash::Hasher;
+    let mut hasher = xxhash_rust::xxh3::Xxh3::with_seed(XXH3_SEED);
+    hasher.write(bytes);
+    ContentHash(hasher.finish())
+}
+
+/// Chunk raw request bytes by `byte_block` and compute a [`ContentHash`]
+/// per full block — the string-mode (`SymbolKind::Bytes`) analogue of
+/// [`compute_request_content_hashes`], for routing HTTP requests that
+/// carry text but no tokens. Partial trailing chunks are discarded (a
+/// worker only caches a full block); empty if `byte_block` is 0.
+pub fn compute_request_byte_content_hashes(bytes: &[u8], byte_block: usize) -> Vec<ContentHash> {
+    if byte_block == 0 {
+        tracing::warn!(
+            "compute_request_byte_content_hashes called with byte_block=0, returning empty"
+        );
+        return Vec::new();
+    }
+    bytes
+        .chunks(byte_block)
+        .filter(|chunk| chunk.len() == byte_block)
+        .map(compute_byte_content_hash)
         .collect()
 }
 
@@ -2843,5 +2885,42 @@ mod tests {
         assert_eq!(stats.evicted_ttl, 3);
         assert_eq!(indexer.current_size(), 0);
         assert_eq!(indexer.entry_count(), 0);
+    }
+
+    #[test]
+    fn byte_content_hashes_are_deterministic_and_prefix_stable() {
+        // Determinism: same bytes → same chain.
+        let a = compute_request_byte_content_hashes(b"hello world foo", 4);
+        let b = compute_request_byte_content_hashes(b"hello world foo", 4);
+        assert_eq!(a, b);
+
+        // Full blocks only: 15 bytes / 4 = 3 full blocks, trailing 3 dropped.
+        assert_eq!(a.len(), 3);
+
+        // Prefix stability: a longer request that shares a byte prefix
+        // produces the SAME leading block hashes — this is the property
+        // string-mode affinity relies on.
+        let longer = compute_request_byte_content_hashes(b"hello world foo BAR BAZ", 4);
+        assert_eq!(&longer[..3], &a[..]);
+
+        // A differing byte in the first block changes that block's hash
+        // (and only shared-prefix blocks stay equal).
+        let diverged = compute_request_byte_content_hashes(b"Hello world foo", 4);
+        assert_ne!(diverged[0], a[0]);
+        assert_eq!(&diverged[1..], &a[1..]);
+    }
+
+    #[test]
+    fn byte_content_hashes_empty_on_zero_block() {
+        assert!(compute_request_byte_content_hashes(b"anything", 0).is_empty());
+        assert!(compute_request_byte_content_hashes(b"", 4).is_empty());
+    }
+
+    /// The token hasher's block_size==0 guard: return empty rather than
+    /// panicking on chunks(0). Mirrors the byte-mode guard.
+    #[test]
+    fn token_content_hashes_empty_on_zero_block() {
+        assert!(compute_request_content_hashes(&[1, 2, 3], 0).is_empty());
+        assert!(compute_request_content_hashes(&[], 4).is_empty());
     }
 }

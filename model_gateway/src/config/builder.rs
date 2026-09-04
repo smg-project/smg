@@ -288,6 +288,16 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn kv_indexer_url(mut self, url: Option<String>) -> Self {
+        self.config.kv_indexer_url = url;
+        self
+    }
+
+    pub fn kv_indexer_block_size(mut self, block: Option<u32>) -> Self {
+        self.config.kv_indexer_block_size = block;
+        self
+    }
+
     pub fn kv_indexer_max_entries(mut self, max: Option<usize>) -> Self {
         self.config.kv_indexer_max_entries = max;
         self

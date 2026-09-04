@@ -72,7 +72,7 @@ use tracing::{debug, warn};
 
 use super::{
     normalize_model_key, utils::PeriodicTask, CacheAwareConfig, LeastLoadPolicy,
-    LoadBalancingPolicy, SelectWorkerInfo,
+    LoadBalancingPolicy, RemoteOverlap, SelectWorkerInfo,
 };
 /// Latest per-worker backend load snapshot stream, keyed by worker URL.
 pub(crate) use crate::worker::load_state::{LoadReceiver, LoadSnapshot};
@@ -1122,6 +1122,92 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         }
     }
 
+    /// Remote-index selection: the pipeline prefetched per-holder overlap
+    /// scores from the shared radix index; score and gate them exactly
+    /// like the local event-driven path (overlap decay, temperature,
+    /// per-candidate spill, LeastLoad final pick), so remote-vs-local
+    /// comparisons vary only where the scores came from.
+    fn select_worker_with_remote(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        remote: &RemoteOverlap,
+    ) -> Option<usize> {
+        let mut healthy_indices: Vec<usize> = Vec::with_capacity(workers.len());
+        let mut load_sum = 0usize;
+        for (idx, worker) in workers.iter().enumerate() {
+            let state = worker.routing_state();
+            if state.eligible() {
+                healthy_indices.push(idx);
+                load_sum += state.load;
+            }
+        }
+        if healthy_indices.is_empty() {
+            return None;
+        }
+        let avg_load = load_sum as f64 / healthy_indices.len() as f64;
+        let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
+
+        if self.is_kv_imbalanced(workers, &healthy_indices) {
+            return self.select_worker_fallback(workers, info, &healthy_indices, model_id);
+        }
+
+        let mut candidates: Vec<OverlapCandidate> = healthy_indices
+            .iter()
+            .filter_map(|&idx| {
+                let url = workers[idx].url();
+                remote
+                    .scores
+                    .iter()
+                    .find(|(holder, matched)| *matched > 0 && holder == url)
+                    .map(|(_, matched)| OverlapCandidate {
+                        idx,
+                        effective_score: f64::from(*matched),
+                    })
+            })
+            .collect();
+        let waiting_prefill_tokens = self.waiting_prefill_snapshot();
+        let tuning = OverlapTuning {
+            overlap_decay: self.config.overlap_decay,
+            selection_temperature: self.config.selection_temperature,
+            waiting_prefill_tokens: waiting_prefill_tokens.as_deref(),
+        };
+        Self::apply_overlap_decay(
+            workers,
+            &mut candidates,
+            remote.request_blocks,
+            remote.block_size.max(1),
+            &tuning,
+        );
+
+        let affinity = Self::affinity_score_group(&candidates, tuning.selection_temperature);
+        if let Some(idx) =
+            self.select_final_from_affinity(workers, &affinity, &healthy_indices, avg_load, info)
+        {
+            debug!(
+                index = "remote",
+                branch = if affinity.contains(&idx) {
+                    "remote_hit"
+                } else {
+                    "remote_spill"
+                },
+                worker = workers[idx].url(),
+                model_id,
+                "Cache-aware selection"
+            );
+            return Some(idx);
+        }
+        let selected = self.select_expected_wait(workers, &healthy_indices, info)?;
+        debug!(
+            index = "remote",
+            branch = "remote_miss",
+            worker = workers[selected].url(),
+            model_id,
+            "Cache-aware selection"
+        );
+        Some(selected)
+    }
+
     fn on_request_complete(&self, worker_url: &str, success: bool) {
         // Could track success rates per worker for more intelligent routing
         if !success {
@@ -1421,15 +1507,20 @@ impl CacheAwarePolicy {
                 avg_load,
                 info,
             )?;
+            // "Cache-aware selection" + branch= is a parse contract for
+            // external log tooling (the sim harness's branch_counts);
+            // event-driven decisions must land in the same breakdown as
+            // the tree/hash modes.
             debug!(
-                worker = workers[idx].url(),
+                index = "event",
                 branch = if affinity_candidates.contains(&idx) {
                     "event_hit"
                 } else {
                     "event_spill"
                 },
+                worker = workers[idx].url(),
                 model_id,
-                "Event-driven routing: overlap match"
+                "Cache-aware selection"
             );
             return Some(idx);
         }
@@ -1437,8 +1528,11 @@ impl CacheAwarePolicy {
         // No cache overlap — expected-wait fallback over the healthy fleet.
         let selected = self.select_expected_wait(workers, healthy_indices, info)?;
         debug!(
+            index = "event",
+            branch = "event_miss",
             worker = workers[selected].url(),
-            model_id, "Event-driven routing: no overlap, expected-wait fallback"
+            model_id,
+            "Cache-aware selection"
         );
         Some(selected)
     }
@@ -2312,6 +2406,50 @@ mod tests {
     }
 
     /// Healthy workers (health checks disabled) for the given URLs.
+    #[test]
+    fn remote_overlap_scores_drive_selection_and_fall_back() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_workers(&workers);
+        let info = SelectWorkerInfo::default();
+
+        // The highest remote score wins the affinity group.
+        let remote = RemoteOverlap {
+            scores: vec![
+                ("http://w2:8000".to_string(), 40),
+                ("http://w1:8000".to_string(), 5),
+            ],
+            request_blocks: 40,
+            block_size: 128,
+        };
+        assert_eq!(
+            policy.select_worker_with_remote(&workers, &info, &remote),
+            Some(1),
+            "top remote holder must be selected"
+        );
+
+        // Scores for unknown holders match nothing and fall back to
+        // expected-wait over the healthy fleet (any worker is valid).
+        let stranger = RemoteOverlap {
+            scores: vec![("http://elsewhere:8000".to_string(), 40)],
+            request_blocks: 40,
+            block_size: 128,
+        };
+        assert!(policy
+            .select_worker_with_remote(&workers, &info, &stranger)
+            .is_some());
+
+        // The default trait impl (every other policy) ignores the scores.
+        let random = crate::policies::RandomPolicy::new();
+        assert!(
+            LoadBalancingPolicy::select_worker_with_remote(&random, &workers, &info, &remote)
+                .is_some()
+        );
+    }
+
     fn make_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
         urls.iter()
             .map(|u| {
