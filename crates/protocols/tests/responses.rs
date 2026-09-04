@@ -743,6 +743,37 @@ fn function_call_items_accept_missing_optional_id() {
 }
 
 #[test]
+fn message_and_reasoning_items_accept_missing_id() {
+    let input: ResponseInput = serde_json::from_value(json!([
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "ok"}]
+        },
+        {
+            "type": "reasoning",
+            "summary": []
+        }
+    ]))
+    .expect("replayed input items without server-generated ids should deserialize");
+
+    match input {
+        ResponseInput::Items(items) => {
+            assert_eq!(items.len(), 2);
+            match &items[0] {
+                ResponseInputOutputItem::Message { id, .. } => assert!(id.is_empty()),
+                other => panic!("expected Message, got {other:?}"),
+            }
+            match &items[1] {
+                ResponseInputOutputItem::Reasoning { id, .. } => assert!(id.is_empty()),
+                other => panic!("expected Reasoning, got {other:?}"),
+            }
+        }
+        other => panic!("expected item-list input, got {other:?}"),
+    }
+}
+
+#[test]
 fn content_part_unknown_type_fails_fast() {
     // Previously `#[serde(other)] Unknown` silently swallowed unknown
     // types; P1 removes that arm so spec-invalid payloads fail cleanly.
