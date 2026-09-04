@@ -321,50 +321,144 @@ impl ResponseStreamEventEmitter {
             response_obj["usage"] = usage_val.clone();
         }
 
-        // Add all original request fields if available
-        if let Some(ref req) = self.original_request {
-            Self::add_optional_field(&mut response_obj, "instructions", req.instructions.as_ref());
-            Self::add_optional_field(
-                &mut response_obj,
-                "max_output_tokens",
-                req.max_output_tokens.as_ref(),
-            );
-            Self::add_optional_field(
-                &mut response_obj,
-                "max_tool_calls",
-                req.max_tool_calls.as_ref(),
-            );
-            Self::add_optional_field(
-                &mut response_obj,
-                "previous_response_id",
-                req.previous_response_id.as_ref(),
-            );
-            Self::add_optional_field(&mut response_obj, "reasoning", req.reasoning.as_ref());
-            Self::add_optional_field(&mut response_obj, "temperature", req.temperature.as_ref());
-            Self::add_optional_field(&mut response_obj, "top_p", req.top_p.as_ref());
-            Self::add_optional_field(&mut response_obj, "truncation", req.truncation.as_ref());
-            Self::add_optional_field(&mut response_obj, "user", req.user.as_ref());
-
-            response_obj["parallel_tool_calls"] = json!(req.parallel_tool_calls.unwrap_or(true));
-            response_obj["store"] = json!(req.store.unwrap_or(true));
-            let empty_tools = vec![];
-            let empty_metadata = Default::default();
-            response_obj["tools"] = json!(req.tools.as_ref().unwrap_or(&empty_tools));
-            response_obj["metadata"] = json!(req.metadata.as_ref().unwrap_or(&empty_metadata));
-
-            // tool_choice: serialize if present, otherwise use "auto"
-            if let Some(ref tc) = req.tool_choice {
-                response_obj["tool_choice"] = json!(tc);
-            } else {
-                response_obj["tool_choice"] = json!("auto");
-            }
-        }
+        self.apply_request_echo_fields(&mut response_obj);
 
         json!({
             "type": ResponseEvent::COMPLETED,
             "sequence_number": self.next_sequence(),
             "response": response_obj
         })
+    }
+
+    /// Echo the original request's fields onto a terminal response object,
+    /// as OpenAI does on every response lifecycle terminal.
+    fn apply_request_echo_fields(&self, response_obj: &mut serde_json::Value) {
+        let Some(ref req) = self.original_request else {
+            return;
+        };
+        Self::add_optional_field(response_obj, "instructions", req.instructions.as_ref());
+        Self::add_optional_field(
+            response_obj,
+            "max_output_tokens",
+            req.max_output_tokens.as_ref(),
+        );
+        Self::add_optional_field(response_obj, "max_tool_calls", req.max_tool_calls.as_ref());
+        Self::add_optional_field(
+            response_obj,
+            "previous_response_id",
+            req.previous_response_id.as_ref(),
+        );
+        Self::add_optional_field(response_obj, "reasoning", req.reasoning.as_ref());
+        Self::add_optional_field(response_obj, "temperature", req.temperature.as_ref());
+        Self::add_optional_field(response_obj, "top_p", req.top_p.as_ref());
+        Self::add_optional_field(response_obj, "truncation", req.truncation.as_ref());
+        Self::add_optional_field(response_obj, "user", req.user.as_ref());
+
+        response_obj["parallel_tool_calls"] = json!(req.parallel_tool_calls.unwrap_or(true));
+        response_obj["store"] = json!(req.store.unwrap_or(true));
+        let empty_tools = vec![];
+        let empty_metadata = Default::default();
+        response_obj["tools"] = json!(req.tools.as_ref().unwrap_or(&empty_tools));
+        response_obj["metadata"] = json!(req.metadata.as_ref().unwrap_or(&empty_metadata));
+
+        // tool_choice: serialize if present, otherwise use "auto"
+        if let Some(ref tc) = req.tool_choice {
+            response_obj["tool_choice"] = json!(tc);
+        } else {
+            response_obj["tool_choice"] = json!("auto");
+        }
+    }
+
+    /// Close the in-progress message item as incomplete, if one is open.
+    ///
+    /// Mid-stream-failure counterpart of the `finish_reason` closers in
+    /// [`Self::process_chunk`]: the same done-event ladder, but the item is
+    /// stamped `"status": "incomplete"` and kept for the terminal response's
+    /// output — the partial text is the point. Events are sent best-effort:
+    /// this runs on a path that may already have lost the client.
+    async fn close_open_message_as_incomplete(&mut self, tx: &SseSender) {
+        let (Some(output_index), Some(item_id)) = (
+            self.current_message_output_index,
+            self.current_item_id.clone(),
+        ) else {
+            return;
+        };
+        let content_index = 0;
+
+        if self.has_emitted_content_part_added {
+            let event = self.emit_text_done(output_index, &item_id, content_index);
+            self.send_event_best_effort(&event, tx).await;
+            let event = self.emit_content_part_done(output_index, &item_id, content_index);
+            self.send_event_best_effort(&event, tx).await;
+        }
+        if self.has_emitted_output_item_added {
+            let item = json!({
+                "id": item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "incomplete",
+                "content": [{
+                    "type": "output_text",
+                    "text": std::mem::take(&mut self.accumulated_text)
+                }]
+            });
+            // Stores the item data; the item is deliberately NOT marked
+            // completed, so emit_failed includes it as the incomplete tail.
+            let event = self.emit_output_item_done(output_index, &item);
+            self.send_event_best_effort(&event, tx).await;
+        }
+        self.current_message_output_index = None;
+        self.current_item_id = None;
+    }
+
+    /// Terminal failure: close any open message item as incomplete, then emit
+    /// `response.failed` carrying a typed error and every item that produced
+    /// output — completed and incomplete alike. Counterpart of
+    /// [`Self::emit_completed`] for the mid-stream failure path.
+    ///
+    /// Returns the failed response object so callers can persist exactly what
+    /// the client was shown.
+    ///
+    /// INVARIANT: terminal — drains internal state via `take()` and must only
+    /// be called once per emitter lifetime (and never after `emit_completed`).
+    pub async fn emit_failed(
+        &mut self,
+        code: &str,
+        message: &str,
+        usage: Option<&serde_json::Value>,
+        tx: &SseSender,
+    ) -> serde_json::Value {
+        self.close_open_message_as_incomplete(tx).await;
+
+        // Unlike emit_completed, incomplete items are included: dropping the
+        // partial output is exactly the failure mode this event exists to fix.
+        let output: Vec<serde_json::Value> = self
+            .output_items
+            .iter_mut()
+            .filter_map(|item| item.item_data.take())
+            .collect();
+
+        let mut response_obj = json!({
+            "id": self.response_id,
+            "object": "response",
+            "created_at": self.created_at,
+            "status": "failed",
+            "model": self.model,
+            "error": {"code": code, "message": message},
+            "output": output
+        });
+        if let Some(usage_val) = usage {
+            response_obj["usage"] = usage_val.clone();
+        }
+        self.apply_request_echo_fields(&mut response_obj);
+
+        let event = json!({
+            "type": ResponseEvent::FAILED,
+            "sequence_number": self.next_sequence(),
+            "response": response_obj.clone()
+        });
+        self.send_event_best_effort(&event, tx).await;
+        response_obj
     }
 
     /// Convert tool entries to JSON values using the shared bridge builder.
@@ -1012,6 +1106,7 @@ pub(crate) fn attach_mcp_server_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routers::common::sse::sse_channel;
 
     #[test]
     fn finalized_streaming_response_serializes_responses_api_usage() {
@@ -1038,5 +1133,102 @@ mod tests {
         );
         assert!(usage.get("prompt_tokens").is_none());
         assert!(usage.get("completion_tokens").is_none());
+    }
+
+    fn chunk_with_content(text: &str) -> ChatCompletionStreamResponse {
+        serde_json::from_value(json!({
+            "id": "chatcmpl_test",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "test-model",
+            "choices": [{"index": 0, "delta": {"content": text}}]
+        }))
+        .expect("valid chunk")
+    }
+
+    /// Collect every `data:` payload the emitter sent; call after dropping tx.
+    async fn drain_frames(rx: &mut SseReceiver) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            let text = String::from_utf8_lossy(bytes.as_ref());
+            for line in text.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+                        out.push(value);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn emit_failed_closes_open_message_and_attaches_partials() {
+        let (tx, mut rx) = sse_channel();
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_f".to_string(), "test-model".to_string(), 1);
+        emitter
+            .process_chunk(&chunk_with_content("partial tex"), &tx)
+            .await
+            .expect("delta events send");
+
+        let failed_obj = emitter
+            .emit_failed("processing_error", "backend died", None, &tx)
+            .await;
+        drop(tx);
+
+        let events = drain_frames(&mut rx).await;
+        let types: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
+            .collect();
+        // The open message item is closed with the full done ladder before the
+        // terminal event...
+        assert!(types.contains(&OutputTextEvent::DONE));
+        assert!(types.contains(&ContentPartEvent::DONE));
+        assert!(types.contains(&OutputItemEvent::DONE));
+        // ...and response.failed is terminal.
+        assert_eq!(types.last(), Some(&ResponseEvent::FAILED));
+
+        let failed = events.last().expect("terminal event present");
+        let response = failed.get("response").expect("carries the response");
+        assert_eq!(response.pointer("/status"), Some(&json!("failed")));
+        assert_eq!(
+            response.pointer("/error/code"),
+            Some(&json!("processing_error"))
+        );
+        assert_eq!(
+            response.pointer("/error/message"),
+            Some(&json!("backend died"))
+        );
+        // The partial output is attached, stamped incomplete — not dropped.
+        assert_eq!(
+            response.pointer("/output/0/status"),
+            Some(&json!("incomplete"))
+        );
+        assert_eq!(
+            response.pointer("/output/0/content/0/text"),
+            Some(&json!("partial tex"))
+        );
+        // What the caller persists is exactly what the client was shown.
+        assert_eq!(&failed_obj, response);
+    }
+
+    #[tokio::test]
+    async fn emit_failed_without_output_still_carries_the_error() {
+        let (tx, mut rx) = sse_channel();
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_f2".to_string(), "m".to_string(), 1);
+        emitter
+            .emit_failed("stream_read_error", "boom", None, &tx)
+            .await;
+        drop(tx);
+
+        let events = drain_frames(&mut rx).await;
+        assert_eq!(events.len(), 1);
+        let response = events[0].get("response").expect("carries the response");
+        assert_eq!(response.pointer("/status"), Some(&json!("failed")));
+        assert_eq!(response.pointer("/output"), Some(&json!([])));
+        assert_eq!(response.pointer("/error/message"), Some(&json!("boom")));
     }
 }

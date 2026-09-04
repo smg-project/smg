@@ -986,6 +986,23 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record a Responses-surface mid-stream terminal failure.
+    ///
+    /// The HTTP status was already 200 when the stream opened, so without this
+    /// counter a backend failure after first byte is indistinguishable from a
+    /// successful request (or from a client disconnect) in every other metric.
+    /// `reason` is a small static set — "backend_error" | "read_error" —
+    /// never a raw upstream string, to keep cardinality bounded.
+    pub fn record_responses_stream_failure(model_id: &str, reason: &'static str) {
+        let model = intern_model_label(model_id);
+        counter!(
+            "smg_responses_stream_failures_total",
+            "model" => model,
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
     /// Record pipeline stage duration (gRPC only).
     /// All labels are static, so this is very fast.
     pub fn record_router_stage_duration(

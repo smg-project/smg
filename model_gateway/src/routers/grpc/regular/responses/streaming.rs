@@ -180,9 +180,24 @@ async fn process_and_transform_sse_stream(
     // Convert body to data stream
     let mut stream = body.into_data_stream();
 
+    // A mid-stream backend failure must terminal-fail the response — close
+    // open items, attach the error and the partial output — never fall through
+    // to response.completed. Captured here, handled after the loop where the
+    // accumulator can be consumed.
+    let mut failure: Option<(String, String)> = None;
+
     // Process stream chunks (each chunk is a complete SSE event)
     while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|e| format!("Stream read error: {e}"))?;
+        let chunk = match chunk_result {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                failure = Some((
+                    "stream_read_error".to_string(),
+                    format!("Stream read error: {e}"),
+                ));
+                break;
+            }
+        };
 
         // Convert chunk to string
         let event_str = String::from_utf8_lossy(&chunk);
@@ -207,6 +222,13 @@ async fn process_and_transform_sse_stream(
                     event_emitter.process_chunk(&chat_chunk, &tx).await?;
                 }
                 Err(_) => {
+                    // The chat layer reports a mid-stream backend failure as an
+                    // error frame; relaying it and then completing would tell
+                    // the client the response succeeded. Fail terminally.
+                    if let Some(frame_error) = parse_error_frame(json_str) {
+                        failure = Some(frame_error);
+                        break;
+                    }
                     // Not a valid chat chunk - might be error event, pass through
                     debug!("Non-chunk SSE event, passing through: {}", event);
                     if tx
@@ -221,25 +243,37 @@ async fn process_and_transform_sse_stream(
         }
     }
 
+    let usage_json = build_usage_json(accumulator.usage.as_ref());
+
+    if let Some((code, message)) = failure {
+        // Terminal failure: response.failed carries the typed error and the
+        // partial output, and what gets persisted is exactly what the client
+        // was shown — a failed response with its partials, not a completed one.
+        Metrics::record_responses_stream_failure(
+            &original_request.model,
+            if code == "stream_read_error" {
+                "read_error"
+            } else {
+                "backend_error"
+            },
+        );
+        event_emitter
+            .emit_failed(&code, &message, usage_json.as_ref(), &tx)
+            .await;
+        let failed_response = accumulator.finalize_failed(&code, &message);
+        persist_response_if_needed(
+            conversation_storage,
+            conversation_item_storage,
+            response_storage,
+            &failed_response,
+            &original_request,
+            request_context,
+        )
+        .await;
+        return Ok(());
+    }
+
     // Emit final response.completed event with accumulated usage
-    let usage_json = accumulator.usage.as_ref().map(|u| {
-        let mut usage_obj = json!({
-            "input_tokens": u.prompt_tokens,
-            "output_tokens": u.completion_tokens,
-            "total_tokens": u.total_tokens
-        });
-
-        // Include reasoning_tokens if present
-        if let Some(details) = &u.completion_tokens_details {
-            if let Some(reasoning_tokens) = details.reasoning_tokens {
-                usage_obj["output_tokens_details"] =
-                    json!({ "reasoning_tokens": reasoning_tokens });
-            }
-        }
-
-        usage_obj
-    });
-
     let completed_event = event_emitter.emit_completed(usage_json.as_ref());
     event_emitter.send_event(&completed_event, &tx).await?;
 
@@ -369,6 +403,26 @@ impl StreamingResponseAccumulator {
     }
 
     fn finalize(self) -> ResponsesResponse {
+        self.finalize_with_item_status("completed", None)
+    }
+
+    /// Finalize after a mid-stream failure: partial content survives with
+    /// `"incomplete"` item status, the response status is `failed`, and the
+    /// typed error rides the response — matching the terminal
+    /// `response.failed` event the client was shown.
+    fn finalize_failed(mut self, code: &str, message: &str) -> ResponsesResponse {
+        self.finish_reason = Some("failed".to_string());
+        self.finalize_with_item_status(
+            "incomplete",
+            Some(json!({"code": code, "message": message})),
+        )
+    }
+
+    fn finalize_with_item_status(
+        self,
+        item_status: &str,
+        error: Option<Value>,
+    ) -> ResponsesResponse {
         let mut output: Vec<ResponseOutputItem> = Vec::new();
 
         // Add message content if present
@@ -381,7 +435,7 @@ impl StreamingResponseAccumulator {
                     annotations: vec![],
                     logprobs: None,
                 }],
-                status: "completed".to_string(),
+                status: item_status.to_string(),
                 phase: None,
             });
         }
@@ -394,7 +448,7 @@ impl StreamingResponseAccumulator {
                 vec![ResponseReasoningContent::ReasoningText {
                     text: self.reasoning_buffer,
                 }],
-                Some("completed".to_string()),
+                Some(item_status.to_string()),
             ));
         }
 
@@ -424,14 +478,58 @@ impl StreamingResponseAccumulator {
             ResponsesUsage::Modern(usage_info.to_response_usage())
         });
 
-        ResponsesResponse::builder(&self.response_id, &self.model)
+        let mut response = ResponsesResponse::builder(&self.response_id, &self.model)
             .copy_from_request(&self.original_request)
             .created_at(self.created_at)
             .status(status)
             .output(output)
             .maybe_usage(usage)
-            .build()
+            .build();
+        if error.is_some() {
+            response.error = error;
+        }
+        response
     }
+}
+
+/// A mid-stream failure frame from the chat layer (`data: {"error": {...}}`).
+/// Returns `(code, message)`; `None` for frames that are not error objects.
+fn parse_error_frame(json_str: &str) -> Option<(String, String)> {
+    let value: Value = serde_json::from_str(json_str).ok()?;
+    let error = value.get("error")?.as_object()?;
+    let message = error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("backend stream error")
+        .to_string();
+    let code = error
+        .get("code")
+        .and_then(|c| c.as_str())
+        .or_else(|| error.get("type").and_then(|t| t.as_str()))
+        .unwrap_or("stream_error")
+        .to_string();
+    Some((code, message))
+}
+
+/// The responses-shaped usage object for terminal events.
+fn build_usage_json(usage: Option<&Usage>) -> Option<Value> {
+    usage.map(|u| {
+        let mut usage_obj = json!({
+            "input_tokens": u.prompt_tokens,
+            "output_tokens": u.completion_tokens,
+            "total_tokens": u.total_tokens
+        });
+
+        // Include reasoning_tokens if present
+        if let Some(details) = &u.completion_tokens_details {
+            if let Some(reasoning_tokens) = details.reasoning_tokens {
+                usage_obj["output_tokens_details"] =
+                    json!({ "reasoning_tokens": reasoning_tokens });
+            }
+        }
+
+        usage_obj
+    })
 }
 
 // ============================================================================
@@ -606,7 +704,20 @@ async fn execute_tool_loop_streaming_internal(
         // Convert chat stream to Responses API events while accumulating for tool call detection
         // Stream text naturally - it only appears on final iteration (tool iterations have empty content)
         let accumulated_response =
-            convert_and_accumulate_stream(response.into_body(), &mut emitter, &tx).await?;
+            match convert_and_accumulate_stream(response.into_body(), &mut emitter, &tx).await? {
+                StreamOutcome::Complete(response) => response,
+                StreamOutcome::Failed(code, message) => {
+                    // Terminal failure: close open items and attach the error
+                    // plus whatever output (mcp_list_tools, prior tool calls,
+                    // partial text) had accumulated across iterations.
+                    Metrics::record_responses_stream_failure(
+                        &current_request.model,
+                        "backend_error",
+                    );
+                    emitter.emit_failed(&code, &message, None, &tx).await;
+                    return Ok(());
+                }
+            };
 
         // Check for tool calls (extract all of them for parallel execution)
         let tool_calls = extract_all_tool_calls_from_chat(&accumulated_response);
@@ -948,17 +1059,32 @@ async fn execute_tool_loop_streaming_internal(
     Ok(())
 }
 
+/// Outcome of draining one chat stream iteration.
+enum StreamOutcome {
+    Complete(ChatCompletionResponse),
+    /// The chat layer failed mid-stream: `(code, message)`.
+    Failed(String, String),
+}
+
 /// Convert chat stream to Responses API events while accumulating for tool call detection
 async fn convert_and_accumulate_stream(
     body: Body,
     emitter: &mut ResponseStreamEventEmitter,
     tx: &SseSender,
-) -> Result<ChatCompletionResponse, String> {
+) -> Result<StreamOutcome, String> {
     let mut accumulator = ChatResponseAccumulator::new();
     let mut stream = body.into_data_stream();
 
     while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|e| format!("Stream read error: {e}"))?;
+        let chunk = match chunk_result {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                return Ok(StreamOutcome::Failed(
+                    "stream_read_error".to_string(),
+                    format!("Stream read error: {e}"),
+                ));
+            }
+        };
 
         // Parse chunk
         let event_str = String::from_utf8_lossy(&chunk);
@@ -970,17 +1096,27 @@ async fn convert_and_accumulate_stream(
 
         if let Some(json_str) = event.strip_prefix("data: ") {
             let json_str = json_str.trim();
-            if let Ok(chat_chunk) = serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
-                // Convert chat chunk to Responses API events and emit
-                emitter.process_chunk(&chat_chunk, tx).await?;
+            match serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
+                Ok(chat_chunk) => {
+                    // Convert chat chunk to Responses API events and emit
+                    emitter.process_chunk(&chat_chunk, tx).await?;
 
-                // Accumulate for tool call detection
-                accumulator.process_chunk(&chat_chunk);
+                    // Accumulate for tool call detection
+                    accumulator.process_chunk(&chat_chunk);
+                }
+                Err(_) => {
+                    // A mid-stream backend failure arrives as an error frame.
+                    // Dropping it silently would let the loop fall through to
+                    // response.completed over truncated output.
+                    if let Some((code, message)) = parse_error_frame(json_str) {
+                        return Ok(StreamOutcome::Failed(code, message));
+                    }
+                }
             }
         }
     }
 
-    Ok(accumulator.finalize())
+    Ok(StreamOutcome::Complete(accumulator.finalize()))
 }
 
 /// Accumulates chat streaming chunks into complete ChatCompletionResponse
@@ -1155,5 +1291,43 @@ mod tests {
             }
             other => panic!("expected function tool call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn error_frames_are_recognized_and_typed() {
+        assert_eq!(
+            parse_error_frame(r#"{"error":{"message":"worker died","type":"stream_error"}}"#),
+            Some(("stream_error".to_string(), "worker died".to_string()))
+        );
+        // An explicit code beats the type when both are present.
+        assert_eq!(
+            parse_error_frame(r#"{"error":{"message":"m","type":"t","code":"c"}}"#),
+            Some(("c".to_string(), "m".to_string()))
+        );
+        // Ordinary chunks and non-error frames are not misread as failures.
+        assert_eq!(
+            parse_error_frame(r#"{"id":"x","object":"chat.completion.chunk"}"#),
+            None
+        );
+        assert_eq!(parse_error_frame("not json"), None);
+    }
+
+    #[test]
+    fn finalize_failed_preserves_partials_as_incomplete() {
+        let request = ResponsesRequest::default();
+        let mut accumulator = StreamingResponseAccumulator::new(&request);
+        accumulator.content_buffer.push_str("partial answer");
+
+        let response = accumulator.finalize_failed("stream_error", "worker died");
+
+        assert!(matches!(response.status, ResponseStatus::Failed));
+        let wire = serde_json::to_value(&response).expect("serializes");
+        assert_eq!(wire.pointer("/status"), Some(&json!("failed")));
+        assert_eq!(wire.pointer("/error/code"), Some(&json!("stream_error")));
+        assert_eq!(wire.pointer("/output/0/status"), Some(&json!("incomplete")));
+        assert_eq!(
+            wire.pointer("/output/0/content/0/text"),
+            Some(&json!("partial answer"))
+        );
     }
 }
