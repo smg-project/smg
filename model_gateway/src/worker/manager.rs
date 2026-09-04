@@ -11,15 +11,12 @@ use std::{
 };
 
 use axum::response::{IntoResponse, Response};
-use dashmap::DashSet;
-use futures::{
-    future,
-    stream::{self, FuturesUnordered, StreamExt},
-};
+use chrono::Utc;
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use http::StatusCode;
 use openai_protocol::worker::{
-    FlushCacheResult, HealthCheckConfig, ProfileOptions, ProfileResult, WorkerLoadInfo,
-    WorkerLoadsResult, WorkerStatus,
+    EngineAggregateMetricsSnapshot, FlushCacheResult, HealthCheckConfig, ProfileOptions,
+    ProfileResult, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus,
 };
 use tokio::{
     sync::{broadcast, mpsc, Notify},
@@ -31,11 +28,11 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     worker::{
         event::{WorkerConnected, WorkerEvent},
+        load_state::LoadSnapshot,
         metrics_aggregator::{self, MetricPack},
-        monitor::WorkerMonitor,
         registry::{WorkerDescriptor, WorkerId},
         worker::WorkerTypeExt,
-        ConnectionMode, Worker, WorkerOrigin, WorkerRegistry, WorkerResult, WorkerType,
+        ConnectionMode, Worker, WorkerOrigin, WorkerRegistry, WorkerResult,
     },
     workflow::{Job, JobQueue},
 };
@@ -112,9 +109,9 @@ impl IntoResponse for EngineMetricsResult {
 /// events to keep its internal schedule in sync with registrations,
 /// removals, and replacements.
 ///
-/// The static fan-out helpers (`get_worker_urls`, `flush_cache_all`,
-/// `get_all_worker_loads`, `get_engine_metrics`) are operational commands
-/// that don't depend on lifecycle state and remain associated functions.
+/// The static helpers (`get_worker_urls`, `flush_cache_all`,
+/// `get_engine_metrics`, `fleet_loads`) are operational commands that
+/// don't depend on lifecycle state and remain associated functions.
 pub struct WorkerManager {
     handle: Option<JoinHandle<()>>,
     shutdown_notify: Arc<Notify>,
@@ -1065,60 +1062,47 @@ impl WorkerManager {
         }
     }
 
-    pub async fn get_all_worker_loads(
+    /// Build the fleet-wide load body from the monitor's published
+    /// snapshot: the same numbers the routing policies are acting on.
+    ///
+    /// No request reaches a worker. That is what makes the route safe to
+    /// stack — a gateway registered as a worker under another gateway
+    /// answers from its cache instead of fanning one upstream poll out
+    /// across its whole fleet.
+    ///
+    /// Workers the monitor has no load for are left out rather than reported
+    /// as idle, so a gateway that has not polled yet answers with an empty
+    /// `loads` array.
+    pub(crate) fn fleet_loads(
         worker_registry: &WorkerRegistry,
-        native_loads_absent: Option<&DashSet<String>>,
-    ) -> WorkerLoadsResult {
-        let workers = worker_registry.get_all();
-        let total_workers = workers.len();
+        snapshot: &LoadSnapshot,
+        model_id: Option<&str>,
+    ) -> WorkerLoadResponse {
+        let mut workers = worker_registry.get_all();
+        workers.sort_by(|a, b| a.url().cmp(b.url()));
 
-        let futures: Vec<_> = workers
-            .iter()
-            .map(|worker| {
-                let worker_type = match worker.worker_type() {
-                    WorkerType::Regular => None,
-                    WorkerType::Prefill => Some("prefill".to_string()),
-                    WorkerType::Decode => Some("decode".to_string()),
-                    WorkerType::Encode => Some("encode".to_string()),
-                };
-                let connection_mode = worker.connection_mode();
-                let worker = Arc::clone(worker);
+        let mut loads = Vec::new();
+        for worker in workers {
+            if model_id.is_some_and(|model| !worker.supports_model(model)) {
+                continue;
+            }
+            let Some(report) = snapshot.get(worker.url()) else {
+                continue;
+            };
+            let worker_type = worker.worker_type().to_string();
+            loads.extend(report.loads.iter().map(|rank| SchedulerLoadSnapshot {
+                worker: Some(worker.url().to_string()),
+                worker_type: Some(worker_type.clone()),
+                ..rank.clone()
+            }));
+        }
 
-                async move {
-                    let details = match connection_mode {
-                        ConnectionMode::Http => {
-                            WorkerMonitor::fetch_http_load(&worker, native_loads_absent).await
-                        }
-                        ConnectionMode::Grpc | ConnectionMode::Zmq => {
-                            WorkerMonitor::fetch_backend_load(&worker).await
-                        }
-                    };
-                    // `load` is the absolute used-token count. Report it only
-                    // when the backend actually provides absolute tokens
-                    let load = details
-                        .as_ref()
-                        .filter(|d| d.has_absolute_token_data())
-                        .map(|d| d.total_used_tokens() as isize)
-                        .unwrap_or(-1);
-                    WorkerLoadInfo {
-                        worker: worker.url().to_string(),
-                        worker_type,
-                        load,
-                        details,
-                    }
-                }
-            })
-            .collect();
-
-        let loads = future::join_all(futures).await;
-        let successful = loads.iter().filter(|l| l.load >= 0).count();
-        let failed = loads.iter().filter(|l| l.load < 0).count();
-
-        WorkerLoadsResult {
+        WorkerLoadResponse {
+            timestamp: Utc::now().to_rfc3339(),
+            version: format!("smg-{}", env!("CARGO_PKG_VERSION")),
+            dp_rank_count: loads.len() as i32,
+            aggregate: EngineAggregateMetricsSnapshot::from_ranks(&loads),
             loads,
-            total_workers,
-            successful,
-            failed,
         }
     }
 
@@ -1175,7 +1159,10 @@ mod tests {
         },
     };
 
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, WorkerStatus},
+    };
 
     use super::*;
     use crate::worker::{
@@ -1950,6 +1937,141 @@ mod tests {
         let result = WorkerManager::stop_profile_all(&registry, Some(url_a.as_str())).await;
         assert_eq!(result.total_workers, 1);
         assert_eq!(result.successful, vec![url_a]);
+    }
+
+    fn load_report(ranks: &[(i32, i32, i32, f64)]) -> WorkerLoadResponse {
+        let loads: Vec<SchedulerLoadSnapshot> = ranks
+            .iter()
+            .map(
+                |&(dp_rank, num_running_reqs, num_waiting_reqs, token_usage)| {
+                    SchedulerLoadSnapshot {
+                        dp_rank,
+                        num_running_reqs,
+                        num_waiting_reqs,
+                        token_usage,
+                        ..Default::default()
+                    }
+                },
+            )
+            .collect();
+        WorkerLoadResponse {
+            timestamp: "2026-09-03T00:00:00Z".to_string(),
+            version: "engine-test".to_string(),
+            dp_rank_count: loads.len() as i32,
+            aggregate: None,
+            loads,
+        }
+    }
+
+    fn make_model_worker(url: &str, model: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .models(vec![ModelCard::new(model)])
+                .build(),
+        )
+    }
+
+    #[test]
+    fn fleet_loads_tags_ranks_and_aggregates() {
+        let registry = WorkerRegistry::new();
+        // Registered out of order to prove the response sorts by URL.
+        registry.register(make_worker("http://w:2", 1, 1)).unwrap();
+        registry.register(make_worker("http://w:1", 1, 1)).unwrap();
+
+        let snapshot = LoadSnapshot::from_loads_for_test(vec![
+            (
+                "http://w:1".to_string(),
+                load_report(&[(0, 4, 1, 0.25), (1, 6, 3, 0.75)]),
+            ),
+            ("http://w:2".to_string(), load_report(&[(0, 2, 0, 0.5)])),
+        ]);
+
+        let body = WorkerManager::fleet_loads(&registry, &snapshot, None);
+
+        assert_eq!(body.dp_rank_count, 3);
+        assert_eq!(body.loads.len(), 3);
+        assert!(body.version.starts_with("smg-"));
+        assert!(!body.timestamp.is_empty());
+
+        let tagged: Vec<(&str, &str, i32)> = body
+            .loads
+            .iter()
+            .map(|rank| {
+                (
+                    rank.worker.as_deref().expect("worker url"),
+                    rank.worker_type.as_deref().expect("worker type"),
+                    rank.dp_rank,
+                )
+            })
+            .collect();
+        assert_eq!(
+            tagged,
+            vec![
+                ("http://w:1", "regular", 0),
+                ("http://w:1", "regular", 1),
+                ("http://w:2", "regular", 0),
+            ]
+        );
+
+        let aggregate = body.aggregate.expect("aggregate");
+        assert_eq!(aggregate.total_running_reqs, 12);
+        assert_eq!(aggregate.total_waiting_reqs, 4);
+        assert_eq!(aggregate.total_reqs, 16);
+        assert_eq!(aggregate.avg_token_usage, 0.5);
+    }
+
+    #[test]
+    fn fleet_loads_filters_by_model() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(make_model_worker("http://a:1", "gpt-4o"))
+            .unwrap();
+        registry
+            .register(make_model_worker("http://b:1", "o3"))
+            .unwrap();
+
+        let snapshot = LoadSnapshot::from_loads_for_test(vec![
+            ("http://a:1".to_string(), load_report(&[(0, 5, 0, 0.5)])),
+            ("http://b:1".to_string(), load_report(&[(0, 9, 0, 0.9)])),
+        ]);
+
+        let body = WorkerManager::fleet_loads(&registry, &snapshot, Some("gpt-4o"));
+
+        assert_eq!(body.dp_rank_count, 1);
+        assert_eq!(body.loads[0].worker.as_deref(), Some("http://a:1"));
+        assert_eq!(body.aggregate.expect("aggregate").total_running_reqs, 5);
+    }
+
+    #[test]
+    fn fleet_loads_omits_workers_without_a_report() {
+        let registry = WorkerRegistry::new();
+        registry.register(make_worker("http://w:1", 1, 1)).unwrap();
+        registry.register(make_worker("http://w:2", 1, 1)).unwrap();
+
+        // Only one worker has been polled: the other must be absent rather
+        // than reported as idle.
+        let snapshot = LoadSnapshot::from_loads_for_test(vec![(
+            "http://w:2".to_string(),
+            load_report(&[(0, 7, 2, 0.4)]),
+        )]);
+
+        let body = WorkerManager::fleet_loads(&registry, &snapshot, None);
+
+        assert_eq!(body.dp_rank_count, 1);
+        assert_eq!(body.loads[0].worker.as_deref(), Some("http://w:2"));
+    }
+
+    #[test]
+    fn fleet_loads_with_no_polled_workers_has_no_aggregate() {
+        let registry = WorkerRegistry::new();
+        registry.register(make_worker("http://w:1", 1, 1)).unwrap();
+
+        let body = WorkerManager::fleet_loads(&registry, &LoadSnapshot::default(), None);
+
+        assert_eq!(body.dp_rank_count, 0);
+        assert!(body.loads.is_empty());
+        assert!(body.aggregate.is_none());
     }
 
     #[tokio::test]

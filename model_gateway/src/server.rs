@@ -564,16 +564,21 @@ async fn stop_profile(
         .into_response()
 }
 
-async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    WorkerManager::get_all_worker_loads(
+async fn get_loads(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListWorkersQuery>,
+) -> Response {
+    let snapshot = state
+        .context
+        .worker_monitor
+        .as_ref()
+        .map(|monitor| monitor.load_snapshot())
+        .unwrap_or_default();
+    Json(WorkerManager::fleet_loads(
         &state.context.worker_registry,
-        state
-            .context
-            .worker_monitor
-            .as_ref()
-            .map(|monitor| monitor.native_loads_absent()),
-    )
-    .await
+        &snapshot,
+        query.model.as_deref(),
+    ))
     .into_response()
 }
 
@@ -591,11 +596,17 @@ async fn list_workers_rest(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListWorkersQuery>,
 ) -> Response {
-    state
+    let mut result = state
         .context
         .worker_service
-        .list_workers(query.model.as_deref())
-        .into_response()
+        .list_workers(query.model.as_deref());
+    if let Some(monitor) = state.context.worker_monitor.as_ref() {
+        let snapshot = monitor.load_snapshot();
+        for info in &mut result.workers {
+            info.engine_load = snapshot.get(&info.spec.url).cloned();
+        }
+    }
+    result.into_response()
 }
 
 async fn get_worker(
@@ -603,7 +614,13 @@ async fn get_worker(
     Path(worker_id_raw): Path<String>,
 ) -> Response {
     match state.context.worker_service.get_worker(&worker_id_raw) {
-        Ok(result) => result.into_response(),
+        Ok(mut result) => {
+            if let Some(monitor) = state.context.worker_monitor.as_ref() {
+                let snapshot = monitor.load_snapshot();
+                result.0.engine_load = snapshot.get(&result.0.spec.url).cloned();
+            }
+            result.into_response()
+        }
         Err(err) => err.into_response(),
     }
 }
@@ -919,6 +936,7 @@ pub fn build_app(
         .route("/health", get(health))
         .route("/health_generate", get(health_generate))
         .route("/engine_metrics", get(engine_metrics))
+        .route("/loads", get(get_loads))
         .route("/v1/models", get(v1_models))
         .route("/get_model_info", get(get_model_info))
         .route("/get_server_info", get(get_server_info));
@@ -928,6 +946,7 @@ pub fn build_app(
         .route("/flush_cache", post(flush_cache))
         .route("/start_profile", post(start_profile))
         .route("/stop_profile", post(stop_profile))
+        // Deprecated alias of the public `/loads`.
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
