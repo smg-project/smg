@@ -45,6 +45,20 @@ pub trait ToolParser: Send + Sync {
         None
     }
 
+    /// Number of structurally complete, valid calls observed by an incremental
+    /// parser. `None` means the parser cannot distinguish completion from
+    /// provisional deltas and preserves the legacy finish-reason behavior.
+    fn completed_tool_call_count(&self) -> Option<usize> {
+        None
+    }
+
+    /// Finalize buffered incremental input at the Engine terminal boundary.
+    /// Parsers use this to release ordinary text that was retained only to
+    /// disambiguate a split structural marker.
+    fn finish_incremental(&mut self) -> StreamingParseResult {
+        StreamingParseResult::default()
+    }
+
     /// Take any text still buffered by the streaming parser that never became
     /// a tool call, transferring ownership to the caller.
     ///
