@@ -24,8 +24,8 @@ use openai_protocol::{
 };
 use smg::{
     policies::{
-        BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
-        RoundRobinPolicy, SelectWorkerInfo,
+        BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy,
+        RandomPolicy, RoundRobinPolicy, SelectWorkerInfo,
     },
     routers::grpc::{backend_client::BackendClient, utils::process_chat_messages},
     worker::{

@@ -690,27 +690,33 @@ impl AppContextBuilder {
     fn with_kv_event_monitor(mut self, config: &RouterConfig) -> Self {
         use crate::config::types::{PolicyConfig, RoutingMode};
 
-        let role_is_cache_aware =
-            |policy: &Option<PolicyConfig>| matches!(policy, Some(PolicyConfig::CacheAware { .. }));
-        let is_cache_aware = matches!(config.policy, PolicyConfig::CacheAware { .. })
-            || match &config.mode {
-                RoutingMode::PrefillDecode {
-                    prefill_policy,
-                    decode_policy,
-                    ..
-                } => role_is_cache_aware(prefill_policy) || role_is_cache_aware(decode_policy),
-                RoutingMode::EncodePrefillDecode {
-                    encode_policy,
-                    prefill_policy,
-                    decode_policy,
-                    ..
-                } => {
-                    role_is_cache_aware(encode_policy)
-                        || role_is_cache_aware(prefill_policy)
-                        || role_is_cache_aware(decode_policy)
-                }
-                _ => false,
-            };
+        let role_is_cache_aware = |policy: &Option<PolicyConfig>| {
+            matches!(
+                policy,
+                Some(PolicyConfig::CacheAware { .. } | PolicyConfig::CacheAwareLength { .. })
+            )
+        };
+        let is_cache_aware = matches!(
+            config.policy,
+            PolicyConfig::CacheAware { .. } | PolicyConfig::CacheAwareLength { .. }
+        ) || match &config.mode {
+            RoutingMode::PrefillDecode {
+                prefill_policy,
+                decode_policy,
+                ..
+            } => role_is_cache_aware(prefill_policy) || role_is_cache_aware(decode_policy),
+            RoutingMode::EncodePrefillDecode {
+                encode_policy,
+                prefill_policy,
+                decode_policy,
+                ..
+            } => {
+                role_is_cache_aware(encode_policy)
+                    || role_is_cache_aware(prefill_policy)
+                    || role_is_cache_aware(decode_policy)
+            }
+            _ => false,
+        };
 
         if is_cache_aware {
             let monitor = Arc::new(KvEventMonitor::new(None));

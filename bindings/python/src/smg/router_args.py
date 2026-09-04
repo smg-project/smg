@@ -15,6 +15,7 @@ COMMON_POLICY_CHOICES = [
     "round_robin",
     "passthrough",
     "cache_aware",
+    "cache_aware_length",
     "power_of_two",
     "least_load",
     "manual",
@@ -244,6 +245,12 @@ class RouterArgs:
     worker_overload_protection: bool = False
     # Restore the conditional load-monitor poll gate (default: poll always)
     disable_load_monitoring: bool = False
+    # cache_aware_length policy: long/short pool split
+    chars_per_token: int = 4
+    long_prefill_threshold: int = 100_000
+    long_pool_max_load: int = 4
+    short_pool_max_load: int = 32
+    long_prefill_indices: list[int] = dataclasses.field(default_factory=list)
     # Most bytes the router may buffer for a request it holds only to keep
     # it retryable; larger eligible requests stream and forfeit router retries
     max_buffered_request_bytes: int = 1048576
@@ -636,6 +643,7 @@ class RouterArgs:
         )
         routing_group.add_argument(
             f"--{prefix}eviction-interval-secs",
+            f"--{prefix}eviction-interval",
             type=int,
             default=RouterArgs.eviction_interval_secs,
             help="Interval in seconds between cache eviction operations",
@@ -685,6 +693,42 @@ class RouterArgs:
                 "Seconds a cache-affinity placement stays routable; should"
                 " approximate serving-engine cache retention. Defaults to 180."
             ),
+        )
+        # cache_aware_length policy parameters
+        routing_group.add_argument(
+            f"--{prefix}chars-per-token",
+            type=int,
+            default=RouterArgs.chars_per_token,
+            help="Divisor for char-level token estimation when X-Prompt-Tokens"
+            " is absent (cache_aware_length policy). Default 4.",
+        )
+        routing_group.add_argument(
+            f"--{prefix}long-prefill-threshold",
+            type=int,
+            default=RouterArgs.long_prefill_threshold,
+            help="Uncached-prefill-token boundary between long and short"
+            " requests (cache_aware_length policy). Default 100000.",
+        )
+        routing_group.add_argument(
+            f"--{prefix}long-pool-max-load",
+            type=int,
+            default=RouterArgs.long_pool_max_load,
+            help="Load ceiling for the long pool (pool=long workers)"
+            " (cache_aware_length policy). Default 4.",
+        )
+        routing_group.add_argument(
+            f"--{prefix}short-pool-max-load",
+            type=int,
+            default=RouterArgs.short_pool_max_load,
+            help="Load ceiling for the short pool (remaining workers)"
+            " (cache_aware_length policy). Default 32.",
+        )
+        routing_group.add_argument(
+            f"--{prefix}long-prefill-indices",
+            type=_parse_int_csv,
+            default=[],
+            help="Comma-separated 0-based indices of --prefill URLs that belong"
+            " to the long pool (get pool=long label for cache_aware_length).",
         )
         routing_group.add_argument(
             f"--{prefix}max-idle-secs",
@@ -1716,6 +1760,25 @@ class RouterArgs:
         return cls(**args_dict)
 
     def _validate_router_args(self):
+        if (self.prefill_urls or self.decode_urls) and not (
+            self.pd_disaggregation or self.epd_disaggregation
+        ):
+            raise ValueError(
+                "--prefill/--decode require --pd-disaggregation or --epd-disaggregation"
+            )
+
+        if len(set(self.long_prefill_indices)) != len(self.long_prefill_indices):
+            raise ValueError("--long-prefill-indices must not contain duplicate values")
+
+        if self.long_prefill_indices:
+            if min(self.long_prefill_indices) < 0:
+                raise ValueError("--long-prefill-indices values must be non-negative")
+            if max(self.long_prefill_indices) >= len(self.prefill_urls):
+                raise ValueError(
+                    "--long-prefill-indices value out of range for "
+                    f"{len(self.prefill_urls)} configured prefill workers"
+                )
+
         # Validate configuration based on mode
         if self.epd_disaggregation:
             if self.encode_policy:

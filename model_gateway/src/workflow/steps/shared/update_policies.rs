@@ -147,14 +147,19 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
                 .policy_registry
                 .get_policy(&model_id)
                 .is_some_and(|policy| policy.name() == "cache_aware");
-            if cache_aware {
+            let cache_aware_length = app_context
+                .policy_registry
+                .get_policy(&model_id)
+                .is_some_and(|policy| policy.name() == "cache_aware_length");
+            if cache_aware || cache_aware_length {
                 app_context
                     .policy_registry
                     .init_cache_aware_policy(&model_id, &all_workers);
             }
 
-            // Start KV event subscription for gRPC workers with cache_aware policy
-            if cache_aware {
+            // Start KV event subscription for gRPC workers with cache_aware or
+            // cache_aware_length policy (both are KV-event-capable).
+            if cache_aware || cache_aware_length {
                 if let Some(ref monitor) = app_context.kv_event_monitor {
                     if *worker.connection_mode() == ConnectionMode::Grpc {
                         monitor.on_worker_added(worker).await;
@@ -162,7 +167,11 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
                 }
             }
 
-            Self::warn_on_cache_aware_without_kv_events(&model_id, worker, cache_aware);
+            Self::warn_on_cache_aware_without_kv_events(
+                &model_id,
+                worker,
+                cache_aware || cache_aware_length,
+            );
 
             if !updated_models.contains(&model_id) {
                 updated_models.push(model_id);

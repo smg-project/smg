@@ -93,6 +93,7 @@ impl ConfigValidator {
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
+        Self::validate_long_prefill_indices(config)?;
         Self::validate_server_settings(config)?;
         Self::validate_storage_context_headers(config)?;
         Self::validate_routing_key_headers(config)?;
@@ -453,6 +454,38 @@ impl ConfigValidator {
         Ok(())
     }
 
+    fn validate_long_prefill_indices(config: &RouterConfig) -> ConfigResult<()> {
+        let indices = &config.long_prefill_indices;
+        if indices.is_empty() {
+            return Ok(());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for &i in indices {
+            if !seen.insert(i) {
+                return Err(ConfigError::InvalidValue {
+                    field: "long_prefill_indices".to_string(),
+                    value: i.to_string(),
+                    reason: "must not contain duplicate values".to_string(),
+                });
+            }
+        }
+        let prefill_count = match &config.mode {
+            RoutingMode::PrefillDecode { prefill_urls, .. }
+            | RoutingMode::EncodePrefillDecode { prefill_urls, .. } => prefill_urls.len(),
+            _ => 0,
+        };
+        if let Some(&max) = indices.iter().max() {
+            if max >= prefill_count {
+                return Err(ConfigError::InvalidValue {
+                    field: "long_prefill_indices".to_string(),
+                    value: max.to_string(),
+                    reason: format!("out of range for {prefill_count} configured prefill workers"),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
             PolicyConfig::Random
@@ -475,92 +508,81 @@ impl ConfigValidator {
                 cache_ttl_secs,
                 cache_boundaries,
             } => {
-                Self::validate_cache_boundaries(cache_boundaries)?;
+                Self::validate_cache_aware_shared(
+                    *cache_threshold,
+                    *balance_rel_threshold,
+                    *eviction_interval_secs,
+                    *max_tree_size,
+                    *block_size,
+                    *balance_token_usage_threshold,
+                    *overload_token_usage_threshold,
+                    *overlap_decay,
+                    *selection_temperature,
+                    cache_index,
+                    *cache_ttl_secs,
+                    cache_boundaries,
+                )?;
+            }
+            PolicyConfig::CacheAwareLength {
+                cache_threshold,
+                balance_abs_threshold: _,
+                balance_rel_threshold,
+                eviction_interval_secs,
+                max_tree_size,
+                block_size,
+                balance_token_usage_threshold,
+                overload_token_usage_threshold,
+                overlap_decay,
+                selection_temperature,
+                cache_index,
+                cache_ttl_secs,
+                cache_boundaries,
+                chars_per_token,
+                long_prefill_threshold,
+                long_pool_max_load,
+                short_pool_max_load,
+            } => {
+                Self::validate_cache_aware_shared(
+                    *cache_threshold,
+                    *balance_rel_threshold,
+                    *eviction_interval_secs,
+                    *max_tree_size,
+                    *block_size,
+                    *balance_token_usage_threshold,
+                    *overload_token_usage_threshold,
+                    *overlap_decay,
+                    *selection_temperature,
+                    cache_index,
+                    *cache_ttl_secs,
+                    cache_boundaries,
+                )?;
 
-                if *cache_ttl_secs == 0 {
+                // ---- Length-specific checks ----
+                if *chars_per_token == 0 {
                     return Err(ConfigError::InvalidValue {
-                        field: "cache_ttl_secs".to_string(),
-                        value: cache_ttl_secs.to_string(),
+                        field: "chars_per_token".to_string(),
+                        value: chars_per_token.to_string(),
                         reason: "Must be > 0".to_string(),
                     });
                 }
-
-                if *cache_index == CacheIndexKind::Hash && cache_boundaries.is_empty() {
+                if *long_prefill_threshold == 0 {
                     return Err(ConfigError::InvalidValue {
-                        field: "cache_index".to_string(),
-                        value: "hash".to_string(),
-                        reason: "cache_index=hash requires non-empty cache_boundaries".to_string(),
-                    });
-                }
-
-                if !overlap_decay.is_finite() || *overlap_decay < 0.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "overlap_decay".to_string(),
-                        value: overlap_decay.to_string(),
-                        reason: "Must be finite and >= 0.0 (0.0 disables)".to_string(),
-                    });
-                }
-
-                if !selection_temperature.is_finite() || *selection_temperature < 0.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "selection_temperature".to_string(),
-                        value: selection_temperature.to_string(),
-                        reason: "Must be finite and >= 0.0 (0.0 is argmax)".to_string(),
-                    });
-                }
-
-                if *block_size == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "block_size".to_string(),
-                        value: block_size.to_string(),
+                        field: "long_prefill_threshold".to_string(),
+                        value: long_prefill_threshold.to_string(),
                         reason: "Must be > 0".to_string(),
                     });
                 }
-
-                if *balance_token_usage_threshold <= 0.0 {
+                if *long_pool_max_load == 0 {
                     return Err(ConfigError::InvalidValue {
-                        field: "balance_token_usage_threshold".to_string(),
-                        value: balance_token_usage_threshold.to_string(),
-                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
-                    });
-                }
-
-                if *overload_token_usage_threshold <= 0.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "overload_token_usage_threshold".to_string(),
-                        value: overload_token_usage_threshold.to_string(),
-                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
-                    });
-                }
-
-                if !(0.0..=1.0).contains(cache_threshold) {
-                    return Err(ConfigError::InvalidValue {
-                        field: "cache_threshold".to_string(),
-                        value: cache_threshold.to_string(),
-                        reason: "Must be between 0.0 and 1.0".to_string(),
-                    });
-                }
-
-                if *balance_rel_threshold < 1.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "balance_rel_threshold".to_string(),
-                        value: balance_rel_threshold.to_string(),
-                        reason: "Must be >= 1.0".to_string(),
-                    });
-                }
-
-                if *eviction_interval_secs == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "eviction_interval_secs".to_string(),
-                        value: eviction_interval_secs.to_string(),
+                        field: "long_pool_max_load".to_string(),
+                        value: long_pool_max_load.to_string(),
                         reason: "Must be > 0".to_string(),
                     });
                 }
-
-                if *max_tree_size == 0 {
+                if *short_pool_max_load == 0 {
                     return Err(ConfigError::InvalidValue {
-                        field: "max_tree_size".to_string(),
-                        value: max_tree_size.to_string(),
+                        field: "short_pool_max_load".to_string(),
+                        value: short_pool_max_load.to_string(),
                         reason: "Must be > 0".to_string(),
                     });
                 }
@@ -668,6 +690,116 @@ impl ConfigValidator {
                 Self::validate_cache_boundaries(cache_boundaries)?;
             }
         }
+        Ok(())
+    }
+
+    /// Shared validation for the cache-aware fields common to both
+    /// `CacheAware` and `CacheAwareLength` policy variants.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the PolicyConfig fields")]
+    fn validate_cache_aware_shared(
+        cache_threshold: f32,
+        balance_rel_threshold: f32,
+        eviction_interval_secs: u64,
+        max_tree_size: usize,
+        block_size: usize,
+        balance_token_usage_threshold: f32,
+        overload_token_usage_threshold: f32,
+        overlap_decay: f32,
+        selection_temperature: f32,
+        cache_index: &CacheIndexKind,
+        cache_ttl_secs: u64,
+        cache_boundaries: &[usize],
+    ) -> ConfigResult<()> {
+        Self::validate_cache_boundaries(cache_boundaries)?;
+
+        if cache_ttl_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "cache_ttl_secs".to_string(),
+                value: cache_ttl_secs.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
+        if *cache_index == CacheIndexKind::Hash && cache_boundaries.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "cache_index".to_string(),
+                value: "hash".to_string(),
+                reason: "cache_index=hash requires non-empty cache_boundaries".to_string(),
+            });
+        }
+
+        if !overlap_decay.is_finite() || overlap_decay < 0.0 {
+            return Err(ConfigError::InvalidValue {
+                field: "overlap_decay".to_string(),
+                value: overlap_decay.to_string(),
+                reason: "Must be finite and >= 0.0 (0.0 disables)".to_string(),
+            });
+        }
+
+        if !selection_temperature.is_finite() || selection_temperature < 0.0 {
+            return Err(ConfigError::InvalidValue {
+                field: "selection_temperature".to_string(),
+                value: selection_temperature.to_string(),
+                reason: "Must be finite and >= 0.0 (0.0 is argmax)".to_string(),
+            });
+        }
+
+        if block_size == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "block_size".to_string(),
+                value: block_size.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
+        if !balance_token_usage_threshold.is_finite() || balance_token_usage_threshold <= 0.0 {
+            return Err(ConfigError::InvalidValue {
+                field: "balance_token_usage_threshold".to_string(),
+                value: balance_token_usage_threshold.to_string(),
+                reason: "Must be finite and > 0.0 (use >= 1.0 to disable)".to_string(),
+            });
+        }
+
+        if !overload_token_usage_threshold.is_finite() || overload_token_usage_threshold <= 0.0 {
+            return Err(ConfigError::InvalidValue {
+                field: "overload_token_usage_threshold".to_string(),
+                value: overload_token_usage_threshold.to_string(),
+                reason: "Must be finite and > 0.0 (use >= 1.0 to disable)".to_string(),
+            });
+        }
+
+        if !(0.0..=1.0).contains(&cache_threshold) {
+            return Err(ConfigError::InvalidValue {
+                field: "cache_threshold".to_string(),
+                value: cache_threshold.to_string(),
+                reason: "Must be between 0.0 and 1.0".to_string(),
+            });
+        }
+
+        if !balance_rel_threshold.is_finite() || balance_rel_threshold < 1.0 {
+            return Err(ConfigError::InvalidValue {
+                field: "balance_rel_threshold".to_string(),
+                value: balance_rel_threshold.to_string(),
+                reason: "Must be finite and >= 1.0".to_string(),
+            });
+        }
+
+        if eviction_interval_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "eviction_interval_secs".to_string(),
+                value: eviction_interval_secs.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
+        if max_tree_size == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "max_tree_size".to_string(),
+                value: max_tree_size.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
         Ok(())
     }
 
@@ -1713,6 +1845,93 @@ mod tests {
         assert!(ConfigValidator::validate(&make(0.0, -1.0)).is_err());
         assert!(ConfigValidator::validate(&make(f32::NAN, 0.0)).is_err());
         assert!(ConfigValidator::validate(&make(0.0, f32::INFINITY)).is_err());
+    }
+
+    #[test]
+    fn test_validate_cache_aware_length_rejects_nan_thresholds() {
+        let make = |balance_token_usage_threshold: f32, overload_token_usage_threshold: f32| {
+            RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec![
+                        "http://worker1:8000".to_string(),
+                        "http://worker2:8000".to_string(),
+                    ],
+                },
+                PolicyConfig::CacheAwareLength {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                    block_size: 16,
+                    balance_token_usage_threshold,
+                    overload_token_usage_threshold,
+                    overlap_decay: 0.0,
+                    selection_temperature: 0.0,
+                    cache_index: Default::default(),
+                    cache_ttl_secs: 180,
+                    cache_boundaries: Vec::new(),
+                    chars_per_token: 4,
+                    long_prefill_threshold: 100_000,
+                    long_pool_max_load: 4,
+                    short_pool_max_load: 32,
+                },
+            )
+        };
+
+        // Valid defaults pass.
+        assert!(ConfigValidator::validate(&make(1.0, 1.0)).is_ok());
+        // NaN rejected for both fields.
+        assert!(ConfigValidator::validate(&make(f32::NAN, 1.0)).is_err());
+        assert!(ConfigValidator::validate(&make(1.0, f32::NAN)).is_err());
+        // Infinity rejected for both fields.
+        assert!(ConfigValidator::validate(&make(f32::INFINITY, 1.0)).is_err());
+        assert!(ConfigValidator::validate(&make(1.0, f32::INFINITY)).is_err());
+        // Zero rejected.
+        assert!(ConfigValidator::validate(&make(0.0, 1.0)).is_err());
+        assert!(ConfigValidator::validate(&make(1.0, 0.0)).is_err());
+    }
+
+    #[test]
+    fn test_validate_cache_aware_length_rejects_non_finite_balance_rel_threshold() {
+        let make = |balance_rel_threshold: f32| {
+            RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec![
+                        "http://worker1:8000".to_string(),
+                        "http://worker2:8000".to_string(),
+                    ],
+                },
+                PolicyConfig::CacheAwareLength {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                    block_size: 16,
+                    balance_token_usage_threshold: 1.0,
+                    overload_token_usage_threshold: 1.0,
+                    overlap_decay: 0.0,
+                    selection_temperature: 0.0,
+                    cache_index: Default::default(),
+                    cache_ttl_secs: 180,
+                    cache_boundaries: Vec::new(),
+                    chars_per_token: 4,
+                    long_prefill_threshold: 100_000,
+                    long_pool_max_load: 4,
+                    short_pool_max_load: 32,
+                },
+            )
+        };
+
+        // Valid value passes.
+        assert!(ConfigValidator::validate(&make(1.1)).is_ok());
+        // NaN passes the < 1.0 check (NaN < 1.0 is false) but must be rejected.
+        assert!(ConfigValidator::validate(&make(f32::NAN)).is_err());
+        // Infinity must be rejected.
+        assert!(ConfigValidator::validate(&make(f32::INFINITY)).is_err());
+        // Below 1.0 rejected.
+        assert!(ConfigValidator::validate(&make(0.9)).is_err());
     }
 
     #[test]

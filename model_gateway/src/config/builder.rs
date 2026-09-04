@@ -112,6 +112,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn long_prefill_indices(mut self, indices: Vec<usize>) -> Self {
+        self.config.long_prefill_indices = indices;
+        self
+    }
+
     pub fn random_policy(mut self) -> Self {
         self.config.policy = PolicyConfig::Random;
         self

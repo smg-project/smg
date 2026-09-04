@@ -83,6 +83,47 @@ use crate::{
     worker::{KvEventMonitor, Worker},
 };
 
+/// Hint about the uncached prefill portion from a partial cache match that
+/// fell below `cache_threshold`. Lets the no-cache strategy classify by
+/// actual prefill work instead of the full request size.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum UncachedHint {
+    /// Uncached token count (gRPC / token-tree path).
+    Tokens(usize),
+    /// Uncached character count (HTTP / string-tree path); the strategy
+    /// converts to tokens via its `chars_per_token` setting.
+    Chars(usize),
+}
+
+/// Strategy for the no-cache branch: when a request does not hit the
+/// cache tree (or KV events / hash index), this trait selects which worker
+/// receives the request. The default behavior (no strategy set) delegates to
+/// LeastLoad's expected-wait algorithm (`select_expected_wait`).
+/// `CacheAwareLengthPolicy` injects a strategy that splits workers into
+/// long/short pools by uncached prefill tokens.
+pub(crate) trait NoCacheStrategy: Send + Sync + std::fmt::Debug {
+    /// Select a worker for the no-cache (miss) branch. `expected_wait_idx` is
+    /// the worker LeastLoad's expected-wait algorithm chose by default; the
+    /// strategy may return it or a pool-selected alternative.
+    ///
+    /// `uncached_hint` carries the estimated uncached-prefill size when the
+    /// call originates from a partial cache match that fell below
+    /// `cache_threshold`. It is `None` when no matching was attempted (e.g.
+    /// imbalanced fallback, event-driven no-overlap, hash-path fallback), in
+    /// which case the strategy should estimate from `info` as before.
+    #[expect(clippy::too_many_arguments, reason = "hot-path plumbing, not state")]
+    fn select_no_cache(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        healthy_indices: &[usize],
+        expected_wait_idx: Option<usize>,
+        avg_load: f64,
+        model_id: &str,
+        uncached_hint: Option<UncachedHint>,
+    ) -> Option<usize>;
+}
+
 /// Cache-aware routing policy
 ///
 /// Routes requests based on cache affinity when load is balanced,
@@ -154,6 +195,11 @@ pub struct CacheAwarePolicy {
     /// cloned inner handle stays canonical and walking it never holds
     /// an outer-shard guard.
     placement_index: Arc<DashMap<String, Arc<PlacementMap>>>,
+    /// Optional no-cache strategy. When `None`, the no-cache fallback
+    /// routes to the expected-wait winner (the default behavior). When
+    /// `Some`, the strategy selects the worker instead — used by
+    /// `CacheAwareLengthPolicy` for long/short pool split.
+    no_cache_strategy: Option<Arc<dyn NoCacheStrategy>>,
 }
 
 /// Hash-mode per-model placement map: (boundary position, xxh3 of the token
@@ -330,6 +376,47 @@ impl CacheAwarePolicy {
             populate_hash_index: AtomicBool::new(false),
             mesh_tree_sync: RwLock::new(None),
             placement_index,
+            no_cache_strategy: None,
+        }
+    }
+
+    /// Attach a no-cache strategy, enabling custom worker selection on the
+    /// cache-miss branch. Used by `CacheAwareLengthPolicy` for long/short
+    /// pool split. Returns `self` for chaining.
+    pub(crate) fn with_no_cache_strategy(mut self, strategy: Arc<dyn NoCacheStrategy>) -> Self {
+        self.no_cache_strategy = Some(strategy);
+        self
+    }
+
+    /// Resolve the no-cache branch: if a strategy is attached, delegate to
+    /// it; otherwise fall back to the expected-wait winner (the default
+    /// behavior). Callers still own tree update for the returned index.
+    ///
+    /// `uncached_hint` is the estimated uncached-prefill token count from a
+    /// partial cache match (below `cache_threshold`); `None` when no matching
+    /// was attempted.
+    #[expect(clippy::too_many_arguments, reason = "hot-path plumbing, not state")]
+    fn resolve_no_cache(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        healthy_indices: &[usize],
+        expected_wait_idx: Option<usize>,
+        avg_load: f64,
+        model_id: &str,
+        uncached_hint: Option<UncachedHint>,
+    ) -> Option<usize> {
+        match &self.no_cache_strategy {
+            Some(strategy) => strategy.select_no_cache(
+                workers,
+                info,
+                healthy_indices,
+                expected_wait_idx,
+                avg_load,
+                model_id,
+                uncached_hint,
+            ),
+            None => expected_wait_idx,
         }
     }
 
@@ -746,10 +833,24 @@ impl CacheAwarePolicy {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
         healthy_indices: &[usize],
+        avg_load: f64,
         model_id: &str,
     ) -> Option<usize> {
-        let selected = self.select_expected_wait(workers, healthy_indices, info)?;
-        let worker_url = workers[selected].url();
+        // LeastLoad expected-wait selection when imbalanced. When a no-cache
+        // strategy is attached, it may override the selection (the strategy
+        // receives the expected-wait winner as its default).
+        let expected = self.select_expected_wait(workers, healthy_indices, info);
+        let min_idx = self.resolve_no_cache(
+            workers,
+            info,
+            healthy_indices,
+            expected,
+            avg_load,
+            model_id,
+            None,
+        )?;
+
+        let worker_url = workers[min_idx].url();
 
         // Even in imbalanced mode, update the appropriate tree to maintain cache state
         // Prefer token tree for gRPC requests, fall back to string tree for HTTP
@@ -769,7 +870,7 @@ impl CacheAwarePolicy {
                 // prefix length the standalone match returned. When we don't
                 // populate the index, a plain insert (no match) suffices.
                 if self.should_populate_hash_index() {
-                    let result = tree.match_and_insert(tokens, worker_url);
+                    let result = tree.match_and_insert(tokens, &worker_url);
                     let matched_prefix: Vec<u32> = tokens[..result.matched_token_count].to_vec();
                     self.hash_index
                         .entry(model_id.to_string())
@@ -777,7 +878,7 @@ impl CacheAwarePolicy {
                         .token_tree
                         .insert(kv_index::hash_token_path(tokens), matched_prefix);
                 } else {
-                    tree.insert_tokens(tokens, worker_url);
+                    tree.insert_tokens(tokens, &worker_url);
                 }
             }
         } else if let Some(text) = info.request_text {
@@ -795,7 +896,7 @@ impl CacheAwarePolicy {
                 // prefix length the standalone match returned. When we don't
                 // populate the index, a plain insert (no match) suffices.
                 if self.should_populate_hash_index() {
-                    let result = tree.match_and_insert(text, worker_url);
+                    let result = tree.match_and_insert(text, &worker_url);
                     let matched_prefix: String =
                         text.chars().take(result.matched_char_count).collect();
                     let path_hash = kv_index::hash_node_path(text);
@@ -805,7 +906,7 @@ impl CacheAwarePolicy {
                         .string_tree
                         .insert(path_hash, matched_prefix);
                 } else {
-                    tree.insert_text(text, worker_url);
+                    tree.insert_text(text, &worker_url);
                 }
             } else {
                 debug!(
@@ -821,7 +922,7 @@ impl CacheAwarePolicy {
             model_id,
             "Cache-aware selection"
         );
-        Some(selected)
+        Some(min_idx)
     }
 }
 
@@ -1089,7 +1190,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // request-count pressure is applied per request to the selected
         // candidate inside each affinity path.
         if self.is_kv_imbalanced(workers, &healthy_indices) {
-            return self.select_worker_fallback(workers, info, &healthy_indices, model_id);
+            return self.select_worker_fallback(
+                workers,
+                info,
+                &healthy_indices,
+                avg_load,
+                model_id,
+            );
         }
 
         // Cache-aware routing when balanced — three types (mutually exclusive):
@@ -1377,7 +1484,8 @@ impl CacheAwarePolicy {
     ///
     /// Self-contained — when overlap is found, selects the worker with the best
     /// cache match. When no overlap (cold start, novel tokens, short request),
-    /// falls back to expected wait. Does NOT fall back to approximate token tree.
+    /// falls back to expected wait, optionally overridden by a no-cache
+    /// strategy. Does NOT fall back to approximate token tree.
     fn select_worker_event_driven(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1434,13 +1542,23 @@ impl CacheAwarePolicy {
             return Some(idx);
         }
 
-        // No cache overlap — expected-wait fallback over the healthy fleet.
-        let selected = self.select_expected_wait(workers, healthy_indices, info)?;
+        // No cache overlap — expected-wait fallback over the healthy fleet,
+        // optionally overridden by a no-cache strategy.
+        let expected = self.select_expected_wait(workers, healthy_indices, info);
+        let min_idx = self.resolve_no_cache(
+            workers,
+            info,
+            healthy_indices,
+            expected,
+            avg_load,
+            model_id,
+            None,
+        )?;
         debug!(
-            worker = workers[selected].url(),
+            worker = workers[min_idx].url(),
             model_id, "Event-driven routing: no overlap, expected-wait fallback"
         );
-        Some(selected)
+        Some(min_idx)
     }
 
     /// Build positive-overlap candidates for event-driven routing.
@@ -1642,6 +1760,7 @@ impl CacheAwarePolicy {
                 workers,
                 info,
                 healthy_indices,
+                avg_load,
                 model_id,
                 "expected_wait_fallback",
                 &[],
@@ -1662,6 +1781,7 @@ impl CacheAwarePolicy {
                 workers,
                 info,
                 healthy_indices,
+                avg_load,
                 model_id,
                 "short_request",
                 tokens,
@@ -1675,6 +1795,7 @@ impl CacheAwarePolicy {
                 workers,
                 info,
                 healthy_indices,
+                avg_load,
                 model_id,
                 "kv_pressure_expected_wait",
                 tokens,
@@ -1711,6 +1832,7 @@ impl CacheAwarePolicy {
             workers,
             info,
             healthy_indices,
+            avg_load,
             model_id,
             "expected_wait_fallback",
             tokens,
@@ -1727,13 +1849,25 @@ impl CacheAwarePolicy {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
         healthy_indices: &[usize],
+        avg_load: f64,
         model_id: &str,
         branch: &'static str,
         tokens: &[u32],
         applicable: &[usize],
         now: Instant,
     ) -> Option<usize> {
-        let idx = self.select_expected_wait(workers, healthy_indices, info)?;
+        // Expected-wait fallback over the healthy fleet, optionally overridden
+        // by a no-cache strategy.
+        let expected = self.select_expected_wait(workers, healthy_indices, info);
+        let idx = self.resolve_no_cache(
+            workers,
+            info,
+            healthy_indices,
+            expected,
+            avg_load,
+            model_id,
+            None,
+        )?;
         if !applicable.is_empty() {
             self.record_placement(model_id, tokens, applicable, workers[idx].url(), now);
         }
@@ -1856,6 +1990,7 @@ impl CacheAwarePolicy {
     }
 
     /// Select worker using token-based tree (gRPC path)
+    #[expect(clippy::too_many_arguments, reason = "hot-path plumbing, not state")]
     fn select_worker_with_tokens(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1892,7 +2027,31 @@ impl CacheAwarePolicy {
                     info,
                 )
             } else {
-                self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info)
+                // Partial match below threshold: pass the uncached portion
+                // (input - matched) so the length strategy can classify by
+                // actual prefill work, not full size. When matched == 0 (no
+                // match at all), pass `None` so the strategy falls through to
+                // its normal priority chain (header → tokens → char estimate).
+                // Without a strategy, `resolve_no_cache` returns the
+                // expected-wait winner (the same worker a plain miss would
+                // pick), preserving LeastLoad's atomic credit semantics.
+                let uncached_hint = (result.matched_token_count > 0).then(|| {
+                    UncachedHint::Tokens(
+                        result
+                            .input_token_count
+                            .saturating_sub(result.matched_token_count),
+                    )
+                });
+                let expected = self.select_expected_wait(workers, healthy_indices, info);
+                self.resolve_no_cache(
+                    workers,
+                    info,
+                    healthy_indices,
+                    expected,
+                    avg_load,
+                    model_id,
+                    uncached_hint,
+                )
             };
             selected_idx.map(|idx| workers[idx].url())
         });
@@ -1929,6 +2088,7 @@ impl CacheAwarePolicy {
     }
 
     /// Select worker using string-based tree (HTTP path)
+    #[expect(clippy::too_many_arguments, reason = "hot-path plumbing, not state")]
     fn select_worker_with_text(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1962,7 +2122,31 @@ impl CacheAwarePolicy {
                     info,
                 )
             } else {
-                self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info)
+                // Partial match below threshold: pass the uncached char count
+                // (input - matched) so the length strategy can classify by
+                // actual prefill work, not full size. When matched == 0 (no
+                // match at all), pass `None` so the strategy falls through to
+                // its normal priority chain. Without a strategy,
+                // `resolve_no_cache` returns the expected-wait winner (the
+                // same worker a plain miss would pick), preserving LeastLoad's
+                // atomic credit semantics.
+                let uncached_hint = (result.matched_char_count > 0).then(|| {
+                    UncachedHint::Chars(
+                        result
+                            .input_char_count
+                            .saturating_sub(result.matched_char_count),
+                    )
+                });
+                let expected = self.select_expected_wait(workers, healthy_indices, info);
+                self.resolve_no_cache(
+                    workers,
+                    info,
+                    healthy_indices,
+                    expected,
+                    avg_load,
+                    model_id,
+                    uncached_hint,
+                )
             };
             selected_idx.map(|idx| workers[idx].url())
         });

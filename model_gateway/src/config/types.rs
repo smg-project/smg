@@ -20,6 +20,10 @@ pub struct RouterConfig {
     pub mode: RoutingMode,
     #[serde(default)]
     pub connection_mode: ConnectionMode,
+    /// 0-based indices of `--prefill` URLs that belong to the long pool
+    /// (get `pool=long` label for cache_aware_length). Empty = no long pool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub long_prefill_indices: Vec<usize>,
     /// Explicit runtime for the startup workers (`--worker-urls`), set from
     /// `--backend` when the connection mode is ZMQ. The ZMQ handshake is shared
     /// across engine runtimes, so the wire protocol cannot be probed and must
@@ -647,6 +651,55 @@ pub enum PolicyConfig {
         cache_boundaries: Vec<usize>,
     },
 
+    /// Cache-aware length policy: a full superset of `cache_aware` that adds
+    /// a long/short pool split on the no-cache branch, driven by the `pool`
+    /// worker label (`pool=long` → long pool, otherwise short pool). Inherits
+    /// all cache_aware features (string tree, token tree, event-driven
+    /// routing, hash index, mesh sync, KV pressure). See
+    /// `policies/cache_aware_length.rs`.
+    #[serde(rename = "cache_aware_length")]
+    CacheAwareLength {
+        // --- Inherited from cache_aware ---
+        #[serde(alias = "cache_match_threshold")]
+        #[serde(default = "default_cal_cache_threshold")]
+        cache_threshold: f32,
+        #[serde(alias = "spill_abs_threshold")]
+        #[serde(default = "default_cal_balance_abs_threshold")]
+        balance_abs_threshold: usize,
+        #[serde(alias = "spill_rel_threshold")]
+        #[serde(default = "default_cal_balance_rel_threshold")]
+        balance_rel_threshold: f32,
+        #[serde(default = "default_cal_eviction_interval_secs")]
+        eviction_interval_secs: u64,
+        #[serde(default = "default_cal_max_tree_size")]
+        max_tree_size: usize,
+        #[serde(default = "default_block_size")]
+        block_size: usize,
+        #[serde(default = "default_balance_token_usage_threshold")]
+        balance_token_usage_threshold: f32,
+        #[serde(default = "default_balance_token_usage_threshold")]
+        overload_token_usage_threshold: f32,
+        #[serde(default = "default_overlap_decay")]
+        overlap_decay: f32,
+        #[serde(default = "default_selection_temperature")]
+        selection_temperature: f32,
+        #[serde(default)]
+        cache_index: CacheIndexKind,
+        #[serde(default = "default_cache_ttl_secs")]
+        cache_ttl_secs: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cache_boundaries: Vec<usize>,
+        // --- Length-specific ---
+        #[serde(default = "default_cal_chars_per_token")]
+        chars_per_token: usize,
+        #[serde(default = "default_cal_long_prefill_threshold")]
+        long_prefill_threshold: usize,
+        #[serde(default = "default_cal_long_pool_max_load")]
+        long_pool_max_load: usize,
+        #[serde(default = "default_cal_short_pool_max_load")]
+        short_pool_max_load: usize,
+    },
+
     /// Power-of-two choices policy: samples two workers and routes to the one
     /// with the lower expected wait, scored like `least_load`
     /// (`(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`).
@@ -780,6 +833,35 @@ fn default_cache_ttl_secs() -> u64 {
     180
 }
 
+// cache_aware_length defaults (kept aligned with CacheAwareLengthConfig::default).
+fn default_cal_cache_threshold() -> f32 {
+    0.3
+}
+fn default_cal_balance_abs_threshold() -> usize {
+    32
+}
+fn default_cal_balance_rel_threshold() -> f32 {
+    1.1
+}
+fn default_cal_eviction_interval_secs() -> u64 {
+    30
+}
+fn default_cal_max_tree_size() -> usize {
+    10000
+}
+fn default_cal_chars_per_token() -> usize {
+    4
+}
+fn default_cal_long_prefill_threshold() -> usize {
+    100_000
+}
+fn default_cal_long_pool_max_load() -> usize {
+    4
+}
+fn default_cal_short_pool_max_load() -> usize {
+    32
+}
+
 fn default_prefix_token_count() -> usize {
     256
 }
@@ -835,6 +917,7 @@ impl PolicyConfig {
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::Passthrough => "passthrough",
             PolicyConfig::CacheAware { .. } => "cache_aware",
+            PolicyConfig::CacheAwareLength { .. } => "cache_aware_length",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::LeastLoad { .. } => "least_load",
             PolicyConfig::Bucket { .. } => "bucket",
@@ -1074,6 +1157,7 @@ impl Default for RouterConfig {
             },
             policy: PolicyConfig::Random,
             cache_boundaries: Vec::new(),
+            long_prefill_indices: Vec::new(),
             routing_key_override: RoutingKeyOverrideConfig::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,

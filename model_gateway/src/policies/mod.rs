@@ -14,6 +14,7 @@ use crate::{
 
 mod bucket;
 mod cache_aware;
+mod cache_aware_length;
 mod consistent_hashing;
 mod dp_min_token;
 mod factory;
@@ -29,6 +30,8 @@ pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
+pub(crate) use cache_aware::{NoCacheStrategy, UncachedHint};
+pub use cache_aware_length::CacheAwareLengthPolicy;
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
 pub use factory::PolicyFactory;
@@ -207,6 +210,44 @@ impl Default for CacheAwareConfig {
             cache_index: CacheIndexKind::Tree,
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+        }
+    }
+}
+
+/// Configuration for the cache_aware_length policy (long/short pool split).
+///
+/// Embeds [`CacheAwareConfig`] as `base` so the policy inherits all
+/// cache_aware features (string tree, token tree, event-driven routing,
+/// hash index, mesh sync, KV pressure) and adds 4 length-specific fields
+/// for the no-cache long/short pool split.
+#[derive(Debug, Clone)]
+pub struct CacheAwareLengthConfig {
+    /// Full cache_aware configuration: cache_threshold, balance thresholds,
+    /// eviction, block_size, KV pressure knobs, overlap decay, selection
+    /// temperature, cache_index, cache_ttl_secs, cache_boundaries.
+    pub base: CacheAwareConfig,
+    /// Divisor for char-level token estimation when `X-Prompt-Tokens` is
+    /// absent: `uncached_tokens = (input_chars - matched_chars) /
+    /// chars_per_token`.
+    pub chars_per_token: usize,
+    /// Uncached-prefill-token boundary between long and short requests.
+    pub long_prefill_threshold: usize,
+    /// Load ceiling for the long pool (`pool=long` workers).
+    pub long_pool_max_load: usize,
+    /// Load ceiling for the short pool (remaining workers).
+    pub short_pool_max_load: usize,
+}
+
+impl Default for CacheAwareLengthConfig {
+    fn default() -> Self {
+        Self {
+            base: CacheAwareConfig::default(),
+            chars_per_token: 4,
+            long_prefill_threshold: 100_000,
+            // 0 would reject every worker as non-free; pick generous defaults so
+            // the policy is usable out of the box before operators tune.
+            long_pool_max_load: 4,
+            short_pool_max_load: 32,
         }
     }
 }
