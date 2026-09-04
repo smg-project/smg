@@ -188,11 +188,16 @@ impl ParserRegistry {
     /// If `configured_parser` supports structural tags → `StructuralTag(json)`.
     /// Otherwise → `JsonSchema(schema)` for required/function tool_choice.
     /// Returns `Ok(None)` for auto/none tool_choice.
+    ///
+    /// `parallel_tool_calls` mirrors the OpenAI request field: when `false`,
+    /// the constraint must allow at most one tool call (`maxItems: 1` on the
+    /// JSON schema, `stop_after_first` on structural tags).
     pub fn generate_tool_constraint(
         &self,
         configured_parser: Option<&str>,
         tools: &[Tool],
         tool_choice: &ToolChoice,
+        parallel_tool_calls: bool,
     ) -> Result<Option<ToolConstraint>, String> {
         if tools.is_empty() {
             return Ok(None);
@@ -210,7 +215,30 @@ impl ParserRegistry {
             let entries = self.entries.read();
             if let Some(entry) = entries.get(name) {
                 if let Some(build_fn) = entry.build_structural_tag.as_ref() {
-                    let tag = build_fn(tools, at_least_one);
+                    let mut tag = build_fn(tools, at_least_one);
+                    if !parallel_tool_calls {
+                        // triggered_tags dialect: stop after the first complete
+                        // tool call instead of allowing parallel calls. A tag
+                        // without an object-valued `format` cannot carry the
+                        // constraint — fail loudly rather than silently
+                        // delivering an unconstrained tag.
+                        match tag
+                            .get_mut("format")
+                            .and_then(serde_json::Value::as_object_mut)
+                        {
+                            Some(format) => {
+                                format.insert(
+                                    "stop_after_first".to_string(),
+                                    serde_json::Value::Bool(true),
+                                );
+                            }
+                            None => {
+                                return Err(format!(
+                                    "parser '{name}' produced a structural tag without a format object; cannot honor parallel_tool_calls=false"
+                                ));
+                            }
+                        }
+                    }
                     let json_str = serde_json::to_string(&tag)
                         .map_err(|e| format!("Failed to serialize structural tag: {e}"))?;
                     return Ok(Some(ToolConstraint::StructuralTag(json_str)));
@@ -226,7 +254,7 @@ impl ParserRegistry {
                 Ok(Some(ToolConstraint::JsonSchema(params_schema)))
             }
             _ => {
-                let schema = build_required_array_schema(tools)?;
+                let schema = build_required_array_schema(tools, parallel_tool_calls)?;
                 Ok(Some(ToolConstraint::JsonSchema(schema)))
             }
         }
@@ -540,7 +568,13 @@ impl Default for ParserFactory {
 }
 
 /// Build JSON schema for required tool calls (array with minItems: 1).
-fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
+///
+/// `parallel_tool_calls=false` adds `maxItems: 1`, so the model can emit at
+/// most one tool call (mirrors SGLang's `get_json_schema_constraint`).
+fn build_required_array_schema(
+    tools: &[Tool],
+    parallel_tool_calls: bool,
+) -> Result<String, String> {
     let mut any_of_schemas = Vec::with_capacity(tools.len());
     for tool in tools {
         let tool_schema = json!({
@@ -585,6 +619,12 @@ fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
         }
     });
 
+    if !parallel_tool_calls {
+        if let serde_json::Value::Object(ref mut obj) = array_schema {
+            obj.insert("maxItems".to_string(), json!(1));
+        }
+    }
+
     if !all_defs.is_empty() {
         if let serde_json::Value::Object(ref mut obj) = array_schema {
             obj.insert("$defs".to_string(), serde_json::Value::Object(all_defs));
@@ -593,4 +633,155 @@ fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
 
     serde_json::to_string(&array_schema)
         .map_err(|e| format!("Failed to serialize tool schema: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::common::{Function, FunctionChoice, Tool, ToolChoice, ToolChoiceValue};
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    fn sample_tools() -> Vec<Tool> {
+        ["get_weather", "search"]
+            .into_iter()
+            .map(|name| Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: name.to_string(),
+                    description: None,
+                    parameters: json!({"type": "object", "properties": {}}),
+                    strict: None,
+                },
+            })
+            .collect()
+    }
+
+    fn required() -> ToolChoice {
+        ToolChoice::Value(ToolChoiceValue::Required)
+    }
+
+    fn json_schema_of(constraint: Option<ToolConstraint>) -> Value {
+        let Some(ToolConstraint::JsonSchema(schema)) = constraint else {
+            panic!("expected a json_schema constraint");
+        };
+        serde_json::from_str(&schema).unwrap()
+    }
+
+    fn structural_tag_of(constraint: Option<ToolConstraint>) -> Value {
+        let Some(ToolConstraint::StructuralTag(tag)) = constraint else {
+            panic!("expected a structural_tag constraint");
+        };
+        serde_json::from_str(&tag).unwrap()
+    }
+
+    #[test]
+    fn json_schema_constraint_gets_max_items_when_parallel_disabled() {
+        let registry = ParserRegistry::new();
+        let schema = json_schema_of(
+            registry
+                .generate_tool_constraint(None, &sample_tools(), &required(), false)
+                .unwrap(),
+        );
+        assert_eq!(schema["maxItems"], json!(1));
+        assert_eq!(schema["minItems"], json!(1));
+    }
+
+    #[test]
+    fn json_schema_constraint_omits_max_items_when_parallel_enabled() {
+        let registry = ParserRegistry::new();
+        let schema = json_schema_of(
+            registry
+                .generate_tool_constraint(None, &sample_tools(), &required(), true)
+                .unwrap(),
+        );
+        assert!(schema.get("maxItems").is_none());
+    }
+
+    #[test]
+    fn structural_tag_sets_stop_after_first_when_parallel_disabled() {
+        let factory = ParserFactory::new();
+        let tag = structural_tag_of(
+            factory
+                .registry()
+                .generate_tool_constraint(Some("mistral"), &sample_tools(), &required(), false)
+                .unwrap(),
+        );
+        assert_eq!(tag["format"]["stop_after_first"], json!(true));
+    }
+
+    #[test]
+    fn structural_tag_omits_stop_after_first_when_parallel_enabled() {
+        let factory = ParserFactory::new();
+        let tag = structural_tag_of(
+            factory
+                .registry()
+                .generate_tool_constraint(Some("mistral"), &sample_tools(), &required(), true)
+                .unwrap(),
+        );
+        assert!(tag["format"].get("stop_after_first").is_none());
+    }
+
+    #[test]
+    fn function_choice_constraint_is_unchanged_by_parallel_flag() {
+        // tool_choice = a specific function already means exactly one call;
+        // the params schema passes through untouched either way.
+        let registry = ParserRegistry::new();
+        let choice = ToolChoice::Function {
+            tool_type: "function".to_string(),
+            function: FunctionChoice {
+                name: "get_weather".to_string(),
+            },
+        };
+        for parallel in [true, false] {
+            let schema = json_schema_of(
+                registry
+                    .generate_tool_constraint(None, &sample_tools(), &choice, parallel)
+                    .unwrap(),
+            );
+            assert_eq!(schema["type"], json!("object"));
+            assert!(schema.get("maxItems").is_none());
+        }
+    }
+
+    #[test]
+    fn auto_choice_still_produces_no_constraint_when_parallel_disabled() {
+        let registry = ParserRegistry::new();
+        let constraint = registry
+            .generate_tool_constraint(
+                None,
+                &sample_tools(),
+                &ToolChoice::Value(ToolChoiceValue::Auto),
+                false,
+            )
+            .unwrap();
+        assert!(constraint.is_none());
+    }
+
+    #[test]
+    fn structural_tag_without_format_object_errors_when_parallel_disabled() {
+        // A builder whose tag has no object-valued "format" cannot carry
+        // stop_after_first; silently passing it through would break the
+        // single-call guarantee, so the registry must fail loudly.
+        let registry = ParserRegistry::new();
+        registry.register_parser_with_structural_tag(
+            "bad_tag",
+            || Box::new(PassthroughParser::new()),
+            |_tools, _at_least_one| json!({"unexpected": true}),
+        );
+
+        let err = registry
+            .generate_tool_constraint(Some("bad_tag"), &sample_tools(), &required(), false)
+            .expect_err("malformed tag must error when parallel calls are disabled");
+        assert!(
+            err.contains("bad_tag"),
+            "error should name the parser: {err}"
+        );
+
+        // With parallel calls enabled the tag passes through untouched.
+        let ok = registry
+            .generate_tool_constraint(Some("bad_tag"), &sample_tools(), &required(), true)
+            .unwrap();
+        assert!(ok.is_some());
+    }
 }
