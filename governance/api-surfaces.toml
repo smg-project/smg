@@ -1,0 +1,161 @@
+schema-version = 1
+
+[[package]]
+name = "data-connector"
+path = "crates/data_connector"
+classification = "published-library"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "engine-zmq-client"
+path = "crates/engine_zmq_client"
+classification = "published-library"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "kv-index"
+path = "crates/kv_index"
+classification = "published-library"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "llm-multimodal"
+path = "crates/multimodal"
+classification = "published-library"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "llm-tokenizer"
+path = "crates/tokenizer"
+classification = "published-library"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "mock-worker"
+path = "crates/mock_worker"
+classification = "quality-only"
+semver = false
+release = "none"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "openai-protocol"
+path = "crates/protocols"
+classification = "published-library"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "reasoning-parser"
+path = "crates/reasoning_parser"
+classification = "published-library"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "smg-auth"
+path = "crates/auth"
+classification = "published-library"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "smg-grpc-client"
+path = "crates/grpc_client"
+classification = "published-library"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "smg-mcp"
+path = "crates/mcp"
+classification = "published-library"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "smg-mesh"
+path = "crates/mesh"
+classification = "published-library"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "smg-mm-rdma"
+path = "crates/mm_rdma"
+classification = "published-library"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "smg-wasm"
+path = "crates/wasm"
+classification = "published-library"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "tool-parser"
+path = "crates/tool_parser"
+classification = "published-library"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "wfaas"
+path = "crates/workflow"
+classification = "published-library"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "smg-client"
+path = "clients/rust"
+classification = "public-sdk"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "smg"
+path = "model_gateway"
+classification = "external-application"
+semver = false
+release = "release-crates"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "smg-python"
+path = "bindings/python"
+classification = "version-locked-binding"
+semver = false
+release = "core-version-sync"
+owner = "CODEOWNERS"
+
+[[package]]
+name = "smg-golang"
+path = "bindings/golang"
+classification = "version-locked-binding"
+semver = false
+release = "core-version-sync"
+owner = "CODEOWNERS"

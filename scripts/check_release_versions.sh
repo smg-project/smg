@@ -74,7 +74,6 @@ CRATES=(
     "smg-mesh|crates/mesh|smg-mesh"
     "smg-grpc-client|crates/grpc_client|smg-grpc-client"
     "smg-client|clients/rust|-"
-    "openapi-gen|clients/openapi-gen|-"
     "smg|model_gateway|-"
 )
 
