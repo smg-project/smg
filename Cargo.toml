@@ -1,5 +1,5 @@
 [workspace]
-members = ["model_gateway", "crates/protocols", "crates/reasoning_parser", "crates/tool_parser", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/radix_index", "crates/radix_tree"]
+members = ["model_gateway", "crates/protocols", "crates/reasoning_parser", "crates/tool_parser", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/radix_index", "crates/radix_tree", "crates/sim_loadgen"]
 resolver = "2"
 
 [workspace.dependencies]
