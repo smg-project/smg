@@ -16,8 +16,9 @@
 #   - the payload lives under /opt/smg-ci (venv + stamp) and
 #     /opt/tokenspeed-src (checkout the venv's editable installs point at),
 #     extracted to identical absolute paths;
-#   - the CUDA toolkit is NOT part of the payload; the install script
-#     apt-installs it on the runner when missing, same as the source path.
+#   - the CUDA toolkit and the Python dev headers are NOT part of the
+#     payload; the install script apt-installs them on the runner when
+#     missing, same as the source path.
 #
 # Built by .github/workflows/ci-tokenspeed-image.yml on every bump of
 # .github/versions/tokenspeed.ref or of the image tooling, and tagged
