@@ -180,6 +180,14 @@ pub struct RouterConfig {
     /// Enable the priority-aware admission scheduler. When false (default),
     /// the legacy concurrency-limit middleware stays wired — zero behavior
     /// change for existing deployments.
+    ///
+    /// Limitation: admission capacity is a single fleet-wide scalar with no
+    /// model dimension, so multi-model deployments get incorrect admission
+    /// limits (an idle model's capacity masks a saturated model's queue).
+    /// SMG logs a one-time warning when the healthy fleet reports more than
+    /// one model id. Until per-model capacity lands, prefer
+    /// `--worker-capacity-override` or one gateway per model. See
+    /// smg-project/smg#2069.
     #[serde(default)]
     pub priority_scheduler_enabled: bool,
     /// Max priority class applied to tenants not listed in the scheduler
