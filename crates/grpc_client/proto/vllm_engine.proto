@@ -158,6 +158,22 @@ message MultimodalInputs {
   smg.grpc.common.Modality modality = 10;
 }
 
+// One media item the worker fetches and processes itself. `url` is forwarded
+// verbatim from the API request: http(s)://, data:<mime>;base64,..., or
+// file://. The worker's MediaConnector applies --allowed-media-domains /
+// --allowed-local-media-path / VLLM_*_FETCH_TIMEOUT.
+message MediaRef {
+  smg.grpc.common.Modality modality = 1;  // IMAGE | VIDEO
+  string url = 2;
+}
+
+// Media references in prompt (media-part) order. `tokenized.input_ids` carries
+// exactly one UNEXPANDED placeholder anchor per item; the worker's processor
+// expands it.
+message MediaRefs {
+  repeated MediaRef items = 1;
+}
+
 // =====================
 // Generate Request
 // =====================
@@ -192,6 +208,10 @@ message GenerateRequest {
 
   // DP rank to pin this request to; unset lets the engine balance internally
   optional int32 data_parallel_rank = 9;
+
+  // Set only when the router skipped multimodal processing. Mutually
+  // exclusive with mm_inputs; requires `tokenized` input.
+  MediaRefs media_refs = 10;
 }
 
 // KV cache transfer parameters for Mooncake PD disaggregation
@@ -360,6 +380,16 @@ message GetServerInfoResponse {
   // the router can verify a shared /dev/shm before using the SHM tensor
   // transport under `auto`. Empty when it can't be determined.
   string shm_namespace_id = 10;
+
+  // Worker-side multimodal processing backend: "" (off, or not a multimodal
+  // model), "inprocess", or "redis". Non-empty iff this worker accepts
+  // `media_refs`. Flattened into the `mm_processor` worker label.
+  string mm_processor = 11;
+
+  // Comma-separated URL schemes the worker will fetch, e.g. "http,https,data"
+  // or "http,https,data,file" (file only with --allowed-local-media-path).
+  // Flattened into the `mm_media_ref_schemes` worker label.
+  string mm_media_ref_schemes = 12;
 }
 
 // =====================
