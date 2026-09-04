@@ -7458,6 +7458,7 @@ dependencies = [
  "smg-mcp",
  "smg-mesh",
  "smg-mm-rdma",
+ "smg-rl",
  "smg-wasm",
  "str0m",
  "tempfile",
@@ -7669,9 +7670,29 @@ dependencies = [
  "smg",
  "smg-auth",
  "smg-mesh",
+ "smg-rl",
  "tikv-jemallocator",
  "tokio",
  "tool-parser",
+]
+
+[[package]]
+name = "smg-rl"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures",
+ "http",
+ "http-body-util",
+ "metrics",
+ "openai-protocol",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

@@ -18,6 +18,9 @@ path = "../../model_gateway"
 default-features = false
 features = ["grpc-client", "jemalloc-stats"]
 
+[dependencies.smg-rl]
+workspace = true
+
 [dependencies.smg-auth]
 workspace = true
 

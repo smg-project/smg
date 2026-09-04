@@ -983,19 +983,30 @@ pub fn build_app(
     let admin_routes = apply_control_plane_auth(admin_routes);
     let worker_routes = apply_control_plane_auth(worker_routes);
 
+    // RL control plane: mounted only when the flag built an `RlState`, so
+    // with `--enable-rl` off nothing under /v1/rl exists and the sink 404s.
+    let rl_routes = app_state.context.rl.as_ref().map(|rl| {
+        apply_control_plane_auth(Router::new().nest("/v1/rl", smg_rl::router(Arc::clone(rl))))
+    });
+
     // `/ha/*` management routes (routers/mesh handlers) are removed
     // in this PR — they all read/write through the v1
     // `MeshSyncManager` and don't map cleanly onto the v2 adapters.
     // A v2-aware admin surface will return in a follow-up PR once
     // adapters are production-wired.
 
-    Ok(Router::new()
+    let mut app = Router::new()
         .merge(protected_routes)
         .merge(realtime_routes)
         .merge(multipart_upload_routes)
         .merge(public_routes)
         .merge(admin_routes)
-        .merge(worker_routes)
+        .merge(worker_routes);
+    if let Some(rl_routes) = rl_routes {
+        app = app.merge(rl_routes);
+    }
+
+    Ok(app
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,

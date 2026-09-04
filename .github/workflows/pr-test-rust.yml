@@ -517,6 +517,7 @@ jobs:
               - 'crates/kv_index/**'
               - 'crates/mesh/**'
               - 'crates/mm_rdma/**'
+              - 'crates/rl/**'
               - 'crates/wasm/**'
               - 'crates/workflow/**'
             chat-completions:

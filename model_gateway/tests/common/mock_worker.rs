@@ -356,6 +356,12 @@ impl MockWorker {
                 post(responses_cancel_handler),
             )
             .route("/flush_cache", post(flush_cache_handler))
+            .route("/pause_generation", post(rl_control_handler))
+            .route("/continue_generation", post(rl_control_handler))
+            .route("/update_weights_from_disk", post(rl_control_handler))
+            .route("/update_weight_version", post(rl_control_handler))
+            .route("/pause", post(rl_control_handler))
+            .route("/resume", post(rl_control_handler))
             .route("/v1/models", get(v1_models_handler))
             .with_state(config);
 
@@ -1503,6 +1509,30 @@ async fn responses_handler(
             .into_response()
         }
     }
+}
+
+/// Engine-native RL control routes. Records the body (verbatim-forwarding
+/// assertions) and answers like SGLang: `{"success": true, "message": ...}`.
+async fn rl_control_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    version: Version,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
+    let config = config.read().await;
+
+    if should_fail(&config) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"success": false, "message": "Random failure for testing"})),
+        )
+            .into_response();
+    }
+
+    if let Some(Json(body)) = body {
+        record_request(config.port, version, &body);
+    }
+
+    Json(json!({"success": true, "message": "ok"})).into_response()
 }
 
 async fn flush_cache_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
