@@ -573,7 +573,9 @@ impl WorkerMonitor {
         let known_absent = native_loads_absent.is_some_and(|memo| memo.contains(worker.url()));
         if !known_absent {
             match Self::probe_native_loads(worker).await {
-                NativeLoads::Available(response) => return Some(response),
+                NativeLoads::Available(response) => {
+                    return Self::project_backend_load(worker.as_ref(), response);
+                }
                 NativeLoads::Absent => {
                     if let Some(memo) = native_loads_absent {
                         memo.insert(worker.url().to_string());
@@ -602,10 +604,7 @@ impl WorkerMonitor {
     /// let one timeout demote a healthy backend to the expensive `/metrics`
     /// path permanently.
     async fn probe_native_loads(worker: &Arc<dyn Worker>) -> NativeLoads {
-        let url = format!(
-            "{}/v1/loads?include=core,disagg,queues,memory",
-            worker.url()
-        );
+        let url = worker.endpoint_url("/v1/loads?include=core,disagg,queues,memory");
         let resp = match Self::authed_request(worker, &url).send().await {
             Ok(resp) => resp,
             // Transport error or timeout: says nothing about the route.
@@ -639,7 +638,7 @@ impl WorkerMonitor {
     /// exposed as `vllm:gpu_cache_usage_perc` in vLLM v0 and renamed to
     /// `vllm:kv_cache_usage_perc` in vLLM v1, so accept either.
     async fn fetch_http_load_vllm(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
-        let url = format!("{}/metrics", worker.url());
+        let url = worker.endpoint_url("/metrics");
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
         let m = PromScrape::parse(&body);
 
@@ -665,7 +664,7 @@ impl WorkerMonitor {
     /// the `sglang:` metric prefix through v0.5.3 and switched to `sglang_`
     /// in v0.5.4+, so detect whichever is present and use it throughout.
     async fn fetch_http_load_sglang(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
-        let url = format!("{}/metrics", worker.url());
+        let url = worker.endpoint_url("/metrics");
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
         let m = PromScrape::parse(&body);
 
@@ -722,6 +721,13 @@ impl WorkerMonitor {
         }
     }
 
+    fn project_backend_load(
+        worker: &dyn Worker,
+        load: WorkerLoadResponse,
+    ) -> Option<WorkerLoadResponse> {
+        load.for_dp_rank(worker.dp_rank())
+    }
+
     /// Fetch load via the backend client's `GetLoads` (gRPC RPC or the ZMQ
     /// engine's pushed scheduler stats). Returns `None` on missing client,
     /// error, or empty `loads` array.
@@ -739,8 +745,7 @@ impl WorkerMonitor {
         };
 
         match backend_client.get_loads().await {
-            Ok(load) if !load.loads.is_empty() => Some(load),
-            Ok(_) => None,
+            Ok(load) => Self::project_backend_load(worker.as_ref(), load),
             Err(e) => {
                 debug!("backend GetLoads failed for {}: {e}", worker.url());
                 None
@@ -1196,6 +1201,39 @@ mod worker_monitor_tests {
         (registry, monitor)
     }
 
+    fn dp4_load() -> WorkerLoadResponse {
+        WorkerLoadResponse {
+            dp_rank_count: 4,
+            loads: (0..4)
+                .map(|rank| SchedulerLoadSnapshot {
+                    dp_rank: rank,
+                    num_running_reqs: rank + 1,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn backend_load_is_projected_to_virtual_worker_rank() {
+        let worker = BasicWorkerBuilder::new("grpc://vllm:8000")
+            .connection_mode(ConnectionMode::Grpc)
+            .dp_config(2, 4)
+            .build();
+
+        let load = WorkerMonitor::project_backend_load(&worker, dp4_load()).unwrap();
+        assert_eq!(load.dp_rank_count, 1);
+        assert_eq!(load.loads[0].dp_rank, 2);
+        assert_eq!(load.loads[0].num_running_reqs, 3);
+
+        let missing_worker = BasicWorkerBuilder::new("grpc://vllm:8000")
+            .connection_mode(ConnectionMode::Grpc)
+            .dp_config(4, 5)
+            .build();
+        assert!(WorkerMonitor::project_backend_load(&missing_worker, dp4_load()).is_none());
+    }
+
     #[tokio::test]
     async fn bootstrap_reconcile_starts_loops_for_existing_workers() {
         let (registry, monitor) = build_monitor();
@@ -1578,6 +1616,10 @@ mod native_loads_tests {
     const NATIVE_BODY: &str = r#"{"loads":[{"dp_rank":0,"num_running_reqs":3,
         "num_waiting_reqs":4,"num_waiting_uncached_tokens":900,"token_usage":0.25}]}"#;
 
+    const NATIVE_DP_BODY: &str = r#"{"dp_rank_count":2,"loads":[
+        {"dp_rank":0,"num_running_reqs":3,"token_usage":0.25},
+        {"dp_rank":1,"num_running_reqs":9,"token_usage":0.75}]}"#;
+
     struct Stub {
         url: String,
         probes: Arc<AtomicUsize>,
@@ -1621,6 +1663,22 @@ mod native_loads_tests {
 
     fn vllm_worker(url: &str) -> Arc<dyn Worker> {
         vllm_worker_with_overload(url, OverloadUpdate::default())
+    }
+
+    fn vllm_dp_worker(url: &str, rank: usize, size: usize) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .runtime_type(RuntimeType::Vllm)
+                .model(ModelCard::new("a"))
+                .dp_config(rank, size)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        )
     }
 
     /// Worker carrying a per-worker overload block — protection for it is
@@ -1936,6 +1994,21 @@ mod native_loads_tests {
         assert_eq!(resp.loads[0].num_waiting_uncached_tokens, 900);
         assert_eq!(resp.loads[0].num_running_reqs, 3);
         assert!(memo.is_empty(), "a serving endpoint must not be memoized");
+    }
+
+    #[tokio::test]
+    async fn native_loads_are_projected_to_the_virtual_worker_rank() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_DP_BODY).await;
+        let worker = vllm_dp_worker(&stub.url, 1, 2);
+
+        let resp = WorkerMonitor::fetch_http_load(&worker, None)
+            .await
+            .expect("rank 1 load response");
+
+        assert_eq!(resp.dp_rank_count, 1);
+        assert_eq!(resp.loads.len(), 1);
+        assert_eq!(resp.loads[0].dp_rank, 1);
+        assert_eq!(resp.loads[0].num_running_reqs, 9);
     }
 
     #[tokio::test]

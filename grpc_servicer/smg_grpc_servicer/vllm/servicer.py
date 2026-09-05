@@ -11,7 +11,6 @@ import itertools
 import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
-from datetime import datetime, timezone
 from pathlib import Path
 
 import grpc
@@ -49,6 +48,7 @@ from smg_grpc_servicer.vllm.kv_transfer import (
     params_to_response_fields,
     resolve_pd_connector,
 )
+from smg_grpc_servicer.vllm.loads import build_loads_response
 from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, mm_identity_cache_salt
 
 logger = init_logger(__name__)
@@ -92,40 +92,6 @@ try:
     from vllm.version import __version__ as VLLM_VERSION
 except Exception:  # pragma: no cover - version lookup is best-effort
     VLLM_VERSION = ""
-
-
-def _latest_scheduler_stats(engine, engine_idx: int = 0):
-    """Best-effort read of the most recent ``SchedulerStats`` snapshot.
-
-    vLLM has no synchronous "current stats" accessor on ``AsyncLLM``/``EngineClient``;
-    ``SchedulerStats`` arrive asynchronously and are cached on the stat loggers. This
-    reaches into ``engine.logger_manager.stat_loggers`` and returns the freshest
-    snapshot, handling the logger-shape variants:
-
-    - ``LoggingStatLogger``                  -> ``.last_scheduler_stats``
-    - ``AggregatedLoggingStatLogger`` (DP)   -> ``.last_scheduler_stats_dict[idx]``
-    - ``PerEngineStatLoggerAdapter``         -> ``.per_engine_stat_loggers[idx]``
-    - ``PrometheusStatLogger``               -> skipped (no cached snapshot)
-
-    Returns ``None`` when stats logging is disabled (``--disable-log-stats``) or no
-    engine step has produced outputs yet.
-    """
-    logger_manager = getattr(engine, "logger_manager", None)
-    if logger_manager is None:
-        return None
-    for sl in getattr(logger_manager, "stat_loggers", None) or []:
-        per = getattr(sl, "last_scheduler_stats_dict", None)
-        if isinstance(per, dict) and engine_idx in per:
-            return per[engine_idx]
-        stats = getattr(sl, "last_scheduler_stats", None)
-        if stats is not None:
-            return stats
-        per_engine = getattr(sl, "per_engine_stat_loggers", None)
-        if isinstance(per_engine, dict) and engine_idx in per_engine:
-            nested = getattr(per_engine[engine_idx], "last_scheduler_stats", None)
-            if nested is not None:
-                return nested
-    return None
 
 
 class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
@@ -531,55 +497,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         request: vllm_engine_pb2.GetLoadsRequest,
         context: grpc.aio.ServicerContext,
     ) -> vllm_engine_pb2.GetLoadsResponse:
-        """
-        Handle load-metric requests.
-
-        Reads the latest SchedulerStats snapshot cached on the engine's stat
-        loggers and maps it onto a single-DP-rank SchedulerLoad: ``token_usage``
-        carries KV-cache utilization ([0,1)) and ``num_running_reqs`` /
-        ``num_waiting_reqs`` report queue depth.
-
-        Always returns exactly one SchedulerLoad entry (zero-filled when no
-        snapshot is available yet, e.g. with --disable-log-stats or before the
-        first engine step) so callers treat the worker as responsive rather than
-        dropping the poll.
-
-        Note: ``request.dp_rank`` and ``request.include`` are accepted but not yet
-        applied — vLLM reports a single DP rank (``dp_rank_count=1``) with only
-        core metrics, so there is nothing to filter. They are reserved for future
-        multi-DP / sectioned-metrics support.
-
-        Args:
-            request: The GetLoadsRequest protobuf
-            context: gRPC context
-
-        Returns:
-            GetLoadsResponse protobuf
-        """
-        stats = _latest_scheduler_stats(self.engine)
-        if stats is not None:
-            num_running = int(getattr(stats, "num_running_reqs", 0) or 0)
-            num_waiting = int(getattr(stats, "num_waiting_reqs", 0) or 0)
-            kv_usage = float(getattr(stats, "kv_cache_usage", 0.0) or 0.0)
-        else:
-            num_running = 0
-            num_waiting = 0
-            kv_usage = 0.0
-
-        load = vllm_engine_pb2.SchedulerLoad(
-            dp_rank=0,
-            num_running_reqs=num_running,
-            num_waiting_reqs=num_waiting,
-            num_total_reqs=num_running + num_waiting,
-            token_usage=max(0.0, kv_usage),
-        )
-
-        return vllm_engine_pb2.GetLoadsResponse(
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            version=VLLM_VERSION,
-            dp_rank_count=1,
-            loads=[load],
-        )
+        """Report cached per-rank core loads; unavailable ranks are omitted."""
+        try:
+            return build_loads_response(self.engine, request, VLLM_VERSION)
+        except ValueError as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
 
     async def GetTokenizer(
         self,
