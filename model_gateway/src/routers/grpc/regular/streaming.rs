@@ -686,12 +686,11 @@ impl StreamingProcessor {
 
         // Phase 4: Finish reason chunks
         for (index, finish_reason) in &finish_reasons {
-            let final_finish_reason =
-                if has_tool_calls.get(index).copied().unwrap_or(false) && finish_reason == "stop" {
-                    "tool_calls".to_string()
-                } else {
-                    finish_reason.clone()
-                };
+            let final_finish_reason = utils::finish_reason_with_tool_calls(
+                finish_reason,
+                has_tool_calls.get(index).copied().unwrap_or(false),
+            )
+            .to_string();
 
             let matched_stop_value = matched_stops.get(index).and_then(|v| v.clone());
 
@@ -2498,15 +2497,11 @@ impl StreamingProcessor {
         }
 
         // Phase 4: Emit message_delta with stop_reason and usage
-        let stop_reason = if has_tool_calls || finish_reason_str == "tool_calls" {
-            Some(messages::StopReason::ToolUse)
-        } else if matched_stop.is_some() {
-            Some(messages::StopReason::StopSequence)
-        } else if finish_reason_str == "length" {
-            Some(messages::StopReason::MaxTokens)
-        } else {
-            Some(messages::StopReason::EndTurn)
-        };
+        let stop_reason = Some(utils::messages_stop_reason(
+            &finish_reason_str,
+            has_tool_calls,
+            matched_stop.is_some(),
+        ));
 
         let stop_sequence = if matches!(stop_reason, Some(messages::StopReason::StopSequence)) {
             matched_stop.and_then(|v| v.as_str().map(String::from))

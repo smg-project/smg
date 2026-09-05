@@ -19,6 +19,7 @@ use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage},
     common::{FunctionCallResponse, StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue},
     generate::GenerateFinishReason,
+    messages::StopReason,
 };
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
@@ -749,6 +750,42 @@ pub(crate) fn generate_tool_call_id(
     } else {
         // Kimi-K2 format: functions.{name}:{global_index}.
         format!("functions.{}:{}", tool_name, history_count + tool_index)
+    }
+}
+
+/// Finish reason for a chat choice after tool-call extraction.
+///
+/// Parsed tool calls turn a natural stop (or a missing reason) into
+/// `tool_calls`. A generation the engine cut short (`length`) or filtered
+/// (`content_filter`) keeps that reason even when the parser recovered tool
+/// calls from the partial text: the client needs the truncation signal more
+/// than the label, and the recovered calls are still returned.
+pub(crate) fn finish_reason_with_tool_calls(engine_reason: &str, has_tool_calls: bool) -> &str {
+    match (has_tool_calls, engine_reason) {
+        (true, "length" | "content_filter") => engine_reason,
+        (true, _) => "tool_calls",
+        (false, _) => engine_reason,
+    }
+}
+
+/// Anthropic `stop_reason` for a finished turn.
+///
+/// Truncation wins: a turn the engine cut at `max_tokens` reports `max_tokens`
+/// even when a tool-use block was recovered from the partial output. Otherwise
+/// tool use outranks a matched stop sequence, which outranks a natural stop.
+pub(crate) fn messages_stop_reason(
+    engine_reason: &str,
+    has_tool_calls: bool,
+    has_stop_sequence: bool,
+) -> StopReason {
+    if engine_reason == "length" {
+        StopReason::MaxTokens
+    } else if has_tool_calls || engine_reason == "tool_calls" {
+        StopReason::ToolUse
+    } else if has_stop_sequence {
+        StopReason::StopSequence
+    } else {
+        StopReason::EndTurn
     }
 }
 
@@ -1530,5 +1567,68 @@ mod tests {
         let id = generate_tool_call_id("gpt-4o", "get_weather", 0, 0);
         assert!(id.starts_with("call_"), "got: {id}");
         assert!(!id.contains("get_weather"), "got: {id}");
+    }
+}
+
+#[cfg(test)]
+mod finish_reason_tests {
+    use openai_protocol::messages::StopReason;
+
+    use super::{finish_reason_with_tool_calls, messages_stop_reason};
+
+    #[test]
+    fn tool_calls_rewrite_only_natural_stops() {
+        assert_eq!(finish_reason_with_tool_calls("stop", true), "tool_calls");
+        assert_eq!(finish_reason_with_tool_calls("", true), "tool_calls");
+        assert_eq!(
+            finish_reason_with_tool_calls("tool_calls", true),
+            "tool_calls"
+        );
+        // A truncated or filtered generation keeps the engine's reason even
+        // when tool calls were recovered from the partial text.
+        assert_eq!(finish_reason_with_tool_calls("length", true), "length");
+        assert_eq!(
+            finish_reason_with_tool_calls("content_filter", true),
+            "content_filter"
+        );
+    }
+
+    #[test]
+    fn without_tool_calls_the_engine_reason_passes_through() {
+        for reason in ["stop", "length", "content_filter", "tool_calls", ""] {
+            assert_eq!(finish_reason_with_tool_calls(reason, false), reason);
+        }
+    }
+
+    #[test]
+    fn messages_truncation_outranks_tool_use() {
+        assert_eq!(
+            messages_stop_reason("length", true, false),
+            StopReason::MaxTokens
+        );
+        assert_eq!(
+            messages_stop_reason("length", false, true),
+            StopReason::MaxTokens
+        );
+    }
+
+    #[test]
+    fn messages_natural_stop_precedence_is_unchanged() {
+        assert_eq!(
+            messages_stop_reason("stop", true, true),
+            StopReason::ToolUse
+        );
+        assert_eq!(
+            messages_stop_reason("tool_calls", false, false),
+            StopReason::ToolUse
+        );
+        assert_eq!(
+            messages_stop_reason("stop", false, true),
+            StopReason::StopSequence
+        );
+        assert_eq!(
+            messages_stop_reason("stop", false, false),
+            StopReason::EndTurn
+        );
     }
 }

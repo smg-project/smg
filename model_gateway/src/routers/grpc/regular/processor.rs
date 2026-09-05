@@ -195,12 +195,10 @@ impl ResponseProcessor {
             complete.finish_reason()
         };
 
-        // Override finish reason if we have tool calls
-        let final_finish_reason_str = if tool_calls.is_some() {
-            "tool_calls"
-        } else {
-            finish_reason_str
-        };
+        // Tool calls override a natural stop; a truncated (`length`) or
+        // filtered generation keeps the engine's reason.
+        let final_finish_reason_str =
+            utils::finish_reason_with_tool_calls(finish_reason_str, tool_calls.is_some());
 
         // When the local decoder matched a stop string, surface it (the engine
         // reports no stop_reason over the ZMQ path); otherwise use the engine's.
@@ -759,15 +757,11 @@ impl ResponseProcessor {
                 .and_then(|v| v.as_str().map(String::from))
         });
 
-        let stop_reason = if tool_calls.is_some() || finish_reason_str == "tool_calls" {
-            Some(messages::StopReason::ToolUse)
-        } else if stop_sequence.is_some() {
-            Some(messages::StopReason::StopSequence)
-        } else if finish_reason_str == "length" {
-            Some(messages::StopReason::MaxTokens)
-        } else {
-            Some(messages::StopReason::EndTurn)
-        };
+        let stop_reason = Some(utils::messages_stop_reason(
+            finish_reason_str,
+            tool_calls.is_some(),
+            stop_sequence.is_some(),
+        ));
 
         // Clear stop_sequence when stop_reason is not StopSequence
         let stop_sequence = if matches!(stop_reason, Some(messages::StopReason::StopSequence)) {
