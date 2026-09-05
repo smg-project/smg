@@ -356,6 +356,7 @@ impl MockWorker {
                 post(responses_cancel_handler),
             )
             .route("/flush_cache", post(flush_cache_handler))
+            .route("/v1/loads", get(loads_handler))
             .route("/v1/models", get(v1_models_handler))
             .with_state(config);
 
@@ -1503,6 +1504,29 @@ async fn responses_handler(
             .into_response()
         }
     }
+}
+
+/// Engine-native load report. The gateway's load monitor prefers this route
+/// over `/metrics`, so serving it is what puts a mock worker into `/loads`.
+async fn loads_handler() -> Response {
+    Json(json!({
+        "dp_rank_count": 1,
+        "loads": [{
+            "dp_rank": 0,
+            "num_running_reqs": 2,
+            "num_waiting_reqs": 1,
+            "num_used_tokens": 1024,
+            "max_total_num_tokens": 8192,
+            "token_usage": 0.125,
+        }],
+        "aggregate": {
+            "total_running_reqs": 2,
+            "total_waiting_reqs": 1,
+            "total_reqs": 3,
+            "avg_token_usage": 0.125,
+        },
+    }))
+    .into_response()
 }
 
 async fn flush_cache_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {

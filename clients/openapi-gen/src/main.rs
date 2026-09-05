@@ -51,6 +51,15 @@ struct Operation {
     #[serde(rename = "requestBody")]
     request_body: Option<RequestBody>,
     responses: BTreeMap<String, Response>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    deprecated: bool,
+}
+
+impl Operation {
+    fn deprecated(mut self) -> Self {
+        self.deprecated = true;
+        self
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -227,6 +236,17 @@ fn path_param(name: &str) -> Parameter {
     }
 }
 
+fn optional_query_param(name: &str) -> Parameter {
+    Parameter {
+        name: name.to_string(),
+        location: "query".to_string(),
+        required: false,
+        schema: ParameterSchema {
+            schema_type: "string".to_string(),
+        },
+    }
+}
+
 fn operation(
     op_id: &str,
     summary: &str,
@@ -240,6 +260,7 @@ fn operation(
         parameters: params,
         request_body,
         responses,
+        deprecated: false,
     }
 }
 
@@ -575,6 +596,35 @@ fn main() -> anyhow::Result<()> {
                 None,
                 worker_accepted_response("Worker deletion accepted"),
             )),
+            ..PathItem::default()
+        },
+    );
+
+    // ---- Fleet load ----
+    let worker_load_name = collect_schema(schema_for!(WorkerLoadResponse), &mut schemas)?;
+    let loads_operation = |op_id: &str, summary: &str| {
+        operation(
+            op_id,
+            summary,
+            Some(vec![optional_query_param("model")]),
+            None,
+            json_response(&worker_load_name, summary),
+        )
+    };
+    paths.insert(
+        "/loads".to_string(),
+        PathItem {
+            get: Some(loads_operation(
+                "getLoads",
+                "Cached engine load for every worker, plus a fleet aggregate",
+            )),
+            ..PathItem::default()
+        },
+    );
+    paths.insert(
+        "/get_loads".to_string(),
+        PathItem {
+            get: Some(loads_operation("getLoadsLegacy", "Deprecated alias of /loads").deprecated()),
             ..PathItem::default()
         },
     );

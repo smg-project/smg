@@ -1883,6 +1883,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         status: Some(status),
         load: worker.load(),
         http2: metadata.http2,
+        engine_load: None,
         job_status: None,
     }
 }
