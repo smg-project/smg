@@ -145,9 +145,18 @@ impl MinimaxM3Parser {
             return false;
         };
         let candidate = after_wrapper.trim_start();
-        candidate.is_empty()
-            || INVOKE_START.starts_with(candidate)
-            || candidate.starts_with(INVOKE_START)
+        if candidate.is_empty() || INVOKE_START.starts_with(candidate) {
+            return true;
+        }
+
+        let Some(after_invoke) = candidate.strip_prefix(INVOKE_START) else {
+            return false;
+        };
+        after_invoke.is_empty()
+            || after_invoke
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_whitespace() || c == '>')
     }
 
     /// Decode common XML entities.

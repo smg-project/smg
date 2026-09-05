@@ -456,9 +456,10 @@ async fn test_m3_streaming_false_invoke_prefix_recovers_at_every_divergence() {
     let wrapper = format!("{NS}<tool_call>");
     let possible_invoke = format!("\n\t{NS}<invoke");
 
-    // Every proper prefix remains viable, including whitespace after the
-    // wrapper. The first divergent byte must release the entire candidate.
-    for split in 0..possible_invoke.len() {
+    // Every prefix through the complete marker remains viable, including
+    // whitespace after the wrapper. The first divergent byte must release the
+    // entire candidate, including when it follows a complete invoke marker.
+    for split in 0..=possible_invoke.len() {
         let mut parser = MinimaxM3Parser::new();
         let held = format!("{wrapper}{}", &possible_invoke[..split]);
 
