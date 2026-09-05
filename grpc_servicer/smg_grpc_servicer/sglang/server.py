@@ -33,6 +33,7 @@ from smg_grpc_servicer.sglang.scheduler_launcher import (
     launch_scheduler_process_only,
     terminate_scheduler_processes,
 )
+from smg_grpc_servicer.sglang.scheduler_watchdog import wait_for_scheduler_shutdown
 from smg_grpc_servicer.sglang.servicer import SGLangSchedulerServicer
 
 logger = logging.getLogger(__name__)
@@ -379,7 +380,7 @@ async def serve_grpc(
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, signal_handler)
 
-        await stop_event.wait()
+        await wait_for_scheduler_shutdown(scheduler_procs, stop_event)
     finally:
         logger.info("Shutting down gRPC server")
 
