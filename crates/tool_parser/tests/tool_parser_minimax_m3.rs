@@ -918,29 +918,36 @@ async fn test_empty_leaf_without_schema_is_unchanged() {
     reason = "test helper; allow-unwrap-in-tests only covers #[test] fns"
 )]
 fn composite_schema_tools(combinator: &str) -> Vec<Tool> {
+    let branches = json!([
+        {
+            "type": "object",
+            "properties": {
+                "string_list": {"type": "array", "items": {"type": "string"}}
+            }
+        },
+        {
+            "type": "object",
+            "properties": {
+                "number_list": {"type": "array", "items": {"type": "number"}}
+            }
+        }
+    ]);
+    let mut nested = json!({"type": "object"});
+    nested
+        .as_object_mut()
+        .unwrap()
+        .insert(combinator.to_string(), branches.clone());
     let mut parameters = json!({
         "type": "object",
         "properties": {
-            "plain": {"type": "string"}
+            "plain": {"type": "string"},
+            "nested": nested
         }
     });
-    parameters.as_object_mut().unwrap().insert(
-        combinator.to_string(),
-        json!([
-            {
-                "type": "object",
-                "properties": {
-                    "string_list": {"type": "array", "items": {"type": "string"}}
-                }
-            },
-            {
-                "type": "object",
-                "properties": {
-                    "number_list": {"type": "array", "items": {"type": "number"}}
-                }
-            }
-        ]),
-    );
+    parameters
+        .as_object_mut()
+        .unwrap()
+        .insert(combinator.to_string(), branches);
 
     vec![Tool {
         tool_type: "function".to_string(),
@@ -995,6 +1002,46 @@ async fn test_m3_resolves_property_schemas_in_top_level_any_of() {
 #[tokio::test]
 async fn test_m3_resolves_property_schemas_in_top_level_all_of() {
     assert_composite_property_schemas("allOf").await;
+}
+
+#[tokio::test]
+async fn test_m3_resolves_nested_composite_property_schemas() {
+    for combinator in ["oneOf", "anyOf", "allOf"] {
+        let parser = MinimaxM3Parser::new();
+        let tools = composite_schema_tools(combinator);
+        let string_items = format!("{}{}", element("item", "12"), element("item", "34"));
+        let number_items = format!("{}{}", element("item", "12"), element("item", "34"));
+        let input = tool_block(&[
+            (
+                "composite_schema",
+                element("nested", &element("string_list", &string_items)),
+            ),
+            (
+                "composite_schema",
+                element("nested", &element("number_list", &number_items)),
+            ),
+        ]);
+
+        let (_, calls) = parser
+            .parse_complete_with_tools(&input, &tools)
+            .await
+            .unwrap();
+        let string_args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let number_args: serde_json::Value =
+            serde_json::from_str(&calls[1].function.arguments).unwrap();
+
+        assert_eq!(
+            string_args,
+            json!({"nested": {"string_list": ["12", "34"]}}),
+            "{combinator} must preserve nested string array items"
+        );
+        assert_eq!(
+            number_args,
+            json!({"nested": {"number_list": [12, 34]}}),
+            "{combinator} must coerce nested number array items"
+        );
+    }
 }
 
 #[tokio::test]
