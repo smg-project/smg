@@ -135,6 +135,21 @@ impl MinimaxM3Parser {
             .max()
     }
 
+    /// Whether a buffered tool-call wrapper can still become a valid invoke.
+    ///
+    /// Whitespace is allowed between the wrapper and the invoke marker. Once
+    /// the first non-whitespace bytes diverge from that marker, later input
+    /// cannot turn the candidate into a tool call.
+    fn could_start_invoke(buffer: &str) -> bool {
+        let Some(after_wrapper) = buffer.strip_prefix(TOOL_CALL_START) else {
+            return false;
+        };
+        let candidate = after_wrapper.trim_start();
+        candidate.is_empty()
+            || INVOKE_START.starts_with(candidate)
+            || candidate.starts_with(INVOKE_START)
+    }
+
     /// Decode common XML entities.
     fn decode_xml_entities(text: &str) -> String {
         text.replace("&lt;", "<")
@@ -467,6 +482,15 @@ impl ToolParser for MinimaxM3Parser {
 
             // Inside a tool call: wait for the complete end token before emitting.
             let Some(end_rel) = self.buffer.find(TOOL_CALL_END) else {
+                if !Self::could_start_invoke(&self.buffer) {
+                    // Release the false wrapper, then resume the normal-text
+                    // scan so a later marker (including a partial one) is still
+                    // recognized rather than flushed as ordinary content.
+                    normal_text.push_str(TOOL_CALL_START);
+                    self.buffer.drain(..TOOL_CALL_START.len());
+                    self.in_tool_call = false;
+                    continue;
+                }
                 break;
             };
             let block_end = end_rel + TOOL_CALL_END.len();
@@ -530,6 +554,14 @@ impl ToolParser for MinimaxM3Parser {
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
+    }
+
+    fn take_unstreamed_normal_text(&mut self) -> String {
+        // Completed blocks are removed from `buffer`, so anything left here is
+        // an independent, incomplete candidate and must be returned verbatim.
+        // Leave the parser ready to process ordinary text if it is reused.
+        self.in_tool_call = false;
+        std::mem::take(&mut self.buffer)
     }
 
     fn reset(&mut self) {
