@@ -18,11 +18,18 @@ use crate::{
         ChatTemplateState, ThinkingKeyName, ThinkingToggle,
     },
     encoders::{
-        kimi_k25_tools::apply_kimi_k25_tools, kimi_k3_xtml::apply_kimi_k3_xtml_with_effort_default,
+        kimi_k25_tools::apply_kimi_k25_tools,
+        kimi_k3_xtml::{
+            apply_kimi_k3_xtml_with_effort_default,
+            render_kimi_k3_xtml_segments_with_effort_default,
+        },
     },
     factory::discover_chat_template_in_dir,
     kimi_k2_tokenizer,
-    traits::{Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait},
+    traits::{
+        Decoder, Encoder, Encoding, PromptSegment, SpecialTokens, TokenIdType,
+        Tokenizer as TokenizerTrait,
+    },
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -510,6 +517,18 @@ impl Encoder for TiktokenTokenizer {
             .map(|input| self.encode(input, add_special_tokens))
             .collect()
     }
+
+    fn encode_segments(&self, segments: &[PromptSegment]) -> Result<Encoding> {
+        let mut ids = Vec::new();
+        for segment in segments {
+            if segment.allow_special {
+                ids.extend(self.tokenizer.encode_with_special_tokens(&segment.text));
+            } else {
+                ids.extend(self.tokenizer.encode_ordinary(&segment.text));
+            }
+        }
+        Ok(Encoding::Tiktoken(ids))
+    }
 }
 
 impl Decoder for TiktokenTokenizer {
@@ -599,6 +618,21 @@ impl TokenizerTrait for TiktokenTokenizer {
             // This is the layer the checkpoint's own `apply_chat_template` sits
             // at, so it applies that wrapper's `thinking_effort` default.
             Renderer::KimiK3Xtml => apply_kimi_k3_xtml_with_effort_default(messages, &params),
+        }
+    }
+
+    fn apply_chat_template_segments(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+    ) -> Result<Vec<PromptSegment>> {
+        match self.renderer {
+            Renderer::KimiK3Xtml => {
+                render_kimi_k3_xtml_segments_with_effort_default(messages, &params)
+            }
+            _ => Ok(vec![PromptSegment::control(
+                self.apply_chat_template(messages, params)?,
+            )]),
         }
     }
 
@@ -978,6 +1012,64 @@ mod tests {
                 .unwrap(),
             Some("b".to_string())
         );
+    }
+
+    /// Every byte as its own rank, so any string is encodable as ordinary text.
+    fn full_byte_tiktoken_model() -> String {
+        (0u32..256)
+            .map(|b| format!("{} {}\n", STANDARD.encode([b as u8]), b))
+            .collect()
+    }
+
+    #[test]
+    fn test_encode_segments_keeps_control_tokens_out_of_text_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tiktoken.model"),
+            full_byte_tiktoken_model(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder": {"300": {"content": "<|open|>", "special": false}}}"#,
+        )
+        .unwrap();
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+
+        let control = tokenizer
+            .encode_segments(&[PromptSegment::control("<|open|>")])
+            .unwrap();
+        assert_eq!(control.token_ids(), &[300]);
+
+        let text = tokenizer
+            .encode_segments(&[PromptSegment::text("<|open|>")])
+            .unwrap();
+        assert!(
+            !text.token_ids().contains(&300),
+            "marker in a text segment must not become a control id: {:?}",
+            text.token_ids()
+        );
+        assert_eq!(
+            tokenizer.decode(text.token_ids(), false).unwrap(),
+            "<|open|>"
+        );
+
+        let mixed = tokenizer
+            .encode_segments(&[
+                PromptSegment::control("<|open|>"),
+                PromptSegment::text("message"),
+                PromptSegment::text("<|open|>"),
+            ])
+            .unwrap();
+        assert_eq!(mixed.token_ids().iter().filter(|&&id| id == 300).count(), 1);
+        assert_eq!(
+            tokenizer.decode(mixed.token_ids(), false).unwrap(),
+            "<|open|>message<|open|>"
+        );
+
+        // The flat encode still maps every marker string to its control id.
+        let flat = tokenizer.encode("<|open|>message<|open|>", false).unwrap();
+        assert_eq!(flat.token_ids().iter().filter(|&&id| id == 300).count(), 2);
     }
 
     #[test]

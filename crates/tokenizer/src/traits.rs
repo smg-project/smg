@@ -12,10 +12,49 @@ use crate::chat_template::{
 /// Type alias for token IDs
 pub type TokenIdType = u32;
 
+/// One piece of a rendered prompt, tagged with how special-token strings in
+/// it must be encoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptSegment {
+    pub text: String,
+    /// `true`: special-token strings map to their control ids (structural
+    /// markers emitted by the renderer). `false`: ordinary BPE, so a literal
+    /// marker string inside message text stays text.
+    pub allow_special: bool,
+}
+
+impl PromptSegment {
+    pub fn control(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            allow_special: true,
+        }
+    }
+
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            allow_special: false,
+        }
+    }
+}
+
+/// The flat prompt string: segment texts concatenated in order.
+pub fn join_segments(segments: &[PromptSegment]) -> String {
+    segments.iter().map(|s| s.text.as_str()).collect()
+}
+
 /// Core encoding trait - separate from decoding for modularity
 pub trait Encoder: Send + Sync {
     fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding>;
     fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>>;
+
+    /// Encode a segmented prompt. The default joins the segments and encodes
+    /// the flat string; backends that can keep control tokens out of ordinary
+    /// text override it.
+    fn encode_segments(&self, segments: &[PromptSegment]) -> Result<Encoding> {
+        self.encode(&join_segments(segments), false)
+    }
 }
 
 /// Core decoding trait - can be implemented independently
@@ -92,6 +131,19 @@ pub trait Tokenizer: Encoder + Decoder {
         Err(anyhow::anyhow!(
             "Chat template not supported by this tokenizer"
         ))
+    }
+
+    /// Segmented form of `apply_chat_template`. Renderers that separate
+    /// structural markers from message text override this; the default wraps
+    /// the flat rendering in a single control segment.
+    fn apply_chat_template_segments(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+    ) -> Result<Vec<PromptSegment>> {
+        Ok(vec![PromptSegment::control(
+            self.apply_chat_template(messages, params)?,
+        )])
     }
 
     /// Get the content format expected by the chat template.

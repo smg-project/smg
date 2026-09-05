@@ -31,7 +31,7 @@ use crate::{
     chat_template::{
         ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
     },
-    traits::{Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer},
+    traits::{Decoder, Encoder, Encoding, PromptSegment, SpecialTokens, TokenIdType, Tokenizer},
 };
 
 /// Configuration for the tokenizer cache
@@ -248,6 +248,15 @@ impl Encoder for CachedTokenizer {
             .map(|&input| self.encode(input, add_special_tokens))
             .collect()
     }
+
+    fn encode_segments(&self, segments: &[PromptSegment]) -> Result<Encoding> {
+        // A single control segment is the flat prompt the caches are keyed on.
+        // Mixed segments are encoded piecewise by the inner tokenizer, uncached.
+        match segments {
+            [only] if only.allow_special => self.encode(&only.text, false),
+            _ => self.inner.encode_segments(segments),
+        }
+    }
 }
 
 impl Decoder for CachedTokenizer {
@@ -284,6 +293,14 @@ impl Tokenizer for CachedTokenizer {
         params: ChatTemplateParams,
     ) -> Result<String> {
         self.inner.apply_chat_template(messages, params)
+    }
+
+    fn apply_chat_template_segments(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+    ) -> Result<Vec<PromptSegment>> {
+        self.inner.apply_chat_template_segments(messages, params)
     }
 
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
