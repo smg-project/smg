@@ -74,7 +74,7 @@ def launch_scheduler_process_only(
     # Allocate ports for inter-process communications
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
-        logger.info(f"{server_args=}")
+    logger.info(f"{server_args=}")
 
     scheduler_procs = []
 

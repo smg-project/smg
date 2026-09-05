@@ -22,7 +22,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.runtime_context import publish
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
@@ -33,6 +33,30 @@ from smg_grpc_servicer.sglang.scheduler_launcher import launch_scheduler_process
 from smg_grpc_servicer.sglang.servicer import SGLangSchedulerServicer
 
 logger = logging.getLogger(__name__)
+
+
+async def _launch_scheduler_with_request_manager(
+    server_args: ServerArgs,
+    bootstrap_server=None,
+):
+    """Bind scheduler IPC endpoints before scheduler processes connect."""
+    port_args = PortArgs.init_new(server_args)
+    request_manager = GrpcRequestManager(
+        server_args=server_args,
+        port_args=port_args,
+        bootstrap_server=bootstrap_server,
+    )
+
+    try:
+        scheduler_info, launched_port_args, scheduler_procs = launch_scheduler_process_only(
+            server_args=server_args,
+            port_args=port_args,
+        )
+    except BaseException:
+        await request_manager.shutdown()
+        raise
+
+    return scheduler_info, launched_port_args, scheduler_procs, request_manager
 
 
 async def serve_grpc(
@@ -79,8 +103,14 @@ async def serve_grpc(
 
     # Launch only the scheduler process(es) (no tokenizer/detokenizer needed for gRPC)
     logger.info("Launching scheduler process(es)...")
-    scheduler_info, port_args, scheduler_procs = launch_scheduler_process_only(
+    (
+        scheduler_info,
+        port_args,
+        scheduler_procs,
+        request_manager,
+    ) = await _launch_scheduler_with_request_manager(
         server_args=server_args,
+        bootstrap_server=bootstrap_server,
     )
 
     # Load model config to get HF config info (same as TokenizerManager does)
@@ -121,14 +151,6 @@ async def serve_grpc(
             "id2label_json": id2label_json,
             "num_labels": num_labels or 0,
         }
-
-    # Create request manager with the correct port args
-    # Note: We pass None for bootstrap_server since it's already started above
-    request_manager = GrpcRequestManager(
-        server_args=server_args,
-        port_args=port_args,
-        bootstrap_server=bootstrap_server,
-    )
 
     if on_request_manager_ready is not None:
         try:
