@@ -162,7 +162,7 @@ pub(crate) async fn prepare_chat_like(
         };
 
         // Step 2: Process messages and apply chat template
-        let processed_messages = match utils::process_chat_messages_with_placeholders(
+        let mut processed_messages = match utils::process_chat_messages_with_placeholders(
             &body_ref,
             &*tokenizer,
             placeholder_tokens.as_ref(),
@@ -175,11 +175,11 @@ pub(crate) async fn prepare_chat_like(
             }
         };
 
-        // Step 3: Tokenize the processed text (no special tokens - chat template already handles them)
-        let encoding = match utils::encode_blocking(
+        // Step 3: Tokenize the rendered segments (the renderer decides which
+        // pieces may carry special tokens)
+        let encoding = match utils::encode_segments_blocking(
             tokenizer.clone(),
-            processed_messages.text.clone(),
-            false,
+            std::mem::take(&mut processed_messages.segments),
         )
         .await
         {

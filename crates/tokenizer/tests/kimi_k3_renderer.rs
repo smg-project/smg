@@ -8,11 +8,13 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use std::{collections::HashMap, fs};
+use std::{collections::HashMap, fs, path::Path};
 
 use llm_tokenizer::{
-    chat_template::ChatTemplateParams, encoders::kimi_k3_xtml::apply_kimi_k3_xtml,
-    traits::Tokenizer as TokenizerTrait, TiktokenTokenizer,
+    chat_template::ChatTemplateParams,
+    encoders::kimi_k3_xtml::apply_kimi_k3_xtml,
+    traits::{Encoder, Tokenizer as TokenizerTrait},
+    TiktokenTokenizer,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -217,4 +219,67 @@ fn tokenizer_loads_and_renders_k3_without_chat_template() {
         rendered.ends_with(&fixture_text("plain_user_thinking")),
         "the directive is the only addition: {rendered}"
     );
+}
+
+/// Token-id parity with the checkpoint's own `apply_chat_template(tokenize=True)`
+/// (`build_chat_segments` + `_encode_chat_segments`), recorded in
+/// `tests/fixtures/kimi_k3/k3_render_ids_fixtures.json`. Needs the real
+/// tokenizer files: point `KIMI_K3_MODEL_DIR` at a Kimi-K3 checkpoint directory
+/// and run with `cargo test -- --ignored`.
+#[test]
+#[ignore = "requires a Kimi-K3 checkpoint directory in KIMI_K3_MODEL_DIR"]
+fn segment_encoding_matches_vendor_token_ids() {
+    let model_dir = std::env::var_os("KIMI_K3_MODEL_DIR")
+        .expect("set KIMI_K3_MODEL_DIR to a Kimi-K3 checkpoint directory");
+    let tok = TiktokenTokenizer::from_dir(Path::new(&model_dir)).expect("K3 tokenizer should load");
+
+    let raw = fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/kimi_k3/k3_render_ids_fixtures.json"),
+    )
+    .expect("k3 id fixtures must exist");
+    let cases: Value = serde_json::from_str(&raw).expect("fixtures must be valid JSON");
+
+    for (name, case) in cases.as_object().expect("fixture root is an object") {
+        let messages = case["messages"].as_array().expect("messages").clone();
+        let tools: Option<Vec<Value>> = case["tools"].as_array().cloned();
+        let expected: Vec<u32> = case["ids"]
+            .as_array()
+            .expect("ids")
+            .iter()
+            .map(|v| v.as_u64().expect("id") as u32)
+            .collect();
+        let params = || ChatTemplateParams {
+            add_generation_prompt: true,
+            tools: tools.as_deref(),
+            ..Default::default()
+        };
+
+        let segments = tok
+            .apply_chat_template_segments(&messages, params())
+            .expect("segment render should succeed");
+        let ids = tok
+            .encode_segments(&segments)
+            .expect("segment encode should succeed");
+        assert_eq!(
+            ids.token_ids(),
+            &expected[..],
+            "case {name}: segment encoding differs"
+        );
+
+        // The flat path maps marker strings inside message text to control ids
+        // and lets BPE merge across attribute-piece boundaries (`=".hidden`), so
+        // it must disagree with the reference exactly in those cases.
+        let flat = tok
+            .apply_chat_template(&messages, params())
+            .expect("flat render");
+        let flat_ids = tok.encode(&flat, false).expect("flat encode");
+        let flat_must_differ = messages.iter().any(|m| m.to_string().contains("<|"))
+            || name == "punctuation_attribute_value";
+        assert_eq!(
+            flat_ids.token_ids() != &expected[..],
+            flat_must_differ,
+            "case {name}: flat encoding parity unexpected"
+        );
+    }
 }

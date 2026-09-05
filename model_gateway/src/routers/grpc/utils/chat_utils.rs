@@ -12,7 +12,7 @@ use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
     stop::StopSequenceDecoderBuilder,
-    traits::{Encoding, Tokenizer},
+    traits::{join_segments, Encoding, PromptSegment, Tokenizer},
     StopSequenceDecoder,
 };
 use openai_protocol::{
@@ -131,6 +131,24 @@ pub(crate) async fn encode_blocking(
         .await
         .map_err(|e| anyhow!("encode semaphore closed: {e}"))?;
     tokio::task::spawn_blocking(move || tokenizer.encode(&text, add_special_tokens))
+        .await
+        .map_err(|e| anyhow!("tokenization task failed: {e}"))?
+}
+
+/// Segmented counterpart of [`encode_blocking`] with the same offload policy.
+pub(crate) async fn encode_segments_blocking(
+    tokenizer: Arc<dyn Tokenizer>,
+    segments: Vec<PromptSegment>,
+) -> anyhow::Result<Encoding> {
+    let bytes: usize = segments.iter().map(|s| s.text.len()).sum();
+    if bytes < ENCODE_OFFLOAD_MIN_BYTES {
+        return tokenizer.encode_segments(&segments);
+    }
+    let _permit = encode_permits()
+        .acquire()
+        .await
+        .map_err(|e| anyhow!("encode semaphore closed: {e}"))?;
+    tokio::task::spawn_blocking(move || tokenizer.encode_segments(&segments))
         .await
         .map_err(|e| anyhow!("tokenization task failed: {e}"))?
 }
@@ -465,7 +483,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
 ) -> Result<ProcessedMessages, String> {
-    let formatted_text = {
+    let segments = {
         // Get content format and transform messages accordingly
         let content_format = tokenizer.chat_template_content_format();
         let mut transformed_messages = process_content_format_with_order(
@@ -525,6 +543,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
             let Some(last_msg) = transformed_messages.pop() else {
                 return Ok(ProcessedMessages {
                     text: String::new(),
+                    segments: Vec::new(),
                     stop_sequences: request.stop.clone(),
                 });
             };
@@ -537,20 +556,25 @@ pub(crate) fn process_chat_messages_with_placeholders(
         };
 
         // Apply chat template with the (now possibly shorter) list of messages
-        let rendered = tokenizer
-            .apply_chat_template(&transformed_messages, params)
+        let mut segments = tokenizer
+            .apply_chat_template_segments(&transformed_messages, params)
             .map_err(|e| format!("Failed to apply chat template: {e}"))?;
 
-        // Append assistant prefix if we have one
+        // Append assistant prefix if we have one. A flat renderer hands back a
+        // single control segment and the prefix joins it, so the prompt stays
+        // one encoding unit; segment-aware renderers take it as message text.
         if let Some(prefix) = assistant_prefix {
-            format!("{rendered}{prefix}")
-        } else {
-            rendered
+            match segments.as_mut_slice() {
+                [only] if only.allow_special => only.text.push_str(&prefix),
+                _ => segments.push(PromptSegment::text(prefix)),
+            }
         }
+        segments
     };
 
     Ok(ProcessedMessages {
-        text: formatted_text,
+        text: join_segments(&segments),
+        segments,
         stop_sequences: request.stop.clone(),
     })
 }

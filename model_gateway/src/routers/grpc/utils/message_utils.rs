@@ -8,7 +8,7 @@
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
-    traits::Tokenizer,
+    traits::{join_segments, Tokenizer},
 };
 use openai_protocol::{
     common::{self, StringOrArray, Tool as ChatTool, ToolChoice as ChatToolChoice},
@@ -96,8 +96,8 @@ pub fn process_messages(
         ..Default::default()
     };
 
-    let formatted_text = tokenizer
-        .apply_chat_template(&transformed_messages, params)
+    let segments = tokenizer
+        .apply_chat_template_segments(&transformed_messages, params)
         .map_err(|e| format!("Failed to apply chat template: {e}"))?;
 
     // Step 7: Build ProcessedMessages
@@ -107,7 +107,8 @@ pub fn process_messages(
         .map(|seqs| StringOrArray::Array(seqs.clone()));
 
     Ok(ProcessedMessages {
-        text: formatted_text,
+        text: join_segments(&segments),
+        segments,
         stop_sequences,
     })
 }
