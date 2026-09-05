@@ -1345,6 +1345,21 @@ pub struct WorkerLoadResponse {
 }
 
 impl WorkerLoadResponse {
+    /// Scope a backend response to one virtual DP worker. A missing rank is
+    /// unavailable; it must never inherit another rank or an aggregate.
+    pub fn for_dp_rank(mut self, rank: Option<usize>) -> Option<Self> {
+        if let Some(rank) = rank {
+            let rank = i32::try_from(rank).ok()?;
+            self.loads.retain(|load| load.dp_rank == rank);
+            self.aggregate = None;
+        }
+        if self.loads.is_empty() {
+            return None;
+        }
+        self.dp_rank_count = i32::try_from(self.loads.len()).ok()?;
+        Some(self)
+    }
+
     /// Average token usage ratio across DP ranks. Returns 0.0 if empty.
     pub fn effective_token_usage(&self) -> f64 {
         if self.loads.is_empty() {
