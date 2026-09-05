@@ -8,7 +8,7 @@
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
-    traits::{join_segments, Tokenizer},
+    traits::{PromptEncoding, Tokenizer},
 };
 use openai_protocol::{
     common::{self, StringOrArray, Tool as ChatTool, ToolChoice as ChatToolChoice},
@@ -30,14 +30,15 @@ use crate::routers::grpc::{multimodal::PlaceholderTokens, ProcessedMessages};
 ///
 /// Parallel to `process_chat_messages()` in chat_utils, but works with
 /// Anthropic Messages API types. Converts InputMessages to JSON values
-/// that the chat template expects, then applies the template.
+/// that the chat template expects, then applies the template. The second
+/// element says how the tokenize step must encode the prompt.
 pub fn process_messages(
     request: &CreateMessageRequest,
     tokenizer: &dyn Tokenizer,
     chat_tools: Option<&[ChatTool]>,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
-) -> Result<ProcessedMessages, String> {
+) -> Result<(ProcessedMessages, PromptEncoding), String> {
     let content_format = tokenizer.chat_template_content_format();
 
     // Step 1: Convert InputMessages to chat template JSON values
@@ -96,8 +97,8 @@ pub fn process_messages(
         ..Default::default()
     };
 
-    let segments = tokenizer
-        .apply_chat_template_segments(&transformed_messages, params)
+    let rendered = tokenizer
+        .apply_chat_template_with_encoding(&transformed_messages, params, None)
         .map_err(|e| format!("Failed to apply chat template: {e}"))?;
 
     // Step 7: Build ProcessedMessages
@@ -106,11 +107,13 @@ pub fn process_messages(
         .as_ref()
         .map(|seqs| StringOrArray::Array(seqs.clone()));
 
-    Ok(ProcessedMessages {
-        text: join_segments(&segments),
-        segments,
-        stop_sequences,
-    })
+    Ok((
+        ProcessedMessages {
+            text: rendered.text,
+            stop_sequences,
+        },
+        rendered.encoding,
+    ))
 }
 
 // ============================================================================

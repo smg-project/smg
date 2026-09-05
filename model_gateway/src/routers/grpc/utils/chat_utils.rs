@@ -12,7 +12,7 @@ use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
     stop::StopSequenceDecoderBuilder,
-    traits::{join_segments, Encoding, PromptSegment, Tokenizer},
+    traits::{Encoding, PromptEncoding, Tokenizer},
     StopSequenceDecoder,
 };
 use openai_protocol::{
@@ -114,43 +114,50 @@ fn encode_permits() -> &'static Semaphore {
     })
 }
 
-/// Tokenize off the async worker threads so CPU-bound `encode` cannot stall the
-/// runtime, bounded by [`encode_permits`] so concurrent offloaded encodes cannot
-/// oversubscribe the CPU. Small inputs are encoded inline to avoid the offload
-/// round-trip dominating.
+/// Run CPU-bound tokenization off the async worker threads so it cannot stall
+/// the runtime, bounded by [`encode_permits`] so concurrent offloaded encodes
+/// cannot oversubscribe the CPU. Inputs below the threshold run inline to avoid
+/// the offload round-trip dominating.
+async fn offload<F>(len: usize, encode: F) -> anyhow::Result<Encoding>
+where
+    F: FnOnce() -> anyhow::Result<Encoding> + Send + 'static,
+{
+    if len < ENCODE_OFFLOAD_MIN_BYTES {
+        return encode();
+    }
+    let _permit = encode_permits()
+        .acquire()
+        .await
+        .map_err(|e| anyhow!("encode semaphore closed: {e}"))?;
+    tokio::task::spawn_blocking(encode)
+        .await
+        .map_err(|e| anyhow!("tokenization task failed: {e}"))?
+}
+
+/// Tokenize `text` through the offload policy of [`offload`].
 pub(crate) async fn encode_blocking(
     tokenizer: Arc<dyn Tokenizer>,
     text: String,
     add_special_tokens: bool,
 ) -> anyhow::Result<Encoding> {
-    if text.len() < ENCODE_OFFLOAD_MIN_BYTES {
-        return tokenizer.encode(&text, add_special_tokens);
-    }
-    let _permit = encode_permits()
-        .acquire()
-        .await
-        .map_err(|e| anyhow!("encode semaphore closed: {e}"))?;
-    tokio::task::spawn_blocking(move || tokenizer.encode(&text, add_special_tokens))
-        .await
-        .map_err(|e| anyhow!("tokenization task failed: {e}"))?
+    offload(text.len(), move || {
+        tokenizer.encode(&text, add_special_tokens)
+    })
+    .await
 }
 
-/// Segmented counterpart of [`encode_blocking`] with the same offload policy.
-pub(crate) async fn encode_segments_blocking(
+/// Tokenize a rendered chat prompt the way its renderer said to: a deferred
+/// encode runs as the job the renderer prepared, anything else encodes `text`.
+/// Both take the same offload policy as [`encode_blocking`].
+pub(crate) async fn encode_prompt_blocking(
     tokenizer: Arc<dyn Tokenizer>,
-    segments: Vec<PromptSegment>,
+    text: &str,
+    encoding: PromptEncoding,
 ) -> anyhow::Result<Encoding> {
-    let bytes: usize = segments.iter().map(|s| s.text.len()).sum();
-    if bytes < ENCODE_OFFLOAD_MIN_BYTES {
-        return tokenizer.encode_segments(&segments);
+    match encoding {
+        PromptEncoding::FromText => encode_blocking(tokenizer, text.to_string(), false).await,
+        PromptEncoding::Deferred(job) => offload(text.len(), move || job.run()).await,
     }
-    let _permit = encode_permits()
-        .acquire()
-        .await
-        .map_err(|e| anyhow!("encode semaphore closed: {e}"))?;
-    tokio::task::spawn_blocking(move || tokenizer.encode_segments(&segments))
-        .await
-        .map_err(|e| anyhow!("tokenization task failed: {e}"))?
 }
 
 /// Process tool call arguments in messages
@@ -459,6 +466,11 @@ pub(crate) fn filter_chat_request_by_tool_choice(
 
 /// Process chat messages and apply template (shared by both routers)
 /// Requires HuggingFace tokenizer with chat template support
+///
+/// Returns the flat prompt only. A renderer that must encode the prompt itself
+/// (Kimi-K3) cannot be honored through this entry point; the gRPC pipeline
+/// uses [`process_chat_messages_with_placeholders`] and encodes what it
+/// returns.
 pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
@@ -469,21 +481,35 @@ pub fn process_chat_messages(
         placeholders.insert(Modality::Image, token.to_string());
         placeholders
     });
-    process_chat_messages_with_placeholders(
+    let (processed, encoding) = process_chat_messages_with_placeholders(
         request,
         tokenizer,
         placeholder_tokens.as_ref(),
         MediaPartOrder::MediaFirst,
-    )
+    )?;
+    if matches!(encoding, PromptEncoding::Deferred(_)) {
+        static WARNED: OnceLock<()> = OnceLock::new();
+        WARNED.get_or_init(|| {
+            tracing::warn!(
+                "the tokenizer's renderer encodes prompts itself; a flat encode of \
+                 ProcessedMessages.text may not reproduce its token ids (marker strings \
+                 in message text, BPE merges across attribute-piece boundaries)"
+            );
+        });
+    }
+    Ok(processed)
 }
 
+/// Render the chat prompt. The second element says how the tokenize step must
+/// encode it: [`PromptEncoding::FromText`] for every flat renderer, or the
+/// deferred encode a segment-aware renderer prepared.
 pub(crate) fn process_chat_messages_with_placeholders(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
-) -> Result<ProcessedMessages, String> {
-    let segments = {
+) -> Result<(ProcessedMessages, PromptEncoding), String> {
+    let rendered = {
         // Get content format and transform messages accordingly
         let content_format = tokenizer.chat_template_content_format();
         let mut transformed_messages = process_content_format_with_order(
@@ -541,11 +567,13 @@ pub(crate) fn process_chat_messages_with_placeholders(
         {
             // Pop the last message to handle it separately — guarded by !is_empty() check above
             let Some(last_msg) = transformed_messages.pop() else {
-                return Ok(ProcessedMessages {
-                    text: String::new(),
-                    segments: Vec::new(),
-                    stop_sequences: request.stop.clone(),
-                });
+                return Ok((
+                    ProcessedMessages {
+                        text: String::new(),
+                        stop_sequences: request.stop.clone(),
+                    },
+                    PromptEncoding::FromText,
+                ));
             };
             last_msg
                 .get("content")
@@ -555,28 +583,25 @@ pub(crate) fn process_chat_messages_with_placeholders(
             None
         };
 
-        // Apply chat template with the (now possibly shorter) list of messages
-        let mut segments = tokenizer
-            .apply_chat_template_segments(&transformed_messages, params)
-            .map_err(|e| format!("Failed to apply chat template: {e}"))?;
-
-        // Append assistant prefix if we have one. A flat renderer hands back a
-        // single control segment and the prefix joins it, so the prompt stays
-        // one encoding unit; segment-aware renderers take it as message text.
-        if let Some(prefix) = assistant_prefix {
-            match segments.as_mut_slice() {
-                [only] if only.allow_special => only.text.push_str(&prefix),
-                _ => segments.push(PromptSegment::text(prefix)),
-            }
-        }
-        segments
+        // Apply chat template with the (now possibly shorter) list of messages.
+        // The prefill goes into the same call so the text and its encoding are
+        // produced together and cannot drift apart.
+        tokenizer
+            .apply_chat_template_with_encoding(
+                &transformed_messages,
+                params,
+                assistant_prefix.as_deref(),
+            )
+            .map_err(|e| format!("Failed to apply chat template: {e}"))?
     };
 
-    Ok(ProcessedMessages {
-        text: join_segments(&segments),
-        segments,
-        stop_sequences: request.stop.clone(),
-    })
+    Ok((
+        ProcessedMessages {
+            text: rendered.text,
+            stop_sequences: request.stop.clone(),
+        },
+        rendered.encoding,
+    ))
 }
 
 /// Create a StopSequenceDecoder from stop parameters
@@ -1554,5 +1579,142 @@ mod tests {
         let id = generate_tool_call_id("gpt-4o", "get_weather", 0, 0);
         assert!(id.starts_with("call_"), "got: {id}");
         assert!(!id.contains("get_weather"), "got: {id}");
+    }
+
+    // --- render -> encode contract -------------------------------------------
+
+    fn prefill_request() -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "continue_final_message": true,
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Sure"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    #[test]
+    fn flat_renderer_joins_the_prefill_and_reports_from_text() {
+        let tokenizer = llm_tokenizer::MockTokenizer::new();
+        let (processed, encoding) = process_chat_messages_with_placeholders(
+            &prefill_request(),
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        assert_eq!(processed.text, "user: Hello\nassistant: Sure");
+        assert!(matches!(encoding, PromptEncoding::FromText));
+
+        // The tokenize step encodes the text exactly as before.
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(tokenizer);
+        let ids = block_on(encode_prompt_blocking(
+            tokenizer.clone(),
+            &processed.text,
+            encoding,
+        ))
+        .unwrap();
+        assert_eq!(
+            ids.token_ids(),
+            tokenizer
+                .encode(&processed.text, false)
+                .unwrap()
+                .token_ids()
+        );
+    }
+
+    #[test]
+    fn deferred_renderer_gets_the_prefill_and_its_job_runs_in_the_tokenize_step() {
+        let tokenizer = llm_tokenizer::MockTokenizer::new().with_deferred_chat_ids(vec![7, 8, 9]);
+        let (processed, encoding) = process_chat_messages_with_placeholders(
+            &prefill_request(),
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        assert_eq!(
+            processed.text, "user: Hello\nassistant: Sure",
+            "the prefill is passed into the render call"
+        );
+        assert!(matches!(encoding, PromptEncoding::Deferred(_)));
+
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(tokenizer);
+        let ids = block_on(encode_prompt_blocking(tokenizer, &processed.text, encoding)).unwrap();
+        assert_eq!(ids.token_ids(), &[7, 8, 9]);
+    }
+
+    #[test]
+    fn deferred_encode_takes_the_offload_path_for_large_prompts() {
+        use std::{
+            sync::Mutex,
+            thread::{self, ThreadId},
+        };
+        // The job records the thread it ran on. `block_on` polls on this
+        // thread, so an offloaded job runs somewhere else.
+        let ran_on: Arc<Mutex<Option<ThreadId>>> = Arc::new(Mutex::new(None));
+        let probe = {
+            let ran_on = ran_on.clone();
+            move || *ran_on.lock().unwrap() = Some(thread::current().id())
+        };
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            llm_tokenizer::MockTokenizer::new()
+                .with_deferred_chat_ids(vec![1, 2])
+                .with_deferred_chat_probe(probe),
+        );
+        let render = |content: &str| {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": content}]
+            }))
+            .unwrap();
+            process_chat_messages_with_placeholders(
+                &request,
+                &*tokenizer,
+                None,
+                MediaPartOrder::MediaFirst,
+            )
+            .unwrap()
+        };
+        let encode = |text: &str, encoding: PromptEncoding| {
+            block_on(encode_prompt_blocking(tokenizer.clone(), text, encoding)).unwrap()
+        };
+
+        let (processed, encoding) = render(&"x".repeat(ENCODE_OFFLOAD_MIN_BYTES * 4));
+        assert!(processed.text.len() >= ENCODE_OFFLOAD_MIN_BYTES);
+        assert_eq!(encode(&processed.text, encoding).token_ids(), &[1, 2]);
+        let offloaded = ran_on.lock().unwrap().take().expect("the job ran");
+        assert_ne!(
+            offloaded,
+            thread::current().id(),
+            "a large deferred encode is offloaded"
+        );
+
+        let (processed, encoding) = render("hi");
+        assert!(processed.text.len() < ENCODE_OFFLOAD_MIN_BYTES);
+        encode(&processed.text, encoding);
+        let inline = ran_on.lock().unwrap().take().expect("the job ran");
+        assert_eq!(
+            inline,
+            thread::current().id(),
+            "a small deferred encode runs inline"
+        );
+    }
+
+    #[test]
+    fn public_entry_point_keeps_the_flat_text_for_a_deferred_renderer() {
+        let tokenizer = llm_tokenizer::MockTokenizer::new().with_deferred_chat_ids(vec![7]);
+        let processed = process_chat_messages(&prefill_request(), &tokenizer, None).unwrap();
+        assert_eq!(processed.text, "user: Hello\nassistant: Sure");
     }
 }

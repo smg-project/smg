@@ -1,7 +1,6 @@
 //! gRPC router implementations
 
 use axum::response::Response;
-use llm_tokenizer::traits::PromptSegment;
 use openai_protocol::{chat::ChatCompletionRequest, common::StringOrArray};
 
 use crate::routers::error;
@@ -54,10 +53,7 @@ fn validate_text_only_output(request: &ChatCompletionRequest) -> Result<(), Box<
 /// The multimodal intermediate lives on `ProcessingState`, not here.
 #[derive(Debug)]
 pub struct ProcessedMessages {
-    /// The flat prompt, `segments` concatenated; kept for logs and `original_text`.
     pub text: String,
-    /// What gets encoded: the renderer's control/text split of the same prompt.
-    pub segments: Vec<PromptSegment>,
     pub stop_sequences: Option<StringOrArray>,
 }
 

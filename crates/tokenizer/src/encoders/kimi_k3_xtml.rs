@@ -15,11 +15,15 @@
 //! `<|sep|>`, `<|end_of_msg|>` and media anchors with special tokens allowed,
 //! everything else — tag names, attribute pieces, message text of every role,
 //! reasoning, tool arguments, internal system messages — as ordinary BPE. A
-//! marker string inside message text therefore never becomes a control id, and
+//! marker string inside message text therefore never becomes a control id
+//! (the one exception is the gateway's `<|media_pad|>` anchor, see below), and
 //! attribute pieces (`" role"`, `="`, value, `"`) are separate BPE units.
-//! [`render_kimi_k3_xtml_segments`] reproduces that segmentation piece by
-//! piece; [`apply_kimi_k3_xtml`] is its concatenation for callers that want
-//! the flat prompt string.
+//! `render_kimi_k3_xtml_prompt` reproduces that segmentation piece by piece
+//! for the tiktoken backend, which encodes it and hands the caller a deferred
+//! encode; [`apply_kimi_k3_xtml_with_effort_default`] is that prompt joined
+//! flat (without the prefill), and [`apply_kimi_k3_xtml`] the bare
+//! `build_chat_segments` rendering with no served effort default. The segment
+//! type stays private to this crate.
 //!
 //! # Image prompts are not built here
 //!
@@ -33,10 +37,7 @@
 use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
 
-use crate::{
-    chat_template::ChatTemplateParams,
-    traits::{join_segments, PromptSegment},
-};
+use crate::chat_template::ChatTemplateParams;
 
 const OPEN_TOKEN: &str = "<|open|>";
 const CLOSE_TOKEN: &str = "<|close|>";
@@ -45,6 +46,38 @@ const END_OF_MSG_TOKEN: &str = "<|end_of_msg|>";
 const IMAGE_PLACEHOLDER: &str = "<|kimi_image_placeholder|>";
 /// The gateway's per-image anchor (`KimiK3VisionSpec::placeholder_token`).
 const MEDIA_ANCHOR: &str = "<|media_pad|>";
+
+/// One piece of a rendered prompt, tagged with how special-token strings in
+/// it must be encoded: the reference's `EncodeSegment { text, allow_special }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptSegment {
+    pub(crate) text: String,
+    /// `true`: special-token strings map to their control ids (structural
+    /// markers emitted by the renderer). `false`: ordinary BPE, so a literal
+    /// marker string inside message text stays text.
+    pub(crate) allow_special: bool,
+}
+
+impl PromptSegment {
+    pub(crate) fn control(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            allow_special: true,
+        }
+    }
+
+    pub(crate) fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            allow_special: false,
+        }
+    }
+}
+
+/// The flat prompt string: segment texts concatenated in order.
+pub(crate) fn join_segments(segments: &[PromptSegment]) -> String {
+    segments.iter().map(|s| s.text.as_str()).collect()
+}
 
 /// The effort the reference applies when a request names none.
 ///
@@ -83,21 +116,25 @@ pub fn apply_kimi_k3_xtml_with_effort_default(
     )?))
 }
 
-/// Segmented form of [`apply_kimi_k3_xtml`]: the reference's `EncodeSegment`
-/// list, structural markers as control segments and everything else as text.
-pub fn render_kimi_k3_xtml_segments(
+/// The served prompt as segments: [`apply_kimi_k3_xtml_with_effort_default`]
+/// plus the caller's `continue_final_message` prefill, appended as one control
+/// piece so marker strings in the prefill keep their control ids. That is
+/// what the flat encode of `rendered + prefill` produced before segments
+/// existed and what SGLang's prefix append does: the rendering always ends in
+/// a control piece (`<|sep|>` after the generation prompt), so no BPE merge
+/// crosses the seam and the prefill's ids equal the flat encode of the same
+/// prefill byte for byte. A prefill of ordinary text encodes the same either
+/// way.
+pub(crate) fn render_kimi_k3_xtml_prompt(
     messages: &[Value],
     params: &ChatTemplateParams,
+    assistant_prefix: Option<&str>,
 ) -> Result<Vec<PromptSegment>> {
-    render_xtml(messages, params, None)
-}
-
-/// Segmented form of [`apply_kimi_k3_xtml_with_effort_default`].
-pub fn render_kimi_k3_xtml_segments_with_effort_default(
-    messages: &[Value],
-    params: &ChatTemplateParams,
-) -> Result<Vec<PromptSegment>> {
-    render_xtml(messages, params, Some(DEFAULT_THINKING_EFFORT))
+    let mut out = render_xtml(messages, params, Some(DEFAULT_THINKING_EFFORT))?;
+    if let Some(prefix) = assistant_prefix {
+        push_control(&mut out, prefix);
+    }
+    Ok(out)
 }
 
 fn render_xtml(
@@ -1006,7 +1043,7 @@ mod tests {
             "function": {"name": "f", "parameters": {"type": "object"}}
         })];
         let params = params(Some(true), Some(&tools));
-        let segments = render_kimi_k3_xtml_segments(&messages, &params).unwrap();
+        let segments = render_xtml(&messages, &params, None).unwrap();
         assert_eq!(
             join_segments(&segments),
             apply_kimi_k3_xtml(&messages, &params).unwrap()
@@ -1020,7 +1057,7 @@ mod tests {
             json!({"role": "user", "content": "Hi"}),
             json!({"role": "assistant", "content": "ok"}),
         ];
-        let segments = render_kimi_k3_xtml_segments(&messages, &params(Some(true), None)).unwrap();
+        let segments = render_xtml(&messages, &params(Some(true), None), None).unwrap();
         let markers = [OPEN_TOKEN, CLOSE_TOKEN, SEP_TOKEN, END_OF_MSG_TOKEN];
         for text in control_texts(&segments) {
             assert!(
@@ -1047,8 +1084,8 @@ mod tests {
             json!({"role": "user", "content": "Bye"}),
         ];
         let params = params(Some(true), None);
-        let segments = render_kimi_k3_xtml_segments(&messages, &params).unwrap();
-        let plain_segments = render_kimi_k3_xtml_segments(&plain, &params).unwrap();
+        let segments = render_xtml(&messages, &params, None).unwrap();
+        let plain_segments = render_xtml(&plain, &params, None).unwrap();
 
         let injected_segments: Vec<&PromptSegment> =
             segments.iter().filter(|s| s.text == injected).collect();
@@ -1061,7 +1098,7 @@ mod tests {
     #[test]
     fn attribute_pieces_are_separate_text_segments() {
         let messages = vec![json!({"role": "user", "content": "Hi"})];
-        let segments = render_kimi_k3_xtml_segments(&messages, &params(Some(true), None)).unwrap();
+        let segments = render_xtml(&messages, &params(Some(true), None), None).unwrap();
         let expected = [
             PromptSegment::control(OPEN_TOKEN),
             PromptSegment::text("message"),
@@ -1082,7 +1119,7 @@ mod tests {
     #[test]
     fn media_anchors_in_message_text_are_control_segments() {
         let messages = vec![json!({"role": "user", "content": "see <|media_pad|> here"})];
-        let segments = render_kimi_k3_xtml_segments(&messages, &params(Some(true), None)).unwrap();
+        let segments = render_xtml(&messages, &params(Some(true), None), None).unwrap();
         assert_eq!(
             segments[7..10].to_vec(),
             vec![
@@ -1090,6 +1127,117 @@ mod tests {
                 PromptSegment::control(MEDIA_ANCHOR),
                 PromptSegment::text(" here"),
             ]
+        );
+    }
+
+    #[test]
+    fn prefill_is_appended_as_one_control_piece() {
+        let messages = vec![json!({"role": "user", "content": "Hi"})];
+        let params = params(Some(true), None);
+        let base = render_kimi_k3_xtml_prompt(&messages, &params, None).unwrap();
+        let prefix = "<|close|>think<|sep|>Sure";
+        let with = render_kimi_k3_xtml_prompt(&messages, &params, Some(prefix)).unwrap();
+        assert_eq!(&with[..base.len()], &base[..]);
+        assert_eq!(&with[base.len()..], &[PromptSegment::control(prefix)]);
+        assert_eq!(join_segments(&with), join_segments(&base) + prefix);
+        // An empty prefill adds nothing.
+        assert_eq!(
+            render_kimi_k3_xtml_prompt(&messages, &params, Some("")).unwrap(),
+            base
+        );
+    }
+
+    /// The reference `build_chat_segments` lists recorded in
+    /// `tests/fixtures/kimi_k3/k3_render_fixtures.json`, compared piece by
+    /// piece (text and `allow_special`), so the split is checked without a
+    /// checkpoint.
+    #[test]
+    fn segments_match_reference_fixture_lists() {
+        let raw = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/kimi_k3/k3_render_fixtures.json"),
+        )
+        .unwrap();
+        let fixtures: Value = serde_json::from_str(&raw).unwrap();
+        let expected = |case: &str| -> Vec<PromptSegment> {
+            fixtures[case]["segments"]
+                .as_array()
+                .unwrap_or_else(|| panic!("fixture `{case}` has no segments"))
+                .iter()
+                .map(|s| PromptSegment {
+                    text: s["text"].as_str().unwrap().to_string(),
+                    allow_special: s["allow_special"].as_bool().unwrap(),
+                })
+                .collect()
+        };
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        })];
+        let hi = vec![json!({"role": "user", "content": "Hi"})];
+
+        // (fixture name, messages, tools, thinking)
+        type Case<'a> = (&'a str, Vec<Value>, Option<&'a [Value]>, Option<bool>);
+        let cases: Vec<Case> = vec![
+            ("plain_user_thinking", hi.clone(), None, Some(true)),
+            (
+                "system_user_thinking",
+                vec![
+                    json!({"role": "system", "content": "You are helpful"}),
+                    json!({"role": "user", "content": "Hi"}),
+                ],
+                None,
+                Some(true),
+            ),
+            ("plain_user_no_thinking", hi.clone(), None, Some(false)),
+            (
+                "assistant_prior_turn",
+                vec![
+                    json!({"role": "user", "content": "Hi"}),
+                    json!({"role": "assistant", "content": "Hello!"}),
+                    json!({"role": "user", "content": "Bye"}),
+                ],
+                None,
+                Some(true),
+            ),
+            (
+                "with_tools",
+                vec![json!({"role": "user", "content": "weather in Paris?"})],
+                Some(&tools),
+                Some(true),
+            ),
+            (
+                "assistant_tool_call_then_result",
+                vec![
+                    json!({"role": "user", "content": "weather?"}),
+                    json!({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "function": {"name": "get_weather", "arguments": {"city": "Paris"}}
+                        }]
+                    }),
+                    json!({"role": "tool", "tool": "get_weather", "content": "sunny"}),
+                ],
+                Some(&tools),
+                Some(true),
+            ),
+        ];
+        for (case, messages, tools, thinking) in cases {
+            let got = render_xtml(&messages, &params(thinking, tools), None).unwrap();
+            assert_eq!(got, expected(case), "case {case}");
+        }
+
+        let kwargs: HashMap<String, Value> =
+            HashMap::from([("thinking_effort".to_string(), json!("low"))]);
+        let got = render_xtml(&hi, &params_kw(Some(true), &kwargs, true), None).unwrap();
+        assert_eq!(
+            got,
+            expected("thinking_effort_low"),
+            "case thinking_effort_low"
         );
     }
 

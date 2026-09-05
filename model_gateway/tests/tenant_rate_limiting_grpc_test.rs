@@ -312,16 +312,11 @@ async fn feature_disabled_is_a_no_op() {
 /// the stage is actually live on a second wired pipeline too, not just
 /// constructed and never reached.
 ///
-/// Chat and Messages are deliberately not covered the same way here: both
-/// need `apply_chat_template` to turn their `messages` array into a prompt
-/// before preparation ever reaches the reserve stage, and `MockTokenizer`
-/// (`crates/tokenizer/src/mock.rs`) doesn't implement it -- confirmed by
-/// running this exact test against `route_chat`, which fails earlier with
-/// `process_messages_failed: Chat template not supported by this
-/// tokenizer`, a 400 from the Chat preparation stage, not a 429 from rate
-/// limiting. That's a pre-existing gap in the shared mock tokenizer,
-/// unrelated to this PR; extending it (or swapping in a template-capable
-/// fake) is out of scope here. Harmony and PD dispatch are also not covered:
+/// Chat and Messages are not covered the same way here. `MockTokenizer`
+/// (`crates/tokenizer/src/mock.rs`) renders a minimal `role: content`
+/// template, so a `route_chat` mirror of this case would reach the reserve
+/// stage; the mechanics it would exercise are the ones Completion already
+/// proves. Harmony and PD dispatch are also not covered:
 /// Harmony needs a harmony-flavored model registered so `HarmonyDetector`
 /// routes into it, and PD needs a distinct prefill+decode worker pair --
 /// both larger harness investments than this suite carries for its other

@@ -167,7 +167,7 @@ impl MessagePreparationStage {
         };
 
         // Step 2: Process messages and apply chat template
-        let mut processed_messages = match message_utils::process_messages(
+        let (processed_messages, prompt_encoding) = match message_utils::process_messages(
             request,
             &*tokenizer,
             tools_for_template,
@@ -181,10 +181,11 @@ impl MessagePreparationStage {
             }
         };
 
-        // Step 3: Tokenize the rendered segments
-        let encoding = match utils::encode_segments_blocking(
+        // Step 3: Tokenize the prompt the way its renderer said to
+        let encoding = match utils::encode_prompt_blocking(
             tokenizer.clone(),
-            std::mem::take(&mut processed_messages.segments),
+            &processed_messages.text,
+            prompt_encoding,
         )
         .await
         {

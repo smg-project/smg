@@ -162,24 +162,26 @@ pub(crate) async fn prepare_chat_like(
         };
 
         // Step 2: Process messages and apply chat template
-        let mut processed_messages = match utils::process_chat_messages_with_placeholders(
-            &body_ref,
-            &*tokenizer,
-            placeholder_tokens.as_ref(),
-            media_order,
-        ) {
-            Ok(msgs) => msgs,
-            Err(e) => {
-                error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
-                return Err(error::bad_request("process_messages_failed", e));
-            }
-        };
+        let (processed_messages, prompt_encoding) =
+            match utils::process_chat_messages_with_placeholders(
+                &body_ref,
+                &*tokenizer,
+                placeholder_tokens.as_ref(),
+                media_order,
+            ) {
+                Ok(msgs) => msgs,
+                Err(e) => {
+                    error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
+                    return Err(error::bad_request("process_messages_failed", e));
+                }
+            };
 
-        // Step 3: Tokenize the rendered segments (the renderer decides which
-        // pieces may carry special tokens)
-        let encoding = match utils::encode_segments_blocking(
+        // Step 3: Tokenize the prompt the way its renderer said to (a flat
+        // encode of the text, or the encode the renderer prepared)
+        let encoding = match utils::encode_prompt_blocking(
             tokenizer.clone(),
-            std::mem::take(&mut processed_messages.segments),
+            &processed_messages.text,
+            prompt_encoding,
         )
         .await
         {

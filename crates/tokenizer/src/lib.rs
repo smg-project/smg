@@ -38,8 +38,8 @@ pub use stop::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
 pub use stream::DecodeStream;
 pub use tiktoken::{TiktokenModel, TiktokenTokenizer};
 pub use traits::{
-    join_segments, Decoder, Encoder, Encoding, PromptSegment, SpecialTokens, TokenIdType,
-    Tokenizer as TokenizerTrait,
+    ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, PromptEncoding, SpecialTokens,
+    TokenIdType, Tokenizer as TokenizerTrait,
 };
 
 /// Main tokenizer wrapper that provides a unified interface for different tokenizer implementations
