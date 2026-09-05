@@ -55,12 +55,40 @@ pub struct MinimaxM3Parser {
     current_tool_id: i32,
     streamed_args_for_tool: Vec<String>,
     in_tool_call: bool,
+    wrapper_prefix_held: bool,
+    wrapper_scan_pos: usize,
+    current_function_name: Option<String>,
+    current_parameters: Map<String, Value>,
+    parameter_emitted: bool,
+    active_element: Option<StreamingElement>,
+    discard_invoke_body: bool,
+    invoke_aborted: bool,
 }
 
 /// A parsed parameter value: either leaf text or nested child elements.
 enum ParamValue {
     Text(String),
     Elements(Vec<(String, ParamValue)>),
+}
+
+/// One open parameter element in the incremental XML-like decoder.
+struct ElementFrame {
+    name: String,
+    text: String,
+    children: Vec<(String, ParamValue)>,
+}
+
+/// Stack for the top-level parameter currently being decoded. Text already
+/// known not to contain a namespace marker is consumed into the stack so long
+/// values are not rescanned after every chunk.
+struct StreamingElement {
+    stack: Vec<ElementFrame>,
+}
+
+enum ElementProgress {
+    Incomplete,
+    Complete(String, ParamValue),
+    Malformed,
 }
 
 impl MinimaxM3Parser {
@@ -72,6 +100,14 @@ impl MinimaxM3Parser {
             current_tool_id: -1,
             streamed_args_for_tool: Vec::new(),
             in_tool_call: false,
+            wrapper_prefix_held: false,
+            wrapper_scan_pos: 0,
+            current_function_name: None,
+            current_parameters: Map::new(),
+            parameter_emitted: false,
+            active_element: None,
+            discard_invoke_body: false,
+            invoke_aborted: false,
         }
     }
 
@@ -133,6 +169,185 @@ impl MinimaxM3Parser {
             .map(|(i, _)| i)
             .filter(|&i| buffer.ends_with(&token[..i]))
             .max()
+    }
+
+    fn is_partial_token(buffer: &str, token: &str) -> bool {
+        !buffer.is_empty() && buffer.len() < token.len() && token.starts_with(buffer)
+    }
+
+    /// Begin decoding a parameter opening tag at the front of the buffer.
+    /// None means the header is split across chunks.
+    fn start_streaming_element(buffer: &mut String) -> Result<Option<StreamingElement>, ()> {
+        let Some(after_start) = buffer.strip_prefix(ELEMENT_START) else {
+            return Err(());
+        };
+        let Some(gt) = after_start.find('>') else {
+            return Ok(None);
+        };
+        let name = after_start[..gt].trim();
+        if name.is_empty() || name.starts_with('/') {
+            return Err(());
+        }
+
+        let consumed = ELEMENT_START.len() + gt + 1;
+        let name = name.to_string();
+        buffer.drain(..consumed);
+        Ok(Some(StreamingElement {
+            stack: vec![ElementFrame {
+                name,
+                text: String::new(),
+                children: Vec::new(),
+            }],
+        }))
+    }
+
+    /// Advance an active parameter without revisiting bytes consumed from prior
+    /// chunks. Structural tags are interpreted only once their closing angle
+    /// bracket is available, making every split within a namespace or tag safe.
+    fn advance_streaming_element(
+        buffer: &mut String,
+        element: &mut StreamingElement,
+    ) -> ElementProgress {
+        loop {
+            let Some(namespace_pos) = buffer.find(NAMESPACE) else {
+                let held = Self::longest_partial_suffix(buffer, NAMESPACE).unwrap_or(0);
+                let safe_end = buffer.len() - held;
+                if safe_end > 0 {
+                    let text: String = buffer.drain(..safe_end).collect();
+                    if let Some(frame) = element.stack.last_mut() {
+                        frame.text.push_str(&text);
+                    }
+                }
+                return ElementProgress::Incomplete;
+            };
+
+            if namespace_pos > 0 {
+                let text: String = buffer.drain(..namespace_pos).collect();
+                if let Some(frame) = element.stack.last_mut() {
+                    frame.text.push_str(&text);
+                }
+            }
+
+            let after_namespace = &buffer[NAMESPACE.len()..];
+            if after_namespace.is_empty() {
+                return ElementProgress::Incomplete;
+            }
+            let Some(after_lt) = after_namespace.strip_prefix('<') else {
+                return ElementProgress::Malformed;
+            };
+            let Some(gt) = after_lt.find('>') else {
+                return ElementProgress::Incomplete;
+            };
+            let tag = after_lt[..gt].trim();
+            if tag.is_empty() {
+                return ElementProgress::Malformed;
+            }
+            let consumed = NAMESPACE.len() + 1 + gt + 1;
+
+            if let Some(close_name) = tag.strip_prefix('/') {
+                let close_name = close_name.trim();
+                if element.stack.last().map(|frame| frame.name.as_str()) != Some(close_name) {
+                    return ElementProgress::Malformed;
+                }
+                buffer.drain(..consumed);
+                let Some(mut frame) = element.stack.pop() else {
+                    return ElementProgress::Malformed;
+                };
+                let value = if frame.children.is_empty() {
+                    ParamValue::Text(frame.text)
+                } else {
+                    if !frame.text.trim().is_empty() {
+                        Self::push_mixed_text(&mut frame.children, frame.text);
+                    }
+                    ParamValue::Elements(frame.children)
+                };
+
+                if let Some(parent) = element.stack.last_mut() {
+                    parent.children.push((frame.name, value));
+                    continue;
+                }
+                return ElementProgress::Complete(frame.name, value);
+            }
+
+            let name = tag.to_string();
+            buffer.drain(..consumed);
+            element.stack.push(ElementFrame {
+                name,
+                text: String::new(),
+                children: Vec::new(),
+            });
+        }
+    }
+
+    fn tool_schema<'a>(tools: &'a [Tool], name: &str) -> Option<&'a Value> {
+        tools
+            .iter()
+            .find(|tool| tool.function.name == name)
+            .map(|tool| &tool.function.parameters)
+    }
+
+    fn property_schema<'a>(schema: Option<&'a Value>, name: &str) -> Option<&'a Value> {
+        schema?
+            .get("properties")
+            .and_then(Value::as_object)?
+            .get(name)
+    }
+
+    /// Serialize one complete top-level parameter. Repeated names emit a later
+    /// duplicate member with the same aggregate value as the complete parser;
+    /// JSON consumers use that last member.
+    fn emit_parameter(&mut self, name: String, value: Value) -> Option<ToolCallItem> {
+        match self.current_parameters.get_mut(&name) {
+            Some(Value::Array(values)) => {
+                values.push(value);
+            }
+            Some(existing) => {
+                let first = existing.take();
+                *existing = Value::Array(vec![first, value]);
+            }
+            None => {
+                self.current_parameters.insert(name.clone(), value);
+            }
+        }
+
+        let key = serde_json::to_string(&name).ok()?;
+        let value = serde_json::to_string(self.current_parameters.get(&name)?).ok()?;
+        let separator = if self.parameter_emitted { "," } else { "{" };
+        let fragment = format!("{separator}{key}:{value}");
+        self.parameter_emitted = true;
+
+        let tool_index = self.current_tool_id as usize;
+        self.streamed_args_for_tool[tool_index].push_str(&fragment);
+        Some(ToolCallItem {
+            tool_index,
+            name: None,
+            parameters: fragment,
+        })
+    }
+
+    fn finish_streaming_invoke(&mut self) -> ToolCallItem {
+        let tool_index = self.current_tool_id as usize;
+        let fragment = if self.parameter_emitted { "}" } else { "{}" }.to_string();
+        self.streamed_args_for_tool[tool_index].push_str(&fragment);
+        self.prev_tool_call_arr[tool_index] = serde_json::json!({
+            "name": self.current_function_name.clone(),
+            "arguments": self.current_parameters.clone(),
+        });
+        self.abandon_streaming_invoke();
+        ToolCallItem {
+            tool_index,
+            name: None,
+            parameters: fragment,
+        }
+    }
+
+    fn abandon_streaming_invoke(&mut self) {
+        self.current_function_name = None;
+        self.current_parameters.clear();
+        self.parameter_emitted = false;
+        self.active_element = None;
+        self.discard_invoke_body = false;
+        self.invoke_aborted = false;
     }
 
     /// Decode common XML entities.
@@ -446,8 +661,10 @@ impl ToolParser for MinimaxM3Parser {
             if !self.in_tool_call {
                 if let Some(start) = self.buffer.find(TOOL_CALL_START) {
                     normal_text.push_str(&self.buffer[..start]);
-                    self.buffer = self.buffer[start..].to_string();
+                    self.buffer.drain(..start);
                     self.in_tool_call = true;
+                    self.wrapper_prefix_held = true;
+                    self.wrapper_scan_pos = TOOL_CALL_START.len();
                     continue;
                 }
 
@@ -465,60 +682,316 @@ impl ToolParser for MinimaxM3Parser {
                 break;
             }
 
-            // Inside a tool call: wait for the complete end token before emitting.
-            let Some(end_rel) = self.buffer.find(TOOL_CALL_END) else {
-                break;
-            };
-            let block_end = end_rel + TOOL_CALL_END.len();
-            let block = self.buffer[..block_end].to_string();
-            self.buffer = self.buffer[block_end..].to_string();
-            self.in_tool_call = false;
+            // Once an invoke header is known, consume each top-level parameter
+            // incrementally and emit it as soon as the whole value is valid.
+            if self.current_function_name.is_some() {
+                if self.active_element.is_some() {
+                    let progress = match self.active_element.as_mut() {
+                        Some(element) => Self::advance_streaming_element(&mut self.buffer, element),
+                        None => ElementProgress::Incomplete,
+                    };
+                    match progress {
+                        ElementProgress::Incomplete => break,
+                        ElementProgress::Malformed => {
+                            // Previously emitted bytes cannot be retracted. Leave
+                            // the JSON object open so this call is not executable.
+                            self.active_element = None;
+                            self.discard_invoke_body = true;
+                            self.invoke_aborted = true;
+                            continue;
+                        }
+                        ElementProgress::Complete(name, value) => {
+                            self.active_element = None;
+                            let schema = Self::tool_schema(
+                                tools,
+                                self.current_function_name.as_deref().unwrap_or_default(),
+                            );
+                            let value =
+                                Self::value_to_json(value, Self::property_schema(schema, &name));
+                            if let Some(call) = self.emit_parameter(name, value) {
+                                calls.push(call);
+                            }
+                            continue;
+                        }
+                    }
+                }
 
-            let (block_calls, _) = Self::parse_tool_calls(&block, tools);
-            if block_calls.is_empty() {
-                // No invoke parsed: match the non-streaming path, which
-                // returns malformed blocks as text rather than dropping them.
-                normal_text.push_str(&block);
+                if self.discard_invoke_body {
+                    let invoke_end = self.buffer.find(INVOKE_END);
+                    let wrapper_end = self.buffer.find(TOOL_CALL_END);
+                    match (invoke_end, wrapper_end) {
+                        (Some(invoke), Some(wrapper)) if wrapper < invoke => {
+                            self.buffer.drain(..wrapper + TOOL_CALL_END.len());
+                            self.abandon_streaming_invoke();
+                            self.in_tool_call = false;
+                            self.wrapper_prefix_held = false;
+                            self.wrapper_scan_pos = 0;
+                        }
+                        (Some(invoke), _) => {
+                            self.buffer.drain(..invoke + INVOKE_END.len());
+                            if self.invoke_aborted {
+                                self.abandon_streaming_invoke();
+                            } else {
+                                calls.push(self.finish_streaming_invoke());
+                            }
+                        }
+                        (None, Some(wrapper)) => {
+                            self.buffer.drain(..wrapper + TOOL_CALL_END.len());
+                            self.abandon_streaming_invoke();
+                            self.in_tool_call = false;
+                            self.wrapper_prefix_held = false;
+                            self.wrapper_scan_pos = 0;
+                        }
+                        (None, None) => {
+                            let invoke_held =
+                                Self::longest_partial_suffix(&self.buffer, INVOKE_END).unwrap_or(0);
+                            let wrapper_held =
+                                Self::longest_partial_suffix(&self.buffer, TOOL_CALL_END)
+                                    .unwrap_or(0);
+                            let held = invoke_held.max(wrapper_held);
+                            let discard = self.buffer.len() - held;
+                            self.buffer.drain(..discard);
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
+                let whitespace = self.buffer.len() - self.buffer.trim_start().len();
+                let candidate = &self.buffer[whitespace..];
+                if candidate.starts_with(INVOKE_END) {
+                    self.buffer.drain(..whitespace + INVOKE_END.len());
+                    calls.push(self.finish_streaming_invoke());
+                    continue;
+                }
+                if candidate.starts_with(TOOL_CALL_END) {
+                    self.buffer.drain(..whitespace + TOOL_CALL_END.len());
+                    self.abandon_streaming_invoke();
+                    self.in_tool_call = false;
+                    self.wrapper_prefix_held = false;
+                    self.wrapper_scan_pos = 0;
+                    continue;
+                }
+                if candidate.is_empty()
+                    || Self::is_partial_token(candidate, INVOKE_END)
+                    || Self::is_partial_token(candidate, ELEMENT_START)
+                    || Self::is_partial_token(candidate, TOOL_CALL_END)
+                {
+                    break;
+                }
+                if candidate.starts_with(ELEMENT_START) {
+                    self.buffer.drain(..whitespace);
+                    match Self::start_streaming_element(&mut self.buffer) {
+                        Ok(Some(element)) => {
+                            self.active_element = Some(element);
+                            continue;
+                        }
+                        Ok(None) => break,
+                        Err(()) => {
+                            self.discard_invoke_body = true;
+                            self.invoke_aborted = true;
+                            continue;
+                        }
+                    }
+                }
+
+                // Ordinary text at a parameter boundary terminates argument
+                // parsing on the complete path. Consume through the invoke end.
+                self.discard_invoke_body = true;
                 continue;
             }
-            for call in block_calls {
+
+            // Retain the wrapper prefix until the first valid header is known.
+            // This preserves the existing all-text fallback for a malformed
+            // complete wrapper while still avoiding repeated scans.
+            if self.wrapper_prefix_held {
+                let search = &self.buffer[self.wrapper_scan_pos..];
+                let invoke = search
+                    .find(INVOKE_START)
+                    .map(|position| self.wrapper_scan_pos + position);
+                let wrapper = search
+                    .find(TOOL_CALL_END)
+                    .map(|position| self.wrapper_scan_pos + position);
+
+                if matches!((invoke, wrapper), (None, Some(_)))
+                    || matches!((invoke, wrapper), (Some(a), Some(b)) if b < a)
+                {
+                    let end = wrapper.unwrap_or_default() + TOOL_CALL_END.len();
+                    normal_text.push_str(&self.buffer[..end]);
+                    self.buffer.drain(..end);
+                    self.in_tool_call = false;
+                    self.wrapper_prefix_held = false;
+                    self.wrapper_scan_pos = 0;
+                    continue;
+                }
+
+                let Some(invoke_pos) = invoke else {
+                    let invoke_held =
+                        Self::longest_partial_suffix(search, INVOKE_START).unwrap_or(0);
+                    let wrapper_held =
+                        Self::longest_partial_suffix(search, TOOL_CALL_END).unwrap_or(0);
+                    self.wrapper_scan_pos = self.buffer.len() - invoke_held.max(wrapper_held);
+                    break;
+                };
+                let after_invoke = &self.buffer[invoke_pos + INVOKE_START.len()..];
+                let Some(gt) = after_invoke.find('>') else {
+                    self.wrapper_scan_pos = invoke_pos;
+                    break;
+                };
+                let malformed_header = after_invoke
+                    .find(NAMESPACE)
+                    .is_some_and(|namespace| namespace < gt);
+                let name = if malformed_header {
+                    None
+                } else {
+                    Self::parse_invoke_name(&after_invoke[..gt])
+                };
+                let Some(name) = name else {
+                    let tail = &self.buffer[invoke_pos..];
+                    let invoke_end = tail.find(INVOKE_END).map(|position| invoke_pos + position);
+                    let wrapper_end = tail
+                        .find(TOOL_CALL_END)
+                        .map(|position| invoke_pos + position);
+                    match (invoke_end, wrapper_end) {
+                        (Some(invoke), Some(wrapper)) if wrapper < invoke => {
+                            let end = wrapper + TOOL_CALL_END.len();
+                            normal_text.push_str(&self.buffer[..end]);
+                            self.buffer.drain(..end);
+                            self.in_tool_call = false;
+                            self.wrapper_prefix_held = false;
+                            self.wrapper_scan_pos = 0;
+                        }
+                        (Some(invoke), _) => {
+                            self.wrapper_scan_pos = invoke + INVOKE_END.len();
+                        }
+                        (None, Some(wrapper)) => {
+                            let end = wrapper + TOOL_CALL_END.len();
+                            normal_text.push_str(&self.buffer[..end]);
+                            self.buffer.drain(..end);
+                            self.in_tool_call = false;
+                            self.wrapper_prefix_held = false;
+                            self.wrapper_scan_pos = 0;
+                        }
+                        (None, None) => {
+                            self.wrapper_scan_pos = invoke_pos;
+                            break;
+                        }
+                    }
+                    continue;
+                };
+
+                let header_end = invoke_pos + INVOKE_START.len() + gt + 1;
+                self.buffer.drain(..header_end);
+                self.wrapper_prefix_held = false;
+                self.wrapper_scan_pos = 0;
                 if self.current_tool_id == -1 {
                     self.current_tool_id = 0;
                 } else {
                     self.current_tool_id += 1;
                 }
-                let tool_id = self.current_tool_id as usize;
                 helpers::ensure_capacity(
                     self.current_tool_id,
                     &mut self.prev_tool_call_arr,
                     &mut self.streamed_args_for_tool,
                 );
-
-                let args = call.function.arguments.clone();
-                if tool_id < self.streamed_args_for_tool.len() {
-                    self.streamed_args_for_tool[tool_id].clone_from(&args);
-                }
-                let parsed_args: Value =
-                    serde_json::from_str(&args).unwrap_or_else(|_| Value::Object(Map::new()));
-                if tool_id < self.prev_tool_call_arr.len() {
-                    self.prev_tool_call_arr[tool_id] = serde_json::json!({
-                        "name": call.function.name,
-                        "arguments": parsed_args,
-                    });
-                }
-
-                // Emit name then full arguments for this completed invoke.
+                self.current_function_name = Some(name.clone());
                 calls.push(ToolCallItem {
-                    tool_index: tool_id,
-                    name: Some(call.function.name),
+                    tool_index: self.current_tool_id as usize,
+                    name: Some(name),
                     parameters: String::new(),
                 });
-                calls.push(ToolCallItem {
-                    tool_index: tool_id,
-                    name: None,
-                    parameters: args,
-                });
+                continue;
             }
+
+            // Between announced invokes, skip separators and retain only a
+            // possible partial next-invoke or wrapper-close marker.
+            let whitespace = self.buffer.len() - self.buffer.trim_start().len();
+            let candidate = &self.buffer[whitespace..];
+            if candidate.starts_with(TOOL_CALL_END) {
+                self.buffer.drain(..whitespace + TOOL_CALL_END.len());
+                self.in_tool_call = false;
+                self.wrapper_scan_pos = 0;
+                continue;
+            }
+            if candidate.is_empty()
+                || Self::is_partial_token(candidate, INVOKE_START)
+                || Self::is_partial_token(candidate, TOOL_CALL_END)
+            {
+                break;
+            }
+
+            if let Some(after_invoke) = candidate.strip_prefix(INVOKE_START) {
+                let Some(gt) = after_invoke.find('>') else {
+                    break;
+                };
+                let malformed_header = after_invoke
+                    .find(NAMESPACE)
+                    .is_some_and(|namespace| namespace < gt);
+                let name = if malformed_header {
+                    None
+                } else {
+                    Self::parse_invoke_name(&after_invoke[..gt])
+                };
+                let Some(name) = name else {
+                    let invoke_end = candidate.find(INVOKE_END);
+                    let wrapper_end = candidate.find(TOOL_CALL_END);
+                    match (invoke_end, wrapper_end) {
+                        (Some(invoke), Some(wrapper)) if wrapper < invoke => {
+                            self.buffer
+                                .drain(..whitespace + wrapper + TOOL_CALL_END.len());
+                            self.in_tool_call = false;
+                        }
+                        (Some(invoke), _) => {
+                            self.buffer.drain(..whitespace + invoke + INVOKE_END.len());
+                        }
+                        (None, Some(wrapper)) => {
+                            self.buffer
+                                .drain(..whitespace + wrapper + TOOL_CALL_END.len());
+                            self.in_tool_call = false;
+                        }
+                        (None, None) => break,
+                    }
+                    continue;
+                };
+
+                let header_end = whitespace + INVOKE_START.len() + gt + 1;
+                self.buffer.drain(..header_end);
+                if self.current_tool_id == -1 {
+                    self.current_tool_id = 0;
+                } else {
+                    self.current_tool_id += 1;
+                }
+                helpers::ensure_capacity(
+                    self.current_tool_id,
+                    &mut self.prev_tool_call_arr,
+                    &mut self.streamed_args_for_tool,
+                );
+                self.current_function_name = Some(name.clone());
+                calls.push(ToolCallItem {
+                    tool_index: self.current_tool_id as usize,
+                    name: Some(name),
+                    parameters: String::new(),
+                });
+                continue;
+            }
+
+            let next_invoke = candidate.find(INVOKE_START);
+            let next_end = candidate.find(TOOL_CALL_END);
+            if let Some(next) = match (next_invoke, next_end) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            } {
+                self.buffer.drain(..whitespace + next);
+                continue;
+            }
+            let invoke_held = Self::longest_partial_suffix(candidate, INVOKE_START).unwrap_or(0);
+            let end_held = Self::longest_partial_suffix(candidate, TOOL_CALL_END).unwrap_or(0);
+            let held = invoke_held.max(end_held);
+            let discard = self.buffer.len() - held;
+            self.buffer.drain(..discard);
+            break;
         }
 
         Ok(StreamingParseResult { normal_text, calls })
@@ -538,5 +1011,8 @@ impl ToolParser for MinimaxM3Parser {
         self.current_tool_id = -1;
         self.streamed_args_for_tool.clear();
         self.in_tool_call = false;
+        self.wrapper_prefix_held = false;
+        self.wrapper_scan_pos = 0;
+        self.abandon_streaming_invoke();
     }
 }

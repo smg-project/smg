@@ -347,6 +347,220 @@ async fn test_m3_streaming_single_call() {
 }
 
 #[tokio::test]
+async fn test_m3_streaming_emits_complete_parameters_before_invoke_end() {
+    let mut parser = MinimaxM3Parser::new();
+    let tools = create_test_tools();
+
+    let header = format!("{NS}<tool_call>\n{NS}<invoke name=\"get_weather\">");
+    let result = parser.parse_incremental(&header, &tools).await.unwrap();
+    assert_eq!(result.calls.len(), 1);
+    assert_eq!(result.calls[0].name.as_deref(), Some("get_weather"));
+    assert!(result.calls[0].parameters.is_empty());
+
+    let mut city_calls = Vec::new();
+    for character in element("city", "Seattle").chars() {
+        let chunk = character.to_string();
+        city_calls.extend(
+            parser
+                .parse_incremental(&chunk, &tools)
+                .await
+                .unwrap()
+                .calls,
+        );
+    }
+    assert_eq!(city_calls.len(), 1);
+    assert_eq!(city_calls[0].parameters, r#"{"city":"Seattle""#);
+
+    let result = parser
+        .parse_incremental(&element("date", "2026-09-05"), &tools)
+        .await
+        .unwrap();
+    assert_eq!(result.calls.len(), 1);
+    assert_eq!(result.calls[0].parameters, r#","date":"2026-09-05""#);
+
+    let result = parser
+        .parse_incremental(&format!("{NS}</invoke>"), &tools)
+        .await
+        .unwrap();
+    assert_eq!(result.calls.len(), 1);
+    assert_eq!(result.calls[0].parameters, "}");
+}
+
+#[tokio::test]
+async fn test_m3_streaming_matches_complete_across_unicode_chunk_boundaries() {
+    let mut tools = create_test_tools();
+    tools.push(Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "create_order".to_string(),
+            description: None,
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "shipping": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "zip": {"type": "integer"}
+                        }
+                    },
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "object"}
+                    }
+                }
+            }),
+            strict: None,
+        },
+    });
+
+    let shipping = element(
+        "shipping",
+        &format!(
+            "{}{}",
+            element("city", "新加坡 &amp; 海港 🦀"),
+            element("zip", "18956")
+        ),
+    );
+    let items = element(
+        "items",
+        &format!(
+            "{}{}",
+            element("item", &element("sku", "book-001")),
+            element("item", &element("sku", "pen-007"))
+        ),
+    );
+    let full = tool_block(&[
+        ("create_order", format!("{shipping}{items}")),
+        (
+            "undeclared_tool",
+            format!(
+                "{}{}",
+                element("query", "增量 streaming"),
+                element("limit", "2")
+            ),
+        ),
+    ]);
+    let complete_parser = MinimaxM3Parser::new();
+    let (_, expected_calls) = complete_parser
+        .parse_complete_with_tools(&full, &tools)
+        .await
+        .unwrap();
+    let expected_names = expected_calls
+        .iter()
+        .map(|call| call.function.name.clone())
+        .collect::<Vec<_>>();
+    let expected_arguments = expected_calls
+        .iter()
+        .map(|call| call.function.arguments.clone())
+        .collect::<Vec<_>>();
+    let boundaries = full
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(full.len()))
+        .collect::<Vec<_>>();
+
+    for chunk_chars in 1..=29 {
+        let mut parser = MinimaxM3Parser::new();
+        let mut names = Vec::new();
+        let mut arguments: Vec<String> = Vec::new();
+        let mut start_char = 0;
+        while start_char + 1 < boundaries.len() {
+            let end_char = (start_char + chunk_chars).min(boundaries.len() - 1);
+            let chunk = &full[boundaries[start_char]..boundaries[end_char]];
+            let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+            for call in result.calls {
+                if let Some(name) = call.name {
+                    names.push(name);
+                }
+                if !call.parameters.is_empty() {
+                    while arguments.len() <= call.tool_index {
+                        arguments.push(String::new());
+                    }
+                    arguments[call.tool_index].push_str(&call.parameters);
+                }
+            }
+            start_char = end_char;
+        }
+
+        assert_eq!(names, expected_names, "chunk size {chunk_chars}");
+        assert_eq!(arguments, expected_arguments, "chunk size {chunk_chars}");
+    }
+}
+
+#[tokio::test]
+async fn test_m3_streaming_duplicate_parameter_matches_complete_value() {
+    let full = tool_block(&[(
+        "tagger",
+        format!("{}{}", element("tag", "a"), element("tag", "b")),
+    )]);
+    let complete_parser = MinimaxM3Parser::new();
+    let (_, expected_calls) = complete_parser.parse_complete(&full).await.unwrap();
+    let expected: serde_json::Value =
+        serde_json::from_str(&expected_calls[0].function.arguments).unwrap();
+
+    let mut parser = MinimaxM3Parser::new();
+    let result = parser.parse_incremental(&full, &[]).await.unwrap();
+    let arguments = result
+        .calls
+        .iter()
+        .filter(|call| call.name.is_none())
+        .map(|call| call.parameters.as_str())
+        .collect::<String>();
+    let actual: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+
+    assert_eq!(actual, expected);
+    assert_eq!(actual["tag"], json!(["a", "b"]));
+}
+
+#[tokio::test]
+async fn test_m3_streaming_malformed_parameter_never_finalizes_arguments() {
+    let mut parser = MinimaxM3Parser::new();
+    let tools = create_test_tools();
+    let header = format!("{NS}<tool_call>{NS}<invoke name=\"get_weather\">");
+    parser.parse_incremental(&header, &tools).await.unwrap();
+    let result = parser
+        .parse_incremental(&element("city", "Shanghai"), &tools)
+        .await
+        .unwrap();
+    assert_eq!(result.calls[0].parameters, r#"{"city":"Shanghai""#);
+
+    let malformed = format!("{NS}<date>today{NS}</wrong>{NS}</invoke>{NS}</tool_call>");
+    let result = parser.parse_incremental(&malformed, &tools).await.unwrap();
+    assert!(result
+        .calls
+        .iter()
+        .all(|call| call.parameters.as_str() != "}"));
+    assert!(parser.get_unstreamed_tool_args().is_none());
+}
+
+#[tokio::test]
+async fn test_m3_reset_discards_an_active_incremental_parameter() {
+    let mut parser = MinimaxM3Parser::new();
+    let tools = create_test_tools();
+    let partial = format!("{NS}<tool_call>{NS}<invoke name=\"get_weather\">{NS}<city>Shang");
+    parser.parse_incremental(&partial, &tools).await.unwrap();
+
+    parser.reset();
+
+    let full = tool_block(&[("search", element("query", "rust"))]);
+    let result = parser.parse_incremental(&full, &tools).await.unwrap();
+    let names = result
+        .calls
+        .iter()
+        .filter_map(|call| call.name.as_deref())
+        .collect::<Vec<_>>();
+    let arguments = result
+        .calls
+        .iter()
+        .filter(|call| call.name.is_none())
+        .map(|call| call.parameters.as_str())
+        .collect::<String>();
+    assert_eq!(names, vec!["search"]);
+    assert_eq!(arguments, r#"{"query":"rust"}"#);
+}
+
+#[tokio::test]
 async fn test_m3_streaming_char_by_char() {
     let mut parser = MinimaxM3Parser::new();
     let tools = create_test_tools();
@@ -781,12 +995,10 @@ async fn test_m3_streaming_rapid_bursts() {
     assert_eq!(args["query"], "rust programming");
 }
 
-/// Streaming a truncated tool call: the start marker and an open invoke arrive,
-/// but the closing `</tool_call>` never does. The parser waits for the end token
-/// (see the `self.buffer.find(TOOL_CALL_END)` guard in `parse_incremental`) and
-/// emits no call and no leaked markup.
+/// Streaming a truncated tool call may emit the name and complete parameters,
+/// but must not invent the final `}` without a real `</invoke>` marker.
 #[tokio::test]
-async fn test_m3_streaming_incomplete_tool_call_emits_nothing() {
+async fn test_m3_streaming_incomplete_tool_call_does_not_finalize() {
     let mut parser = MinimaxM3Parser::new();
     let tools = create_test_tools();
     let chunks = [
@@ -796,14 +1008,17 @@ async fn test_m3_streaming_incomplete_tool_call_emits_nothing() {
     ];
 
     let mut normal = String::new();
-    let mut emitted = 0;
+    let mut emitted = Vec::new();
     for chunk in &chunks {
         let result = parser.parse_incremental(chunk, &tools).await.unwrap();
         normal.push_str(&result.normal_text);
-        emitted += result.calls.len();
+        emitted.extend(result.calls);
     }
 
-    assert_eq!(emitted, 0, "incomplete streamed block must not emit a call");
+    assert_eq!(emitted.len(), 2);
+    assert_eq!(emitted[0].name.as_deref(), Some("get_weather"));
+    assert_eq!(emitted[1].parameters, r#"{"city":"Chicago""#);
+    assert!(parser.get_unstreamed_tool_args().is_none());
     assert!(
         !normal.contains("<invoke"),
         "tool-call markup must not leak into normal text"
