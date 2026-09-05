@@ -92,6 +92,7 @@ def server_mod(monkeypatch):
         "smg_grpc_servicer.sglang.scheduler_launcher": _module(
             "smg_grpc_servicer.sglang.scheduler_launcher",
             launch_scheduler_process_only=lambda **_kwargs: None,
+            terminate_scheduler_processes=lambda _procs: None,
         ),
         "smg_grpc_servicer.sglang.servicer": _module(
             "smg_grpc_servicer.sglang.servicer",
@@ -221,3 +222,70 @@ def test_scheduler_launch_failure_never_starts_serving(monkeypatch, server_mod):
     grpc_server_factory.assert_not_called()
     health_servicer_factory.assert_not_called()
     warmup_thread_factory.assert_not_called()
+
+
+def test_post_launch_startup_failure_releases_owned_resources(monkeypatch, server_mod):
+    request_manager = SimpleNamespace(shutdown=AsyncMock())
+    scheduler_procs = [object(), object()]
+    terminate_scheduler_processes = Mock()
+
+    async def launch(**_kwargs):
+        return {"status": "ready"}, object(), scheduler_procs, request_manager
+
+    model_config_factory = Mock(side_effect=RuntimeError("model config failed"))
+    monkeypatch.setattr(server_mod, "_launch_scheduler_with_request_manager", launch)
+    monkeypatch.setattr(
+        server_mod,
+        "ModelConfig",
+        SimpleNamespace(from_server_args=model_config_factory),
+    )
+    monkeypatch.setattr(
+        server_mod,
+        "terminate_scheduler_processes",
+        terminate_scheduler_processes,
+        raising=False,
+    )
+
+    server_args = SimpleNamespace(disaggregation_mode="null")
+    with pytest.raises(RuntimeError, match="model config failed"):
+        asyncio.run(server_mod.serve_grpc(server_args))
+
+    request_manager.shutdown.assert_awaited_once_with()
+    terminate_scheduler_processes.assert_called_once_with(scheduler_procs)
+
+
+def test_failed_startup_cleanup_runs_in_reverse_ownership_order(monkeypatch, server_mod):
+    events = []
+    scheduler_procs = [object()]
+
+    health_servicer = SimpleNamespace(
+        set_not_serving=Mock(side_effect=lambda: events.append("health"))
+    )
+
+    async def stop_server(grace):
+        assert grace == 0
+        events.append("server")
+
+    async def shutdown_manager():
+        events.append("manager")
+
+    server = SimpleNamespace(stop=AsyncMock(side_effect=stop_server))
+    request_manager = SimpleNamespace(shutdown=AsyncMock(side_effect=shutdown_manager))
+    terminate_scheduler_processes = Mock(side_effect=lambda _procs: events.append("schedulers"))
+    monkeypatch.setattr(
+        server_mod,
+        "terminate_scheduler_processes",
+        terminate_scheduler_processes,
+    )
+
+    asyncio.run(
+        server_mod._cleanup_failed_startup(
+            server,
+            health_servicer,
+            request_manager,
+            scheduler_procs,
+        )
+    )
+
+    assert events == ["health", "server", "schedulers", "manager"]
+    terminate_scheduler_processes.assert_called_once_with(scheduler_procs)
