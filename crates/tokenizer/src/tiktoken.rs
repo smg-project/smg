@@ -225,6 +225,13 @@ impl TiktokenTokenizer {
             };
 
         let special_tokens = Self::get_special_tokens_for_model(model);
+        // Built-in encodings have no tokenizer_config.json; every token the
+        // encoding treats as special is one `skip_special_tokens` strips.
+        let skip_token_ids = tokenizer
+            .special_tokens()
+            .into_iter()
+            .flat_map(|token| tokenizer.encode_with_special_tokens(token))
+            .collect();
 
         let vocab_size = match model {
             TiktokenModel::O200kBase => 200019,
@@ -241,7 +248,7 @@ impl TiktokenTokenizer {
             vocab_size,
             chat_template: ChatTemplateState::empty(),
             eos_token_ids: Vec::new(), // No directory path in from_model
-            skip_token_ids: HashSet::new(),
+            skip_token_ids,
             renderer: Renderer::Jinja,
         })
     }
@@ -977,6 +984,21 @@ mod tests {
             "a[EOS]<|open|>b"
         );
         assert_eq!(tokenizer.decode(&[0, 2, 3, 1], true).unwrap(), "a<|open|>b");
+    }
+
+    #[test]
+    fn test_builtin_encoding_skips_its_special_tokens_on_decode() {
+        let tokenizer = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).unwrap();
+        let ids = tokenizer.encode("hello<|endoftext|>world", false).unwrap();
+        assert!(ids.token_ids().contains(&100257));
+        assert_eq!(
+            tokenizer.decode(ids.token_ids(), false).unwrap(),
+            "hello<|endoftext|>world"
+        );
+        assert_eq!(
+            tokenizer.decode(ids.token_ids(), true).unwrap(),
+            "helloworld"
+        );
     }
 
     #[test]

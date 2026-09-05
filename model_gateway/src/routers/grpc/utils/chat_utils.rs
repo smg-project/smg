@@ -560,9 +560,14 @@ pub(crate) fn process_chat_messages_with_placeholders(
             .apply_chat_template_segments(&transformed_messages, params)
             .map_err(|e| format!("Failed to apply chat template: {e}"))?;
 
-        // Append assistant prefix if we have one
+        // Append assistant prefix if we have one. A flat renderer hands back a
+        // single control segment and the prefix joins it, so the prompt stays
+        // one encoding unit; segment-aware renderers take it as message text.
         if let Some(prefix) = assistant_prefix {
-            segments.push(PromptSegment::text(prefix));
+            match segments.as_mut_slice() {
+                [only] if only.allow_special => only.text.push_str(&prefix),
+                _ => segments.push(PromptSegment::text(prefix)),
+            }
         }
         segments
     };
