@@ -45,7 +45,7 @@ def resolve_pd_connector(config: object) -> tuple[str, str]:
 
     child = pd_children[0]
     child_engine_id = child.get("engine_id", engine_id)
-    if not isinstance(child_engine_id, str):
+    if not isinstance(child_engine_id, str) or not child_engine_id:
         return connector, engine_id
     return child["kv_connector"], child_engine_id
 

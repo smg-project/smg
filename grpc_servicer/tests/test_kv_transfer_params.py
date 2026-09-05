@@ -80,6 +80,34 @@ class TestResolvePdConnector:
             "child-engine",
         )
 
+    def test_empty_child_engine_id_is_not_projected(self):
+        config = _kv_config(
+            "MultiConnector",
+            extra={
+                "connectors": [
+                    {"kv_connector": "NixlConnector", "engine_id": ""},
+                    {"kv_connector": "MooncakeStoreConnector"},
+                ]
+            },
+        )
+
+        assert kv_transfer.resolve_pd_connector(config) == (
+            "MultiConnector",
+            "parent-engine",
+        )
+
+    def test_empty_parent_engine_id_is_not_projected(self):
+        config = _kv_config(
+            "MultiConnector",
+            engine_id="",
+            extra={"connectors": [{"kv_connector": "MooncakeConnector"}]},
+        )
+
+        assert kv_transfer.resolve_pd_connector(config) == (
+            "MultiConnector",
+            "",
+        )
+
     @pytest.mark.parametrize(
         "extra",
         [
