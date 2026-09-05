@@ -159,6 +159,34 @@ ensure_python_headers() {
     fi
 }
 
+ensure_rdma_libs() {
+    # ── RDMA runtime libraries ─────────────────────────────────────────────
+    # The EPD lane moves embeddings over Mooncake, whose native extension
+    # dlopens libibverbs/libnuma at import time whatever the transport is.
+    # Without them the encode worker dies during startup with
+    # "libibverbs.so.1: cannot open shared object file", which TokenSpeed
+    # reports as a generic "please install mooncake".
+    #
+    # Like the CUDA toolkit and Python headers above, these belong to the
+    # runner and are not part of the prebuilt payload: the source build only
+    # ever pulled them in as a transitive dependency of libopenmpi-dev, so the
+    # prebuilt fast path leaves the runner without them. Install them
+    # explicitly on both paths, same set as ci_install_vllm.sh.
+    if ldconfig -p 2> /dev/null | grep -q 'libibverbs\.so\.1'; then
+        echo "RDMA libraries: libibverbs.so.1 present"
+        return
+    fi
+
+    echo "libibverbs.so.1 not found; installing RDMA runtime libraries"
+    if ! command -v apt-get &> /dev/null; then
+        echo "ERROR: no apt-get to install the RDMA runtime libraries with" >&2
+        exit 1
+    fi
+    export DEBIAN_FRONTEND=noninteractive
+    $RETRY 3 10 $SUDO apt-get update -qq
+    $RETRY 3 10 $SUDO apt-get install -y --no-install-recommends libnuma1 libibverbs1 ibverbs-providers
+}
+
 install_tokenspeed_from_source() {
     # ── Clone TokenSpeed ───────────────────────────────────────────────────
     # ``git clone --branch`` only accepts branch/tag names, not SHAs, so we
@@ -302,6 +330,7 @@ fi
 
 setup_cuda_env
 ensure_python_headers
+ensure_rdma_libs
 
 if [ "$use_prebuilt" = "0" ]; then
     install_tokenspeed_from_source
@@ -341,6 +370,20 @@ python3 -c "from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedule
     print('gRPC servicer: importable')"
 python3 -c "from smg_grpc_servicer.tokenspeed.encoder_servicer import _lazy_encode_request; \
     print('EncodeRequest:', _lazy_encode_request())"
+# Prove Mooncake's native extension loads here rather than 20 minutes later
+# inside the EPD lane, where TokenSpeed reduces the dlopen failure to a
+# generic "please install mooncake". Lanes without the package skip it.
+python3 -c "
+import importlib.util
+
+if importlib.util.find_spec('mooncake') is None:
+    print('mooncake: not installed, skipping')
+else:
+    import torch  # bundled CUDA libraries must load first
+    from mooncake.engine import TransferEngine
+
+    print('mooncake TransferEngine: importable')
+"
 python3 -c "
 import pathlib
 import smg_grpc_proto
