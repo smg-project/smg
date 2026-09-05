@@ -84,14 +84,15 @@ while IFS=$'\t' read -r id created tags; do
         deleted=$((deleted + 1))
         continue
     fi
-    if gh api --method DELETE \
-        "/orgs/${OWNER}/packages/container/${PACKAGE}/versions/${id}" > /dev/null 2>&1; then
+    if err="$(gh api --method DELETE \
+        "/orgs/${OWNER}/packages/container/${PACKAGE}/versions/${id}" 2>&1 > /dev/null)"; then
         log "delete ${tags} (${created})"
         deleted=$((deleted + 1))
     else
-        # Most likely the token lacks package-delete rights. Say so once per
-        # version and carry on; a full image is still cheaper than a red build.
-        log "WARNING: could not delete ${tags} (version ${id})"
+        # Most likely the token lacks package-delete rights. Print what the API
+        # actually said so that is diagnosable from the log, then carry on: a
+        # stale image is cheaper than a red build.
+        log "WARNING: could not delete ${tags} (version ${id}): ${err//$'\n'/ }"
     fi
 done <<< "$sorted"
 

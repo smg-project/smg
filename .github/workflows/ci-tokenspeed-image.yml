@@ -138,6 +138,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      - name: Install gh CLI
+        run: |
+          if ! command -v gh &>/dev/null; then
+            mkdir -p "$HOME/.local/bin"
+            GH_VERSION="2.74.0"
+            GH_SHA256="e55c9d49dc49c0b0fef0a9acd3510482fd9e27ff52ae80f8a6e838cd25b4cd89"
+            curl -fsSL --connect-timeout 10 --max-time 120 -o /tmp/gh.tgz \
+              "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+            echo "${GH_SHA256}  /tmp/gh.tgz" | sha256sum --check --quiet
+            tar xzf /tmp/gh.tgz --strip-components=2 -C "$HOME/.local/bin" "gh_${GH_VERSION}_linux_amd64/bin/gh"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+
       - name: Prune superseded images
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
