@@ -6,6 +6,7 @@ Run with: pytest grpc_servicer/tests/test_kv_transfer_params.py
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,6 +29,103 @@ NIXL_HANDOFF = {
     "remote_port": 5600,
     "tp_size": 2,
 }
+
+
+def _kv_config(connector, engine_id="parent-engine", extra=None):
+    return SimpleNamespace(
+        kv_connector=connector,
+        engine_id=engine_id,
+        kv_connector_extra_config=extra,
+    )
+
+
+class TestResolvePdConnector:
+    def test_ordinary_connector_is_unchanged(self):
+        config = _kv_config("ExampleConnector", engine_id="engine-1")
+
+        assert kv_transfer.resolve_pd_connector(config) == (
+            "ExampleConnector",
+            "engine-1",
+        )
+
+    def test_projects_mooncake_child_with_parent_engine_id(self):
+        config = _kv_config(
+            "MultiConnector",
+            extra={
+                "connectors": [
+                    {"kv_connector": "MooncakeConnector"},
+                    {"kv_connector": "MooncakeStoreConnector"},
+                ]
+            },
+        )
+
+        assert kv_transfer.resolve_pd_connector(config) == (
+            "MooncakeConnector",
+            "parent-engine",
+        )
+
+    def test_projects_nixl_child_with_child_engine_id(self):
+        config = _kv_config(
+            "MultiConnector",
+            extra={
+                "connectors": [
+                    {"kv_connector": "NixlConnector", "engine_id": "child-engine"},
+                    {"kv_connector": "MooncakeStoreConnector"},
+                ]
+            },
+        )
+
+        assert kv_transfer.resolve_pd_connector(config) == (
+            "NixlConnector",
+            "child-engine",
+        )
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            None,
+            {},
+            {"connectors": "not-a-list"},
+            {"connectors": [None, {"kv_connector": "NixlConnector"}]},
+            {"connectors": [{}, {"kv_connector": "NixlConnector"}]},
+            {"connectors": [{"kv_connector": 42}]},
+            {"connectors": [{"kv_connector": "NixlConnector", "engine_id": None}]},
+        ],
+    )
+    def test_malformed_multi_connector_is_not_projected(self, extra):
+        config = _kv_config("MultiConnector", extra=extra)
+
+        assert kv_transfer.resolve_pd_connector(config) == (
+            "MultiConnector",
+            "parent-engine",
+        )
+
+    def test_store_only_multi_connector_is_not_projected(self):
+        config = _kv_config(
+            "MultiConnector",
+            extra={"connectors": [{"kv_connector": "MooncakeStoreConnector"}]},
+        )
+
+        assert kv_transfer.resolve_pd_connector(config) == (
+            "MultiConnector",
+            "parent-engine",
+        )
+
+    def test_multiple_pd_children_are_not_projected(self):
+        config = _kv_config(
+            "MultiConnector",
+            extra={
+                "connectors": [
+                    {"kv_connector": "MooncakeConnector"},
+                    {"kv_connector": "NixlConnector"},
+                ]
+            },
+        )
+
+        assert kv_transfer.resolve_pd_connector(config) == (
+            "MultiConnector",
+            "parent-engine",
+        )
 
 
 class TestParamsFromRequest:
