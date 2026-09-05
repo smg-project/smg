@@ -17,6 +17,9 @@ name: CI TokenSpeed Image
 # doesn't exist yet, detect-changes resolves an empty image, and the lanes
 # degrade gracefully. This workflow builds the new tag on merge, and every
 # subsequent run is fast again.
+#
+# Retention: each tag is ~8 GB and nothing can pull a superseded one, so the
+# prune job below keeps the newest few and deletes the rest.
 
 on:
   push:
@@ -122,3 +125,20 @@ jobs:
         run: |
           docker rmi "$IMAGE" || true
           docker rmi "$BASE" || true
+
+  # Superseded tags are unreachable by construction (the tag is a hash of its
+  # own inputs), so this runs whenever the tag resolves — after a fresh push
+  # and after a no-op run that found the tag already present. Split out onto
+  # the CPU pool because that is where the gh CLI is available.
+  prune:
+    needs: [build-and-push]
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Prune superseded images
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci_prune_tokenspeed_images.sh
