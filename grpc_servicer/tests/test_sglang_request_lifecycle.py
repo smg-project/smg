@@ -80,6 +80,34 @@ def test_concurrent_active_aborts_are_forwarded_only_once():
     assert forwarded == [state.request_id]
 
 
+def test_forward_failure_releases_abort_claim_for_retry():
+    state = FakeRequestState()
+    lifecycle = RequestLifecycle({state.request_id: state})
+    forwarded = []
+
+    async def run_aborts():
+        async def fail():
+            raise RuntimeError("scheduler send failed")
+
+        try:
+            await lifecycle.abort_if_active(state.request_id, fail)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("forward failure was not propagated")
+
+        assert state.finished is False
+        assert state.stream_finished is False
+
+        async def succeed():
+            forwarded.append(state.request_id)
+
+        return await lifecycle.abort_if_active(state.request_id, succeed)
+
+    assert asyncio.run(run_aborts()) is True
+    assert forwarded == [state.request_id]
+
+
 def test_completed_request_ignores_scheduler_abort():
     state = FakeRequestState(finished=True)
     lifecycle = RequestLifecycle({state.request_id: state})
@@ -104,6 +132,37 @@ def test_scheduler_can_abort_an_active_request():
     assert lifecycle.accept_scheduler_abort(state.request_id) is state
     assert state.finished is True
     assert state.stream_finished is True
+
+
+def test_scheduler_abort_ack_targets_original_claim_after_id_reuse():
+    states = {}
+    lifecycle = RequestLifecycle(states)
+    old_state = FakeRequestState()
+    new_state = FakeRequestState()
+
+    lifecycle.register(old_state)
+    assert lifecycle.claim_abort(old_state.request_id) is old_state
+    lifecycle.register(new_state)
+
+    assert lifecycle.accept_scheduler_abort(old_state.request_id) is old_state
+    assert new_state.finished is False
+    assert new_state.stream_finished is False
+
+
+def test_scheduler_abort_ack_survives_cleanup_before_id_reuse():
+    states = {}
+    lifecycle = RequestLifecycle(states)
+    old_state = FakeRequestState()
+    new_state = FakeRequestState()
+
+    lifecycle.register(old_state)
+    assert lifecycle.claim_abort(old_state.request_id) is old_state
+    assert lifecycle.remove(old_state.request_id, old_state) is old_state
+    lifecycle.register(new_state)
+
+    assert lifecycle.accept_scheduler_abort(old_state.request_id) is old_state
+    assert new_state.finished is False
+    assert new_state.stream_finished is False
 
 
 def test_concurrent_aborts_are_claimed_only_once():

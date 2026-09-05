@@ -18,14 +18,13 @@ class RequestLifecycle:
 
     def __init__(self, states: dict[str, RequestState]):
         self._states = states
-        self._abort_claims: dict[str, RequestState] = {}
+        self._abort_claims: dict[str, list[RequestState]] = {}
         self._lock = threading.Lock()
 
     def register(self, state: RequestState) -> None:
         """Register a request, preserving the manager's overwrite semantics."""
         with self._lock:
             self._states[state.request_id] = state
-            self._abort_claims.pop(state.request_id, None)
 
     def get(self, request_id: str) -> RequestState | None:
         """Return the currently registered state for a request ID."""
@@ -41,18 +40,45 @@ class RequestLifecycle:
 
             state.finished = True
             state.stream_finished = True
-            self._abort_claims[request_id] = state
+            self._abort_claims.setdefault(request_id, []).append(state)
             return state
 
     async def abort_if_active(
         self, request_id: str, forward: Callable[[], Awaitable[None]]
     ) -> bool:
         """Forward an abort only after atomically claiming an active request."""
-        if self.claim_abort(request_id) is None:
+        state = self.claim_abort(request_id)
+        if state is None:
             return False
 
-        await forward()
+        try:
+            await forward()
+        except BaseException:
+            self._rollback_abort(request_id, state)
+            raise
         return True
+
+    def _rollback_abort(self, request_id: str, state: RequestState) -> None:
+        """Release a failed abort claim if it still belongs to this state."""
+        with self._lock:
+            claims = self._abort_claims.get(request_id)
+            if claims is None:
+                return
+
+            claim_index = next(
+                (index for index, claim in enumerate(claims) if claim is state),
+                None,
+            )
+            if claim_index is None:
+                return
+
+            claims.pop(claim_index)
+            if not claims:
+                self._abort_claims.pop(request_id)
+
+            if self._states.get(request_id) is state:
+                state.finished = False
+                state.stream_finished = False
 
     def finish(
         self,
@@ -74,15 +100,18 @@ class RequestLifecycle:
     def accept_scheduler_abort(self, request_id: str) -> RequestState | None:
         """Accept a scheduler abort for an active or locally aborted request."""
         with self._lock:
-            state = self._states.get(request_id)
-            local_claim = self._abort_claims.get(request_id) is state
-            if state is None or (state.finished and not local_claim):
-                return None
+            claims = self._abort_claims.get(request_id)
+            if claims:
+                state = claims.pop(0)
+                if not claims:
+                    self._abort_claims.pop(request_id)
+            else:
+                state = self._states.get(request_id)
+                if state is None or state.finished:
+                    return None
 
             state.finished = True
             state.stream_finished = True
-            if local_claim:
-                self._abort_claims.pop(request_id, None)
             return state
 
     def remove(self, request_id: str, state: RequestState | None = None) -> RequestState | None:
@@ -91,7 +120,4 @@ class RequestLifecycle:
             current = self._states.get(request_id)
             if current is None or (state is not None and current is not state):
                 return None
-            removed = self._states.pop(request_id)
-            if self._abort_claims.get(request_id) is removed:
-                self._abort_claims.pop(request_id, None)
-            return removed
+            return self._states.pop(request_id)
