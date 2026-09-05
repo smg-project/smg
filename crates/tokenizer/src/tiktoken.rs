@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -52,6 +52,8 @@ struct TiktokenConfig {
     special_tokens: SpecialTokens,
     /// Token string -> ID mapping from `added_tokens_decoder`
     added_tokens: HashMap<String, TokenIdType>,
+    /// Ids `skip_special_tokens` removes from decoded text.
+    skip_token_ids: HashSet<TokenIdType>,
     chat_template: Option<String>,
 }
 
@@ -60,11 +62,35 @@ fn parse_tiktoken_config(value: &serde_json::Value) -> TiktokenConfig {
     TiktokenConfig {
         special_tokens: parse_special_tokens(value),
         added_tokens: parse_added_tokens_decoder(value),
+        skip_token_ids: parse_skip_token_ids(value),
         chat_template: value
             .get("chat_template")
             .and_then(|v| v.as_str())
             .map(String::from),
     }
+}
+
+/// Ids of `added_tokens_decoder` entries flagged `"special": true`: the set
+/// `skip_special_tokens` strips, as HuggingFace defines it. Added tokens
+/// without the flag (Kimi-K3's `<|open|>` / `<|close|>` / `<|sep|>`) are
+/// control tokens for encoding but stay in decoded text.
+fn parse_skip_token_ids(config: &serde_json::Value) -> HashSet<TokenIdType> {
+    let mut ids = HashSet::new();
+    if let Some(added) = config
+        .get("added_tokens_decoder")
+        .and_then(|v| v.as_object())
+    {
+        for (id_str, token_info) in added {
+            let special = token_info
+                .get("special")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if let (true, Ok(id)) = (special, id_str.parse::<TokenIdType>()) {
+                ids.insert(id);
+            }
+        }
+    }
+    ids
 }
 
 /// Load `tokenizer_config.json` from `dir`, returning both the parsed
@@ -152,6 +178,7 @@ pub struct TiktokenTokenizer {
     vocab_size: usize,
     chat_template: ChatTemplateState,
     eos_token_ids: Vec<TokenIdType>,
+    skip_token_ids: HashSet<TokenIdType>,
     renderer: Renderer,
 }
 
@@ -207,6 +234,7 @@ impl TiktokenTokenizer {
             vocab_size,
             chat_template: ChatTemplateState::empty(),
             eos_token_ids: Vec::new(), // No directory path in from_model
+            skip_token_ids: HashSet::new(),
             renderer: Renderer::Jinja,
         })
     }
@@ -312,6 +340,7 @@ impl TiktokenTokenizer {
             vocab_size,
             chat_template: ChatTemplateState::new(chat_template)?,
             eos_token_ids,
+            skip_token_ids: config.skip_token_ids,
             renderer,
         })
     }
@@ -484,7 +513,18 @@ impl Encoder for TiktokenTokenizer {
 }
 
 impl Decoder for TiktokenTokenizer {
-    fn decode(&self, token_ids: &[TokenIdType], _skip_special_tokens: bool) -> Result<String> {
+    fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
+        let kept: Vec<TokenIdType>;
+        let token_ids: &[TokenIdType] = if skip_special_tokens && !self.skip_token_ids.is_empty() {
+            kept = token_ids
+                .iter()
+                .copied()
+                .filter(|id| !self.skip_token_ids.contains(id))
+                .collect();
+            &kept
+        } else {
+            token_ids
+        };
         match self.tokenizer.decode(token_ids) {
             Ok(text) => Ok(text),
             Err(err) if is_unknown_tiktoken_decode_error(&err) => Err(Error::msg(format!(
@@ -882,6 +922,61 @@ mod tests {
             err.to_string()
                 .contains("tiktoken decode failed for unknown token id"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_skip_special_tokens_drops_only_special_flagged_ids() {
+        let dir = write_minimal_tiktoken_dir(
+            r#"{
+                "added_tokens_decoder": {
+                    "2": { "content": "[EOS]", "special": true },
+                    "3": { "content": "<|open|>", "special": false }
+                }
+            }"#,
+            None,
+        );
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+
+        assert_eq!(
+            tokenizer.decode(&[0, 2, 3, 1], false).unwrap(),
+            "a[EOS]<|open|>b"
+        );
+        assert_eq!(tokenizer.decode(&[0, 2, 3, 1], true).unwrap(), "a<|open|>b");
+    }
+
+    #[test]
+    fn test_skip_special_tokens_holds_text_in_incremental_decode() {
+        let dir = write_minimal_tiktoken_dir(
+            r#"{
+                "added_tokens_decoder": {
+                    "2": { "content": "[EOS]", "special": true }
+                }
+            }"#,
+            None,
+        );
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+
+        let mut ids = Vec::new();
+        let mut prefix = String::new();
+        let mut prefix_index = 0;
+        assert_eq!(
+            tokenizer
+                .decode_step(0, &mut ids, &mut prefix, &mut prefix_index, true)
+                .unwrap(),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            tokenizer
+                .decode_step(2, &mut ids, &mut prefix, &mut prefix_index, true)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            tokenizer
+                .decode_step(1, &mut ids, &mut prefix, &mut prefix_index, true)
+                .unwrap(),
+            Some("b".to_string())
         );
     }
 
