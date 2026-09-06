@@ -1,5 +1,9 @@
 # radix-index
 
+Published on crates.io as **`smg-radix-index`** (import path `radix_index`).
+Depends on `smg-radix-tree` and `smg-grpc-client` (the event bridge), so it
+publishes in tier 3 of the release workflow.
+
 A shared radix membership index for cache-aware routing: gateways ask
 "which worker already holds the longest prefix of this request?" without
 each gateway building and syncing its own tree.

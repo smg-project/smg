@@ -16,7 +16,7 @@
 //! state (determinism).
 //!
 //! `fuzz_quick` (32+8 seeds) always runs. The campaign entry point:
-//!   RADIX_FUZZ_SEEDS=10000 cargo test -p radix-tree --release \
+//!   RADIX_FUZZ_SEEDS=10000 cargo test -p smg-radix-tree --release \
 //!     --test fuzz_differential -- --ignored --nocapture
 
 mod common;

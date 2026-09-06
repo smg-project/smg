@@ -1,5 +1,9 @@
 # radix-tree
 
+Published on crates.io as **`smg-radix-tree`** (the bare `radix-tree` name
+belongs to an unrelated router crate); the Rust import path is `radix_tree`.
+No SMG dependencies — it is a tier-1 crate in the release workflow.
+
 A generic prefix-membership index: given per-holder chains of
 content-addressed blocks, answer *"which holders already hold the
 longest prefix of this chain, and how deep?"* — plus the write and

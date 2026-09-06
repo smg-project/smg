@@ -6,7 +6,7 @@
 //! the baseline; R1 adds the RadixTree side under the same driver.
 //!
 //! Run (numbers are meaningless in debug):
-//!   cargo test -p radix-tree --release --test pinned_bench \
+//!   cargo test -p smg-radix-tree --release --test pinned_bench \
 //!     -- --ignored --nocapture
 //!
 //! Protocol (§11): RSS sampled after fill, before query-phase

@@ -1,9 +1,20 @@
 [package]
-name = "radix-tree"
+name = "smg-radix-tree"
 version = "0.1.0"
 edition = "2021"
-description = "Generic prefix-membership index"
+description = "Generic prefix-membership index: chain-native radix tree answering which holders share the longest prefix of a block chain, and how deep"
 license = "Apache-2.0"
+repository = "https://github.com/smg-project/smg"
+readme = "README.md"
+authors = ["Simo Lin <linsimo.mark@gmail.com>"]
+keywords = ["radix-tree", "prefix-matching", "cache-routing", "kv-cache", "llm"]
+categories = ["data-structures", "caching"]
+
+# The Rust import path stays `radix_tree`; only the crates.io package name
+# carries the `smg-` prefix (the bare `radix-tree` name is taken).
+[lib]
+name = "radix_tree"
+path = "src/lib.rs"
 
 [dependencies]
 # Zero SMG dependencies. External utility crates only.
@@ -13,4 +24,4 @@ rustc-hash = "2"
 [dev-dependencies]
 # The differential oracle. Dev-only: the published crate never
 # depends on SMG code.
-kv-index = { path = "../kv_index" }
+kv-index = { workspace = true }

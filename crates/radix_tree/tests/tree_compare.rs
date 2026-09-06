@@ -11,7 +11,7 @@
 //! One structure per process for clean RSS deltas:
 //!   RADIX_COMPARE_SIDE=token|string|radix64|radix128|radix256|radix512
 //!
-//! Run: RADIX_COMPARE_SIDE=... cargo test -p radix-tree --release \
+//! Run: RADIX_COMPARE_SIDE=... cargo test -p smg-radix-tree --release \
 //!   --test tree_compare -- --ignored --nocapture
 
 mod common;
