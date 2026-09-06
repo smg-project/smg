@@ -109,7 +109,8 @@ impl BuildStage for HarmonyRequestBuildingStage {
             | RequestType::Completion(_)
             | RequestType::Embedding(_)
             | RequestType::Classify(_)
-            | RequestType::Messages(_)) => {
+            | RequestType::Messages(_)
+            | RequestType::Transcription { .. }) => {
                 error!(
                     function = "HarmonyRequestBuildingStage::build",
                     request_type = %request_type,

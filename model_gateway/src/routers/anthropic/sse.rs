@@ -19,7 +19,10 @@ use tracing::{debug, error, warn};
 
 use super::mcp::{IterationResult, McpToolCall};
 use crate::routers::{
-    common::sse::{SseDecodeError, SseDecoder, SseEncodeError, SseEncoder, SseFrame},
+    common::{
+        header_utils::is_smg_owned_error_code_header,
+        sse::{SseDecodeError, SseDecoder, SseEncodeError, SseEncoder, SseFrame},
+    },
     error::internal_error,
 };
 
@@ -70,14 +73,16 @@ pub(crate) fn build_sse_response(
 
     for (key, value) in &upstream_headers {
         let key_str = key.as_str();
-        if !matches!(
-            key_str,
-            "content-type"
-                | "cache-control"
-                | "connection"
-                | "transfer-encoding"
-                | "content-length"
-        ) {
+        if !is_smg_owned_error_code_header(key_str)
+            && !matches!(
+                key_str,
+                "content-type"
+                    | "cache-control"
+                    | "connection"
+                    | "transfer-encoding"
+                    | "content-length"
+            )
+        {
             builder = builder.header(key, value);
         }
     }
@@ -692,6 +697,23 @@ fn resolve_event(frame: SseFrame<'_>) -> Option<(Cow<'_, str>, Cow<'_, str>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routers::error::HEADER_X_SMG_ERROR_CODE;
+
+    #[test]
+    fn build_sse_response_drops_smg_owned_error_code() {
+        let mut upstream_headers = HeaderMap::new();
+        upstream_headers.insert(HEADER_X_SMG_ERROR_CODE, "forged".parse().unwrap());
+        upstream_headers.insert("x-upstream-id", "worker-a".parse().unwrap());
+
+        let response = build_sse_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            upstream_headers,
+            Body::empty(),
+        );
+
+        assert!(response.headers().get(HEADER_X_SMG_ERROR_CODE).is_none());
+        assert_eq!(response.headers().get("x-upstream-id").unwrap(), "worker-a");
+    }
 
     /// Decode `bytes` through the shared `SseDecoder` and resolve each frame
     /// to `(event_type, data)` the way `consume_and_forward` does.

@@ -506,6 +506,7 @@ impl MediaConnector {
         cfg: VideoFetchConfig,
         source: VideoSource,
     ) -> Result<Arc<VideoClip>, MediaConnectorError> {
+        validate_max_long_side_pixel(cfg.max_long_side_pixel)?;
         ensure_input_byte_limit(bytes.len(), video_max_input_bytes(), "video")?;
         if cfg.max_frames == 0 {
             return Err(MediaConnectorError::VideoDecode(
@@ -2125,7 +2126,8 @@ mod tests {
         effective_sample_fps, ensure_input_byte_limit, expected_sampled_frame_count,
         fps_filter_for_metadata, parse_ffmpeg_duration_seconds, parse_ffprobe_video_info,
         parse_ppm_stream, read_file_with_limit, split_png_stream, video_temp_suffix,
-        MediaConnectorError, VideoFetchConfig, VideoMetadata,
+        MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaSource, VideoFetchConfig,
+        VideoMetadata,
     };
 
     const TINY_PNG: &[u8] = &[
@@ -2398,6 +2400,34 @@ mod tests {
         assert_eq!(super::adaptive_opencv_decoder_threads(8, 32), 1);
         assert_eq!(super::adaptive_opencv_decoder_threads(1, 0), 2);
     }
+
+    /// Defense in depth for the video path: the tracker validates M3's range,
+    /// but the decoder must reject a zero or off-grid cap itself, before it
+    /// spends a decode on the clip, exactly as the image decoder does.
+    #[tokio::test]
+    async fn decode_video_rejects_an_invalid_long_side_cap() {
+        let connector =
+            MediaConnector::new(reqwest::Client::new(), MediaConnectorConfig::default())
+                .expect("default connector");
+        for value in [0, 505] {
+            let cfg = VideoFetchConfig {
+                max_long_side_pixel: Some(value),
+                ..VideoFetchConfig::default()
+            };
+            let err = connector
+                .fetch_video(MediaSource::InlineBytes(vec![0u8; 16]), cfg)
+                .await
+                .expect_err("an invalid cap must be rejected");
+            assert!(
+                matches!(
+                    err,
+                    MediaConnectorError::InvalidMaxLongSidePixel { value: got, factor: 28 }
+                        if got == value
+                ),
+                "cap {value}: unexpected error {err:?}"
+            );
+        }
+    }
 }
 
 /// The vision patch factor MiniMax-M3's `max_long_side_pixel` must align to
@@ -2593,6 +2623,11 @@ fn cap_decoded_frames(
 
             // Size from the capped geometry; the pre-cap length would leave a
             // large allocation attached to the clip for its whole lifetime.
+            // Clamped to the source buffer: the descriptors are only validated
+            // per frame inside the loop below, so they must not drive the
+            // allocation on their own. The clamp never under-reserves, since
+            // the capped total is at most the uncapped total, which is at most
+            // the buffer.
             let capacity: usize = video
                 .frames
                 .iter()
@@ -2600,7 +2635,8 @@ fn cap_decoded_frames(
                     Some((w, h)) => (w as usize) * (h as usize) * 3,
                     None => f.len,
                 })
-                .sum();
+                .fold(0usize, usize::saturating_add)
+                .min(video.data.len());
             let mut data: Vec<u8> = Vec::with_capacity(capacity);
             let mut frames = Vec::with_capacity(video.frames.len());
 
@@ -2670,6 +2706,47 @@ mod video_frame_cap_tests {
             video: DecodedRgbVideo::new(Bytes::from(data), descs),
             sample_fps: 2.0,
         }
+    }
+
+    /// A descriptor that disagrees with its buffer must not size the
+    /// allocation: the capacity is clamped to the source buffer, and the
+    /// per-frame bounds check then hands the clip back untouched.
+    #[test]
+    fn inconsistent_frame_descriptors_do_not_drive_the_allocation() {
+        let small = (100 * 100 * 3) as usize;
+        let big = (1920 * 1080 * 3) as usize;
+        let data = vec![0u8; small + big];
+        let frames = vec![
+            // Inside the cap, so its `len` feeds the capacity sum directly,
+            // and that `len` is nonsense.
+            DecodedRgbFrame {
+                width: 100,
+                height: 100,
+                offset: 0,
+                len: isize::MAX as usize,
+            },
+            // Over the cap, so the "nothing to cap" early return does not fire.
+            DecodedRgbFrame {
+                width: 1920,
+                height: 1080,
+                offset: small,
+                len: big,
+            },
+        ];
+        let decoded = DecodedVideoFrames::Rgb {
+            video: DecodedRgbVideo::new(Bytes::from(data), frames),
+            sample_fps: 2.0,
+        };
+
+        let DecodedVideoFrames::Rgb { video, .. } = cap_decoded_frames(decoded, Some(504)) else {
+            panic!("expected RGB");
+        };
+        // Left to downstream validation rather than reshaped or reallocated.
+        assert_eq!(video.frames[0].len, isize::MAX as usize);
+        assert_eq!(
+            (video.frames[1].width, video.frames[1].height),
+            (1920, 1080)
+        );
     }
 
     #[test]

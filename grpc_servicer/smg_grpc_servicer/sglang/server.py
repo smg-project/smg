@@ -22,17 +22,71 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.runtime_context import publish
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
-from smg_grpc_servicer.sglang.scheduler_launcher import launch_scheduler_process_only
+from smg_grpc_servicer.sglang.scheduler_launcher import (
+    launch_scheduler_process_only,
+    terminate_scheduler_processes,
+)
 from smg_grpc_servicer.sglang.servicer import SGLangSchedulerServicer
 
 logger = logging.getLogger(__name__)
+
+
+async def _launch_scheduler_with_request_manager(
+    server_args: ServerArgs,
+    bootstrap_server=None,
+):
+    """Bind scheduler IPC endpoints before scheduler processes connect."""
+    port_args = PortArgs.init_new(server_args)
+    request_manager = GrpcRequestManager(
+        server_args=server_args,
+        port_args=port_args,
+        bootstrap_server=bootstrap_server,
+    )
+
+    try:
+        scheduler_info, launched_port_args, scheduler_procs = launch_scheduler_process_only(
+            server_args=server_args,
+            port_args=port_args,
+        )
+    except BaseException:
+        await request_manager.shutdown()
+        raise
+
+    return scheduler_info, launched_port_args, scheduler_procs, request_manager
+
+
+async def _cleanup_failed_startup(
+    server,
+    health_servicer,
+    request_manager: GrpcRequestManager,
+    scheduler_procs,
+):
+    """Release resources retained by an incomplete gRPC startup."""
+    if health_servicer is not None:
+        try:
+            health_servicer.set_not_serving()
+        except Exception:
+            logger.exception("Failed to mark gRPC health as not serving")
+
+    if server is not None:
+        try:
+            await server.stop(0)
+        except Exception:
+            logger.exception("Failed to stop partially started gRPC server")
+
+    terminate_scheduler_processes(scheduler_procs)
+
+    try:
+        await request_manager.shutdown()
+    except Exception:
+        logger.exception("Failed to shut down request manager after startup failure")
 
 
 async def serve_grpc(
@@ -79,252 +133,252 @@ async def serve_grpc(
 
     # Launch only the scheduler process(es) (no tokenizer/detokenizer needed for gRPC)
     logger.info("Launching scheduler process(es)...")
-    scheduler_info, port_args, scheduler_procs = launch_scheduler_process_only(
+    (
+        scheduler_info,
+        port_args,
+        scheduler_procs,
+        request_manager,
+    ) = await _launch_scheduler_with_request_manager(
         server_args=server_args,
-    )
-
-    # Load model config to get HF config info (same as TokenizerManager does)
-    model_config = ModelConfig.from_server_args(server_args)
-
-    # Update model info from scheduler info and model config
-    if model_info is None:
-        # Extract classification labels from HuggingFace config (if available)
-        # Match logic in serving_classify.py::_get_id2label_mapping
-        hf_config = model_config.hf_config
-        id2label = getattr(hf_config, "id2label", None)
-        num_labels = getattr(hf_config, "num_labels", 0) or 0
-
-        # If no id2label but num_labels exists, create default mapping
-        if not id2label and num_labels:
-            id2label = {i: f"LABEL_{i}" for i in range(num_labels)}
-        elif id2label and not num_labels:
-            num_labels = len(id2label)
-
-        # Convert to JSON string for proto transport
-        # id2label is a dict like {0: "negative", 1: "positive"}
-        id2label_json = json.dumps(id2label) if id2label else ""
-
-        model_info = {
-            "model_name": server_args.model_path,
-            "max_context_length": scheduler_info.get(
-                "max_total_num_tokens", server_args.context_length or 8192
-            ),
-            "vocab_size": scheduler_info.get("vocab_size", 128256),
-            "supports_vision": scheduler_info.get("supports_vision", False),
-            "model_type": getattr(hf_config, "model_type", None),
-            "architectures": getattr(hf_config, "architectures", None),
-            "max_req_input_len": scheduler_info.get("max_req_input_len", 8192),
-            "eos_token_ids": scheduler_info.get("eos_token_ids", []),
-            "pad_token_id": scheduler_info.get("pad_token_id", 0),
-            "bos_token_id": scheduler_info.get("bos_token_id", 1),
-            # Classification model support
-            "id2label_json": id2label_json,
-            "num_labels": num_labels or 0,
-        }
-
-    # Create request manager with the correct port args
-    # Note: We pass None for bootstrap_server since it's already started above
-    request_manager = GrpcRequestManager(
-        server_args=server_args,
-        port_args=port_args,
         bootstrap_server=bootstrap_server,
     )
 
-    if on_request_manager_ready is not None:
-        try:
+    server = None
+    health_servicer = None
+    try:
+        # Load model config to get HF config info (same as TokenizerManager does)
+        model_config = ModelConfig.from_server_args(server_args)
+
+        # Update model info from scheduler info and model config
+        if model_info is None:
+            # Extract classification labels from HuggingFace config (if available)
+            # Match logic in serving_classify.py::_get_id2label_mapping
+            hf_config = model_config.hf_config
+            id2label = getattr(hf_config, "id2label", None)
+            num_labels = getattr(hf_config, "num_labels", 0) or 0
+
+            # If no id2label but num_labels exists, create default mapping
+            if not id2label and num_labels:
+                id2label = {i: f"LABEL_{i}" for i in range(num_labels)}
+            elif id2label and not num_labels:
+                num_labels = len(id2label)
+
+            # Convert to JSON string for proto transport
+            # id2label is a dict like {0: "negative", 1: "positive"}
+            id2label_json = json.dumps(id2label) if id2label else ""
+
+            model_info = {
+                "model_name": server_args.model_path,
+                "max_context_length": scheduler_info.get(
+                    "max_total_num_tokens", server_args.context_length or 8192
+                ),
+                "vocab_size": scheduler_info.get("vocab_size", 128256),
+                "supports_vision": scheduler_info.get("supports_vision", False),
+                "model_type": getattr(hf_config, "model_type", None),
+                "architectures": getattr(hf_config, "architectures", None),
+                "max_req_input_len": scheduler_info.get("max_req_input_len", 8192),
+                "eos_token_ids": scheduler_info.get("eos_token_ids", []),
+                "pad_token_id": scheduler_info.get("pad_token_id", 0),
+                "bos_token_id": scheduler_info.get("bos_token_id", 1),
+                # Classification model support
+                "id2label_json": id2label_json,
+                "num_labels": num_labels or 0,
+            }
+
+        if on_request_manager_ready is not None:
             await on_request_manager_ready(request_manager, server_args, scheduler_info)
-        except Exception:
-            # The shutdown guard below only covers the post-start path, so
-            # clean up the scheduler processes and sockets before re-raising.
-            logger.exception("on_request_manager_ready callback failed, shutting down")
-            await request_manager.shutdown()
-            for proc in scheduler_procs:
-                if proc.is_alive():
-                    proc.terminate()
-                    proc.join(timeout=2.0)
-                    if proc.is_alive():
-                        proc.kill()
-            raise
 
-    # Create gRPC server
-    server = grpc.aio.server(
-        futures.ThreadPoolExecutor(max_workers=10),
-        options=[
-            ("grpc.max_send_message_length", 1024 * 1024 * 256),
-            ("grpc.max_receive_message_length", 1024 * 1024 * 256),
-            # Allow client HTTP/2 keepalive pings every 10s+.
-            # Without this, the gRPC C-core default (300s minimum) causes
-            # GOAWAY when clients send pings more frequently during long
-            # requests (e.g. prefill) where no DATA frames flow.
-            ("grpc.http2.min_ping_interval_without_data_ms", 10000),
-            ("grpc.keepalive_permit_without_calls", True),
-        ],
-    )
+        # Create gRPC server
+        server = grpc.aio.server(
+            futures.ThreadPoolExecutor(max_workers=10),
+            options=[
+                ("grpc.max_send_message_length", 1024 * 1024 * 256),
+                ("grpc.max_receive_message_length", 1024 * 1024 * 256),
+                # Allow client HTTP/2 keepalive pings every 10s+.
+                # Without this, the gRPC C-core default (300s minimum) causes
+                # GOAWAY when clients send pings more frequently during long
+                # requests (e.g. prefill) where no DATA frames flow.
+                ("grpc.http2.min_ping_interval_without_data_ms", 10000),
+                ("grpc.keepalive_permit_without_calls", True),
+            ],
+        )
 
-    # Create standard health service (for Kubernetes probes)
-    health_servicer = SGLangHealthServicer(
-        request_manager=request_manager,
-        scheduler_info=scheduler_info,
-    )
-    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
+        # Create standard health service (for Kubernetes probes)
+        health_servicer = SGLangHealthServicer(
+            request_manager=request_manager,
+            scheduler_info=scheduler_info,
+        )
+        health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
 
-    # Add SGLang service
-    servicer = SGLangSchedulerServicer(
-        request_manager=request_manager,
-        server_args=server_args,
-        model_config=model_config,
-        model_info=model_info,
-        scheduler_info=scheduler_info,
-        health_servicer=health_servicer,
-    )
-    sglang_scheduler_pb2_grpc.add_SglangSchedulerServicer_to_server(servicer, server)
+        # Add SGLang service
+        servicer = SGLangSchedulerServicer(
+            request_manager=request_manager,
+            server_args=server_args,
+            model_config=model_config,
+            model_info=model_info,
+            scheduler_info=scheduler_info,
+            health_servicer=health_servicer,
+        )
+        sglang_scheduler_pb2_grpc.add_SglangSchedulerServicer_to_server(servicer, server)
 
-    # Enable reflection
-    SERVICE_NAMES = (
-        sglang_scheduler_pb2.DESCRIPTOR.services_by_name["SglangScheduler"].full_name,
-        "grpc.health.v1.Health",
-        reflection.SERVICE_NAME,
-    )
-    reflection.enable_server_reflection(SERVICE_NAMES, server)
+        # Enable reflection
+        SERVICE_NAMES = (
+            sglang_scheduler_pb2.DESCRIPTOR.services_by_name["SglangScheduler"].full_name,
+            "grpc.health.v1.Health",
+            reflection.SERVICE_NAME,
+        )
+        reflection.enable_server_reflection(SERVICE_NAMES, server)
 
-    # Start server
-    listen_addr = f"{server_args.host}:{server_args.port}"
-    if server_args.ssl_certfile and server_args.ssl_keyfile:
-        if server_args.ssl_keyfile_password:
-            raise ValueError(
-                "gRPC mode does not support encrypted SSL key files "
-                "(--ssl-keyfile-password). Please provide an unencrypted key "
-                "file when using --grpc-mode."
-            )
+        # Start server
+        listen_addr = f"{server_args.host}:{server_args.port}"
+        if server_args.ssl_certfile and server_args.ssl_keyfile:
+            if server_args.ssl_keyfile_password:
+                raise ValueError(
+                    "gRPC mode does not support encrypted SSL key files "
+                    "(--ssl-keyfile-password). Please provide an unencrypted key "
+                    "file when using --grpc-mode."
+                )
 
-        def _read_ssl_file(filepath: str, description: str) -> bytes:
-            try:
-                with open(filepath, "rb") as f:
-                    return f.read()
-            except OSError as e:
-                raise ValueError(f"Failed to read {description} '{filepath}': {e}") from e
-
-        private_key = _read_ssl_file(server_args.ssl_keyfile, "SSL key file")
-        certificate_chain = _read_ssl_file(server_args.ssl_certfile, "SSL certificate file")
-        root_certificates = None
-        if server_args.ssl_ca_certs:
-            root_certificates = _read_ssl_file(server_args.ssl_ca_certs, "SSL CA certificates file")
-
-        if server_args.enable_ssl_refresh:
-            # Use dynamic credentials so gRPC re-reads certs on each
-            # new connection via the fetcher callback.
-            _cert_mtime = os.path.getmtime(server_args.ssl_certfile)
-            _key_mtime = os.path.getmtime(server_args.ssl_keyfile)
-            _ca_mtime = (
-                os.path.getmtime(server_args.ssl_ca_certs) if server_args.ssl_ca_certs else None
-            )
-
-            def _cert_config_fetcher():
-                nonlocal _cert_mtime, _key_mtime, _ca_mtime
+            def _read_ssl_file(filepath: str, description: str) -> bytes:
                 try:
-                    new_cert_mt = os.path.getmtime(server_args.ssl_certfile)
-                    new_key_mt = os.path.getmtime(server_args.ssl_keyfile)
-                    new_ca_mt = (
-                        os.path.getmtime(server_args.ssl_ca_certs)
-                        if server_args.ssl_ca_certs
-                        else None
-                    )
+                    with open(filepath, "rb") as f:
+                        return f.read()
+                except OSError as e:
+                    raise ValueError(f"Failed to read {description} '{filepath}': {e}") from e
 
-                    if (
-                        new_cert_mt == _cert_mtime
-                        and new_key_mt == _key_mtime
-                        and new_ca_mt == _ca_mtime
-                    ):
-                        return None  # No change
+            private_key = _read_ssl_file(server_args.ssl_keyfile, "SSL key file")
+            certificate_chain = _read_ssl_file(server_args.ssl_certfile, "SSL certificate file")
+            root_certificates = None
+            if server_args.ssl_ca_certs:
+                root_certificates = _read_ssl_file(
+                    server_args.ssl_ca_certs, "SSL CA certificates file"
+                )
 
-                    new_key = _read_ssl_file(server_args.ssl_keyfile, "SSL key file")
-                    new_cert = _read_ssl_file(server_args.ssl_certfile, "SSL certificate file")
-                    new_root = None
-                    if server_args.ssl_ca_certs:
-                        new_root = _read_ssl_file(
-                            server_args.ssl_ca_certs,
-                            "SSL CA certificates file",
+            if server_args.enable_ssl_refresh:
+                # Use dynamic credentials so gRPC re-reads certs on each
+                # new connection via the fetcher callback.
+                _cert_mtime = os.path.getmtime(server_args.ssl_certfile)
+                _key_mtime = os.path.getmtime(server_args.ssl_keyfile)
+                _ca_mtime = (
+                    os.path.getmtime(server_args.ssl_ca_certs) if server_args.ssl_ca_certs else None
+                )
+
+                def _cert_config_fetcher():
+                    nonlocal _cert_mtime, _key_mtime, _ca_mtime
+                    try:
+                        new_cert_mt = os.path.getmtime(server_args.ssl_certfile)
+                        new_key_mt = os.path.getmtime(server_args.ssl_keyfile)
+                        new_ca_mt = (
+                            os.path.getmtime(server_args.ssl_ca_certs)
+                            if server_args.ssl_ca_certs
+                            else None
                         )
 
-                    logger.info("gRPC SSL certificate change detected, reloading.")
-                    config = grpc.ssl_server_certificate_configuration(
-                        [(new_key, new_cert)],
-                        root_certificates=new_root,
+                        if (
+                            new_cert_mt == _cert_mtime
+                            and new_key_mt == _key_mtime
+                            and new_ca_mt == _ca_mtime
+                        ):
+                            return None  # No change
+
+                        new_key = _read_ssl_file(server_args.ssl_keyfile, "SSL key file")
+                        new_cert = _read_ssl_file(server_args.ssl_certfile, "SSL certificate file")
+                        new_root = None
+                        if server_args.ssl_ca_certs:
+                            new_root = _read_ssl_file(
+                                server_args.ssl_ca_certs,
+                                "SSL CA certificates file",
+                            )
+
+                        logger.info("gRPC SSL certificate change detected, reloading.")
+                        config = grpc.ssl_server_certificate_configuration(
+                            [(new_key, new_cert)],
+                            root_certificates=new_root,
+                        )
+
+                        # Update mtimes only after successful reload
+                        _cert_mtime = new_cert_mt
+                        _key_mtime = new_key_mt
+                        _ca_mtime = new_ca_mt
+
+                        return config
+                    except Exception:
+                        logger.exception(
+                            "Failed to reload gRPC SSL certificates — "
+                            "continuing with previous certificates."
+                        )
+                        return None
+
+                try:
+                    initial_config = grpc.ssl_server_certificate_configuration(
+                        [(private_key, certificate_chain)],
+                        root_certificates=root_certificates,
                     )
-
-                    # Update mtimes only after successful reload
-                    _cert_mtime = new_cert_mt
-                    _key_mtime = new_key_mt
-                    _ca_mtime = new_ca_mt
-
-                    return config
-                except Exception:
-                    logger.exception(
-                        "Failed to reload gRPC SSL certificates — "
-                        "continuing with previous certificates."
+                    credentials = grpc.dynamic_ssl_server_credentials(
+                        initial_config,
+                        _cert_config_fetcher,
                     )
-                    return None
-
-            try:
-                initial_config = grpc.ssl_server_certificate_configuration(
-                    [(private_key, certificate_chain)],
-                    root_certificates=root_certificates,
+                except Exception as e:
+                    raise ValueError(
+                        f"Failed to create gRPC dynamic SSL credentials. "
+                        f"Verify that --ssl-keyfile and --ssl-certfile contain "
+                        f"valid, matching PEM data. Underlying error: {e}"
+                    ) from e
+                logger.info("gRPC SSL certificate auto-refresh enabled.")
+            else:
+                try:
+                    credentials = grpc.ssl_server_credentials(
+                        [(private_key, certificate_chain)],  # pairs: (key, cert)
+                        root_certificates=root_certificates,
+                    )
+                except Exception as e:
+                    raise ValueError(
+                        f"Failed to create gRPC SSL credentials. Verify that "
+                        f"--ssl-keyfile and --ssl-certfile contain valid, matching "
+                        f"PEM data. Underlying error: {e}"
+                    ) from e
+            bound_port = server.add_secure_port(listen_addr, credentials)
+            if bound_port == 0:
+                raise RuntimeError(
+                    f"Failed to bind gRPC TLS server to {listen_addr}. "
+                    f"Check that the port is available and SSL credentials are valid."
                 )
-                credentials = grpc.dynamic_ssl_server_credentials(
-                    initial_config,
-                    _cert_config_fetcher,
-                )
-            except Exception as e:
-                raise ValueError(
-                    f"Failed to create gRPC dynamic SSL credentials. "
-                    f"Verify that --ssl-keyfile and --ssl-certfile contain "
-                    f"valid, matching PEM data. Underlying error: {e}"
-                ) from e
-            logger.info("gRPC SSL certificate auto-refresh enabled.")
+            logger.info(f"gRPC server (TLS) listening on {listen_addr}")
         else:
-            try:
-                credentials = grpc.ssl_server_credentials(
-                    [(private_key, certificate_chain)],  # pairs: (key, cert)
-                    root_certificates=root_certificates,
-                )
-            except Exception as e:
-                raise ValueError(
-                    f"Failed to create gRPC SSL credentials. Verify that "
-                    f"--ssl-keyfile and --ssl-certfile contain valid, matching "
-                    f"PEM data. Underlying error: {e}"
-                ) from e
-        bound_port = server.add_secure_port(listen_addr, credentials)
-        if bound_port == 0:
-            raise RuntimeError(
-                f"Failed to bind gRPC TLS server to {listen_addr}. "
-                f"Check that the port is available and SSL credentials are valid."
-            )
-        logger.info(f"gRPC server (TLS) listening on {listen_addr}")
-    else:
-        server.add_insecure_port(listen_addr)
-        logger.info(f"gRPC server listening on {listen_addr}")
+            server.add_insecure_port(listen_addr)
+            logger.info(f"gRPC server listening on {listen_addr}")
 
-    await server.start()
+        await server.start()
+    except BaseException:
+        logger.exception("gRPC startup failed, releasing scheduler resources")
+        await _cleanup_failed_startup(
+            server,
+            health_servicer,
+            request_manager,
+            scheduler_procs,
+        )
+        raise
 
-    # Start warmup in a separate thread
-    warmup_thread = threading.Thread(
-        target=_wait_and_warmup_grpc,
-        args=(server_args, health_servicer),
-    )
-    warmup_thread.start()
-
-    # Handle shutdown signals
-    loop = asyncio.get_running_loop()
-    stop_event = asyncio.Event()
-
-    def signal_handler():
-        logger.info("Received shutdown signal")
-        stop_event.set()
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, signal_handler)
-
+    warmup_thread = None
     try:
+        # Start warmup in a separate thread
+        warmup_thread = threading.Thread(
+            target=_wait_and_warmup_grpc,
+            args=(server_args, health_servicer),
+        )
+        warmup_thread.start()
+
+        # Handle shutdown signals
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+
+        def signal_handler():
+            logger.info("Received shutdown signal")
+            stop_event.set()
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, signal_handler)
+
         await stop_event.wait()
     finally:
         logger.info("Shutting down gRPC server")
@@ -341,23 +395,13 @@ async def serve_grpc(
         await servicer.shutdown()
 
         # Wait for warmup thread to finish
-        if warmup_thread.is_alive():
+        if warmup_thread is not None and warmup_thread.is_alive():
             logger.info("Waiting for warmup thread to finish...")
             warmup_thread.join(timeout=5.0)
 
         # Terminate scheduler processes before exiting to avoid atexit hang
         # The scheduler processes have SIGINT ignored, so they won't get KeyboardInterrupt
-        for i, proc in enumerate(scheduler_procs):
-            if proc.is_alive():
-                logger.info(f"Terminating scheduler process {i}...")
-                proc.terminate()
-                proc.join(timeout=2.0)
-                if proc.is_alive():
-                    logger.warning(f"Scheduler process {i} did not terminate, killing...")
-                    proc.kill()
-                    proc.join(timeout=1.0)
-
-        logger.info("All scheduler processes terminated")
+        terminate_scheduler_processes(scheduler_procs)
 
 
 def _execute_grpc_server_warmup(server_args: ServerArgs):

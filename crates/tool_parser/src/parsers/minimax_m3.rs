@@ -244,6 +244,29 @@ impl MinimaxM3Parser {
         schema?.get("type")?.as_str()
     }
 
+    /// Find a named property in this schema or a nested composition branch.
+    fn property_schema<'a>(schema: Option<&'a Value>, name: &str) -> Option<&'a Value> {
+        let schema = schema?;
+        if let Some(property) = schema.get("properties").and_then(|value| value.get(name)) {
+            return Some(property);
+        }
+
+        for keyword in ["oneOf", "anyOf", "allOf"] {
+            for branch in schema
+                .get(keyword)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(property) = Self::property_schema(Some(branch), name) {
+                    return Some(property);
+                }
+            }
+        }
+
+        None
+    }
+
     /// Convert a parsed parameter value into a JSON value, coercing leaves by
     /// the schema node they sit under: array elements descend into `items`,
     /// object members into their `properties` entry.
@@ -265,12 +288,9 @@ impl MinimaxM3Parser {
                     return Value::Array(items);
                 }
 
-                let properties = schema
-                    .and_then(|s| s.get("properties"))
-                    .and_then(Value::as_object);
                 let mut map: Map<String, Value> = Map::new();
                 for (name, child) in children {
-                    let child_schema = properties.and_then(|p| p.get(&name));
+                    let child_schema = Self::property_schema(schema, &name);
                     let child_json = Self::value_to_json(child, child_schema);
                     match map.get_mut(&name) {
                         Some(Value::Array(arr)) => arr.push(child_json),
@@ -294,9 +314,6 @@ impl MinimaxM3Parser {
     /// arguments collected so far would run the tool with silently missing
     /// parameters.
     fn parse_invoke_params(body: &str, params_schema: Option<&Value>) -> Option<Value> {
-        let properties = params_schema
-            .and_then(|s| s.get("properties"))
-            .and_then(Value::as_object);
         let mut map: Map<String, Value> = Map::new();
         let mut pos = 0;
 
@@ -314,7 +331,7 @@ impl MinimaxM3Parser {
             pos += trim_len;
             let (name, value, consumed) = Self::parse_element(&body[pos..])?;
             pos += consumed;
-            let json = Self::value_to_json(value, properties.and_then(|p| p.get(&name)));
+            let json = Self::value_to_json(value, Self::property_schema(params_schema, &name));
             match map.get_mut(&name) {
                 Some(Value::Array(arr)) => arr.push(json),
                 Some(existing) => {

@@ -129,7 +129,7 @@ impl OpenAIRouter {
         model_id: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<Arc<dyn Worker>, Response> {
-        WorkerSelector::new(&self.worker_registry, &self.shared_components.client)
+        WorkerSelector::new(&self.worker_registry)
             .select_worker(&SelectWorkerRequest {
                 model_id,
                 headers,
@@ -201,7 +201,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let worker = self.select_worker(model, headers).await;
         forward_realtime_rest(
             RealtimeLabels::OPENAI,
-            &self.shared_components.client,
             worker,
             headers,
             body,
@@ -222,7 +221,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let worker = self.select_worker(model, headers).await;
         forward_realtime_rest(
             RealtimeLabels::OPENAI,
-            &self.shared_components.client,
             worker,
             headers,
             body,
@@ -242,7 +240,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let worker = self.select_worker(model, headers).await;
         forward_realtime_rest(
             RealtimeLabels::OPENAI,
-            &self.shared_components.client,
             worker,
             headers,
             body,
@@ -330,7 +327,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             parsed,
             worker,
             auth_header,
-            self.shared_components.client.clone(),
             bind_addr,
             self.context.webrtc_stun_server.clone(),
             Arc::clone(&self.realtime_registry),

@@ -28,7 +28,6 @@ use crate::{
 /// reused across calls.
 pub struct WorkerSelector<'a> {
     registry: &'a WorkerRegistry,
-    client: &'a reqwest::Client,
 }
 
 /// Input for [`WorkerSelector::select_worker`].
@@ -66,8 +65,8 @@ pub struct SelectWorkerRequest<'a> {
 }
 
 impl<'a> WorkerSelector<'a> {
-    pub fn new(registry: &'a WorkerRegistry, client: &'a reqwest::Client) -> Self {
-        Self { registry, client }
+    pub fn new(registry: &'a WorkerRegistry) -> Self {
+        Self { registry }
     }
 
     fn matches_worker_filters(worker: &Arc<dyn Worker>, req: &SelectWorkerRequest<'_>) -> bool {
@@ -230,7 +229,7 @@ impl<'a> WorkerSelector<'a> {
 
         let futures: Vec<_> = external_workers
             .iter()
-            .map(|w| refresh_worker_models(self.client, w, auth_header))
+            .map(|w| refresh_worker_models(w, auth_header))
             .collect();
 
         // Timeout prevents a slow/unresponsive worker from blocking all
@@ -274,12 +273,11 @@ fn filter_by_provider(
 /// Anthropic uses `x-api-key`, OpenAI uses `Authorization: Bearer`). The
 /// response is parsed via [`ListModelsResponse::parse_upstream`].
 async fn refresh_worker_models(
-    client: &reqwest::Client,
     worker: &Arc<dyn Worker>,
     auth_header: Option<&HeaderValue>,
 ) -> bool {
     let url = format!("{}/v1/models", worker.url());
-    let mut backend_req = client.get(&url);
+    let mut backend_req = worker.http_client().get(&url);
 
     // Use caller's auth if provided, otherwise fall back to worker's configured API key.
     // This matches how auth is handled in request routing (e.g. openai/router.rs).
@@ -362,9 +360,8 @@ mod tests {
         let registry = WorkerRegistry::new();
         registry.register_or_replace(worker("http://127.0.0.1:18080", false));
         registry.register_or_replace(worker("http://127.0.0.1:18081", true));
-        let client = reqwest::Client::new();
 
-        let picked = WorkerSelector::new(&registry, &client)
+        let picked = WorkerSelector::new(&registry)
             .select_worker(&SelectWorkerRequest {
                 model_id: "m",
                 require_realtime_capable: true,
@@ -379,9 +376,8 @@ mod tests {
     async fn requires_realtime_errors_when_none_capable() {
         let registry = WorkerRegistry::new();
         registry.register_or_replace(worker("http://127.0.0.1:18080", false));
-        let client = reqwest::Client::new();
 
-        let res = WorkerSelector::new(&registry, &client)
+        let res = WorkerSelector::new(&registry)
             .select_worker(&SelectWorkerRequest {
                 model_id: "m",
                 require_realtime_capable: true,
@@ -398,9 +394,8 @@ mod tests {
     async fn without_realtime_flag_any_worker_eligible() {
         let registry = WorkerRegistry::new();
         registry.register_or_replace(worker("http://127.0.0.1:18080", false));
-        let client = reqwest::Client::new();
 
-        let res = WorkerSelector::new(&registry, &client)
+        let res = WorkerSelector::new(&registry)
             .select_worker(&SelectWorkerRequest {
                 model_id: "m",
                 ..Default::default()

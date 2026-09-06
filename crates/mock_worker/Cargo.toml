@@ -17,6 +17,7 @@ path = "src/main.rs"
 smg-grpc-client.workspace = true
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
 tokio = { workspace = true, features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 tonic.workspace = true
 axum.workspace = true
 serde_json.workspace = true

@@ -1039,7 +1039,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             error::extract_error_code_from_response(&response),
-            "no_available_workers"
+            "worker_overload_protection_shed"
         );
         assert!(
             !is_retryable_response(&response),
@@ -1278,8 +1278,8 @@ mod tests {
         }
     }
 
-    /// The gRPC transport must shed an all-overloaded model with the same 503
-    /// `no_available_workers` the HTTP router uses. Its usual empty-pool answer
+    /// The gRPC transport must shed an all-overloaded model with the same
+    /// distinct overload 503 the HTTP router uses. Its usual empty-pool answer
     /// is a 404, which would both misreport pressure as model absence and skip
     /// the retry path (404 is not retryable).
     #[test]
@@ -1332,7 +1332,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             extract_error_code_from_response(&response),
-            "no_available_workers"
+            "worker_overload_protection_shed"
         );
 
         // Recovery re-admits, and the failure response goes back to 404 for a

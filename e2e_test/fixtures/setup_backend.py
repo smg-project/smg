@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 import anthropic
 import openai
@@ -133,6 +134,50 @@ def _gateway_readiness_timeout(
 
 def _make_openai_client(gateway: Gateway) -> openai.OpenAI:
     return openai.OpenAI(base_url=f"{gateway.base_url}/v1", api_key="not-used")
+
+
+# Statuses a fresh gateway returns while it is still wiring up (no worker
+# routable yet, tokenizer not registered) rather than rejecting the request.
+_NOT_SERVING_YET = frozenset({404, 408, 425, 429, 500, 502, 503, 504})
+
+
+def _wait_for_serving(
+    gateway: Gateway, model_id: str, model_path: str, timeout: float = 180.0
+) -> None:
+    """Block until the gateway answers a real chat request for ``model_path``.
+
+    PD lanes have returned 404 for a class's first request seconds after the
+    gateway reported ready, for reasons the readiness gate does not explain.
+    Wait for a request to succeed rather than trusting the gate.
+    """
+    if "chat" not in get_model_spec(model_id).get("features", []):
+        return
+    client = _make_openai_client(gateway).with_options(max_retries=0)
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            client.chat.completions.create(
+                model=model_path,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1,
+                timeout=min(60.0, remaining),
+            )
+            return
+        except openai.APIStatusError as exc:
+            if exc.status_code not in _NOT_SERVING_YET:
+                raise
+            last_error = exc
+        except (openai.APIConnectionError, openai.APITimeoutError) as exc:
+            last_error = exc
+        time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+    raise TimeoutError(
+        f"Gateway at {gateway.base_url} did not serve a chat request for "
+        f"{model_path} within {timeout}s: {last_error}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +416,7 @@ def _setup_pd(
             prefill_workers=prefill_workers,
             decode_workers=decode_workers,
         )
+        _wait_for_serving(gateway, model_id, model_path)
         logger.info("%s PD backend ready at %s", runtime_label, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     finally:

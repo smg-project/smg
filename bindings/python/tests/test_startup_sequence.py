@@ -221,12 +221,17 @@ class TestRouterInitialization:
 
             # Function returns None; ensure start was invoked
 
-    def test_pd_service_discovery_does_not_force_igw(self):
-        """PD mode with service discovery keeps PD routing (no IGW auto-enable)."""
+    @pytest.mark.parametrize("pd_disaggregation,epd_disaggregation", [(True, False), (False, True)])
+    def test_disaggregated_service_discovery_enables_igw_without_replacing_mode(
+        self, pd_disaggregation, epd_disaggregation
+    ):
+        """Service discovery enables IGW while preserving PD/EPD flags."""
         args = RouterArgs(
             service_discovery=True,
-            pd_disaggregation=True,
-            prefill_selector={"component": "engine"},
+            pd_disaggregation=pd_disaggregation,
+            epd_disaggregation=epd_disaggregation,
+            encode_selector={"component": "encoder"},
+            prefill_selector={"component": "prefill"},
             decode_selector={"component": "decoder"},
             service_discovery_port=8080,
             service_discovery_namespace="default",
@@ -240,6 +245,7 @@ class TestRouterInitialization:
                 captured_args.update(
                     dict(
                         pd_disaggregation=router_args.pd_disaggregation,
+                        epd_disaggregation=router_args.epd_disaggregation,
                         enable_igw=router_args.enable_igw,
                     )
                 )
@@ -250,8 +256,9 @@ class TestRouterInitialization:
             launch_router(args)
 
             router_mod.from_args.assert_called_once()
-            assert captured_args["pd_disaggregation"] is True
-            assert captured_args["enable_igw"] is False
+            assert captured_args["pd_disaggregation"] is pd_disaggregation
+            assert captured_args["epd_disaggregation"] is epd_disaggregation
+            assert captured_args["enable_igw"] is True
             mock_router_instance.start.assert_called_once()
 
     def test_router_initialization_with_retry_config(self):

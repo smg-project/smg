@@ -13,7 +13,7 @@ use crate::routers::{
     grpc::{
         common::stages::PipelineStage,
         context::{PreparationOutput, RequestContext},
-        multimodal, utils,
+        multimodal, utils, ProcessedMessages,
     },
 };
 
@@ -42,6 +42,30 @@ impl ChatPreparationStage {
         ctx: &mut RequestContext,
         request: &ChatCompletionRequest,
     ) -> Result<(), Response> {
+        let (token_ids, processed_messages, tool_constraints) =
+            prepare_chat_like(ctx, request).await?;
+        ctx.state.preparation = Some(PreparationOutput::Chat {
+            token_ids,
+            processed_messages,
+            tool_constraints,
+        });
+        Ok(())
+    }
+}
+
+/// The chat request → prepared inputs pipeline, shared by the chat endpoint
+/// and the transcription endpoint (whose backend request is chat-shaped).
+///
+/// Applies the model's chat template + multimodal expansion, tokenizes,
+/// derives `skip_special_tokens`, and builds the stop decoder — writing the
+/// intermediate/decoder/skip-special onto `ctx.state`. Returns the pieces the
+/// caller stores in its own `PreparationOutput` variant. Does NOT set
+/// `ctx.state.preparation`.
+pub(crate) async fn prepare_chat_like(
+    ctx: &mut RequestContext,
+    request: &ChatCompletionRequest,
+) -> Result<(Vec<u32>, ProcessedMessages, Option<(String, String)>), Response> {
+    {
         // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
         let tokenizer =
             utils::resolve_tokenizer(ctx, "ChatPreparationStage::prepare_chat").map_err(|e| *e)?;
@@ -138,24 +162,26 @@ impl ChatPreparationStage {
         };
 
         // Step 2: Process messages and apply chat template
-        let processed_messages = match utils::process_chat_messages_with_placeholders(
-            &body_ref,
-            &*tokenizer,
-            placeholder_tokens.as_ref(),
-            media_order,
-        ) {
-            Ok(msgs) => msgs,
-            Err(e) => {
-                error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
-                return Err(error::bad_request("process_messages_failed", e));
-            }
-        };
+        let (processed_messages, prompt_encoding) =
+            match utils::process_chat_messages_with_placeholders(
+                &body_ref,
+                &*tokenizer,
+                placeholder_tokens.as_ref(),
+                media_order,
+            ) {
+                Ok(msgs) => msgs,
+                Err(e) => {
+                    error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
+                    return Err(error::bad_request("process_messages_failed", e));
+                }
+            };
 
-        // Step 3: Tokenize the processed text (no special tokens - chat template already handles them)
-        let encoding = match utils::encode_blocking(
+        // Step 3: Tokenize the prompt the way its renderer said to (a flat
+        // encode of the text, or the encode the renderer prepared)
+        let encoding = match utils::encode_prompt_blocking(
             tokenizer.clone(),
-            processed_messages.text.clone(),
-            false,
+            &processed_messages.text,
+            prompt_encoding,
         )
         .await
         {
@@ -298,20 +324,17 @@ impl ChatPreparationStage {
             request.ignore_eos,
         );
 
-        // Store results in context.
+        // Store the intermediate + decoder + derived skip_special_tokens on
+        // ctx (PreparationOutput is consumed by request_building before
+        // response_processing runs); hand the rest to the caller.
         ctx.state.multimodal_intermediate = multimodal_intermediate;
-        ctx.state.preparation = Some(PreparationOutput::Chat {
-            token_ids,
-            processed_messages,
-            tool_constraints: tool_call_constraint.map(|c| c.to_tuple()),
-        });
-
-        // Store stop decoder and derived skip_special_tokens for response processing.
-        // Stored on ResponseState because PreparationOutput is consumed by
-        // request_building before response_processing runs.
         ctx.state.response.stop_decoder = Some(stop_decoder);
         ctx.state.response.skip_special_tokens = Some(skip_special_tokens);
 
-        Ok(())
+        Ok((
+            token_ids,
+            processed_messages,
+            tool_call_constraint.map(|c| c.to_tuple()),
+        ))
     }
 }

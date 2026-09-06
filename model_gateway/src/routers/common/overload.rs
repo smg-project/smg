@@ -35,6 +35,13 @@ use crate::{
 /// a client hint, not a correctness input. Default matches the config default.
 static SHED_RETRY_AFTER_SECS: AtomicU64 = AtomicU64::new(10);
 
+/// Client-visible, gateway-owned code for a worker-overload-protection shed.
+///
+/// This deliberately covers both an all-overloaded candidate pool and the
+/// selection-to-dispatch re-check, where another worker may still be eligible.
+pub(crate) const WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE: &str =
+    "worker_overload_protection_shed";
+
 /// Latch the poll interval the shed responses advertise. Called once at
 /// startup when the load monitor is built.
 pub fn set_shed_retry_after_secs(secs: u64) {
@@ -90,7 +97,8 @@ pub fn shed_if_worker_overloaded(worker: &dyn Worker, model_id: &str) -> Option<
 fn shed(branch: &'static str, stage: &'static str, worker: &str, message: String) -> Response {
     Metrics::record_worker_overload_shed(stage);
     debug!(branch, stage, worker, "Overload shed");
-    let mut response = error::service_unavailable("no_available_workers", message);
+    let mut response =
+        error::service_unavailable(WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE, message);
     response.headers_mut().insert(
         RETRY_AFTER,
         HeaderValue::from(SHED_RETRY_AFTER_SECS.load(Ordering::Relaxed)),
@@ -127,10 +135,10 @@ mod tests {
         )
     }
 
-    /// The shed is the existing `no_available_workers` 503, taken from the
-    /// candidate pool rather than the model index.
+    /// The shed is a distinct 503, taken from the candidate pool rather than
+    /// the model index.
     #[test]
-    fn all_overloaded_sheds_with_no_available_workers_503() {
+    fn all_overloaded_sheds_with_distinct_503_code() {
         let a = worker("http://127.0.0.1:9801", "m");
         let b = worker("http://127.0.0.1:9802", "m");
         let pool = vec![Arc::clone(&a), Arc::clone(&b)];
@@ -146,7 +154,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             extract_error_code_from_response(&response),
-            "no_available_workers"
+            "worker_overload_protection_shed"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .expect("gateway error code header"),
+            "worker_overload_protection_shed"
         );
     }
 
@@ -212,7 +227,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             extract_error_code_from_response(&response),
-            "no_available_workers"
+            "worker_overload_protection_shed"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .expect("gateway error code header"),
+            "worker_overload_protection_shed"
         );
     }
 }

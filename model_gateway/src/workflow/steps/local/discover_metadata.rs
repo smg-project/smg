@@ -3,7 +3,6 @@
 use std::{collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
-use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -18,16 +17,8 @@ use crate::{
     },
 };
 
-#[expect(
-    clippy::expect_used,
-    reason = "Lazy static initialization — reqwest::Client::build() only fails on TLS backend misconfiguration which is unrecoverable"
-)]
-static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
-    Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("Failed to create HTTP client")
-});
+/// Per-request deadline for metadata fetches.
+const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // HTTP response structs (sglang /server_info, /model_info; vllm /v1/models)
@@ -97,12 +88,13 @@ struct VersionResponse {
 
 /// GET JSON with optional bearer auth, with 404 fallback to `/get_<endpoint>`.
 async fn get_json_with_fallback<T: serde::de::DeserializeOwned>(
+    client: &Client,
     base_url: &str,
     endpoint: &str,
     api_key: Option<&str>,
 ) -> Result<T, String> {
     let url = format!("{base_url}/{endpoint}");
-    let mut req = HTTP_CLIENT.get(&url);
+    let mut req = client.get(&url).timeout(METADATA_TIMEOUT);
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
     }
@@ -116,7 +108,7 @@ async fn get_json_with_fallback<T: serde::de::DeserializeOwned>(
         // Fallback to deprecated /get_<endpoint> prefix
         warn!("'/{endpoint}' returned 404, falling back to deprecated '/get_{endpoint}'");
         let old_url = format!("{base_url}/get_{endpoint}");
-        let mut req = HTTP_CLIENT.get(&old_url);
+        let mut req = client.get(&old_url).timeout(METADATA_TIMEOUT);
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
         }
@@ -145,10 +137,11 @@ async fn get_json_with_fallback<T: serde::de::DeserializeOwned>(
 
 /// GET JSON (no fallback).
 async fn http_get_json<T: serde::de::DeserializeOwned>(
+    client: &Client,
     url: &str,
     api_key: Option<&str>,
 ) -> Result<T, String> {
-    let mut req = HTTP_CLIENT.get(url);
+    let mut req = client.get(url).timeout(METADATA_TIMEOUT);
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
     }
@@ -164,32 +157,45 @@ async fn http_get_json<T: serde::de::DeserializeOwned>(
         .map_err(|e| format!("Failed to parse {url}: {e}"))
 }
 
-pub async fn get_server_info(url: &str, api_key: Option<&str>) -> Result<ServerInfo, String> {
-    get_json_with_fallback(&http_base_url(url), "server_info", api_key).await
+pub async fn get_server_info(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> Result<ServerInfo, String> {
+    get_json_with_fallback(client, &http_base_url(url), "server_info", api_key).await
 }
 
-pub async fn get_model_info(url: &str, api_key: Option<&str>) -> Result<ModelInfo, String> {
-    get_json_with_fallback(&http_base_url(url), "model_info", api_key).await
+pub async fn get_model_info(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> Result<ModelInfo, String> {
+    get_json_with_fallback(client, &http_base_url(url), "model_info", api_key).await
 }
 
 // ---------------------------------------------------------------------------
 // Per-backend metadata fetchers
 // ---------------------------------------------------------------------------
 
-async fn fetch_sglang_http_metadata(url: &str, api_key: Option<&str>) -> HashMap<String, String> {
+async fn fetch_sglang_http_metadata(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> HashMap<String, String> {
     let base = http_base_url(url);
     let mut labels = HashMap::new();
 
-    if let Ok(info) = get_server_info(&base, api_key).await {
+    if let Ok(info) = get_server_info(client, &base, api_key).await {
         labels.extend(flat_labels(&info));
     }
-    if let Ok(info) = get_model_info(&base, api_key).await {
+    if let Ok(info) = get_model_info(client, &base, api_key).await {
         labels.extend(flat_labels(&info));
     }
 
     // /v1/models gives us model identity and max_model_len when a compatible
     // local frontend does not expose the SGLang-specific metadata endpoints.
-    if let Ok(models) = http_get_json::<ModelsResponse>(&format!("{base}/v1/models"), api_key).await
+    if let Ok(models) =
+        http_get_json::<ModelsResponse>(client, &format!("{base}/v1/models"), api_key).await
     {
         if let Some(m) = models.data.first() {
             if let Some(id) = m.id.as_ref().filter(|id| !id.is_empty()) {
@@ -213,12 +219,17 @@ async fn fetch_sglang_http_metadata(url: &str, api_key: Option<&str>) -> HashMap
     labels
 }
 
-async fn fetch_vllm_http_metadata(url: &str, api_key: Option<&str>) -> HashMap<String, String> {
+async fn fetch_vllm_http_metadata(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> HashMap<String, String> {
     let base = http_base_url(url);
     let mut labels = HashMap::new();
 
     // /v1/models — vLLM uses `root` as model_path, `id` as served_model_name
-    if let Ok(models) = http_get_json::<ModelsResponse>(&format!("{base}/v1/models"), api_key).await
+    if let Ok(models) =
+        http_get_json::<ModelsResponse>(client, &format!("{base}/v1/models"), api_key).await
     {
         if let Some(m) = models.data.first() {
             if let Some(ref root) = m.root {
@@ -234,7 +245,9 @@ async fn fetch_vllm_http_metadata(url: &str, api_key: Option<&str>) -> HashMap<S
     }
 
     // /version
-    if let Ok(v) = http_get_json::<VersionResponse>(&format!("{base}/version"), api_key).await {
+    if let Ok(v) =
+        http_get_json::<VersionResponse>(client, &format!("{base}/version"), api_key).await
+    {
         if !v.version.is_empty() {
             labels.insert("version".to_string(), v.version);
         }
@@ -354,11 +367,11 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                         );
                         "sglang"
                     });
+                let client = context.data.http_client("discover_metadata")?;
+                let api_key = config.api_key.as_deref();
                 let labels = match runtime {
-                    "vllm" => {
-                        fetch_vllm_http_metadata(&config.url, config.api_key.as_deref()).await
-                    }
-                    _ => fetch_sglang_http_metadata(&config.url, config.api_key.as_deref()).await,
+                    "vllm" => fetch_vllm_http_metadata(&client, &config.url, api_key).await,
+                    _ => fetch_sglang_http_metadata(&client, &config.url, api_key).await,
                 };
                 Ok((labels, None))
             }
@@ -419,7 +432,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_sglang_http_metadata() {
-        let labels = fetch_sglang_http_metadata("http://0.0.0.0:30000", None).await;
+        let labels = fetch_sglang_http_metadata(&Client::new(), "http://0.0.0.0:30000", None).await;
         dump_labels("SGLang HTTP combined", &labels);
         assert!(labels.contains_key("model_path"));
         assert!(labels.contains_key("tokenizer_path"));
@@ -428,7 +441,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_vllm_http_metadata() {
-        let labels = fetch_vllm_http_metadata("http://0.0.0.0:20000", None).await;
+        let labels = fetch_vllm_http_metadata(&Client::new(), "http://0.0.0.0:20000", None).await;
         dump_labels("vLLM HTTP", &labels);
         assert!(labels.contains_key("model_path"));
         assert!(labels.contains_key("version"));
@@ -521,7 +534,8 @@ mod tests {
                 .unwrap();
         });
 
-        let labels = fetch_sglang_http_metadata(&format!("http://{addr}"), None).await;
+        let labels =
+            fetch_sglang_http_metadata(&Client::new(), &format!("http://{addr}"), None).await;
         server.abort();
 
         assert_eq!(

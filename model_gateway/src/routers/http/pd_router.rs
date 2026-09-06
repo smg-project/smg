@@ -19,7 +19,6 @@ use openai_protocol::{
     rerank::RerankRequest,
     responses::ResponsesRequest,
 };
-use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -80,7 +79,6 @@ enum PdSelectionFailure {
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
-    pub client: Client,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
 }
@@ -101,30 +99,29 @@ impl PDRouter {
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
-        // Plain HTTP GET to the selected URL: only healthy HTTP-transport
+        // Plain HTTP GET to the selected worker: only healthy HTTP-transport
         // prefill workers are eligible (same rule as the PD legs).
-        let first_worker_url = self
+        let first_worker = self
             .worker_registry
             .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpPrefill)
             .iter()
             .find(|w| w.is_healthy())
-            .map(|w| w.url().to_string());
+            .cloned();
 
-        if let Some(worker_url) = first_worker_url {
-            self.proxy_to_worker(worker_url, endpoint, headers).await
+        if let Some(worker) = first_worker {
+            Self::proxy_to_worker(&worker, endpoint, headers).await
         } else {
             error::service_unavailable("no_prefill_servers", "No prefill servers available")
         }
     }
 
     async fn proxy_to_worker(
-        &self,
-        worker_url: String,
+        worker: &Arc<dyn Worker>,
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
-        let url = format!("{worker_url}/{endpoint}");
-        let mut request_builder = self.client.get(&url);
+        let url = format!("{}/{endpoint}", worker.url());
+        let mut request_builder = worker.http_client().get(&url);
 
         if let Some(headers) = headers {
             for (name, value) in headers {
@@ -201,7 +198,6 @@ impl PDRouter {
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
-            client: ctx.client.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
         })
@@ -825,7 +821,6 @@ impl PDRouter {
 
         // Build both requests
         let prefill_request = self.build_post_with_headers(
-            &self.client,
             prefill.as_ref(),
             context.route,
             prefill_body,
@@ -833,7 +828,6 @@ impl PDRouter {
             false,
         );
         let decode_request = self.build_post_with_headers(
-            &self.client,
             decode.as_ref(),
             context.route,
             decode_body,
@@ -1024,7 +1018,6 @@ impl PDRouter {
             .emit();
 
             let prefill_request = self.build_post_with_headers(
-                &self.client,
                 prefill.as_ref(),
                 context.route,
                 prefill_body,
@@ -1148,7 +1141,6 @@ impl PDRouter {
         };
 
         let decode_request = self.build_post_with_headers(
-            &self.client,
             decode.as_ref(),
             context.route,
             decode_body,
@@ -1697,7 +1689,6 @@ impl PDRouter {
     )]
     fn build_post_with_headers(
         &self,
-        client: &Client,
         worker: &dyn Worker,
         route: &'static str,
         body: Bytes,
@@ -1706,7 +1697,8 @@ impl PDRouter {
     ) -> reqwest::RequestBuilder {
         let endpoint_url = worker.endpoint_url(route);
         let mut request = attach_sized_body(
-            client
+            worker
+                .http_client()
                 .post(endpoint_url)
                 .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
             body,
@@ -1873,8 +1865,9 @@ impl RouterTrait for PDRouter {
 
         let prefill_url = format!("{}/health_generate", prefill.url());
         let (prefill_result, decode_result) = tokio::join!(
-            self.client.get(&prefill_url).send(),
-            self.client
+            prefill.http_client().get(&prefill_url).send(),
+            decode
+                .http_client()
                 .get(format!("{}/health_generate", decode.url()))
                 .send()
         );
@@ -2204,7 +2197,6 @@ mod tests {
         PDRouter {
             worker_registry,
             policy_registry,
-            client: Client::new(),
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
         }
@@ -2357,7 +2349,6 @@ mod tests {
 
         let request = router
             .build_post_with_headers(
-                &router.client,
                 &worker,
                 "/generate",
                 Bytes::from(r#"{"text":"hello"}"#),

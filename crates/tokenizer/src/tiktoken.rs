@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Error, Result};
@@ -18,11 +19,18 @@ use crate::{
         ChatTemplateState, ThinkingKeyName, ThinkingToggle,
     },
     encoders::{
-        kimi_k25_tools::apply_kimi_k25_tools, kimi_k3_xtml::apply_kimi_k3_xtml_with_effort_default,
+        kimi_k25_tools::apply_kimi_k25_tools,
+        kimi_k3_xtml::{
+            apply_kimi_k3_xtml_with_effort_default, join_segments, render_kimi_k3_xtml_prompt,
+            PromptSegment,
+        },
     },
     factory::discover_chat_template_in_dir,
     kimi_k2_tokenizer,
-    traits::{Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait},
+    traits::{
+        ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, PromptEncoding, SpecialTokens,
+        TokenIdType, Tokenizer as TokenizerTrait,
+    },
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -52,6 +60,8 @@ struct TiktokenConfig {
     special_tokens: SpecialTokens,
     /// Token string -> ID mapping from `added_tokens_decoder`
     added_tokens: HashMap<String, TokenIdType>,
+    /// Ids `skip_special_tokens` removes from decoded text.
+    skip_token_ids: HashSet<TokenIdType>,
     chat_template: Option<String>,
 }
 
@@ -60,11 +70,35 @@ fn parse_tiktoken_config(value: &serde_json::Value) -> TiktokenConfig {
     TiktokenConfig {
         special_tokens: parse_special_tokens(value),
         added_tokens: parse_added_tokens_decoder(value),
+        skip_token_ids: parse_skip_token_ids(value),
         chat_template: value
             .get("chat_template")
             .and_then(|v| v.as_str())
             .map(String::from),
     }
+}
+
+/// Ids of `added_tokens_decoder` entries flagged `"special": true`: the set
+/// `skip_special_tokens` strips, as HuggingFace defines it. Added tokens
+/// without the flag (Kimi-K3's `<|open|>` / `<|close|>` / `<|sep|>`) are
+/// control tokens for encoding but stay in decoded text.
+fn parse_skip_token_ids(config: &serde_json::Value) -> HashSet<TokenIdType> {
+    let mut ids = HashSet::new();
+    if let Some(added) = config
+        .get("added_tokens_decoder")
+        .and_then(|v| v.as_object())
+    {
+        for (id_str, token_info) in added {
+            let special = token_info
+                .get("special")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if let (true, Ok(id)) = (special, id_str.parse::<TokenIdType>()) {
+                ids.insert(id);
+            }
+        }
+    }
+    ids
 }
 
 /// Load `tokenizer_config.json` from `dir`, returning both the parsed
@@ -145,13 +179,16 @@ fn parse_special_tokens(config: &serde_json::Value) -> SpecialTokens {
 
 /// Tiktoken tokenizer wrapper — supports both built-in OpenAI encodings and hub-loaded models.
 pub struct TiktokenTokenizer {
-    tokenizer: CoreBPE,
+    /// Shared so a deferred chat encode can own a handle and run on another
+    /// thread after the render call returned.
+    tokenizer: Arc<CoreBPE>,
     special_tokens: SpecialTokens,
     vocab: HashMap<String, TokenIdType>,
     reverse_vocab: HashMap<TokenIdType, String>,
     vocab_size: usize,
     chat_template: ChatTemplateState,
     eos_token_ids: Vec<TokenIdType>,
+    skip_token_ids: HashSet<TokenIdType>,
     renderer: Renderer,
 }
 
@@ -174,7 +211,7 @@ impl TiktokenTokenizer {
     /// Create a new Tiktoken tokenizer for the specified built-in model
     pub fn new(model: TiktokenModel) -> Result<Self> {
         let tokenizer =
-            match model {
+            Arc::new(match model {
                 TiktokenModel::O200kBase => o200k_base()
                     .map_err(|e| Error::msg(format!("Failed to load o200k_base: {e}")))?,
                 TiktokenModel::Cl100kBase => cl100k_base()
@@ -188,9 +225,16 @@ impl TiktokenTokenizer {
                 TiktokenModel::R50kBase => {
                     r50k_base().map_err(|e| Error::msg(format!("Failed to load r50k_base: {e}")))?
                 }
-            };
+            });
 
         let special_tokens = Self::get_special_tokens_for_model(model);
+        // Built-in encodings have no tokenizer_config.json; every token the
+        // encoding treats as special is one `skip_special_tokens` strips.
+        let skip_token_ids = tokenizer
+            .special_tokens()
+            .into_iter()
+            .flat_map(|token| tokenizer.encode_with_special_tokens(token))
+            .collect();
 
         let vocab_size = match model {
             TiktokenModel::O200kBase => 200019,
@@ -207,6 +251,7 @@ impl TiktokenTokenizer {
             vocab_size,
             chat_template: ChatTemplateState::empty(),
             eos_token_ids: Vec::new(), // No directory path in from_model
+            skip_token_ids,
             renderer: Renderer::Jinja,
         })
     }
@@ -285,7 +330,7 @@ impl TiktokenTokenizer {
             .map(|id| id as usize + 1)
             .unwrap_or(0);
         let (vocab, reverse_vocab) = build_vocab_maps(&encoder, &config.added_tokens);
-        let tokenizer = CoreBPE::new(encoder, special_tokens_encoder, pattern)?;
+        let tokenizer = Arc::new(CoreBPE::new(encoder, special_tokens_encoder, pattern)?);
 
         // 5. Load chat template — propagate errors for explicit paths,
         //    silently fall back for auto-discovery
@@ -312,6 +357,7 @@ impl TiktokenTokenizer {
             vocab_size,
             chat_template: ChatTemplateState::new(chat_template)?,
             eos_token_ids,
+            skip_token_ids: config.skip_token_ids,
             renderer,
         })
     }
@@ -465,6 +511,26 @@ pub fn is_tiktoken_file(path: &Path) -> bool {
         .is_some_and(|name| name == "tiktoken.model" || name.ends_with(".tiktoken"))
 }
 
+/// Piecewise encode for a segmented prompt: control pieces with special
+/// tokens recognized, text pieces as ordinary BPE. The allowed-special set is
+/// built once per prompt; `encode_with_special_tokens` would rebuild it for
+/// every piece, and a Kimi prompt has hundreds of control pieces.
+fn encode_segments(bpe: &CoreBPE, segments: &[PromptSegment]) -> Result<Vec<TokenIdType>> {
+    let allowed = bpe.special_tokens();
+    let mut ids = Vec::new();
+    for segment in segments {
+        if segment.allow_special {
+            let (piece, _) = bpe
+                .encode(&segment.text, &allowed)
+                .map_err(|e| Error::msg(format!("tiktoken encode failed: {e}")))?;
+            ids.extend(piece);
+        } else {
+            ids.extend(bpe.encode_ordinary(&segment.text));
+        }
+    }
+    Ok(ids)
+}
+
 impl Encoder for TiktokenTokenizer {
     fn encode(&self, input: &str, _add_special_tokens: bool) -> Result<Encoding> {
         // tiktoken ignores `add_special_tokens` (it means BOS/EOS prepend on HF
@@ -484,7 +550,18 @@ impl Encoder for TiktokenTokenizer {
 }
 
 impl Decoder for TiktokenTokenizer {
-    fn decode(&self, token_ids: &[TokenIdType], _skip_special_tokens: bool) -> Result<String> {
+    fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
+        let kept: Vec<TokenIdType>;
+        let token_ids: &[TokenIdType] = if skip_special_tokens && !self.skip_token_ids.is_empty() {
+            kept = token_ids
+                .iter()
+                .copied()
+                .filter(|id| !self.skip_token_ids.contains(id))
+                .collect();
+            &kept
+        } else {
+            token_ids
+        };
         match self.tokenizer.decode(token_ids) {
             Ok(text) => Ok(text),
             Err(err) if is_unknown_tiktoken_decode_error(&err) => Err(Error::msg(format!(
@@ -560,6 +637,37 @@ impl TokenizerTrait for TiktokenTokenizer {
             // at, so it applies that wrapper's `thinking_effort` default.
             Renderer::KimiK3Xtml => apply_kimi_k3_xtml_with_effort_default(messages, &params),
         }
+    }
+
+    fn apply_chat_template_with_encoding(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+        assistant_prefix: Option<&str>,
+    ) -> Result<ChatTemplateOutput> {
+        if !matches!(self.renderer, Renderer::KimiK3Xtml) {
+            let mut text = self.apply_chat_template(messages, params)?;
+            if let Some(prefix) = assistant_prefix {
+                text.push_str(prefix);
+            }
+            return Ok(ChatTemplateOutput {
+                text,
+                encoding: PromptEncoding::FromText,
+            });
+        }
+        // K3's ids are not a function of the flat text: render the reference's
+        // segments and hand the caller the piecewise encode to run where it
+        // would have encoded the text. The renderer reads none of
+        // `params.special_tokens`, so the injection `apply_chat_template`
+        // performs is a no-op here.
+        let segments = render_kimi_k3_xtml_prompt(messages, &params, assistant_prefix)?;
+        let text = join_segments(&segments);
+        let bpe = Arc::clone(&self.tokenizer);
+        let job = EncodeJob::new(move || encode_segments(&bpe, &segments).map(Encoding::Tiktoken));
+        Ok(ChatTemplateOutput {
+            text,
+            encoding: PromptEncoding::Deferred(job),
+        })
     }
 
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
@@ -883,6 +991,233 @@ mod tests {
                 .contains("tiktoken decode failed for unknown token id"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_skip_special_tokens_drops_only_special_flagged_ids() {
+        let dir = write_minimal_tiktoken_dir(
+            r#"{
+                "added_tokens_decoder": {
+                    "2": { "content": "[EOS]", "special": true },
+                    "3": { "content": "<|open|>", "special": false }
+                }
+            }"#,
+            None,
+        );
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+
+        assert_eq!(
+            tokenizer.decode(&[0, 2, 3, 1], false).unwrap(),
+            "a[EOS]<|open|>b"
+        );
+        assert_eq!(tokenizer.decode(&[0, 2, 3, 1], true).unwrap(), "a<|open|>b");
+    }
+
+    #[test]
+    fn test_builtin_encoding_skips_its_special_tokens_on_decode() {
+        let tokenizer = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).unwrap();
+        let ids = tokenizer.encode("hello<|endoftext|>world", false).unwrap();
+        assert!(ids.token_ids().contains(&100257));
+        assert_eq!(
+            tokenizer.decode(ids.token_ids(), false).unwrap(),
+            "hello<|endoftext|>world"
+        );
+        assert_eq!(
+            tokenizer.decode(ids.token_ids(), true).unwrap(),
+            "helloworld"
+        );
+    }
+
+    #[test]
+    fn test_skip_special_tokens_holds_text_in_incremental_decode() {
+        let dir = write_minimal_tiktoken_dir(
+            r#"{
+                "added_tokens_decoder": {
+                    "2": { "content": "[EOS]", "special": true }
+                }
+            }"#,
+            None,
+        );
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+
+        let mut ids = Vec::new();
+        let mut prefix = String::new();
+        let mut prefix_index = 0;
+        assert_eq!(
+            tokenizer
+                .decode_step(0, &mut ids, &mut prefix, &mut prefix_index, true)
+                .unwrap(),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            tokenizer
+                .decode_step(2, &mut ids, &mut prefix, &mut prefix_index, true)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            tokenizer
+                .decode_step(1, &mut ids, &mut prefix, &mut prefix_index, true)
+                .unwrap(),
+            Some("b".to_string())
+        );
+    }
+
+    /// Every byte as its own rank, so any string is encodable as ordinary text.
+    fn full_byte_tiktoken_model() -> String {
+        (0u32..256)
+            .map(|b| format!("{} {}\n", STANDARD.encode([b as u8]), b))
+            .collect()
+    }
+
+    /// A tiktoken directory whose `config.json` selects the K3 renderer and
+    /// whose vocabulary is every byte plus the four structural markers.
+    fn k3_byte_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tiktoken.model"),
+            full_byte_tiktoken_model(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder": {
+                "300": {"content": "<|open|>", "special": false},
+                "301": {"content": "<|close|>", "special": false},
+                "302": {"content": "<|sep|>", "special": false},
+                "303": {"content": "<|end_of_msg|>", "special": true}
+            }}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"architectures": ["KimiK3ForConditionalGeneration"]}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_encode_segments_keeps_control_tokens_out_of_text_segments() {
+        let tokenizer = TiktokenTokenizer::from_dir(k3_byte_dir().path()).unwrap();
+        let bpe = &tokenizer.tokenizer;
+
+        let control = encode_segments(bpe, &[PromptSegment::control("<|open|>")]).unwrap();
+        assert_eq!(control, vec![300]);
+
+        let text = encode_segments(bpe, &[PromptSegment::text("<|open|>")]).unwrap();
+        assert!(
+            !text.contains(&300),
+            "marker in a text segment must not become a control id: {text:?}"
+        );
+        assert_eq!(tokenizer.decode(&text, false).unwrap(), "<|open|>");
+
+        let mixed = encode_segments(
+            bpe,
+            &[
+                PromptSegment::control("<|open|>"),
+                PromptSegment::text("message"),
+                PromptSegment::text("<|open|>"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(mixed.iter().filter(|&&id| id == 300).count(), 1);
+        assert_eq!(
+            tokenizer.decode(&mixed, false).unwrap(),
+            "<|open|>message<|open|>"
+        );
+
+        // The flat encode still maps every marker string to its control id.
+        let flat = tokenizer.encode("<|open|>message<|open|>", false).unwrap();
+        assert_eq!(flat.token_ids().iter().filter(|&&id| id == 300).count(), 2);
+    }
+
+    #[test]
+    fn test_k3_chat_template_defers_its_encode() {
+        let tokenizer = TiktokenTokenizer::from_dir(k3_byte_dir().path()).unwrap();
+        let messages = vec![serde_json::json!({"role": "user", "content": "<|open|>x"})];
+        let params = || ChatTemplateParams {
+            add_generation_prompt: true,
+            ..Default::default()
+        };
+
+        let rendered = tokenizer
+            .apply_chat_template_with_encoding(&messages, params(), None)
+            .unwrap();
+        assert_eq!(
+            rendered.text,
+            tokenizer.apply_chat_template(&messages, params()).unwrap(),
+            "the flat text is the served rendering"
+        );
+        let PromptEncoding::Deferred(job) = rendered.encoding else {
+            panic!("K3 must defer its encode");
+        };
+        let ids = job.run().unwrap();
+        let expected = encode_segments(
+            &tokenizer.tokenizer,
+            &render_kimi_k3_xtml_prompt(&messages, &params(), None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ids.token_ids(), &expected[..]);
+        // The user-typed marker is text (four structural <|open|> per prompt:
+        // thinking-effort message, user message, assistant tail, think tail).
+        assert_eq!(ids.token_ids().iter().filter(|&&id| id == 300).count(), 4);
+        let flat = tokenizer.encode(&rendered.text, false).unwrap();
+        assert_eq!(flat.token_ids().iter().filter(|&&id| id == 300).count(), 5);
+    }
+
+    #[test]
+    fn test_k3_prefill_keeps_its_control_tokens() {
+        let tokenizer = TiktokenTokenizer::from_dir(k3_byte_dir().path()).unwrap();
+        let messages = vec![serde_json::json!({"role": "user", "content": "Hi"})];
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            ..Default::default()
+        };
+        let prefix = "<|close|>think<|sep|>Sure";
+        let rendered = tokenizer
+            .apply_chat_template_with_encoding(&messages, params, Some(prefix))
+            .unwrap();
+        assert!(rendered.text.ends_with(prefix));
+        let PromptEncoding::Deferred(job) = rendered.encoding else {
+            panic!("K3 must defer its encode");
+        };
+        let ids = job.run().unwrap();
+        let tail: Vec<u32> = std::iter::once(301)
+            .chain("think".bytes().map(u32::from))
+            .chain(std::iter::once(302))
+            .chain("Sure".bytes().map(u32::from))
+            .collect();
+        assert!(
+            ids.token_ids().ends_with(&tail),
+            "prefill markers must stay control ids: {:?}",
+            ids.token_ids()
+        );
+    }
+
+    #[test]
+    fn test_flat_renderer_reports_from_text_with_prefill_joined() {
+        let dir = write_minimal_tiktoken_dir("{}", None);
+        let mut tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        tokenizer
+            .set_chat_template(
+                "{% for m in messages %}{{ m.content }}{% endfor %}{% if add_generation_prompt %}A:{% endif %}"
+                    .to_string(),
+            )
+            .unwrap();
+        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
+        let params = || ChatTemplateParams {
+            add_generation_prompt: true,
+            ..Default::default()
+        };
+        let rendered = tokenizer
+            .apply_chat_template_with_encoding(&messages, params(), Some(" there"))
+            .unwrap();
+        assert_eq!(
+            rendered.text,
+            tokenizer.apply_chat_template(&messages, params()).unwrap() + " there"
+        );
+        assert!(matches!(rendered.encoding, PromptEncoding::FromText));
     }
 
     #[test]

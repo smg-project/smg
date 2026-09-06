@@ -11,10 +11,9 @@ use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent},
     common::{FunctionCallResponse, JsonSchemaFormat, ResponseFormat, ToolCall, UsageInfo},
     responses::{
-        ReasoningEffort, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-        ResponseOutputItem, ResponseReasoningContent::ReasoningText, ResponseStatus,
-        ResponsesRequest, ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig,
-        TextFormat,
+        ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
+        ResponseReasoningContent::ReasoningText, ResponseStatus, ResponsesRequest,
+        ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig, TextFormat,
     },
     UNKNOWN_MODEL_ID,
 };
@@ -250,22 +249,10 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
         reasoning_effort: req
             .reasoning
             .as_ref()
-            .and_then(|r| r.effort.as_ref())
-            .map(reasoning_effort_to_str)
-            .map(str::to_string),
+            .and_then(|r| r.effort)
+            .map(|effort| effort.as_str().to_string()),
         ..Default::default()
     })
-}
-
-/// Map the Responses `reasoning.effort` enum to the Chat `reasoning_effort`
-/// string (verbatim snake_case, as the Chat pipeline expects).
-fn reasoning_effort_to_str(effort: &ReasoningEffort) -> &'static str {
-    match effort {
-        ReasoningEffort::Minimal => "minimal",
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
-    }
 }
 
 /// Extract text content from ResponseContentPart array. `Refusal` is
@@ -447,6 +434,7 @@ mod tests {
     use openai_protocol::{
         chat::{ChatChoice, ChatCompletionMessage},
         common::{StreamOptions, Usage},
+        responses::ReasoningEffort,
     };
 
     use super::*;
@@ -529,6 +517,31 @@ mod tests {
 
         let chat_req = responses_to_chat(&req).unwrap();
         assert_eq!(chat_req.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    /// The outer OpenAI tiers reach the Chat pipeline verbatim, where `none`
+    /// already means thinking off.
+    #[test]
+    fn test_reasoning_effort_outer_tiers_flow_through() {
+        use openai_protocol::responses::ResponseReasoningParam;
+
+        for effort in [
+            ReasoningEffort::None,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+        ] {
+            let req = ResponsesRequest {
+                input: ResponseInput::Text("hi".to_string()),
+                reasoning: Some(ResponseReasoningParam {
+                    effort: Some(effort),
+                    summary: None,
+                }),
+                ..Default::default()
+            };
+
+            let chat_req = responses_to_chat(&req).unwrap();
+            assert_eq!(chat_req.reasoning_effort.as_deref(), Some(effort.as_str()));
+        }
     }
 
     #[test]

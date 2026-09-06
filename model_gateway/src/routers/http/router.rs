@@ -30,10 +30,7 @@ use openai_protocol::{
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
-use reqwest::{
-    multipart::{Form, Part},
-    Client,
-};
+use reqwest::multipart::{Form, Part};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, warn};
@@ -96,7 +93,6 @@ const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
-    client: Client,
     retry_config: RetryConfig,
     /// Cap on buffered worker response bodies, mirroring the ingress limit.
     max_payload_size: usize,
@@ -152,7 +148,6 @@ impl std::fmt::Debug for Router {
         f.debug_struct("Router")
             .field("worker_registry", &self.worker_registry)
             .field("policy_registry", &self.policy_registry)
-            .field("client", &self.client)
             .field("retry_config", &self.retry_config)
             .finish_non_exhaustive()
     }
@@ -168,7 +163,6 @@ impl Router {
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
-            client: ctx.client.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             max_payload_size: ctx.router_config.max_payload_size,
             stream_stall_timeout: match ctx.router_config.stream_body_stall_timeout_secs {
@@ -182,15 +176,15 @@ impl Router {
         })
     }
 
-    fn select_first_worker(&self) -> Result<String, String> {
-        // proxy_get_request sends a plain HTTP GET to the returned URL, so
+    fn select_first_worker(&self) -> Result<Arc<dyn Worker>, String> {
+        // proxy_get_request sends a plain HTTP GET to the returned worker, so
         // only HTTP-transport workers are eligible: a gRPC or ZMQ worker's
         // URL cannot serve it.
         self.worker_registry
             .get_routing_pool(crate::worker::UNKNOWN_MODEL_ID, RoutingPool::HttpRegular)
             .iter()
             .find(|worker| worker.is_healthy())
-            .map(|worker| worker.url().to_string())
+            .cloned()
             .ok_or_else(|| "No workers are available".to_string())
     }
 
@@ -198,8 +192,10 @@ impl Router {
         let headers = header_utils::copy_request_headers(&req);
 
         match self.select_first_worker() {
-            Ok(worker_url) => {
-                let mut request_builder = self.client.get(format!("{worker_url}/{endpoint}"));
+            Ok(worker) => {
+                let mut request_builder = worker
+                    .http_client()
+                    .get(format!("{}/{endpoint}", worker.url()));
                 for (name, value) in headers {
                     if header_utils::should_forward_request_header(&name) {
                         request_builder = request_builder.header(name, value);
@@ -315,7 +311,7 @@ impl Router {
         model_id: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<Arc<dyn Worker>, Response> {
-        WorkerSelector::new(&self.worker_registry, &self.client)
+        WorkerSelector::new(&self.worker_registry)
             .select_worker(&SelectWorkerRequest {
                 model_id,
                 headers,
@@ -344,7 +340,6 @@ impl Router {
             body.set_model(canonical_model.to_string());
             forward_realtime_rest(
                 RealtimeLabels::HTTP,
-                &self.client,
                 worker,
                 headers,
                 &body,
@@ -356,7 +351,6 @@ impl Router {
         } else {
             forward_realtime_rest(
                 RealtimeLabels::HTTP,
-                &self.client,
                 worker,
                 headers,
                 body,
@@ -724,7 +718,7 @@ impl Router {
             .into_iter()
             .map(|worker| {
                 let url = format!("{}/{}", worker.base_url(), endpoint);
-                let client = self.client.clone();
+                let client = worker.http_client().clone();
                 let method = method.clone();
 
                 let headers = filtered_headers.clone();
@@ -995,7 +989,7 @@ impl Router {
         };
 
         let endpoint_url = worker.endpoint_url(route);
-        let mut request_builder = self.client.post(&endpoint_url).multipart(form);
+        let mut request_builder = worker.http_client().post(&endpoint_url).multipart(form);
 
         // reqwest sets the multipart Content-Type (with boundary) itself; the
         // forward allow-list already excludes Content-Type/Content-Length.
@@ -1265,7 +1259,8 @@ impl Router {
         let endpoint_url = worker.endpoint_url(route);
 
         let mut request_builder = attach_sized_body(
-            self.client
+            worker
+                .http_client()
                 .post(&endpoint_url)
                 .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
             body,
@@ -1312,8 +1307,10 @@ impl Router {
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             header_utils::insert_routed_worker_id(&mut response_headers, worker_url);
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            if status.is_success() && !response_headers.contains_key(CONTENT_TYPE) {
+                response_headers
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            }
 
             let stream = res.bytes_stream();
             // Bounded channel applies backpressure: a slow client makes the
@@ -1415,8 +1412,8 @@ impl Router {
             Arc::clone(&progress),
         );
 
-        let mut request_builder = self
-            .client
+        let mut request_builder = worker
+            .http_client()
             .post(&endpoint_url)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .body(reqwest::Body::wrap_stream(capped));
@@ -2215,7 +2212,6 @@ impl RouterTrait for Router {
             parsed,
             worker,
             auth_header,
-            self.client.clone(),
             bind_addr,
             self.webrtc_stun_server.clone(),
             Arc::clone(&self.realtime_registry),
@@ -2235,7 +2231,7 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
     };
 
-    use axum::http::header::CONTENT_LENGTH;
+    use axum::http::header::{CONTENT_LENGTH, RETRY_AFTER};
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
@@ -2289,7 +2285,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_recovers_on_second_connection() {
         let (addr, accepted) = flaky_upstream(1).await;
-        let client = Client::new();
+        let client = reqwest::Client::new();
         let builder = client.post(format!("http://{addr}/generate")).body("{}");
 
         let res = send_with_stale_conn_retry(builder).await.unwrap();
@@ -2300,7 +2296,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_is_bounded_to_one() {
         let (addr, accepted) = flaky_upstream(usize::MAX).await;
-        let client = Client::new();
+        let client = reqwest::Client::new();
         let builder = client.post(format!("http://{addr}/generate")).body("{}");
 
         let err = send_with_stale_conn_retry(builder).await.unwrap_err();
@@ -2311,7 +2307,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_skips_unclonable_bodies() {
         let (addr, accepted) = flaky_upstream(usize::MAX).await;
-        let client = Client::new();
+        let client = reqwest::Client::new();
         let stream_body = reqwest::Body::wrap_stream(stream::once(async {
             Ok::<_, std::io::Error>(Bytes::from_static(b"{}"))
         }));
@@ -2350,7 +2346,6 @@ mod tests {
         Router {
             worker_registry,
             policy_registry,
-            client: Client::new(),
             retry_config: RetryConfig::default(),
             max_payload_size: 536_870_912,
             stream_stall_timeout: Some(Duration::from_secs(60)),
@@ -2385,7 +2380,7 @@ mod tests {
         let result = router.select_first_worker();
 
         assert!(result.is_ok());
-        let url = result.unwrap();
+        let url = result.unwrap().url().to_string();
         // DashMap doesn't guarantee order, so just check we get one of the workers
         assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
     }
@@ -2402,7 +2397,7 @@ mod tests {
             .build();
         router.worker_registry.register_or_replace(Arc::new(grpc));
 
-        let url = router.select_first_worker().unwrap();
+        let url = router.select_first_worker().unwrap().url().to_string();
         assert!(
             url.starts_with("http://worker"),
             "picked a non-HTTP transport: {url}"
@@ -2424,7 +2419,7 @@ mod tests {
         let result = router.select_first_worker();
 
         assert!(result.is_ok());
-        let url = result.unwrap();
+        let url = result.unwrap().url().to_string();
 
         let worker = router.worker_registry.get_by_url(&url).unwrap();
         assert!(worker.is_healthy());
@@ -2459,6 +2454,36 @@ mod tests {
                 None
             )
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn unavailable_workers_keep_generic_503_without_retry_after() {
+        let router = create_test_regular_router();
+        for worker in router.worker_registry.get_all() {
+            worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        }
+
+        let response = router
+            .route_typed_request(
+                None,
+                DropProbeRequest {
+                    text: "unavailable".to_string(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .expect("gateway error code header"),
+            "no_available_workers"
+        );
+        assert!(response.headers().get(RETRY_AFTER).is_none());
     }
 
     fn rerank_request() -> RerankRequest {
@@ -2643,7 +2668,6 @@ mod tests {
         Router {
             worker_registry,
             policy_registry,
-            client: Client::new(),
             retry_config: RetryConfig::default(),
             max_payload_size,
             stream_stall_timeout: Some(Duration::from_secs(60)),

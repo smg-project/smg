@@ -377,8 +377,8 @@ class RouterArgs:
             help=(
                 "Speak HTTP/2 to workers via prior knowledge (h2c on cleartext),"
                 " multiplexing every request to a worker over one connection."
-                " Requires every HTTP worker to serve HTTP/2 without an upgrade"
-                " handshake."
+                " Negotiated per worker at registration: a worker that does not"
+                " answer HTTP/2 stays on HTTP/1.1."
             ),
         )
         worker_group.add_argument(

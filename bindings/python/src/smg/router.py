@@ -215,8 +215,8 @@ class Router:
         dp_minimum_tokens_scheduler: Enable minimum tokens scheduler for data parallel group. Default: False
         upstream_http2: Speak HTTP/2 to workers via prior knowledge (h2c on
             cleartext), multiplexing every request to a worker over one
-            connection. Requires every HTTP worker to serve HTTP/2 without an
-            upgrade handshake. Default: False
+            connection. Negotiated per worker at registration: a worker that
+            does not answer HTTP/2 stays on HTTP/1.1. Default: False
         enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When
             enabled, the router can manage multiple models simultaneously with per-model
             load balancing policies. Default: False

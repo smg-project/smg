@@ -152,10 +152,7 @@ impl RouterTrait for AnthropicRouter {
             "Processing Messages API request"
         );
 
-        let selector = WorkerSelector::new(
-            &self.router_ctx.worker_registry,
-            &self.router_ctx.http_client,
-        );
+        let selector = WorkerSelector::new(&self.router_ctx.worker_registry);
         let selected_worker = match selector
             .select_worker(&SelectWorkerRequest {
                 model_id,

@@ -913,6 +913,137 @@ async fn test_empty_leaf_without_schema_is_unchanged() {
     assert_eq!(args["avoid_aisles"], json!(""));
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper; allow-unwrap-in-tests only covers #[test] fns"
+)]
+fn composite_schema_tools(combinator: &str) -> Vec<Tool> {
+    let branches = json!([
+        {
+            "type": "object",
+            "properties": {
+                "string_list": {"type": "array", "items": {"type": "string"}}
+            }
+        },
+        {
+            "type": "object",
+            "properties": {
+                "number_list": {"type": "array", "items": {"type": "number"}}
+            }
+        }
+    ]);
+    let mut nested = json!({"type": "object"});
+    nested
+        .as_object_mut()
+        .unwrap()
+        .insert(combinator.to_string(), branches.clone());
+    let mut parameters = json!({
+        "type": "object",
+        "properties": {
+            "plain": {"type": "string"},
+            "nested": nested
+        }
+    });
+    parameters
+        .as_object_mut()
+        .unwrap()
+        .insert(combinator.to_string(), branches);
+
+    vec![Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "composite_schema".to_string(),
+            description: None,
+            parameters,
+            strict: None,
+        },
+    }]
+}
+
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper; allow-unwrap-in-tests only covers #[test] fns"
+)]
+async fn assert_composite_property_schemas(combinator: &str) {
+    let parser = MinimaxM3Parser::new();
+    let tools = composite_schema_tools(combinator);
+    let string_items = format!("{}{}", element("item", "12"), element("item", "34"));
+    let number_items = format!("{}{}", element("item", "12"), element("item", "34"));
+    let input = tool_block(&[
+        ("composite_schema", element("plain", "007")),
+        ("composite_schema", element("string_list", &string_items)),
+        ("composite_schema", element("number_list", &number_items)),
+    ]);
+
+    let (_, calls) = parser
+        .parse_complete_with_tools(&input, &tools)
+        .await
+        .unwrap();
+    let arguments = calls
+        .iter()
+        .map(|call| serde_json::from_str::<serde_json::Value>(&call.function.arguments).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(arguments[0], json!({"plain": "007"}));
+    assert_eq!(arguments[1], json!({"string_list": ["12", "34"]}));
+    assert_eq!(arguments[2], json!({"number_list": [12, 34]}));
+}
+
+#[tokio::test]
+async fn test_m3_resolves_property_schemas_in_top_level_one_of() {
+    assert_composite_property_schemas("oneOf").await;
+}
+
+#[tokio::test]
+async fn test_m3_resolves_property_schemas_in_top_level_any_of() {
+    assert_composite_property_schemas("anyOf").await;
+}
+
+#[tokio::test]
+async fn test_m3_resolves_property_schemas_in_top_level_all_of() {
+    assert_composite_property_schemas("allOf").await;
+}
+
+#[tokio::test]
+async fn test_m3_resolves_nested_composite_property_schemas() {
+    for combinator in ["oneOf", "anyOf", "allOf"] {
+        let parser = MinimaxM3Parser::new();
+        let tools = composite_schema_tools(combinator);
+        let string_items = format!("{}{}", element("item", "12"), element("item", "34"));
+        let number_items = format!("{}{}", element("item", "12"), element("item", "34"));
+        let input = tool_block(&[
+            (
+                "composite_schema",
+                element("nested", &element("string_list", &string_items)),
+            ),
+            (
+                "composite_schema",
+                element("nested", &element("number_list", &number_items)),
+            ),
+        ]);
+
+        let (_, calls) = parser
+            .parse_complete_with_tools(&input, &tools)
+            .await
+            .unwrap();
+        let string_args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let number_args: serde_json::Value =
+            serde_json::from_str(&calls[1].function.arguments).unwrap();
+
+        assert_eq!(
+            string_args,
+            json!({"nested": {"string_list": ["12", "34"]}}),
+            "{combinator} must preserve nested string array items"
+        );
+        assert_eq!(
+            number_args,
+            json!({"nested": {"number_list": [12, 34]}}),
+            "{combinator} must coerce nested number array items"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_populated_array_still_parses_after_empty_container_fix() {
     let parser = MinimaxM3Parser::new();

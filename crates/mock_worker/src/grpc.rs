@@ -9,7 +9,8 @@ use std::{
 
 use futures::{stream, Stream};
 use smg_grpc_client::{common_proto as common, tokenspeed_scheduler::tokenspeed_proto as ts};
-use tokio::sync::mpsc;
+use tokio::{net::TcpListener, sync::mpsc};
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{transport::Server, Request, Response, Status};
 use ts::{
     generate_response::Response as GenResp,
@@ -30,16 +31,29 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
             return;
         }
     };
-    let addr = SocketAddr::new(ip, port);
+    let listener = match TcpListener::bind(SocketAddr::new(ip, port)).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("grpc worker {port} failed to bind: {e}");
+            return;
+        }
+    };
+    serve_with_listener(cfg, listener).await;
+}
+
+/// Serve on an already-bound listener. Callers that need a free port bind
+/// port 0 and read it back instead of picking one and binding it later.
+pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
+    let addr = listener.local_addr().ok();
     // One simulated engine per listener (i.e. per virtual worker).
     let engine = cfg.realistic.then(|| Engine::spawn(cfg.engine.clone()));
     let service = MockScheduler { cfg, engine };
     if let Err(e) = Server::builder()
         .add_service(TokenSpeedSchedulerServer::new(service))
-        .serve(addr)
+        .serve_with_incoming(TcpListenerStream::new(listener))
         .await
     {
-        tracing::error!("grpc worker {port} stopped: {e}");
+        tracing::error!("grpc worker {addr:?} stopped: {e}");
     }
 }
 

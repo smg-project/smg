@@ -44,7 +44,11 @@ from smg_grpc_servicer.vllm.kv_events import (
     resolve_kv_events_config,
     stream_kv_events,
 )
-from smg_grpc_servicer.vllm.kv_transfer import params_from_request, params_to_response_fields
+from smg_grpc_servicer.vllm.kv_transfer import (
+    params_from_request,
+    params_to_response_fields,
+    resolve_pd_connector,
+)
 from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, mm_identity_cache_salt
 
 logger = init_logger(__name__)
@@ -508,11 +512,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         parallel = self.engine.vllm_config.parallel_config
         kv_transfer_config = self.engine.vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
-            kv_connector = kv_transfer_config.kv_connector or ""
+            kv_connector, kv_engine_id = resolve_pd_connector(kv_transfer_config)
             kv_role = kv_transfer_config.kv_role or ""
-            # Base engine_id; with DP the engine cores serve `{id}_dp{rank}` and
-            # the router derives the suffix from the rank it pins per request
-            kv_engine_id = getattr(kv_transfer_config, "engine_id", "") or ""
+            # Effective PD engine_id; with DP the engine cores serve
+            # `{id}_dp{rank}` and the router derives the suffix from the rank it
+            # pins per request.
 
         return vllm_engine_pb2.GetServerInfoResponse(
             kv_connector=kv_connector,

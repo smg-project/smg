@@ -264,6 +264,25 @@ impl RouterFactory {
         policy: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Vec<(RouterId, &'static str, Result<Box<dyn RouterTrait>, String>)> {
+        let (encode_policy, prefill_policy, decode_policy) = match &ctx.router_config.mode {
+            RoutingMode::PrefillDecode {
+                prefill_policy,
+                decode_policy,
+                ..
+            } => (None, prefill_policy.as_ref(), decode_policy.as_ref()),
+            RoutingMode::EncodePrefillDecode {
+                encode_policy,
+                prefill_policy,
+                decode_policy,
+                ..
+            } => (
+                encode_policy.as_ref(),
+                prefill_policy.as_ref(),
+                decode_policy.as_ref(),
+            ),
+            _ => (None, None, None),
+        };
+
         vec![
             (
                 router_ids::HTTP_REGULAR,
@@ -278,14 +297,14 @@ impl RouterFactory {
             (
                 router_ids::HTTP_PD,
                 "HTTP PD",
-                Self::create_pd_router(None, None, policy, ctx).await,
+                Self::create_pd_router(prefill_policy, decode_policy, policy, ctx).await,
             ),
             (router_ids::GRPC_PD, "gRPC PD", {
-                Self::set_pd_policies(None, None, policy, ctx);
+                Self::set_pd_policies(prefill_policy, decode_policy, policy, ctx);
                 Self::create_grpc_router(ctx, Mode::PrefillDecode)
             }),
             (router_ids::GRPC_EPD, "gRPC EPD", {
-                Self::set_epd_policies(None, None, None, policy, ctx);
+                Self::set_epd_policies(encode_policy, prefill_policy, decode_policy, policy, ctx);
                 Self::create_grpc_router(ctx, Mode::EncodePrefillDecode)
             }),
             (
@@ -408,6 +427,39 @@ mod grpc_router_type_tests {
                 .await
                 .expect("router creation");
             assert_eq!(router.router_type(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn igw_routers_preserve_disaggregated_role_policies() {
+        for mode in [
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: Some(PolicyConfig::Passthrough),
+            },
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![],
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                encode_policy: Some(PolicyConfig::PowerOfTwo {
+                    load_check_interval_secs: 5,
+                }),
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: Some(PolicyConfig::Passthrough),
+            },
+        ] {
+            let expected_encode_policy = mode
+                .get_encode_policy(&PolicyConfig::ConsistentHashing)
+                .name();
+            let ctx = grpc_ctx(mode).await;
+            RouterFactory::create_igw_routers(&ctx.router_config.policy, &ctx).await;
+
+            let policies = &ctx.policy_registry;
+            assert_eq!(policies.get_encode_policy().name(), expected_encode_policy);
+            assert_eq!(policies.get_prefill_policy().name(), "round_robin");
+            assert_eq!(policies.get_decode_policy().name(), "passthrough");
         }
     }
 }

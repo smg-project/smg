@@ -69,6 +69,11 @@ on:
         type: number
         default: 0
         description: "Minimum effective (selected) test count; exported as E2E_MIN_SELECTED for the pytest harness floor check (0 = disabled)"
+      tokenspeed_prebuilt_image:
+        required: false
+        type: string
+        default: ""
+        description: "Prebuilt TokenSpeed carrier image to extract onto the runner (resolved by detect-changes); empty = build from source"
 
 jobs:
   run:
@@ -84,10 +89,23 @@ jobs:
       E2E_VLLM_KV_BACKEND: ${{ inputs.vllm_kv_backend }}
       E2E_CONNECTION_MODE: ${{ inputs.connection_mode }}
       E2E_ZMQ_ENGINE_COUNT: ${{ inputs.zmq_engine_count }}
+      TOKENSPEED_PREBUILT_IMAGE: ${{ inputs.tokenspeed_prebuilt_image }}
       ROUTER_LOCAL_MODEL_PATH: /models
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      # The cluster runners share one NAT egress IP and GitHub intermittently
+      # 401s anonymous git from it, even for public repos — the TokenSpeed
+      # source fetch dies on "could not read Username". Carry the workflow
+      # token on every github.com git operation instead.
+      - name: Authenticate git for github.com
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
 
       # Engine-specific setup
       - name: Setup SGLang backend

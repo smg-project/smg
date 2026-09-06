@@ -38,6 +38,24 @@ def run_scheduler_with_signal_handling(*args, **kwargs):
     run_scheduler_process(*args, **kwargs)
 
 
+def terminate_scheduler_processes(scheduler_procs: list[mp.Process]) -> None:
+    """Terminate and reap scheduler processes without abandoning later ranks."""
+    for i, proc in enumerate(scheduler_procs):
+        try:
+            if proc.is_alive():
+                logger.info(f"Terminating scheduler process {i}...")
+                proc.terminate()
+            proc.join(timeout=2.0)
+            if proc.is_alive():
+                logger.warning(f"Scheduler process {i} did not terminate, killing...")
+                proc.kill()
+                proc.join(timeout=1.0)
+        except Exception:
+            logger.exception(f"Failed to terminate scheduler process {i}")
+
+    logger.info("All scheduler processes terminated")
+
+
 def launch_scheduler_process_only(
     server_args: ServerArgs,
     port_args: PortArgs | None = None,
@@ -74,9 +92,28 @@ def launch_scheduler_process_only(
     # Allocate ports for inter-process communications
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
-        logger.info(f"{server_args=}")
+    logger.info(f"{server_args=}")
 
     scheduler_procs = []
+    try:
+        scheduler_info = _start_scheduler_processes(
+            server_args,
+            port_args,
+            scheduler_procs,
+        )
+    except BaseException:
+        terminate_scheduler_processes(scheduler_procs)
+        raise
+
+    return scheduler_info, port_args, scheduler_procs
+
+
+def _start_scheduler_processes(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    scheduler_procs: list[mp.Process],
+) -> dict:
+    """Start scheduler processes and wait for every ready handshake."""
 
     if server_args.dp_size == 1:
         # Single data parallel group - launch TP/PP schedulers
@@ -144,8 +181,8 @@ def launch_scheduler_process_only(
                     numa_utils.configure_subprocess(server_args, gpu_id),
                 ):
                     proc.start()
+                    scheduler_procs.append(proc)
 
-                scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
     else:
         # Data parallelism - launch data parallel controller
@@ -181,4 +218,4 @@ def launch_scheduler_process_only(
     logger.info(f"All {len(scheduler_procs)} scheduler process(es) initialized successfully")
 
     # Return the first scheduler's info (they should all be the same)
-    return scheduler_infos[0], port_args, scheduler_procs
+    return scheduler_infos[0]

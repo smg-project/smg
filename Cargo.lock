@@ -4288,6 +4288,7 @@ dependencies = [
  "smg-grpc-client",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",
