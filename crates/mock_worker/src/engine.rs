@@ -438,7 +438,8 @@ impl SchedulerState {
         });
     }
 
-    /// Tokens currently resident in KV.
+    /// Tokens physically resident in KV (admission control and eviction
+    /// watermarks); see [`Self::pinned_tokens`] for what is REPORTED.
     fn used_tokens(&self, p: &EngineParams) -> u64 {
         if p.prefix_cache {
             // KV holds the shared radix cache (blocks persist across requests
@@ -460,8 +461,24 @@ impl SchedulerState {
         }
     }
 
+    /// Tokens pinned by running requests (prompt + generated so far): the
+    /// KV a scheduler cannot evict. This — not physical occupancy — is what
+    /// engines report as `num_used_tokens` / `token_usage` (SGLang: used =
+    /// total − available − evictable), so a warm radix cache that keeps
+    /// KV physically full does not read as an overloaded worker. Reporting
+    /// occupancy instead trips a gateway's token-usage overload gate on
+    /// every warm worker and makes its cache-aware routing avoid exactly
+    /// the workers holding the prefixes (measured: same-worker follow-ups
+    /// fell from 0.87 to 0.15 over a 100 s run at 0.9 threshold).
+    fn pinned_tokens(&self) -> u64 {
+        self.running
+            .iter()
+            .map(|r| u64::from(r.prompt_tokens + r.generated))
+            .sum()
+    }
+
     fn snapshot(&self, p: &EngineParams) -> LoadSnapshot {
-        let used = self.used_tokens(p);
+        let used = self.pinned_tokens().min(p.kv_capacity_tokens);
         let waiting_uncached: i64 = self.waiting.iter().map(|w| w.uncached_tokens as i64).sum();
         LoadSnapshot {
             num_running_reqs: self.running.len() as i32,
@@ -864,6 +881,53 @@ mod tests {
             }
         }
         panic!("no token produced");
+    }
+
+    /// A warm prefix cache keeps KV physically occupied, but the reported
+    /// usage must fall back to the running requests' pinned tokens once
+    /// they finish — otherwise every warm worker reads as overloaded.
+    #[test]
+    fn reported_usage_excludes_evictable_cache() {
+        let p = EngineParams {
+            prefix_cache: true,
+            block_size: 4,
+            kv_capacity_tokens: 4096,
+            prefill_chunk_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let mut st = SchedulerState::new();
+        let (r, mut rx) = req("a", vec![3; 256], 8);
+        st.enqueue(r, &p);
+        let mut done = false;
+        for _ in 0..10_000 {
+            let step = st.step(&p);
+            for (tx, ev) in step.sends {
+                let _ = tx.send(ev);
+            }
+            while let Ok(ev) = rx.try_recv() {
+                if matches!(ev, GenEvent::Done { .. }) {
+                    done = true;
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        assert!(done, "request did not finish");
+        // Drain the completed request out of the batch.
+        let _ = st.step(&p);
+        assert!(
+            st.cache.len() >= 256 / 4,
+            "prefix cache retained the prompt blocks"
+        );
+        assert!(
+            st.used_tokens(&p) >= 256,
+            "KV is physically occupied by the cache"
+        );
+        let snap = st.snapshot(&p);
+        assert_eq!(snap.num_running_reqs, 0);
+        assert_eq!(snap.num_used_tokens, 0, "no running request pins KV");
+        assert_eq!(snap.token_usage, 0.0);
     }
 
     #[test]
