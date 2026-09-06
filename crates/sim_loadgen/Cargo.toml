@@ -1,0 +1,16 @@
+[package]
+name = "sim-loadgen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Open-loop /generate load generator simulating production ingress for SMG scale tests"
+
+[[bin]]
+name = "sim-loadgen"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+reqwest = { workspace = true, features = ["stream", "json", "rustls", "http2"] }
+serde_json.workspace = true
+futures.workspace = true
