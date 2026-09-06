@@ -52,7 +52,7 @@ async fn wait_until(
 /// a gone worker), and a re-announce heals it back — the blocks were
 /// only soft-retired, not lost.
 #[tokio::test]
-async fn dropped_holder_stops_scoring_then_readd_restores() {
+async fn dropped_holder_stops_scoring_then_readvertise_restores() {
     let url = spawn_index(EngineConfig::default(), Duration::from_secs(60));
     let client = RemoteIndex::connect(url);
     let hashes = vec![1u64, 2, 3, 4];

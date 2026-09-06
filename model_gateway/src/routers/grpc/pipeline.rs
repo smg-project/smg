@@ -105,10 +105,6 @@ pub(crate) struct PipelineDeps {
 impl PipelineDeps {
     /// Full deps for the chat/messages/harmony endpoints, which consume the
     /// configured parser factories/overrides.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one-time deps wiring at router construction"
-    )]
     pub(crate) fn new(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,

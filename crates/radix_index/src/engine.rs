@@ -1893,7 +1893,7 @@ mod tests {
             "re-applying a standing drop must not relay (echo ping-pong)"
         );
 
-        let readd = UpdateMsg {
+        let readvertise = UpdateMsg {
             added: Some(AddedControl {
                 capacity_blocks: 0,
                 event_fed: false,
@@ -1901,9 +1901,12 @@ mod tests {
             dropped: false,
             ..drop_msg.clone()
         };
-        assert!(engine.apply(&readd).changed, "un-drop is a transition");
         assert!(
-            !engine.apply(&readd).changed,
+            engine.apply(&readvertise).changed,
+            "un-drop is a transition"
+        );
+        assert!(
+            !engine.apply(&readvertise).changed,
             "re-announcing a live holder must not relay"
         );
     }

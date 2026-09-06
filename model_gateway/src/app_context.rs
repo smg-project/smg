@@ -18,7 +18,7 @@ use crate::{
     config::RouterConfig,
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
-    policies::PolicyRegistry,
+    policies::{remote_index::RemoteIndexHandle, PolicyRegistry},
     rate_limit::RateLimitManager,
     routers::{
         common::{openai_bridge::FormatRegistry, overload, realtime::RealtimeRegistry},
@@ -80,7 +80,7 @@ pub struct AppContext {
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
     /// Remote radix index client (`--kv-indexer-url`); `None` leaves
     /// every routing path on local-index behavior.
-    pub remote_index: Option<Arc<crate::policies::remote_index::RemoteIndexHandle>>,
+    pub remote_index: Option<Arc<RemoteIndexHandle>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
     /// Bind address for WebRTC UDP sockets (`None` = `0.0.0.0`, auto-detect).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -117,7 +117,7 @@ pub struct AppContextBuilder {
     mcp_format_registry: Option<FormatRegistry>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
-    remote_index: Option<Arc<crate::policies::remote_index::RemoteIndexHandle>>,
+    remote_index: Option<Arc<RemoteIndexHandle>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
 }
@@ -744,7 +744,7 @@ impl AppContextBuilder {
         // overlap query + placement publish through one call. Unset leaves
         // every code path on its exact prior behavior.
         if let Some(url) = &config.kv_indexer_url {
-            let handle = crate::policies::remote_index::RemoteIndexHandle::connect(
+            let handle = RemoteIndexHandle::connect(
                 url,
                 // Default shared with the bridge's --block-size: the
                 // keyspace key includes block size, and divergent

@@ -44,7 +44,10 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{policy_filters_unavailable_workers, PolicyRegistry, SelectWorkerInfo},
+    policies::{
+        policy_filters_unavailable_workers, remote_index::IndexPrediction, PolicyRegistry,
+        SelectWorkerInfo,
+    },
     routers::{
         common::{
             attach_sized_body,
@@ -535,7 +538,7 @@ impl Router {
         // borrowed across it; gated on the flag so it is zero-cost when the
         // shared index is off.
         let mut remote_overlap: Option<crate::policies::RemoteOverlap> = None;
-        let mut index_prediction: Option<crate::policies::remote_index::IndexPrediction> = None;
+        let mut index_prediction: Option<IndexPrediction> = None;
         if self.policy_registry.remote_index_enabled() {
             let (owned_tokens, owned_text, owned_rid) = lease.with_view(|view| {
                 (

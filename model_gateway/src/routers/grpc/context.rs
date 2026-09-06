@@ -40,6 +40,7 @@ use super::{
 };
 use crate::{
     middleware::TenantRequestMeta,
+    policies::remote_index::IndexPrediction,
     routers::error::internal_error,
     worker::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
 };
@@ -212,7 +213,7 @@ pub(crate) struct ProcessingState {
     /// Remote radix-index prefetch outcome (selection stage), consumed by
     /// the placement publish and the response echo headers. `None` unless
     /// `--kv-indexer-url` is set and the request took the prefetch path.
-    pub index_prediction: Option<crate::policies::remote_index::IndexPrediction>,
+    pub index_prediction: Option<IndexPrediction>,
 
     // Response processing state seeded during ingress (stop decoder, router
     // stop obligations, derived skip_special_tokens).
@@ -284,7 +285,7 @@ pub(crate) struct DispatchContext {
     pub load_guards: Option<LoadGuards>,
     /// Remote radix-index prefetch outcome, carried across the build
     /// boundary for the placement publish and response echo headers.
-    pub index_prediction: Option<crate::policies::remote_index::IndexPrediction>,
+    pub index_prediction: Option<IndexPrediction>,
     pub response: ResponseState,
 }
 
