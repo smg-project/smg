@@ -113,7 +113,14 @@ impl PipelineStage for WorkerSelectionStage {
         // would actually read it (tokens win otherwise).
         let keep_text =
             tokens.is_none() || self.policy_registry.any_policy_needs_request_text(headers);
-        let cache_namespace = CacheNamespace::derive(&ctx.input.request_type.cache_partition());
+        // The typed engine wires (gRPC servicers, direct ZMQ) do not carry the
+        // request's cache-partition fields yet, so the engine's prefix cache
+        // is unpartitioned on this path and the router must not split
+        // affinity for it: a namespace here would cost cache hits for every
+        // request that sets a salt today. The snapshot carries the field so
+        // the forwarding change can derive it (as the HTTP proxy path does via
+        // `GenerationRequest::cache_partition`) without touching selection.
+        let cache_namespace: Option<CacheNamespace> = None;
         ctx.state.routing_snapshot = Some(RoutingSnapshot {
             routing_text: keep_text.then(|| text.map(str::to_string)).flatten(),
             token_ids: ids.to_vec(),
@@ -1542,5 +1549,91 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "verdict must reflect the pinned pool, not every runtime"
         );
+    }
+
+    /// The namespace lives on the routing snapshot so a retry re-selects in
+    /// the same cache partition: the retained snapshot, not a re-derivation
+    /// from a request that may already be released, decides the key.
+    #[test]
+    fn reselect_keys_affinity_under_the_retained_cache_namespace() {
+        use openai_protocol::common::CachePartition;
+
+        let model_id = "namespace-retry-model";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let workers: Vec<Arc<dyn Worker>> = ["grpc://127.0.0.1:9401", "grpc://127.0.0.1:9402"]
+            .iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(*url)
+                        .model(ModelCard::new(model_id))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::Vllm)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        for worker in &workers {
+            worker_registry.register(Arc::clone(worker)).unwrap();
+        }
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 0,
+                max_tree_size: 4096,
+                block_size: 16,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
+            })),
+            WorkerSelectionMode::Regular,
+        );
+        let wire = WireConstraint {
+            runtime: RuntimeType::Vllm,
+            connection: ConnectionMode::Grpc,
+        };
+        let namespace = |salt: &str| {
+            CacheNamespace::derive(&CachePartition {
+                cache_salt: Some(salt),
+                extra_key: None,
+                lora_path: None,
+            })
+        };
+        let selected = |ctx: &DispatchContext| match ctx.workers.as_ref().unwrap() {
+            WorkerSelection::Single { worker } => worker.url().to_string(),
+            WorkerSelection::Disaggregated { .. } => panic!("expected single selection"),
+        };
+        let prompt: Vec<u32> = (1..33).collect();
+
+        // Worker 1 is busier, so tenant A's first selection lands on worker 2.
+        workers[0].increment_load();
+        let mut ctx = dispatch_ctx(model_id, wire);
+        ctx.routing.token_ids = prompt.clone();
+        ctx.routing.cache_namespace = namespace("tenant-a");
+        stage.reselect(&mut ctx).unwrap();
+        assert_eq!(selected(&ctx), "grpc://127.0.0.1:9402");
+
+        // A retry from the retained snapshot stays in tenant A's partition
+        // even once worker 2 is the busier one...
+        workers[1].increment_load();
+        workers[1].increment_load();
+        stage.reselect(&mut ctx).unwrap();
+        assert_eq!(selected(&ctx), "grpc://127.0.0.1:9402");
+
+        // ...while a retained snapshot for tenant B misses and takes the
+        // least-loaded worker 1.
+        let mut other = dispatch_ctx(model_id, wire);
+        other.routing.token_ids = prompt;
+        other.routing.cache_namespace = namespace("tenant-b");
+        stage.reselect(&mut other).unwrap();
+        assert_eq!(selected(&other), "grpc://127.0.0.1:9401");
     }
 }

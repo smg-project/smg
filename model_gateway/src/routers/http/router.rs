@@ -1700,8 +1700,10 @@ impl Router {
         let model_id = crate::worker::UNKNOWN_MODEL_ID;
         // Buffered-path parity: a valid tokens hint is exactly what selection
         // would have received there (text is never extracted alongside it).
-        // Streamed requests have no readable body, hence no rid key;
-        // routing-key override is excluded by the body-path gate above.
+        // Streamed requests have no readable body, hence no rid key and no
+        // cache namespace: selection keys unpartitioned here, so a request
+        // that needs partitioned affinity must take the buffered path.
+        // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
         let Some(worker) = self.select_worker_for_model(
             model_id,

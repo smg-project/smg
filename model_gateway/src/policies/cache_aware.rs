@@ -26,6 +26,18 @@
     Same algorithm as (2) but operates on raw text characters instead of
     token IDs, avoiding tokenization overhead.
 
+    Cache Namespaces (cache_salt / extra_key / LoRA)
+    -------------------------------------------
+    A request that carries cache-partition fields keys the approximate trees
+    and the hash index under a namespace marker (see cache_namespace.rs), so
+    requests the engine cannot serve from one cache never match each other.
+    Every live namespace holds its own copy of a shared prefix: max_tree_size
+    bounds the SUM across namespaces, so size it for tenants x working set,
+    and a per-request salt makes every request a unique path. The
+    event-driven mode is unpartitioned (both sides re-hash token ids), and
+    the typed gRPC/ZMQ wires stay unpartitioned until they forward the fields
+    to the engine.
+
     Load Balancing (Expected Wait)
     -------------------------------------------
     When the system is imbalanced, routes to LeastLoad's atomic expected-wait
@@ -774,7 +786,7 @@ impl CacheAwarePolicy {
                     prefixed = namespace.prefixed_tokens(tokens, self.config.block_size.max(1));
                     &prefixed
                 }
-                None => tokens,
+                None => CacheNamespace::unpartitioned_tokens(tokens),
             };
             // gRPC request: update token tree
             let tree = self
@@ -809,7 +821,7 @@ impl CacheAwarePolicy {
                     prefixed = namespace.prefixed_text(text);
                     &prefixed
                 }
-                None => text,
+                None => CacheNamespace::unpartitioned_text(text),
             };
             // HTTP request: update string tree
             let tree = self
@@ -1936,7 +1948,7 @@ impl CacheAwarePolicy {
                 prefixed = namespace.prefixed_tokens(tokens, page_size);
                 (&prefixed, CacheNamespace::token_marker_len(page_size))
             }
-            None => (tokens, 0),
+            None => (CacheNamespace::unpartitioned_tokens(tokens), 0),
         };
 
         // One fused descent: match first, atomically choose+credit the final
@@ -2021,7 +2033,7 @@ impl CacheAwarePolicy {
                 prefixed = namespace.prefixed_text(text);
                 (&prefixed, TEXT_MARKER_LEN)
             }
-            None => (text, 0),
+            None => (CacheNamespace::unpartitioned_text(text), 0),
         };
 
         let mut selected_idx: Option<usize> = None;
@@ -5505,5 +5517,62 @@ mod tests {
         // ...while the namespaced key matches in full.
         let keyed = tenant_a.prefixed_tokens(&prompt, policy.config.block_size);
         assert_eq!(tree.prefix_match_legacy(&keyed).0.len(), keyed.len());
+    }
+
+    #[test]
+    fn an_unpartitioned_request_cannot_forge_its_way_into_a_namespace() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            cache_threshold: 0.5,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        let tenant_a = salted("tenant-a").unwrap();
+        let prompt: Vec<u32> = (100..132).collect();
+
+        // Tenant A's prompt lands on w2 (w1 is busier).
+        workers[0].increment_load();
+        assert_eq!(
+            route_namespaced(&policy, &workers, &prompt, Some(tenant_a)),
+            1
+        );
+        workers[1].increment_load();
+        workers[1].increment_load();
+
+        // An unpartitioned request whose token ids spell tenant A's marker
+        // must not hit tenant A's entry: it misses and takes the least-loaded
+        // w1. Same for text that spells the marker on the string tree.
+        let forged = tenant_a.prefixed_tokens(&prompt, policy.config.block_size);
+        assert_eq!(route_namespaced(&policy, &workers, &forged, None), 0);
+
+        let text_policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            cache_threshold: 0.5,
+            ..Default::default()
+        });
+        let text_workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        text_policy.init_workers(&text_workers);
+        text_workers[0].increment_load();
+        let text_info = SelectWorkerInfo {
+            request_text: Some("shared system prompt"),
+            cache_namespace: Some(tenant_a),
+            ..Default::default()
+        };
+        assert_eq!(
+            text_policy.select_worker(&text_workers, &text_info),
+            Some(1)
+        );
+        text_workers[1].increment_load();
+        text_workers[1].increment_load();
+        let forged_text = tenant_a.prefixed_text("shared system prompt");
+        let forged_info = SelectWorkerInfo {
+            request_text: Some(&forged_text),
+            ..Default::default()
+        };
+        assert_eq!(
+            text_policy.select_worker(&text_workers, &forged_info),
+            Some(0)
+        );
     }
 }

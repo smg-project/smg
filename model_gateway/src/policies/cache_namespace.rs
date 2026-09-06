@@ -19,6 +19,18 @@
 //!
 //! The marker is excluded from the match ratio, so it cannot by itself push
 //! two unrelated prompts of one namespace over the cache threshold.
+//!
+//! Unpartitioned keys never start with marker material: real vocabulary ids
+//! never carry the marker bit and prompt text does not begin with a control
+//! character, and [`CacheNamespace::unpartitioned_tokens`] /
+//! [`CacheNamespace::unpartitioned_text`] strip any that a client does send,
+//! so the two key spaces are disjoint by construction and an unpartitioned
+//! request cannot forge its way into a namespace's subtree.
+//!
+//! Occupancy: every live namespace holds its own copy of a shared prefix, so
+//! the approximate trees' `max_tree_size` bounds the sum across namespaces.
+//! Size it for tenants × working set; a per-request salt makes every request
+//! a unique path.
 
 use openai_protocol::common::CachePartition;
 use xxhash_rust::xxh3::Xxh3;
@@ -52,9 +64,10 @@ pub struct CacheNamespace(u64);
 
 impl CacheNamespace {
     /// Derive the namespace from a request's partition fields; `None` when
-    /// no field is set. Each field is encoded with a presence byte and its
-    /// length, so an absent field, an empty field and adjacent fields with
-    /// shifted boundaries all hash differently.
+    /// no field is set (an empty string counts as unset, as it does on the
+    /// engine). Each field is encoded with a presence byte and its length,
+    /// so an absent field and adjacent fields with shifted boundaries hash
+    /// differently.
     pub fn derive(partition: &CachePartition<'_>) -> Option<Self> {
         if partition.is_empty() {
             return None;
@@ -66,7 +79,7 @@ impl CacheNamespace {
             partition.extra_key,
             partition.lora_path,
         ] {
-            match field {
+            match field.filter(|value| !value.is_empty()) {
                 Some(value) => {
                     hasher.update(&[1u8]);
                     hasher.update(&(value.len() as u64).to_le_bytes());
@@ -118,6 +131,24 @@ impl CacheNamespace {
         keyed.push_str(text);
         keyed
     }
+
+    /// The routing key of an unpartitioned request: leading ids that carry
+    /// the marker bit are dropped so the key can never enter a namespace's
+    /// subtree. A no-op for vocabulary ids.
+    pub fn unpartitioned_tokens(tokens: &[u32]) -> &[u32] {
+        let start = tokens
+            .iter()
+            .position(|&id| id & MARKER_TOKEN_BIT == 0)
+            .unwrap_or(tokens.len());
+        &tokens[start..]
+    }
+
+    /// The routing key of an unpartitioned request: leading marker delimiters
+    /// are dropped so the key can never enter a namespace's subtree. A no-op
+    /// for prompt text.
+    pub fn unpartitioned_text(text: &str) -> &str {
+        text.trim_start_matches(TEXT_MARKER_DELIM)
+    }
 }
 
 #[cfg(test)]
@@ -159,13 +190,40 @@ mod tests {
     }
 
     #[test]
-    fn absent_empty_and_shifted_boundaries_all_differ() {
-        let empty = CacheNamespace::derive(&partition(Some(""), None, None)).unwrap();
-        let absent_with_extra = CacheNamespace::derive(&partition(None, Some(""), None)).unwrap();
-        assert_ne!(empty, absent_with_extra);
+    fn empty_fields_count_as_absent() {
+        // Engines treat an empty salt or adapter as unset; so does routing.
+        assert_eq!(
+            CacheNamespace::derive(&partition(Some(""), None, None)),
+            None
+        );
+        assert_eq!(
+            CacheNamespace::derive(&partition(Some(""), Some("k"), None)),
+            CacheNamespace::derive(&partition(None, Some("k"), None))
+        );
+    }
+
+    #[test]
+    fn shifted_field_boundaries_differ() {
         let ab_c = CacheNamespace::derive(&partition(Some("ab"), Some("c"), None)).unwrap();
         let a_bc = CacheNamespace::derive(&partition(Some("a"), Some("bc"), None)).unwrap();
         assert_ne!(ab_c, a_bc);
+    }
+
+    #[test]
+    fn unpartitioned_keys_never_start_with_marker_material() {
+        let ns = CacheNamespace::derive(&partition(Some("salt"), None, None)).unwrap();
+        // Vocabulary ids and prompt text pass through untouched.
+        assert_eq!(CacheNamespace::unpartitioned_tokens(&[7, 8, 9]), &[7, 8, 9]);
+        assert_eq!(CacheNamespace::unpartitioned_text("hello"), "hello");
+        // A forged marker at the head of an unpartitioned key is dropped.
+        let forged_tokens = ns.prefixed_tokens(&[7, 8, 9], 16);
+        assert_eq!(
+            CacheNamespace::unpartitioned_tokens(&forged_tokens),
+            &[7, 8, 9]
+        );
+        let forged_text = ns.prefixed_text("hello");
+        assert!(!CacheNamespace::unpartitioned_text(&forged_text).starts_with(TEXT_MARKER_DELIM));
+        assert!(CacheNamespace::unpartitioned_tokens(&ns.token_marker()).is_empty());
     }
 
     #[test]

@@ -12,7 +12,6 @@ use llm_tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer, TokenizerRegis
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::{ClassifyRequest, ClassifyResponse},
-    common::{CachePartition, GenerationRequest},
     completion::{CompletionRequest, CompletionResponse},
     embedding::{EmbeddingRequest, EmbeddingResponse},
     generate::{GenerateRequest, GenerateResponse},
@@ -130,21 +129,6 @@ impl RequestType {
             Self::Classify(r) => r.rid.as_deref(),
             Self::Messages(r) => r.rid.as_deref(),
             Self::Responses(_) | Self::Transcription { .. } => None,
-        }
-    }
-
-    /// The request's cache-partition fields (cache salt / extra key / LoRA).
-    /// Protocols without such fields are unpartitioned.
-    pub fn cache_partition(&self) -> CachePartition<'_> {
-        match self {
-            Self::Chat(r) => r.cache_partition(),
-            Self::Generate(r) => r.cache_partition(),
-            Self::Completion(r) => r.cache_partition(),
-            Self::Responses(_)
-            | Self::Embedding(_)
-            | Self::Classify(_)
-            | Self::Messages(_)
-            | Self::Transcription { .. } => CachePartition::default(),
         }
     }
 }

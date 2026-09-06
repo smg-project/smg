@@ -70,9 +70,13 @@ pub struct CachePartition<'a> {
 }
 
 impl CachePartition<'_> {
-    /// True when no partitioning field is set.
+    /// True when no partitioning field is set. An empty string is "unset":
+    /// engines treat an empty salt or adapter as absent, so it must not
+    /// split the request off from the shared unpartitioned cache.
     pub fn is_empty(&self) -> bool {
-        self.cache_salt.is_none() && self.extra_key.is_none() && self.lora_path.is_none()
+        [self.cache_salt, self.extra_key, self.lora_path]
+            .iter()
+            .all(|field| field.is_none_or(str::is_empty))
     }
 }
 
