@@ -68,6 +68,7 @@ CRATES=(
     "smg-auth|crates/auth|smg-auth"
     "smg-mcp|crates/mcp|smg-mcp"
     "kv-index|crates/kv_index|kv-index"
+    "smg-radix-tree|crates/radix_tree|smg-radix-tree"
     "data-connector|crates/data_connector|smg-data-connector"
     "llm-multimodal|crates/multimodal|llm-multimodal"
     "smg-wasm|crates/wasm|smg-wasm"

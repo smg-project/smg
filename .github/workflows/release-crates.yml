@@ -41,6 +41,8 @@ jobs:
             path: crates/mm_rdma
           - crate: engine-zmq-client
             path: crates/engine_zmq_client
+          - crate: smg-radix-tree
+            path: crates/radix_tree
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/publish-crate
