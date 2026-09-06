@@ -235,10 +235,12 @@ async fn execute_mcp_tool_loop_streaming(
         {
             Ok(result) => result,
             Err(err_response) => {
+                Metrics::record_responses_stream_failure(&current_request.model, "backend_error");
                 emitter
-                    .emit_error(
+                    .emit_failed(
+                        "pipeline_error",
                         &format!("Pipeline execution failed: {err_response:?}"),
-                        Some("pipeline_error"),
+                        None,
                         tx,
                     )
                     .await;
@@ -258,8 +260,11 @@ async fn execute_mcp_tool_loop_streaming(
         {
             Ok(result) => result,
             Err(err_msg) => {
+                // Mid-stream backend death: terminal-fail with the partial
+                // output attached rather than a bare error frame.
+                Metrics::record_responses_stream_failure(&current_request.model, "backend_error");
                 emitter
-                    .emit_error(&err_msg, Some("processing_error"), tx)
+                    .emit_failed("processing_error", &err_msg, None, tx)
                     .await;
                 return;
             }
@@ -457,10 +462,12 @@ async fn execute_without_mcp_streaming(
     {
         Ok(result) => result,
         Err(err_response) => {
+            Metrics::record_responses_stream_failure(&current_request.model, "backend_error");
             emitter
-                .emit_error(
+                .emit_failed(
+                    "pipeline_error",
                     &format!("Pipeline execution failed: {err_response:?}"),
-                    Some("pipeline_error"),
+                    None,
                     tx,
                 )
                 .await;
@@ -480,8 +487,11 @@ async fn execute_without_mcp_streaming(
     {
         Ok(result) => result,
         Err(err_msg) => {
+            // Mid-stream backend death: terminal-fail with the partial output
+            // attached rather than a bare error frame.
+            Metrics::record_responses_stream_failure(&current_request.model, "backend_error");
             emitter
-                .emit_error(&err_msg, Some("processing_error"), tx)
+                .emit_failed("processing_error", &err_msg, None, tx)
                 .await;
             return;
         }

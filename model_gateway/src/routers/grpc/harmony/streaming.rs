@@ -848,6 +848,9 @@ impl HarmonyStreamingProcessor {
                                     // Emit output_item.added
                                     let event = emitter.emit_output_item_added(output_index, &item);
                                     emitter.send_event_best_effort(&event, tx).await;
+                                    // Registered so a mid-stream failure can close
+                                    // this item with its partial text (emit_failed).
+                                    emitter.track_open_message(output_index, &item_id);
                                 }
 
                                 let Some(output_index) = message_output_index else {
@@ -1135,6 +1138,7 @@ impl HarmonyStreamingProcessor {
                             "id": item_id,
                             "type": "message",
                             "role": "assistant",
+                            "status": "completed",
                             "content": [{
                                 "type": "output_text",
                                 "text": accumulated_final_text.clone()
