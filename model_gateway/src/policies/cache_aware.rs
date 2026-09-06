@@ -1684,7 +1684,13 @@ impl CacheAwarePolicy {
         let now = Instant::now();
 
         // Hash mode keys on token ids; untokenized requests stay load-balanced.
-        let Some(tokens) = info.tokens.filter(|t| !t.is_empty()) else {
+        // Unpartitioned heads are stripped of marker material like the tree
+        // keys, so the placement key spaces stay disjoint by construction too.
+        let tokens = match info.cache_namespace {
+            Some(_) => info.tokens,
+            None => info.tokens.map(CacheNamespace::unpartitioned_tokens),
+        };
+        let Some(tokens) = tokens.filter(|t| !t.is_empty()) else {
             return self.hash_expected_wait(
                 workers,
                 info,
@@ -5574,5 +5580,29 @@ mod tests {
             text_policy.select_worker(&text_workers, &forged_info),
             Some(0)
         );
+    }
+
+    #[test]
+    fn hash_mode_strips_marker_material_from_unpartitioned_heads() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[4]));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        let tokens = [1u32, 2, 3, 4, 5];
+        let tenant_a = salted("tenant-a").unwrap();
+
+        // Tenant A's placement lands on w2 (w1 is busier).
+        workers[0].increment_load();
+        assert_eq!(
+            route_namespaced(&policy, &workers, &tokens, Some(tenant_a)),
+            1
+        );
+        workers[1].increment_load();
+        workers[1].increment_load();
+
+        // An unpartitioned head that spells tenant A's marker keys as the
+        // bare prompt: no holder, so it takes the least-loaded w1.
+        let mut forged = tenant_a.token_marker().to_vec();
+        forged.extend_from_slice(&tokens);
+        assert_eq!(route_namespaced(&policy, &workers, &forged, None), 0);
     }
 }
