@@ -12,6 +12,7 @@ use llm_tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer, TokenizerRegis
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::{ClassifyRequest, ClassifyResponse},
+    common::{CachePartition, GenerationRequest},
     completion::{CompletionRequest, CompletionResponse},
     embedding::{EmbeddingRequest, EmbeddingResponse},
     generate::{GenerateRequest, GenerateResponse},
@@ -40,6 +41,7 @@ use super::{
 };
 use crate::{
     middleware::TenantRequestMeta,
+    policies::CacheNamespace,
     routers::error::internal_error,
     worker::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
 };
@@ -128,6 +130,21 @@ impl RequestType {
             Self::Classify(r) => r.rid.as_deref(),
             Self::Messages(r) => r.rid.as_deref(),
             Self::Responses(_) | Self::Transcription { .. } => None,
+        }
+    }
+
+    /// The request's cache-partition fields (cache salt / extra key / LoRA).
+    /// Protocols without such fields are unpartitioned.
+    pub fn cache_partition(&self) -> CachePartition<'_> {
+        match self {
+            Self::Chat(r) => r.cache_partition(),
+            Self::Generate(r) => r.cache_partition(),
+            Self::Completion(r) => r.cache_partition(),
+            Self::Responses(_)
+            | Self::Embedding(_)
+            | Self::Classify(_)
+            | Self::Messages(_)
+            | Self::Transcription { .. } => CachePartition::default(),
         }
     }
 }
@@ -223,6 +240,8 @@ pub(crate) struct RoutingSnapshot {
     pub token_ids: Vec<u32>,
     /// rid-derived sticky key, derived once at first selection.
     pub rid_key: Option<String>,
+    /// The request's cache namespace, derived once at first selection.
+    pub cache_namespace: Option<CacheNamespace>,
 }
 
 /// The wire the retained plan was built for. Retry re-selection filters

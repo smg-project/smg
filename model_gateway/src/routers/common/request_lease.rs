@@ -5,7 +5,9 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use bytes::Bytes;
 
 use super::trim_serialization_slack;
-use crate::{config::types::RetryConfig, observability::metrics::Metrics};
+use crate::{
+    config::types::RetryConfig, observability::metrics::Metrics, policies::CacheNamespace,
+};
 
 /// When a [`RequestLease`] lets go of the parsed request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +35,7 @@ pub(crate) struct RoutingDerivatives {
     pub tokens: Option<Vec<u32>>,
     pub text: Option<String>,
     pub rid_key: Option<String>,
+    pub cache_namespace: Option<CacheNamespace>,
 }
 
 /// Borrowed view of the leased request and its routing derivatives.
@@ -42,6 +45,7 @@ pub(crate) struct LeaseView<'a, T> {
     pub tokens: Option<&'a [u32]>,
     pub text: Option<&'a str>,
     pub rid_key: Option<&'a str>,
+    pub cache_namespace: Option<CacheNamespace>,
 }
 
 /// Single owner of a request's dispatch-phase memory: the parsed request,
@@ -188,6 +192,7 @@ impl<T> RequestLease<T> {
             tokens: held.routing.tokens.as_deref(),
             text: held.routing.text.as_deref(),
             rid_key: held.routing.rid_key.as_deref(),
+            cache_namespace: held.routing.cache_namespace,
         }
     }
 }

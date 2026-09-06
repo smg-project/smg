@@ -33,7 +33,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     routers::{
         common::{
             attach_sized_body, header_utils,
@@ -466,6 +466,7 @@ impl PDRouter {
                 view.text,
                 view.tokens,
                 view.rid_key,
+                view.cache_namespace,
                 context.model_id,
                 context.headers.as_ref(),
             )
@@ -1310,6 +1311,7 @@ impl PDRouter {
         request_text: Option<&str>,
         tokens: Option<&[u32]>,
         rid_key: Option<&str>,
+        cache_namespace: Option<CacheNamespace>,
         model_id: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<PdPair, Box<PdSelectionFailure>> {
@@ -1364,6 +1366,7 @@ impl PDRouter {
                 request_text,
                 tokens,
                 rid_key,
+                cache_namespace,
                 headers,
                 hash_ring.clone(),
                 "prefill",
@@ -1378,6 +1381,7 @@ impl PDRouter {
                 request_text,
                 tokens,
                 rid_key,
+                cache_namespace,
                 headers,
                 hash_ring,
                 "decode",
@@ -1414,6 +1418,7 @@ impl PDRouter {
         request_text: Option<&str>,
         tokens: Option<&[u32]>,
         rid_key: Option<&str>,
+        cache_namespace: Option<CacheNamespace>,
         headers: Option<&HeaderMap>,
         hash_ring: Option<Arc<HashRing>>,
         worker_type: &str,
@@ -1448,6 +1453,7 @@ impl PDRouter {
                     headers,
                     routing_key: self.policy_registry.resolve_routing_key(headers),
                     rid_key,
+                    cache_namespace,
                     hash_ring,
                     leg,
                 },
@@ -1846,22 +1852,22 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None)
-        {
-            Ok(pair) => pair,
-            // A deep probe that generates gets the same answer routing does:
-            // an all-vetoed fleet fails the probe, exactly as an all-circuit-
-            // broken one already did.
-            Err(failure) => match *failure {
-                PdSelectionFailure::Shed(shed) => return shed,
-                PdSelectionFailure::Unavailable(e) => {
-                    return error::service_unavailable(
-                        "no_healthy_worker_pair",
-                        format!("No healthy worker pair available: {e}"),
-                    );
-                }
-            },
-        };
+        let (prefill, decode) =
+            match self.select_pd_pair(None, None, None, None, UNKNOWN_MODEL_ID, None) {
+                Ok(pair) => pair,
+                // A deep probe that generates gets the same answer routing does:
+                // an all-vetoed fleet fails the probe, exactly as an all-circuit-
+                // broken one already did.
+                Err(failure) => match *failure {
+                    PdSelectionFailure::Shed(shed) => return shed,
+                    PdSelectionFailure::Unavailable(e) => {
+                        return error::service_unavailable(
+                            "no_healthy_worker_pair",
+                            format!("No healthy worker pair available: {e}"),
+                        );
+                    }
+                },
+            };
 
         let prefill_url = format!("{}/health_generate", prefill.url());
         let (prefill_result, decode_result) = tokio::join!(
@@ -1970,6 +1976,7 @@ impl RouterTrait for PDRouter {
                 .policy_registry
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
+            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
         };
         let context = PDRequestContext {
             route: "/generate",
@@ -2010,6 +2017,7 @@ impl RouterTrait for PDRouter {
                 .policy_registry
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
+            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
         };
         let context = PDRequestContext {
             route: "/v1/chat/completions",
@@ -2046,6 +2054,7 @@ impl RouterTrait for PDRouter {
                 .policy_registry
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
+            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
         };
         let context = PDRequestContext {
             route: "/v1/messages",
@@ -2082,6 +2091,7 @@ impl RouterTrait for PDRouter {
                 .policy_registry
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
+            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
         };
         let context = PDRequestContext {
             route: "/v1/responses",
@@ -2125,6 +2135,7 @@ impl RouterTrait for PDRouter {
                 .policy_registry
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
+            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
         };
         let context = PDRequestContext {
             route: "/v1/completions",
@@ -2160,6 +2171,7 @@ impl RouterTrait for PDRouter {
                 .policy_registry
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
+            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
         };
         let context = PDRequestContext {
             route: "/v1/rerank",
@@ -2387,7 +2399,7 @@ mod tests {
             .worker_registry
             .register_or_replace(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None);
+        let result = router.select_pd_pair(None, None, None, None, UNKNOWN_MODEL_ID, None);
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -2412,13 +2424,13 @@ mod tests {
         }
 
         let (prefill, decode) = router
-            .select_pd_pair(None, None, None, "GLM-5.2-Coding", None)
+            .select_pd_pair(None, None, None, None, "GLM-5.2-Coding", None)
             .expect("alias should select a PD pair");
         assert_eq!(prefill.url(), "http://prefill");
         assert_eq!(decode.url(), "http://decode");
 
         assert!(router
-            .select_pd_pair(None, None, None, "GLM-5.2-Unknown", None)
+            .select_pd_pair(None, None, None, None, "GLM-5.2-Unknown", None)
             .is_err());
     }
 
@@ -2426,7 +2438,7 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None);
+        let result = router.select_pd_pair(None, None, None, None, UNKNOWN_MODEL_ID, None);
 
         assert!(result.is_err());
         // No workers at all is the pre-existing unavailable string, not a shed:

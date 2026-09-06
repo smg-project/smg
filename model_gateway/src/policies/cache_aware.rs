@@ -71,8 +71,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use super::{
-    normalize_model_key, utils::PeriodicTask, CacheAwareConfig, LeastLoadPolicy,
-    LoadBalancingPolicy, SelectWorkerInfo,
+    normalize_model_key, utils::PeriodicTask, CacheAwareConfig, CacheNamespace, LeastLoadPolicy,
+    LoadBalancingPolicy, SelectWorkerInfo, TEXT_MARKER_LEN,
 };
 /// Latest per-worker backend load snapshot stream, keyed by worker URL.
 pub(crate) use crate::worker::load_state::{LoadReceiver, LoadSnapshot};
@@ -172,8 +172,20 @@ struct PlacementHolder {
 /// evicts the stalest.
 const PLACEMENT_HOLDER_CAP: usize = 3;
 
-fn hash_token_head(head: &[u32]) -> u64 {
-    xxhash_rust::xxh3::xxh3_64(bytemuck::cast_slice(head))
+fn hash_token_head(namespace: Option<CacheNamespace>, head: &[u32]) -> u64 {
+    match namespace {
+        // An unpartitioned head hashes exactly as before.
+        None => xxhash_rust::xxh3::xxh3_64(bytemuck::cast_slice(head)),
+        // A partitioned head hashes as marker ‖ head (the placement index has
+        // no pages, so the bare marker suffices): a differing namespace is a
+        // different key, and a same-namespace head keys as before.
+        Some(namespace) => {
+            let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+            hasher.update(bytemuck::cast_slice(&namespace.token_marker()));
+            hasher.update(bytemuck::cast_slice(head));
+            hasher.digest()
+        }
+    }
 }
 
 /// Per-model inner container for [`CacheAwarePolicy::hash_index`].
@@ -751,9 +763,19 @@ impl CacheAwarePolicy {
         let selected = self.select_expected_wait(workers, healthy_indices, info)?;
         let worker_url = workers[selected].url();
 
-        // Even in imbalanced mode, update the appropriate tree to maintain cache state
-        // Prefer token tree for gRPC requests, fall back to string tree for HTTP
+        // Even in imbalanced mode, update the appropriate tree to maintain cache
+        // state, under the request's cache namespace so a partitioned request
+        // never seeds affinity for other partitions. Prefer the token tree for
+        // gRPC requests, fall back to the string tree for HTTP.
         if let Some(tokens) = info.tokens {
+            let prefixed;
+            let tokens: &[u32] = match info.cache_namespace {
+                Some(namespace) => {
+                    prefixed = namespace.prefixed_tokens(tokens, self.config.block_size.max(1));
+                    &prefixed
+                }
+                None => tokens,
+            };
             // gRPC request: update token tree
             let tree = self
                 .token_trees
@@ -781,6 +803,14 @@ impl CacheAwarePolicy {
                 }
             }
         } else if let Some(text) = info.request_text {
+            let prefixed;
+            let text: &str = match info.cache_namespace {
+                Some(namespace) => {
+                    prefixed = namespace.prefixed_text(text);
+                    &prefixed
+                }
+                None => text,
+            };
             // HTTP request: update string tree
             let tree = self
                 .string_trees
@@ -1097,6 +1127,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         //   2. Approximate token tree: TokenTree prefix matching (gRPC, no events)
         //   3. Approximate string tree: Tree prefix matching (HTTP)
         if let Some(tokens) = request_tokens {
+            // Event-driven mode re-hashes engine-reported blocks from their
+            // token ids on both sides, so a namespace marker on the request
+            // side alone would break every same-namespace match. It stays
+            // unpartitioned here; the approximate and hash modes below key
+            // under the request's cache namespace.
             if self.has_event_indexer(model_id) {
                 self.select_worker_event_driven(
                     workers,
@@ -1685,7 +1720,10 @@ impl CacheAwarePolicy {
 
         let url_to_idx = Self::healthy_url_index(workers, healthy_indices);
         for &boundary in applicable.iter().rev() {
-            let key = (boundary, hash_token_head(&tokens[..boundary]));
+            let key = (
+                boundary,
+                hash_token_head(info.cache_namespace, &tokens[..boundary]),
+            );
             let holder_candidates = self.live_holder_candidates(&url_to_idx, model_id, key, now);
             if holder_candidates.is_empty() {
                 continue;
@@ -1702,7 +1740,14 @@ impl CacheAwarePolicy {
             } else {
                 "hash_spill"
             };
-            self.record_placement(model_id, tokens, applicable, workers[selected].url(), now);
+            self.record_placement(
+                model_id,
+                info.cache_namespace,
+                tokens,
+                applicable,
+                workers[selected].url(),
+                now,
+            );
             Self::log_hash_decision(branch, boundary, workers[selected].url(), model_id);
             return Some(selected);
         }
@@ -1735,7 +1780,14 @@ impl CacheAwarePolicy {
     ) -> Option<usize> {
         let idx = self.select_expected_wait(workers, healthy_indices, info)?;
         if !applicable.is_empty() {
-            self.record_placement(model_id, tokens, applicable, workers[idx].url(), now);
+            self.record_placement(
+                model_id,
+                info.cache_namespace,
+                tokens,
+                applicable,
+                workers[idx].url(),
+                now,
+            );
         }
         Self::log_hash_decision(branch, 0, workers[idx].url(), model_id);
         Some(idx)
@@ -1790,6 +1842,7 @@ impl CacheAwarePolicy {
     fn record_placement(
         &self,
         model_id: &str,
+        namespace: Option<CacheNamespace>,
         tokens: &[u32],
         boundaries: &[usize],
         worker_url: &str,
@@ -1807,7 +1860,7 @@ impl CacheAwarePolicy {
             )
         };
         for &boundary in boundaries {
-            let key = (boundary, hash_token_head(&tokens[..boundary]));
+            let key = (boundary, hash_token_head(namespace, &tokens[..boundary]));
             let mut holders = model.entry(key).or_default();
             holders.retain(|h| now.duration_since(h.last_touch) <= ttl);
             if let Some(holder) = holders.iter_mut().find(|h| h.worker_url == worker_url) {
@@ -1872,15 +1925,31 @@ impl CacheAwarePolicy {
             .value()
             .clone();
 
+        // A partitioned request keys under its namespace marker: another
+        // namespace diverges at position 0 and can never match, and the
+        // marker never counts toward the match ratio. The marker fills whole
+        // pages, so the prompt's page grid is the unpartitioned one.
+        let page_size = self.config.block_size.max(1);
+        let prefixed;
+        let (keyed, marker_len): (&[u32], usize) = match info.cache_namespace {
+            Some(namespace) => {
+                prefixed = namespace.prefixed_tokens(tokens, page_size);
+                (&prefixed, CacheNamespace::token_marker_len(page_size))
+            }
+            None => (tokens, 0),
+        };
+
         // One fused descent: match first, atomically choose+credit the final
         // worker from the affinity/spill candidate set, then insert only that
         // worker before the closure returns.
         let mut selected_idx: Option<usize> = None;
-        let result = tree.match_and_insert_with(tokens, |result| {
-            let match_rate = if result.input_token_count == 0 {
+        let result = tree.match_and_insert_with(keyed, |result| {
+            let matched = result.matched_token_count.saturating_sub(marker_len);
+            let input = result.input_token_count.saturating_sub(marker_len);
+            let match_rate = if input == 0 {
                 0.0
             } else {
-                result.matched_token_count as f32 / result.input_token_count as f32
+                matched as f32 / input as f32
             };
             selected_idx = if match_rate > self.config.cache_threshold {
                 self.select_matched_candidate(
@@ -1900,16 +1969,16 @@ impl CacheAwarePolicy {
         self.log_tree_decision(
             selected_idx.map(|idx| workers[idx].url()),
             healthy_indices.first().map(|&idx| workers[idx].url()),
-            result.matched_token_count,
-            result.input_token_count,
+            result.matched_token_count.saturating_sub(marker_len),
+            result.input_token_count.saturating_sub(marker_len),
             &result.matched_tenants,
             model_id,
         );
 
         let idx = selected_idx?;
         if self.should_populate_hash_index() {
-            let matched_prefix: Vec<u32> = tokens[..result.matched_token_count].to_vec();
-            let node_hash = kv_index::hash_token_path(tokens);
+            let matched_prefix: Vec<u32> = keyed[..result.matched_token_count].to_vec();
+            let node_hash = kv_index::hash_token_path(keyed);
             self.hash_index
                 .entry(model_id.to_string())
                 .or_default()
@@ -1945,12 +2014,24 @@ impl CacheAwarePolicy {
             .value()
             .clone();
 
+        // Same partition rule as the token tree, in chars.
+        let prefixed;
+        let (keyed, marker_len): (&str, usize) = match info.cache_namespace {
+            Some(namespace) => {
+                prefixed = namespace.prefixed_text(text);
+                (&prefixed, TEXT_MARKER_LEN)
+            }
+            None => (text, 0),
+        };
+
         let mut selected_idx: Option<usize> = None;
-        let result = tree.match_and_insert_with(text, |result| {
-            let match_rate = if result.input_char_count == 0 {
+        let result = tree.match_and_insert_with(keyed, |result| {
+            let matched = result.matched_char_count.saturating_sub(marker_len);
+            let input = result.input_char_count.saturating_sub(marker_len);
+            let match_rate = if input == 0 {
                 0.0
             } else {
-                result.matched_char_count as f32 / result.input_char_count as f32
+                matched as f32 / input as f32
             };
             selected_idx = if match_rate > self.config.cache_threshold {
                 self.select_matched_candidate(
@@ -1970,16 +2051,16 @@ impl CacheAwarePolicy {
         self.log_tree_decision(
             selected_idx.map(|idx| workers[idx].url()),
             healthy_indices.first().map(|&idx| workers[idx].url()),
-            result.matched_char_count,
-            result.input_char_count,
+            result.matched_char_count.saturating_sub(marker_len),
+            result.input_char_count.saturating_sub(marker_len),
             &result.matched_tenants,
             model_id,
         );
 
         let idx = selected_idx?;
         if self.should_populate_hash_index() {
-            let matched_prefix: String = text.chars().take(result.matched_char_count).collect();
-            let path_hash = kv_index::hash_node_path(text);
+            let matched_prefix: String = keyed.chars().take(result.matched_char_count).collect();
+            let path_hash = kv_index::hash_node_path(keyed);
             self.hash_index
                 .entry(model_id.to_string())
                 .or_default()
@@ -3377,7 +3458,7 @@ mod tests {
             token_tree.insert_tokens(&tokens, worker_url);
             policy.token_trees.insert(model_id.to_string(), token_tree);
 
-            policy.record_placement(model_id, &tokens, &[16], worker_url, Instant::now());
+            policy.record_placement(model_id, None, &tokens, &[16], worker_url, Instant::now());
         }
 
         policy.remove_workers_from_model("retired-model", &HashSet::from([worker_url.to_string()]));
@@ -4802,7 +4883,14 @@ mod tests {
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let model = normalize_model_key(workers[0].model_id());
         let cached: Vec<u32> = (0..16).collect();
-        policy.record_placement(model, &cached, &[16], workers[0].url(), Instant::now());
+        policy.record_placement(
+            model,
+            None,
+            &cached,
+            &[16],
+            workers[0].url(),
+            Instant::now(),
+        );
         workers[1].increment_load();
         update_expected_wait_loads(&policy, &workers, &[10_000, 0]);
 
@@ -4827,7 +4915,7 @@ mod tests {
         let model = normalize_model_key(workers[0].model_id());
         let placements = policy.placement_index.get(model).unwrap();
         let holders = placements
-            .get(&(16, hash_token_head(&tokens)))
+            .get(&(16, hash_token_head(None, &tokens)))
             .expect("final dispatch must be recorded");
         assert_eq!(holders.len(), 1);
         assert_eq!(holders[0].worker_url, workers[1].url());
@@ -4839,7 +4927,14 @@ mod tests {
         let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let model = normalize_model_key(workers[0].model_id());
         let tokens: Vec<u32> = (0..16).collect();
-        policy.record_placement(model, &tokens, &[16], workers[0].url(), Instant::now());
+        policy.record_placement(
+            model,
+            None,
+            &tokens,
+            &[16],
+            workers[0].url(),
+            Instant::now(),
+        );
         for _ in 0..100 {
             workers[0].increment_load();
         }
@@ -4853,7 +4948,9 @@ mod tests {
         assert_only_final_worker_credited(&policy, &workers, 2, 16);
 
         let placements = policy.placement_index.get(model).unwrap();
-        let holders = placements.get(&(16, hash_token_head(&tokens))).unwrap();
+        let holders = placements
+            .get(&(16, hash_token_head(None, &tokens)))
+            .unwrap();
         let holder_urls: HashSet<&str> = holders
             .iter()
             .map(|holder| holder.worker_url.as_str())
@@ -4887,8 +4984,8 @@ mod tests {
         let model = normalize_model_key(workers[0].model_id());
         let tokens: Vec<u32> = (0..16).collect();
         let now = Instant::now();
-        policy.record_placement(model, &tokens, &[16], workers[0].url(), now);
-        policy.record_placement(model, &tokens, &[16], workers[1].url(), now);
+        policy.record_placement(model, None, &tokens, &[16], workers[0].url(), now);
+        policy.record_placement(model, None, &tokens, &[16], workers[1].url(), now);
         for _ in 0..5 {
             workers[1].increment_load();
         }
@@ -4952,8 +5049,8 @@ mod tests {
         let now = Instant::now();
 
         // w2 holds the 16-token head, w1 the deeper 32-token head.
-        policy.record_placement(model, &tokens, &[16], "http://w2:8000", now);
-        policy.record_placement(model, &tokens, &[32], "http://w1:8000", now);
+        policy.record_placement(model, None, &tokens, &[16], "http://w2:8000", now);
+        policy.record_placement(model, None, &tokens, &[32], "http://w1:8000", now);
         // Even with the shallow holder strictly less loaded, the deeper
         // boundary must win.
         workers[0].increment_load();
@@ -4974,7 +5071,7 @@ mod tests {
         // 64 exceeds the request length: only the two applicable levels.
         assert_eq!(placements.len(), 2);
         for boundary in [16usize, 32] {
-            let key = (boundary, hash_token_head(&tokens[..boundary]));
+            let key = (boundary, hash_token_head(None, &tokens[..boundary]));
             let holders = placements.get(&key).unwrap();
             assert_eq!(holders.len(), 1);
             assert_eq!(holders[0].worker_url, workers[selected].url());
@@ -5022,9 +5119,9 @@ mod tests {
         let model = normalize_model_key(workers[0].model_id());
         let tokens: Vec<u32> = (0..16).collect();
         let t0 = Instant::now();
-        let key = (16usize, hash_token_head(&tokens[..16]));
+        let key = (16usize, hash_token_head(None, &tokens[..16]));
 
-        policy.record_placement(model, &tokens, &[16], "http://w1:8000", t0);
+        policy.record_placement(model, None, &tokens, &[16], "http://w1:8000", t0);
 
         let url_to_idx = CacheAwarePolicy::healthy_url_index(&workers, &[0, 1]);
         // Just inside the 180s default TTL: live.
@@ -5074,7 +5171,7 @@ mod tests {
         let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
         let tokens: Vec<u32> = (0..16).collect();
         let t0 = Instant::now();
-        let key = (16usize, hash_token_head(&tokens[..16]));
+        let key = (16usize, hash_token_head(None, &tokens[..16]));
 
         for (i, url) in [
             "http://w1:8000",
@@ -5085,7 +5182,14 @@ mod tests {
         .iter()
         .enumerate()
         {
-            policy.record_placement("m", &tokens, &[16], url, t0 + Duration::from_secs(i as u64));
+            policy.record_placement(
+                "m",
+                None,
+                &tokens,
+                &[16],
+                url,
+                t0 + Duration::from_secs(i as u64),
+            );
         }
 
         let placements = policy.placement_index.get("m").unwrap();
@@ -5100,9 +5204,16 @@ mod tests {
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let model = normalize_model_key(workers[0].model_id());
         let tokens: Vec<u32> = (0..16).collect();
-        let key = (16usize, hash_token_head(&tokens[..16]));
+        let key = (16usize, hash_token_head(None, &tokens[..16]));
 
-        policy.record_placement(model, &tokens, &[16], "http://w1:8000", Instant::now());
+        policy.record_placement(
+            model,
+            None,
+            &tokens,
+            &[16],
+            "http://w1:8000",
+            Instant::now(),
+        );
         // Past both gate margins (rel 1.1 of avg 50, abs avg+32): spill.
         for _ in 0..100 {
             workers[0].increment_load();
@@ -5126,7 +5237,14 @@ mod tests {
         let model = normalize_model_key(workers[0].model_id());
         let tokens: Vec<u32> = (0..16).collect();
 
-        policy.record_placement(model, &tokens, &[16], "http://w1:8000", Instant::now());
+        policy.record_placement(
+            model,
+            None,
+            &tokens,
+            &[16],
+            "http://w1:8000",
+            Instant::now(),
+        );
         workers[0].increment_load();
         let _tx = inject_kv(&policy, &workers, &[0.9, 0.1]);
 
@@ -5155,14 +5273,14 @@ mod tests {
         let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
         let tokens: Vec<u32> = (0..16).collect();
         let now = Instant::now();
-        policy.record_placement("m", &tokens, &[16], "http://w1:8000", now);
-        policy.record_placement("m", &tokens, &[16], "http://w2:8000", now);
+        policy.record_placement("m", None, &tokens, &[16], "http://w1:8000", now);
+        policy.record_placement("m", None, &tokens, &[16], "http://w2:8000", now);
 
         policy.remove_worker_by_url("http://w1:8000");
 
         let placements = policy.placement_index.get("m").unwrap();
         let holders = placements
-            .get(&(16usize, hash_token_head(&tokens[..16])))
+            .get(&(16usize, hash_token_head(None, &tokens[..16])))
             .unwrap();
         assert_eq!(holders.len(), 1);
         assert_eq!(holders[0].worker_url, "http://w2:8000");
@@ -5174,9 +5292,10 @@ mod tests {
         let fresh: Vec<u32> = (0..16).collect();
         let stale: Vec<u32> = (500..516).collect();
         let t0 = Instant::now();
-        policy.record_placement("m", &stale, &[16], "http://w1:8000", t0);
+        policy.record_placement("m", None, &stale, &[16], "http://w1:8000", t0);
         policy.record_placement(
             "m",
+            None,
             &fresh,
             &[16],
             "http://w1:8000",
@@ -5192,7 +5311,7 @@ mod tests {
         let placements = policy.placement_index.get("m").unwrap();
         assert_eq!(placements.len(), 1);
         assert!(placements
-            .get(&(16usize, hash_token_head(&fresh[..16])))
+            .get(&(16usize, hash_token_head(None, &fresh[..16])))
             .is_some());
     }
 
@@ -5202,9 +5321,9 @@ mod tests {
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let tokens: Vec<u32> = (0..16).collect();
         let now = Instant::now();
-        let key = (16usize, hash_token_head(&tokens[..16]));
-        policy.record_placement("m", &tokens, &[16], "http://w1:8000", now);
-        policy.record_placement("m", &tokens, &[16], "http://w2:8000", now);
+        let key = (16usize, hash_token_head(None, &tokens[..16]));
+        policy.record_placement("m", None, &tokens, &[16], "http://w1:8000", now);
+        policy.record_placement("m", None, &tokens, &[16], "http://w2:8000", now);
 
         // w1 unhealthy: its holder entry must not resolve.
         let url_to_idx = CacheAwarePolicy::healthy_url_index(&workers, &[1]);
@@ -5256,7 +5375,7 @@ mod tests {
                     for i in 0..50u32 {
                         let base = t * 1000 + i * 16;
                         let tokens: Vec<u32> = (base..base + 16).collect();
-                        policy.record_placement("m", &tokens, &[16], "http://w1:8000", now);
+                        policy.record_placement("m", None, &tokens, &[16], "http://w1:8000", now);
                         CacheAwarePolicy::sweep_placement_index(&policy.placement_index, ttl, now);
                     }
                 });
@@ -5275,5 +5394,116 @@ mod tests {
     fn with_config_normalizes_boundaries() {
         let policy = CacheAwarePolicy::with_config(hash_config(&[64, 16, 16, 0]));
         assert_eq!(policy.config.cache_boundaries, vec![16, 64]);
+    }
+
+    // ---- cache namespaces (cache_salt / extra_key / LoRA partitioning) ----
+
+    fn salted(salt: &str) -> Option<CacheNamespace> {
+        CacheNamespace::derive(&openai_protocol::common::CachePartition {
+            cache_salt: Some(salt),
+            extra_key: None,
+            lora_path: None,
+        })
+    }
+
+    fn route_namespaced(
+        policy: &CacheAwarePolicy,
+        workers: &[Arc<dyn Worker>],
+        tokens: &[u32],
+        cache_namespace: Option<CacheNamespace>,
+    ) -> usize {
+        policy
+            .select_worker(
+                workers,
+                &SelectWorkerInfo {
+                    tokens: Some(tokens),
+                    cache_namespace,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn head_hash_is_unchanged_without_a_namespace_and_keys_like_the_tree_with_one() {
+        let head = [5u32, 6, 7, 8];
+        assert_eq!(
+            hash_token_head(None, &head),
+            xxhash_rust::xxh3::xxh3_64(bytemuck::cast_slice(&head))
+        );
+        let tenant_a = salted("tenant-a").unwrap();
+        let tenant_b = salted("tenant-b").unwrap();
+        // A namespaced head hashes marker ‖ head (hash mode has no pages).
+        let mut keyed = tenant_a.token_marker().to_vec();
+        keyed.extend_from_slice(&head);
+        assert_eq!(
+            hash_token_head(Some(tenant_a), &head),
+            xxhash_rust::xxh3::xxh3_64(bytemuck::cast_slice(&keyed))
+        );
+        assert_ne!(
+            hash_token_head(Some(tenant_a), &head),
+            hash_token_head(None, &head)
+        );
+        assert_ne!(
+            hash_token_head(Some(tenant_a), &head),
+            hash_token_head(Some(tenant_b), &head)
+        );
+    }
+
+    #[test]
+    fn hash_mode_keys_placements_under_the_cache_namespace() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[4]));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        let tokens = [1u32, 2, 3, 4, 5];
+        let tenant_a = salted("tenant-a");
+        let tenant_b = salted("tenant-b");
+
+        // w1 is busier: tenant A's first request misses onto w2 and is
+        // recorded there under its namespace.
+        workers[0].increment_load();
+        assert_eq!(route_namespaced(&policy, &workers, &tokens, tenant_a), 1);
+        // A hash hit keeps tenant A on w2 once w2 is the busier worker...
+        workers[1].increment_load();
+        workers[1].increment_load();
+        assert_eq!(route_namespaced(&policy, &workers, &tokens, tenant_a), 1);
+        // ...while tenant B and an unpartitioned request key differently,
+        // miss, and take the least-loaded w1.
+        assert_eq!(route_namespaced(&policy, &workers, &tokens, tenant_b), 0);
+        assert_eq!(route_namespaced(&policy, &workers, &tokens, None), 0);
+    }
+
+    #[test]
+    fn imbalance_fallback_inserts_under_the_cache_namespace() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        // One full page (the tree is page-aligned at the default block size).
+        let prompt: Vec<u32> = (100..116).collect();
+        let tenant_a = salted("tenant-a").unwrap();
+        let model_id = normalize_model_key(workers[0].model_id());
+        // Materialize the model's token tree so the fallback path has one to
+        // update.
+        let seed: Vec<u32> = (1..17).collect();
+        route_namespaced(&policy, &workers, &seed, None);
+
+        let info = SelectWorkerInfo {
+            tokens: Some(&prompt),
+            cache_namespace: Some(tenant_a),
+            ..Default::default()
+        };
+        policy
+            .select_worker_fallback(&workers, &info, &[0, 1], model_id)
+            .unwrap();
+
+        let tree = policy.token_trees.get(model_id).unwrap().value().clone();
+        // The unpartitioned prompt cannot see the namespaced insert...
+        assert!(tree.prefix_match_legacy(&prompt).0.is_empty());
+        // ...while the namespaced key matches in full.
+        let keyed = tenant_a.prefixed_tokens(&prompt, policy.config.block_size);
+        assert_eq!(tree.prefix_match_legacy(&keyed).0.len(), keyed.len());
     }
 }

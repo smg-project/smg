@@ -6,10 +6,10 @@ use validator::Validate;
 
 use super::{
     common::{
-        default_true, deserialize_null_as_false, is_false, is_true, validate_stop, ChatLogProbs,
-        ContentPart, Function, FunctionCall, FunctionChoice, GenerationRequest, ResponseFormat,
-        StreamOptions, StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue,
-        ToolReference, Usage,
+        default_true, deserialize_null_as_false, is_false, is_true, validate_stop, CachePartition,
+        ChatLogProbs, ContentPart, Function, FunctionCall, FunctionChoice, GenerationRequest,
+        ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice,
+        ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -639,6 +639,16 @@ impl GenerationRequest for ChatCompletionRequest {
         self.stream
     }
 
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition {
+            // Engine extensions carried in the passthrough map, not typed
+            // fields: vLLM/SGLang `cache_salt`, SGLang `extra_key`.
+            cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
+            extra_key: self.other.get("extra_key").and_then(Value::as_str),
+            lora_path: self.lora_path.as_deref(),
+        }
+    }
+
     fn get_model(&self) -> Option<&str> {
         Some(&self.model)
     }
@@ -805,7 +815,7 @@ pub struct ChatStreamChoice {
 mod tests {
     use serde_json::{json, Value};
 
-    use super::{thinking_from_reasoning_effort, ChatCompletionRequest};
+    use super::{thinking_from_reasoning_effort, ChatCompletionRequest, GenerationRequest};
 
     fn request_with_output_fields(fields: &[(&str, Value)]) -> ChatCompletionRequest {
         let mut value = json!({
@@ -943,5 +953,28 @@ mod tests {
             serde_json::from_value(value).expect("request must deserialize");
         let tools = request.tools.expect("tools must be present");
         assert_eq!(tools[0].function.parameters, json!({}));
+    }
+
+    #[test]
+    fn cache_partition_reads_passthrough_salt_and_typed_lora() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "cache_salt": "tenant-a",
+            "extra_key": "k",
+            "lora_path": "adapter"
+        }))
+        .unwrap();
+        let partition = request.cache_partition();
+        assert_eq!(partition.cache_salt, Some("tenant-a"));
+        assert_eq!(partition.extra_key, Some("k"));
+        assert_eq!(partition.lora_path, Some("adapter"));
+
+        let bare: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(bare.cache_partition().is_empty());
     }
 }
