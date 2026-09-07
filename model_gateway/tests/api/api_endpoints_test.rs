@@ -944,7 +944,6 @@ mod responses_endpoint_tests {
         ctx.shutdown().await;
     }
 
-    #[cfg(feature = "provider-openai")]
     #[tokio::test]
     async fn test_v1_responses_get_multi_worker_uses_shared_storage() {
         // Start two mock workers

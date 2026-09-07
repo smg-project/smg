@@ -273,7 +273,7 @@ impl RouterFactory {
     pub async fn create_igw_routers(
         policy: &PolicyConfig,
         ctx: &Arc<AppContext>,
-    ) -> Vec<(RouterId, &'static str, Result<Box<dyn RouterTrait>, String>)> {
+    ) -> Vec<IgwRouterEntry> {
         let (encode_policy, prefill_policy, decode_policy) = match &ctx.router_config.mode {
             RoutingMode::PrefillDecode {
                 prefill_policy,

@@ -5,7 +5,7 @@
 //! admitted only when the router its traffic would reach exists in this
 //! build; nothing decides this at runtime.
 
-use openai_protocol::worker::{ProviderType, RuntimeType, WorkerSpec};
+use openai_protocol::worker::{ProviderType, RuntimeType, WorkerModels, WorkerSpec};
 
 /// The provider routers a build carries, one flag per feature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,14 +82,39 @@ fn targets_provider(spec: &WorkerSpec) -> bool {
     spec.runtime_type == RuntimeType::External || provider_of(spec).is_some()
 }
 
+/// Every provider a worker's traffic can be dispatched under, judged the way
+/// the dispatcher judges it: a model's own provider first, else the worker's.
+/// Only the listed models are ever dispatched to a worker that lists any, so
+/// the worker's own provider counts alone when it serves every model.
+/// Empty for a self-hosted engine.
+fn providers_needed(spec: &WorkerSpec) -> Vec<Option<ProviderType>> {
+    let default = provider_of(spec);
+    let cards: &[_] = match &spec.models {
+        WorkerModels::Wildcard => &[],
+        WorkerModels::Single(card) => std::slice::from_ref(card.as_ref()),
+        WorkerModels::Multi(cards) => cards,
+    };
+    if cards.is_empty() {
+        return vec![default];
+    }
+    let mut needed: Vec<Option<ProviderType>> = cards
+        .iter()
+        .map(|card| card.provider.clone().or_else(|| default.clone()))
+        .collect();
+    needed.dedup();
+    needed
+}
+
 /// The family whose router `spec` needs but `compiled` lacks, or `None` when
-/// the spec is not a provider target or its router is present.
+/// the spec is not a provider target or every router it can reach is present.
 pub(crate) fn missing_router_in(spec: &WorkerSpec, compiled: Compiled) -> Option<ProviderFamily> {
     if !targets_provider(spec) {
         return None;
     }
-    let family = ProviderFamily::of(provider_of(spec).as_ref());
-    (!family.compiled_in(compiled)).then_some(family)
+    providers_needed(spec)
+        .into_iter()
+        .map(|provider| ProviderFamily::of(provider.as_ref()))
+        .find(|family| !family.compiled_in(compiled))
 }
 
 /// [`missing_router_in`] against this build.
@@ -154,5 +179,40 @@ mod tests {
             Some(ProviderFamily::Gemini)
         );
         assert_eq!(ProviderFamily::Gemini.feature(), "provider-gemini");
+    }
+
+    #[test]
+    fn a_model_that_names_its_own_provider_is_judged_by_it() {
+        // A proxy on a private host: the worker says nothing about its
+        // provider, the model card does. Dispatch keys on the card.
+        let proxied = spec(json!({
+            "url": "https://llm.internal:8443",
+            "runtime_type": "external",
+            "models": [{"id": "claude-3-5-sonnet", "provider": "anthropic"}]
+        }));
+        assert_eq!(missing_router_in(&proxied, ANTHROPIC_ONLY), None);
+        let openai_only = Compiled {
+            openai: true,
+            anthropic: false,
+            gemini: false,
+        };
+        assert_eq!(
+            missing_router_in(&proxied, openai_only),
+            Some(ProviderFamily::Anthropic)
+        );
+
+        // A worker serving models of two providers needs both routers.
+        let mixed = spec(json!({
+            "url": "https://llm.internal:8443",
+            "runtime_type": "external",
+            "models": [
+                {"id": "gpt-4o"},
+                {"id": "gemini-2.5-pro", "provider": "gemini"}
+            ]
+        }));
+        assert_eq!(
+            missing_router_in(&mixed, openai_only),
+            Some(ProviderFamily::Gemini)
+        );
     }
 }

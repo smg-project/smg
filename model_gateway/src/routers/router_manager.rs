@@ -227,6 +227,28 @@ impl RouterManager {
         None
     }
 
+    /// The router that serves an external worker's provider, whether or not
+    /// this build carries it.
+    fn external_router_id(provider: Option<&ProviderType>) -> &'static RouterId {
+        match provider {
+            Some(ProviderType::Gemini) => &router_ids::HTTP_GEMINI,
+            Some(ProviderType::Anthropic) => &router_ids::HTTP_ANTHROPIC,
+            _ => &router_ids::HTTP_OPENAI,
+        }
+    }
+
+    /// Whether an external worker serves `model` through a provider router
+    /// this build does not carry. Such a request must fail rather than fall
+    /// through to a self-hosted router that would proxy it untranslated.
+    fn external_router_missing(&self, workers: &[Arc<dyn Worker>], model: &str) -> bool {
+        workers.iter().any(|w| {
+            matches!(w.metadata().spec.runtime_type, RuntimeType::External)
+                && !self
+                    .routers
+                    .contains_key(Self::external_router_id(w.provider_for_model(model)))
+        })
+    }
+
     fn select_router_for_workers(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -236,11 +258,7 @@ impl RouterManager {
         if let Some(model) = model_id {
             for w in workers {
                 if matches!(w.metadata().spec.runtime_type, RuntimeType::External) {
-                    let router_id = match w.provider_for_model(model) {
-                        Some(ProviderType::Gemini) => &router_ids::HTTP_GEMINI,
-                        Some(ProviderType::Anthropic) => &router_ids::HTTP_ANTHROPIC,
-                        _ => &router_ids::HTTP_OPENAI,
-                    };
+                    let router_id = Self::external_router_id(w.provider_for_model(model));
                     return self.routers.get(router_id).map(|r| r.clone());
                 }
             }
@@ -337,6 +355,15 @@ impl RouterManager {
 
         self.select_router_for_workers(workers, model_id)
             .or_else(|| {
+                if let Some(model) = model_id {
+                    if self.external_router_missing(workers, model) {
+                        warn!(
+                            model = %model,
+                            "No provider router compiled in for this model's external worker"
+                        );
+                        return None;
+                    }
+                }
                 let default = self
                     .default_router
                     .read()
