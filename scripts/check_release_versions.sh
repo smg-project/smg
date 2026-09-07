@@ -74,6 +74,7 @@ CRATES=(
     "smg-wasm|crates/wasm|smg-wasm"
     "smg-mesh|crates/mesh|smg-mesh"
     "smg-grpc-client|crates/grpc_client|smg-grpc-client"
+    "smg-radix-index|crates/radix_index|smg-radix-index"
     "smg-external-router|crates/external_router|smg-external-router"
     "smg-rl|crates/rl|smg-rl"
     "smg-client|clients/rust|-"
