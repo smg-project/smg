@@ -72,11 +72,6 @@ pub trait RouterTrait: Send + Sync + Debug {
         (StatusCode::NOT_IMPLEMENTED, "Server info not implemented").into_response()
     }
 
-    /// Get available models
-    async fn get_models(&self, _req: Request<Body>) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Get models not implemented").into_response()
-    }
-
     /// Get model information
     async fn get_model_info(&self, _req: Request<Body>) -> Response {
         (

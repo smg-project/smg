@@ -275,10 +275,7 @@ impl AppTestContext {
             }
 
             let inner_router = RouterFactory::create_router(&app_context).await.unwrap();
-            let manager = RouterManager::new(
-                app_context.worker_registry.clone(),
-                app_context.client.clone(),
-            );
+            let manager = RouterManager::new(app_context.worker_registry.clone());
             let router_id =
                 RouterManager::determine_router_id(&config.mode, config.connection_mode);
             let manager = Arc::new(manager);

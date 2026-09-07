@@ -19,7 +19,7 @@ async fn test_policy_registry_with_router_manager() {
     let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
 
     // Create RouterManager with shared registries
-    let _router_manager = RouterManager::new(worker_registry.clone(), reqwest::Client::new());
+    let _router_manager = RouterManager::new(worker_registry.clone());
 
     // Add first worker for llama-3 with cache_aware policy hint
     let mut labels1 = HashMap::new();

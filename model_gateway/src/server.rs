@@ -47,7 +47,7 @@ use wfaas::LoggingSubscriber;
 use crate::{
     app_context::AppContext,
     config::RouterConfig,
-    endpoints::{conversations, parse, responses as response_handlers, tokenize},
+    endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
     mesh::MeshAdapters,
     middleware::{self, AdmissionQueue, AuthConfig},
     observability::{
@@ -136,7 +136,7 @@ async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    state.router.get_models(req).await
+    models::list_models(&state.context, req.headers()).await
 }
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {

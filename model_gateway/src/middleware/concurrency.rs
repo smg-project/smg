@@ -288,10 +288,7 @@ mod tests {
                 .unwrap(),
         );
         Arc::new(AppState {
-            router: Arc::new(RouterManager::new(
-                context.worker_registry.clone(),
-                context.client.clone(),
-            )),
+            router: Arc::new(RouterManager::new(context.worker_registry.clone())),
             probe_state: ProbeState::new(context.inflight_tracker.clone()),
             context,
             admission_queue,
