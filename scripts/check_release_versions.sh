@@ -73,6 +73,7 @@ CRATES=(
     "smg-wasm|crates/wasm|smg-wasm"
     "smg-mesh|crates/mesh|smg-mesh"
     "smg-grpc-client|crates/grpc_client|smg-grpc-client"
+    "smg-external-router|crates/external_router|smg-external-router"
     "smg-client|clients/rust|-"
     "openapi-gen|clients/openapi-gen|-"
     "smg|model_gateway|-"

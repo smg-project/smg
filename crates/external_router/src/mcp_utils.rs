@@ -407,7 +407,7 @@ fn inject_user_into_hosted_args(
 /// (no overrides, no `user`, non-object args, pre-existing `user`).
 ///
 /// Routers should call this in place of the inline override + injection
-/// pair. Keeping it here (in `routers/common/mcp_utils.rs`) avoids leaking
+/// pair. Keeping it here, in the external-router crate, avoids leaking
 /// gateway-side concerns into `crates/mcp` while still giving every router
 /// a single chokepoint.
 pub fn prepare_hosted_dispatch_args(

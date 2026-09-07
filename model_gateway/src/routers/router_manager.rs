@@ -31,6 +31,7 @@ use openai_protocol::{
     transcription::{AudioFile, TranscriptionRequest},
     UNKNOWN_MODEL_ID,
 };
+use smg_external_router::spec_for_provider;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -40,7 +41,6 @@ use crate::{
     routers::{
         common::body_policy::REASON_MODEL_SELECTION,
         error as route_error,
-        external::ExternalRouterAdapter,
         factory::{router_ids, RouterId},
         BodyPolicy, RouterFactory, RouterTrait,
     },
@@ -240,16 +240,13 @@ impl RouterManager {
         })
     }
 
-    /// The mounted external router that takes workers of `provider`.
+    /// The mounted external router that takes workers of `provider`, resolved
+    /// through the crate's identity table so dispatch and admission agree.
     fn external_router_for(&self, provider: Option<&ProviderType>) -> Option<Arc<dyn RouterTrait>> {
-        self.routers.iter().find_map(|entry| {
-            let router = entry.value();
-            router
-                .as_any()
-                .downcast_ref::<ExternalRouterAdapter>()
-                .filter(|adapter| adapter.takes(provider))
-                .map(|_| Arc::clone(router))
-        })
+        let spec = spec_for_provider(provider)?;
+        self.routers
+            .get(&RouterId::new(spec.router_id))
+            .map(|router| Arc::clone(router.value()))
     }
 
     fn select_router_for_workers(

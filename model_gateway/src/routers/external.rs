@@ -172,12 +172,6 @@ impl ExternalRouterAdapter {
     pub fn spec(&self) -> &ExternalRouterSpec {
         &self.spec
     }
-
-    /// Whether this router takes a worker of `provider` (`None`: an external
-    /// worker that names no provider).
-    pub fn takes(&self, provider: Option<&ProviderType>) -> bool {
-        self.spec.takes(provider)
-    }
 }
 
 impl fmt::Debug for ExternalRouterAdapter {

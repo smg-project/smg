@@ -10,7 +10,6 @@ use axum::{http::HeaderMap, response::Response};
 use openai_protocol::{
     model_type::Endpoint,
     responses::{ResponseInput, ResponseInputOutputItem, ResponsesRequest},
-    worker::ProviderType,
 };
 use serde_json::to_value;
 
@@ -26,7 +25,7 @@ use super::{
     handle_non_streaming_response, handle_streaming_response,
 };
 use crate::{
-    error,
+    error, known,
     metrics::{bool_to_static_str, metrics_labels, Metrics},
     tenant::TenantRequestMeta,
     worker::{SelectWorkerRequest, WorkerSource},
@@ -65,7 +64,7 @@ pub(in crate::openai) async fn route_responses(
         .select(&SelectWorkerRequest {
             model_id: model,
             headers,
-            provider: Some(ProviderType::OpenAI),
+            router: Some(known::OPENAI),
             ..Default::default()
         })
         .await

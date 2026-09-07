@@ -3,7 +3,6 @@
 //! Transition: SelectWorker → LoadPreviousInteraction
 
 use axum::response::Response;
-use openai_protocol::worker::ProviderType;
 
 use crate::{
     error,
@@ -11,6 +10,7 @@ use crate::{
         context::RequestContext,
         state::{RequestState, StepResult},
     },
+    known,
     worker::SelectWorkerRequest,
 };
 
@@ -39,7 +39,7 @@ pub(crate) async fn worker_selection(ctx: &mut RequestContext) -> Result<StepRes
         .select(&SelectWorkerRequest {
             model_id: model,
             headers: ctx.input.headers.as_ref(),
-            provider: Some(ProviderType::Gemini),
+            router: Some(known::GEMINI),
             ..Default::default()
         })
         .await?;

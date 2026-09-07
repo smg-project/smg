@@ -1,9 +1,16 @@
 //! The metrics a router emits. They live here so the gateway and every
 //! external router record the same names with the same labels.
 
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use metrics::{counter, histogram};
 use once_cell::sync::Lazy;
 
@@ -17,8 +24,8 @@ const MAX_MODEL_LABELS: usize = 1024;
 /// Max distinct client/model-controlled MCP tool-name labels.
 const MAX_TOOL_LABELS: usize = 1024;
 
-static MODEL_LABELS: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
-static TOOL_LABELS: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
+static MODEL_LABELS: Lazy<BoundedLabels> = Lazy::new(|| BoundedLabels::new(MAX_MODEL_LABELS));
+static TOOL_LABELS: Lazy<BoundedLabels> = Lazy::new(|| BoundedLabels::new(MAX_TOOL_LABELS));
 static BOUNDED_LABEL_SENTINEL_ARC: Lazy<Arc<str>> = Lazy::new(|| Arc::from(BOUNDED_LABEL_SENTINEL));
 
 /// Intern a client-controlled label with a hard cardinality cap.
@@ -28,28 +35,63 @@ static BOUNDED_LABEL_SENTINEL_ARC: Lazy<Arc<str>> = Lazy::new(|| Arc::from(BOUND
 /// interner — or the metric's Prometheus series set — without bound. Unlike an LRU,
 /// admitted values are never evicted and re-admitted, which would keep minting new
 /// series in the recorder even as the map churned.
-fn intern_bounded_label(map: &DashMap<String, Arc<str>>, cap: usize, s: &str) -> Arc<str> {
-    if let Some(entry) = map.get(s) {
-        return Arc::clone(entry.value());
+/// A label set that admits at most `cap` distinct values; everything past
+/// the cap maps to the sentinel. Admission reserves a slot before touching
+/// the map, so a burst of distinct labels cannot overshoot the cap.
+struct BoundedLabels {
+    map: DashMap<String, Arc<str>>,
+    admitted: AtomicUsize,
+    cap: usize,
+}
+
+impl BoundedLabels {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: DashMap::new(),
+            admitted: AtomicUsize::new(0),
+            cap,
+        }
     }
-    // Best-effort cap; a small concurrent overshoot is harmless.
-    if map.len() >= cap {
-        return Arc::clone(&BOUNDED_LABEL_SENTINEL_ARC);
+
+    fn intern(&self, s: &str) -> Arc<str> {
+        if let Some(entry) = self.map.get(s) {
+            return Arc::clone(entry.value());
+        }
+        let mut admitted = self.admitted.load(Ordering::Relaxed);
+        loop {
+            if admitted >= self.cap {
+                return Arc::clone(&BOUNDED_LABEL_SENTINEL_ARC);
+            }
+            match self.admitted.compare_exchange_weak(
+                admitted,
+                admitted + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(now) => admitted = now,
+            }
+        }
+        match self.map.entry(s.to_string()) {
+            Entry::Occupied(entry) => {
+                // Someone else admitted this label first; give the slot back.
+                self.admitted.fetch_sub(1, Ordering::AcqRel);
+                Arc::clone(entry.get())
+            }
+            Entry::Vacant(entry) => Arc::clone(&*entry.insert(Arc::from(s))),
+        }
     }
-    map.entry(s.to_string())
-        .or_insert_with(|| Arc::from(s))
-        .clone()
 }
 
 /// Intern a client-supplied model label, bounded by [`MAX_MODEL_LABELS`].
 pub fn intern_model_label(model_id: &str) -> Arc<str> {
-    intern_bounded_label(&MODEL_LABELS, MAX_MODEL_LABELS, model_id)
+    MODEL_LABELS.intern(model_id)
 }
 
 /// Intern a client/model-controlled MCP tool-name label, bounded by
 /// [`MAX_TOOL_LABELS`].
 pub fn intern_tool_label(tool_name: &str) -> Arc<str> {
-    intern_bounded_label(&TOOL_LABELS, MAX_TOOL_LABELS, tool_name)
+    TOOL_LABELS.intern(tool_name)
 }
 
 pub const STREAMING_TRUE: &str = "true";
@@ -335,26 +377,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn intern_bounded_label_caps_cardinality_with_sentinel() {
-        let map: DashMap<String, Arc<str>> = DashMap::new();
+    fn bounded_labels_cap_cardinality_with_a_sentinel() {
+        let labels = BoundedLabels::new(2);
 
-        let a = intern_bounded_label(&map, 2, "m1");
-        let b = intern_bounded_label(&map, 2, "m2");
-        assert_eq!(map.len(), 2);
+        let a = labels.intern("m1");
+        let b = labels.intern("m2");
+        assert_eq!(labels.map.len(), 2);
 
         // Repeats return the same interned Arc without growing the map.
-        let a2 = intern_bounded_label(&map, 2, "m1");
+        let a2 = labels.intern("m1");
         assert!(Arc::ptr_eq(&a, &a2));
-        assert_eq!(map.len(), 2);
+        assert_eq!(labels.map.len(), 2);
 
         // A distinct value past the cap collapses to the sentinel and does not
         // grow the map, so no new Prometheus series is minted for it.
-        let c = intern_bounded_label(&map, 2, "m3");
+        let c = labels.intern("m3");
         assert_eq!(&*c, BOUNDED_LABEL_SENTINEL);
-        assert_eq!(map.len(), 2);
+        assert_eq!(labels.map.len(), 2);
 
         // Already-admitted values still resolve normally after the cap is hit.
-        let b2 = intern_bounded_label(&map, 2, "m2");
+        let b2 = labels.intern("m2");
         assert!(Arc::ptr_eq(&b, &b2));
         assert_ne!(&*a, BOUNDED_LABEL_SENTINEL);
     }

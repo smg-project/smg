@@ -34,6 +34,6 @@ pub mod worker;
 pub use context::ExternalContext;
 pub use retry_config::RetryConfig;
 pub use router::{
-    builtin_routers, ids, spec_for_backend, spec_for_provider, BuildFuture, ExternalRouter,
-    ExternalRouterSpec,
+    builtin_routers, home_among, ids, known, spec_for_backend, spec_for_provider, BuildFuture,
+    ExternalRouter, ExternalRouterSpec,
 };

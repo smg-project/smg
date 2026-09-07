@@ -111,7 +111,7 @@ async fn test_openai_router_creation() {
     let ctx = create_test_app_context().await;
     // Register an external worker before creating the router
     register_external_worker(&ctx, "https://api.openai.com", None);
-    let router = ExternalRouterAdapter::mount(smg_external_router::openai::spec(), &ctx).await;
+    let router = ExternalRouterAdapter::mount(smg_external_router::known::OPENAI, &ctx).await;
 
     assert!(router.is_ok(), "Router creation should succeed");
 
@@ -606,7 +606,7 @@ async fn test_router_factory_openai_mode() {
 async fn test_unsupported_endpoints() {
     let ctx = create_test_app_context().await;
     register_external_worker(&ctx, "https://api.openai.com", None);
-    let router = ExternalRouterAdapter::mount(smg_external_router::openai::spec(), &ctx)
+    let router = ExternalRouterAdapter::mount(smg_external_router::known::OPENAI, &ctx)
         .await
         .unwrap();
 

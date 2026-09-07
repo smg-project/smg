@@ -8,7 +8,7 @@ use axum::{
     response::Response,
 };
 use futures_util::StreamExt;
-use openai_protocol::{chat::ChatCompletionRequest, model_type::Endpoint, worker::ProviderType};
+use openai_protocol::{chat::ChatCompletionRequest, model_type::Endpoint};
 use serde_json::to_value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -21,6 +21,7 @@ use super::{
 use crate::{
     error,
     header_utils::{apply_provider_headers, extract_auth_header},
+    known,
     metrics::{bool_to_static_str, metrics_labels, Metrics},
     retry::{is_retryable_response, RetryExecutor},
     sse::SSE_CHANNEL_BUFFER,
@@ -63,7 +64,7 @@ pub(super) async fn route_chat(
         .select(&SelectWorkerRequest {
             model_id: model,
             headers,
-            provider: Some(ProviderType::OpenAI),
+            router: Some(known::OPENAI),
             ..Default::default()
         })
         .await

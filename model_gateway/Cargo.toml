@@ -85,7 +85,7 @@ wfaas.workspace = true
 llm-tokenizer.workspace = true
 smg-auth.workspace = true
 smg-mcp.workspace = true
-smg-external-router = { path = "../crates/external_router", default-features = false }
+smg-external-router = { workspace = true, default-features = false }
 kv-index.workspace = true
 smg-data-connector.workspace = true
 llm-multimodal = { workspace = true, default-features = false }
@@ -156,7 +156,7 @@ toml = "1.1"
 # the provider routers) would leak into every test target whatever features the
 # build selected, so a `--no-default-features` test run would not be one.
 smg = { path = ".", default-features = false, features = ["test-util"] }
-smg-external-router = { path = "../crates/external_router", default-features = false }
+smg-external-router = { workspace = true, default-features = false }
 # Enable the mock engine for the ZMQ client's loopback tests.
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
 criterion = { version = "0.8", features = ["html_reports"] }

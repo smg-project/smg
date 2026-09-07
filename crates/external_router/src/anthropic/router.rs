@@ -9,7 +9,7 @@ use std::{any::Any, collections::HashMap, fmt};
 
 use async_trait::async_trait;
 use axum::{http::HeaderMap, response::Response};
-use openai_protocol::{messages::CreateMessageRequest, worker::ProviderType};
+use openai_protocol::messages::CreateMessageRequest;
 use tracing::{error, info};
 
 use super::{
@@ -17,7 +17,7 @@ use super::{
     mcp, non_streaming, streaming,
 };
 use crate::{
-    error::bad_gateway, header_utils, mcp_utils, tenant::TenantRequestMeta,
+    error::bad_gateway, header_utils, known, mcp_utils, tenant::TenantRequestMeta,
     worker::SelectWorkerRequest, ExternalContext, ExternalRouter,
 };
 
@@ -134,7 +134,7 @@ impl ExternalRouter for AnthropicRouter {
             .select(&SelectWorkerRequest {
                 model_id,
                 headers,
-                provider: Some(ProviderType::Anthropic),
+                router: Some(known::ANTHROPIC),
                 ..Default::default()
             })
             .await

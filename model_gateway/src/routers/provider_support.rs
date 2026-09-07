@@ -5,7 +5,7 @@
 //! nothing decides this at runtime.
 
 use openai_protocol::worker::{ProviderType, RuntimeType, WorkerModels, WorkerSpec};
-use smg_external_router::{builtin_routers, ExternalRouterSpec};
+use smg_external_router::{home_among, known, ExternalRouterSpec};
 
 /// The router a provider target needs but this build lacks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,26 +30,6 @@ fn targets_provider(spec: &WorkerSpec) -> bool {
     spec.runtime_type == RuntimeType::External || provider_of(spec).is_some()
 }
 
-/// The router a worker of `provider` reaches, named whether or not it is
-/// compiled in: Anthropic and Gemini have routers of their own; every other
-/// provider rides the OpenAI-compatible router.
-fn needed(provider: Option<&ProviderType>) -> MissingRouter {
-    match provider {
-        Some(ProviderType::Anthropic) => MissingRouter {
-            label: "Anthropic",
-            feature: "provider-anthropic",
-        },
-        Some(ProviderType::Gemini) => MissingRouter {
-            label: "Gemini",
-            feature: "provider-gemini",
-        },
-        _ => MissingRouter {
-            label: "OpenAI-compatible",
-            feature: "provider-openai",
-        },
-    }
-}
-
 /// Every provider a worker's traffic can be dispatched under, judged the way
 /// the dispatcher judges it: a model's own provider first, else the worker's.
 /// Only the listed models are ever dispatched to a worker that lists any, so
@@ -72,30 +52,39 @@ fn providers_needed(spec: &WorkerSpec) -> Vec<Option<ProviderType>> {
     needed
 }
 
-/// The router `spec` needs that none of `routers` provides, or `None` when
-/// the spec is not a provider target or every router it can reach is there.
+/// The router `spec` needs that this build lacks, judged over `known`, or
+/// `None` when the spec is not a provider target or every router it can reach
+/// is compiled in. A router that is known but not compiled names its feature.
 pub(crate) fn missing_router_among(
     spec: &WorkerSpec,
-    routers: &[ExternalRouterSpec],
+    known: &[ExternalRouterSpec],
 ) -> Option<MissingRouter> {
     if !targets_provider(spec) {
         return None;
     }
-    providers_needed(spec)
-        .into_iter()
-        .find(|provider| !routers.iter().any(|r| r.takes(provider.as_ref())))
-        .map(|provider| needed(provider.as_ref()))
+    providers_needed(spec).into_iter().find_map(|provider| {
+        match home_among(known, provider.as_ref()) {
+            Some(router) if router.compiled => None,
+            Some(router) => Some(MissingRouter {
+                label: router.label,
+                feature: router.feature,
+            }),
+            None => Some(MissingRouter {
+                label: "external",
+                feature: "providers",
+            }),
+        }
+    })
 }
 
 /// [`missing_router_among`] against this build.
 pub(crate) fn missing_router(spec: &WorkerSpec) -> Option<MissingRouter> {
-    missing_router_among(spec, &builtin_routers())
+    missing_router_among(spec, &known::all())
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use smg_external_router::{BuildFuture, ExternalContext};
 
     use super::*;
 
@@ -103,52 +92,30 @@ mod tests {
         serde_json::from_value(value).expect("worker spec")
     }
 
-    fn never(_ctx: ExternalContext) -> BuildFuture {
-        Box::pin(async { Err("not built in tests".to_string()) })
-    }
-
-    fn router(
-        backend: &'static str,
-        serves: fn(&ProviderType) -> bool,
-        fallback: bool,
-    ) -> ExternalRouterSpec {
-        ExternalRouterSpec {
-            router_id: backend,
-            backend,
-            label: backend,
-            feature: backend,
-            serves,
-            fallback,
-            build: never,
-        }
+    fn with_compiled(backends: &[&str]) -> Vec<ExternalRouterSpec> {
+        known::all()
+            .into_iter()
+            .map(|mut spec| {
+                spec.compiled = backends.contains(&spec.backend);
+                spec
+            })
+            .collect()
     }
 
     fn anthropic_only() -> Vec<ExternalRouterSpec> {
-        vec![router(
-            "anthropic",
-            |p| matches!(p, ProviderType::Anthropic),
-            false,
-        )]
+        with_compiled(&["anthropic"])
     }
 
     fn everything() -> Vec<ExternalRouterSpec> {
-        vec![
-            router(
-                "openai",
-                |p| !matches!(p, ProviderType::Anthropic | ProviderType::Gemini),
-                true,
-            ),
-            router("anthropic", |p| matches!(p, ProviderType::Anthropic), false),
-            router("gemini", |p| matches!(p, ProviderType::Gemini), false),
-        ]
+        with_compiled(&["openai", "anthropic", "gemini"])
     }
 
     #[test]
     fn self_hosted_engines_need_no_provider_router() {
         let local = spec(json!({"url": "http://10.0.0.5:8000"}));
-        assert_eq!(missing_router_among(&local, &[]), None);
+        assert_eq!(missing_router_among(&local, &with_compiled(&[])), None);
         let sglang = spec(json!({"url": "grpc://10.0.0.5:8000", "runtime_type": "sglang"}));
-        assert_eq!(missing_router_among(&sglang, &[]), None);
+        assert_eq!(missing_router_among(&sglang, &with_compiled(&[])), None);
     }
 
     #[test]
@@ -156,7 +123,7 @@ mod tests {
         let anthropic = spec(json!({"url": "https://api.anthropic.com"}));
         assert_eq!(missing_router_among(&anthropic, &anthropic_only()), None);
         assert_eq!(
-            missing_router_among(&anthropic, &[]).map(|m| m.feature),
+            missing_router_among(&anthropic, &with_compiled(&[])).map(|m| m.feature),
             Some("provider-anthropic")
         );
 
@@ -192,11 +159,7 @@ mod tests {
             "models": [{"id": "claude-3-5-sonnet", "provider": "anthropic"}]
         }));
         assert_eq!(missing_router_among(&proxied, &anthropic_only()), None);
-        let openai_only = vec![router(
-            "openai",
-            |p| !matches!(p, ProviderType::Anthropic | ProviderType::Gemini),
-            true,
-        )];
+        let openai_only = with_compiled(&["openai"]);
         assert_eq!(
             missing_router_among(&proxied, &openai_only).map(|m| m.feature),
             Some("provider-anthropic")

@@ -30,6 +30,7 @@ use super::{
 };
 use crate::{
     header_utils::extract_auth_header,
+    known,
     metrics::{metrics_labels, Metrics},
     realtime::{
         rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
@@ -127,7 +128,7 @@ impl OpenAIRouter {
             .select(&SelectWorkerRequest {
                 model_id,
                 headers,
-                provider: Some(ProviderType::OpenAI),
+                router: Some(known::OPENAI),
                 ..Default::default()
             })
             .await

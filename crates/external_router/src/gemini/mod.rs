@@ -17,32 +17,4 @@ mod router;
 mod state;
 mod steps;
 
-use std::sync::Arc;
-
-use openai_protocol::worker::ProviderType;
 pub use router::GeminiRouter;
-
-use crate::{ids, BuildFuture, ExternalContext, ExternalRouter, ExternalRouterSpec};
-
-fn serves(provider: &ProviderType) -> bool {
-    matches!(provider, ProviderType::Gemini)
-}
-
-fn build(ctx: ExternalContext) -> BuildFuture {
-    Box::pin(async move {
-        GeminiRouter::new(&ctx).map(|router| Arc::new(router) as Arc<dyn ExternalRouter>)
-    })
-}
-
-/// How the gateway mounts this router.
-pub fn spec() -> ExternalRouterSpec {
-    ExternalRouterSpec {
-        router_id: ids::GEMINI,
-        backend: "gemini",
-        label: "Gemini",
-        feature: "provider-gemini",
-        serves,
-        fallback: false,
-        build,
-    }
-}

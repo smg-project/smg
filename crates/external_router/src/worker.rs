@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use axum::{http::HeaderMap, response::Response};
 use openai_protocol::worker::{ConnectionMode, ProviderType, RuntimeType, WorkerType};
 
-use crate::RetryConfig;
+use crate::{ExternalRouterSpec, RetryConfig};
 
 /// Keeps a worker's load accounted for as long as it is alive; dropping it
 /// releases the load.
@@ -23,6 +23,7 @@ pub trait ExternalWorker: Send + Sync + Debug {
     fn record_outcome(&self, status_code: u16);
     fn http_client(&self) -> &reqwest::Client;
     /// Hold the worker's load for a long-lived session.
+    #[must_use = "dropping the hold releases the worker's load at once"]
     fn hold_load(&self, headers: Option<&HeaderMap>) -> LoadHold;
 }
 
@@ -40,10 +41,9 @@ pub struct SelectWorkerRequest<'a> {
     /// upstream `/v1/models` refresh on cache miss.
     pub headers: Option<&'a HeaderMap>,
 
-    /// Provider-based security filtering for multi-provider setups.
-    /// When set, prevents credentials from leaking to workers of a
-    /// different provider (e.g. Anthropic key to OpenAI worker).
-    pub provider: Option<ProviderType>,
+    /// The router selecting, so only workers it takes are candidates: a
+    /// caller's credentials must not reach a worker of another provider.
+    pub router: Option<ExternalRouterSpec>,
 
     /// Filter by worker type (Regular, Prefill, Decode). `None` = any.
     pub worker_type: Option<WorkerType>,

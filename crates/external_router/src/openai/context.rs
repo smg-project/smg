@@ -61,7 +61,7 @@ impl ComponentRefs {
         }
     }
 
-    /// Access router configuration shared by both request context variants.
+    /// The MCP orchestrator, present only on the Responses path.
     pub fn mcp_orchestrator(&self) -> Option<&Arc<McpOrchestrator>> {
         match self {
             ComponentRefs::Shared(_) => None,

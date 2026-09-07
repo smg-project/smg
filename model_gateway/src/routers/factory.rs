@@ -222,11 +222,6 @@ impl RouterFactory {
         ctx.policy_registry.set_decode_policy(decode_policy);
     }
 
-    /// Create an OpenAI router
-    ///
-    /// Workers should be registered via the external worker registration workflow
-    /// before using this router. The workflow discovers models from the provided
-    /// endpoints and creates external workers in the registry.
     /// Mount the external router that `backend` names, or say which Cargo
     /// feature would compile it in.
     pub async fn create_external_router(
@@ -234,10 +229,10 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
         match spec_for_backend(backend) {
-            Some(spec) => ExternalRouterAdapter::mount(spec, ctx).await,
+            Some(spec) if spec.compiled => ExternalRouterAdapter::mount(spec, ctx).await,
+            Some(spec) => Err(spec.not_compiled()),
             None => Err(format!(
-                "{backend} routing is not compiled into this build; rebuild with the \
-                 `provider-{backend}` Cargo feature"
+                "{backend} is not an external router this gateway knows"
             )),
         }
     }
