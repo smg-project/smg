@@ -123,8 +123,8 @@ struct ScoreInputs<'a> {
     inflight: &'a HashMap<String, SincePollDispatch>,
     nominal_throughput: f64,
     fleet_has_loads: bool,
-    /// What a reporting peer scores on average; the score of a worker
-    /// without a fresh report, before its own in-flight.
+    /// The best-known reporting peer's score: what a worker without a
+    /// fresh report scores before its own in-flight.
     peer_baseline: f64,
 }
 
@@ -234,11 +234,11 @@ impl LeastLoadPolicy {
                 (queued_tokens + inflight_tokens) / throughput
                     + self.kv_pressure_weight * k / (1.0 - k)
             }
-            // No fresh snapshot, but peers report: score it as an average
+            // No fresh snapshot, but peers report: score it as the best-known
             // reporting peer plus its own live in-flight (count × mean prefill)
             // at the fleet's nominal throughput. Unknown load must not read as
             // idle, or every request would herd onto the one worker whose
-            // report is missing.
+            // report is missing; nor must it be starved.
             None if fleet_has_loads => {
                 peer_baseline
                     + worker.load() as f64 * self.mean_prefill_tokens as f64 / nominal_throughput
@@ -383,33 +383,32 @@ impl LeastLoadPolicy {
         // Argmin with reservoir tie-breaking: equal-score workers (the common
         // idle/homogeneous case scores exactly equal) are sampled uniformly
         // instead of first-index-wins, which herded ties onto one worker.
-        // What a reporting peer scores on average; a worker without a report
-        // is scored from this rather than as idle.
-        let peer_baseline = {
-            let reported: Vec<f64> = candidates
+        // A worker without a fresh report scores as the best-known reporting
+        // peer plus its own in-flight: never better than a worker whose load
+        // is known, never starved by one. Computed only when some candidate
+        // lacks a report, so the common all-reporting case pays nothing.
+        let peer_baseline = if candidates
+            .iter()
+            .all(|&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()).is_some())
+        {
+            0.0
+        } else {
+            let known = ScoreInputs {
+                loads,
+                complete_snapshot,
+                inflight: &inflight,
+                nominal_throughput,
+                fleet_has_loads,
+                peer_baseline: 0.0,
+            };
+            candidates
                 .iter()
                 .filter(|&&i| {
                     Self::fresh_load(loads, complete_snapshot, workers[i].url()).is_some()
                 })
-                .map(|&i| {
-                    self.score(
-                        &workers[i],
-                        &ScoreInputs {
-                            loads,
-                            complete_snapshot,
-                            inflight: &inflight,
-                            nominal_throughput,
-                            fleet_has_loads,
-                            peer_baseline: 0.0,
-                        },
-                    )
-                })
-                .collect();
-            if reported.is_empty() {
-                0.0
-            } else {
-                reported.iter().sum::<f64>() / reported.len() as f64
-            }
+                .map(|&i| self.score(&workers[i], &known))
+                .fold(f64::INFINITY, f64::min)
+                .min(f64::MAX)
         };
         let mut rng = rand::rng();
         let mut best = first;
@@ -652,9 +651,10 @@ mod tests {
                 .unwrap();
             seen[idx] += 1;
         }
+        // Three-way tie sampled uniformly: Binomial(150, 1/3), mean 50.
         assert!(
-            seen[2] < 150,
-            "the unreported worker took every request: {seen:?}"
+            seen[2] < 100,
+            "the unreported worker must share, not take, the traffic: {seen:?}"
         );
         assert!(
             seen[0] > 0 && seen[1] > 0,
