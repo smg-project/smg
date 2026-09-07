@@ -631,7 +631,7 @@ jobs:
           - engine: tokenspeed
             timeout: 56
             test_timeout: 26
-            test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py
+            test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_loads.py
             min_selected: 114 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
