@@ -257,8 +257,16 @@ def generate_golden_qwen2_vl(image_path: str, output_dir: str) -> dict:
     # transformers < 5 exposes the pixel bounds as attributes; 5.x keeps them
     # only in size={"shortest_edge": min_pixels, "longest_edge": max_pixels}.
     size = getattr(processor, "size", None) or {}
-    min_pixels = getattr(processor, "min_pixels", None) or size.get("shortest_edge")
-    max_pixels = getattr(processor, "max_pixels", None) or size.get("longest_edge")
+    min_pixels = getattr(processor, "min_pixels", None)
+    max_pixels = getattr(processor, "max_pixels", None)
+    if min_pixels is None:
+        min_pixels = size.get("shortest_edge") if hasattr(size, "get") else None
+    if max_pixels is None:
+        max_pixels = size.get("longest_edge") if hasattr(size, "get") else None
+    if min_pixels is None or max_pixels is None:
+        raise RuntimeError(
+            f"could not resolve Qwen2-VL pixel bounds from processor (size={size!r})"
+        )
 
     # Calculate number of tokens
     # tokens = (T * H * W) / merge_size²
@@ -633,7 +641,8 @@ def generate_for_model(model_key: str, image_paths: list, output_dir: str) -> in
     failures = 0
     for image_path in image_paths:
         if not os.path.exists(image_path):
-            print(f"  Image not found: {image_path}, skipping")
+            failures += 1
+            print(f"  Image not found: {image_path}")
             continue
 
         image_name = Path(image_path).stem
@@ -641,12 +650,16 @@ def generate_for_model(model_key: str, image_paths: list, output_dir: str) -> in
 
         try:
             data = generator_fn(image_path, output_dir)
-            if data is not None:
-                save_golden(model_key, image_name, data, output_dir)
-                print(f"    pixel_values shape: {data['pixel_values'].shape}")
-                print(
-                    f"    pixel_values range: [{data['pixel_values'].min():.4f}, {data['pixel_values'].max():.4f}]"
-                )
+            if data is None:
+                # The generator printed why (typically the processor class is
+                # missing from the installed transformers); no fixture was written.
+                failures += 1
+                continue
+            save_golden(model_key, image_name, data, output_dir)
+            print(f"    pixel_values shape: {data['pixel_values'].shape}")
+            print(
+                f"    pixel_values range: [{data['pixel_values'].min():.4f}, {data['pixel_values'].max():.4f}]"
+            )
         except Exception as e:
             failures += 1
             print(f"    Error: {e}")
