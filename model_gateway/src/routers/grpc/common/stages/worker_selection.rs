@@ -361,9 +361,14 @@ impl WorkerSelectionStage {
                     PlacementFailure::AllOverloaded(shed) => Some(shed),
                     PlacementFailure::NoCandidates | PlacementFailure::Unavailable => None,
                 },
-                _ => {
-                    let candidates = self.leg_candidates(model_id, *leg, wire);
-                    overload::shed_if_all_overloaded(&candidates, model_id)
+                WorkerType::Prefill => {
+                    self.disaggregated_leg_shed(model_id, RoutingPool::GrpcPrefill, wire)
+                }
+                WorkerType::Decode => {
+                    self.disaggregated_leg_shed(model_id, RoutingPool::GrpcDecode, wire)
+                }
+                WorkerType::Encode => {
+                    self.disaggregated_leg_shed(model_id, RoutingPool::GrpcEncode, wire)
                 }
             };
             if let Some(shed) = shed {
@@ -379,41 +384,25 @@ impl WorkerSelectionStage {
         error::model_not_found(model_id)
     }
 
-    /// The pool one leg selected over, *before* the `is_available()` filter,
-    /// under the same worker-type and transport rules selection applied.
+    /// The shed verdict for one disaggregated leg, judged from the pool it
+    /// selected over *before* the `is_available()` filter. The legs are
+    /// gRPC-only (no KV rendezvous on ZMQ), so a retry pins the runtime alone;
+    /// the regular leg is judged by [`placement::single_failure`] instead.
     /// Failure path only.
-    fn leg_candidates(
+    fn disaggregated_leg_shed(
         &self,
         model_id: &str,
-        worker_type: WorkerType,
+        pool: RoutingPool,
         wire: Option<WireConstraint>,
-    ) -> Vec<Arc<dyn Worker>> {
-        // One definition shared with selection: the same routing-pool
-        // projection, before the `is_available()` filter. Regular selection
-        // takes either gRPC-pipeline transport; the disaggregated legs are
-        // gRPC-only (no KV rendezvous on ZMQ). The wildcard model maps to
-        // the global snapshot — not the `unknown` model-index entry.
-        let pool = match worker_type {
-            WorkerType::Regular => RoutingPool::GrpcPipelineRegular,
-            WorkerType::Prefill => RoutingPool::GrpcPrefill,
-            WorkerType::Decode => RoutingPool::GrpcDecode,
-            WorkerType::Encode => RoutingPool::GrpcEncode,
-        };
-        self.worker_registry
+    ) -> Option<Response> {
+        let candidates: Vec<Arc<dyn Worker>> = self
+            .worker_registry
             .get_routing_pool(model_id, pool)
             .iter()
-            .filter(|w| {
-                wire.is_none_or(|c| {
-                    w.metadata().spec.runtime_type == c.runtime
-                        && match worker_type {
-                            WorkerType::Regular => *w.connection_mode() == c.connection,
-                            // Disaggregated legs are gRPC-only regardless of pin.
-                            _ => true,
-                        }
-                })
-            })
+            .filter(|w| wire.is_none_or(|c| w.metadata().spec.runtime_type == c.runtime))
             .cloned()
-            .collect()
+            .collect();
+        overload::shed_if_all_overloaded(&candidates, model_id)
     }
 
     #[expect(
