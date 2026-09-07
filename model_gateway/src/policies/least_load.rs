@@ -401,14 +401,20 @@ impl LeastLoadPolicy {
                 fleet_has_loads,
                 peer_baseline: 0.0,
             };
-            candidates
+            let best_known = candidates
                 .iter()
                 .filter(|&&i| {
                     Self::fresh_load(loads, complete_snapshot, workers[i].url()).is_some()
                 })
                 .map(|&i| self.score(&workers[i], &known))
-                .fold(f64::INFINITY, f64::min)
-                .min(f64::MAX)
+                .fold(f64::INFINITY, f64::min);
+            // Nobody reports: the dark-fleet arm scores by live in-flight and
+            // never reads the baseline; keep it neutral rather than infinite.
+            if best_known.is_finite() {
+                best_known
+            } else {
+                0.0
+            }
         };
         let mut rng = rand::rng();
         let mut best = first;
@@ -633,32 +639,36 @@ mod tests {
 
     #[test]
     fn a_worker_without_a_report_is_scored_like_its_peers() {
-        // Two workers report a queue; the third never answered the load
-        // poll. Unknown load must not read as idle, or the whole fleet
-        // herds onto the one worker nobody has heard from.
+        // Two workers report queues of different depth; the third never
+        // answered the load poll. Unknown load must not read as idle, or the
+        // whole fleet herds onto the one worker nobody has heard from; nor
+        // may it read as the peers' average, which would let the deeper
+        // queue beat it. It ties with the best-known peer: both the lightly
+        // loaded peer and the unreported worker are picked, the heavily
+        // loaded peer never.
         let urls = ["http://a:8000", "http://b:8000", "http://c:8000"];
         let mut seen = [0usize; 3];
         for _ in 0..150 {
             let policy = LeastLoadPolicy::new();
             let workers: Vec<Arc<dyn Worker>> = urls.iter().map(|u| mk(u)).collect();
             let mut loads = HashMap::new();
-            for url in &urls[..2] {
-                loads.insert(url.to_string(), make_load_reqs_only(1, 0.125, 100.0));
-            }
+            loads.insert(urls[0].to_string(), make_load_reqs_only(1, 0.125, 100.0));
+            loads.insert(urls[1].to_string(), make_load_reqs_only(3, 0.125, 100.0));
             policy.update_loads(&loads);
             let idx = policy
                 .select_worker(&workers, &SelectWorkerInfo::default())
                 .unwrap();
             seen[idx] += 1;
         }
-        // Three-way tie sampled uniformly: Binomial(150, 1/3), mean 50.
+        assert_eq!(seen[1], 0, "the deeper queue must never win: {seen:?}");
         assert!(
-            seen[2] < 100,
-            "the unreported worker must share, not take, the traffic: {seen:?}"
+            seen[0] > 0 && seen[2] > 0,
+            "the unreported worker ties with the best-known peer: {seen:?}"
         );
+        // Two-way tie sampled uniformly: Binomial(150, 1/2), mean 75.
         assert!(
-            seen[0] > 0 && seen[1] > 0,
-            "reporting peers must still be chosen: {seen:?}"
+            seen[2] < 120,
+            "the unreported worker must share, not take, the traffic: {seen:?}"
         );
     }
 
