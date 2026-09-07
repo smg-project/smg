@@ -16,7 +16,7 @@ use crate::{
     routers::{
         common::{
             overload,
-            placement::{self, PairCandidates, PlacementFailure, PlacementInputs},
+            placement::{self, PairCandidates, PairFailure, PlacementFailure, PlacementInputs},
         },
         error,
         grpc::{
@@ -157,19 +157,13 @@ impl PipelineStage for WorkerSelectionStage {
                     cache_namespace,
                     None,
                 ) {
-                    Some((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
+                    Ok((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
                         prefill,
                         decode,
                         runtime_type,
                     },
-                    None => {
-                        return Err(self.selection_failure(
-                            model_id,
-                            &[WorkerType::Prefill, WorkerType::Decode],
-                            None,
-                        ))
-                    }
+                    Err(response) => return Err(response),
                 }
             }
             WorkerSelectionMode::EncodePrefillDecode => {
@@ -301,19 +295,13 @@ impl WorkerSelectionStage {
                     cache_namespace,
                     wire,
                 ) {
-                    Some((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
+                    Ok((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
                         prefill,
                         decode,
                         runtime_type,
                     },
-                    None => {
-                        return Err(self.selection_failure(
-                            model_id,
-                            &[WorkerType::Prefill, WorkerType::Decode],
-                            wire,
-                        ))
-                    }
+                    Err(response) => return Err(response),
                 }
             }
         };
@@ -386,6 +374,28 @@ impl WorkerSelectionStage {
             "No available workers for model"
         );
         error::model_not_found(model_id)
+    }
+
+    /// The response for a failed pair placement. The verdict was judged from
+    /// the leg's own candidates inside the placement, so a shed is answered
+    /// as it was built and counted once; every other miss keeps the
+    /// not-found answer this router always gave.
+    fn pair_failure(&self, model_id: &str, failure: PairFailure) -> Response {
+        match failure.verdict {
+            PlacementFailure::AllOverloaded(shed) => shed,
+            PlacementFailure::NoCandidates
+            | PlacementFailure::Unavailable
+            | PlacementFailure::PolicyDeclined(_) => {
+                error!(
+                    function = "WorkerSelectionStage::execute",
+                    mode = ?self.mode,
+                    model_id = %model_id,
+                    leg = ?failure.leg,
+                    "No available workers for model"
+                );
+                error::model_not_found(model_id)
+            }
+        }
     }
 
     /// The shed verdict for one disaggregated leg, judged from the pool it
@@ -468,7 +478,7 @@ impl WorkerSelectionStage {
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
-    ) -> Option<PdWorkerPair> {
+    ) -> Result<PdWorkerPair, Response> {
         // Both legs derive from ONE membership snapshot: separate pool
         // lookups could straddle a concurrent replacement and pair workers
         // that never coexisted. The pools are strictly gRPC (a ZMQ leg would
@@ -497,8 +507,8 @@ impl WorkerSelectionStage {
                 cache_namespace,
             },
         )
-        .ok()?;
-        Some((pair.prefill, pair.decode, pair.runtime))
+        .map_err(|failure| self.pair_failure(model_id, *failure))?;
+        Ok((pair.prefill, pair.decode, pair.runtime))
     }
 
     /// Select per-item encode workers + a prefill/decode pair for EPD routing.
@@ -871,7 +881,7 @@ mod tests {
         );
         assert!(stage
             .select_pd_pair(model_id, None, None, None, None, None, None)
-            .is_some());
+            .is_ok());
 
         for url in &prefill_urls {
             let worker = worker_registry.get_by_url(url).expect("registered");
@@ -881,7 +891,7 @@ mod tests {
         assert!(
             stage
                 .select_pd_pair(model_id, None, None, None, None, None, None)
-                .is_none(),
+                .is_err(),
             "the veto empties the prefill pool"
         );
         let response =
@@ -1051,7 +1061,7 @@ mod tests {
         assert!(
             stage
                 .select_pd_pair(model_id, None, None, None, None, None, None)
-                .is_none(),
+                .is_err(),
             "ZMQ-only PD pools must not yield a pair"
         );
 

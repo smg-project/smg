@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use axum::{http::HeaderMap, response::Response};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
@@ -94,8 +94,9 @@ pub(crate) struct PairCandidates<'a> {
 pub(crate) struct Pair {
     pub prefill: Arc<dyn Worker>,
     pub decode: Arc<dyn Worker>,
-    /// The runtime both legs run when homogeneity was required; otherwise
-    /// the prefill worker's.
+    /// The runtime both legs run when homogeneity was required. Otherwise
+    /// it is the first available prefill worker's, which says nothing about
+    /// the selected pair; only a homogeneous caller should read it.
     pub runtime: RuntimeType,
 }
 
@@ -232,7 +233,7 @@ pub(crate) fn failure_from(candidates: &[Arc<dyn Worker>], model_id: &str) -> Pl
 /// its own policy and sticky namespace.
 ///
 /// Every leg is judged live for availability; `wire` pins both legs to the
-/// retained plan's runtime on a retry; `homogeneous_runtime` narrows both
+/// retained plan's runtime and transport on a retry; `homogeneous_runtime` narrows both
 /// legs to the first available prefill worker's runtime, which the gRPC
 /// wire needs because its rendezvous is runtime-specific. A miss names the
 /// leg and carries the verdict judged from that leg's own candidates.
@@ -249,7 +250,10 @@ pub(crate) fn select_pair(
         leg.iter()
             .filter(|w| {
                 w.is_available()
-                    && wire.is_none_or(|wire| w.metadata().spec.runtime_type == wire.runtime)
+                    && wire.is_none_or(|wire| {
+                        w.metadata().spec.runtime_type == wire.runtime
+                            && *w.connection_mode() == wire.connection
+                    })
             })
             .cloned()
             .collect()
@@ -258,14 +262,14 @@ pub(crate) fn select_pair(
     let mut decode = available(candidates.decode);
 
     if prefill.is_empty() {
-        warn!("No available prefill workers");
+        debug!("No available prefill workers");
         return Err(Box::new(PairFailure {
             leg: WorkerLeg::Prefill,
             verdict: failure_from(candidates.prefill, model_id),
         }));
     }
     if decode.is_empty() {
-        warn!("No available decode workers");
+        debug!("No available decode workers");
         return Err(Box::new(PairFailure {
             leg: WorkerLeg::Decode,
             verdict: failure_from(candidates.decode, model_id),
@@ -292,7 +296,7 @@ pub(crate) fn select_pair(
         prefill.retain(|w| w.metadata().spec.runtime_type == runtime);
         decode.retain(|w| w.metadata().spec.runtime_type == runtime);
         if decode.is_empty() {
-            warn!("No available PD pair for runtime {:?}", runtime);
+            debug!("No available PD pair for runtime {:?}", runtime);
             return Err(Box::new(PairFailure {
                 leg: WorkerLeg::Decode,
                 verdict: PlacementFailure::Unavailable,
@@ -315,30 +319,20 @@ pub(crate) fn select_pair(
         hash_ring,
         leg: WorkerLeg::Prefill,
     };
-    // A policy that sees an unfiltered pool can miss because every worker is
-    // overloaded; judge the verdict from the leg's candidates so a shed
-    // stays a shed.
-    let declined = |leg: WorkerLeg, pool: &[Arc<dyn Worker>], policy: &'static str| {
-        let verdict = match failure_from(pool, model_id) {
-            PlacementFailure::AllOverloaded(shed) => PlacementFailure::AllOverloaded(shed),
-            _ => PlacementFailure::PolicyDeclined(policy),
-        };
-        Box::new(PairFailure { leg, verdict })
+    // Both legs were filtered for availability above, so a miss here is the
+    // policy's own decision, never an overloaded pool.
+    let declined = |leg: WorkerLeg, policy: &'static str| {
+        Box::new(PairFailure {
+            leg,
+            verdict: PlacementFailure::PolicyDeclined(policy),
+        })
     };
     let Some(prefill_idx) = policies.select_worker(&prefill_policy, &prefill, &info) else {
-        return Err(declined(
-            WorkerLeg::Prefill,
-            candidates.prefill,
-            prefill_policy.name(),
-        ));
+        return Err(declined(WorkerLeg::Prefill, prefill_policy.name()));
     };
     info.leg = WorkerLeg::Decode;
     let Some(decode_idx) = policies.select_worker(&decode_policy, &decode, &info) else {
-        return Err(declined(
-            WorkerLeg::Decode,
-            candidates.decode,
-            decode_policy.name(),
-        ));
+        return Err(declined(WorkerLeg::Decode, decode_policy.name()));
     };
 
     let selected_prefill = prefill[prefill_idx].clone();
@@ -516,7 +510,7 @@ mod tests {
         assert_eq!(pair.prefill.metadata().spec.runtime_type, pair.runtime);
         assert_eq!(pair.decode.metadata().spec.runtime_type, pair.runtime);
 
-        // A retry pinned to a runtime with no decode worker names the leg.
+        // A model with no decode worker at all names the leg.
         let only_prefill = registry_of(&[(
             "grpc://p:1",
             WorkerType::Prefill,
@@ -542,6 +536,69 @@ mod tests {
         .expect("no decode worker exists");
         assert_eq!(failure.leg, WorkerLeg::Decode);
         assert!(matches!(failure.verdict, PlacementFailure::NoCandidates));
+    }
+
+    #[test]
+    fn a_pinned_pair_keeps_the_retained_runtime_and_transport() {
+        // Same runtime on both legs, but the only decode worker speaks ZMQ.
+        let registry = registry_of(&[
+            (
+                "grpc://p:1",
+                WorkerType::Prefill,
+                ConnectionMode::Grpc,
+                RuntimeType::Sglang,
+            ),
+            (
+                "zmq://d:1",
+                WorkerType::Decode,
+                ConnectionMode::Zmq,
+                RuntimeType::Sglang,
+            ),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let by_type = |worker_type: WorkerType| -> Vec<Arc<dyn Worker>> {
+            registry
+                .get_all()
+                .into_iter()
+                .filter(|w| *w.worker_type() == worker_type)
+                .collect()
+        };
+        let prefill = by_type(WorkerType::Prefill);
+        let decode = by_type(WorkerType::Decode);
+        let candidates = || PairCandidates {
+            prefill: &prefill,
+            decode: &decode,
+        };
+
+        // Unpinned, the ZMQ decode worker is a candidate like any other.
+        assert!(select_pair(
+            &registry,
+            &policies,
+            MODEL,
+            candidates(),
+            None,
+            false,
+            PlacementInputs::default(),
+        )
+        .is_ok());
+
+        // A retry that retained a gRPC plan must not land on it.
+        let failure = select_pair(
+            &registry,
+            &policies,
+            MODEL,
+            candidates(),
+            Some(WireConstraint {
+                runtime: RuntimeType::Sglang,
+                connection: ConnectionMode::Grpc,
+            }),
+            false,
+            PlacementInputs::default(),
+        )
+        .err()
+        .expect("the retained transport has no decode worker");
+        assert_eq!(failure.leg, WorkerLeg::Decode);
+        assert!(matches!(failure.verdict, PlacementFailure::Unavailable));
     }
 
     #[test]

@@ -821,10 +821,16 @@ impl Router {
                 PlacementFailure::AllOverloaded(shed) => shed,
                 PlacementFailure::NoCandidates
                 | PlacementFailure::Unavailable
-                | PlacementFailure::PolicyDeclined(_) => error::service_unavailable(
-                    "no_available_workers",
-                    "All workers are unavailable (circuit breaker open or unhealthy)",
-                ),
+                | PlacementFailure::PolicyDeclined(_) => {
+                    // The verdict cannot tell a policy miss from a drained
+                    // pool; the pool can.
+                    let message = if non_dp_workers.iter().any(|w| w.is_available()) {
+                        "Policy returned no eligible worker"
+                    } else {
+                        "All workers are unavailable (circuit breaker open or unhealthy)"
+                    };
+                    error::service_unavailable("no_available_workers", message)
+                }
             };
             record_pre_send_error(&resp);
             return resp;
