@@ -2,13 +2,10 @@
 
 use std::sync::Arc;
 
-#[cfg(feature = "provider-anthropic")]
-use super::anthropic::AnthropicRouter;
-#[cfg(feature = "provider-gemini")]
-use super::gemini::GeminiRouter;
-#[cfg(feature = "provider-openai")]
-use super::openai::OpenAIRouter;
+use smg_external_router::{builtin_routers, spec_for_backend};
+
 use super::{
+    external::ExternalRouterAdapter,
     grpc::{
         mode::{grpc_mode, Mode},
         router::GrpcRouter,
@@ -38,13 +35,15 @@ impl RouterId {
 
 /// Static router ID constants to avoid heap allocations in hot paths
 pub mod router_ids {
+    use smg_external_router::ids as external_ids;
+
     use super::RouterId;
 
     pub const HTTP_REGULAR: RouterId = RouterId::new("http-regular");
     pub const HTTP_PD: RouterId = RouterId::new("http-pd");
-    pub const HTTP_OPENAI: RouterId = RouterId::new("http-openai");
-    pub const HTTP_ANTHROPIC: RouterId = RouterId::new("http-anthropic");
-    pub const HTTP_GEMINI: RouterId = RouterId::new("http-gemini");
+    pub const HTTP_OPENAI: RouterId = RouterId::new(external_ids::OPENAI);
+    pub const HTTP_ANTHROPIC: RouterId = RouterId::new(external_ids::ANTHROPIC);
+    pub const HTTP_GEMINI: RouterId = RouterId::new(external_ids::GEMINI);
     pub const GRPC_REGULAR: RouterId = RouterId::new("grpc-regular");
     pub const GRPC_PD: RouterId = RouterId::new("grpc-pd");
     pub const GRPC_EPD: RouterId = RouterId::new("grpc-epd");
@@ -121,9 +120,11 @@ impl RouterFactory {
                 RoutingMode::EncodePrefillDecode { .. } => {
                     Err("EPD mode requires gRPC connection_mode and TokenSpeed".to_string())
                 }
-                RoutingMode::OpenAI { .. } => Self::create_openai_router(ctx).await,
-                RoutingMode::Anthropic { .. } => Self::create_anthropic_router(ctx).await,
-                RoutingMode::Gemini { .. } => Self::create_gemini_router(ctx).await,
+                RoutingMode::OpenAI { .. } => Self::create_external_router("openai", ctx).await,
+                RoutingMode::Anthropic { .. } => {
+                    Self::create_external_router("anthropic", ctx).await
+                }
+                RoutingMode::Gemini { .. } => Self::create_external_router("gemini", ctx).await,
             },
         }
     }
@@ -226,44 +227,19 @@ impl RouterFactory {
     /// Workers should be registered via the external worker registration workflow
     /// before using this router. The workflow discovers models from the provided
     /// endpoints and creates external workers in the registry.
-    #[cfg(feature = "provider-openai")]
-    pub async fn create_openai_router(
+    /// Mount the external router that `backend` names, or say which Cargo
+    /// feature would compile it in.
+    pub async fn create_external_router(
+        backend: &str,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        let router = OpenAIRouter::new(ctx).await?;
-        Ok(Box::new(router))
-    }
-
-    /// Create an Anthropic router
-    ///
-    /// Handles Anthropic Messages API (/v1/messages) with support for streaming,
-    /// tool use, extended thinking, and other Anthropic-specific features.
-    #[expect(
-        clippy::unused_async,
-        reason = "async for API consistency with other create_* factory methods"
-    )]
-    #[cfg(feature = "provider-anthropic")]
-    pub async fn create_anthropic_router(
-        ctx: &Arc<AppContext>,
-    ) -> Result<Box<dyn RouterTrait>, String> {
-        let router = AnthropicRouter::new(ctx.clone())?;
-        Ok(Box::new(router))
-    }
-
-    /// Create a Gemini Interactions router
-    ///
-    /// Handles Gemini Interactions API (/v1/interactions) with support for
-    /// streaming, MCP tool interception, and native Gemini format passthrough.
-    #[expect(
-        clippy::unused_async,
-        reason = "async for API consistency with other create_* factory methods"
-    )]
-    #[cfg(feature = "provider-gemini")]
-    pub async fn create_gemini_router(
-        ctx: &Arc<AppContext>,
-    ) -> Result<Box<dyn RouterTrait>, String> {
-        let router = GeminiRouter::new(ctx.clone())?;
-        Ok(Box::new(router))
+        match spec_for_backend(backend) {
+            Some(spec) => ExternalRouterAdapter::mount(spec, ctx).await,
+            None => Err(format!(
+                "{backend} routing is not compiled into this build; rebuild with the \
+                 `provider-{backend}` Cargo feature"
+            )),
+        }
     }
 
     /// Create all routers for IGW (multi-router) mode.
@@ -322,123 +298,15 @@ impl RouterFactory {
         // Every provider router this build carries. They proxy to third-party
         // APIs and forward the caller's credentials upstream, so a build that
         // should never do that simply leaves the features out.
-        routers.extend(
-            [
-                Self::openai_igw_entry(ctx).await,
-                Self::anthropic_igw_entry(ctx).await,
-                Self::gemini_igw_entry(ctx).await,
-            ]
-            .into_iter()
-            .flatten(),
-        );
+        for spec in builtin_routers() {
+            routers.push((
+                RouterId::new(spec.router_id),
+                spec.label,
+                ExternalRouterAdapter::mount(spec, ctx).await,
+            ));
+        }
 
         routers
-    }
-
-    #[cfg(feature = "provider-openai")]
-    async fn openai_igw_entry(ctx: &Arc<AppContext>) -> Option<IgwRouterEntry> {
-        Some((
-            router_ids::HTTP_OPENAI,
-            "OpenAI",
-            Self::create_openai_router(ctx).await,
-        ))
-    }
-
-    #[cfg(feature = "provider-anthropic")]
-    async fn anthropic_igw_entry(ctx: &Arc<AppContext>) -> Option<IgwRouterEntry> {
-        Some((
-            router_ids::HTTP_ANTHROPIC,
-            "Anthropic",
-            Self::create_anthropic_router(ctx).await,
-        ))
-    }
-
-    #[cfg(feature = "provider-gemini")]
-    async fn gemini_igw_entry(ctx: &Arc<AppContext>) -> Option<IgwRouterEntry> {
-        Some((
-            router_ids::HTTP_GEMINI,
-            "Gemini",
-            Self::create_gemini_router(ctx).await,
-        ))
-    }
-}
-
-/// A build without the OpenAI-compatible provider router: the constructor
-/// keeps its signature so callers do not change, and answers with the reason.
-#[cfg(not(feature = "provider-openai"))]
-impl RouterFactory {
-    #[expect(
-        clippy::unused_async,
-        reason = "signature shared with the provider build"
-    )]
-    pub async fn create_openai_router(
-        _ctx: &Arc<AppContext>,
-    ) -> Result<Box<dyn RouterTrait>, String> {
-        Err(
-            "OpenAI-compatible provider routing is not compiled into this build; rebuild with \
-             the `provider-openai` Cargo feature"
-                .to_string(),
-        )
-    }
-
-    #[expect(
-        clippy::unused_async,
-        reason = "signature shared with the provider build"
-    )]
-    async fn openai_igw_entry(_ctx: &Arc<AppContext>) -> Option<IgwRouterEntry> {
-        None
-    }
-}
-
-/// A build without the Anthropic router; see the OpenAI-compatible twin.
-#[cfg(not(feature = "provider-anthropic"))]
-impl RouterFactory {
-    #[expect(
-        clippy::unused_async,
-        reason = "signature shared with the provider build"
-    )]
-    pub async fn create_anthropic_router(
-        _ctx: &Arc<AppContext>,
-    ) -> Result<Box<dyn RouterTrait>, String> {
-        Err(
-            "Anthropic routing is not compiled into this build; rebuild with the \
-             `provider-anthropic` Cargo feature"
-                .to_string(),
-        )
-    }
-
-    #[expect(
-        clippy::unused_async,
-        reason = "signature shared with the provider build"
-    )]
-    async fn anthropic_igw_entry(_ctx: &Arc<AppContext>) -> Option<IgwRouterEntry> {
-        None
-    }
-}
-
-/// A build without the Gemini router; see the OpenAI-compatible twin.
-#[cfg(not(feature = "provider-gemini"))]
-impl RouterFactory {
-    #[expect(
-        clippy::unused_async,
-        reason = "signature shared with the provider build"
-    )]
-    pub async fn create_gemini_router(
-        _ctx: &Arc<AppContext>,
-    ) -> Result<Box<dyn RouterTrait>, String> {
-        Err(
-            "Gemini routing is not compiled into this build; rebuild with the \
-             `provider-gemini` Cargo feature"
-                .to_string(),
-        )
-    }
-
-    #[expect(
-        clippy::unused_async,
-        reason = "signature shared with the provider build"
-    )]
-    async fn gemini_igw_entry(_ctx: &Arc<AppContext>) -> Option<IgwRouterEntry> {
-        None
     }
 }
 

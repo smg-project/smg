@@ -322,12 +322,12 @@ jobs:
         # default features; see model_gateway/Cargo.toml.
         run: |
           source "$HOME/.cargo/env"
-          cargo clippy -p smg --no-default-features --features grpc-client,jemalloc-stats --all-targets -- -D warnings
+          cargo clippy -p smg -p smg-external-router --no-default-features --features smg/grpc-client,smg/jemalloc-stats --all-targets -- -D warnings
 
       - name: Lint a single-provider build (Anthropic only)
         run: |
           source "$HOME/.cargo/env"
-          cargo clippy -p smg --no-default-features --features grpc-client,jemalloc-stats,provider-anthropic --all-targets -- -D warnings
+          cargo clippy -p smg -p smg-external-router --no-default-features --features smg/grpc-client,smg/jemalloc-stats,smg/provider-anthropic --all-targets -- -D warnings
 
       - name: Run fmt
         run: |

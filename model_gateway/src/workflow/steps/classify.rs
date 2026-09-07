@@ -90,16 +90,13 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
         // A provider target needs the provider's router, which exists only in
         // a build that compiled it in; a worker nothing could route to must
         // not enter the registry.
-        if let Some(family) = provider_support::missing_router(config) {
+        if let Some(missing) = provider_support::missing_router(config) {
             return Err(WorkflowError::StepFailed {
                 step_id: StepId::new("classify_worker_type"),
                 message: format!(
                     "worker {} targets the {} provider, but this build carries no {} router; \
                      rebuild with the `{}` Cargo feature to admit it",
-                    config.url,
-                    family.label(),
-                    family.label(),
-                    family.feature()
+                    config.url, missing.label, missing.label, missing.feature
                 ),
             });
         }

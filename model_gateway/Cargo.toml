@@ -26,9 +26,9 @@ mm-rdma = ["smg-mm-rdma/nixl"]
 # it serves; IGW mode registers every router compiled in, and a worker that
 # targets a provider is admitted only when its router is present. Leave them
 # all out for a self-hosted-only build.
-provider-openai = []
-provider-anthropic = []
-provider-gemini = []
+provider-openai = ["smg-external-router/openai"]
+provider-anthropic = ["smg-external-router/anthropic"]
+provider-gemini = ["smg-external-router/gemini"]
 providers = ["provider-openai", "provider-anthropic", "provider-gemini"]
 # Client-injection seam for this crate's own K8s discovery integration tests
 # (auto-enabled by the self dev-dependency below, never in production builds).
@@ -85,6 +85,7 @@ wfaas.workspace = true
 llm-tokenizer.workspace = true
 smg-auth.workspace = true
 smg-mcp.workspace = true
+smg-external-router = { path = "../crates/external_router", default-features = false }
 kv-index.workspace = true
 smg-data-connector.workspace = true
 llm-multimodal = { workspace = true, default-features = false }
@@ -155,6 +156,7 @@ toml = "1.1"
 # the provider routers) would leak into every test target whatever features the
 # build selected, so a `--no-default-features` test run would not be one.
 smg = { path = ".", default-features = false, features = ["test-util"] }
+smg-external-router = { path = "../crates/external_router", default-features = false }
 # Enable the mock engine for the ZMQ client's loopback tests.
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
 criterion = { version = "0.8", features = ["html_reports"] }

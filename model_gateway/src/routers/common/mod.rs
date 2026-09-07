@@ -36,18 +36,16 @@
 //!   responses to clients and parsing upstream SSE byte streams
 
 pub mod body_policy;
-pub mod header_utils;
+pub use smg_external_router::header_utils;
 pub(crate) mod kv_transfer;
-pub mod mcp_utils;
-pub mod openai_bridge;
+pub use smg_external_router::{mcp_utils, openai_bridge};
 pub mod overload;
-pub mod persistence_utils;
+pub use smg_external_router::persistence_utils;
 pub(crate) mod placement;
-pub mod realtime;
+pub use smg_external_router::realtime;
 pub mod request_lease;
-pub mod retry;
-pub(crate) mod sglang_fields;
-pub mod sse;
+pub(crate) use smg_external_router::sglang_fields;
+pub use smg_external_router::{retry, sse};
 pub mod worker_selection;
 
 /// Threshold above which upstream request bodies are sent as one-shot

@@ -4,10 +4,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use axum::{
-    http::{HeaderMap, HeaderValue},
-    response::Response,
-};
+use axum::{http::HeaderValue, response::Response};
 use futures_util::future::join_all;
 use openai_protocol::models::ListModelsResponse;
 
@@ -19,7 +16,7 @@ use crate::{
         },
         error,
     },
-    worker::{ConnectionMode, ProviderType, RuntimeType, Worker, WorkerRegistry, WorkerType},
+    worker::{ProviderType, RuntimeType, Worker, WorkerRegistry},
 };
 
 /// Holds references to shared infrastructure needed for worker selection.
@@ -30,39 +27,7 @@ pub struct WorkerSelector<'a> {
     registry: &'a WorkerRegistry,
 }
 
-/// Input for [`WorkerSelector::select_worker`].
-///
-/// Combines the model to resolve with optional registry filters and
-/// the caller's HTTP headers (used for auth passthrough during
-/// upstream model refresh).
-#[derive(Debug, Default)]
-pub struct SelectWorkerRequest<'a> {
-    /// Model ID to select a worker for (required).
-    pub model_id: &'a str,
-
-    /// Caller's HTTP headers — used to extract the auth token for
-    /// upstream `/v1/models` refresh on cache miss.
-    pub headers: Option<&'a HeaderMap>,
-
-    /// Provider-based security filtering for multi-provider setups.
-    /// When set, prevents credentials from leaking to workers of a
-    /// different provider (e.g. Anthropic key to OpenAI worker).
-    pub provider: Option<ProviderType>,
-
-    /// Filter by worker type (Regular, Prefill, Decode). `None` = any.
-    pub worker_type: Option<WorkerType>,
-
-    /// Filter by connection mode (Http, Grpc). `None` = any.
-    pub connection_mode: Option<ConnectionMode>,
-
-    /// Filter by runtime type (External, Sglang, Vllm, Trtllm). `None` = any.
-    pub runtime_type: Option<RuntimeType>,
-
-    /// When `true`, restrict candidates to workers advertising realtime
-    /// capability (the `realtime` label). Used by the realtime routes so
-    /// they never proxy to a worker that can't serve realtime.
-    pub require_realtime_capable: bool,
-}
+pub use smg_external_router::worker::SelectWorkerRequest;
 
 impl<'a> WorkerSelector<'a> {
     pub fn new(registry: &'a WorkerRegistry) -> Self {
@@ -334,7 +299,7 @@ mod tests {
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
-    use crate::worker::BasicWorkerBuilder;
+    use crate::worker::{BasicWorkerBuilder, WorkerType};
 
     fn no_health_check() -> HealthCheckConfig {
         HealthCheckConfig {

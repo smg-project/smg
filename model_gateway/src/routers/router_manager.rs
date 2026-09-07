@@ -40,6 +40,7 @@ use crate::{
     routers::{
         common::body_policy::REASON_MODEL_SELECTION,
         error as route_error,
+        external::ExternalRouterAdapter,
         factory::{router_ids, RouterId},
         BodyPolicy, RouterFactory, RouterTrait,
     },
@@ -227,25 +228,27 @@ impl RouterManager {
         None
     }
 
-    /// The router that serves an external worker's provider, whether or not
-    /// this build carries it.
-    fn external_router_id(provider: Option<&ProviderType>) -> &'static RouterId {
-        match provider {
-            Some(ProviderType::Gemini) => &router_ids::HTTP_GEMINI,
-            Some(ProviderType::Anthropic) => &router_ids::HTTP_ANTHROPIC,
-            _ => &router_ids::HTTP_OPENAI,
-        }
-    }
-
     /// Whether an external worker serves `model` through a provider router
     /// this build does not carry. Such a request must fail rather than fall
     /// through to a self-hosted router that would proxy it untranslated.
     fn external_router_missing(&self, workers: &[Arc<dyn Worker>], model: &str) -> bool {
         workers.iter().any(|w| {
             matches!(w.metadata().spec.runtime_type, RuntimeType::External)
-                && !self
-                    .routers
-                    .contains_key(Self::external_router_id(w.provider_for_model(model)))
+                && self
+                    .external_router_for(w.provider_for_model(model))
+                    .is_none()
+        })
+    }
+
+    /// The mounted external router that takes workers of `provider`.
+    fn external_router_for(&self, provider: Option<&ProviderType>) -> Option<Arc<dyn RouterTrait>> {
+        self.routers.iter().find_map(|entry| {
+            let router = entry.value();
+            router
+                .as_any()
+                .downcast_ref::<ExternalRouterAdapter>()
+                .filter(|adapter| adapter.takes(provider))
+                .map(|_| Arc::clone(router))
         })
     }
 
@@ -258,8 +261,7 @@ impl RouterManager {
         if let Some(model) = model_id {
             for w in workers {
                 if matches!(w.metadata().spec.runtime_type, RuntimeType::External) {
-                    let router_id = Self::external_router_id(w.provider_for_model(model));
-                    return self.routers.get(router_id).map(|r| r.clone());
+                    return self.external_router_for(w.provider_for_model(model));
                 }
             }
         }

@@ -333,10 +333,10 @@ impl WorkerService {
     /// here rather than after the 202, inside the background workflow.
     fn require_provider_router(config: &WorkerSpec) -> Result<(), WorkerServiceError> {
         match provider_support::missing_router(config) {
-            Some(family) => Err(WorkerServiceError::ProviderNotCompiled {
+            Some(missing) => Err(WorkerServiceError::ProviderNotCompiled {
                 url: config.url.clone(),
-                family: family.label(),
-                feature: family.feature(),
+                family: missing.label,
+                feature: missing.feature,
             }),
             None => Ok(()),
         }
