@@ -47,6 +47,7 @@ use wfaas::LoggingSubscriber;
 use crate::{
     app_context::AppContext,
     config::RouterConfig,
+    endpoints::{conversations, parse, responses as response_handlers, tokenize},
     mesh::MeshAdapters,
     middleware::{self, AdmissionQueue, AuthConfig},
     observability::{
@@ -56,11 +57,9 @@ use crate::{
     },
     routers::{
         common::realtime::ws::RealtimeQueryParams,
-        conversations,
         http::router::{stream_eligible_request_bodies, StreamBodyState},
-        parse, responses as response_handlers,
         router_manager::RouterManager,
-        tokenize, RouterTrait,
+        RouterTrait,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},

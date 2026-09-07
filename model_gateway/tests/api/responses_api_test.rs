@@ -11,7 +11,8 @@ use openai_protocol::{
 };
 use smg::{
     config::RouterConfig,
-    routers::{conversations, RouterFactory},
+    endpoints::conversations,
+    routers::RouterFactory,
     tenant::{RouteRequestMeta, TenantKey},
 };
 
