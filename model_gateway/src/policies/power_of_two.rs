@@ -153,8 +153,8 @@ mod tests {
     #[test]
     fn remove_worker_forgets_stale_snapshot() {
         // a's heavy snapshot steers picks to b; after remove_worker(a), a is
-        // scored on the missing-snapshot drain-time path (idle -> 0) instead
-        // of the stale queue.
+        // scored like its reporting peer instead of by the stale queue, so it
+        // is picked again.
         let policy = PowerOfTwoPolicy::new();
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
         let mut loads = HashMap::new();
@@ -167,9 +167,11 @@ mod tests {
         );
 
         policy.remove_worker("http://a:8000");
-        assert_eq!(
-            policy.select_worker(&workers, &SelectWorkerInfo::default()),
-            Some(0)
+        let picked_a = (0..50)
+            .any(|_| policy.select_worker(&workers, &SelectWorkerInfo::default()) == Some(0));
+        assert!(
+            picked_a,
+            "a stays unpicked after its stale snapshot was dropped"
         );
     }
 

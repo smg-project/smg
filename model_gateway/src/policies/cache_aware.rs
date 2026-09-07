@@ -2878,13 +2878,18 @@ mod tests {
             (true, 1024, 1),
             "worker removal must preserve other workers' state"
         );
-        let second = SelectWorkerInfo {
-            request_text: Some("zulu removal miss"),
-            ..Default::default()
-        };
-        assert_eq!(
-            policy.select_worker(&workers, &second),
-            Some(0),
+        // Scored like its reporting peer once the stale queue is gone, the
+        // removed worker is picked again instead of shunned.
+        let picked_removed = (0..50).any(|i| {
+            let text = format!("{i} removal miss");
+            let miss = SelectWorkerInfo {
+                request_text: Some(&text),
+                ..Default::default()
+            };
+            policy.select_worker(&workers, &miss) == Some(0)
+        });
+        assert!(
+            picked_removed,
             "removed worker's stale heavy snapshot must not survive cleanup"
         );
     }

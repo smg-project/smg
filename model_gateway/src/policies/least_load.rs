@@ -115,6 +115,19 @@ pub struct LeastLoadPolicy {
     max_waiting_requests: u32,
 }
 
+/// Everything one expected-wait score reads besides the worker itself.
+#[derive(Clone, Copy)]
+struct ScoreInputs<'a> {
+    loads: Option<&'a HashMap<String, WorkerLoadResponse>>,
+    complete_snapshot: Option<&'a LoadSnapshot>,
+    inflight: &'a HashMap<String, SincePollDispatch>,
+    nominal_throughput: f64,
+    fleet_has_loads: bool,
+    /// What a reporting peer scores on average; the score of a worker
+    /// without a fresh report, before its own in-flight.
+    peer_baseline: f64,
+}
+
 impl LeastLoadPolicy {
     pub fn new() -> Self {
         Self::with_params(
@@ -197,15 +210,15 @@ impl LeastLoadPolicy {
     /// worker reports at all, in which case we fall back to join-shortest-queue
     /// on the live in-flight count (which, unlike the since-poll estimate,
     /// reflects completions and so suits backends that never report loads).
-    fn score(
-        &self,
-        worker: &Arc<dyn Worker>,
-        loads: Option<&HashMap<String, WorkerLoadResponse>>,
-        complete_snapshot: Option<&LoadSnapshot>,
-        inflight: &HashMap<String, SincePollDispatch>,
-        nominal_throughput: f64,
-        fleet_has_loads: bool,
-    ) -> f64 {
+    fn score(&self, worker: &Arc<dyn Worker>, inputs: &ScoreInputs<'_>) -> f64 {
+        let ScoreInputs {
+            loads,
+            complete_snapshot,
+            inflight,
+            nominal_throughput,
+            fleet_has_loads,
+            peer_baseline,
+        } = *inputs;
         let url = worker.url();
         match Self::fresh_load(loads, complete_snapshot, url) {
             Some(load) => {
@@ -221,11 +234,14 @@ impl LeastLoadPolicy {
                 (queued_tokens + inflight_tokens) / throughput
                     + self.kv_pressure_weight * k / (1.0 - k)
             }
-            // No fresh snapshot, but peers report: estimate this worker's drain
-            // time from its live in-flight (count × mean prefill) at the fleet's
-            // nominal throughput, keeping the same units as reporting workers.
+            // No fresh snapshot, but peers report: score it as an average
+            // reporting peer plus its own live in-flight (count × mean prefill)
+            // at the fleet's nominal throughput. Unknown load must not read as
+            // idle, or every request would herd onto the one worker whose
+            // report is missing.
             None if fleet_has_loads => {
-                worker.load() as f64 * self.mean_prefill_tokens as f64 / nominal_throughput
+                peer_baseline
+                    + worker.load() as f64 * self.mean_prefill_tokens as f64 / nominal_throughput
             }
             // Whole fleet dark (cold start, or a backend that never reports
             // loads): join-shortest-queue on live in-flight.
@@ -367,26 +383,48 @@ impl LeastLoadPolicy {
         // Argmin with reservoir tie-breaking: equal-score workers (the common
         // idle/homogeneous case scores exactly equal) are sampled uniformly
         // instead of first-index-wins, which herded ties onto one worker.
+        // What a reporting peer scores on average; a worker without a report
+        // is scored from this rather than as idle.
+        let peer_baseline = {
+            let reported: Vec<f64> = candidates
+                .iter()
+                .filter(|&&i| {
+                    Self::fresh_load(loads, complete_snapshot, workers[i].url()).is_some()
+                })
+                .map(|&i| {
+                    self.score(
+                        &workers[i],
+                        &ScoreInputs {
+                            loads,
+                            complete_snapshot,
+                            inflight: &inflight,
+                            nominal_throughput,
+                            fleet_has_loads,
+                            peer_baseline: 0.0,
+                        },
+                    )
+                })
+                .collect();
+            if reported.is_empty() {
+                0.0
+            } else {
+                reported.iter().sum::<f64>() / reported.len() as f64
+            }
+        };
         let mut rng = rand::rng();
         let mut best = first;
-        let mut best_score = self.score(
-            &workers[best],
+        let inputs = ScoreInputs {
             loads,
             complete_snapshot,
-            &inflight,
+            inflight: &inflight,
             nominal_throughput,
             fleet_has_loads,
-        );
+            peer_baseline,
+        };
+        let mut best_score = self.score(&workers[best], &inputs);
         let mut tied = 1u32;
         for &idx in rest {
-            let s = self.score(
-                &workers[idx],
-                loads,
-                complete_snapshot,
-                &inflight,
-                nominal_throughput,
-                fleet_has_loads,
-            );
+            let s = self.score(&workers[idx], &inputs);
             if s < best_score {
                 best = idx;
                 best_score = s;
@@ -591,6 +629,36 @@ mod tests {
         assert!(
             seen.iter().all(|&s| s),
             "equal-score ties must spread across all workers, saw {seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_worker_without_a_report_is_scored_like_its_peers() {
+        // Two workers report a queue; the third never answered the load
+        // poll. Unknown load must not read as idle, or the whole fleet
+        // herds onto the one worker nobody has heard from.
+        let urls = ["http://a:8000", "http://b:8000", "http://c:8000"];
+        let mut seen = [0usize; 3];
+        for _ in 0..150 {
+            let policy = LeastLoadPolicy::new();
+            let workers: Vec<Arc<dyn Worker>> = urls.iter().map(|u| mk(u)).collect();
+            let mut loads = HashMap::new();
+            for url in &urls[..2] {
+                loads.insert(url.to_string(), make_load_reqs_only(1, 0.125, 100.0));
+            }
+            policy.update_loads(&loads);
+            let idx = policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .unwrap();
+            seen[idx] += 1;
+        }
+        assert!(
+            seen[2] < 150,
+            "the unreported worker took every request: {seen:?}"
+        );
+        assert!(
+            seen[0] > 0 && seen[1] > 0,
+            "reporting peers must still be chosen: {seen:?}"
         );
     }
 
