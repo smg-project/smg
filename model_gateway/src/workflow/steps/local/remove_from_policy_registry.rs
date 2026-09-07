@@ -79,6 +79,19 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
                 monitor.on_worker_removed(worker.url()).await;
             }
 
+            // Fleet-departure signal for the REMOTE index: soft-retire the
+            // worker's holder so replicas stop scoring it now, instead of
+            // leaking it until the index's silence backstop fires. This is
+            // the same lifecycle signal that purges the local indexer above.
+            if let Some(ref handle) = app_context.remote_index {
+                for model_id in WorkerRegistry::worker_model_ids(worker) {
+                    handle
+                        .client()
+                        .publish_dropped(&model_id, handle.block_size() as u32, worker.url())
+                        .await;
+                }
+            }
+
             // Drop the worker's cached load report from load-aware policies
             // (power_of_two, least_load) so their caches don't leak under churn.
             app_context

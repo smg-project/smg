@@ -49,6 +49,8 @@ pub use round_robin::RoundRobinPolicy;
 ///
 /// This trait provides a unified interface for implementing routing algorithms
 /// that can work with both regular single-worker selection and PD dual-worker selection.
+pub(crate) mod remote_index;
+
 pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Select a single worker from the available workers
     ///
@@ -59,6 +61,34 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// * `workers` - Available workers to select from
     /// * `info` - Additional information for routing decisions
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize>;
+
+    /// Selection with prefetched remote-index overlap scores (the shared
+    /// radix index; `--kv-indexer-url`). The default ignores the scores
+    /// and delegates, so every policy except cache_aware — and every
+    /// caller that never prefetches — behaves exactly as `select_worker`.
+    fn select_worker_with_remote(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        _remote: &RemoteOverlap,
+    ) -> Option<usize> {
+        self.select_worker(workers, info)
+    }
+
+    /// Selection when a shared remote index is WIRED but produced no
+    /// usable overlap for this request (outage, timeout, nothing to
+    /// hash). A policy that keeps local prefix state must not consult or
+    /// populate it here — with a remote index that local state is a
+    /// partial, per-gateway view that would silently absorb remote
+    /// misses — so cache_aware overrides this with a load-only pick.
+    /// The default delegates: every other policy has no such state.
+    fn select_worker_remote_only(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        self.select_worker(workers, info)
+    }
 
     /// Update policy state after request completion
     ///
@@ -276,6 +306,53 @@ impl WorkerLeg {
             WorkerLeg::Single => "",
             WorkerLeg::Prefill => "prefill:",
             WorkerLeg::Decode => "decode:",
+        }
+    }
+}
+
+/// Prefetched overlap scores from the remote radix index, resolved by the
+/// async pipeline stage before the (synchronous) policy call.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteOverlap {
+    /// Per-holder (worker url, matched prefix blocks), descending.
+    pub scores: Vec<(String, u32)>,
+    /// The request's full prefix depth in blocks (for overlap decay).
+    pub request_blocks: usize,
+    /// Block size the scores were computed at.
+    pub block_size: usize,
+}
+
+/// What the shared index said for this request, as placement sees it.
+/// Three states, because "no scores" means two different things: a
+/// path that never asked keeps plain policy selection (local state
+/// included), while a path that asked and got nothing must not fall
+/// back to a local prefix tree that would then hold a partial,
+/// per-gateway view of remote misses.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum RemoteLookup<'a> {
+    /// This path did not query the index — it does not participate
+    /// (retry re-selection, HTTP PD, transcription, the streamed
+    /// pass-through), no index is wired, or the request had nothing to
+    /// hash. Plain `select_worker`.
+    #[default]
+    NotAttempted,
+    /// The index was queried for this request and answered with no
+    /// usable overlap (empty, timeout, disconnected). cache_aware picks
+    /// on load alone and leaves its local trees untouched.
+    Missed,
+    /// The index answered with per-holder overlap.
+    Hit(&'a RemoteOverlap),
+}
+
+impl<'a> RemoteLookup<'a> {
+    /// From `PolicyRegistry::resolve_remote_overlap*`'s result: `None`
+    /// is a skip (nothing was asked), an answer with no scores is a
+    /// miss, anything else a hit.
+    pub fn from_resolved(overlap: Option<&'a RemoteOverlap>) -> Self {
+        match overlap {
+            None => Self::NotAttempted,
+            Some(overlap) if overlap.scores.is_empty() => Self::Missed,
+            Some(overlap) => Self::Hit(overlap),
         }
     }
 }
