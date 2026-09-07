@@ -27,6 +27,8 @@
 //!   used by every router for transport-level retries. Has zero
 //!   coupling to the `Worker` trait — it lived in `worker/` for
 //!   historical reasons before this extraction.
+//! - [`sglang_fields`] — the SGLang-only request fields the HTTP proxy
+//!   strips at their defaults and the provider transformers drop outright
 //! - [`sse`] — shared SSE codec (encoder + decoder) for streaming
 //!   responses to clients and parsing upstream SSE byte streams
 
@@ -40,7 +42,7 @@ pub mod persistence_utils;
 pub mod realtime;
 pub mod request_lease;
 pub mod retry;
-pub mod sglang_fields;
+pub(crate) mod sglang_fields;
 pub mod sse;
 pub mod worker_selection;
 
