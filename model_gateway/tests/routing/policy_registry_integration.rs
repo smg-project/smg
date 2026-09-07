@@ -1,16 +1,16 @@
-//! Integration tests for PolicyRegistry with RouterManager
+//! Integration tests for PolicyRegistry with Gateway
 
 use std::{collections::HashMap, sync::Arc};
 
 use openai_protocol::worker::WorkerSpec;
 use smg::{
-    config::PolicyConfig, policies::PolicyRegistry, routers::router_manager::RouterManager,
+    config::PolicyConfig, policies::PolicyRegistry, routers::gateway::Gateway,
     worker::WorkerRegistry,
 };
 
 #[expect(clippy::print_stdout, reason = "test diagnostic output")]
 #[tokio::test]
-async fn test_policy_registry_with_router_manager() {
+async fn test_policy_registry_with_gateway() {
     // Create HTTP client
     let _client = reqwest::Client::new();
 
@@ -18,8 +18,8 @@ async fn test_policy_registry_with_router_manager() {
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
 
-    // Create RouterManager with shared registries
-    let _router_manager = RouterManager::new(worker_registry.clone());
+    // Create Gateway with shared registries
+    let _gateway = Gateway::new(worker_registry.clone());
 
     // Add first worker for llama-3 with cache_aware policy hint
     let mut labels1 = HashMap::new();

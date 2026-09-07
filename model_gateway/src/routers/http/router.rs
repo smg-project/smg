@@ -66,12 +66,12 @@ use crate::{
         },
         error::{self, extract_error_code_from_response},
         external::GatewayWorker,
+        gateway::Gateway,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         http::{
             request_body::{serialize_request_body, RequestBodyError},
             request_stream::{CappedBodyStream, StreamProgress},
         },
-        router_manager::RouterManager,
         BodyPolicy, RouterTrait,
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
@@ -1797,7 +1797,7 @@ pub async fn stream_eligible_request_bodies(
     // ForwardCapable: resolve the concrete regular router behind an optional
     // manager. Either arm can only fail on a registration race that turned
     // dispatch model-addressed again.
-    let resolved = match state.router.as_any().downcast_ref::<RouterManager>() {
+    let resolved = match state.router.as_any().downcast_ref::<Gateway>() {
         Some(manager) => match manager.select_router_for_request(None) {
             Some(selected) => selected,
             None => {

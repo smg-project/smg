@@ -57,8 +57,8 @@ use crate::{
     },
     routers::{
         common::realtime::ws::RealtimeQueryParams,
+        gateway::Gateway,
         http::router::{stream_eligible_request_bodies, StreamBodyState},
-        router_manager::RouterManager,
         RouterTrait,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
@@ -77,7 +77,7 @@ pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
     pub admission_queue: Option<Arc<AdmissionQueue>>,
-    pub router_manager: Option<Arc<RouterManager>>,
+    pub gateway: Option<Arc<Gateway>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
     pub mesh_adapters: Option<Arc<MeshAdapters>>,
     /// Cached O(1) readiness state shared with the optional dedicated
@@ -1280,8 +1280,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         worker_stats.total_workers, worker_stats.healthy_workers
     );
 
-    let router_manager = RouterManager::from_config(&config, &app_context).await?;
-    let router: Arc<dyn RouterTrait> = router_manager.clone();
+    let gateway = Gateway::from_config(&config, &app_context).await?;
+    let router: Arc<dyn RouterTrait> = gateway.clone();
 
     // WorkerManager owns the background health check loop. Its handle must
     // outlive the server to keep the task alive — bind it here so its Drop
@@ -1304,7 +1304,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // WorkerMonitor subscribes to registry events. Starting its event
     // loop here (after the synchronous worker population in
-    // RouterManager::from_config above) means the bootstrap reconcile
+    // Gateway::from_config above) means the bootstrap reconcile
     // captures every worker that exists at this point and the event
     // task picks up everything registered afterwards.
     if let Some(ref worker_monitor) = app_context.worker_monitor {
@@ -1369,7 +1369,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         router,
         context: app_context.clone(),
         admission_queue,
-        router_manager: Some(router_manager),
+        gateway: Some(gateway),
         mesh_handler,
         mesh_adapters,
         probe_state,

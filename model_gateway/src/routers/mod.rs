@@ -32,10 +32,10 @@ pub mod common;
 pub use smg_external_router::error;
 pub mod external;
 pub mod factory;
+pub mod gateway;
 pub mod grpc;
 pub mod http;
 pub(crate) mod provider_support;
-pub mod router_manager;
 
 pub use common::body_policy::BodyPolicy;
 pub use factory::RouterFactory;

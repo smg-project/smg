@@ -108,13 +108,15 @@ pub(crate) enum RoutingPool {
     HttpPrefill,
     /// HTTP-transport decode pool (same contract as [`Self::HttpPrefill`]).
     HttpDecode,
+    /// Workers that front a third-party provider, whatever their type.
+    External,
 }
 
 type WorkerSnapshot = Arc<[Arc<dyn Worker>]>;
 type LazyRoutingPool = OnceLock<WorkerSnapshot>;
 
 impl RoutingPool {
-    const COUNT: usize = 7;
+    const COUNT: usize = 8;
 
     const fn index(self) -> usize {
         match self {
@@ -125,6 +127,7 @@ impl RoutingPool {
             Self::GrpcEncode => 4,
             Self::HttpPrefill => 5,
             Self::HttpDecode => 6,
+            Self::External => 7,
         }
     }
 
@@ -158,6 +161,7 @@ impl RoutingPool {
                 *worker.worker_type() == WorkerType::Decode
                     && *worker.connection_mode() == ConnectionMode::Http
             }
+            Self::External => worker.metadata().spec.runtime_type == RuntimeType::External,
         }
     }
 }
@@ -777,13 +781,13 @@ impl WorkerRegistry {
     /// other is pinned — and substituting one for the other would silently run
     /// a model the client did not ask for.
     ///
-    /// External workers reach only the OpenAI, Anthropic and Gemini routers
-    /// ([`RouterManager::select_router_for_workers`] gives them priority, and
+    /// External workers reach only the provider routers
+    /// ([`Gateway::select_router_for_model`] gives them priority, and
     /// single-router mode picks by routing mode), none of which rewrite the
     /// outbound model. Keep it that way: canonicalize registry lookups there
     /// if needed, never the request body.
     ///
-    /// [`RouterManager::select_router_for_workers`]: crate::routers::RouterManager
+    /// [`Gateway::select_router_for_model`]: crate::routers::gateway::Gateway
     pub fn resolve_model_alias(&self, model_id: &str) -> Option<Arc<str>> {
         if model_id == UNKNOWN_MODEL_ID || self.model_index.contains_key(model_id) {
             return None;
