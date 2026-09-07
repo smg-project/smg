@@ -18,6 +18,9 @@
 //!   session registry) shared by the OpenAI and HTTP routers
 //! - [`overload`] — shed responses for the absolute worker-overload
 //!   guard, shared by the HTTP and gRPC selection paths
+//! - [`placement`] — policy-driven worker placement over the routing
+//!   pools (single worker and prefill/decode pairs), the one sequence the
+//!   HTTP and gRPC families used to each carry a copy of
 //! - [`worker_selection`] — per-request worker-selection helpers used
 //!   by every routing path (regular, PD, fallback, external provider)
 //! - [`request_lease`] — dispatch-phase owner of a request's parsed
@@ -39,6 +42,7 @@ pub mod mcp_utils;
 pub mod openai_bridge;
 pub mod overload;
 pub mod persistence_utils;
+pub(crate) mod placement;
 pub mod realtime;
 pub mod request_lease;
 pub mod retry;

@@ -11,11 +11,13 @@ use tracing::{error, warn};
 
 use super::PipelineStage;
 use crate::{
-    gateway::placement::{self, PlacementFailure, PlacementInputs},
     observability::metrics::{metrics_labels, Metrics},
     policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
-        common::overload,
+        common::{
+            overload,
+            placement::{self, PlacementFailure, PlacementInputs},
+        },
         error,
         grpc::{
             context::{

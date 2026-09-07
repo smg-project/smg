@@ -228,7 +228,7 @@ pub(crate) struct RoutingSnapshot {
     pub cache_namespace: Option<CacheNamespace>,
 }
 
-pub(crate) use crate::gateway::placement::WireConstraint;
+pub(crate) use crate::routers::common::placement::WireConstraint;
 
 impl WireConstraint {
     fn of(workers: &WorkerSelection) -> Self {

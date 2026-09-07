@@ -1,5 +1,9 @@
 //! Single-worker placement shared by the HTTP and gRPC families.
 //!
+//! Distinct from [`super::worker_selection`], the least-load selector with
+//! refresh-on-miss that the provider and realtime paths use; this is the
+//! policy-registry path over the self-hosted routing pools.
+//!
 //! Every family used to carry its own copy of the same sequence: take the
 //! routing pool for the model, narrow it to the retained wire on a retry,
 //! drop unavailable workers unless the policy does that itself, hand the

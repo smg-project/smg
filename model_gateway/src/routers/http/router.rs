@@ -38,7 +38,6 @@ use tracing::{error, warn};
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    gateway::placement::{self, PlacementFailure, PlacementInputs},
     middleware::{scheduler::PreemptionGuard, TenantRequestMeta},
     observability::{
         events::{self, Event},
@@ -57,6 +56,7 @@ use crate::{
                 REASON_WORKER_MUTATES_BODY,
             },
             header_utils, overload,
+            placement::{self, PlacementFailure, PlacementInputs},
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
