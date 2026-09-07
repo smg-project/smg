@@ -27,17 +27,10 @@ use crate::{
 
 /// Answer `GET /v1/models` for the caller identified by `headers`.
 pub async fn list_models(context: &AppContext, headers: &HeaderMap) -> Response {
-    // Every credential that authenticates as this gateway, shared and
-    // per-tenant. Rebuilt per call from the config it derives from; the
-    // endpoint is not hot and the set is small.
-    let gateway_auth = AuthConfig::with_tenant_keys(
-        context.router_config.api_key.clone(),
-        &context.router_config.tenant_api_keys,
-    );
     list_models_with(
         &context.worker_registry,
         &context.client,
-        &gateway_auth,
+        &context.gateway_auth,
         headers,
     )
     .await

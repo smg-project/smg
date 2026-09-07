@@ -16,7 +16,7 @@ use tracing::debug;
 
 use crate::{
     config::RouterConfig,
-    middleware::TokenBucket,
+    middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     rate_limit::RateLimitManager,
@@ -52,6 +52,11 @@ impl std::error::Error for AppContextBuildError {}
 pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
+    /// Every credential that authenticates as this gateway: the shared
+    /// `api_key` plus any per-tenant keys, derived once from `router_config`.
+    /// The serving auth layer and the `/v1/models` BYOK short-circuit both
+    /// read this set, so they cannot drift apart.
+    pub gateway_auth: AuthConfig,
     pub rate_limiter: Option<Arc<TokenBucket>>,
     pub rate_limit_manager: Option<Arc<RateLimitManager>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
@@ -359,8 +364,13 @@ impl AppContextBuilder {
         ));
 
         let worker_client_cache = Arc::new(WorkerHttpClientCache::new(&router_config));
+        let gateway_auth = AuthConfig::with_tenant_keys(
+            router_config.api_key.clone(),
+            &router_config.tenant_api_keys,
+        );
 
         Ok(AppContext {
+            gateway_auth,
             client: self
                 .client
                 .ok_or(AppContextBuildError::MissingField("client"))?,
