@@ -370,7 +370,9 @@ jobs:
 
   # Advisory: the thresholds in e2e_test/benchmarks are absolute latencies on
   # a shared runner pool and sit inside its noise band, so a miss is a warning,
-  # not a merge blocker. Results are still uploaded and summarized.
+  # not a merge blocker: it shows up as a warning annotation and in the step
+  # summary (BENCH_ENFORCE_THRESHOLDS=1 makes it fail). Results are still
+  # uploaded and summarized.
   benchmarks:
     needs: build-wheel
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
