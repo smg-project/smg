@@ -33,7 +33,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    policies::{CacheNamespace, PolicyRegistry, WorkerLeg},
     routers::{
         common::{
             attach_sized_body, header_utils,
@@ -42,6 +42,7 @@ use crate::{
                 KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
             },
             overload,
+            placement::{self, PairCandidates, PairFailure, PlacementFailure, PlacementInputs},
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, RetryExecutor},
             serialize_json_sized,
@@ -53,10 +54,7 @@ use crate::{
         http::router::send_with_stale_conn_retry,
         RouterTrait,
     },
-    worker::{
-        HashRing, RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
-        UNKNOWN_MODEL_ID,
-    },
+    worker::{RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID},
 };
 
 /// Why PD pair selection produced nothing.
@@ -216,21 +214,6 @@ impl PDRouter {
                     format!("No available servers: {error}"),
                 )
             }
-        }
-    }
-
-    /// Classify one leg's selection miss. `candidates` is the leg pool before
-    /// the `is_available()` filter, so the verdict describes the pool that
-    /// actually emptied rather than the model's whole registry entry — a
-    /// saturated prefill leg leaves the decode workers unflagged.
-    fn leg_failure(
-        candidates: &[Arc<dyn Worker>],
-        model_id: &str,
-        error: String,
-    ) -> PdSelectionFailure {
-        match overload::shed_if_all_overloaded(candidates, model_id) {
-            Some(shed) => PdSelectionFailure::Shed(shed),
-            None => PdSelectionFailure::Unavailable(error),
         }
     }
 
@@ -1353,120 +1336,49 @@ impl PDRouter {
             }
         };
 
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-        let decode_policy = self.policy_registry.get_decode_policy();
-
-        // Get cached hash ring for consistent hashing
-        let hash_ring = self.worker_registry.get_hash_ring(model_id);
-
-        let prefill = self
-            .pick_worker_by_policy_arc(
-                &prefill_workers,
-                &prefill_policy,
-                request_text,
+        let pair = placement::select_pair(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            PairCandidates {
+                prefill: &prefill_workers,
+                decode: &decode_workers,
+            },
+            None,
+            false,
+            PlacementInputs {
+                text: request_text,
                 tokens,
+                headers,
                 rid_key,
                 cache_namespace,
-                headers,
-                hash_ring.clone(),
-                "prefill",
-                crate::policies::WorkerLeg::Prefill,
-            )
-            .map_err(|e| Box::new(Self::leg_failure(&prefill_workers, model_id, e)))?;
+            },
+        )
+        .map_err(|failure| Box::new(Self::pair_failure(*failure)))?;
 
-        let decode = self
-            .pick_worker_by_policy_arc(
-                &decode_workers,
-                &decode_policy,
-                request_text,
-                tokens,
-                rid_key,
-                cache_namespace,
-                headers,
-                hash_ring,
-                "decode",
-                crate::policies::WorkerLeg::Decode,
-            )
-            .map_err(|e| Box::new(Self::leg_failure(&decode_workers, model_id, e)))?;
-
-        // Record worker selection metrics (Layer 3)
-        let model = model_id;
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_PREFILL,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            prefill_policy.name(),
-        );
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_DECODE,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            decode_policy.name(),
-        );
-
-        Ok((prefill, decode))
+        Ok((pair.prefill, pair.decode))
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "HTTP PD worker pick threads policy + request context + leg"
-    )]
-    fn pick_worker_by_policy_arc(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        policy: &Arc<dyn LoadBalancingPolicy>,
-        request_text: Option<&str>,
-        tokens: Option<&[u32]>,
-        rid_key: Option<&str>,
-        cache_namespace: Option<CacheNamespace>,
-        headers: Option<&HeaderMap>,
-        hash_ring: Option<Arc<HashRing>>,
-        worker_type: &str,
-        leg: crate::policies::WorkerLeg,
-    ) -> Result<Arc<dyn Worker>, String> {
-        if workers.is_empty() {
-            return Err(format!(
-                "No {worker_type} workers available. Please check if {worker_type} servers are configured and healthy."
-            ));
+    /// Map a leg's placement verdict to this router's selection failure,
+    /// keeping the operator-facing messages the legs always produced.
+    fn pair_failure(failure: PairFailure) -> PdSelectionFailure {
+        let leg = match failure.leg {
+            WorkerLeg::Prefill => "prefill",
+            WorkerLeg::Decode => "decode",
+            WorkerLeg::Single => "worker",
+        };
+        match failure.verdict {
+            PlacementFailure::AllOverloaded(shed) => PdSelectionFailure::Shed(shed),
+            PlacementFailure::NoCandidates => PdSelectionFailure::Unavailable(format!(
+                "No {leg} workers available. Please check if {leg} servers are configured and healthy."
+            )),
+            PlacementFailure::Unavailable => PdSelectionFailure::Unavailable(format!(
+                "No available {leg} workers (all circuits open or unhealthy)"
+            )),
+            PlacementFailure::PolicyDeclined(policy) => PdSelectionFailure::Unavailable(
+                format!("Policy {policy} failed to select a {leg} worker"),
+            ),
         }
-
-        let available_workers: Vec<Arc<dyn Worker>> = workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-
-        if available_workers.is_empty() {
-            return Err(format!(
-                "No available {worker_type} workers (all circuits open or unhealthy)"
-            ));
-        }
-
-        let selected_idx = self
-            .policy_registry
-            .select_worker(
-                policy,
-                &available_workers,
-                &SelectWorkerInfo {
-                    request_text,
-                    tokens,
-                    headers,
-                    routing_key: self.policy_registry.resolve_routing_key(headers),
-                    rid_key,
-                    cache_namespace,
-                    hash_ring,
-                    leg,
-                },
-            )
-            .ok_or_else(|| {
-                format!(
-                    "Policy {} failed to select a {} worker",
-                    policy.name(),
-                    worker_type
-                )
-            })?;
-
-        Ok(available_workers[selected_idx].clone())
     }
 
     #[expect(clippy::too_many_arguments)]

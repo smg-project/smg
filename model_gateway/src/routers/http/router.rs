@@ -44,9 +44,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{
-        policy_filters_unavailable_workers, CacheNamespace, PolicyRegistry, SelectWorkerInfo,
-    },
+    policies::{CacheNamespace, PolicyRegistry},
     routers::{
         common::{
             attach_sized_body,
@@ -516,10 +514,12 @@ impl Router {
                 ) {
                     PlacementFailure::NoCandidates => error::model_not_found(model_id),
                     PlacementFailure::AllOverloaded(shed) => shed,
-                    PlacementFailure::Unavailable => error::service_unavailable(
-                        "no_available_workers",
-                        "All workers are unavailable (circuit breaker open or unhealthy)",
-                    ),
+                    PlacementFailure::Unavailable | PlacementFailure::PolicyDeclined(_) => {
+                        error::service_unavailable(
+                            "no_available_workers",
+                            "All workers are unavailable (circuit breaker open or unhealthy)",
+                        )
+                    }
                 };
             }
         };
@@ -801,70 +801,34 @@ impl Router {
             record_pre_send_error(&resp);
             return resp;
         }
-        let policy = self.policy_registry.get_policy_or_default(model_id);
-        let filtered;
-        let available: &[Arc<dyn Worker>] = if policy_filters_unavailable_workers(policy.as_ref()) {
-            &non_dp_workers
-        } else {
-            filtered = non_dp_workers
-                .iter()
-                .filter(|worker| worker.is_available())
-                .cloned()
-                .collect::<Vec<_>>();
-            &filtered
-        };
-        if available.is_empty() {
-            let resp =
-                overload::shed_if_all_overloaded(&non_dp_workers, model_id).unwrap_or_else(|| {
-                    error::service_unavailable(
-                        "no_available_workers",
-                        "All workers are unavailable (circuit breaker open or unhealthy)",
-                    )
-                });
-            record_pre_send_error(&resp);
-            return resp;
-        }
-
-        let hash_ring = self.worker_registry.get_hash_ring(model_id);
-        let idx = match self.policy_registry.select_worker(
-            &policy,
-            available,
-            &SelectWorkerInfo {
-                request_text: text.as_deref(),
+        let Some(worker) = placement::select_from(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            &non_dp_workers,
+            PlacementInputs {
+                text: text.as_deref(),
                 tokens: hinted_tokens.as_deref(),
                 headers,
-                routing_key: self.policy_registry.resolve_routing_key(headers),
                 rid_key: None,
                 cache_namespace: None,
-                hash_ring,
-                leg: crate::policies::WorkerLeg::Single,
             },
-        ) {
-            Some(i) => i,
-            None => {
-                // Self-filtering policies see the unfiltered pool, so "all
-                // workers overloaded" surfaces here as a policy miss instead
-                // of an empty pre-filter above. Classify the shed on this arm
-                // too, or the 503 loses Retry-After, retryability marking,
-                // and the overload-shed metric.
-                let resp = overload::shed_if_all_overloaded(&non_dp_workers, model_id)
-                    .unwrap_or_else(|| {
-                        error::service_unavailable(
-                            "no_available_workers",
-                            "Policy returned no eligible worker",
-                        )
-                    });
-                record_pre_send_error(&resp);
-                return resp;
-            }
+        ) else {
+            // Judged from the same candidates whether the pre-filter emptied
+            // or a self-filtering policy missed on an all-overloaded pool, so
+            // a shed keeps its Retry-After, retryability and metric.
+            let resp = match placement::failure_from(&non_dp_workers, model_id) {
+                PlacementFailure::AllOverloaded(shed) => shed,
+                PlacementFailure::NoCandidates
+                | PlacementFailure::Unavailable
+                | PlacementFailure::PolicyDeclined(_) => error::service_unavailable(
+                    "no_available_workers",
+                    "All workers are unavailable (circuit breaker open or unhealthy)",
+                ),
+            };
+            record_pre_send_error(&resp);
+            return resp;
         };
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_REGULAR,
-            metrics_labels::CONNECTION_HTTP,
-            model_id,
-            policy.name(),
-        );
-        let worker = available[idx].clone();
 
         // Same dispatch-time re-check the regular path takes. A transcription
         // occupies its worker for far longer than a chat completion, so a
