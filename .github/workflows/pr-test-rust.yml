@@ -317,6 +317,18 @@ jobs:
           rustup component add clippy
           cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Lint the self-hosted-only build (no provider routers)
+        # Meaningful only because the crate's self dev-dependency disables
+        # default features; see model_gateway/Cargo.toml.
+        run: |
+          source "$HOME/.cargo/env"
+          cargo clippy -p smg --no-default-features --features grpc-client,jemalloc-stats --all-targets -- -D warnings
+
+      - name: Lint a single-provider build (Anthropic only)
+        run: |
+          source "$HOME/.cargo/env"
+          cargo clippy -p smg --no-default-features --features grpc-client,jemalloc-stats,provider-anthropic --all-targets -- -D warnings
+
       - name: Run fmt
         run: |
           source "$HOME/.cargo/env"

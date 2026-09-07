@@ -33,6 +33,7 @@ pub(crate) const SGLANG_FIELDS: &[&str] = &[
     "backend_url",
 ];
 
+#[cfg(feature = "provider-openai")]
 pub(crate) fn strip_sglang_fields(payload: &mut Value) {
     if let Some(obj) = payload.as_object_mut() {
         for field in SGLANG_FIELDS {

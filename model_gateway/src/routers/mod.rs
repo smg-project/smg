@@ -28,14 +28,18 @@ use openai_protocol::{
 
 use crate::middleware::TenantRequestMeta;
 
+#[cfg(feature = "provider-anthropic")]
 pub mod anthropic;
 pub mod common;
 pub mod error;
 pub mod factory;
+#[cfg(feature = "provider-gemini")]
 pub mod gemini;
 pub mod grpc;
 pub mod http;
+#[cfg(feature = "provider-openai")]
 pub mod openai;
+pub(crate) mod provider_support;
 pub mod router_manager;
 
 pub use common::body_policy::BodyPolicy;

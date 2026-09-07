@@ -31,6 +31,7 @@ pub(crate) struct RealtimeLabels {
 
 impl RealtimeLabels {
     /// Labels for the OpenAI router relaying to an external provider.
+    #[cfg(feature = "provider-openai")]
     pub const OPENAI: Self = Self {
         router: metrics_labels::ROUTER_OPENAI,
         backend: metrics_labels::BACKEND_EXTERNAL,
