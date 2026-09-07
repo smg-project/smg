@@ -44,7 +44,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{CacheNamespace, PolicyRegistry},
+    policies::{remote_index::IndexPrediction, CacheNamespace, PolicyRegistry, RemoteLookup},
     routers::{
         common::{
             attach_sized_body,
@@ -236,6 +236,10 @@ impl Router {
     /// Select worker considering circuit breaker state.
     /// Filters to workers serving the specified model. When model is "unknown"
     /// (generate endpoint without model), considers all HTTP workers.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selection threads every routing input the policy consumes, plus the remote-overlap prefetch"
+    )]
     fn select_worker_for_model(
         &self,
         model_id: &str,
@@ -244,6 +248,7 @@ impl Router {
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
+        remote: RemoteLookup<'_>,
     ) -> Option<Arc<dyn Worker>> {
         // This router proxies plain HTTP to the worker's URL, so only HTTP
         // workers are candidates; nothing pins a wire on this path.
@@ -259,6 +264,7 @@ impl Router {
                 headers,
                 rid_key,
                 cache_namespace,
+                remote,
             },
         )
     }
@@ -491,6 +497,58 @@ impl Router {
         canonical_model: Option<&str>,
         is_stream: bool,
     ) -> Response {
+        // Remote-index prefetch (--kv-indexer-url): resolve the shared-index
+        // overlap before selection so cache_aware can steer to a worker that
+        // already holds the prompt prefix, and keep the prediction for the
+        // post-dispatch placement publish. The routing inputs are hoisted to
+        // owned copies because the query awaits and the lease view cannot be
+        // borrowed across it; gated on the flag so it is zero-cost when the
+        // shared index is off.
+        let mut remote_overlap: Option<crate::policies::RemoteOverlap> = None;
+        let mut index_prediction: Option<IndexPrediction> = None;
+        if self.policy_registry.remote_index_enabled() {
+            // Only the branch about to be taken is materialized: the
+            // full prompt text (tens to hundreds of KB on agentic
+            // traffic) is copied only when there are no tokens to
+            // route on, since the token path never reads it.
+            let (owned_tokens, owned_text, owned_rid) = lease.with_view(|view| {
+                (
+                    view.tokens.map(<[u32]>::to_vec),
+                    view.tokens
+                        .is_none()
+                        .then(|| view.text.map(str::to_string))
+                        .flatten(),
+                    view.rid_key.map(str::to_string),
+                )
+            });
+            // Prefer the token tree (stronger, token-prefix affinity);
+            // fall back to string mode (raw-byte prefix) only when the
+            // request carries text but no tokens.
+            let resolved = if owned_tokens.is_some() {
+                self.policy_registry
+                    .resolve_remote_overlap(
+                        model_id,
+                        owned_tokens.as_deref(),
+                        headers,
+                        owned_rid.as_deref(),
+                    )
+                    .await
+            } else {
+                self.policy_registry
+                    .resolve_remote_overlap_bytes(
+                        model_id,
+                        owned_text.as_deref(),
+                        headers,
+                        owned_rid.as_deref(),
+                    )
+                    .await
+            };
+            if let Some((overlap, prediction)) = resolved {
+                remote_overlap = Some(overlap);
+                index_prediction = Some(prediction);
+            }
+        }
+
         let worker = match lease.with_view(|view| {
             self.select_worker_for_model(
                 model_id,
@@ -499,6 +557,7 @@ impl Router {
                 headers,
                 view.rid_key,
                 view.cache_namespace,
+                RemoteLookup::from_resolved(remote_overlap.as_ref()),
             )
         }) {
             Some(w) => w,
@@ -581,6 +640,18 @@ impl Router {
 
         let status = response.status();
         worker.record_outcome(status.as_u16());
+
+        // Publish the routing-time prompt chain as a placement for the
+        // dispatched worker on success only (never on error/retry, which
+        // must not advertise a phantom holder). HTTP does not surface the
+        // generated output tokens, so there is no prompt (+) output refine —
+        // the prompt-only placement is final.
+        if status.is_success() {
+            if let Some(prediction) = &index_prediction {
+                self.policy_registry
+                    .publish_placement(prediction, worker.url(), None);
+            }
+        }
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {
@@ -813,6 +884,9 @@ impl Router {
                 headers,
                 rid_key: None,
                 cache_namespace: None,
+                // Transcription never queries the shared index (audio has
+                // no prompt prefix to share); it places as without one.
+                remote: RemoteLookup::NotAttempted,
             },
         ) else {
             // Judged from the same candidates whether the pre-filter emptied
@@ -1652,6 +1726,14 @@ impl Router {
         // that needs partitioned affinity must take the buffered path.
         // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
+        // The streamed pass-through selects under `UNKNOWN_MODEL_ID` (the
+        // body, and thus the real model, is never read here). The shared
+        // index is keyed by model, so participating from this path would
+        // publish into a different keyspace than the buffered path's real
+        // model — fragmenting the index for mixed buffered/streamed
+        // traffic. It does not ask the index (`NotAttempted`: placement
+        // exactly as without one) until the streamed path can resolve the
+        // model without buffering.
         let Some(worker) = self.select_worker_for_model(
             model_id,
             None,
@@ -1659,6 +1741,7 @@ impl Router {
             Some(req.headers()),
             None,
             None,
+            RemoteLookup::NotAttempted,
         ) else {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
             return Err(req);
@@ -2324,6 +2407,7 @@ mod tests {
                 None,
                 None,
                 None,
+                RemoteLookup::NotAttempted,
             )
             .unwrap();
         assert!(selected.is_available());
@@ -2338,7 +2422,8 @@ mod tests {
                 None,
                 None,
                 None,
-                None
+                None,
+                RemoteLookup::NotAttempted
             )
             .is_none());
     }

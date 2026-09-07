@@ -87,6 +87,7 @@ smg-auth.workspace = true
 smg-mcp.workspace = true
 smg-external-router = { workspace = true, default-features = false }
 kv-index.workspace = true
+smg-radix-index = { workspace = true }
 smg-data-connector.workspace = true
 llm-multimodal = { workspace = true, default-features = false }
 smg-mm-rdma.workspace = true
