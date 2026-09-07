@@ -15,9 +15,9 @@ use serde::{
 use serde_json::value::{to_raw_value, RawValue};
 
 use crate::{
-    routers::{
-        common::{serialize_json_sized, serialized_capacity},
-        openai::{is_stripped_sglang_default, strip_default_sglang_fields, SGLANG_FIELDS},
+    routers::common::{
+        serialize_json_sized, serialized_capacity,
+        sglang_fields::{is_stripped_sglang_default, strip_default_sglang_fields, SGLANG_FIELDS},
     },
     worker::{Worker, WorkerError},
 };

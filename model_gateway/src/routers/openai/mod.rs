@@ -15,5 +15,4 @@ mod provider;
 pub mod responses;
 mod router;
 
-pub(crate) use provider::{is_stripped_sglang_default, strip_default_sglang_fields, SGLANG_FIELDS};
 pub use router::OpenAIRouter;

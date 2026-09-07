@@ -1,7 +1,10 @@
 use serde_json::Value;
 
 use super::{Provider, ProviderError};
-use crate::worker::{Endpoint, ProviderType};
+use crate::{
+    routers::common::sglang_fields::strip_sglang_fields,
+    worker::{Endpoint, ProviderType},
+};
 
 pub struct XAIProvider;
 
@@ -15,7 +18,7 @@ impl Provider for XAIProvider {
         payload: &mut Value,
         endpoint: Endpoint,
     ) -> Result<(), ProviderError> {
-        super::types::strip_sglang_fields(payload);
+        strip_sglang_fields(payload);
 
         if endpoint == Endpoint::Responses {
             if let Some(obj) = payload.as_object_mut() {

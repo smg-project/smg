@@ -40,6 +40,7 @@ pub mod persistence_utils;
 pub mod realtime;
 pub mod request_lease;
 pub mod retry;
+pub mod sglang_fields;
 pub mod sse;
 pub mod worker_selection;
 

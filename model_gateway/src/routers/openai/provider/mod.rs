@@ -18,5 +18,4 @@ pub use provider_trait::Provider;
 pub use registry::ProviderRegistry;
 pub use sglang::SGLangProvider;
 pub use types::ProviderError;
-pub(crate) use types::{is_stripped_sglang_default, strip_default_sglang_fields, SGLANG_FIELDS};
 pub use xai::XAIProvider;

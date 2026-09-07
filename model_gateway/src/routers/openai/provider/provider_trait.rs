@@ -1,8 +1,11 @@
 use reqwest::RequestBuilder;
 use serde_json::Value;
 
-use super::{types::strip_sglang_fields, ProviderError};
-use crate::worker::{Endpoint, ProviderType};
+use super::ProviderError;
+use crate::{
+    routers::common::sglang_fields::strip_sglang_fields,
+    worker::{Endpoint, ProviderType},
+};
 
 /// Default `transform_request` strips SGLang fields.
 pub trait Provider: Send + Sync {
