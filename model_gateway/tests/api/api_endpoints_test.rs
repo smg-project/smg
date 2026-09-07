@@ -875,10 +875,9 @@ mod responses_endpoint_tests {
 
     #[tokio::test]
     async fn test_v1_responses_input_items() {
-        // This test uses OpenAI mode because the input_items endpoint
-        // is only implemented in OpenAIRouter and reads from storage (no workers needed)
+        // The input_items endpoint is storage-backed and needs no workers.
         let mut config = RouterConfig::builder()
-            .openai_mode(vec!["http://dummy.local".to_string()]) // Dummy URL (won't be called)
+            .regular_mode(vec![])
             .random_policy()
             .host("127.0.0.1")
             .port(3002)
@@ -999,6 +998,7 @@ mod responses_endpoint_tests {
         ctx.shutdown().await;
     }
 
+    #[cfg(feature = "provider-openai")]
     async fn create_openai_ctx(port: u16) -> AppTestContext {
         use smg::config::RouterConfig;
         let mut config = RouterConfig::builder()
@@ -1029,6 +1029,7 @@ mod responses_endpoint_tests {
         .await
     }
 
+    #[cfg(feature = "provider-openai")]
     async fn create_response(
         app: &axum::Router,
         payload: serde_json::Value,
@@ -1048,6 +1049,7 @@ mod responses_endpoint_tests {
         (status, json)
     }
 
+    #[cfg(feature = "provider-openai")]
     #[tokio::test]
     async fn test_v1_responses_store_false_retrieve_404() {
         let ctx = create_openai_ctx(18970).await;
@@ -1077,6 +1079,7 @@ mod responses_endpoint_tests {
         ctx.shutdown().await;
     }
 
+    #[cfg(feature = "provider-openai")]
     #[tokio::test]
     async fn test_v1_responses_store_true_retrieve_200() {
         let ctx = create_openai_ctx(18971).await;
@@ -1112,6 +1115,7 @@ mod responses_endpoint_tests {
         ctx.shutdown().await;
     }
 
+    #[cfg(feature = "provider-openai")]
     #[tokio::test]
     async fn test_v1_responses_store_omitted_retrieve_200() {
         let ctx = create_openai_ctx(18973).await;
@@ -1146,6 +1150,7 @@ mod responses_endpoint_tests {
         ctx.shutdown().await;
     }
 
+    #[cfg(feature = "provider-openai")]
     #[tokio::test]
     async fn test_v1_responses_store_false_as_previous_response_id() {
         let ctx = create_openai_ctx(18972).await;

@@ -15,13 +15,21 @@ readme = "../README.md"
 categories = ["web-programming", "network-programming"]
 
 [features]
-default = ["grpc-client", "jemalloc-stats"]
+default = ["grpc-client", "jemalloc-stats", "providers"]
 grpc-client = []
 grpc-server = []
 jemalloc-stats = ["tikv-jemallocator/stats", "dep:tikv-jemalloc-ctl"]
 jemalloc-profiling = ["tikv-jemallocator/profiling"]
 opencv-video = ["llm-multimodal/opencv-video"]
 mm-rdma = ["smg-mm-rdma/nixl"]
+# Third-party provider routers, one feature each. A build picks the providers
+# it serves; IGW mode registers every router compiled in, and a worker that
+# targets a provider is admitted only when its router is present. Leave them
+# all out for a self-hosted-only build.
+provider-openai = ["smg-external-router/openai"]
+provider-anthropic = ["smg-external-router/anthropic"]
+provider-gemini = ["smg-external-router/gemini"]
+providers = ["provider-openai", "provider-anthropic", "provider-gemini"]
 # Client-injection seam for this crate's own K8s discovery integration tests
 # (auto-enabled by the self dev-dependency below, never in production builds).
 test-util = []
@@ -77,6 +85,7 @@ wfaas.workspace = true
 llm-tokenizer.workspace = true
 smg-auth.workspace = true
 smg-mcp.workspace = true
+smg-external-router = { workspace = true, default-features = false }
 kv-index.workspace = true
 smg-data-connector.workspace = true
 llm-multimodal = { workspace = true, default-features = false }
@@ -142,8 +151,12 @@ chrono = { version = "0.4", features = ["clock"] }
 toml = "1.1"
 
 [dev-dependencies]
-# Self dev-dependency: turns on `test-util` for this crate's own test targets.
-smg = { path = ".", features = ["test-util"] }
+# Self dev-dependency: turns on `test-util` for this crate's own test targets,
+# and only that. Without `default-features = false` the default set (including
+# the provider routers) would leak into every test target whatever features the
+# build selected, so a `--no-default-features` test run would not be one.
+smg = { path = ".", default-features = false, features = ["test-util"] }
+smg-external-router = { workspace = true, default-features = false }
 # Enable the mock engine for the ZMQ client's loopback tests.
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
 criterion = { version = "0.8", features = ["html_reports"] }

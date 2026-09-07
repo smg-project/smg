@@ -16,7 +16,7 @@ serde_yaml = "0.9"
 [dependencies.smg]
 path = "../../model_gateway"
 default-features = false
-features = ["grpc-client", "jemalloc-stats"]
+features = ["grpc-client", "jemalloc-stats", "providers"]
 
 [dependencies.smg-auth]
 workspace = true

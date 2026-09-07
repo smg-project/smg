@@ -7454,6 +7454,7 @@ dependencies = [
  "sha2 0.11.0",
  "smg",
  "smg-auth",
+ "smg-external-router",
  "smg-grpc-client",
  "smg-mcp",
  "smg-mesh",
@@ -7530,6 +7531,46 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "smg-external-router"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "dashmap",
+ "data-connector",
+ "futures",
+ "futures-util",
+ "http",
+ "http-body-util",
+ "memchr",
+ "metrics",
+ "multer",
+ "once_cell",
+ "openai-protocol",
+ "rand 0.10.2",
+ "regex",
+ "reqwest 0.13.4",
+ "rmcp",
+ "rustls",
+ "serde",
+ "serde_json",
+ "smg-mcp",
+ "str0m",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite 0.30.0",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+ "webpki-roots",
 ]
 
 [[package]]

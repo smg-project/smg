@@ -16,7 +16,7 @@ use crate::{
     routers::{
         common::{
             overload,
-            placement::{self, PlacementFailure, PlacementInputs},
+            placement::{self, PairCandidates, PairFailure, PlacementFailure, PlacementInputs},
         },
         error,
         grpc::{
@@ -157,19 +157,13 @@ impl PipelineStage for WorkerSelectionStage {
                     cache_namespace,
                     None,
                 ) {
-                    Some((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
+                    Ok((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
                         prefill,
                         decode,
                         runtime_type,
                     },
-                    None => {
-                        return Err(self.selection_failure(
-                            model_id,
-                            &[WorkerType::Prefill, WorkerType::Decode],
-                            None,
-                        ))
-                    }
+                    Err(response) => return Err(response),
                 }
             }
             WorkerSelectionMode::EncodePrefillDecode => {
@@ -301,19 +295,13 @@ impl WorkerSelectionStage {
                     cache_namespace,
                     wire,
                 ) {
-                    Some((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
+                    Ok((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
                         prefill,
                         decode,
                         runtime_type,
                     },
-                    None => {
-                        return Err(self.selection_failure(
-                            model_id,
-                            &[WorkerType::Prefill, WorkerType::Decode],
-                            wire,
-                        ))
-                    }
+                    Err(response) => return Err(response),
                 }
             }
         };
@@ -361,7 +349,9 @@ impl WorkerSelectionStage {
                     wire,
                 ) {
                     PlacementFailure::AllOverloaded(shed) => Some(shed),
-                    PlacementFailure::NoCandidates | PlacementFailure::Unavailable => None,
+                    PlacementFailure::NoCandidates
+                    | PlacementFailure::Unavailable
+                    | PlacementFailure::PolicyDeclined(_) => None,
                 },
                 WorkerType::Prefill => {
                     self.disaggregated_leg_shed(model_id, RoutingPool::GrpcPrefill, wire)
@@ -384,6 +374,28 @@ impl WorkerSelectionStage {
             "No available workers for model"
         );
         error::model_not_found(model_id)
+    }
+
+    /// The response for a failed pair placement. The verdict was judged from
+    /// the leg's own candidates inside the placement, so a shed is answered
+    /// as it was built and counted once; every other miss keeps the
+    /// not-found answer this router always gave.
+    fn pair_failure(&self, model_id: &str, failure: PairFailure) -> Response {
+        match failure.verdict {
+            PlacementFailure::AllOverloaded(shed) => shed,
+            PlacementFailure::NoCandidates
+            | PlacementFailure::Unavailable
+            | PlacementFailure::PolicyDeclined(_) => {
+                error!(
+                    function = "WorkerSelectionStage::execute",
+                    mode = ?self.mode,
+                    model_id = %model_id,
+                    leg = ?failure.leg,
+                    "No available workers for model"
+                );
+                error::model_not_found(model_id)
+            }
+        }
     }
 
     /// The shed verdict for one disaggregated leg, judged from the pool it
@@ -466,133 +478,37 @@ impl WorkerSelectionStage {
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
-    ) -> Option<PdWorkerPair> {
+    ) -> Result<PdWorkerPair, Response> {
         // Both legs derive from ONE membership snapshot: separate pool
         // lookups could straddle a concurrent replacement and pair workers
         // that never coexisted. The pools are strictly gRPC (a ZMQ leg would
         // silently drop the PD bootstrap info, see `RoutingPool::GrpcPrefill`;
-        // the wildcard model maps to the global snapshot), and availability
-        // stays a live per-request check.
+        // the wildcard model maps to the global snapshot). The legs must
+        // share a runtime, the rendezvous being runtime-specific, and a retry
+        // pins both to the retained plan's runtime.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
-        let all_prefill = Self::available_workers(&snapshot, RoutingPool::GrpcPrefill);
-        let all_decode = Self::available_workers(&snapshot, RoutingPool::GrpcDecode);
-
-        // Retry re-selection pins both legs to the retained plan's runtime.
-        let (all_prefill, all_decode) = match wire {
-            Some(constraint) => (
-                all_prefill
-                    .into_iter()
-                    .filter(|w| w.metadata().spec.runtime_type == constraint.runtime)
-                    .collect::<Vec<_>>(),
-                all_decode
-                    .into_iter()
-                    .filter(|w| w.metadata().spec.runtime_type == constraint.runtime)
-                    .collect::<Vec<_>>(),
-            ),
-            None => (all_prefill, all_decode),
-        };
-
-        if all_prefill.is_empty() {
-            warn!("No available prefill workers");
-            return None;
-        }
-
-        if all_decode.is_empty() {
-            warn!("No available decode workers");
-            return None;
-        }
-
-        // Determine the runtime type from prefill workers.
-        // All workers in a PD pair must use the same runtime.
-        let first_runtime = all_prefill.first()?.metadata().spec.runtime_type;
-
-        // Check for mixed runtimes in both prefill and decode pools
-        let prefill_mixed = all_prefill
-            .iter()
-            .skip(1)
-            .any(|w| w.metadata().spec.runtime_type != first_runtime);
-        let decode_mixed = all_decode
-            .iter()
-            .any(|w| w.metadata().spec.runtime_type != first_runtime);
-
-        if prefill_mixed || decode_mixed {
-            warn!(
-                "Mixed runtime types in PD workers (prefill_mixed={}, decode_mixed={}). Using {:?}.",
-                prefill_mixed,
-                decode_mixed,
-                first_runtime
-            );
-        }
-
-        let target_runtime = first_runtime;
-
-        // Filter both pools to the target runtime
-        let available_prefill: Vec<_> = all_prefill
-            .into_iter()
-            .filter(|w| w.metadata().spec.runtime_type == target_runtime)
-            .collect();
-        let available_decode: Vec<_> = all_decode
-            .into_iter()
-            .filter(|w| w.metadata().spec.runtime_type == target_runtime)
-            .collect();
-
-        if available_prefill.is_empty() || available_decode.is_empty() {
-            warn!("No available PD pair for runtime {:?}", target_runtime);
-            return None;
-        }
-
-        // Independent P/D policies so stateful ones (e.g. round_robin) don't share a counter.
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-        let decode_policy = self.policy_registry.get_decode_policy();
-
-        // Get cached hash ring for consistent hashing (O(log n) lookup)
-        let hash_ring = self.worker_registry.get_hash_ring(model_id);
-
-        // Prefill and decode are separate pools; tag each leg so the routing-key
-        // override keys its sticky map per leg (a key sticks independently).
-        let mut info = SelectWorkerInfo {
-            request_text: text,
-            tokens,
-            headers,
-            routing_key: self.policy_registry.resolve_routing_key(headers),
-            rid_key,
-            cache_namespace,
-            hash_ring,
-            leg: WorkerLeg::Prefill,
-        };
-        let prefill_idx =
-            self.policy_registry
-                .select_worker(&prefill_policy, &available_prefill, &info)?;
-        info.leg = WorkerLeg::Decode;
-        let decode_idx =
-            self.policy_registry
-                .select_worker(&decode_policy, &available_decode, &info)?;
-
-        let model = model_id;
-
-        // Record worker selection metrics for both prefill and decode
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_PREFILL,
-            available_prefill[prefill_idx]
-                .connection_mode()
-                .as_metric_label(),
-            model,
-            prefill_policy.name(),
-        );
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_DECODE,
-            available_decode[decode_idx]
-                .connection_mode()
-                .as_metric_label(),
-            model,
-            decode_policy.name(),
-        );
-
-        Some((
-            available_prefill[prefill_idx].clone(),
-            available_decode[decode_idx].clone(),
-            target_runtime,
-        ))
+        let prefill = snapshot.pool(RoutingPool::GrpcPrefill);
+        let decode = snapshot.pool(RoutingPool::GrpcDecode);
+        let pair = placement::select_pair(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            PairCandidates {
+                prefill: &prefill,
+                decode: &decode,
+            },
+            wire,
+            true,
+            PlacementInputs {
+                text,
+                tokens,
+                headers,
+                rid_key,
+                cache_namespace,
+            },
+        )
+        .map_err(|failure| self.pair_failure(model_id, *failure))?;
+        Ok((pair.prefill, pair.decode, pair.runtime))
     }
 
     /// Select per-item encode workers + a prefill/decode pair for EPD routing.
@@ -965,7 +881,7 @@ mod tests {
         );
         assert!(stage
             .select_pd_pair(model_id, None, None, None, None, None, None)
-            .is_some());
+            .is_ok());
 
         for url in &prefill_urls {
             let worker = worker_registry.get_by_url(url).expect("registered");
@@ -975,7 +891,7 @@ mod tests {
         assert!(
             stage
                 .select_pd_pair(model_id, None, None, None, None, None, None)
-                .is_none(),
+                .is_err(),
             "the veto empties the prefill pool"
         );
         let response =
@@ -1145,7 +1061,7 @@ mod tests {
         assert!(
             stage
                 .select_pd_pair(model_id, None, None, None, None, None, None)
-                .is_none(),
+                .is_err(),
             "ZMQ-only PD pools must not yield a pair"
         );
 

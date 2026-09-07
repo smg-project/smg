@@ -28,15 +28,14 @@ use openai_protocol::{
 
 use crate::middleware::TenantRequestMeta;
 
-pub mod anthropic;
 pub mod common;
-pub mod error;
+pub use smg_external_router::error;
+pub mod external;
 pub mod factory;
-pub mod gemini;
+pub mod gateway;
 pub mod grpc;
 pub mod http;
-pub mod openai;
-pub mod router_manager;
+pub(crate) mod provider_support;
 
 pub use common::body_policy::BodyPolicy;
 pub use factory::RouterFactory;
