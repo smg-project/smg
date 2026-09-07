@@ -228,14 +228,7 @@ pub(crate) struct RoutingSnapshot {
     pub cache_namespace: Option<CacheNamespace>,
 }
 
-/// The wire the retained plan was built for. Retry re-selection filters
-/// candidates to this (runtime, transport): the plan's proto flavor and its
-/// stop-resolution are wire-specific and cannot be rebuilt post-drop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct WireConstraint {
-    pub runtime: RuntimeType,
-    pub connection: ConnectionMode,
-}
+pub(crate) use crate::gateway::placement::WireConstraint;
 
 impl WireConstraint {
     fn of(workers: &WorkerSelection) -> Self {

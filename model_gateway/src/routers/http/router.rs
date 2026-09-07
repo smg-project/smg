@@ -38,6 +38,7 @@ use tracing::{error, warn};
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
+    gateway::placement::{self, PlacementFailure, PlacementInputs},
     middleware::{scheduler::PreemptionGuard, TenantRequestMeta},
     observability::{
         events::{self, Event},
@@ -245,59 +246,22 @@ impl Router {
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
     ) -> Option<Arc<dyn Worker>> {
-        let candidates = self
-            .worker_registry
-            .get_routing_pool(model_id, RoutingPool::HttpRegular);
-
-        // Get the appropriate policy for this model
-        let policy = self.policy_registry.get_policy_or_default(model_id);
-
-        // Most policies already apply the complete availability predicate.
-        // Give them the shared registry snapshot directly instead of cloning
-        // every available worker into a second per-request Vec. Hash policies
-        // currently use a weaker health predicate and retain the pre-filter.
-        let filtered;
-        let available: &[Arc<dyn Worker>] = if policy_filters_unavailable_workers(policy.as_ref()) {
-            &candidates
-        } else {
-            filtered = candidates
-                .iter()
-                .filter(|worker| worker.is_available())
-                .cloned()
-                .collect::<Vec<_>>();
-            &filtered
-        };
-        if available.is_empty() {
-            return None;
-        }
-
-        // Get cached hash ring for consistent hashing (O(log n) lookup)
-        let hash_ring = self.worker_registry.get_hash_ring(model_id);
-
-        let idx = self.policy_registry.select_worker(
-            &policy,
-            available,
-            &SelectWorkerInfo {
-                request_text: text,
+        // This router proxies plain HTTP to the worker's URL, so only HTTP
+        // workers are candidates; nothing pins a wire on this path.
+        placement::select_single(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            RoutingPool::HttpRegular,
+            None,
+            PlacementInputs {
+                text,
                 tokens,
                 headers,
-                routing_key: self.policy_registry.resolve_routing_key(headers),
                 rid_key,
                 cache_namespace,
-                hash_ring,
-                leg: crate::policies::WorkerLeg::Single,
             },
-        )?;
-
-        // Record worker selection metric (Layer 3)
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_REGULAR,
-            metrics_labels::CONNECTION_HTTP,
-            model_id,
-            policy.name(),
-        );
-
-        Some(available[idx].clone())
+        )
     }
 
     /// Select a local, realtime-capable worker for the given model.
@@ -540,23 +504,22 @@ impl Router {
         }) {
             Some(w) => w,
             None => {
-                // Distinguish "no workers for this model" from "workers exist but unavailable"
-                let total = self
-                    .worker_registry
-                    .get_routing_pool(model_id, RoutingPool::HttpRegular);
-                // `total` is exactly the pool selection drew from, wildcard
-                // model included — classifying from it rather than from the
-                // model index is what makes the shed fire for a model-less
-                // `/generate` and for a model that is also served over gRPC.
-                return if total.is_empty() {
-                    error::model_not_found(model_id)
-                } else if let Some(shed) = overload::shed_if_all_overloaded(&total, model_id) {
-                    shed
-                } else {
-                    error::service_unavailable(
+                // The verdict is judged from exactly the pool selection drew
+                // from, wildcard model included: that is what makes the shed
+                // fire for a model-less `/generate` and for a model that is
+                // also served over gRPC.
+                return match placement::single_failure(
+                    &self.worker_registry,
+                    model_id,
+                    RoutingPool::HttpRegular,
+                    None,
+                ) {
+                    PlacementFailure::NoCandidates => error::model_not_found(model_id),
+                    PlacementFailure::AllOverloaded(shed) => shed,
+                    PlacementFailure::Unavailable => error::service_unavailable(
                         "no_available_workers",
                         "All workers are unavailable (circuit breaker open or unhealthy)",
-                    )
+                    ),
                 };
             }
         };

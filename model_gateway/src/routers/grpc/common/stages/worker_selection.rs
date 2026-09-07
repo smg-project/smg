@@ -11,11 +11,9 @@ use tracing::{error, warn};
 
 use super::PipelineStage;
 use crate::{
+    gateway::placement::{self, PlacementFailure, PlacementInputs},
     observability::metrics::{metrics_labels, Metrics},
-    policies::{
-        policy_filters_unavailable_workers, CacheNamespace, LoadBalancingPolicy, PolicyRegistry,
-        SelectWorkerInfo, WorkerLeg,
-    },
+    policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
         common::overload,
         error,
@@ -351,8 +349,24 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
     ) -> Response {
         for leg in legs {
-            let candidates = self.leg_candidates(model_id, *leg, wire);
-            if let Some(shed) = overload::shed_if_all_overloaded(&candidates, model_id) {
+            let shed = match leg {
+                // The regular leg is judged from exactly the pool the shared
+                // placement drew from.
+                WorkerType::Regular => match placement::single_failure(
+                    &self.worker_registry,
+                    model_id,
+                    RoutingPool::GrpcPipelineRegular,
+                    wire,
+                ) {
+                    PlacementFailure::AllOverloaded(shed) => Some(shed),
+                    PlacementFailure::NoCandidates | PlacementFailure::Unavailable => None,
+                },
+                _ => {
+                    let candidates = self.leg_candidates(model_id, *leg, wire);
+                    overload::shed_if_all_overloaded(&candidates, model_id)
+                }
+            };
+            if let Some(shed) = shed {
                 return shed;
             }
         }
@@ -416,76 +430,22 @@ impl WorkerSelectionStage {
         cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
     ) -> Option<Arc<dyn Worker>> {
-        // Get workers for the specified model. The gRPC router serves both gRPC
-        // and direct-ZMQ workers, so accept either transport (not HTTP).
-        let pool = self
-            .worker_registry
-            .get_routing_pool(model_id, RoutingPool::GrpcPipelineRegular);
-        // A retry pins the retained plan's runtime/transport.
-        let wire_pinned;
-        let candidates: &[Arc<dyn Worker>] = match wire {
-            None => &pool,
-            Some(c) => {
-                wire_pinned = pool
-                    .iter()
-                    .filter(|w| {
-                        w.metadata().spec.runtime_type == c.runtime
-                            && *w.connection_mode() == c.connection
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                &wire_pinned
-            }
-        };
-
-        // Get the appropriate policy for this model
-        let policy = self.policy_registry.get_policy_or_default(model_id);
-
-        let filtered;
-        let available: &[Arc<dyn Worker>] = if policy_filters_unavailable_workers(policy.as_ref()) {
-            candidates
-        } else {
-            filtered = candidates
-                .iter()
-                .filter(|worker| worker.is_available())
-                .cloned()
-                .collect::<Vec<_>>();
-            &filtered
-        };
-        if available.is_empty() {
-            return None;
-        }
-
-        // Get cached hash ring for consistent hashing (O(log n) lookup)
-        let hash_ring = self.worker_registry.get_hash_ring(model_id);
-
-        // Select worker via the registry (applies the routing-key sticky override
-        // when enabled; otherwise delegates to the configured policy).
-        let idx = self.policy_registry.select_worker(
-            &policy,
-            available,
-            &SelectWorkerInfo {
-                request_text: text,
+        // The gRPC router serves both gRPC and direct-ZMQ workers, so the pool
+        // accepts either transport (not HTTP). A retry pins the retained wire.
+        placement::select_single(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            RoutingPool::GrpcPipelineRegular,
+            wire,
+            PlacementInputs {
+                text,
                 tokens,
                 headers,
-                routing_key: self.policy_registry.resolve_routing_key(headers),
                 rid_key,
                 cache_namespace,
-                hash_ring,
-                leg: WorkerLeg::Single,
             },
-        )?;
-        let selected = available[idx].clone();
-
-        // Record worker selection metric
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_REGULAR,
-            selected.connection_mode().as_metric_label(),
-            model_id,
-            policy.name(),
-        );
-
-        Some(selected)
+        )
     }
 
     /// Workers from one leg pool of `snapshot` that also pass the live
