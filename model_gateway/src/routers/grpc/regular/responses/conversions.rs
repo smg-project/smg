@@ -84,6 +84,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                     ResponseInputOutputItem::FunctionToolCall {
                         call_id,
                         name,
+                        namespace,
                         arguments,
                         output,
                         ..
@@ -100,7 +101,10 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                                 id: tool_call_id.clone(),
                                 tool_type: "function".to_string(),
                                 function: FunctionCallResponse {
-                                    name: name.clone(),
+                                    name: match namespace {
+                                        Some(namespace) => format!("{namespace}.{name}"),
+                                        None => name.clone(),
+                                    },
                                     arguments: Some(arguments.clone()),
                                 },
                             }]),
@@ -139,7 +143,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                         // Note: The function name is looked up from prev_outputs in Harmony path
                         // For Chat path, we just use the call_id
                         messages.push(ChatMessage::Tool {
-                            content: MessageContent::Text(output.clone()),
+                            content: MessageContent::Text(output.to_text_only()?),
                             tool_call_id: call_id.clone(),
                         });
                     }
@@ -387,6 +391,7 @@ pub(crate) fn chat_to_responses(
                 id: Some(tool_call.id.clone()),
                 call_id: tool_call.id.clone(),
                 name: tool_call.function.name.clone(),
+                namespace: None,
                 arguments: tool_call.function.arguments.clone().unwrap_or_default(),
                 output: None, // Tool hasn't been executed yet
                 status: "in_progress".to_string(),
@@ -594,6 +599,7 @@ mod tests {
                 id: Some("fc_item_id".to_string()),
                 call_id: "call_tool_id".to_string(),
                 name: "lookup".to_string(),
+                namespace: Some("weather".to_string()),
                 arguments: "{\"q\":\"rust\"}".to_string(),
                 output: Some("done".to_string()),
                 status: Some("completed".to_string()),
@@ -608,7 +614,10 @@ mod tests {
             ChatMessage::Assistant {
                 tool_calls: Some(tool_calls),
                 ..
-            } => assert_eq!(tool_calls[0].id, "call_tool_id"),
+            } => {
+                assert_eq!(tool_calls[0].id, "call_tool_id");
+                assert_eq!(tool_calls[0].function.name, "weather.lookup");
+            }
             other => panic!("expected assistant tool call, got {other:?}"),
         }
 

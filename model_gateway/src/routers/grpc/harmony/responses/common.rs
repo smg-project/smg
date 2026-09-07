@@ -124,6 +124,7 @@ pub(super) fn build_next_request_with_tools(
             id: Some(tool_call.id.clone()),
             call_id: tool_call.id.clone(),
             name: tool_call.function.name.clone(),
+            namespace: None,
             arguments: tool_call
                 .function
                 .arguments

@@ -475,6 +475,7 @@ fn build_tool_response(
             id: Some(tool_call.id.clone()),
             call_id: tool_call.id.clone(),
             name: tool_call.function.name.clone(),
+            namespace: None,
             arguments: tool_call.function.arguments.clone().unwrap_or_default(),
             output: Some(output_str),
             status: if result.is_error {
@@ -494,6 +495,7 @@ fn build_tool_response(
             id: Some(tool_call.id),
             call_id,
             name: tool_call.function.name,
+            namespace: None,
             arguments,
             output: None, // No output = needs execution
             status: "completed".to_string(),

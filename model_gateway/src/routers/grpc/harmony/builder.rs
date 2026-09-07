@@ -742,10 +742,15 @@ impl HarmonyBuilder {
             // Function tool call (with optional output)
             ResponseInputOutputItem::FunctionToolCall {
                 name,
+                namespace,
                 arguments,
                 output,
                 ..
             } => {
+                let name = match namespace {
+                    Some(namespace) => format!("{namespace}.{name}"),
+                    None => name.clone(),
+                };
                 // If there's an output, this represents the tool result
                 // Otherwise, it's the tool call itself
                 if let Some(output_str) = output {
@@ -807,8 +812,12 @@ impl HarmonyBuilder {
                         ResponseInputOutputItem::FunctionToolCall {
                             call_id: item_call_id,
                             name,
+                            namespace,
                             ..
-                        } if item_call_id == call_id => Some(name.clone()),
+                        } if item_call_id == call_id => Some(match namespace {
+                            Some(namespace) => format!("{namespace}.{name}"),
+                            None => name.clone(),
+                        }),
                         _ => None,
                     })
                     .ok_or_else(|| format!("No function call found for call_id: {call_id}"))?;
@@ -823,7 +832,7 @@ impl HarmonyBuilder {
                     },
                     recipient: Some("assistant".to_string()),
                     content: vec![Content::Text(TextContent {
-                        text: output.clone(),
+                        text: output.to_text_only()?,
                     })],
                     channel: None,
                     content_type: None,

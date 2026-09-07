@@ -79,6 +79,7 @@ impl ToolLoopState {
                 id: Some(id),
                 call_id,
                 name: tool_name,
+                namespace: None,
                 arguments: args_json_str,
                 output: Some(output_str),
                 status: Some("completed".to_string()),

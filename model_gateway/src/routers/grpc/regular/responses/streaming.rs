@@ -325,6 +325,7 @@ impl StreamingResponseAccumulator {
                             id: None,
                             call_id: String::new(),
                             name: String::new(),
+                            namespace: None,
                             arguments: String::new(),
                             output: None,
                             status: "in_progress".to_string(),
