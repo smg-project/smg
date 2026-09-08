@@ -547,7 +547,11 @@ async fn apply_probe_completion(
 
     let Some(((), transition)) =
         registry.apply_if_revision(&worker_id, expected_revision, |current_worker| {
-            if launched_status == WorkerStatus::Pending {
+            // The Pending cap catches URLs that never become healthy. A worker
+            // answering "draining" is reachable and will serve again, so a
+            // long drain that starts in Pending must not eat the cap and turn
+            // the first healthy probe into Failed.
+            if launched_status == WorkerStatus::Pending && outcome != ProbeOutcome::Draining {
                 current_worker.total_pending_probes_increment();
             }
             (
@@ -1970,6 +1974,53 @@ mod tests {
             None,
         );
         manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn draining_probes_do_not_spend_the_pending_cap() {
+        // `apply_probe_completion` owns the pending-probe counter, so this has
+        // to be checked at its level: a worker that drains in Pending for
+        // longer than max_pending_probes (10 * failure_threshold) and then
+        // serves must be promoted, not failed by the cap on its first healthy
+        // probe.
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = make_worker("http://w:1", 2, 3);
+        let worker_id = registry.register(worker.clone()).unwrap();
+        let completion = |probe_result: WorkerResult<()>| ProbeCompletion {
+            worker_id: worker_id.clone(),
+            worker: worker.clone(),
+            expected_revision: worker.revision(),
+            launched_status: WorkerStatus::Pending,
+            health_config: cfg(2, 3),
+            probe_result,
+        };
+
+        for _ in 0..40 {
+            let result = apply_probe_completion(
+                &registry,
+                completion(Err(WorkerError::Draining {
+                    url: worker.url().to_string(),
+                })),
+                None,
+            )
+            .await;
+            assert!(matches!(result, ProbeApplyResult::Applied(None)));
+        }
+        assert_eq!(worker.total_pending_probes(), 0);
+        assert_eq!(worker.status(), WorkerStatus::Pending);
+
+        assert!(matches!(
+            apply_probe_completion(&registry, completion(Ok(())), None).await,
+            ProbeApplyResult::Applied(None)
+        ));
+        assert!(matches!(
+            apply_probe_completion(&registry, completion(Ok(())), None).await,
+            ProbeApplyResult::Applied(Some((WorkerStatus::Pending, WorkerStatus::Ready)))
+        ));
+        assert_eq!(
+            registry.get(&worker_id).unwrap().status(),
+            WorkerStatus::Ready
+        );
     }
 
     #[tokio::test]
