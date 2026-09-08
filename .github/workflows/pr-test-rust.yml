@@ -910,7 +910,7 @@ jobs:
           # lanes while the test step keeps the shared 34-minute budget.
           - engine: tokenspeed
             timeout: 60
-            min_selected: 6 # floor ≈ 95% of the 7 gRPC PD tests marked for tokenspeed
+            min_selected: 10 # floor ≈ 95% of the 11 gRPC PD cases marked for tokenspeed
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
