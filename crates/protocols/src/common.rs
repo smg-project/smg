@@ -262,6 +262,10 @@ pub enum ContentPart {
     InputAudio { input_audio: InputAudio },
     #[serde(rename = "video_url")]
     VideoUrl { video_url: VideoUrl },
+    /// Pass through unknown content objects to HTTP backends.
+    /// Also matches malformed known types; gRPC backends reject this variant.
+    #[serde(untagged)]
+    Unknown(Map<String, Value>),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
@@ -1072,6 +1076,49 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn content_part_round_trips_unknown_type() {
+        let value = json!({
+            "type": "vendor_special",
+            "payload": {"items": [1, "two", null], "enabled": true},
+            "vendor_option": "keep"
+        });
+        let part: ContentPart = serde_json::from_value(value.clone()).unwrap();
+
+        assert!(
+            matches!(&part, ContentPart::Unknown(fields) if fields["type"] == "vendor_special")
+        );
+        assert_eq!(serde_json::to_value(&part).unwrap(), value);
+    }
+
+    #[test]
+    fn content_part_rejects_non_objects() {
+        for value in [
+            json!(null),
+            json!(true),
+            json!(42),
+            json!("text"),
+            json!([]),
+        ] {
+            assert!(serde_json::from_value::<ContentPart>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn content_part_known_types_take_precedence_over_fallback() {
+        for value in [
+            json!({"type": "text", "text": "hello"}),
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}),
+            json!({"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}}),
+            json!({"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}),
+            json!({"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}),
+        ] {
+            let part: ContentPart = serde_json::from_value(value.clone()).unwrap();
+            assert!(!matches!(&part, ContentPart::Unknown(_)));
+            assert_eq!(serde_json::to_value(&part).unwrap(), value);
+        }
     }
 
     #[test]

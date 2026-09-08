@@ -602,6 +602,8 @@ impl RequestPipeline {
             );
             // The failed attempt's worker load must not stay elevated through
             // the backoff window (a fresh context dropped them here before).
+            // This releases its PD admission claim too, so the retry is not
+            // queued behind its own predecessor's bootstrap rooms.
             dctx.load_guards = None;
 
             let Some(config) = retry_config else {
@@ -1443,17 +1445,23 @@ mod request_release_tests {
     /// probe reaches zero strong references or a deadline passes, recording
     /// the outcome in `released`. An ungated stub (no probe) answers
     /// immediately -- used for the PD prefill leg. `fail_first` makes the
-    /// first generate call return UNAVAILABLE, for retry-replay tests; every
-    /// call's input token ids and engine request id are recorded.
+    /// first generate call return UNAVAILABLE, for retry-replay tests;
+    /// `fail_always` fails every call, and `answer_after` stalls the generate
+    /// RPC, standing in for an engine that answers only at its own deadline.
+    /// Every call's input token ids and engine request id are recorded, as is
+    /// every aborted request id.
     #[derive(Clone, Default)]
     struct GatedScheduler {
         probe: Option<Weak<CompletionRequest>>,
         gate_rpc: bool,
         released: Arc<AtomicBool>,
         fail_first: bool,
+        fail_always: bool,
+        answer_after: Option<Duration>,
         calls: Arc<AtomicUsize>,
         seen_input_ids: Arc<Mutex<Vec<Vec<u32>>>>,
         seen_request_ids: Arc<Mutex<Vec<String>>>,
+        aborted_request_ids: Arc<Mutex<Vec<String>>>,
     }
 
     impl GatedScheduler {
@@ -1519,8 +1527,13 @@ mod request_release_tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(request.request_id.clone());
-            if self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            if self.fail_always
+                || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0)
+            {
                 return Err(Status::unavailable("release-test induced failure"));
+            }
+            if let Some(delay) = self.answer_after {
+                tokio::time::sleep(delay).await;
             }
             if self.gate_rpc {
                 if let Some(probe) = &self.probe {
@@ -1556,8 +1569,12 @@ mod request_release_tests {
 
         async fn abort(
             &self,
-            _request: TonicRequest<ts::AbortRequest>,
+            request: TonicRequest<ts::AbortRequest>,
         ) -> Result<TonicResponse<ts::AbortResponse>, Status> {
+            self.aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request.into_inner().request_id);
             Ok(TonicResponse::new(ts::AbortResponse {
                 success: true,
                 message: String::new(),
@@ -1958,6 +1975,89 @@ mod request_release_tests {
             assert!(ids[0].starts_with("cmpl_") && ids[1].starts_with("cmpl_"));
             assert_ne!(ids[0], ids[1], "each attempt gets a fresh engine id");
         }
+    }
+
+    /// A prefill leg that cannot start must answer the client immediately
+    /// rather than waiting out the decode leg's own deadline, and the decode
+    /// room it stranded must be aborted rather than left for the engine to
+    /// time out. The decode stub here answers only after `DECODE_DELAY`,
+    /// standing in for an engine whose transfer deadline is what the client
+    /// used to wait on.
+    #[tokio::test]
+    async fn a_failed_prefill_answers_now_and_aborts_the_decode_room() {
+        const DECODE_DELAY: Duration = Duration::from_secs(2);
+
+        let prefill_port = spawn_stub(GatedScheduler {
+            fail_always: true,
+            ..Default::default()
+        })
+        .await;
+        let aborted = Arc::new(Mutex::new(Vec::new()));
+        let decode_request_ids = Arc::new(Mutex::new(Vec::new()));
+        let decode_port = spawn_stub(GatedScheduler {
+            answer_after: Some(DECODE_DELAY),
+            aborted_request_ids: Arc::clone(&aborted),
+            seen_request_ids: Arc::clone(&decode_request_ids),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+        register_worker(&worker_registry, decode_port, WorkerType::Decode);
+        let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+        let components = components(worker_registry).await;
+
+        let started = Instant::now();
+        let response = pipeline
+            .execute_completion(
+                completion_request(false),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let answered_in = started.elapsed();
+
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "prefill_worker_failed_to_start"
+        );
+        assert!(
+            answered_in < DECODE_DELAY,
+            "the prefill failure must not wait for the decode leg, took {answered_in:?}"
+        );
+
+        // The decode leg is retired off the request path: once its dispatch
+        // lands, its stream drops and that is what sends the abort.
+        let deadline = Instant::now() + DECODE_DELAY + Duration::from_secs(8);
+        loop {
+            if !aborted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the stranded decode room was never aborted"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let aborted = aborted.lock().unwrap_or_else(PoisonError::into_inner);
+        let dispatched = decode_request_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            aborted.as_slice(),
+            dispatched.as_slice(),
+            "the abort must name the decode leg's own request id"
+        );
     }
 }
 

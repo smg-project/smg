@@ -344,7 +344,10 @@ async fn run_health_loop(
                 if matches!(
                     apply_probe_completion(&registry, completion, job_queue.as_ref()).await,
                     ProbeApplyResult::Applied(Some((_, WorkerStatus::Failed)))
-                ) {
+                ) && config.remove_unhealthy
+                {
+                    // Removal is in flight; stop probing. Without removal the
+                    // worker stays scheduled so a restart rejoins.
                     next_check.remove(&worker_id);
                 }
             }
@@ -459,15 +462,16 @@ fn queue_due_probes(
 
         let launched_status = worker.status();
         let expected_revision = worker.revision();
-        if launched_status == WorkerStatus::Failed {
+        if launched_status == WorkerStatus::Failed && config.remove_unhealthy {
+            // Removal takes it from here. A Failed worker that is not being
+            // removed keeps its probe slot below, so an engine that comes back
+            // on the same address is noticed and promoted.
             next_check.remove(&worker_id);
-            if config.remove_unhealthy {
-                removals.push(RemovalCandidate {
-                    worker_id: worker_id.clone(),
-                    url: worker.base_url().to_string(),
-                    expected_revision,
-                });
-            }
+            removals.push(RemovalCandidate {
+                worker_id: worker_id.clone(),
+                url: worker.base_url().to_string(),
+                expected_revision,
+            });
             continue;
         }
         if launched_status == WorkerStatus::Draining {
@@ -628,8 +632,9 @@ fn apply_connect_signal(
     match registry.transition_status_if_revision(&worker_id, revision, WorkerStatus::Ready) {
         Some((old, new)) => {
             debug!(worker_url = %url, ?old, ?new, "Promoted worker on connect signal");
-            // A Failed worker was dropped from the schedule; a promoted one is
-            // serving traffic, so it must be probed again — otherwise a later
+            // A Failed worker may have been dropped from the schedule (removal
+            // enabled); a promoted one is serving traffic, so it must be probed
+            // again — otherwise a later
             // engine death would leave it Ready with a dead client forever.
             if let Some(worker) = registry.get(&worker_id) {
                 schedule_worker_at(
@@ -670,9 +675,11 @@ fn schedule_descriptor_at(
         next_check.remove(&descriptor.worker_id);
         return;
     }
-    if descriptor.status == WorkerStatus::Failed {
-        // Startup reconcile and lagged rebuild must be side-effect-free:
-        // do not reschedule already-failed workers for probing or removal.
+    if descriptor.status == WorkerStatus::Failed && config.remove_unhealthy {
+        // Startup reconcile and lagged rebuild must be side-effect-free, and
+        // scheduling a Failed worker under removal would queue its removal.
+        // Without removal the probe is the only effect, and it is how a
+        // restarted engine rejoins.
         next_check.remove(&descriptor.worker_id);
         return;
     }
@@ -731,7 +738,10 @@ pub(crate) enum ProbeOutcome {
 ///   - NotReady → Ready on `success_threshold` consecutive successes
 ///   - NotReady → Failed on `liveness_failure_threshold` (3 × failure_threshold)
 ///   - Ready → NotReady on `failure_threshold` consecutive failures
-///   - Failed: terminal (handled outside this function — no transitions)
+///   - Failed → Ready on `success_threshold` consecutive successes: the engine
+///     came back on the same address (a restart), and without
+///     `--remove-unhealthy-workers` this is the only way it rejoins
+///   - Failed stays Failed on failure
 ///   - Ready → NotReady at once on a `Draining` outcome (the worker refuses
 ///     new work already); the failure counter is reset as on the threshold
 ///     path so the liveness budget is unchanged
@@ -769,7 +779,7 @@ pub(crate) fn compute_next_status(
 
         if matches!(
             current_status,
-            WorkerStatus::Pending | WorkerStatus::NotReady
+            WorkerStatus::Pending | WorkerStatus::NotReady | WorkerStatus::Failed
         ) && successes >= success_threshold
         {
             worker.consecutive_successes_reset();
@@ -813,9 +823,10 @@ pub(crate) fn compute_next_status(
                 }
             }
             WorkerStatus::Failed | WorkerStatus::Draining => {
-                // Terminal for the health-state machine. Failed is removed
-                // by `--remove-unhealthy-workers`; Draining is removed by
-                // the discovery drain timer once in-flight requests settle.
+                // Nowhere further down to go. Failed is removed by
+                // `--remove-unhealthy-workers` and otherwise stays probed so
+                // a restart is noticed; Draining is removed by the discovery
+                // drain timer once in-flight requests settle.
             }
         }
 
@@ -1772,25 +1783,27 @@ mod tests {
     }
 
     #[test]
-    fn test_state_machine_failed_is_terminal() {
+    fn test_state_machine_failed_recovers_after_success_threshold() {
         let worker = make_worker("http://w:1", 2, 3);
         worker.set_status(WorkerStatus::Failed);
 
-        // Successful probes don't recover Failed.
+        // Failures keep it Failed.
         assert_eq!(
-            compute_next_status(&worker, ProbeOutcome::Healthy, &cfg(2, 3)),
-            None
-        );
-        assert_eq!(
-            compute_next_status(&worker, ProbeOutcome::Healthy, &cfg(2, 3)),
+            compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
             None
         );
         assert_eq!(worker.status(), WorkerStatus::Failed);
 
-        // Failed probes don't transition Failed anywhere either.
+        // The engine came back on the same address: success_threshold
+        // consecutive successes promote it exactly like NotReady, because a
+        // static fleet has no other way to rejoin.
         assert_eq!(
-            compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
+            compute_next_status(&worker, ProbeOutcome::Healthy, &cfg(2, 3)),
             None
+        );
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Healthy, &cfg(2, 3)),
+            Some(WorkerStatus::Ready)
         );
     }
 
@@ -1908,6 +1921,29 @@ mod tests {
         assert!(
             !next_check.contains_key(&failed_id),
             "bootstrap reconcile must not reschedule failed workers"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_from_registry_keeps_failed_workers_probed_without_removal() {
+        // Without --remove-unhealthy-workers a Failed worker is kept on the
+        // schedule: the probe is how a restart on the same address rejoins.
+        let registry = Arc::new(WorkerRegistry::new());
+        let failed_worker = make_worker("http://failed:1", 2, 3);
+        failed_worker.set_status(WorkerStatus::Failed);
+        let failed_id = registry.register(failed_worker).unwrap();
+        let mut next_check = HashMap::new();
+        reconcile_from_registry(
+            &registry,
+            &mut next_check,
+            &WorkerManagerConfig {
+                default_check_interval_secs: 5,
+                remove_unhealthy: false,
+            },
+        );
+        assert!(
+            next_check.contains_key(&failed_id),
+            "a failed worker that is not being removed must keep being probed"
         );
     }
 

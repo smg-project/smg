@@ -10,6 +10,7 @@ pub use smg_data_connector::{
 
 use super::{validation::ConfigValidator, ConfigResult};
 use crate::{
+    routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
     worker::{ConnectionMode, RuntimeType, WorkerMode},
 };
@@ -96,6 +97,14 @@ pub struct RouterConfig {
     pub job_queue_concurrency: usize,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// How long a disaggregated (PD) dispatch waits for a slot in the decode
+    /// engine's running window before shedding. Must stay well under the
+    /// engine's bootstrap deadline (120s on TokenSpeed): a request that waits
+    /// out this budget and then dispatches still has the whole deadline ahead
+    /// of it. `0` sheds immediately instead of waiting. Ignored for engines
+    /// that report no running window.
+    #[serde(default = "default_pd_admission_wait_secs")]
+    pub pd_admission_wait_secs: u64,
     /// Restore the conditional load-monitor poll gate: only poll worker groups
     /// when a load-aware routing policy, `engine_metrics`, or overload
     /// protection needs the data. Default `false` — the monitor polls every
@@ -336,6 +345,10 @@ pub struct TokenizerCacheConfig {
 
 fn default_load_monitor_interval_secs() -> u64 {
     10
+}
+
+fn default_pd_admission_wait_secs() -> u64 {
+    DEFAULT_PD_ADMISSION_WAIT_SECS
 }
 
 fn default_job_queue_capacity() -> usize {
@@ -936,8 +949,9 @@ pub struct HealthCheckConfig {
     pub check_interval_secs: u64,
     pub endpoint: String,
     pub disable_health_check: bool,
-    /// Let workers recover after prolonged failure: removal re-enters them
-    /// through service discovery once their engine returns.
+    /// Recover failed workers by removal: they re-enter through service
+    /// discovery once their engine returns. Off, a Failed worker stays
+    /// registered and probed, and rejoins in place when it answers again.
     #[serde(default, alias = "worker_auto_recovery")]
     pub remove_unhealthy_workers: bool,
     /// Seconds to keep a Ready worker in `Draining` after `RemoveWorker`
@@ -1069,6 +1083,7 @@ impl Default for RouterConfig {
             job_queue_capacity: default_job_queue_capacity(),
             job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
+            pd_admission_wait_secs: default_pd_admission_wait_secs(),
             disable_load_monitoring: false,
             worker_overload_protection: false,
             worker_overload_waiting_requests: None,
@@ -1391,6 +1406,27 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.stream_body_stall_timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_pd_admission_wait_serde_default_and_roundtrip() {
+        // Config files predating the field deserialize to the 30s default.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("pd_admission_wait_secs")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.pd_admission_wait_secs, 30);
+
+        // The shed-immediately zero round-trips instead of reverting.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .pd_admission_wait_secs(0)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.pd_admission_wait_secs, 0);
     }
 
     #[test]

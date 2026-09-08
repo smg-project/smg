@@ -21,7 +21,9 @@ use crate::{
     policies::PolicyRegistry,
     rate_limit::RateLimitManager,
     routers::{
-        common::{openai_bridge::FormatRegistry, overload, realtime::RealtimeRegistry},
+        common::{
+            openai_bridge::FormatRegistry, overload, pd_admission, realtime::RealtimeRegistry,
+        },
         gateway::Gateway,
         grpc::multimodal::MultimodalConfigRegistry,
     },
@@ -631,6 +633,9 @@ impl AppContextBuilder {
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
+        // PD dispatch waits here, not in the decode engine's queue, when the
+        // pair's running window is full.
+        pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
         // Wire the backend load-snapshot feed into every policy that consumes
         // it; the monitor polls every group by default, conditionally under
         // `--disable-load-monitoring`.

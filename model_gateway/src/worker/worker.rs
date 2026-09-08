@@ -441,6 +441,31 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Decrement the load counter
     fn decrement_load(&self);
 
+    /// Claim `count` PD bootstrap rooms while the worker's claimed total
+    /// stays within `window`; a refusal claims nothing.
+    ///
+    /// The PD admission gate reserves through this rather than comparing
+    /// [`Worker::load`] to the window: a read-then-send lets two dispatches
+    /// both take the last free slot, which is exactly the over-window burst
+    /// the gate exists to prevent.
+    ///
+    /// The defaults admit unconditionally and track nothing. They exist for
+    /// implementations that carry no shared runtime (the language bindings,
+    /// test doubles): the gate only reaches a worker that reports a running
+    /// window, and any implementation that does report one must override
+    /// these three with a real claim, or the window is not enforced.
+    fn try_admit_pd(&self, _count: usize, _window: usize) -> bool {
+        true
+    }
+
+    /// Release `count` rooms claimed by [`Worker::try_admit_pd`].
+    fn release_pd(&self, _count: usize) {}
+
+    /// Rooms currently claimed on this worker.
+    fn pd_admitted(&self) -> usize {
+        0
+    }
+
     /// Get the current routing-key load cardinality.
     fn routing_key_load(&self) -> usize;
 
@@ -464,19 +489,29 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Worker-reported in-flight capacity, if available.
     ///
-    /// Reads the `max_running_requests` label populated by the metadata
-    /// discovery pipeline (Step 4 of the worker lifecycle). Returns
-    /// `None` when the worker hasn't reported a value or reports zero
-    /// (zero is meaningless for capacity accounting).
+    /// Reads the running-window label populated by the metadata discovery
+    /// pipeline (Step 4 of the worker lifecycle). Returns `None` when the
+    /// worker hasn't reported a value or reports zero (zero is meaningless
+    /// for capacity accounting).
+    ///
+    /// Engines spell the same window two ways — TokenSpeed and vLLM
+    /// advertise `max_num_seqs`, SGLang advertises `max_running_requests` —
+    /// and both are the count of requests the scheduler will run at once, so
+    /// both are read here rather than leaving TokenSpeed workers looking like
+    /// non-reporters. `max_num_seqs` wins when a worker reports both: it is
+    /// the authoritative name for the engines that use it, and it is the
+    /// order `smg_grpc_servicer.tokenspeed.loads::running_window` reports in,
+    /// so the label and the `GetLoads` report cannot disagree.
     ///
     /// `WorkerCapacity` uses this to derive total fleet capacity when
     /// every worker reports; falls back to a configured per-worker
-    /// estimate otherwise.
+    /// estimate otherwise. The PD admission gate uses it as the decode
+    /// leg's admission bound.
     fn max_running_requests(&self) -> Option<u16> {
-        self.metadata()
-            .spec
-            .labels
-            .get("max_running_requests")
+        let labels = &self.metadata().spec.labels;
+        labels
+            .get("max_num_seqs")
+            .or_else(|| labels.get("max_running_requests"))
             .and_then(|s| s.parse::<u16>().ok())
             .filter(|n| *n > 0)
     }
@@ -1108,6 +1143,13 @@ pub struct WorkerRuntime {
     consecutive_successes: AtomicUsize,
     total_pending_probes: AtomicUsize,
     load_counter: AtomicUsize,
+    /// Bootstrap rooms the PD admission gate has claimed on this worker and
+    /// not yet released. Separate from `load_counter` because admission must
+    /// *claim* against the engine's running window rather than read it: two
+    /// dispatches that both saw the last free slot would both send, which is
+    /// the over-window burst the gate exists to prevent. Lives here so a
+    /// same-URL replacement inherits the rooms the engine still holds.
+    pd_admitted: AtomicUsize,
     processed_counter: AtomicUsize,
     worker_routing_key_load: WorkerRoutingKeyLoad,
     revision: AtomicU64,
@@ -1125,6 +1167,7 @@ impl WorkerRuntime {
             consecutive_successes: AtomicUsize::new(0),
             total_pending_probes: AtomicUsize::new(0),
             load_counter: AtomicUsize::new(0),
+            pd_admitted: AtomicUsize::new(0),
             processed_counter: AtomicUsize::new(0),
             worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
             revision: AtomicU64::new(0),
@@ -1198,6 +1241,31 @@ impl WorkerRuntime {
                 current.checked_sub(1)
             })
             .is_ok()
+    }
+
+    // ── PD admission claims ─────────────────────────────────────────
+
+    pub fn pd_admitted(&self) -> usize {
+        self.pd_admitted.load(Ordering::Relaxed)
+    }
+
+    /// Claim `count` rooms, but only while the claimed total stays within
+    /// `window`. All-or-nothing: a refusal claims nothing.
+    pub fn try_admit_pd(&self, count: usize, window: usize) -> bool {
+        self.pd_admitted
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                admitted.checked_add(count).filter(|total| *total <= window)
+            })
+            .is_ok()
+    }
+
+    /// Release `count` claimed rooms, saturating at zero.
+    pub fn release_pd(&self, count: usize) {
+        let _ = self
+            .pd_admitted
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                Some(admitted.saturating_sub(count))
+            });
     }
 
     // ── Routing-key load ────────────────────────────────────────────
@@ -1575,6 +1643,18 @@ impl Worker for BasicWorker {
             );
         }
         self.update_running_requests_metrics();
+    }
+
+    fn try_admit_pd(&self, count: usize, window: usize) -> bool {
+        self.runtime.load().try_admit_pd(count, window)
+    }
+
+    fn release_pd(&self, count: usize) {
+        self.runtime.load().release_pd(count);
+    }
+
+    fn pd_admitted(&self) -> usize {
+        self.runtime.load().pd_admitted()
     }
 
     fn routing_key_load(&self) -> usize {
@@ -2959,6 +3039,81 @@ mod tests {
             .build();
         // Zero is meaningless for capacity; treat as "not reported".
         assert_eq!(worker.max_running_requests(), None);
+    }
+
+    #[test]
+    fn test_max_running_requests_reads_the_tokenspeed_spelling() {
+        use crate::worker::BasicWorkerBuilder;
+        // TokenSpeed advertises the same scheduler window as `max_num_seqs`;
+        // without this a TokenSpeed worker looks like a non-reporter to both
+        // fleet capacity and PD admission.
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("max_num_seqs".to_string(), "16".to_string());
+        let worker = BasicWorkerBuilder::new("grpc://w:30000")
+            .labels(labels)
+            .build();
+        assert_eq!(worker.max_running_requests(), Some(16));
+    }
+
+    #[test]
+    fn test_max_running_requests_prefers_max_num_seqs_when_both_are_reported() {
+        use crate::worker::BasicWorkerBuilder;
+        // The servicer's `running_window` resolves in the same order, so a
+        // worker reporting both spellings cannot have its discovery label
+        // disagree with its GetLoads report.
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("max_running_requests".to_string(), "256".to_string());
+        labels.insert("max_num_seqs".to_string(), "16".to_string());
+        let worker = BasicWorkerBuilder::new("grpc://w:30000")
+            .labels(labels)
+            .build();
+        assert_eq!(worker.max_running_requests(), Some(16));
+    }
+
+    #[test]
+    fn test_pd_admission_claims_are_atomic_and_bounded_by_the_window() {
+        use crate::worker::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("grpc://w:30000").build();
+
+        assert!(worker.try_admit_pd(2, 3));
+        assert_eq!(worker.pd_admitted(), 2);
+        // All-or-nothing: a refusal must leave the claim untouched.
+        assert!(!worker.try_admit_pd(2, 3));
+        assert_eq!(worker.pd_admitted(), 2);
+        assert!(worker.try_admit_pd(1, 3));
+        assert_eq!(worker.pd_admitted(), 3);
+
+        worker.release_pd(3);
+        assert_eq!(worker.pd_admitted(), 0);
+        // Releases saturate rather than wrapping to usize::MAX.
+        worker.release_pd(1);
+        assert_eq!(worker.pd_admitted(), 0);
+    }
+
+    #[test]
+    fn test_pd_admission_never_overshoots_the_window_under_real_parallelism() {
+        use std::{sync::Arc, thread};
+
+        use crate::worker::BasicWorkerBuilder;
+        // The whole point of claiming rather than reading: threads racing for
+        // the last rooms must not all win.
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://w:30000").build());
+        let window = 8;
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let worker = Arc::clone(&worker);
+                thread::spawn(move || worker.try_admit_pd(1, window))
+            })
+            .collect();
+
+        let admitted = threads
+            .into_iter()
+            .map(|handle| handle.join().expect("claim thread"))
+            .filter(|claimed| *claimed)
+            .count();
+
+        assert_eq!(admitted, window, "exactly the window's worth may claim");
+        assert_eq!(worker.pd_admitted(), window);
     }
 
     #[test]

@@ -39,7 +39,6 @@ fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
                             max_long_side_pixel: image_url.max_long_side_pixel,
                         });
                     }
-                    ContentPart::Text { .. } => {}
                     ContentPart::AudioUrl { audio_url } => {
                         parts.push(MediaContentPart::AudioUrl {
                             url: audio_url.url.clone(),
@@ -63,6 +62,9 @@ fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
                             max_long_side_pixel: video_url.max_long_side_pixel,
                         });
                     }
+                    ContentPart::Text { .. } => {}
+                    // Chat preparation rejects unknown parts before building the media plan.
+                    ContentPart::Unknown(_) => {}
                 }
             }
         }

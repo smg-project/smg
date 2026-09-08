@@ -251,6 +251,9 @@ class RouterArgs:
     kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
     # Per-request image-count limit replacing model spec limits; None keeps spec limits
     mm_per_request_image_limit: int | None = None
+    # Seconds a PD dispatch waits for a slot in the decode engine's running
+    # window before shedding; 0 sheds immediately
+    pd_admission_wait_secs: int = 30
     # Appended to preserve the positional RouterArgs constructor contract.
     worker_mode: str = "engine"
 
@@ -734,6 +737,18 @@ class RouterArgs:
                 " are enabled and otherwise stream to the worker verbatim,"
                 " forfeiting router-level retries. 0 never buffers for"
                 " retries"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}pd-admission-wait-secs",
+            type=int,
+            default=RouterArgs.pd_admission_wait_secs,
+            help=(
+                "Seconds a prefill/decode dispatch waits for a free slot in"
+                " the decode engine's running window before shedding with 503"
+                " worker_overload_protection_shed. Keep it well under the"
+                " engine's bootstrap deadline. 0 sheds immediately; engines"
+                " that report no running window are never gated"
             ),
         )
         routing_group.add_argument(

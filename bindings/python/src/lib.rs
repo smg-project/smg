@@ -533,6 +533,7 @@ struct Router {
     kv_connector_annotation: String,
     kv_engine_id_annotation: String,
     mm_per_request_image_limit: Option<usize>,
+    pd_admission_wait_secs: u64,
     /// Appended last for positional constructor compatibility.
     worker_mode: worker::WorkerMode,
 }
@@ -863,6 +864,7 @@ impl Router {
             .worker_overload_protection(self.worker_overload_protection)
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -1113,6 +1115,7 @@ impl Router {
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
         mm_per_request_image_limit = None,
+        pd_admission_wait_secs = 30,
         worker_mode = String::from("engine"),
     ))]
     #[expect(clippy::too_many_arguments)]
@@ -1263,6 +1266,7 @@ impl Router {
         kv_connector_annotation: String,
         kv_engine_id_annotation: String,
         mm_per_request_image_limit: Option<usize>,
+        pd_admission_wait_secs: u64,
         worker_mode: String,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
@@ -1434,6 +1438,7 @@ impl Router {
             kv_connector_annotation,
             kv_engine_id_annotation,
             mm_per_request_image_limit,
+            pd_admission_wait_secs,
             worker_mode,
         })
     }

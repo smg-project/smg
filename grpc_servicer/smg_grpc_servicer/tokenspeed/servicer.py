@@ -47,6 +47,7 @@ from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
+from smg_grpc_servicer.tokenspeed.loads import convert_load_to_protobuf, running_window
 
 if TYPE_CHECKING:
     # Type-only — keeps these out of the cold-path graph when the servicer is
@@ -674,31 +675,20 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             or getattr(self.async_llm.server_args, "max_total_num_tokens", 0)
             or 0
         )
+        max_running_requests = running_window(self.async_llm.server_args)
 
-        scheduler_loads: list[tokenspeed_scheduler_pb2.SchedulerLoad] = []
-        total_running = 0
-        total_waiting = 0
-        token_usages: list[float] = []
-        for lo in load_outputs:
-            num_running = max(0, int(lo.num_reqs) - int(lo.num_waiting_reqs))
-            num_used_tokens = int(lo.num_pages) * page_size
-            token_usage = (
-                num_used_tokens / max_total_num_tokens if max_total_num_tokens > 0 else 0.0
+        scheduler_loads = [
+            convert_load_to_protobuf(
+                lo,
+                page_size=page_size,
+                max_total_num_tokens=max_total_num_tokens,
+                max_running_requests=max_running_requests,
             )
-            scheduler_loads.append(
-                tokenspeed_scheduler_pb2.SchedulerLoad(
-                    dp_rank=int(lo.dp_rank),
-                    num_running_reqs=num_running,
-                    num_waiting_reqs=int(lo.num_waiting_reqs),
-                    num_total_reqs=int(lo.num_reqs),
-                    num_used_tokens=num_used_tokens,
-                    max_total_num_tokens=max_total_num_tokens,
-                    token_usage=token_usage,
-                )
-            )
-            total_running += num_running
-            total_waiting += int(lo.num_waiting_reqs)
-            token_usages.append(token_usage)
+            for lo in load_outputs
+        ]
+        token_usages = [load.token_usage for load in scheduler_loads]
+        total_running = sum(load.num_running_reqs for load in scheduler_loads)
+        total_waiting = sum(load.num_waiting_reqs for load in scheduler_loads)
 
         aggregate = tokenspeed_scheduler_pb2.AggregateMetrics(
             total_running_reqs=total_running,

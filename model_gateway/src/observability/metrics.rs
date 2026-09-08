@@ -1126,6 +1126,16 @@ impl Metrics {
         counter!("smg_pd_kv_transfer_failures_total").increment(1);
     }
 
+    /// Record a PD dispatch that had to wait for a decode admission slot.
+    pub fn record_pd_admission_wait() {
+        counter!("smg_pd_admission_waits_total").increment(1);
+    }
+
+    /// Record a PD dispatch shed because no decode slot freed in time.
+    pub fn record_pd_admission_shed() {
+        counter!("smg_pd_admission_sheds_total").increment(1);
+    }
+
     // ========================================================================
     // Layer 3: Worker metrics
     // ========================================================================

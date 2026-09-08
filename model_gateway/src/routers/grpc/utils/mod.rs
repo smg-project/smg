@@ -13,7 +13,7 @@ pub(crate) use chat_utils::{
     encode_blocking, encode_prompt_blocking, filter_chat_request_by_tool_choice,
     filter_tools_by_tool_choice, generate_tool_call_id, get_history_tool_calls_count,
     parse_finish_reason, parse_json_schema_response, process_chat_messages_with_placeholders,
-    resolve_tokenizer, send_error_sse,
+    resolve_tokenizer, send_error_sse, validate_chat_content_parts,
 };
 pub(crate) use logprobs::{
     convert_generate_input_logprobs, convert_generate_output_logprobs, convert_proto_logprobs,

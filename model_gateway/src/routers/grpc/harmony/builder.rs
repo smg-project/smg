@@ -346,6 +346,7 @@ impl HarmonyBuilder {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<HarmonyBuildOutput, String> {
+        utils::validate_chat_content_parts(&request.messages)?;
         reject_chat_audio(&request.messages)?;
         let encoding = try_harmony_encoding()?;
 
@@ -1250,6 +1251,21 @@ mod tests {
 
     use super::*;
     use crate::routers::grpc::common::responses::utils::namespace_test_request;
+
+    #[test]
+    fn build_from_chat_rejects_unknown_content_parts_before_loading_encoding() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-oss-120b",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "vendor_media", "payload": "media_1"}]
+            }]
+        }))
+        .unwrap();
+        let error = HarmonyBuilder::new().build_from_chat(&request).unwrap_err();
+        assert!(error.contains("vendor_media"));
+        assert!(error.contains("gRPC"));
+    }
 
     #[test]
     fn chat_audio_is_explicitly_rejected() {

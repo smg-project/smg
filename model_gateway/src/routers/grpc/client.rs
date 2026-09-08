@@ -865,6 +865,9 @@ const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     "pp_size",
     "context_length",
     "max_total_tokens",
+    // TokenSpeed's spelling of the scheduler's running window; the fleet
+    // capacity accounting and the PD admission gate read either name.
+    "max_num_seqs",
     "max_running_requests",
     "load_balance_method",
     "is_embedding",
