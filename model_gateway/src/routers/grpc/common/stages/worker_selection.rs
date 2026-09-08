@@ -14,10 +14,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
-        common::{
-            overload,
-            placement::{self, PairCandidates, PairFailure, PlacementFailure, PlacementInputs},
-        },
+        common::placement::{self, PairCandidates, PairFailure, PlacementFailure, PlacementInputs},
         error,
         grpc::{
             context::{
@@ -338,77 +335,99 @@ impl WorkerSelectionStage {
         legs: &[WorkerType],
         wire: Option<WireConstraint>,
     ) -> Response {
+        let mut unavailable = false;
         for leg in legs {
-            let shed = match leg {
+            let verdict = match leg {
                 // The regular leg is judged from exactly the pool the shared
                 // placement drew from.
-                WorkerType::Regular => match placement::single_failure(
+                WorkerType::Regular => placement::single_failure(
                     &self.worker_registry,
                     model_id,
                     RoutingPool::GrpcPipelineRegular,
                     wire,
-                ) {
-                    PlacementFailure::AllOverloaded(shed) => Some(shed),
-                    PlacementFailure::NoCandidates
-                    | PlacementFailure::Unavailable
-                    | PlacementFailure::PolicyDeclined(_) => None,
-                },
+                ),
                 WorkerType::Prefill => {
-                    self.disaggregated_leg_shed(model_id, RoutingPool::GrpcPrefill, wire)
+                    self.disaggregated_leg_verdict(model_id, RoutingPool::GrpcPrefill, wire)
                 }
                 WorkerType::Decode => {
-                    self.disaggregated_leg_shed(model_id, RoutingPool::GrpcDecode, wire)
+                    self.disaggregated_leg_verdict(model_id, RoutingPool::GrpcDecode, wire)
                 }
                 WorkerType::Encode => {
-                    self.disaggregated_leg_shed(model_id, RoutingPool::GrpcEncode, wire)
+                    self.disaggregated_leg_verdict(model_id, RoutingPool::GrpcEncode, wire)
                 }
             };
-            if let Some(shed) = shed {
-                return shed;
+            match verdict {
+                PlacementFailure::AllOverloaded(shed) => return shed,
+                PlacementFailure::Unavailable | PlacementFailure::PolicyDeclined(_) => {
+                    unavailable = true;
+                }
+                PlacementFailure::NoCandidates => {}
             }
         }
+        if unavailable {
+            return self.workers_unavailable(model_id);
+        }
+        error!(
+            function = "WorkerSelectionStage::execute",
+            mode = ?self.mode,
+            model_id = %model_id,
+            "No worker serves model"
+        );
+        error::model_not_found(model_id)
+    }
+
+    /// Workers serve the model but none can take the request right now
+    /// (unhealthy, circuit breaker open, or the policy declined). A 503 with
+    /// the same code the HTTP router uses: the model exists, the client should
+    /// retry, and nothing about its request is wrong. Answering 404 here told
+    /// clients the model was gone while its workers restarted.
+    fn workers_unavailable(&self, model_id: &str) -> Response {
         error!(
             function = "WorkerSelectionStage::execute",
             mode = ?self.mode,
             model_id = %model_id,
             "No available workers for model"
         );
-        error::model_not_found(model_id)
+        error::service_unavailable(
+            "no_available_workers",
+            format!("All workers for model '{model_id}' are unavailable (unhealthy or circuit breaker open)"),
+        )
     }
 
     /// The response for a failed pair placement. The verdict was judged from
     /// the leg's own candidates inside the placement, so a shed is answered
-    /// as it was built and counted once; every other miss keeps the
-    /// not-found answer this router always gave.
+    /// as it was built and counted once; a leg nobody serves is a 404, and a
+    /// leg whose workers are all unavailable is the 503 the HTTP router gives.
     fn pair_failure(&self, model_id: &str, failure: PairFailure) -> Response {
         match failure.verdict {
             PlacementFailure::AllOverloaded(shed) => shed,
-            PlacementFailure::NoCandidates
-            | PlacementFailure::Unavailable
-            | PlacementFailure::PolicyDeclined(_) => {
+            PlacementFailure::Unavailable | PlacementFailure::PolicyDeclined(_) => {
+                self.workers_unavailable(model_id)
+            }
+            PlacementFailure::NoCandidates => {
                 error!(
                     function = "WorkerSelectionStage::execute",
                     mode = ?self.mode,
                     model_id = %model_id,
                     leg = ?failure.leg,
-                    "No available workers for model"
+                    "No worker serves model"
                 );
                 error::model_not_found(model_id)
             }
         }
     }
 
-    /// The shed verdict for one disaggregated leg, judged from the pool it
+    /// The verdict for one disaggregated leg, judged from the pool it
     /// selected over *before* the `is_available()` filter. The legs are
     /// gRPC-only (no KV rendezvous on ZMQ), so a retry pins the runtime alone;
     /// the regular leg is judged by [`placement::single_failure`] instead.
     /// Failure path only.
-    fn disaggregated_leg_shed(
+    fn disaggregated_leg_verdict(
         &self,
         model_id: &str,
         pool: RoutingPool,
         wire: Option<WireConstraint>,
-    ) -> Option<Response> {
+    ) -> PlacementFailure {
         let candidates: Vec<Arc<dyn Worker>> = self
             .worker_registry
             .get_routing_pool(model_id, pool)
@@ -416,7 +435,7 @@ impl WorkerSelectionStage {
             .filter(|w| wire.is_none_or(|c| w.metadata().spec.runtime_type == c.runtime))
             .cloned()
             .collect();
-        overload::shed_if_all_overloaded(&candidates, model_id)
+        placement::failure_from(&candidates, model_id)
     }
 
     #[expect(
@@ -1207,6 +1226,101 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// Workers serve the model but none is available: a 503 with the HTTP
+    /// router's code, not the 404 that told clients the model was gone while
+    /// its workers restarted.
+    #[test]
+    fn an_unavailable_regular_worker_answers_503_not_404() {
+        use openai_protocol::worker::WorkerStatus;
+
+        use crate::routers::error::extract_error_code_from_response;
+        let model_id = "test-model-unavailable";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:8470")
+                .model(ModelCard::new(model_id))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .build(),
+        );
+        worker_registry.register(Arc::clone(&worker)).unwrap();
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::Regular,
+        );
+        // Any status but Ready is unavailable to routing.
+        worker.set_status(WorkerStatus::NotReady);
+        assert!(stage
+            .select_single_worker(model_id, None, None, None, None, None, None)
+            .is_none());
+
+        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
+        // A model nobody serves stays a 404.
+        assert_eq!(
+            stage
+                .selection_failure("no-such-model", &[WorkerType::Regular], None)
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// A disaggregated leg whose only worker is down is the same 503, both
+    /// through the per-leg fallback and through the pair verdict.
+    #[test]
+    fn an_unavailable_decode_leg_answers_503_not_404() {
+        use openai_protocol::worker::WorkerStatus;
+
+        use crate::{policies::WorkerLeg, routers::error::extract_error_code_from_response};
+        let model_id = "test-model-decode-down";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_pd_workers(&worker_registry, model_id, 1);
+        let decode = worker_registry
+            .get_routing_pool(model_id, RoutingPool::GrpcDecode)
+            .first()
+            .cloned()
+            .expect("one decode worker registered");
+        decode.set_status(WorkerStatus::NotReady);
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::PrefillDecode,
+        );
+
+        let fallback =
+            stage.selection_failure(model_id, &[WorkerType::Prefill, WorkerType::Decode], None);
+        let pair = stage.pair_failure(
+            model_id,
+            PairFailure {
+                leg: WorkerLeg::Decode,
+                verdict: PlacementFailure::Unavailable,
+            },
+        );
+
+        for response in [fallback, pair] {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                extract_error_code_from_response(&response),
+                "no_available_workers"
+            );
+        }
+        let absent = stage.pair_failure(
+            model_id,
+            PairFailure {
+                leg: WorkerLeg::Decode,
+                verdict: PlacementFailure::NoCandidates,
+            },
+        );
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
     }
 
     fn dispatch_ctx(model_id: &str, wire: WireConstraint) -> DispatchContext {
