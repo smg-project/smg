@@ -16,8 +16,11 @@ use llm_tokenizer::{
     StopSequenceDecoder,
 };
 use openai_protocol::{
-    chat::{ChatCompletionRequest, ChatMessage},
-    common::{FunctionCallResponse, StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue},
+    chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+    common::{
+        ContentPart, FunctionCallResponse, StringOrArray, Tool, ToolCall, ToolChoice,
+        ToolChoiceValue,
+    },
     generate::GenerateFinishReason,
 };
 use serde_json::{json, Value};
@@ -245,6 +248,34 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
         combined.extend(template_kwargs.clone());
     }
     combined
+}
+
+/// gRPC backends require content parts the gateway knows how to render.
+pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<(), String> {
+    for message in messages {
+        let content = match message {
+            ChatMessage::System { content, .. }
+            | ChatMessage::User { content, .. }
+            | ChatMessage::Tool { content, .. }
+            | ChatMessage::Developer { content, .. } => Some(content),
+            ChatMessage::Assistant { content, .. } => content.as_ref(),
+            ChatMessage::Function { .. } => None,
+        };
+        if let Some(MessageContent::Parts(parts)) = content {
+            for part in parts {
+                if let ContentPart::Unknown(fields) = part {
+                    let type_name = fields
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<missing>");
+                    return Err(format!(
+                        "Unsupported chat content part type {type_name:?} for gRPC backends"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn process_content_format_with_order(
@@ -476,6 +507,8 @@ pub fn process_chat_messages(
     tokenizer: &dyn Tokenizer,
     image_placeholder: Option<&str>,
 ) -> Result<ProcessedMessages, String> {
+    // Bindings call this entry point without the gRPC preparation stage.
+    validate_chat_content_parts(&request.messages)?;
     let placeholder_tokens = image_placeholder.map(|token| {
         let mut placeholders = PlaceholderTokens::default();
         placeholders.insert(Modality::Image, token.to_string());
@@ -854,6 +887,57 @@ mod tests {
             tokens.insert(*modality, (*token).to_string());
         }
         tokens
+    }
+
+    #[test]
+    fn unknown_chat_content_parts_are_rejected_in_every_role() {
+        for role in ["system", "user", "assistant", "tool", "developer"] {
+            let message: ChatMessage = serde_json::from_value(json!({
+                "role": role,
+                "tool_call_id": "call_1",
+                "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "vendor_media", "payload": {"id": "media_1"}}
+                ]
+            }))
+            .unwrap();
+            let error = validate_chat_content_parts(&[message]).unwrap_err();
+            assert!(error.contains("vendor_media"), "{role}: {error}");
+            assert!(error.contains("gRPC"), "{role}: {error}");
+        }
+    }
+
+    #[test]
+    fn process_chat_messages_rejects_unknown_content_parts() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Describe this attachment"},
+                {"type": "vendor_media", "payload": "media_1"}
+            ]}]
+        }))
+        .unwrap();
+        let tokenizer = llm_tokenizer::MockTokenizer::new();
+        let error = process_chat_messages(&request, &tokenizer, None).unwrap_err();
+        assert!(error.contains("vendor_media"));
+    }
+
+    #[test]
+    fn known_chat_content_parts_are_accepted() {
+        let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+                {"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}},
+                {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}},
+                {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
+            ]},
+            {"role": "assistant", "content": null},
+            {"role": "function", "name": "lookup", "content": "result"}
+        ]))
+        .unwrap();
+        assert!(validate_chat_content_parts(&messages).is_ok());
     }
 
     #[test]
