@@ -904,36 +904,30 @@ jobs:
             kv_backend: mooncake
             timeout: 40
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
-          # No tokenspeed row yet. The classes carry the marks and the
-          # per-engine model, so `E2E_RUNTIME=tokenspeed pytest e2e_test/router`
-          # runs the suite by hand — but this lane cannot gate merge until the
-          # concurrency mismatch below is settled.
-          #
-          # Sequential PD works: on run 34173426995 both TestPDMessagesGrpc
-          # cases passed against Qwen3.5-9B on a 1p1d TokenSpeed pair. The
-          # MMLU case then drives 32 concurrent requests at the model spec's
-          # `--max-num-seqs 4` (the only such cap in e2e_test/, inherited from
-          # the 4-GPU EPD smoke lane). With an admission window that far below
-          # the offered concurrency the two legs admit disjoint subsets and
-          # each waits on the other, so the engine's own PD guards fire:
-          # prefill "Some requests timed out when bootstrapping ... fail to
-          # receive the cache manifest from the decode instance", decode "Some
-          # requests fail to receive KV Cache transfer done signal". 14 of 64
-          # requests died that way; the eval took 1392s against ~16s on the
-          # sglang and vllm rows and scored 0.609 under the 0.65 threshold.
-          # Re-add this row once the window covers the suite's concurrency
-          # (`--max-num-seqs` >= the eval's num_threads), together with the
-          # `extra_models` and `tokenspeed_prebuilt_image` inputs it needs.
+          # TokenSpeed prefill/decode over its Mooncake transfer, on the model
+          # its disaggregation path is proven on (Qwen3.5-9B, fetched by id).
+          # First run (34173426995): sequential PD passed; 32 concurrent
+          # requests deadlocked both legs because the spec's engine window was
+          # 4 (prefill waits for a decode that is never admitted). The window
+          # now covers the suite's bursts; the over-window deadlock itself is
+          # pinned by the topology suite. The prebuilt image is extracted, but
+          # a cold path builds from source, hence the larger budgets.
+          - engine: tokenspeed
+            timeout: 75
+            test_timeout: 50
+            min_selected: 10 # floor ≈ 95% of the 11 gRPC PD cases marked for tokenspeed
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
       gpu_tier: "2"
       runner: ${{ vars.SMG_RUNNER_GPU_2 || '2-gpu-h100' }}
       timeout: ${{ matrix.timeout }}
-      test_timeout: 34
+      test_timeout: ${{ matrix.test_timeout || 34 }}
       test_dirs: e2e_test/router
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
       min_selected: ${{ matrix.min_selected }}
+      extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
+      tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
   # === 4 GPU ===
