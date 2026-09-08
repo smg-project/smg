@@ -69,6 +69,7 @@ class WorkerPool:
         gpu_offset: int = 0,
         gpus: int | None = None,
         extra_engine_args: list[str] | None = None,
+        wait_ready: bool = True,
     ) -> list[Worker]:
         """Return ``count`` healthy workers for the given key.
 
@@ -114,6 +115,7 @@ class WorkerPool:
                     gpu_offset=gpu_offset,
                     gpus=gpus,
                     extra_engine_args=extra_engine_args,
+                    wait_ready=wait_ready,
                 )
 
             # REGULAR workers always start at gpu 0; ``gpu_offset`` is only
@@ -156,6 +158,7 @@ class WorkerPool:
                 log_dir=log_dir,
                 gpus=gpus,
                 extra_engine_args=extra_engine_args,
+                wait_ready=wait_ready,
             )
             self._key = key
             self._workers = new_workers

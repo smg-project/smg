@@ -1006,6 +1006,50 @@ jobs:
       tokenspeed_prebuilt_image: ${{ needs.detect-changes.outputs.tokenspeed-image }}
     secrets: inherit
 
+  # PD disaggregation under one 4-GPU topology (2 prefill + 2 decode) plus a
+  # fleet assembled at runtime through the worker API, per engine. The full
+  # topology sweep (1p1d .. 3p1d) runs in nightly-pd.yml; this lane guards
+  # every PR with the topology that exercises both legs' load balancing.
+  e2e-4gpu-pd:
+    name: e2e-4gpu-pd (${{ matrix.engine }})
+    needs: [e2e-1gpu-gateway, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.e2e-1gpu-gateway.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && (needs.detect-changes.outputs.common == 'true'
+                  || needs.detect-changes.outputs.chat-completions == 'true')))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: sglang
+            timeout: 50
+            test_timeout: 42
+          - engine: vllm
+            timeout: 50
+            test_timeout: 42
+          # Qwen3.5-9B loads slower and the prebuilt image is extracted first;
+          # a cold path builds the engine from source.
+          - engine: tokenspeed
+            timeout: 85
+            test_timeout: 60
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: ${{ matrix.engine }}
+      gpu_tier: "4"
+      runner: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
+      timeout: ${{ matrix.timeout }}
+      test_timeout: ${{ matrix.test_timeout }}
+      test_dirs: e2e_test/router/test_pd_topologies.py
+      test_filter: -k "2p2d or AssembledAtRuntime"
+      extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
+      min_selected: 10 # floor ≈ 95% of the 11 cases the -k filter keeps
+      tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+    secrets: inherit
+
   # --- Vendor E2E: CPU-only cloud backend tests ---
 
   e2e-vendor:
@@ -1318,7 +1362,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -1387,6 +1431,7 @@ jobs:
                 "${{ needs.e2e-4gpu-chat.result }}" == "failure" || \
                 "${{ needs.e2e-4gpu-gateway.result }}" == "failure" || \
                 "${{ needs.e2e-4gpu-epd.result }}" == "failure" || \
+                "${{ needs.e2e-4gpu-pd.result }}" == "failure" || \
                 "${{ needs.e2e-vendor.result }}" == "failure" || \
                 "${{ needs.go-unit-tests.result }}" == "failure" || \
                 "${{ needs.go-bindings-e2e.result }}" == "failure" ]]; then

@@ -59,6 +59,8 @@ _WORKER_DEFAULTS = {
     "decode": None,
     "gpus": None,
     "extra_engine_args": None,
+    # PD only: spawn every prefill/decode worker first and wait afterwards.
+    "parallel_start": False,
 }
 
 # Track worker startup failures — fail fast after repeated failures
@@ -207,9 +209,9 @@ def setup_backend(request: pytest.FixtureRequest):
     """
     raw_param = request.param
     if isinstance(raw_param, tuple):
-        backend_name, epd_counts = raw_param
+        backend_name, leg_counts = raw_param
     else:
-        backend_name, epd_counts = raw_param, None
+        backend_name, leg_counts = raw_param, None
 
     if os.environ.get(ENV_SKIP_BACKEND_SETUP, "").lower() in ("1", "true", "yes"):
         pytest.skip(f"{ENV_SKIP_BACKEND_SETUP} is set")
@@ -239,6 +241,12 @@ def setup_backend(request: pytest.FixtureRequest):
     _validate_connection_mode(connection_mode, engine)
     model_path = get_model_spec(model_id)["model"]
     workers_config = get_marker_kwargs(request, "workers", defaults=_WORKER_DEFAULTS)
+    if is_pd and leg_counts is not None:
+        # ``("pd_grpc", (n_prefill, n_decode))`` lets one class sweep PD
+        # topologies; setup_backend is class-scoped, so counts ride in the param.
+        if len(leg_counts) != 2:
+            raise ValueError("pd_* backend params take (n_prefill, n_decode) counts")
+        workers_config = {**workers_config, "prefill": leg_counts[0], "decode": leg_counts[1]}
     log_dir = os.environ.get("E2E_LOG_DIR") or gateway_config.get("log_dir")
 
     fail_count = _worker_start_failures.get(engine, 0)
@@ -256,7 +264,7 @@ def setup_backend(request: pytest.FixtureRequest):
                 model_path,
                 engine,
                 connection_mode,
-                epd_counts,
+                leg_counts,
                 gateway_config,
                 gateway,
                 log_dir,
@@ -385,6 +393,7 @@ def _setup_pd(
         num_decode,
     )
 
+    parallel_start = bool(workers_config.get("parallel_start"))
     all_workers: list = []
     try:
         prefill_workers = _start_workers_tracked(
@@ -394,6 +403,7 @@ def _setup_pd(
             count=num_prefill,
             worker_type=WorkerType.PREFILL,
             log_dir=log_dir,
+            wait_ready=not parallel_start,
         )
         all_workers.extend(prefill_workers)
 
@@ -407,8 +417,17 @@ def _setup_pd(
             worker_type=WorkerType.DECODE,
             log_dir=log_dir,
             gpu_offset=decode_gpu_offset,
+            wait_ready=not parallel_start,
         )
         all_workers.extend(decode_workers)
+        if parallel_start:
+            # Each worker loads on its own GPUs, so spawning them all first
+            # makes a topology cost one model load instead of one per worker.
+            # It also brings the legs up in no particular order, which is what
+            # a user launching a fleet does.
+            startup_timeout = spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+            for worker in all_workers:
+                worker.wait_ready(startup_timeout)
 
         _start_gateway(
             gateway,

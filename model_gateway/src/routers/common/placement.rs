@@ -419,6 +419,11 @@ pub(crate) fn select_pair(
         decode_policy.name(),
     );
 
+    debug!(
+        prefill = %selected_prefill.url(),
+        decode = %selected_decode.url(),
+        "Selected PD pair"
+    );
     Ok(Pair {
         prefill: selected_prefill,
         decode: selected_decode,

@@ -113,7 +113,16 @@ class Worker:
             )
             return
 
-        # Wait for health check
+        self.wait_ready(timeout)
+
+    def wait_ready(self, timeout: int = DEFAULT_STARTUP_TIMEOUT) -> None:
+        """Block until the spawned worker passes its health check.
+
+        ``start(wait_ready=False)`` followed by this call lets a caller spawn
+        several workers and wait for all of them afterwards.
+        """
+        if self.process is None:
+            raise RuntimeError(f"Worker {self.model_id} has not been started")
         if self.mode == ConnectionMode.ZMQ:
             # SMG (the router) binds the ZMQ sockets and this engine dials in;
             # there is no worker port to probe. The gateway's readiness gate

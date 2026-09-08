@@ -1,0 +1,154 @@
+name: Nightly PD Topologies
+
+# Sweeps every prefill/decode topology a 4-GPU node allows (1p1d, 1p2d, 2p1d,
+# 1p3d, 3p1d, 2p2d) plus a fleet assembled at runtime, per engine. The PR lane
+# e2e-4gpu-pd runs one topology; this is where the rest get exercised.
+
+on:
+  schedule:
+    - cron: "45 9 * * *" # 09:45 UTC daily, after the nightly benchmarks release the GPU pool
+  workflow_dispatch:
+    inputs:
+      engines:
+        description: "Space-separated engines to run (sglang vllm tokenspeed); empty = all"
+        required: false
+        default: ""
+      filter:
+        description: "pytest -k expression (e.g. 1p3d, or 'not AssembledAtRuntime'); empty = every topology"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-pd
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      engines: ${{ steps.plan.outputs.engines }}
+    steps:
+      - id: plan
+        env:
+          ENGINES: ${{ inputs.engines }}
+        run: |
+          wanted="${ENGINES:-sglang vllm tokenspeed}"
+          json=$(printf '%s\n' $wanted | jq -R . | jq -sc .)
+          echo "engines=$json" >> "$GITHUB_OUTPUT"
+          echo "engines: $json"
+
+  build-wheel:
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Build Python wheel
+        run: |
+          rm -rf bindings/python/dist/
+          bash scripts/ci_setup_python_venv.sh
+          bash scripts/ci_build_wheel.sh
+
+      - name: Generate Python client types
+        run: |
+          source "$HOME/.cargo/env"
+          mkdir -p clients/openapi
+          cargo run -p openapi-gen -- clients/openapi/smg-openapi.yaml
+          pip install 'datamodel-code-generator==0.54.0'
+          datamodel-codegen \
+            --input clients/openapi/smg-openapi.yaml \
+            --input-file-type openapi \
+            --output clients/python/smg_client/types/_generated.py \
+            --output-model-type pydantic_v2.BaseModel \
+            --use-annotated \
+            --field-constraints \
+            --target-python-version 3.10 \
+            --collapse-root-models \
+            --use-standard-collections \
+            --use-union-operator
+          sed -i 's/class \(.*\)(Enum):/class \1(str, Enum):/' clients/python/smg_client/types/_generated.py
+
+      - name: Build WASM test fixtures
+        run: |
+          source "$HOME/.cargo/env"
+          bash crates/wasm/tests/fixtures/build_fixtures.sh
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: smg-wheel
+          path: bindings/python/dist/*.whl
+          retention-days: 1
+
+      - name: Upload Python client types
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-client-types
+          path: clients/python/smg_client/types/_generated.py
+          retention-days: 1
+
+      - name: Upload WASM test fixtures
+        uses: actions/upload-artifact@v7
+        with:
+          name: wasm-test-fixtures
+          path: crates/wasm/tests/fixtures/*.wasm
+          retention-days: 1
+          if-no-files-found: ignore
+
+  # Same resolution as detect-changes in pr-test-rust.yml: the prebuilt
+  # TokenSpeed carrier image, or empty to build from source.
+  tokenspeed-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve TokenSpeed CI image
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$(bash scripts/ci_tokenspeed_image_tag.sh 2>/dev/null || true)"
+          image=""
+          if [ -n "$tag" ]; then
+            candidate="ghcr.io/${{ github.repository_owner }}/smg:${tag}"
+            if docker login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "$GH_TOKEN" > /dev/null 2>&1 \
+               && docker manifest inspect "$candidate" > /dev/null 2>&1; then
+              image="$candidate"
+            fi
+          fi
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "TokenSpeed image: ${image:-none (source build)}"
+
+  pd-topologies:
+    name: pd-topologies (${{ matrix.engine }})
+    needs: [plan, build-wheel, tokenspeed-image]
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: ${{ fromJSON(needs.plan.outputs.engines) }}
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: ${{ matrix.engine }}
+      gpu_tier: "4"
+      runner: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
+      # Six topologies, each with worker restarts; TokenSpeed also extracts
+      # its engine image and loads a slower model.
+      timeout: ${{ matrix.engine == 'tokenspeed' && 170 || 130 }}
+      test_timeout: ${{ matrix.engine == 'tokenspeed' && 150 || 115 }}
+      test_dirs: e2e_test/router/test_pd_topologies.py
+      test_filter: ${{ inputs.filter != '' && format('-k "{0}"', inputs.filter) || '' }}
+      extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
+      min_selected: 0
+      tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.tokenspeed-image.outputs.image || '' }}
+    secrets: inherit
