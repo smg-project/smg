@@ -187,13 +187,6 @@ MODEL_SPECS: dict[str, dict] = {
             "fa3",
             "--max-model-len",
             "8192",
-            # PD legs admit requests independently: a window smaller than the
-            # number of requests in flight lets prefill and decode admit
-            # disjoint subsets and wait on each other until the transfer
-            # timeout (run 34173426995 deadlocked at 4 under 32 concurrent).
-            # 32 covers every burst the PD suites drive.
-            "--max-num-seqs",
-            "32",
             "--gpu-memory-utilization",
             "0.8",
             # This model's hybrid-attention KV pool opts into tokenspeed's
