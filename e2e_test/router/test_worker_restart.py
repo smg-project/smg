@@ -67,6 +67,15 @@ def _chat(gateway: Gateway, model_path: str, timeout: float) -> httpx.Response:
     )
 
 
+def _error_code(resp: httpx.Response) -> str | None:
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    error = body.get("error", body)
+    return error.get("code") if isinstance(error, dict) else None
+
+
 def _wait_until_served(gateway: Gateway, model_path: str, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     last = "no attempt"
@@ -120,9 +129,13 @@ class TestWorkerRestart:
                 elapsed,
                 resp.text[:200],
             )
-            assert 500 <= resp.status_code < 600, (
-                f"request during the outage should fail, got {resp.status_code}: {resp.text[:200]}"
+            # The model exists and its worker is merely down: that is a 503
+            # no_available_workers (#2465), not a 404 that tells the client the
+            # model is gone.
+            assert resp.status_code == 503, (
+                f"request during the outage should be a 503, got {resp.status_code}: {resp.text[:200]}"
             )
+            assert _error_code(resp) == "no_available_workers", resp.text[:200]
             assert elapsed < 20.0, f"request during the outage hung for {elapsed:.1f}s"
 
             worker.start()  # same port, same URL

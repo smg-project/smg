@@ -91,7 +91,9 @@ def _wait_for_deep_queue(gateway, min_waiting: int, timeout: float) -> dict:
             if entry.get("num_waiting_reqs", 0) >= min_waiting:
                 return entry
         time.sleep(0.2)
-    pytest.fail(f"engine queue never reached {min_waiting} waiting requests; last reports: {last}")
+    raise AssertionError(
+        f"engine queue never reached {min_waiting} waiting requests; last reports: {last}"
+    )
 
 
 class _OverloadShedBase:
