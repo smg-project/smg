@@ -434,7 +434,7 @@ class TestPDTopology:
         assert used <= peers, f"unknown {role} workers in placement: {used - peers}"
 
         victim.start()
-        _wait_for_status(gateway, victim.base_url, "healthy", timeout=600.0)
+        _wait_for_status(gateway, victim.base_url, "healthy", timeout=300.0)
         before = len(_pairs_logged())
         count = 4 * len(workers)
         for i in range(count):
@@ -443,12 +443,15 @@ class TestPDTopology:
         used = {p for p, _ in pairs} if role == "prefill" else {d for _, d in pairs}
         assert victim.base_url in used, f"restarted {role} worker never rejoined rotation"
 
+    @pytest.mark.flaky(reruns=0)  # a restart per attempt; a real failure must surface once
     def test_decode_leg_survives_losing_one_worker(self, setup_backend):
         self._leg_survives_losing_one(setup_backend, "decode")
 
+    @pytest.mark.flaky(reruns=0)  # a restart per attempt; a real failure must surface once
     def test_prefill_leg_survives_losing_one_worker(self, setup_backend):
         self._leg_survives_losing_one(setup_backend, "prefill")
 
+    @pytest.mark.flaky(reruns=0)  # a restart per attempt; a real failure must surface once
     def test_sole_leg_outage_is_reported_promptly(self, setup_backend):
         _, model, client, gateway = setup_backend
         if len(gateway.decode_workers) == 1:
@@ -477,7 +480,7 @@ class TestPDTopology:
         assert code, f"outage answer carried no error code: {resp.text[:200]}"
 
         victim.start()
-        _wait_for_status(gateway, victim.base_url, "healthy", timeout=600.0)
+        _wait_for_status(gateway, victim.base_url, "healthy", timeout=300.0)
         _wait_until_served(gateway, model, timeout=120.0)
 
 
@@ -493,6 +496,7 @@ class TestPDTopology:
 class TestPDAssembledAtRuntime:
     """IGW gateway with no workers; prefill and decode arrive through the API."""
 
+    @pytest.mark.flaky(reruns=0)  # a restart per attempt; a real failure must surface once
     def test_legs_added_through_the_api_route_as_pd(self):
         engine = get_runtime()
         model_id = _MODEL_BY_ENGINE.get(engine, _MODEL)
@@ -530,6 +534,7 @@ class TestPDAssembledAtRuntime:
             ok, detail = gateway.add_worker(decode[0].base_url, worker_type="decode")
             assert ok, f"registering the decode worker failed: {detail}"
             roles = {r: len(ws) for r, ws in _workers_by_role(gateway).items()}
+            logger.info("roles after registration: %s", roles)
             assert roles == {"prefill": 1, "decode": 1}, f"/workers roles: {roles}"
 
             _wait_until_served(gateway, model_path, timeout=180.0)
