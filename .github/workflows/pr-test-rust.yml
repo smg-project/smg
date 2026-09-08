@@ -904,13 +904,26 @@ jobs:
             kv_backend: mooncake
             timeout: 40
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
-          # TokenSpeed prefill/decode over its Mooncake transfer. The prebuilt
-          # engine image is extracted rather than built, but a cold path still
-          # builds from source, so the job budget matches the other TokenSpeed
-          # lanes while the test step keeps the shared 34-minute budget.
-          - engine: tokenspeed
-            timeout: 60
-            min_selected: 10 # floor ≈ 95% of the 11 gRPC PD cases marked for tokenspeed
+          # No tokenspeed row yet. The classes carry the marks and the
+          # per-engine model, so `E2E_RUNTIME=tokenspeed pytest e2e_test/router`
+          # runs the suite by hand — but this lane cannot gate merge until the
+          # concurrency mismatch below is settled.
+          #
+          # Sequential PD works: on run 34173426995 both TestPDMessagesGrpc
+          # cases passed against Qwen3.5-9B on a 1p1d TokenSpeed pair. The
+          # MMLU case then drives 32 concurrent requests at the model spec's
+          # `--max-num-seqs 4` (the only such cap in e2e_test/, inherited from
+          # the 4-GPU EPD smoke lane). With an admission window that far below
+          # the offered concurrency the two legs admit disjoint subsets and
+          # each waits on the other, so the engine's own PD guards fire:
+          # prefill "Some requests timed out when bootstrapping ... fail to
+          # receive the cache manifest from the decode instance", decode "Some
+          # requests fail to receive KV Cache transfer done signal". 14 of 64
+          # requests died that way; the eval took 1392s against ~16s on the
+          # sglang and vllm rows and scored 0.609 under the 0.65 threshold.
+          # Re-add this row once the window covers the suite's concurrency
+          # (`--max-num-seqs` >= the eval's num_threads), together with the
+          # `extra_models` and `tokenspeed_prebuilt_image` inputs it needs.
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -921,8 +934,6 @@ jobs:
       test_dirs: e2e_test/router
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
       min_selected: ${{ matrix.min_selected }}
-      extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
-      tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
   # === 4 GPU ===
