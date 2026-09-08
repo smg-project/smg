@@ -25,7 +25,9 @@ import pytest
 logger = logging.getLogger(__name__)
 
 # Short poll interval so a report lands within seconds; the gateway default is 10s.
-LOAD_MONITOR_INTERVAL_SECS = 2
+# One second also keeps a burst observable: a small model on an H100 finishes
+# sixteen 512-token generations in about a second, inside a single wider poll.
+LOAD_MONITOR_INTERVAL_SECS = 1
 _GATEWAY_ARGS = ["--load-monitor-interval", str(LOAD_MONITOR_INTERVAL_SECS)]
 _REPORT_TIMEOUT_SECS = 8 * LOAD_MONITOR_INTERVAL_SECS
 
@@ -75,7 +77,6 @@ def _assert_report_is_sane(entry: dict) -> None:
 @pytest.mark.engine("sglang", "vllm", "tokenspeed")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
-@pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
 @pytest.mark.gateway(extra_args=_GATEWAY_ARGS)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestWorkerLoadReports:
@@ -96,6 +97,7 @@ class TestWorkerLoadReports:
 
         A report that never moves off zero would still pass the presence check
         above; this proves the counters come from the engine, not a default.
+        The burst is sized to outlast several poll intervals on a fast engine.
         """
         _, model, client, gateway = setup_backend
         expected = _worker_urls(gateway)
@@ -110,14 +112,14 @@ class TestWorkerLoadReports:
                     messages=[
                         {"role": "user", "content": "Write a long story about a lighthouse."}
                     ],
-                    max_tokens=512,
+                    max_tokens=1536,
                     temperature=0.0,
                     extra_body={"ignore_eos": True},
                 )
             except BaseException as exc:  # surfaced below; never swallow silently
                 errors.append(exc)
 
-        threads = [threading.Thread(target=_long_request, daemon=True) for _ in range(16)]
+        threads = [threading.Thread(target=_long_request, daemon=True) for _ in range(32)]
         for t in threads:
             t.start()
 
@@ -133,10 +135,10 @@ class TestWorkerLoadReports:
                 time.sleep(0.25)
         finally:
             for t in threads:
-                t.join(timeout=120)
+                t.join(timeout=300)
 
         assert not errors, f"burst requests failed: {errors[:3]}"
-        assert observed, "no load report showed running or waiting work during a 16-request burst"
+        assert observed, "no load report showed running or waiting work during a 32-request burst"
 
 
 @pytest.mark.engine("sglang", "vllm", "tokenspeed")
