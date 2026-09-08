@@ -101,7 +101,7 @@ class TestPDMessagesHttp(MessagesOverPD):
 
 @pytest.mark.engine("sglang", "vllm", "tokenspeed")
 @pytest.mark.gpu(2)
-@pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
+@pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct", tokenspeed="Qwen/Qwen3.5-9B")
 @pytest.mark.e2e
 @pytest.mark.parametrize("setup_backend", ["pd_grpc"], indirect=True)
 class TestPDMessagesGrpc(MessagesOverPD):

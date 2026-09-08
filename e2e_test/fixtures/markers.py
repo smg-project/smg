@@ -83,3 +83,20 @@ def get_marker_kwargs(
     if marker is not None:
         result.update(marker.kwargs)
     return result
+
+
+def model_id_for_engine(marker: pytest.Mark | None, engine: str | None, default: Any = None) -> Any:
+    """Resolve the model id a ``@pytest.mark.model`` marker names for ``engine``.
+
+    ``@pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct", tokenspeed="Qwen/Qwen3.5-9B")``
+    keeps one class portable across engines whose supported model sets differ:
+    the positional id is the default and a keyword named after an engine
+    overrides it for that engine only.
+    """
+    if marker is None:
+        return default
+    if engine and engine in marker.kwargs:
+        return marker.kwargs[engine]
+    if marker.args:
+        return marker.args[0]
+    return default

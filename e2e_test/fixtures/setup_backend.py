@@ -41,7 +41,7 @@ from infra.model_specs import get_model_spec
 from infra.worker import stop_workers
 from infra.worker_pool import get_pool
 
-from .markers import get_marker_kwargs, get_marker_value
+from .markers import get_marker_kwargs, get_marker_value, model_id_for_engine, resolve_class_marker
 
 logger = logging.getLogger(__name__)
 
@@ -214,7 +214,7 @@ def setup_backend(request: pytest.FixtureRequest):
     if os.environ.get(ENV_SKIP_BACKEND_SETUP, "").lower() in ("1", "true", "yes"):
         pytest.skip(f"{ENV_SKIP_BACKEND_SETUP} is set")
 
-    model_id = get_marker_value(request, "model")
+    model_id = model_id_for_engine(resolve_class_marker(request.node, "model"), get_runtime())
     if model_id is None:
         model_id = os.environ.get(ENV_MODEL, DEFAULT_MODEL)
 
