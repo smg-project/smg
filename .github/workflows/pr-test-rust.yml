@@ -848,11 +848,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The router suite grew (load reports, overload, restart); the sglang
+          # lane also switches models between classes, which restarts a worker.
           - engine: sglang
-            timeout: 20
+            timeout: 30
             min_selected: 23 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
-            timeout: 20
+            timeout: 30
             min_selected: 3 # vllm gateway lane selects only 3 tests; floor covers all of them (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
