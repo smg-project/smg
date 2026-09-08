@@ -99,7 +99,7 @@ class TestPDMessagesHttp(MessagesOverPD):
     """Messages API through the HTTP PD router's dual dispatch."""
 
 
-@pytest.mark.engine("sglang", "vllm")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed")
 @pytest.mark.gpu(2)
 @pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
 @pytest.mark.e2e

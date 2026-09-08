@@ -80,7 +80,7 @@ class TestPDResponsesHttp:
         assert completed_events[0].response.status == "completed"
 
 
-@pytest.mark.engine("sglang", "vllm")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed")
 @pytest.mark.gpu(2)
 @pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
 @pytest.mark.e2e

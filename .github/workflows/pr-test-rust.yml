@@ -904,6 +904,13 @@ jobs:
             kv_backend: mooncake
             timeout: 40
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+          # TokenSpeed prefill/decode over its Mooncake transfer. The prebuilt
+          # engine image is extracted rather than built, but a cold path still
+          # builds from source, so the job budget matches the other TokenSpeed
+          # lanes while the test step keeps the shared 34-minute budget.
+          - engine: tokenspeed
+            timeout: 60
+            min_selected: 6 # floor ≈ 95% of the 7 gRPC PD tests marked for tokenspeed
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -914,6 +921,7 @@ jobs:
       test_dirs: e2e_test/router
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
       min_selected: ${{ matrix.min_selected }}
+      tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
   # === 4 GPU ===
