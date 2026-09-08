@@ -76,7 +76,7 @@ def _serving_worker(gateway, send: Callable[[], None]) -> str:
     return busy.pop()
 
 
-@pytest.mark.engine("sglang", "vllm")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed")
 @pytest.mark.gpu(2)
 @pytest.mark.e2e
 @pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
