@@ -48,6 +48,7 @@ def backend_from_str(backend_str: str | None) -> BackendType:
         # Engine backends: routing behaves like the default; over ZMQ they pin
         # the startup workers' wire protocol (vLLM EngineCore vs TokenSpeed).
         "vllm": BackendType.Vllm,
+        "trtllm": BackendType.Trtllm,
         "tokenspeed": BackendType.Tokenspeed,
     }
     backend_lower = backend_str.lower()

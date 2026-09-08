@@ -254,6 +254,8 @@ class RouterArgs:
     # Seconds a PD dispatch waits for a slot in the decode engine's running
     # window before shedding; 0 sheds immediately
     pd_admission_wait_secs: int = 30
+    # Appended to preserve the positional RouterArgs constructor contract.
+    worker_mode: str = "engine"
 
     @staticmethod
     def add_cli_args(
@@ -373,6 +375,12 @@ class RouterArgs:
                 "List of worker URLs. Supports IPv4 and IPv6 addresses"
                 " (use brackets for IPv6, e.g., http://[::1]:8000 http://192.168.1.1:8000)"
             ),
+        )
+        worker_group.add_argument(
+            f"--{prefix}worker-mode",
+            choices=["engine", "smg"],
+            default=RouterArgs.worker_mode,
+            help="Use the direct engine endpoint or the two-tier SMG Worker service",
         )
         worker_group.add_argument(
             f"--{prefix}upstream-http2",

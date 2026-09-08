@@ -160,7 +160,7 @@ RUN uv pip install maturin \
     && cargo clean \
     && rm -rf bindings/python/dist/ \
     && cd bindings/python \
-    && ulimit -n 65536 && maturin build --release --features vendored-openssl,opencv-video --out dist \
+    && ulimit -n 65536 && maturin build --release --features extension-module,vendored-openssl,opencv-video --out dist \
     && rm -rf /root/.cache
 
 ######################### ROUTER IMAGE #########################

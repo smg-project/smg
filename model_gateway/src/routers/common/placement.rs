@@ -24,16 +24,31 @@ use crate::{
         WorkerLeg,
     },
     routers::common::overload,
-    worker::{ConnectionMode, ConnectionModeExt, RoutingPool, RuntimeType, Worker, WorkerRegistry},
+    worker::{
+        ConnectionMode, ConnectionModeExt, RoutingPool, RuntimeType, Worker, WorkerMode,
+        WorkerRegistry,
+    },
 };
 
 /// The wire a retained plan was built for. Retry re-selection filters
-/// candidates to this (runtime, transport): the plan's proto flavor and its
-/// stop-resolution are wire-specific and cannot be rebuilt post-drop.
+/// candidates to this (runtime, transport, endpoint mode): the plan's proto
+/// flavor and its stop-resolution are wire-specific and cannot be rebuilt
+/// post-drop. Mode matters because a two-tier SMG Worker and a direct engine
+/// worker can share runtime and transport while speaking different protos.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WireConstraint {
     pub runtime: RuntimeType,
     pub connection: ConnectionMode,
+    pub mode: WorkerMode,
+}
+
+impl WireConstraint {
+    /// Whether `worker` speaks exactly this wire.
+    pub(crate) fn admits(self, worker: &Arc<dyn Worker>) -> bool {
+        worker.metadata().spec.runtime_type == self.runtime
+            && *worker.connection_mode() == self.connection
+            && worker.worker_mode() == self.mode
+    }
 }
 
 /// Everything a single-worker placement reads from the request.
@@ -118,15 +133,7 @@ pub(crate) fn candidates(
     let pool = registry.get_routing_pool(model_id, pool);
     match wire {
         None => Candidates::Shared(pool),
-        Some(wire) => Candidates::Pinned(
-            pool.iter()
-                .filter(|w| {
-                    w.metadata().spec.runtime_type == wire.runtime
-                        && *w.connection_mode() == wire.connection
-                })
-                .cloned()
-                .collect(),
-        ),
+        Some(wire) => Candidates::Pinned(pool.iter().filter(|w| wire.admits(w)).cloned().collect()),
     }
 }
 
@@ -447,6 +454,7 @@ mod tests {
         let wire = Some(WireConstraint {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
+            mode: WorkerMode::Engine,
         });
 
         assert_eq!(
@@ -591,6 +599,7 @@ mod tests {
             Some(WireConstraint {
                 runtime: RuntimeType::Sglang,
                 connection: ConnectionMode::Grpc,
+                mode: WorkerMode::Engine,
             }),
             false,
             PlacementInputs::default(),

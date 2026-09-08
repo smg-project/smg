@@ -42,7 +42,7 @@ use crate::{
     middleware::TenantRequestMeta,
     policies::CacheNamespace,
     routers::{common::pd_admission::PdAdmissionGuard, error::internal_error},
-    worker::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
+    worker::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerMode, WorkerRegistry},
 };
 
 /// Ingress-phase request context: owns the parsed request.
@@ -236,11 +236,14 @@ impl WireConstraint {
             WorkerSelection::Single { worker } => Self {
                 runtime: worker.metadata().spec.runtime_type,
                 connection: *worker.connection_mode(),
+                mode: worker.worker_mode(),
             },
-            // Disaggregated legs are gRPC-only.
+            // Disaggregated legs are gRPC-only, and never two-tier: config
+            // validation rejects worker_mode=smg with disaggregation.
             WorkerSelection::Disaggregated { runtime_type, .. } => Self {
                 runtime: *runtime_type,
                 connection: ConnectionMode::Grpc,
+                mode: WorkerMode::Engine,
             },
         }
     }

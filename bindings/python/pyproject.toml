@@ -50,6 +50,9 @@ dev = [
 smg = "smg.cli:main"
 
 [tool.maturin]
+# Not a default Cargo feature: see the comment in Cargo.toml. Enabling it here
+# keeps the wheel correct while leaving `cargo test` able to link.
+features = ["extension-module"]
 python-source = "src"
 module-name = "smg.smg_rs"
 # Exclude bindings/python/README.md to use root README only

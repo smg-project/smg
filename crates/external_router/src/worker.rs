@@ -4,7 +4,7 @@ use std::{any::Any, fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
 use axum::{http::HeaderMap, response::Response};
-use openai_protocol::worker::{ConnectionMode, ProviderType, RuntimeType, WorkerType};
+use openai_protocol::worker::{ConnectionMode, ProviderType, RuntimeType, WorkerMode, WorkerType};
 
 use crate::{ExternalRouterSpec, RetryConfig};
 
@@ -53,6 +53,10 @@ pub struct SelectWorkerRequest<'a> {
 
     /// Filter by runtime type (External, Sglang, Vllm, Trtllm). `None` = any.
     pub runtime_type: Option<RuntimeType>,
+
+    /// Filter by endpoint identity (direct engine or two-tier SMG Worker).
+    /// `None` keeps the legacy behavior and considers both modes.
+    pub worker_mode: Option<WorkerMode>,
 
     /// When `true`, restrict candidates to workers advertising realtime
     /// capability (the `realtime` label). Used by the realtime routes so

@@ -2,6 +2,7 @@
 //! standalone binary and in-process integration tests can drive them.
 
 pub mod config;
+pub mod control;
 pub mod engine;
 pub mod grpc;
 pub mod http;

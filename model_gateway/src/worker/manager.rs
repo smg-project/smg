@@ -32,7 +32,7 @@ use crate::{
         metrics_aggregator::{self, MetricPack},
         registry::{WorkerDescriptor, WorkerId},
         worker::WorkerTypeExt,
-        ConnectionMode, Worker, WorkerOrigin, WorkerRegistry, WorkerResult,
+        ConnectionMode, Worker, WorkerError, WorkerOrigin, WorkerRegistry, WorkerResult,
     },
     workflow::{Job, JobQueue},
 };
@@ -520,20 +520,29 @@ async fn apply_probe_completion(
         probe_result,
     } = completion;
 
-    let probe_ok = match probe_result {
-        Ok(()) => true,
+    let outcome = match probe_result {
+        Ok(()) => ProbeOutcome::Healthy,
+        Err(WorkerError::Draining { .. }) => {
+            // Every probe while the worker drains lands here; the one that
+            // actually changes its status is logged with the transition.
+            debug!(
+                worker_url = %worker.url(),
+                "Worker reports draining"
+            );
+            ProbeOutcome::Draining
+        }
         Err(err) => {
             warn!(
                 worker_url = %worker.url(),
                 error = %err,
                 "Health probe failed"
             );
-            false
+            ProbeOutcome::Unhealthy
         }
     };
     Metrics::record_worker_health_check(
         worker.worker_type().as_metric_label(),
-        if probe_ok {
+        if outcome == ProbeOutcome::Healthy {
             metrics_labels::CB_SUCCESS
         } else {
             metrics_labels::CB_FAILURE
@@ -542,12 +551,16 @@ async fn apply_probe_completion(
 
     let Some(((), transition)) =
         registry.apply_if_revision(&worker_id, expected_revision, |current_worker| {
-            if launched_status == WorkerStatus::Pending {
+            // The Pending cap catches URLs that never become healthy. A worker
+            // answering "draining" is reachable and will serve again, so a
+            // long drain that starts in Pending must not eat the cap and turn
+            // the first healthy probe into Failed.
+            if launched_status == WorkerStatus::Pending && outcome != ProbeOutcome::Draining {
                 current_worker.total_pending_probes_increment();
             }
             (
                 (),
-                compute_next_status(current_worker, probe_ok, &health_config),
+                compute_next_status(current_worker, outcome, &health_config),
             )
         })
     else {
@@ -566,6 +579,12 @@ async fn apply_probe_completion(
             ?new,
             "Worker status transition"
         );
+        if outcome == ProbeOutcome::Draining && new == WorkerStatus::NotReady {
+            warn!(
+                worker_url = %worker.url(),
+                "Worker is draining; left rotation"
+            );
+        }
         if new == WorkerStatus::Failed {
             if let Some(jq) = job_queue {
                 submit_removal_job(
@@ -700,6 +719,16 @@ fn schedule_worker_at(
     );
 }
 
+/// What one health probe learned, as the readiness machine consumes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    Healthy,
+    Unhealthy,
+    /// The worker itself reports that it is draining: healthy enough to
+    /// answer, but refusing new work.
+    Draining,
+}
+
 /// Apply the state machine to a probe outcome. Returns the next status if
 /// a transition is needed, `None` if the worker stays in its current state.
 ///
@@ -712,10 +741,16 @@ fn schedule_worker_at(
 ///   - Failed → Ready on `success_threshold` consecutive successes: the engine
 ///     came back on the same address (a restart), and without
 ///     `--remove-unhealthy-workers` this is the only way it rejoins
-///   - Failed stays Failed on failure; Draining never transitions here
-fn compute_next_status(
+///   - Failed stays Failed on failure
+///   - Ready → NotReady at once on a `Draining` outcome (the worker refuses
+///     new work already); the failure counter is reset as on the threshold
+///     path so the liveness budget is unchanged
+///   - Any other status holds on `Draining`: the worker is alive and
+///     answering, so a long drain spends no liveness budget and is re-admitted
+///     through the normal success threshold once it serves again
+pub(crate) fn compute_next_status(
     worker: &Arc<dyn Worker>,
-    probe_ok: bool,
+    outcome: ProbeOutcome,
     health_config: &HealthCheckConfig,
 ) -> Option<WorkerStatus> {
     let current_status = worker.status();
@@ -727,7 +762,18 @@ fn compute_next_status(
     // Pending cap: prevent misconfigured URLs from sitting in Pending forever.
     let max_pending_probes = failure_threshold * 10;
 
-    if probe_ok {
+    if outcome == ProbeOutcome::Draining {
+        worker.consecutive_successes_reset();
+        if current_status == WorkerStatus::Ready {
+            worker.consecutive_failures_reset();
+            return Some(WorkerStatus::NotReady);
+        }
+        // Draining is not dying: neither the liveness budget nor the Pending
+        // cap moves while the worker keeps answering that it is draining.
+        return None;
+    }
+
+    if outcome == ProbeOutcome::Healthy {
         worker.consecutive_failures_reset();
         let successes = worker.consecutive_successes_increment();
 
@@ -1567,16 +1613,89 @@ mod tests {
     }
 
     #[test]
+    fn draining_leaves_rotation_on_the_first_probe_without_shortening_liveness() {
+        let worker = make_worker("http://w:1", 2, 3);
+        worker.set_status(WorkerStatus::Ready);
+        // A failure already on the counter must not carry into the NotReady
+        // budget: the threshold path resets it, so this path must too.
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
+            None
+        );
+
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Draining, &cfg(2, 3)),
+            Some(WorkerStatus::NotReady)
+        );
+        worker.set_status(WorkerStatus::NotReady);
+
+        // Liveness: 3 * failure_threshold consecutive failures from a clean
+        // counter, exactly as after a threshold demotion.
+        for _ in 0..8 {
+            assert_eq!(
+                compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
+                None
+            );
+        }
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
+            Some(WorkerStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn a_long_drain_holds_in_not_ready_and_readmits_when_serving_resumes() {
+        // Only a Ready worker has rotation to leave. Once out, a worker that
+        // keeps answering "draining" is alive, so the drain spends no liveness
+        // budget however long it runs -- well past 3 * failure_threshold --
+        // and it comes back through the ordinary success threshold.
+        let worker = make_worker("http://w:1", 2, 3);
+        worker.set_status(WorkerStatus::NotReady);
+        for _ in 0..40 {
+            assert_eq!(
+                compute_next_status(&worker, ProbeOutcome::Draining, &cfg(2, 3)),
+                None
+            );
+        }
+        assert_eq!(worker.status(), WorkerStatus::NotReady);
+
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Healthy, &cfg(2, 3)),
+            None
+        );
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Healthy, &cfg(2, 3)),
+            Some(WorkerStatus::Ready)
+        );
+    }
+
+    #[test]
+    fn draining_while_pending_neither_promotes_nor_spends_the_pending_cap() {
+        let worker = make_worker("http://w:1", 2, 3);
+        assert_eq!(worker.status(), WorkerStatus::Pending);
+        for _ in 0..40 {
+            assert_eq!(
+                compute_next_status(&worker, ProbeOutcome::Draining, &cfg(2, 3)),
+                None
+            );
+        }
+        assert_eq!(worker.status(), WorkerStatus::Pending);
+    }
+
+    #[test]
     fn test_state_machine_pending_to_ready_after_success_threshold() {
         let worker = make_worker("http://w:1", 2, 3);
         assert_eq!(worker.status(), WorkerStatus::Pending);
 
         // First success: not yet promoted (1 < 2)
-        assert_eq!(compute_next_status(&worker, true, &cfg(2, 3)), None);
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Healthy, &cfg(2, 3)),
+            None
+        );
         assert_eq!(worker.status(), WorkerStatus::Pending);
 
         // Second success: promoted Pending → Ready
-        let next = compute_next_status(&worker, true, &cfg(2, 3));
+        let next = compute_next_status(&worker, ProbeOutcome::Healthy, &cfg(2, 3));
         assert_eq!(next, Some(WorkerStatus::Ready));
     }
 
@@ -1586,13 +1705,19 @@ mod tests {
         worker.set_status(WorkerStatus::Ready);
 
         // 1 fail, 2 fail: still Ready
-        assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
-        assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
+            None
+        );
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
+            None
+        );
         assert_eq!(worker.status(), WorkerStatus::Ready);
 
         // 3rd fail: Ready → NotReady
         assert_eq!(
-            compute_next_status(&worker, false, &cfg(2, 3)),
+            compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
             Some(WorkerStatus::NotReady)
         );
     }
@@ -1605,7 +1730,7 @@ mod tests {
         // liveness_threshold = 3 × failure_threshold = 9
         for i in 1..9 {
             assert_eq!(
-                compute_next_status(&worker, false, &cfg(2, 3)),
+                compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
                 None,
                 "iteration {i}"
             );
@@ -1613,7 +1738,7 @@ mod tests {
 
         // 9th consecutive failure → Failed
         assert_eq!(
-            compute_next_status(&worker, false, &cfg(2, 3)),
+            compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
             Some(WorkerStatus::Failed)
         );
     }
@@ -1627,12 +1752,15 @@ mod tests {
         // loop usually does this before calling compute_next_status.
         for _ in 0..29 {
             worker.total_pending_probes_increment();
-            assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
+            assert_eq!(
+                compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
+                None
+            );
         }
         worker.total_pending_probes_increment();
         // 30th: Pending → Failed
         assert_eq!(
-            compute_next_status(&worker, false, &cfg(2, 3)),
+            compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
             Some(WorkerStatus::Failed)
         );
     }
@@ -1649,7 +1777,7 @@ mod tests {
         }
         // Even on success, the cap fires.
         assert_eq!(
-            compute_next_status(&worker, true, &cfg(2, 3)),
+            compute_next_status(&worker, ProbeOutcome::Healthy, &cfg(2, 3)),
             Some(WorkerStatus::Failed)
         );
     }
@@ -1660,15 +1788,21 @@ mod tests {
         worker.set_status(WorkerStatus::Failed);
 
         // Failures keep it Failed.
-        assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
+            None
+        );
         assert_eq!(worker.status(), WorkerStatus::Failed);
 
         // The engine came back on the same address: success_threshold
         // consecutive successes promote it exactly like NotReady, because a
         // static fleet has no other way to rejoin.
-        assert_eq!(compute_next_status(&worker, true, &cfg(2, 3)), None);
         assert_eq!(
-            compute_next_status(&worker, true, &cfg(2, 3)),
+            compute_next_status(&worker, ProbeOutcome::Healthy, &cfg(2, 3)),
+            None
+        );
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Healthy, &cfg(2, 3)),
             Some(WorkerStatus::Ready)
         );
     }
@@ -1678,9 +1812,12 @@ mod tests {
         let worker = make_worker("http://w:1", 2, 3);
         worker.set_status(WorkerStatus::NotReady);
 
-        assert_eq!(compute_next_status(&worker, true, &cfg(2, 3)), None);
         assert_eq!(
-            compute_next_status(&worker, true, &cfg(2, 3)),
+            compute_next_status(&worker, ProbeOutcome::Healthy, &cfg(2, 3)),
+            None
+        );
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Healthy, &cfg(2, 3)),
             Some(WorkerStatus::Ready)
         );
     }
@@ -1691,20 +1828,35 @@ mod tests {
         worker.set_status(WorkerStatus::Ready);
 
         // 2 failures (not yet at threshold)
-        assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
-        assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
+            None
+        );
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
+            None
+        );
 
         // Single success resets the counter
-        assert_eq!(compute_next_status(&worker, true, &cfg(2, 3)), None);
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Healthy, &cfg(2, 3)),
+            None
+        );
 
         // Now 2 failures again — still no transition because counter was reset
-        assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
-        assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
+            None
+        );
+        assert_eq!(
+            compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
+            None
+        );
         assert_eq!(worker.status(), WorkerStatus::Ready);
 
         // 3rd failure now triggers transition
         assert_eq!(
-            compute_next_status(&worker, false, &cfg(2, 3)),
+            compute_next_status(&worker, ProbeOutcome::Unhealthy, &cfg(2, 3)),
             Some(WorkerStatus::NotReady)
         );
     }
@@ -1858,6 +2010,53 @@ mod tests {
             None,
         );
         manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn draining_probes_do_not_spend_the_pending_cap() {
+        // `apply_probe_completion` owns the pending-probe counter, so this has
+        // to be checked at its level: a worker that drains in Pending for
+        // longer than max_pending_probes (10 * failure_threshold) and then
+        // serves must be promoted, not failed by the cap on its first healthy
+        // probe.
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = make_worker("http://w:1", 2, 3);
+        let worker_id = registry.register(worker.clone()).unwrap();
+        let completion = |probe_result: WorkerResult<()>| ProbeCompletion {
+            worker_id: worker_id.clone(),
+            worker: worker.clone(),
+            expected_revision: worker.revision(),
+            launched_status: WorkerStatus::Pending,
+            health_config: cfg(2, 3),
+            probe_result,
+        };
+
+        for _ in 0..40 {
+            let result = apply_probe_completion(
+                &registry,
+                completion(Err(WorkerError::Draining {
+                    url: worker.url().to_string(),
+                })),
+                None,
+            )
+            .await;
+            assert!(matches!(result, ProbeApplyResult::Applied(None)));
+        }
+        assert_eq!(worker.total_pending_probes(), 0);
+        assert_eq!(worker.status(), WorkerStatus::Pending);
+
+        assert!(matches!(
+            apply_probe_completion(&registry, completion(Ok(())), None).await,
+            ProbeApplyResult::Applied(None)
+        ));
+        assert!(matches!(
+            apply_probe_completion(&registry, completion(Ok(())), None).await,
+            ProbeApplyResult::Applied(Some((WorkerStatus::Pending, WorkerStatus::Ready)))
+        ));
+        assert_eq!(
+            registry.get(&worker_id).unwrap().status(),
+            WorkerStatus::Ready
+        );
     }
 
     #[tokio::test]

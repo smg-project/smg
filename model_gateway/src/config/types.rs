@@ -12,7 +12,7 @@ use super::{validation::ConfigValidator, ConfigResult};
 use crate::{
     routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
-    worker::{ConnectionMode, RuntimeType},
+    worker::{ConnectionMode, RuntimeType, WorkerMode},
 };
 
 /// Main router configuration
@@ -28,6 +28,11 @@ pub struct RouterConfig {
     /// this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_worker_runtime_type: Option<RuntimeType>,
+    /// Service identity for workers supplied through `--worker-urls`.
+    /// `engine` preserves the direct-engine path; `smg` selects the two-tier
+    /// Worker control and inference services.
+    #[serde(default, skip_serializing_if = "WorkerMode::is_engine")]
+    pub startup_worker_mode: WorkerMode,
     /// DP engines per startup ZMQ worker: each `--worker-urls` ZMQ worker
     /// becomes a grouped worker whose handshake awaits this many engines on
     /// one socket set (`dp_size` on the worker spec, no rank). `None`/1 keeps
@@ -1121,6 +1126,7 @@ impl Default for RouterConfig {
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
             startup_worker_runtime_type: None,
+            startup_worker_mode: WorkerMode::Engine,
             zmq_engine_count: None,
             model_path: None,
             tokenizer_path: None,

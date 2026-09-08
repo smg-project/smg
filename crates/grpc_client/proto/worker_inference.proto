@@ -1,0 +1,146 @@
+syntax = "proto3";
+
+package smg.worker.v1;
+
+import "google/protobuf/struct.proto";
+
+// Stable Router-to-Worker data plane. The Worker owns translation from this
+// engine-neutral contract to the colocated engine protocol.
+//
+// Version 1 intentionally covers regular text generation only. Embeddings,
+// multimodal tensors, and disaggregated execution will be added as separate,
+// capability-gated protocol extensions.
+service WorkerInference {
+  rpc Generate(GenerateRequest) returns (stream GenerateResponse);
+  rpc Abort(AbortRequest) returns (AbortResponse);
+}
+
+message GenerateRequest {
+  string request_id = 1;
+  TokenizedInput tokenized = 2;
+  SamplingParams sampling_params = 3;
+
+  bool return_logprob = 4;
+  optional int32 logprob_start_len = 5;
+  int32 top_logprobs_num = 6;
+  repeated uint32 token_ids_logprob = 7;
+  bool stream = 8;
+
+  // Optional attention-DP pin. The Worker decides how to map this to its
+  // engine and rejects it if the advertised engine does not support it.
+  optional int32 data_parallel_rank = 9;
+}
+
+message TokenizedInput {
+  repeated uint32 input_ids = 1;
+  string original_text = 2;
+}
+
+message SamplingParams {
+  optional float temperature = 1;
+  optional float top_p = 2;
+  optional int32 top_k = 3;
+  optional float min_p = 4;
+  optional float frequency_penalty = 5;
+  optional float presence_penalty = 6;
+  optional float repetition_penalty = 7;
+  optional uint32 max_new_tokens = 8;
+  uint32 min_new_tokens = 9;
+  repeated string stop = 10;
+  repeated uint32 stop_token_ids = 11;
+  bool ignore_eos = 12;
+  // Presence-tracked: proto3 cannot tell an omitted bool from an explicit
+  // `false`, and each engine's own default differs from `false`. A Worker
+  // adapter that cannot express an override must reject only a value the
+  // caller actually supplied, not an omission.
+  optional bool skip_special_tokens = 13;
+  optional bool spaces_between_special_tokens = 14;
+  uint32 n = 15;
+  map<string, float> logit_bias = 16;
+
+  oneof constraint {
+    string regex = 17;
+    string json_schema = 18;
+    string ebnf_grammar = 19;
+    string structural_tag = 20;
+  }
+
+  // Compatibility escape hatch. Portable fields must graduate to typed
+  // fields above rather than remaining in this map.
+  google.protobuf.Struct engine_parameters = 21;
+  optional bool no_stop_trim = 22;
+  optional uint64 sampling_seed = 23;
+
+  // Primary end-of-sequence id, resolved by the Router's tokenizer.
+  //
+  // A Worker fronting a tokenizer-less engine cannot derive this when the
+  // deployment names a repo id rather than a local model directory. Without
+  // it the engine stops on the id only because it also rides
+  // `stop_token_ids`, and reports the finish as `matched_stop = <eos id>`
+  // instead of a plain EOS -- so the same model answers differently depending
+  // on whether its weights happen to be on local disk.
+  optional uint32 eos_token_id = 24;
+}
+
+message GenerateResponse {
+  string request_id = 1;
+
+  oneof response {
+    GenerateStreamChunk chunk = 2;
+    GenerateComplete complete = 3;
+  }
+}
+
+// One incremental step of a stream.
+//
+// Chunks are DELTAS: `token_ids` and `output_logprobs` carry only what is new
+// since the previous chunk for the same `index`, and the counts are the
+// run's totals so far. A Worker fronting an engine that streams cumulative
+// output must convert before emitting. The Router keys its accumulation on
+// this contract, so an adapter that passes cumulative output through
+// duplicates logprobs and miscounts tokens.
+message GenerateStreamChunk {
+  repeated uint32 token_ids = 1;
+  uint32 prompt_tokens = 2;
+  uint32 completion_tokens = 3;
+  uint32 cached_tokens = 4;
+  OutputLogProbs output_logprobs = 5;
+  uint32 index = 6;
+}
+
+message GenerateComplete {
+  repeated uint32 output_ids = 1;
+  string finish_reason = 2;
+  uint32 prompt_tokens = 3;
+  uint32 completion_tokens = 4;
+  uint32 cached_tokens = 5;
+  OutputLogProbs output_logprobs = 6;
+
+  oneof matched_stop {
+    uint32 matched_token_id = 7;
+    string matched_stop_str = 8;
+  }
+
+  uint32 index = 9;
+}
+
+message OutputLogProbs {
+  repeated float token_logprobs = 1;
+  repeated uint32 token_ids = 2;
+  repeated TopLogProbs top_logprobs = 3;
+}
+
+message TopLogProbs {
+  repeated float values = 1;
+  repeated uint32 token_ids = 2;
+}
+
+message AbortRequest {
+  string request_id = 1;
+  string reason = 2;
+}
+
+message AbortResponse {
+  bool success = 1;
+  string message = 2;
+}

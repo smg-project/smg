@@ -72,6 +72,10 @@ message SamplingParams {
   bool include_stop_str_in_output = 25;  // Whether to include stop strings in output
   map<int32, float> logit_bias = 26;  // Token ID to bias mapping (-100 to 100)
   optional int32 truncate_prompt_tokens = 27;  // Prompt truncation (-1 for model max)
+  // Caller-supplied primary EOS id, used when the client's own EOS lookup
+  // (model-dir config, adopted tokenizer) found none. Lets a two-tier Worker
+  // carry the Router tokenizer's EOS to a tokenizer-less EngineCore.
+  optional uint32 eos_token_id = 28;
 
   // Structured outputs (one of) - matches vLLM's StructuredOutputsParams
   oneof constraint {

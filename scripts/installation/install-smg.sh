@@ -29,7 +29,22 @@ pip install --no-cache-dir --upgrade pip \
     && pip install maturin --no-cache-dir --force-reinstall
 
 cd "${SMG_SRC}/bindings/python"
-ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist
+
+# A command-line `--features` replaces `[tool.maturin] features` rather than
+# adding to it, so `extension-module` has to be named here or the wheel's .so
+# links libpython and fails to load wherever that exact libpython is absent.
+#
+# It is resolved against the tree rather than hardcoded because this script is
+# always the one from the build context while ${SMG_SRC} is whatever
+# ${SMG_COMMIT} points at -- a revision from before the feature existed would
+# otherwise fail with "none of the selected packages contains this feature".
+# There `extension-module` is a default feature, so omitting it is correct.
+MATURIN_FEATURES="vendored-openssl"
+if grep -qE '^[[:space:]]*extension-module[[:space:]]*=' Cargo.toml; then
+    MATURIN_FEATURES="extension-module,${MATURIN_FEATURES}"
+fi
+echo "Building smg wheel with --features ${MATURIN_FEATURES}"
+ulimit -n 65536 && maturin build --release --features "${MATURIN_FEATURES}" --out dist
 pip install --force-reinstall dist/*.whl
 
 # Install smg-grpc-proto and smg-grpc-servicer from source so the image stays

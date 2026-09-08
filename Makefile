@@ -37,9 +37,15 @@ build: ## Build the project in release mode
 	@echo "Building Shepherd Model Gateway..."
 	@cargo build --release
 
+# bindings/python is a workspace member, so `cargo test` builds a test binary
+# that must link libpython (the maturin cdylib deliberately does not). See
+# scripts/expose_libpython.sh.
 test: ## Run all tests
 	@echo "Running tests..."
-	@cargo test
+	@libdir=$$(bash scripts/expose_libpython.sh) \
+		&& RUSTFLAGS="$${RUSTFLAGS:-} -L $$libdir" \
+		   LD_LIBRARY_PATH="$$libdir$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
+		   cargo test
 
 clean: ## Clean build artifacts
 	@echo "Cleaning build artifacts..."
@@ -106,7 +112,7 @@ python-dev: ## Build Python bindings in development mode (fast, debug build)
 
 python-build: ## Build Python wheel (release mode with vendored OpenSSL)
 	@echo "Building Python wheel (release, vendored OpenSSL, using $(JOBS) parallel jobs with sccache)..."
-	@cd $(PYTHON_DIR) && CARGO_BUILD_JOBS=$(JOBS) maturin build --release --out dist --features vendored-openssl
+	@cd $(PYTHON_DIR) && CARGO_BUILD_JOBS=$(JOBS) maturin build --release --out dist --features extension-module,vendored-openssl
 
 python-build-release: python-build ## Alias for python-build
 
@@ -131,7 +137,7 @@ python-test: ## Run Python tests
 
 python-check: ## Check Python package with twine
 	@echo "Checking Python package..."
-	@cd $(PYTHON_DIR) && CARGO_BUILD_JOBS=$(JOBS) maturin build --release --out dist --features vendored-openssl
+	@cd $(PYTHON_DIR) && CARGO_BUILD_JOBS=$(JOBS) maturin build --release --out dist --features extension-module,vendored-openssl
 	@pip install twine 2>/dev/null || true
 	@twine check $(PYTHON_DIR)/dist/*
 	@echo "Python package check passed!"

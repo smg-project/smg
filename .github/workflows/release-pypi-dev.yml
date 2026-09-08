@@ -127,7 +127,7 @@ jobs:
           manylinux: auto
           # PR runs build a single interpreter (3.12) to keep dry-run fast
           # (~6 min vs ~25 min); workflow_dispatch builds the full matrix.
-          args: --release --out dist --features vendored-openssl --interpreter ${{ github.event_name == 'pull_request' && '3.12' || '3.10 3.11 3.12 3.13' }}
+          args: --release --out dist --features extension-module,vendored-openssl --interpreter ${{ github.event_name == 'pull_request' && '3.12' || '3.10 3.11 3.12 3.13' }}
           rust-toolchain: 1.98.0
           before-script-linux: |
             if command -v yum &> /dev/null; then
