@@ -175,6 +175,16 @@ def _wait_for_status(gateway: Gateway, url: str, wanted: str, timeout: float) ->
     pytest.fail(f"worker {url} never became {wanted} within {timeout:.0f}s (last: {seen})")
 
 
+def _wait_for_removal(gateway: Gateway, url: str, timeout: float) -> None:
+    """A removal drains in-flight work first; the worker leaves /workers after that."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _status_of(gateway, url) is None:
+            return
+        time.sleep(0.5)
+    pytest.fail(f"worker {url} still listed {timeout:.0f}s after its removal was accepted")
+
+
 def _answer_text(message: dict) -> str:
     """Content plus any reasoning text: thinking models may answer in either."""
     content = message.get("content") or ""
@@ -721,6 +731,9 @@ class TestPDAssembledAtRuntime:
                 f"with no decode worker the gateway answered {resp.status_code} after {elapsed:.1f}s"
             )
 
+            # Re-adding the same URL while the removal is still draining is
+            # refused as a duplicate, so wait for the worker to actually leave.
+            _wait_for_removal(gateway, decode[0].base_url, timeout=60.0)
             ok, detail = gateway.add_worker(decode[0].base_url, worker_type="decode")
             assert ok, f"re-registering the decode worker failed: {detail}"
             _wait_until_served(gateway, model_path, timeout=120.0)

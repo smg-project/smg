@@ -28,7 +28,14 @@ from .constants import (
     vllm_kv_backend,
 )
 from .model_specs import get_model_spec
-from .process_utils import detect_ib_device, get_open_port, wait_for_health
+from .process_utils import (
+    detect_ib_device,
+    get_open_port,
+    gpu_memory_used_mib,
+    wait_for_gpu_memory_release,
+    wait_for_health,
+    wait_for_process_group_exit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +59,8 @@ class Worker:
     extra_engine_args: list[str] | None = None
     process: subprocess.Popen | None = field(default=None, repr=False)
     _log_file: IO[Any] | None = field(default=None, repr=False)
+    # Used memory per GPU just before launch; ``stop`` waits for it to come back.
+    _gpu_mem_baseline: dict[int, int] | None = field(default=None, repr=False)
 
     @property
     def base_url(self) -> str:
@@ -102,6 +111,7 @@ class Worker:
         )
         logger.debug("Command: %s", " ".join(cmd))
 
+        self._gpu_mem_baseline = gpu_memory_used_mib(self.gpu_ids)
         self.process = self._spawn_process(cmd, env)
 
         if not wait_ready:
@@ -158,18 +168,28 @@ class Worker:
         pid = self.process.pid
         logger.info("Stopping worker %s (PID %d)", self.model_id, pid)
 
-        # Kill entire process group (workers run in their own session)
+        # Workers run in their own session, so the launcher and every engine
+        # child process share one group.
+        pgid: int | None
         try:
             pgid = os.getpgid(pid)
-            os.killpg(pgid, signal.SIGTERM)
         except (ProcessLookupError, OSError):
+            pgid = None
+
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                self.process.terminate()
+        else:
             self.process.terminate()
 
         try:
             self.process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             try:
-                pgid = os.getpgid(pid)
+                if pgid is None:
+                    raise ProcessLookupError
                 os.killpg(pgid, signal.SIGKILL)
             except (ProcessLookupError, OSError):
                 self.process.kill()
@@ -177,6 +197,25 @@ class Worker:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 logger.error("Worker PID %d did not die after SIGKILL", pid)
+
+        # ``process.wait`` only reaps the launcher. The engine's children
+        # (vLLM's EngineCore, SGLang's scheduler) outlive it while they tear
+        # down their CUDA contexts, and a replacement started on the same GPUs
+        # inside that window fails its startup memory check against the old
+        # allocation. Wait for the group to empty, then for the memory.
+        if pgid is not None:
+            stragglers = wait_for_process_group_exit(pgid, timeout=40.0, kill_after=20.0)
+            if stragglers:
+                logger.error("Worker %s: PIDs %s survived SIGKILL", self.model_id, stragglers)
+        if self._gpu_mem_baseline is not None:
+            held = wait_for_gpu_memory_release(self.gpu_ids, self._gpu_mem_baseline, timeout=60.0)
+            if held:
+                logger.warning(
+                    "Worker %s: GPU memory still held 60s after stop: used %s MiB, baseline %s MiB",
+                    self.model_id,
+                    held,
+                    self._gpu_mem_baseline,
+                )
 
         # Clean up log file
         if self._log_file is not None:
