@@ -35,7 +35,9 @@ import re
 import tempfile
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 import httpx
@@ -43,7 +45,7 @@ import pytest
 from infra import ConnectionMode, Gateway, WorkerType, cleanup_pool, start_workers, stop_workers
 from infra.constants import get_runtime
 from infra.model_specs import get_model_spec
-from infra.pd_logs import LOG_FLUSH_TIMEOUT_S, read_logs
+from infra.pd_logs import LOG_FLUSH_TIMEOUT_S, read_logs, worker_log_dir
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +79,27 @@ _GATEWAY_ARGS = [
 _TOPOLOGIES = [
     pytest.param(("pd_grpc", (p, d)), id=f"{p}p{d}d")
     for p, d in [(1, 1), (1, 2), (2, 1), (1, 3), (3, 1), (2, 2)]
+] + [
+    # The HTTP PD router is its own code path (pairing, KV handoff, error
+    # answers); SGLang is the only engine that serves it.
+    pytest.param(
+        ("pd_http", (p, d)),
+        id=f"{p}p{d}d-http",
+        marks=pytest.mark.skip_for_runtime("vllm", "tokenspeed", reason="HTTP PD is SGLang-only"),
+    )
+    for p, d in [(1, 1), (2, 2)]
 ]
+# A decode window a modest burst overruns. The gateway's admission gate, bounded
+# by the window the engine reports, is what keeps the excess out of the engine,
+# where the prefill's bootstrap deadline would expire on merely queued requests.
+_WINDOW = 4
+_WINDOW_ARGS = {
+    "sglang": ["--max-running-requests", str(_WINDOW)],
+    "vllm": ["--max-num-seqs", str(_WINDOW)],
+    "tokenspeed": ["--max-num-seqs", str(_WINDOW)],
+}.get(get_runtime(), [])
+# What an SGLang-lineage prefill logs when it gave up waiting for the decode.
+_BOOTSTRAP_TIMEOUT_MARKERS = ("timed out when bootstrapping",)
 _WORDS = [
     "apricot",
     "bramble",
@@ -216,6 +238,21 @@ def _fleet_idle(gateway: Gateway) -> tuple[bool, list[dict]]:
     loads = resp.json().get("loads", [])
     busy = [e for e in loads if e.get("num_running_reqs", 0) + e.get("num_waiting_reqs", 0) > 0]
     return (not busy, loads)
+
+
+def _require_load_reports(backend: str) -> None:
+    """The idle check reads /loads; HTTP SGLang workers report none without metrics."""
+    if backend == "pd_http":
+        pytest.skip("load reports need gRPC workers")
+
+
+def _assert_fleet_idle_within(gateway: Gateway, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    idle, loads = _fleet_idle(gateway)
+    while not idle and time.monotonic() < deadline:
+        time.sleep(1.0)
+        idle, loads = _fleet_idle(gateway)
+    assert idle, f"engines still hold work after {timeout:.0f}s: {loads}"
 
 
 def _run_all(fns: list[Callable[[], None]], timeout: float) -> list[BaseException]:
@@ -383,7 +420,8 @@ class TestPDTopology:
         assert usage is not None and usage.completion_tokens > 0, f"no usage on the stream: {usage}"
 
     def test_abandoned_streams_free_both_legs(self, setup_backend):
-        _, model, client, gateway = setup_backend
+        backend, model, client, gateway = setup_backend
+        _require_load_reports(backend)
         body = {
             "model": model,
             "messages": [{"role": "user", "content": "Write a very long story about the sea."}],
@@ -405,13 +443,57 @@ class TestPDTopology:
         errors = _run_all([_abandon for _ in range(4)], timeout=90)
         assert not errors, f"streams failed before they could be abandoned: {errors[:2]}"
 
-        deadline = time.monotonic() + 30.0
-        idle, loads = _fleet_idle(gateway)
-        while not idle and time.monotonic() < deadline:
-            time.sleep(1.0)
-            idle, loads = _fleet_idle(gateway)
-        assert idle, f"abandoned streams still occupy the engines after 30s: {loads}"
+        _assert_fleet_idle_within(gateway, 30.0)
         _wait_until_served(gateway, model, timeout=60.0)
+
+    def test_aborts_during_prefill_free_both_legs(self, setup_backend):
+        """Clients that give up before the first token leave no room behind."""
+        backend, model, _, gateway = setup_backend
+        _require_load_reports(backend)
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": _long_prompt("22222")}],
+            "max_tokens": 64,
+            "temperature": 0,
+            "stream": True,
+        }
+
+        def _give_up_early() -> None:
+            try:
+                httpx.post(
+                    f"{gateway.base_url}/v1/chat/completions",
+                    json=body,
+                    timeout=httpx.Timeout(10.0, read=0.3),
+                )
+            except httpx.ReadTimeout:
+                return  # dropped while the prompt was still being prefilled
+            # An answer inside the read window is not a failure of this test.
+
+        errors = _run_all([_give_up_early for _ in range(8)], timeout=60)
+        assert not errors, f"requests failed before they could be abandoned: {errors[:2]}"
+        _assert_fleet_idle_within(gateway, 30.0)
+        _wait_until_served(gateway, model, timeout=60.0)
+
+    def test_batched_completion_serves_every_choice(self, setup_backend):
+        """``n`` choices fan out one bootstrap room each; every choice must come back."""
+        _, model, _, gateway = setup_backend
+
+        resp = httpx.post(
+            f"{gateway.base_url}/v1/completions",
+            json={
+                "model": model,
+                "prompt": "The three primary colors are",
+                "n": 4,
+                "max_tokens": 16,
+                "temperature": 0.8,
+            },
+            timeout=120.0,
+        )
+
+        assert resp.status_code == 200, f"{resp.status_code} {resp.text[:300]}"
+        choices = resp.json().get("choices", [])
+        assert len(choices) == 4, f"expected 4 choices, got {len(choices)}"
+        assert all(c.get("text", "").strip() for c in choices), f"empty choice in {choices}"
 
     # -- failure -----------------------------------------------------------
 
@@ -471,17 +553,98 @@ class TestPDTopology:
             "sole %s down: status=%s code=%s after %.1fs", role, resp.status_code, code, elapsed
         )
         assert elapsed < 20.0, f"request hung for {elapsed:.1f}s while the only {role} was down"
-        # The gRPC path answers 404 model_not_found for an unavailable leg today;
-        # the HTTP router answers 503 no_available_workers. Either is prompt and
-        # carries a code; a follow-up aligns the gRPC path with the 503.
-        assert resp.status_code in (404, 503), (
+        # The model exists and its leg is merely down: a 503 the client can
+        # retry, never a 404 that says the model is gone (#2465). The HTTP PD
+        # router names the leg in its code.
+        assert resp.status_code == 503, (
             f"unexpected outage answer: {resp.status_code} {resp.text[:200]}"
         )
-        assert code, f"outage answer carried no error code: {resp.text[:200]}"
+        assert code in ("no_available_workers", f"no_{role}_servers", f"{role}_unavailable"), (
+            f"outage answer carried an unexpected code: {code!r} {resp.text[:200]}"
+        )
 
         victim.start()
         _wait_for_status(gateway, victim.base_url, "healthy", timeout=300.0)
         _wait_until_served(gateway, model, timeout=120.0)
+
+
+# ---------------------------------------------------------------------------
+# a decode window smaller than the burst
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.engine("sglang", "vllm", "tokenspeed")
+@pytest.mark.gpu(4)
+@pytest.mark.e2e
+@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"])
+@pytest.mark.workers(parallel_start=True, extra_engine_args=_WINDOW_ARGS)
+@pytest.mark.gateway(
+    log_level="debug",
+    log_dir=str(_LOG_DIR),
+    extra_args=[*_GATEWAY_ARGS, "--pd-admission-wait-secs", "2"],
+)
+@pytest.mark.parametrize(
+    "setup_backend", [pytest.param(("pd_grpc", (1, 1)), id="1p1d-window4")], indirect=True
+)
+class TestPDSmallWindow:
+    """A burst wider than the decode window is held or shed at the gateway.
+
+    Without the admission gate the excess reached the engine, where the
+    prefill's bootstrap deadline expired on requests that were merely queued
+    behind the decode's admission, and every such room then held a decode slot
+    for the whole transfer timeout (run 34173426995: 14 of 64 requests lost,
+    1392 s for an eval that takes 35 s).
+    """
+
+    def test_burst_beyond_decode_window_is_shed_not_stalled(self, setup_backend):
+        _, model, _, gateway = setup_backend
+        _wait_until_served(gateway, model, timeout=60.0)
+        results: list[httpx.Response] = []
+
+        def _one(i: int) -> None:
+            results.append(
+                httpx.post(
+                    f"{gateway.base_url}/v1/chat/completions",
+                    json={
+                        "model": model,
+                        "messages": [
+                            {"role": "user", "content": f"Write {i} sentences about the sea."}
+                        ],
+                        "max_tokens": 96,
+                        "temperature": 0,
+                        "ignore_eos": True,
+                    },
+                    timeout=120.0,
+                )
+            )
+
+        started = time.monotonic()
+        errors = _run_all([partial(_one, i) for i in range(6 * _WINDOW)], timeout=180)
+        elapsed = time.monotonic() - started
+
+        assert not errors, f"requests failed at the transport: {errors[:2]}"
+        statuses = Counter(r.status_code for r in results)
+        logger.info(
+            "burst of %d against a window of %d: %s in %.1fs",
+            6 * _WINDOW,
+            _WINDOW,
+            dict(statuses),
+            elapsed,
+        )
+        assert set(statuses) <= {200, 503}, (
+            f"a burst must be served or shed, never errored: {dict(statuses)}"
+        )
+        assert statuses[200] >= _WINDOW, f"too few requests served: {dict(statuses)}"
+        for resp in results:
+            if resp.status_code == 503:
+                assert _error_code(resp) == "worker_overload_protection_shed", resp.text[:200]
+                assert resp.headers.get("retry-after"), "a shed must say when to retry"
+        assert elapsed < 90.0, f"the burst took {elapsed:.0f}s; queued rooms are timing out"
+
+        logs = read_logs(worker_log_dir(_LOG_DIR), "worker-*.log")
+        for marker in _BOOTSTRAP_TIMEOUT_MARKERS:
+            assert marker not in logs, f"an engine leg timed out a bootstrap: {marker!r}"
+        _wait_until_served(gateway, model, timeout=60.0)
 
 
 # ---------------------------------------------------------------------------

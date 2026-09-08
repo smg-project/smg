@@ -1044,9 +1044,9 @@ jobs:
       timeout: ${{ matrix.timeout }}
       test_timeout: ${{ matrix.test_timeout }}
       test_dirs: e2e_test/router/test_pd_topologies.py
-      test_filter: -k "2p2d or AssembledAtRuntime"
+      test_filter: -k "(2p2d and not http) or AssembledAtRuntime or SmallWindow"
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
-      min_selected: 10 # floor ≈ 95% of the 11 cases the -k filter keeps
+      min_selected: 13 # floor ≈ 95% of the 14 cases the -k filter keeps
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 

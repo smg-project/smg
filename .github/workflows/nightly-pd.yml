@@ -29,16 +29,20 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      engines: ${{ steps.plan.outputs.engines }}
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - id: plan
         env:
           ENGINES: ${{ inputs.engines }}
         run: |
           wanted="${ENGINES:-sglang vllm tokenspeed}"
-          json=$(printf '%s\n' $wanted | jq -R . | jq -sc .)
-          echo "engines=$json" >> "$GITHUB_OUTPUT"
-          echo "engines: $json"
+          # One row per engine; vLLM also runs over Mooncake next to its NIXL default.
+          matrix=$(printf '%s\n' $wanted | jq -Rsc '
+            split("\n") | map(select(length > 0)) |
+            map(if . == "vllm" then [{engine: "vllm"}, {engine: "vllm", kv_backend: "mooncake"}]
+                else [{engine: .}] end) | add')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "matrix: $matrix"
 
   build-wheel:
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
@@ -131,12 +135,12 @@ jobs:
           echo "TokenSpeed image: ${image:-none (source build)}"
 
   pd-topologies:
-    name: pd-topologies (${{ matrix.engine }})
+    name: pd-topologies (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
     needs: [plan, build-wheel, tokenspeed-image]
     strategy:
       fail-fast: false
       matrix:
-        engine: ${{ fromJSON(needs.plan.outputs.engines) }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -144,9 +148,10 @@ jobs:
       runner: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
       # Six topologies, each with worker restarts; TokenSpeed also extracts
       # its engine image and loads a slower model.
-      timeout: ${{ matrix.engine == 'tokenspeed' && 170 || 130 }}
-      test_timeout: ${{ matrix.engine == 'tokenspeed' && 150 || 115 }}
+      timeout: ${{ matrix.engine == 'tokenspeed' && 190 || 170 }}
+      test_timeout: ${{ matrix.engine == 'tokenspeed' && 170 || 150 }}
       test_dirs: e2e_test/router/test_pd_topologies.py
+      vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
       test_filter: ${{ inputs.filter != '' && format('-k "{0}"', inputs.filter) || '' }}
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
       min_selected: 0
