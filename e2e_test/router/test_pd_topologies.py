@@ -422,7 +422,15 @@ class TestPDTopology:
             if chunk.usage:
                 usage = chunk.usage
             for choice in chunk.choices:
-                text += choice.delta.content or ""
+                # Thinking models may spend the whole budget in the reasoning
+                # channel; either channel proves the decode leg streamed.
+                delta = choice.delta
+                text += delta.content or ""
+                text += (
+                    getattr(delta, "reasoning_content", None)
+                    or getattr(delta, "reasoning", None)
+                    or ""
+                )
                 finish = choice.finish_reason or finish
 
         assert text.strip(), "stream carried no content"
