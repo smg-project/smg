@@ -258,7 +258,6 @@ pub(crate) fn handle_json_tool_streaming(
     current_text: &str,
     start_idx: usize,
     partial_json: &mut crate::partial_json::PartialJson,
-    tool_indices: &HashMap<String, usize>,
     buffer: &mut String,
     current_tool_id: &mut i32,
     current_tool_name_sent: &mut bool,
@@ -270,8 +269,8 @@ pub(crate) fn handle_json_tool_streaming(
     // Where the next JSON value starts in `current_text`.
     let mut cursor = start_idx;
 
-    // Each iteration parses one JSON value. A value that can never become a
-    // declared tool call is emitted as content and the loop advances past it,
+    // Each iteration parses one JSON value. A complete value with no `name`
+    // is emitted as content and the loop advances past it,
     // so a declared call trailing a non-tool value in the same chunk still
     // becomes tool-call deltas. Looping rather than recursing keeps stack
     // depth constant however many values a single chunk carries.
@@ -320,34 +319,17 @@ pub(crate) fn handle_json_tool_streaming(
         // This must happen before validation since different LLMs use different field names
         let current_tool_call = normalize_tool_call_fields(obj);
 
-        // A value that can never become a declared tool call is content: a
-        // complete value with no `name`, or a `name` (complete by construction,
-        // since partial strings are disallowed until the name is sent) that is
-        // not among the declared tools. Dropping it here is what left streams
-        // with neither content nor tool-call deltas, while the non-streaming
-        // path returned the same text as content.
+        // A complete value with no `name` is not a tool call at all, so it is
+        // content. Dropping it here is what left streams with neither content
+        // nor tool-call deltas while the non-streaming path returned the same
+        // text as content. A value that *has* a name is forwarded whether or
+        // not the name was declared - the client decides what to do with a
+        // name it did not ask for, and both paths agree on that.
         let consumed = match current_tool_call.get("name").and_then(|v| v.as_str()) {
-            Some(name) if !tool_indices.contains_key(name) => {
-                tracing::debug!(
-                    "Undeclared tool name '{}' - emitting buffered text as content",
-                    name
-                );
-                reset_current_tool_state(
-                    buffer,
-                    current_tool_name_sent,
-                    streamed_args_for_tool,
-                    prev_tool_call_arr,
-                );
-                if is_complete {
-                    cursor + safe_end_idx
-                } else {
-                    current_text.len()
-                }
-            }
             None if is_complete => cursor + safe_end_idx,
             _ => {
-                // A declared tool call: hand it to the streaming cases below,
-                // leaving the buffer holding everything from this value on.
+                // A tool call: hand it to the streaming cases below, leaving
+                // the buffer holding everything from this value on.
                 if cursor > start_idx {
                     *buffer = current_text[cursor..].to_string();
                 }
@@ -393,24 +375,22 @@ pub(crate) fn handle_json_tool_streaming(
     // Case 1: Handle tool name streaming
     if !*current_tool_name_sent {
         if let Some(function_name) = current_tool_call.get("name").and_then(|v| v.as_str()) {
-            if tool_indices.contains_key(function_name) {
-                // Initialize if first tool
-                if *current_tool_id == -1 {
-                    *current_tool_id = 0;
-                    streamed_args_for_tool.push(String::new());
-                } else if *current_tool_id as usize >= streamed_args_for_tool.len() {
-                    // Ensure capacity for subsequent tools
-                    ensure_capacity(*current_tool_id, prev_tool_call_arr, streamed_args_for_tool);
-                }
-
-                // Send tool name with empty parameters
-                *current_tool_name_sent = true;
-                result.calls.push(ToolCallItem {
-                    tool_index: *current_tool_id as usize,
-                    name: Some(function_name.to_string()),
-                    parameters: String::new(),
-                });
+            // Initialize if first tool
+            if *current_tool_id == -1 {
+                *current_tool_id = 0;
+                streamed_args_for_tool.push(String::new());
+            } else if *current_tool_id as usize >= streamed_args_for_tool.len() {
+                // Ensure capacity for subsequent tools
+                ensure_capacity(*current_tool_id, prev_tool_call_arr, streamed_args_for_tool);
             }
+
+            // Send tool name with empty parameters
+            *current_tool_name_sent = true;
+            result.calls.push(ToolCallItem {
+                tool_index: *current_tool_id as usize,
+                name: Some(function_name.to_string()),
+                parameters: String::new(),
+            });
         }
     }
 
@@ -424,6 +404,21 @@ pub(crate) fn handle_json_tool_streaming(
     // `current_tool_name_sent` implies `current_tool_id >= 0`.
     if *current_tool_name_sent {
         let Some(cur_arguments) = current_tool_call.get("arguments") else {
+            // A call carrying no `arguments` at all - `{"name": "x"}` - has
+            // nothing to stream, but it still has to complete: without the
+            // transition below the buffer keeps the value, the next chunk
+            // reparses it, and every following token is swallowed instead of
+            // reaching the client as content.
+            if is_complete {
+                ensure_capacity(*current_tool_id, prev_tool_call_arr, streamed_args_for_tool);
+                let tool_id = *current_tool_id as usize;
+                if tool_id < prev_tool_call_arr.len() {
+                    prev_tool_call_arr[tool_id] = current_tool_call;
+                }
+                *buffer = current_text[cursor + end_idx..].to_string();
+                *current_tool_name_sent = false;
+                *current_tool_id += 1;
+            }
             return Ok(result);
         };
         let tool_id = *current_tool_id as usize;

@@ -243,7 +243,9 @@ impl ToolParser for MistralParser {
     async fn parse_incremental(
         &mut self,
         chunk: &str,
-        tools: &[Tool],
+        // Unused: forwarding means the parser no longer consults the
+        // declared set - whatever the model emitted is passed through.
+        _tools: &[Tool],
     ) -> ParserResult<StreamingParseResult> {
         // Append new text to buffer
         self.buffer.push_str(chunk);
@@ -282,9 +284,6 @@ impl ToolParser for MistralParser {
             }
         }
 
-        // Build tool indices
-        let tool_indices = helpers::get_tool_indices(tools);
-
         // Determine start index for JSON parsing
         let start_idx = if let Some(pos) = current_text.find(self.bot_token) {
             pos + self.bot_token.len()
@@ -298,7 +297,6 @@ impl ToolParser for MistralParser {
             current_text,
             start_idx,
             &mut self.partial_json,
-            &tool_indices,
             &mut self.buffer,
             &mut self.current_tool_id,
             &mut self.current_tool_name_sent,

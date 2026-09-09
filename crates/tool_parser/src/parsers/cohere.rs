@@ -242,7 +242,9 @@ impl ToolParser for CohereParser {
     async fn parse_incremental(
         &mut self,
         chunk: &str,
-        tools: &[Tool],
+        // Unused: forwarding means the parser no longer consults the
+        // declared set - whatever the model emitted is passed through.
+        _tools: &[Tool],
     ) -> ParserResult<StreamingParseResult> {
         self.buffer.push_str(chunk);
 
@@ -285,9 +287,6 @@ impl ToolParser for CohereParser {
                     // We have complete JSON - extract it before modifying buffer
                     let json_content = self.buffer[..pos].to_string();
 
-                    // Build tool indices
-                    let tool_indices = helpers::get_tool_indices(tools);
-
                     // Create a temporary buffer for the helper (it expects to manage buffer state)
                     let mut temp_buffer = String::new();
 
@@ -296,7 +295,6 @@ impl ToolParser for CohereParser {
                         &json_content,
                         0,
                         &mut self.partial_json,
-                        &tool_indices,
                         &mut temp_buffer,
                         &mut self.current_tool_id,
                         &mut self.current_tool_name_sent,

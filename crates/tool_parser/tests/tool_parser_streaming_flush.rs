@@ -39,11 +39,6 @@ use tool_parser::{
 const NON_TOOL_JSON: &str =
     r#"{"type": "function", "function": "get_weather", "parameters": {"city": "Tokyo"}}"#;
 
-/// Valid, complete JSON in llama tool shape, but the name is not among the
-/// declared tools.
-const UNDECLARED_TOOL_JSON: &str =
-    r#"{"name": "get_stock_price", "parameters": {"ticker": "AAPL"}}"#;
-
 type MakeParser = fn() -> Box<dyn ToolParser>;
 
 fn llama() -> Box<dyn ToolParser> {
@@ -150,13 +145,18 @@ async fn streaming_never_swallows_content() {
             ..BLANK
         },
         Case {
-            label: "llama: undeclared name split across chunk boundaries",
+            // An undeclared name is forwarded as the call the model made,
+            // identically to the non-streaming path - the client decides what
+            // to do with a name it did not declare, rather than the gateway
+            // rewriting it as text on one path and not the other.
+            label: "llama: undeclared name split across chunks is forwarded",
             feed: Feed::Chunks(&[
                 r#"{"name": "get_st"#,
                 r#"ock_price", "para"#,
                 r#"meters": {"ticker": "AAPL"}}"#,
             ]),
-            text: UNDECLARED_TOOL_JSON,
+            call: Some("get_stock_price"),
+            args_contain: Some(r#"{"ticker":"AAPL"}"#),
             ..BLANK
         },
         Case {
@@ -167,9 +167,10 @@ async fn streaming_never_swallows_content() {
             ..BLANK
         },
         Case {
-            // Content-preserving, markers included: everything the model
-            // emitted reaches the client, as the non-streaming path does too.
-            label: "mistral: undeclared name inside [TOOL_CALLS] array",
+            // [TOOL_CALLS] is an explicit statement of intent, so an
+            // undeclared name is forwarded as the call the model meant to
+            // make rather than rewritten as text.
+            label: "mistral: undeclared name behind an explicit marker is forwarded",
             make: mistral,
             feed: Feed::Chunks(&[
                 "[TOOL_CALLS] ",
@@ -177,7 +178,8 @@ async fn streaming_never_swallows_content() {
                 r#"cate", "arguments"#,
                 r#"": {"x": 1}}]"#,
             ]),
-            text: r#"[TOOL_CALLS] [{"name": "frobnicate", "arguments": {"x": 1}}]"#,
+            call: Some("frobnicate"),
+            args_contain: Some(r#"{"x":1}"#),
             ..BLANK
         },
         Case {
@@ -225,14 +227,15 @@ async fn streaming_never_swallows_content() {
             ..BLANK
         },
         Case {
-            label: "mistral: declared call after an undeclared one streams its args",
+            label: "mistral: an undeclared call no longer strands the declared one behind it",
             make: mistral,
             feed: Feed::Chunks(&[
                 r#"[TOOL_CALLS] [{"name": "bogus", "arguments": {}}, {"name": "get_weather", "arguments": {"city": "Paris"}}"#,
                 "]",
             ]),
-            text: r#"[TOOL_CALLS] [{"name": "bogus", "arguments": {}}, "#,
-            call: Some("get_weather"),
+            // Both are forwarded now, in order, so the first announced name
+            // is the undeclared one and the declared call keeps its args.
+            call: Some("bogus"),
             args_contain: Some(r#"{"city":"Paris"}"#),
             ..BLANK
         },
@@ -248,15 +251,14 @@ async fn streaming_never_swallows_content() {
             ..BLANK
         },
         Case {
-            // The helper bails out on the undeclared, still-incomplete value
-            // and emits the whole chunk, so `normal_text_buffer` holds back
-            // the trailing partial `</tool_call>`. With no tool call ever
-            // announced that suffix is real text, not marker debris.
-            label: "qwen: partial </tool_call> held in normal_text_buffer",
+            // A value with no `name` is content on any path, and the
+            // trailing partial `</tool_call>` is held back until end of
+            // stream, where it is real text rather than marker debris.
+            label: "qwen: no-name value in markers, with a partial end token",
             make: qwen,
             feed: Feed::Chunks(&[r#"<tool_call>
-{"name": "bogus"</tool"#]),
-            text: "<tool_call>\n{\"name\": \"bogus\"",
+{"foo": 1}</tool"#]),
+            text: "<tool_call>\n{\"foo\": 1}",
             flush: "</tool",
             ..BLANK
         },
@@ -326,14 +328,19 @@ async fn streaming_never_swallows_content() {
             ..BLANK
         },
         Case {
-            label: "json: adjacent undeclared call then a declared call",
+            // Neither call is filtered, so both reach the client in order -
+            // the undeclared one first, then the declared one on the chunk
+            // after it, each with its own arguments.
+            label: "json: adjacent calls are both forwarded, in order",
             make: json,
-            feed: Feed::Chunks(&[concat!(
-                r#"{"name": "bogus_tool", "arguments": {}}"#,
-                r#"{"name": "get_weather", "arguments": {"city": "Paris"}}"#
-            )]),
-            text: r#"{"name": "bogus_tool", "arguments": {}}"#,
-            call: Some("get_weather"),
+            feed: Feed::Chunks(&[
+                concat!(
+                    r#"{"name": "bogus_tool", "arguments": {}}"#,
+                    r#"{"name": "get_weather", "arguments": {"city": "Paris"}}"#
+                ),
+                "",
+            ]),
+            call: Some("bogus_tool"),
             args_contain: Some(r#"{"city":"Paris"}"#),
             ..BLANK
         },
@@ -410,24 +417,47 @@ async fn reset_clears_the_streaming_buffers() {
         "reset must clear the streaming buffer"
     );
 
-    // Qwen additionally parks a partial `</tool_call>` in `normal_text_buffer`,
-    // which reset() must clear too or it bleeds into the next request.
+    // Qwen holds an unterminated tail in `buffer`, which reset() must clear or
+    // it bleeds into the next request. A value with no `name` is content on
+    // any path, so this does not depend on the declared-name policy.
     let held = r#"<tool_call>
-{"name": "bogus"</tool"#;
+{"foo": 1"#;
     let mut qwen = QwenParser::new();
     qwen.parse_incremental(held, &tools).await.unwrap();
     let mut drained = QwenParser::new();
     drained.parse_incremental(held, &tools).await.unwrap();
     assert_eq!(
         drained.take_unstreamed_normal_text(),
-        "</tool",
-        "precondition: normal_text_buffer is holding the partial end token"
+        held,
+        "precondition: the unterminated tail is buffered"
     );
 
     qwen.reset();
     assert_eq!(
         qwen.take_unstreamed_normal_text(),
         "",
-        "reset must clear normal_text_buffer, not just the main buffer"
+        "reset must clear the buffered tail"
     );
+}
+
+#[tokio::test]
+async fn a_call_without_arguments_does_not_swallow_what_follows() {
+    // `{"name": "x"}` carries nothing to stream, but it still has to complete.
+    // Without the completion transition the buffer keeps the value, the next
+    // chunk reparses it, and everything after it is swallowed - the same
+    // content loss this suite exists to prevent, reached by a different route.
+    let tools = create_test_tools();
+    for name in ["get_time", "bogus_tool"] {
+        let mut parser = LlamaParser::new();
+        let mut text = String::new();
+        for chunk in [format!(r#"{{"name": "{name}"}}"#), ". Done.".to_string()] {
+            let result = parser.parse_incremental(&chunk, &tools).await.unwrap();
+            text.push_str(&result.normal_text);
+        }
+        text.push_str(&parser.take_unstreamed_normal_text());
+        assert_eq!(
+            text, ". Done.",
+            "[{name}] content after an argument-less call must reach the client"
+        );
+    }
 }
