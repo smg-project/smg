@@ -535,6 +535,13 @@ class Worker:
             else:
                 self.nixl_port = get_open_port()
                 env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(self.nixl_port)
+                # Single-host NIXL moves KV over CUDA IPC, and UCX caches the
+                # imported handles on the reader. A decode worker then keeps a
+                # dead prefill's whole KV region mapped (54 GiB stayed
+                # allocated 60 s after every prefill process had exited), and
+                # the prefill restarted on that GPU fails its free-memory
+                # check. Drop the cache so a mapping ends with its transfer.
+                env.setdefault("UCX_CUDA_IPC_CACHE", "n")
 
         if self.engine == "trtllm":
             # TRT-LLM bootstraps workers over Open MPI even at TP=1. On CI pods the
