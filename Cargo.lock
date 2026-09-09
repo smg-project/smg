@@ -7312,6 +7312,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sim-loadgen"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "reqwest 0.13.4",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"

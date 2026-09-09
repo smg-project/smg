@@ -7,6 +7,13 @@
 //! synthetic token ids (one per whitespace word) so shared text prefixes still
 //! produce cache hits and prompt length still drives prefill latency. Token-id
 //! KV events (event-driven `cache_aware`) remain a gRPC-path feature.
+//!
+//! `/generate` is SGLang-native in realistic mode: it reads `input_ids` when
+//! the body carries them (text is the fallback), and answers in the native
+//! shape (`output_ids` + `meta_info`), so a load generator that speaks the
+//! production `/generate` contract scores cached tokens and rebuilds
+//! multi-turn context from the worker's own output. In canned mode it stays
+//! the historical chat-shaped alias the existing rigs depend on.
 
 use std::{
     convert::Infallible,
@@ -39,6 +46,9 @@ use crate::{
 pub struct AppState {
     cfg: Arc<Config>,
     engine: Option<Engine>,
+    /// The listener's port, echoed in native `meta_info.worker_port` so a
+    /// client can attribute a response to a worker without trusting routing.
+    port: u16,
 }
 
 /// Build the router serving the mock HTTP worker contract.
@@ -48,7 +58,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
-        .route("/generate", post(chat_completions))
+        .route("/generate", post(generate))
         .route("/v1/loads", get(loads))
         .with_state(state)
 }
@@ -64,7 +74,7 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
     };
     // One simulated engine per listener (i.e. per virtual worker).
     let engine = cfg.realistic.then(|| Engine::spawn(cfg.engine.clone()));
-    let state = Arc::new(AppState { cfg, engine });
+    let state = Arc::new(AppState { cfg, engine, port });
     if let Err(e) = axum::serve(listener, router(state)).await {
         tracing::error!("http worker {port} stopped: {e}");
     }
@@ -140,6 +150,197 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: Bytes) -> Re
 
 async fn completions(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     handle(Endpoint::Completions, state, body).await
+}
+
+/// `/generate`: SGLang-native in realistic mode, chat-shaped alias otherwise.
+async fn generate(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    if state.engine.is_none() {
+        return handle(Endpoint::Chat, state, body).await;
+    }
+    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    drop(body);
+    let stream_requested = parsed
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let prompt_ids = extract_input_ids(&parsed)
+        .unwrap_or_else(|| synth_token_ids(&extract_prompt_text(&parsed)));
+    let max_new = extract_native_max_new(&parsed).unwrap_or(state.cfg.output_tokens);
+    drop(parsed);
+    let request_id = next_request_id();
+    let (tx, rx) = mpsc::unbounded_channel();
+    state
+        .engine
+        .as_ref()
+        .expect("checked above")
+        .submit(NewRequest {
+            request_id: request_id.clone(),
+            prompt_token_ids: prompt_ids,
+            max_new,
+            events: tx,
+        });
+    if stream_requested {
+        native_sse(rx, request_id, state.port).into_response()
+    } else {
+        Json(native_completion(rx, request_id, state.port).await).into_response()
+    }
+}
+
+/// Everything a native response reports, accumulated from the engine's events.
+struct NativeProgress {
+    request_id: String,
+    worker_port: u16,
+    prompt_tokens: u32,
+    cached_tokens: u32,
+    output_ids: Vec<u32>,
+    finished: bool,
+}
+
+impl NativeProgress {
+    fn new(request_id: String, worker_port: u16) -> Self {
+        Self {
+            request_id,
+            worker_port,
+            prompt_tokens: 0,
+            cached_tokens: 0,
+            output_ids: Vec::new(),
+            finished: false,
+        }
+    }
+
+    fn absorb(&mut self, ev: engine::GenEvent) {
+        match ev {
+            engine::GenEvent::Token {
+                token_id,
+                prompt_tokens,
+                cached_tokens,
+            } => {
+                self.prompt_tokens = prompt_tokens;
+                self.cached_tokens = cached_tokens;
+                self.output_ids.push(token_id);
+            }
+            engine::GenEvent::Done {
+                prompt_tokens,
+                cached_tokens,
+                ..
+            } => {
+                self.prompt_tokens = prompt_tokens;
+                self.cached_tokens = cached_tokens;
+                self.finished = true;
+            }
+        }
+    }
+
+    /// The SGLang-native frame: `output_ids` and completion accounting are
+    /// reported once, on the terminal frame; earlier frames carry the prompt
+    /// accounting only (first frame = time to first token).
+    fn frame(&self) -> Value {
+        let completion = if self.finished {
+            self.output_ids.len()
+        } else {
+            0
+        };
+        json!({
+            "text": if self.finished { "mock" } else { "" },
+            "output_ids": if self.finished { Value::from(self.output_ids.clone()) } else { Value::from(Vec::<u32>::new()) },
+            "meta_info": {
+                "id": self.request_id,
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": completion,
+                "cached_tokens": self.cached_tokens,
+                "finish_reason": if self.finished {
+                    json!({"type": "length", "length": completion})
+                } else {
+                    Value::Null
+                },
+                "worker_port": self.worker_port,
+            },
+        })
+    }
+}
+
+/// Non-streaming native `/generate`: one JSON object after the last token.
+async fn native_completion(
+    mut rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+    request_id: String,
+    worker_port: u16,
+) -> Value {
+    let mut progress = NativeProgress::new(request_id, worker_port);
+    while let Some(ev) = rx.recv().await {
+        progress.absorb(ev);
+    }
+    progress.frame()
+}
+
+/// Streaming native `/generate`: a first frame at the first token (so the
+/// client's TTFT is the engine's), the terminal frame with `output_ids` at
+/// completion, then `[DONE]`. Intermediate tokens are accumulated, not
+/// streamed one per frame: the production `/generate` clients this mock
+/// serves read the first and last frame, and a frame per token through the
+/// gateway would make the mock fleet's SSE volume the bottleneck.
+fn native_sse(
+    rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+    request_id: String,
+    worker_port: u16,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    enum St {
+        Active {
+            rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+            progress: NativeProgress,
+            first_sent: bool,
+        },
+        Closing,
+        Ended,
+    }
+
+    let body = stream::unfold(
+        St::Active {
+            rx,
+            progress: NativeProgress::new(request_id, worker_port),
+            first_sent: false,
+        },
+        |st| async move {
+            match st {
+                St::Active {
+                    mut rx,
+                    mut progress,
+                    mut first_sent,
+                } => loop {
+                    match rx.recv().await {
+                        Some(ev) => {
+                            progress.absorb(ev);
+                            if progress.finished {
+                                let frame = progress.frame();
+                                return Some((
+                                    Ok(Event::default().data(frame.to_string())),
+                                    St::Closing,
+                                ));
+                            }
+                            if !first_sent {
+                                first_sent = true;
+                                let frame = progress.frame();
+                                return Some((
+                                    Ok(Event::default().data(frame.to_string())),
+                                    St::Active {
+                                        rx,
+                                        progress,
+                                        first_sent,
+                                    },
+                                ));
+                            }
+                        }
+                        // Engine dropped the request without a terminal
+                        // event: end the stream so the client sees an
+                        // incomplete response, not a hang.
+                        None => return None,
+                    }
+                },
+                St::Closing => Some((Ok(Event::default().data("[DONE]")), St::Ended)),
+                St::Ended => None,
+            }
+        },
+    );
+    Sse::new(body)
 }
 
 async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Response {
@@ -410,6 +611,31 @@ fn hash_word(w: &str) -> u32 {
     h % 30_000
 }
 
+/// Native `input_ids`: a flat token list, or a batch of one (`[[...]]`).
+fn extract_input_ids(v: &Value) -> Option<Vec<u32>> {
+    let ids = v.get("input_ids")?.as_array()?;
+    let seq = match ids.first() {
+        Some(Value::Array(inner)) => inner,
+        _ => ids,
+    };
+    Some(
+        seq.iter()
+            .filter_map(Value::as_u64)
+            .map(|id| id as u32)
+            .collect(),
+    )
+}
+
+/// Native limit: `sampling_params.max_new_tokens` first, then the top-level
+/// OpenAI-style keys.
+fn extract_native_max_new(v: &Value) -> Option<u32> {
+    v.get("sampling_params")
+        .and_then(|sp| sp.get("max_new_tokens"))
+        .and_then(Value::as_u64)
+        .map(|n| n as u32)
+        .or_else(|| extract_max_tokens(v))
+}
+
 fn extract_max_tokens(v: &Value) -> Option<u32> {
     for key in ["max_tokens", "max_new_tokens"] {
         if let Some(n) = v.get(key).and_then(Value::as_u64) {
@@ -422,4 +648,60 @@ fn extract_max_tokens(v: &Value) -> Option<u32> {
 fn next_request_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     format!("mock-http-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_input_ids_accepts_flat_and_batched_shapes() {
+        let flat = json!({"input_ids": [1, 2, 3]});
+        let batched = json!({"input_ids": [[4, 5]]});
+        let text_only = json!({"text": "a b"});
+        assert_eq!(extract_input_ids(&flat), Some(vec![1, 2, 3]));
+        assert_eq!(extract_input_ids(&batched), Some(vec![4, 5]));
+        assert_eq!(extract_input_ids(&text_only), None);
+    }
+
+    #[test]
+    fn native_max_new_prefers_sampling_params() {
+        let native = json!({"sampling_params": {"max_new_tokens": 7}, "max_tokens": 99});
+        let openai = json!({"max_tokens": 99});
+        assert_eq!(extract_native_max_new(&native), Some(7));
+        assert_eq!(extract_native_max_new(&openai), Some(99));
+        assert_eq!(extract_native_max_new(&json!({})), None);
+    }
+
+    #[test]
+    fn native_frames_report_output_only_when_finished() {
+        let mut p = NativeProgress::new("r1".into(), 9007);
+        p.absorb(engine::GenEvent::Token {
+            token_id: 11,
+            prompt_tokens: 100,
+            cached_tokens: 64,
+        });
+        let first = p.frame();
+        assert_eq!(first["output_ids"].as_array().unwrap().len(), 0);
+        assert_eq!(first["meta_info"]["completion_tokens"], 0);
+        assert_eq!(first["meta_info"]["cached_tokens"], 64);
+        assert!(first["meta_info"]["finish_reason"].is_null());
+        p.absorb(engine::GenEvent::Token {
+            token_id: 12,
+            prompt_tokens: 100,
+            cached_tokens: 64,
+        });
+        p.absorb(engine::GenEvent::Done {
+            finish_reason: "length",
+            prompt_tokens: 100,
+            completion_tokens: 2,
+            cached_tokens: 64,
+        });
+        let last = p.frame();
+        assert_eq!(last["output_ids"], json!([11, 12]));
+        assert_eq!(last["meta_info"]["completion_tokens"], 2);
+        assert_eq!(last["meta_info"]["prompt_tokens"], 100);
+        assert_eq!(last["meta_info"]["worker_port"], 9007);
+        assert_eq!(last["meta_info"]["finish_reason"]["type"], "length");
+    }
 }
