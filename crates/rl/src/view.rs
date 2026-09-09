@@ -1,7 +1,7 @@
 //! The registry view the gateway hands to the RL crate. This trait is the
 //! entire read-side coupling to `model_gateway` (touchpoint (a) in COUPLING.md).
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use openai_protocol::worker::{ConnectionMode, RuntimeType, WorkerStatus, WorkerType};
 
@@ -24,6 +24,10 @@ pub struct RlWorkerInfo {
     pub dp_size: Option<usize>,
     /// `WorkerSpec.labels`: discovered metadata merged with caller labels.
     pub labels: HashMap<String, String>,
+    /// The client the gateway negotiated for this worker (HTTP version,
+    /// TLS identity and roots, pool tuning), shared with its data-plane and
+    /// admin calls. `None` when the gateway does not speak HTTP to it.
+    pub http_client: Option<Arc<reqwest::Client>>,
 }
 
 /// Read-only access to the worker registry.

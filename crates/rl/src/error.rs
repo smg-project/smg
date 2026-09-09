@@ -39,8 +39,6 @@ pub enum RlError {
         url: String,
         timeout_secs: u64,
     },
-    #[error("failed to build the RL control-plane HTTP client: {0}")]
-    Client(String),
 }
 
 impl RlError {
@@ -55,7 +53,6 @@ impl RlError {
             Self::UnsupportedConnectionMode { .. } => "unsupported_connection_mode",
             Self::UpstreamUnreachable { .. } => "upstream_unreachable",
             Self::UpstreamTimeout { .. } => "upstream_timeout",
-            Self::Client(_) => "client_init_failed",
         }
     }
 
@@ -69,7 +66,6 @@ impl RlError {
             Self::UnsupportedConnectionMode { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::UpstreamUnreachable { .. } => StatusCode::BAD_GATEWAY,
             Self::UpstreamTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
-            Self::Client(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 

@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use axum::{
@@ -50,7 +50,15 @@ pub fn worker(id: &str, url: &str, runtime: RuntimeType) -> RlWorkerInfo {
         is_dp_aware: url.contains('@'),
         dp_size: None,
         labels,
+        http_client: Some(test_client()),
     }
+}
+
+/// One plain client shared by every fake worker, standing in for the
+/// gateway's per-worker negotiated client.
+pub fn test_client() -> Arc<reqwest::Client> {
+    static CLIENT: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
+    Arc::clone(CLIENT.get_or_init(|| Arc::new(reqwest::Client::new())))
 }
 
 /// One recorded request seen by a fake engine.

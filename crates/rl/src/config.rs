@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RlConfig {
-    /// Mount `/v1/rl/*` and build the control-plane client.
+    /// Mount `/v1/rl/*`.
     pub enabled: bool,
     /// Total timeout for one proxied engine call (refits can take minutes).
     pub control_timeout_secs: u64,

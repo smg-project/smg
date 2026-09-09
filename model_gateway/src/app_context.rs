@@ -373,8 +373,7 @@ impl AppContextBuilder {
             &router_config.tenant_api_keys,
         );
 
-        let rl = crate::rl_adapter::build_rl_state(&worker_registry, &router_config)
-            .map_err(AppContextBuildError::InvalidConfig)?;
+        let rl = crate::rl_adapter::build_rl_state(&worker_registry, &router_config);
 
         Ok(AppContext {
             gateway_auth,

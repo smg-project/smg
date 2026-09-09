@@ -1,6 +1,9 @@
 //! Verbatim proxy of one engine-native route to one worker.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     body::Bytes,
@@ -152,15 +155,24 @@ pub async fn call_worker(
     worker: &RlWorkerInfo,
     req: &ProxyRequest,
 ) -> Result<CallOutcome, RlError> {
-    if worker.connection_mode != ConnectionMode::Http {
-        return Err(RlError::UnsupportedConnectionMode {
-            worker_id: worker.id.clone(),
-            url: worker.url.clone(),
-            mode: enum_str(&worker.connection_mode),
-        });
-    }
+    // A worker the gateway never speaks HTTP to has no client to borrow.
+    let client = match &worker.http_client {
+        Some(client) if worker.connection_mode == ConnectionMode::Http => client,
+        _ => {
+            return Err(RlError::UnsupportedConnectionMode {
+                worker_id: worker.id.clone(),
+                url: worker.url.clone(),
+                mode: enum_str(&worker.connection_mode),
+            })
+        }
+    };
     let url = req.url_for(worker);
-    let mut builder = state.client.request(req.method.clone(), &url);
+    // The worker's client carries the gateway's request timeout; a refit
+    // can outlive it, so the control deadline is set per request, as the
+    // gateway's own flush/profile admin calls do.
+    let mut builder = client
+        .request(req.method.clone(), &url)
+        .timeout(Duration::from_secs(state.config.control_timeout_secs));
     if let Some(ct) = &req.content_type {
         builder = builder.header(CONTENT_TYPE, ct.clone());
     }
@@ -303,7 +315,7 @@ mod tests {
             control_timeout_secs: timeout_secs,
             fanout_concurrency: 4,
         };
-        Arc::new(RlState::new(Arc::new(FakeView(workers)), cfg, false).unwrap())
+        Arc::new(RlState::new(Arc::new(FakeView(workers)), cfg))
     }
 
     async fn json_body(resp: Response) -> Value {
@@ -473,6 +485,32 @@ mod tests {
             .unwrap();
         assert_eq!(r.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert!(engine.seen().is_empty());
+    }
+
+    /// The control deadline is applied per request, so it holds even when
+    /// the worker's client carries no client-level timeout of its own.
+    #[tokio::test]
+    async fn control_timeout_is_applied_per_request_on_the_worker_client() {
+        let slow_engine = FakeEngine::start(StatusCode::OK, json!({}), 1500).await;
+        let mut w = worker("slow", &slow_engine.url, RuntimeType::Sglang);
+        w.http_client = Some(Arc::new(reqwest::Client::new()));
+        let app = crate::router::<()>(state(vec![w], 1));
+
+        let r = app
+            .oneshot(
+                Request::post("/workers/slow/engine/flush_cache")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = json_body(r).await;
+        assert_eq!(body["error"], "upstream_timeout");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("timed out after 1s"));
     }
 
     #[tokio::test]

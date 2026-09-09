@@ -182,7 +182,7 @@ mod tests {
             control_timeout_secs: 5,
             fanout_concurrency: concurrency,
         };
-        Arc::new(RlState::new(Arc::new(FakeView(workers)), cfg, false).unwrap())
+        Arc::new(RlState::new(Arc::new(FakeView(workers)), cfg))
     }
 
     async fn json_body(resp: Response) -> Value {

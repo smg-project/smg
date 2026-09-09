@@ -199,7 +199,10 @@ mod tests {
     };
 
     fn state(workers: Vec<RlWorkerInfo>) -> Arc<RlState> {
-        Arc::new(RlState::new(Arc::new(FakeView(workers)), RlConfig::default(), false).unwrap())
+        Arc::new(RlState::new(
+            Arc::new(FakeView(workers)),
+            RlConfig::default(),
+        ))
     }
 
     #[test]

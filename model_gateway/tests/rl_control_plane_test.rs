@@ -4,10 +4,13 @@ mod common;
 
 use axum::{
     body::Body,
-    http::{Request, StatusCode},
+    http::{Request, StatusCode, Version},
 };
 use common::{
-    mock_worker::{HealthStatus, MockWorkerConfig, RequestRecorder, WorkerType},
+    mock_worker::{
+        set_request_recorder, HealthStatus, MockWorker, MockWorkerConfig, RequestRecorder,
+        WorkerType,
+    },
     AppTestContext, TestRouterConfig,
 };
 use http_body_util::BodyExt;
@@ -97,7 +100,7 @@ async fn discovery_lists_mock_workers() {
 #[tokio::test]
 async fn proxy_forwards_body_verbatim() {
     let recorder = RequestRecorder::new();
-    common::mock_worker::set_request_recorder(18904, recorder.clone());
+    set_request_recorder(18904, recorder.clone());
     let ctx = ctx(true, vec![mock(18904, 0.0)]).await;
     let app = ctx.create_app();
     let id = {
@@ -156,8 +159,8 @@ async fn fanout_hits_every_worker_and_reports_failures_without_touching_breakers
     assert!(body["failed"][0]["url"].as_str().unwrap().contains("18906"));
     assert_eq!(body["failed"][0]["error"], "upstream_unreachable");
 
-    // The control plane owns its own client: no data-plane breaker trips and
-    // no load counter moves, however the engine answered.
+    // Control calls borrow each worker's HTTP client but bypass its breaker
+    // and load counter, however the engine answered.
     for worker in ctx.app_context.worker_registry.get_all() {
         assert!(worker.circuit_breaker_can_execute(), "{}", worker.url());
         assert_eq!(worker.load(), 0, "{}", worker.url());
@@ -190,5 +193,77 @@ async fn control_plane_auth_guards_v1_rl() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    ctx.shutdown().await;
+}
+
+/// Control calls go through each worker's own negotiated HTTP client, so a
+/// worker that resolved to HTTP/1.1 under `--upstream-http2` is spoken to
+/// on HTTP/1.1 while a worker that negotiated h2c gets HTTP/2.
+#[tokio::test]
+async fn control_calls_follow_each_worker_negotiated_http_version() {
+    let mut config = TestRouterConfig::round_robin(0);
+    config.rl.enabled = true;
+    config.rl.control_timeout_secs = 5;
+    config.upstream_http2 = true;
+    let negotiated = RequestRecorder::new();
+    set_request_recorder(18908, negotiated.clone());
+    let pinned = RequestRecorder::new();
+    set_request_recorder(18909, pinned.clone());
+
+    // 18908 registers at startup and negotiates h2c; 18909 is registered
+    // afterwards with `http_pool.http2 = false`, which pins it to HTTP/1.1.
+    let ctx = AppTestContext::new_with_config(config, vec![mock(18908, 0.0)]).await;
+    let app = ctx.create_app();
+    let mut pinned_worker = MockWorker::new(mock(18909, 0.0));
+    let pinned_url = pinned_worker.start().await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/workers")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "url": pinned_url, "http_pool": { "http2": false } }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // Registration runs in the background; wait until discovery lists both.
+    let mut workers = Vec::new();
+    for _ in 0..50 {
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/v1/rl/workers").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = json_of(resp).await;
+        workers = body["workers"].as_array().cloned().unwrap_or_default();
+        if workers.len() == 2 && workers.iter().all(|w| w["health"] == "ready") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(workers.len(), 2, "{workers:?}");
+
+    for w in &workers {
+        let id = w["id"].as_str().unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/v1/rl/workers/{id}/engine/pause_generation"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"abort"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{}", w["url"]);
+    }
+    assert_eq!(negotiated.versions(), vec![Version::HTTP_2]);
+    assert_eq!(pinned.versions(), vec![Version::HTTP_11]);
+
+    pinned_worker.stop().await;
     ctx.shutdown().await;
 }
