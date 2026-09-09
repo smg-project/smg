@@ -43,7 +43,7 @@ from pathlib import Path
 import httpx
 import pytest
 from infra import ConnectionMode, Gateway, WorkerType, cleanup_pool, start_workers, stop_workers
-from infra.constants import get_runtime, is_sglang, is_tokenspeed
+from infra.constants import get_runtime, is_sglang
 from infra.model_specs import get_model_spec
 from infra.pd_logs import LOG_FLUSH_TIMEOUT_S, read_logs, worker_log_dir
 
@@ -509,15 +509,12 @@ class TestPDTopology:
         _assert_fleet_idle_within(gateway, 30.0)
         _wait_until_served(gateway, model, timeout=60.0)
 
-    @pytest.mark.xfail(
-        is_tokenspeed(),
-        strict=True,
-        reason="the gateway mints one bootstrap room per request and TokenSpeed broadcasts "
-        "it to every sample of an n>1 request; the prefill rejects the decode's repeated "
-        "pre-allocations as duplicates and the request fails with decode_worker_failed_to_start",
-    )
     def test_batched_completion_serves_every_choice(self, setup_backend, request):
-        """Every choice of an ``n>1`` request must come back through the PD pair."""
+        """Every choice of an ``n>1`` request must come back through the PD pair.
+
+        Over gRPC the gateway fans the request out into one single-sample
+        pair per choice, each with its own bootstrap room (#2482).
+        """
         mode, model, _, gateway = setup_backend
         if mode == "pd_http" and is_sglang():
             # Same shape as the TokenSpeed gRPC case: the HTTP PD router mints
