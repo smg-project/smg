@@ -5,7 +5,11 @@ edition = "2021"
 description = "RL control plane for SMG: worker discovery, engine-route passthrough, and fan-out"
 license = "Apache-2.0"
 repository = "https://github.com/smg-project/smg"
-publish = false
+authors = [
+    "Keyang Ru <rukeyang@gmail.com>",
+]
+keywords = ["smg", "llm", "gateway", "rl"]
+categories = ["api-bindings"]
 
 [lib]
 name = "smg_rl"

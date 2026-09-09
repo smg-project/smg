@@ -69,6 +69,8 @@ jobs:
             path: crates/wasm
           - crate: llm-tokenizer
             path: crates/tokenizer
+          - crate: smg-rl
+            path: crates/rl
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/publish-crate
