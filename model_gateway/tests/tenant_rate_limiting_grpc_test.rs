@@ -78,6 +78,7 @@ async fn start_mock_grpc_worker(output_tokens: u32) -> u16 {
         output_tokens,
         realistic: false,
         engine: mock_worker::engine::EngineParams::default(),
+        scripted_outputs: Vec::new(),
     });
     tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
     port
