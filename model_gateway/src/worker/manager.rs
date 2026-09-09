@@ -32,9 +32,9 @@ use crate::{
         metrics_aggregator::{self, MetricPack},
         registry::{WorkerDescriptor, WorkerId},
         worker::WorkerTypeExt,
-        ConnectionMode, Worker, WorkerOrigin, WorkerRegistry, WorkerResult,
+        ConnectionMode, Worker, WorkerOrigin, WorkerRegistry, WorkerResult, WorkerType,
     },
-    workflow::{Job, JobQueue},
+    workflow::{steps::local::discover_grpc_kv_engine_id, Job, JobQueue},
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -492,6 +492,14 @@ fn queue_due_probes(
         in_flight.insert(worker_id.clone());
         probes.push(Box::pin(async move {
             let probe_result = worker.check_health_async().await;
+            if probe_result.is_ok()
+                && matches!(
+                    launched_status,
+                    WorkerStatus::Failed | WorkerStatus::NotReady
+                )
+            {
+                refresh_kv_engine_id_after_recovery(&worker).await;
+            }
             ProbeCompletion {
                 worker_id,
                 worker,
@@ -713,6 +721,39 @@ fn schedule_worker_at(
 ///     came back on the same address (a restart), and without
 ///     `--remove-unhealthy-workers` this is the only way it rejoins
 ///   - Failed stays Failed on failure; Draining never transitions here
+/// A PD worker that answers its probe again after failing may be a new engine
+/// process on the same address, with a new KV transfer engine id (#2491).
+/// Re-read the id before the worker is promoted, so the next handoff is
+/// minted for the engine that is actually there. Only gRPC engines report
+/// the id; a read that fails keeps the previous one and says so.
+async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>) {
+    let spec = &worker.metadata().spec;
+    if !matches!(spec.worker_type, WorkerType::Prefill | WorkerType::Decode)
+        || *worker.connection_mode() != ConnectionMode::Grpc
+        || spec.kv_connector.is_none()
+    {
+        return;
+    }
+    match discover_grpc_kv_engine_id(worker.url(), spec.runtime_type.as_str()).await {
+        Ok(discovered) => {
+            let previous = worker.kv_engine_id();
+            if worker.refresh_kv_engine_id(discovered.clone()) {
+                info!(
+                    worker_url = %worker.url(),
+                    ?previous,
+                    ?discovered,
+                    "Recovered PD worker reports a new KV engine id"
+                );
+            }
+        }
+        Err(error) => warn!(
+            worker_url = %worker.url(),
+            %error,
+            "Could not re-read the KV engine id of a recovered PD worker; keeping the previous one"
+        ),
+    }
+}
+
 fn compute_next_status(
     worker: &Arc<dyn Worker>,
     probe_ok: bool,

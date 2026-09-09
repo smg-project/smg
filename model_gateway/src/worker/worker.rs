@@ -616,6 +616,20 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().dp_size()
     }
 
+    /// The KV transfer engine id the worker's engine currently reports: the
+    /// spec's, unless a recovery re-read it (see
+    /// [`Self::refresh_kv_engine_id`]). A PD handoff must be minted for the
+    /// engine process that is there now, not the one discovered at
+    /// registration (#2491).
+    fn kv_engine_id(&self) -> Option<String> {
+        self.metadata().spec.kv_engine_id.clone()
+    }
+
+    /// Replace the engine id after a re-read. Returns `true` when it changed.
+    fn refresh_kv_engine_id(&self, _kv_engine_id: Option<String>) -> bool {
+        false
+    }
+
     /// Transform a request for DP-aware routing.
     ///
     /// When the worker has a `dp_rank`, injects `data_parallel_rank`
@@ -1282,6 +1296,11 @@ pub struct BasicWorker {
     /// When not `Wildcard`, overrides metadata.models for routing decisions.
     /// Uses `ArcSwap` for lock-free reads on the hot path (`supports_model`).
     pub models_override: Arc<ArcSwap<WorkerModels>>,
+    /// The KV transfer engine id in force, seeded from the spec and replaced
+    /// when a recovered engine reports a new one (see
+    /// [`Worker::refresh_kv_engine_id`]). Not shared across same-URL
+    /// replacements: a replacement is built from a fresh discovery.
+    pub kv_engine_id: ArcSwapOption<String>,
     /// Worker-directed HTTP client, shared across same-config workers, built
     /// on first use (see [`LazyHttpClient`]).
     pub http_client: Arc<LazyHttpClient>,
@@ -1300,6 +1319,7 @@ impl Clone for BasicWorker {
             zmq_connect_abort: Arc::clone(&self.zmq_connect_abort),
             connect_signal_tx: self.connect_signal_tx.clone(),
             models_override: Arc::clone(&self.models_override),
+            kv_engine_id: ArcSwapOption::new(self.kv_engine_id.load_full()),
             http_client: Arc::clone(&self.http_client),
             resilience: self.resilience.clone(),
         }
@@ -1435,6 +1455,19 @@ impl BasicWorker {
 
 #[async_trait]
 impl Worker for BasicWorker {
+    fn kv_engine_id(&self) -> Option<String> {
+        self.kv_engine_id.load_full().map(|id| (*id).clone())
+    }
+
+    fn refresh_kv_engine_id(&self, kv_engine_id: Option<String>) -> bool {
+        let previous = self.kv_engine_id.load_full();
+        if previous.as_deref() == kv_engine_id.as_ref() {
+            return false;
+        }
+        self.kv_engine_id.store(kv_engine_id.map(Arc::new));
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

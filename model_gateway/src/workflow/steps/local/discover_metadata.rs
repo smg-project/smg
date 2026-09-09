@@ -256,6 +256,17 @@ async fn fetch_vllm_http_metadata(
     labels
 }
 
+/// Re-read the KV transfer engine id a gRPC engine reports, for a PD worker
+/// that came back on the same address (#2491): a restarted engine process
+/// carries a new id, and a handoff minted for the old one strands the decode.
+pub(crate) async fn discover_grpc_kv_engine_id(
+    url: &str,
+    runtime_type: &str,
+) -> Result<Option<String>, String> {
+    let (mut labels, _) = fetch_grpc_metadata(url, runtime_type).await?;
+    Ok(labels.remove("kv_engine_id").filter(|id| !id.is_empty()))
+}
+
 async fn fetch_grpc_metadata(
     url: &str,
     runtime_type: &str,

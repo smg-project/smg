@@ -3,6 +3,7 @@ mod detect_backend;
 mod detect_connection;
 mod discover_dp;
 mod discover_metadata;
+pub(crate) use discover_metadata::discover_grpc_kv_engine_id;
 mod drain_workers;
 mod ensure_harmony_encoding;
 mod find_worker_to_update;
