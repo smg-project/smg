@@ -1299,7 +1299,9 @@ pub struct BasicWorker {
     /// The KV transfer engine id in force, seeded from the spec and replaced
     /// when a recovered engine reports a new one (see
     /// [`Worker::refresh_kv_engine_id`]). Not shared across same-URL
-    /// replacements: a replacement is built from a fresh discovery.
+    /// replacements: a worker built from a fresh discovery starts from its
+    /// own spec, and one rebuilt by a properties update starts from that
+    /// spec's (unrefreshed) id.
     pub kv_engine_id: ArcSwapOption<String>,
     /// Worker-directed HTTP client, shared across same-config workers, built
     /// on first use (see [`LazyHttpClient`]).
