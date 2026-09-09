@@ -4,7 +4,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::{
-    errors::{ParserError, ParserResult},
+    errors::ParserResult,
     parsers::helpers,
     traits::ToolParser,
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
@@ -59,11 +59,15 @@ pub struct DeepSeekDsmlParser {
     current_tool_name_sent: bool,
     /// Tracks raw JSON string content streamed to client for each tool's arguments
     streamed_args_for_tool: Vec<String>,
+    /// Calls whose invoke and argument object have both closed successfully.
+    completed_tool_call_count: usize,
 }
 
 /// Full DSML closing tags for suffix-based stripping during streaming.
 const DSML_PARAMETER_END_TAG: &str = "</｜DSML｜parameter>";
 const DSML_INVOKE_END_TAG: &str = "</｜DSML｜invoke>";
+const DSML_OPEN_SENTINEL: &str = "<｜DSML｜";
+const DSML_CLOSE_SENTINEL: &str = "</｜DSML｜";
 
 /// DeepSeek end-of-sentence marker. Some engines emit this as raw text at the
 /// end of a truncated turn; it must never bleed into tool-call argument bytes.
@@ -149,6 +153,7 @@ impl DeepSeekDsmlParser {
             current_tool_id: -1,
             current_tool_name_sent: false,
             streamed_args_for_tool: Vec::new(),
+            completed_tool_call_count: 0,
         }
     }
 
@@ -235,16 +240,28 @@ impl DeepSeekDsmlParser {
         serde_json::to_string(&Value::Object(params)).unwrap_or_else(|_| "{}".to_string())
     }
 
-    /// Parse a single complete invoke block into a ToolCall
-    fn parse_invoke(&self, name: &str, content: &str) -> ToolCall {
-        let arguments = self.parse_parameters_from_dsml(content, false);
+    fn arguments_are_valid_object(content: &str, arguments: &str) -> bool {
+        let candidate = if content.trim().starts_with('{') {
+            content.trim()
+        } else {
+            arguments
+        };
+        matches!(serde_json::from_str(candidate), Ok(Value::Object(_)))
+    }
 
-        ToolCall {
+    /// Parse a single complete invoke block into a ToolCall.
+    fn parse_invoke(&self, name: &str, content: &str) -> Option<ToolCall> {
+        let arguments = self.parse_parameters_from_dsml(content, false);
+        if !Self::arguments_are_valid_object(content, &arguments) {
+            return None;
+        }
+
+        Some(ToolCall {
             function: FunctionCall {
                 name: name.trim().to_string(),
                 arguments,
             },
-        }
+        })
     }
 }
 
@@ -257,29 +274,52 @@ impl ToolParser for DeepSeekDsmlParser {
             return Ok((text.to_string(), vec![]));
         }
 
-        let idx = text
-            .find(self.block_open.as_str())
-            .ok_or_else(|| ParserError::ParsingFailed("DSML marker not found".to_string()))?;
+        let Some(idx) = text.find(self.block_open.as_str()) else {
+            let marker_start = [DSML_OPEN_SENTINEL, DSML_CLOSE_SENTINEL]
+                .into_iter()
+                .filter_map(|marker| text.find(marker))
+                .min();
+            let Some(marker_start) = marker_start else {
+                return Ok((text.to_string(), Vec::new()));
+            };
+            return Ok((text[..marker_start].trim_end().to_string(), Vec::new()));
+        };
         let normal_text = text[..idx].trim_end().to_string();
 
         let mut tools = Vec::new();
+        let mut last_block_end = None;
 
         for fc_cap in self.tool_call_complete_regex.captures_iter(text) {
+            last_block_end = fc_cap.get(0).map(|outer| outer.end());
             let fc_content = fc_cap.get(1).map_or("", |m| m.as_str());
 
             for inv_cap in self.invoke_complete_regex.captures_iter(fc_content) {
                 let func_name = inv_cap.get(1).map_or("", |m| m.as_str());
                 let invoke_content = inv_cap.get(2).map_or("", |m| m.as_str());
 
-                tools.push(self.parse_invoke(func_name, invoke_content));
+                if let Some(tool) = self.parse_invoke(func_name, invoke_content) {
+                    tools.push(tool);
+                }
             }
         }
 
-        if tools.is_empty() {
-            return Ok((normal_text, vec![]));
+        let mut normal_text = normal_text;
+        if let Some(end) = last_block_end {
+            normal_text.push_str(&text[end..].replace(EOS_TOKEN, ""));
         }
 
         Ok((normal_text, tools))
+    }
+
+    async fn parse_complete_with_tools(
+        &self,
+        output: &str,
+        tools: &[Tool],
+    ) -> ParserResult<(String, Vec<ToolCall>)> {
+        let (normal_text, mut calls) = self.parse_complete(output).await?;
+        let tool_indices = helpers::get_tool_indices(tools);
+        calls.retain(|call| tool_indices.contains_key(call.function.name.as_str()));
+        Ok((normal_text, calls))
     }
 
     async fn parse_incremental(
@@ -302,13 +342,19 @@ impl ToolParser for DeepSeekDsmlParser {
         // passthrough path and lose the sentinel, turning every subsequent
         // chunk into plain text. (See regression test
         // `test_deepseek_dsml_v4_streaming_bpe_chunked_opener`.)
-        let has_dsml = current_text.contains("<｜DSML｜");
-        let has_partial_prefix = current_text.ends_with('<')
-            || current_text.ends_with("<｜")
-            || current_text.ends_with("</")
-            || current_text.ends_with("</｜");
+        let has_dsml =
+            current_text.contains(DSML_OPEN_SENTINEL) || current_text.contains(DSML_CLOSE_SENTINEL);
+        let has_partial_prefix =
+            helpers::ends_with_partial_token(&current_text, DSML_OPEN_SENTINEL).is_some()
+                || helpers::ends_with_partial_token(&current_text, DSML_CLOSE_SENTINEL).is_some();
 
         if !has_dsml && !has_partial_prefix {
+            // DeepSeek V4 emits blank lines immediately before a DSML tool-call
+            // block. Hold whitespace until the next token tells us whether it
+            // belongs to normal text or is only block framing.
+            if current_text.trim().is_empty() {
+                return Ok(StreamingParseResult::default());
+            }
             let mut normal_text = std::mem::take(&mut self.buffer);
             for end_token in [
                 self.block_close.as_str(),
@@ -327,6 +373,12 @@ impl ToolParser for DeepSeekDsmlParser {
         // If we have partial prefix but no actual DSML content, buffer and wait
         if !has_dsml && has_partial_prefix {
             return Ok(StreamingParseResult::default());
+        }
+
+        let mut normal_text = String::new();
+        if let Some(start) = self.buffer.find(self.block_open.as_str()) {
+            normal_text = self.buffer[..start].trim_end().to_string();
+            self.buffer = self.buffer[start..].to_string();
         }
 
         let tool_indices = helpers::get_tool_indices(tools);
@@ -379,10 +431,23 @@ impl ToolParser for DeepSeekDsmlParser {
                         &self.prev_tool_call_arr,
                     );
                     return Ok(StreamingParseResult {
-                        normal_text: String::new(),
+                        normal_text,
                         calls: all_calls,
                     });
                 }
+            }
+
+            let current_args = self.parse_parameters_from_dsml(&invoke_content, !is_complete);
+            if is_complete && !Self::arguments_are_valid_object(&invoke_content, &current_args) {
+                tracing::debug!("Invalid arguments for tool '{}' - skipping", func_name);
+                if let Some(end) = match_end {
+                    self.buffer = self.buffer[end..].to_string();
+                }
+                if self.current_tool_name_sent {
+                    self.current_tool_id += 1;
+                }
+                self.current_tool_name_sent = false;
+                continue;
             }
 
             // Initialize state on first tool
@@ -418,8 +483,6 @@ impl ToolParser for DeepSeekDsmlParser {
                 });
             }
 
-            // Parse current arguments (partial or complete)
-            let current_args = self.parse_parameters_from_dsml(&invoke_content, !is_complete);
             let tool_id = self.current_tool_id as usize;
 
             // Compute diff against what we've already sent
@@ -492,6 +555,7 @@ impl ToolParser for DeepSeekDsmlParser {
                 } else {
                     self.buffer.clear();
                 }
+                self.completed_tool_call_count += 1;
                 self.current_tool_id += 1;
                 self.current_tool_name_sent = false;
                 continue;
@@ -500,18 +564,48 @@ impl ToolParser for DeepSeekDsmlParser {
             }
         }
 
+        // Once the outer close tag is complete, discard all DSML framing and
+        // release only genuine trailing assistant text. In live V4 streams the
+        // closing sentinel is one token followed by the block-name pieces, so
+        // treating only the opening sentinel as DSML leaks the close tag.
+        if let Some(start) = self.buffer.find(self.block_close.as_str()) {
+            let tail = self.buffer[start + self.block_close.len()..].replace(EOS_TOKEN, "");
+            self.buffer.clear();
+            normal_text.push_str(&tail);
+        }
+
         Ok(StreamingParseResult {
-            normal_text: String::new(),
+            normal_text,
             calls: all_calls,
         })
     }
 
     fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains(self.block_open.as_str())
+        text.contains(DSML_OPEN_SENTINEL) || text.contains(DSML_CLOSE_SENTINEL)
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
+    }
+
+    fn completed_tool_call_count(&self) -> Option<usize> {
+        Some(self.completed_tool_call_count)
+    }
+
+    fn finish_incremental(&mut self) -> StreamingParseResult {
+        let marker_start = [DSML_OPEN_SENTINEL, DSML_CLOSE_SENTINEL]
+            .into_iter()
+            .filter_map(|marker| self.buffer.find(marker))
+            .min();
+        let normal_text = match marker_start {
+            Some(start) => self.buffer[..start].trim_end().to_string(),
+            None => std::mem::take(&mut self.buffer),
+        };
+        self.buffer.clear();
+        StreamingParseResult {
+            normal_text,
+            calls: Vec::new(),
+        }
     }
 
     fn reset(&mut self) {
@@ -520,5 +614,6 @@ impl ToolParser for DeepSeekDsmlParser {
         self.current_tool_id = -1;
         self.current_tool_name_sent = false;
         self.streamed_args_for_tool.clear();
+        self.completed_tool_call_count = 0;
     }
 }
