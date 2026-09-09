@@ -7,8 +7,10 @@
 use std::{
     collections::HashMap,
     fs::{read_dir, remove_file, OpenOptions},
+    future::Future,
     io::Write,
     path::{Path, PathBuf},
+    pin::Pin,
     process,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -17,6 +19,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use futures::future::select_all;
 use futures_util::StreamExt;
 use memmap2::MmapOptions;
 use rand::RngExt;
@@ -1502,16 +1505,70 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Number of parallel samples requested (vLLM only; 1 when unset).
+    /// Number of parallel samples requested (1 when unset). vLLM, SGLang
+    /// and TokenSpeed carry it in their sampling params; the others have no
+    /// per-request sample count.
     pub fn sampling_n(&self) -> u32 {
+        let n = match self {
+            Self::Vllm(req) => req.sampling_params.as_ref().map(|p| p.n),
+            Self::Sglang(req) => req.sampling_params.as_ref().map(|p| p.n),
+            Self::TokenSpeed(req) => req.sampling_params.as_ref().map(|p| p.n),
+            Self::Trtllm(_) | Self::Mlx(_) => None,
+        };
+        n.filter(|&n| n > 0).unwrap_or(1)
+    }
+
+    /// Set the number of parallel samples (engines without the field ignore it).
+    pub fn set_sampling_n(&mut self, n: u32) {
         match self {
-            Self::Vllm(req) => req
-                .sampling_params
-                .as_ref()
-                .map(|p| p.n)
-                .filter(|&n| n > 0)
-                .unwrap_or(1),
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 1,
+            Self::Vllm(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    params.n = n;
+                }
+            }
+            Self::Sglang(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    params.n = n;
+                }
+            }
+            Self::TokenSpeed(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    params.n = n;
+                }
+            }
+            Self::Trtllm(_) | Self::Mlx(_) => {}
+        }
+    }
+
+    /// Offset an explicit sampling seed so fanned-out samples stay distinct
+    /// yet deterministic; an unset seed stays unset (the engine then seeds
+    /// each request on its own). Engines without a seed field ignore it.
+    pub fn offset_sampling_seed(&mut self, offset: u32) {
+        match self {
+            Self::Vllm(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    let offset = i32::try_from(offset).unwrap_or(i32::MAX);
+                    params.seed = params.seed.map(|seed| seed.wrapping_add(offset));
+                }
+            }
+            Self::TokenSpeed(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    params.sampling_seed = params
+                        .sampling_seed
+                        .map(|seed| seed.wrapping_add(u64::from(offset)));
+                }
+            }
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) => {}
+        }
+    }
+
+    /// Whether the request carries multimodal inputs.
+    pub fn has_mm_inputs(&self) -> bool {
+        match self {
+            Self::Sglang(req) => req.mm_inputs.is_some(),
+            Self::Vllm(req) => req.mm_inputs.is_some(),
+            Self::TokenSpeed(req) => req.mm_inputs.is_some(),
+            Self::Trtllm(_) | Self::Mlx(_) => false,
         }
     }
 
@@ -1595,6 +1652,53 @@ pub enum ProtoGenerateResponse {
 }
 
 impl ProtoGenerateResponse {
+    /// Stamp the choice index on a chunk or complete. A fanned-out n>1
+    /// sample reports index 0 from its own engine request; the fan-out
+    /// restamps it with the sample's position.
+    pub fn set_index(&mut self, index: u32) {
+        match self {
+            Self::Sglang(resp) => match resp.response.as_mut() {
+                Some(sglang::generate_response::Response::Chunk(chunk)) => chunk.index = index,
+                Some(sglang::generate_response::Response::Complete(complete)) => {
+                    complete.index = index;
+                }
+                None => {}
+            },
+            Self::Vllm(resp) => match resp.response.as_mut() {
+                Some(vllm::generate_response::Response::Chunk(chunk)) => chunk.index = index,
+                Some(vllm::generate_response::Response::Complete(complete)) => {
+                    complete.index = index;
+                }
+                None => {}
+            },
+            Self::Trtllm(resp) => match resp.response.as_mut() {
+                Some(trtllm::generate_response::Response::Chunk(chunk)) => {
+                    chunk.sequence_index = index;
+                }
+                Some(trtllm::generate_response::Response::Complete(complete)) => {
+                    complete.sequence_index = index;
+                }
+                None => {}
+            },
+            Self::Mlx(resp) => match resp.response.as_mut() {
+                Some(mlx::generate_response::Response::Chunk(chunk)) => chunk.index = index,
+                Some(mlx::generate_response::Response::Complete(complete)) => {
+                    complete.index = index;
+                }
+                None => {}
+            },
+            Self::TokenSpeed(resp) => match resp.response.as_mut() {
+                Some(tokenspeed::generate_response::Response::Chunk(chunk)) => {
+                    chunk.index = index;
+                }
+                Some(tokenspeed::generate_response::Response::Complete(complete)) => {
+                    complete.index = index;
+                }
+                None => {}
+            },
+        }
+    }
+
     /// Get the response variant (chunk, complete, or error)
     ///
     /// Consumes self to avoid cloning large proto messages in hot streaming path
@@ -2158,6 +2262,9 @@ pub enum ProtoStream {
     /// ZMQ backend: a custom stream yielding vLLM-proto responses built from
     /// EngineCore outputs. Auto-aborts on drop, so `mark_completed` is a no-op.
     Zmq(ZmqGenerateStream),
+    /// An n>1 fan-out over rendezvous-room PD pairs: one child per sample,
+    /// each response stamped with its sample's index (see [`FanoutStream`]).
+    Fanout(FanoutStream),
 }
 
 impl ProtoStream {
@@ -2196,6 +2303,7 @@ impl ProtoStream {
                 .next()
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
+            Self::Fanout(stream) => stream.next().await,
         }
     }
 
@@ -2208,6 +2316,7 @@ impl ProtoStream {
             Self::Mlx(stream) => stream.mark_completed(),
             Self::TokenSpeed(stream) => stream.mark_completed(),
             Self::Zmq(stream) => stream.mark_completed(),
+            Self::Fanout(stream) => stream.mark_completed(),
         }
     }
 
@@ -2228,6 +2337,133 @@ impl ProtoStream {
             Self::Mlx(stream) => Self::Mlx(stream.defer_abort_until_first_item()),
             Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_until_first_item()),
             Self::Zmq(stream) => Self::Zmq(stream),
+            Self::Fanout(stream) => Self::Fanout(stream.defer_abort_until_first_item()),
+        }
+    }
+}
+
+impl FanoutChild for ProtoStream {
+    fn next_item(
+        &mut self,
+    ) -> impl Future<Output = Option<Result<ProtoGenerateResponse, tonic::Status>>> + Send {
+        self.next()
+    }
+
+    fn mark_completed(&mut self) {
+        Self::mark_completed(self);
+    }
+
+    fn defer_abort_until_first_item(self) -> Self {
+        Self::defer_abort_until_first_item(self)
+    }
+}
+
+/// What a fan-out needs from a child stream. Implemented by [`ProtoStream`];
+/// tests implement it on a scripted child.
+pub trait FanoutChild: Send {
+    /// The child's next response, or `None` once it has ended.
+    fn next_item(
+        &mut self,
+    ) -> impl Future<Output = Option<Result<ProtoGenerateResponse, tonic::Status>>> + Send;
+
+    /// Mark the child completed so dropping it sends no abort.
+    fn mark_completed(&mut self);
+
+    /// Defer the child's abort-on-drop until its first response.
+    #[must_use]
+    fn defer_abort_until_first_item(self) -> Self;
+}
+
+/// One child per sample of an n>1 fan-out over rendezvous-room PD pairs.
+///
+/// Each child is a single-sample dispatch whose responses report choice
+/// index 0; the fan-out restamps them with the child's position, so the
+/// pipeline demuxes the merged stream exactly like an engine-native n>1
+/// stream. Children are polled together, starting from a rotating cursor so
+/// a chatty child cannot starve its siblings, and are retired as they end;
+/// the fan-out ends with the last child. Dropping it drops every child, so
+/// each leg keeps its abort-on-drop, and `mark_completed` reaches every
+/// child.
+pub struct FanoutStream<C = ProtoStream> {
+    children: Vec<Option<C>>,
+    cursor: usize,
+}
+
+type FanoutItem = Option<Result<ProtoGenerateResponse, tonic::Status>>;
+/// One child's pending `next_item`, tagged with the child's position.
+type FanoutPoll<'a> = Pin<Box<dyn Future<Output = (usize, FanoutItem)> + Send + 'a>>;
+
+impl<C: FanoutChild> FanoutStream<C> {
+    pub fn new(children: Vec<C>) -> Self {
+        Self {
+            children: children.into_iter().map(Some).collect(),
+            cursor: 0,
+        }
+    }
+
+    /// Children that have not ended yet.
+    pub fn open_children(&self) -> usize {
+        self.children.iter().flatten().count()
+    }
+
+    /// Next response from any open child, stamped with that child's index.
+    pub async fn next(&mut self) -> FanoutItem {
+        loop {
+            let len = self.children.len();
+            if len == 0 {
+                return None;
+            }
+            let start = self.cursor % len;
+            self.cursor = (start + 1) % len;
+            // Open children before the cursor go to the back of the poll
+            // order, so the cursor rotates which child gets the first look.
+            let skip = self.children[..start].iter().flatten().count();
+            let mut polls: Vec<FanoutPoll<'_>> = self
+                .children
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(position, child)| {
+                    child.as_mut().map(|child| {
+                        let poll: FanoutPoll<'_> =
+                            Box::pin(async move { (position, child.next_item().await) });
+                        poll
+                    })
+                })
+                .collect();
+            if polls.is_empty() {
+                return None;
+            }
+            let rotate = skip % polls.len();
+            polls.rotate_left(rotate);
+            let ((position, item), _, _) = select_all(polls).await;
+            match item {
+                Some(Ok(mut response)) => {
+                    response.set_index(u32::try_from(position).unwrap_or(u32::MAX));
+                    return Some(Ok(response));
+                }
+                Some(Err(status)) => return Some(Err(status)),
+                None => self.children[position] = None,
+            }
+        }
+    }
+
+    /// Mark every open child completed.
+    pub fn mark_completed(&mut self) {
+        for child in self.children.iter_mut().flatten() {
+            child.mark_completed();
+        }
+    }
+
+    /// Defer every open child's abort-on-drop until its first response.
+    #[must_use]
+    pub fn defer_abort_until_first_item(self) -> Self {
+        Self {
+            children: self
+                .children
+                .into_iter()
+                .map(|child| child.map(FanoutChild::defer_abort_until_first_item))
+                .collect(),
+            cursor: self.cursor,
         }
     }
 }
@@ -2332,6 +2568,172 @@ impl ProtoEmbedComplete {
             Self::Sglang(r) => r.embedding_dim,
             Self::Vllm(r) => r.embedding_dim,
         }
+    }
+}
+
+#[cfg(test)]
+mod fanout_tests {
+    use std::{
+        collections::VecDeque,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
+
+    use super::*;
+
+    /// A child that yields a script, then ends.
+    struct Scripted {
+        items: VecDeque<Result<ProtoGenerateResponse, tonic::Status>>,
+        completed: Arc<AtomicBool>,
+    }
+
+    impl FanoutChild for Scripted {
+        fn next_item(
+            &mut self,
+        ) -> impl Future<Output = Option<Result<ProtoGenerateResponse, tonic::Status>>> + Send
+        {
+            let item = self.items.pop_front();
+            async move { item }
+        }
+
+        fn mark_completed(&mut self) {
+            self.completed.store(true, Ordering::SeqCst);
+        }
+
+        fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+    }
+
+    fn chunk(text: &str) -> ProtoGenerateResponse {
+        ProtoGenerateResponse::Sglang(Box::new(sglang::GenerateResponse {
+            response: Some(sglang::generate_response::Response::Chunk(
+                sglang::GenerateStreamChunk {
+                    token_ids: vec![text.len() as u32],
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }))
+    }
+
+    fn complete() -> ProtoGenerateResponse {
+        ProtoGenerateResponse::Sglang(Box::new(sglang::GenerateResponse {
+            response: Some(sglang::generate_response::Response::Complete(
+                sglang::GenerateComplete::default(),
+            )),
+            ..Default::default()
+        }))
+    }
+
+    fn child(items: Vec<ProtoGenerateResponse>) -> (Scripted, Arc<AtomicBool>) {
+        let completed = Arc::new(AtomicBool::new(false));
+        let child = Scripted {
+            items: items.into_iter().map(Ok).collect(),
+            completed: Arc::clone(&completed),
+        };
+        (child, completed)
+    }
+
+    fn index_of(response: ProtoGenerateResponse) -> u32 {
+        match response.into_response() {
+            ProtoResponseVariant::Chunk(chunk) => chunk.index(),
+            ProtoResponseVariant::Complete(complete) => complete.index(),
+            ProtoResponseVariant::None => u32::MAX,
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_stamps_each_childs_position_and_ends_with_the_last_child() {
+        let (first, first_done) = child(vec![chunk("a"), chunk("aa"), complete()]);
+        let (second, second_done) = child(vec![chunk("b"), complete()]);
+        let mut fanout = FanoutStream::new(vec![first, second]);
+
+        let mut indices = Vec::new();
+        while let Some(item) = fanout.next().await {
+            indices.push(index_of(item.unwrap()));
+        }
+        assert_eq!(indices.len(), 5);
+        assert_eq!(indices.iter().filter(|&&i| i == 0).count(), 3);
+        assert_eq!(indices.iter().filter(|&&i| i == 1).count(), 2);
+        // The rotating cursor lets the second child in before the first drains.
+        assert_ne!(indices[0], indices[1]);
+        assert_eq!(fanout.open_children(), 0);
+        assert!(fanout.next().await.is_none());
+
+        assert!(!first_done.load(Ordering::SeqCst));
+        fanout.mark_completed();
+        // Ended children were retired; only open children get marked.
+        assert!(!first_done.load(Ordering::SeqCst));
+        assert!(!second_done.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn fanout_mark_completed_reaches_every_open_child() {
+        let (first, first_done) = child(vec![chunk("a")]);
+        let (second, second_done) = child(vec![chunk("b")]);
+        let mut fanout = FanoutStream::new(vec![first, second]);
+        assert_eq!(fanout.open_children(), 2);
+        fanout.mark_completed();
+        assert!(first_done.load(Ordering::SeqCst));
+        assert!(second_done.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn fanout_passes_a_child_error_through() {
+        let (first, _) = child(vec![chunk("a")]);
+        let second = Scripted {
+            items: VecDeque::from([Err(tonic::Status::internal("leg died"))]),
+            completed: Arc::new(AtomicBool::new(false)),
+        };
+        let mut fanout = FanoutStream::new(vec![second, first]);
+        let first_item = fanout.next().await.unwrap();
+        assert!(matches!(first_item, Err(status) if status.message() == "leg died"));
+    }
+
+    #[test]
+    fn set_index_restamps_chunks_and_completes() {
+        let mut response = chunk("x");
+        response.set_index(3);
+        assert_eq!(index_of(response), 3);
+        let mut response = complete();
+        response.set_index(2);
+        assert_eq!(index_of(response), 2);
+    }
+
+    #[test]
+    fn sampling_n_reads_and_writes_the_room_based_engines() {
+        let mut sglang_req = ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
+            sampling_params: Some(sglang::SamplingParams {
+                n: 4,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(sglang_req.sampling_n(), 4);
+        sglang_req.set_sampling_n(1);
+        assert_eq!(sglang_req.sampling_n(), 1);
+        assert!(!sglang_req.has_mm_inputs());
+
+        let mut tokenspeed_req =
+            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed::GenerateRequest {
+                sampling_params: Some(tokenspeed::SamplingParams {
+                    n: 0,
+                    sampling_seed: Some(5),
+                    ..Default::default()
+                }),
+                mm_inputs: Some(tokenspeed::MultimodalInputs::default()),
+                ..Default::default()
+            }));
+        assert_eq!(tokenspeed_req.sampling_n(), 1, "0 means unset");
+        assert!(tokenspeed_req.has_mm_inputs());
+        tokenspeed_req.offset_sampling_seed(2);
+        let ProtoGenerateRequest::TokenSpeed(req) = &tokenspeed_req else {
+            panic!("runtime changed");
+        };
+        assert_eq!(req.sampling_params.as_ref().unwrap().sampling_seed, Some(7));
     }
 }
 

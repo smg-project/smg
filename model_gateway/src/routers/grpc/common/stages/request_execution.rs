@@ -6,7 +6,10 @@ use axum::response::Response;
 use futures::future::{join_all, try_join_all};
 use tracing::{debug, error, info_span, Instrument};
 
-use super::pd_protocol::{DpPlacement, PdDispatch, PdProtocol};
+use super::{
+    helpers::{maybe_inject_pd_metadata, maybe_inject_pd_rendezvous},
+    pd_protocol::{DpPlacement, PdDispatch, PdProtocol},
+};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
@@ -25,8 +28,8 @@ use crate::{
                 ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
             },
             proto_wrapper::{
-                ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest, ProtoResponseVariant,
-                ProtoStream,
+                FanoutStream, ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest,
+                ProtoResponseVariant, ProtoStream,
             },
             utils::tonic_ext::{TonicResultExt, TonicStatusExt},
         },
@@ -97,15 +100,74 @@ enum PdDispatchOutcome {
     },
 }
 
-/// Backend requests one plan dispatches — one per batched prompt, else one.
+/// Backend requests one plan dispatches — one per batched prompt, times the
+/// PD fan-out width where a parallel PD request asks for n>1 samples.
 ///
 /// This is both the load-guard scale and the number of PD bootstrap rooms the
 /// plan will post, which is why admission and the guards read the same count.
-fn plan_sub_requests(plan: &ExecutionPlan) -> usize {
+fn plan_sub_requests(plan: &ExecutionPlan, workers: Option<&WorkerSelection>) -> usize {
+    let protocol = workers
+        .and_then(WorkerSelection::disaggregated_runtime_type)
+        .and_then(|runtime| PdProtocol::for_runtime(*runtime));
+    let width = |request: &ProtoGenerateRequest| {
+        protocol
+            .and_then(|protocol| pd_fanout_width(request, protocol))
+            .map_or(1, |n| n as usize)
+    };
     match plan {
-        ExecutionPlan::Batch { requests, .. } => requests.len(),
-        _ => 1,
+        ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::Single,
+            requests,
+            ..
+        } => requests.len(),
+        ExecutionPlan::Batch { requests, .. } => requests.iter().map(width).sum(),
+        ExecutionPlan::PrefillDecode(request) | ExecutionPlan::EncodePrefillDecode { request } => {
+            width(request)
+        }
+        ExecutionPlan::Single(_) => 1,
     }
+}
+
+/// Fan-out width for a parallel PD dispatch: `n` when the request asks for
+/// more than one sample of a text-only prompt, else `None`.
+///
+/// A rendezvous room serves one sample. The engines that rendezvous on a
+/// room broadcast the request's single room to every sample of an n>1
+/// request: each of the decode's children then pre-allocates against the
+/// same room, and the prefill either rejects the repeats (TokenSpeed) or
+/// serves one child while the rest wait on KV that never comes. So each
+/// sample becomes its own single-sample PD dispatch with its own room, and
+/// the merged streams stamp every child's position as the choice index. A
+/// multimodal payload travels as one SHM segment that the prefill unlinks on
+/// read, so it cannot be handed to n prefills; those requests keep the
+/// single dispatch.
+fn pd_fanout_width(request: &ProtoGenerateRequest, protocol: PdProtocol) -> Option<u32> {
+    if protocol.dispatch != PdDispatch::Parallel || request.has_mm_inputs() {
+        return None;
+    }
+    let n = request.sampling_n();
+    (n > 1).then_some(n)
+}
+
+/// Split an n>1 request into `n` single-sample sub-requests. Sub `i` carries
+/// engine id `{id}-{i}`, `n = 1`, a seed offset of `i` when the request
+/// pinned a seed, and whatever rendezvous `remint` stamps on it.
+fn fan_out_pd_request(
+    request: &ProtoGenerateRequest,
+    n: u32,
+    mut remint: impl FnMut(&mut ProtoGenerateRequest),
+) -> Vec<ProtoGenerateRequest> {
+    let base_id = request.request_id().to_string();
+    (0..n)
+        .map(|i| {
+            let mut sub = request.clone();
+            sub.set_request_id(format!("{base_id}-{i}"));
+            sub.set_sampling_n(1);
+            sub.offset_sampling_seed(i);
+            remint(&mut sub);
+            sub
+        })
+        .collect()
 }
 
 /// Metric connection labels for the PD legs (a leg can be gRPC or ZMQ).
@@ -135,7 +197,7 @@ pub(crate) async fn execute_plan(
     // completion fans out one PD dispatch per sub-request, so admission has
     // to claim for all of them or the siblings walk past a gate that only
     // ever asked about one.
-    let sub_requests = plan_sub_requests(&execution_plan);
+    let sub_requests = plan_sub_requests(&execution_plan, ctx.workers.as_ref());
 
     // Admission runs before this attempt claims anything else. The decode
     // leg's engine window is what clears the prefill's bootstrap deadline, so
@@ -271,10 +333,77 @@ async fn execute_pd_dispatch(
         PdDispatch::Sequential => {
             execute_sequential_pd(proto_request, clients, workers, model).await
         }
-        PdDispatch::Parallel => {
-            execute_parallel_pd(proto_request, clients, workers, protocol).await
-        }
+        PdDispatch::Parallel => match pd_fanout_width(&proto_request, protocol) {
+            Some(n) => execute_fanout_pd(proto_request, n, clients, workers, protocol).await,
+            None => execute_parallel_pd(proto_request, clients, workers, protocol).await,
+        },
     }
+}
+
+/// Dispatch an n>1 request as `n` concurrent single-sample PD pairs, each
+/// with its own rendezvous room, and merge their legs into one PD result
+/// whose responses carry the sample index. Fail-fast: the first pair that
+/// fails to start fails the request, and dropping the others aborts them.
+async fn execute_fanout_pd(
+    proto_request: ProtoGenerateRequest,
+    n: u32,
+    clients: &mut ClientSelection,
+    workers: &WorkerSelection,
+    protocol: PdProtocol,
+) -> Result<ExecutionResult, Response> {
+    let subs = fan_out_pd_request(&proto_request, n, |sub| {
+        maybe_inject_pd_metadata(sub, workers);
+        maybe_inject_pd_rendezvous(sub, workers);
+    });
+    debug!(
+        request_id = proto_request.request_id(),
+        samples = n,
+        "PD fan-out: one single-sample pair per sample, each with its own room"
+    );
+    let dispatches = subs.into_iter().map(|sub| {
+        let mut clients = clients.clone();
+        async move { execute_parallel_pd(sub, &mut clients, workers, protocol).await }
+    });
+    let results = try_join_all(dispatches).await?;
+
+    let mut prefills = Vec::with_capacity(results.len());
+    let mut decodes = Vec::with_capacity(results.len());
+    let mut timing: Option<PdTiming> = None;
+    for result in results {
+        let ExecutionResult::PrefillDecode {
+            prefill,
+            decode,
+            pd_timing,
+        } = result
+        else {
+            error!(
+                function = "execute_fanout_pd",
+                "PD fan-out child returned a non-PD result"
+            );
+            return Err(error::internal_error(
+                "pd_fanout_unexpected_result",
+                "PD fan-out child returned a non-PD result",
+            ));
+        };
+        prefills.push(prefill);
+        decodes.push(*decode);
+        // The earliest prefill start anchors the merged request's TTFT.
+        timing = Some(match timing {
+            Some(earliest) if earliest.prefill_start <= pd_timing.prefill_start => earliest,
+            _ => pd_timing,
+        });
+    }
+    let Some(pd_timing) = timing else {
+        return Err(error::internal_error(
+            "pd_fanout_empty",
+            "PD fan-out produced no dispatch",
+        ));
+    };
+    Ok(ExecutionResult::PrefillDecode {
+        prefill: ProtoStream::Fanout(FanoutStream::new(prefills)),
+        decode: Box::new(ProtoStream::Fanout(FanoutStream::new(decodes))),
+        pd_timing,
+    })
 }
 
 async fn execute_epd_dispatch(
@@ -954,10 +1083,149 @@ async fn execute_sequential_pd(
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use smg_grpc_client::{tokenspeed_proto as ts, vllm_proto as vllm};
+    use smg_grpc_client::{sglang_proto as sglang, tokenspeed_proto as ts, vllm_proto as vllm};
 
     use super::*;
     use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType};
+
+    fn tokenspeed_request(n: u32, seed: Option<u64>) -> ProtoGenerateRequest {
+        ProtoGenerateRequest::TokenSpeed(Box::new(ts::GenerateRequest {
+            request_id: "req".to_string(),
+            sampling_params: Some(ts::SamplingParams {
+                n,
+                sampling_seed: seed,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+
+    fn tokenspeed_pair() -> WorkerSelection {
+        let leg = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(worker_type)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .build(),
+            )
+        };
+        WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: leg("grpc://prefill:30000", WorkerType::Prefill),
+            decode: leg("grpc://decode:30000", WorkerType::Decode),
+            runtime_type: RuntimeType::TokenSpeed,
+        }
+    }
+
+    #[test]
+    fn pd_fanout_width_applies_to_multi_sample_text_requests_on_parallel_pd() {
+        let tokenspeed = PdProtocol::for_runtime(RuntimeType::TokenSpeed).unwrap();
+        assert_eq!(
+            pd_fanout_width(&tokenspeed_request(3, None), tokenspeed),
+            Some(3)
+        );
+        assert_eq!(
+            pd_fanout_width(&tokenspeed_request(1, None), tokenspeed),
+            None
+        );
+        assert_eq!(
+            pd_fanout_width(&tokenspeed_request(0, None), tokenspeed),
+            None
+        );
+
+        let sglang = ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
+            request_id: "req".to_string(),
+            sampling_params: Some(sglang::SamplingParams {
+                n: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(
+            pd_fanout_width(
+                &sglang,
+                PdProtocol::for_runtime(RuntimeType::Sglang).unwrap()
+            ),
+            Some(2)
+        );
+
+        // A multimodal payload cannot be handed to n prefills.
+        let mut multimodal = tokenspeed_request(3, None);
+        if let ProtoGenerateRequest::TokenSpeed(req) = &mut multimodal {
+            req.mm_inputs = Some(ts::MultimodalInputs::default());
+        }
+        assert_eq!(pd_fanout_width(&multimodal, tokenspeed), None);
+
+        // The sequential (vLLM) path relays one KV handoff and already
+        // skips it for n>1; no fan-out there.
+        let vllm = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: "req".to_string(),
+            sampling_params: Some(vllm::SamplingParams {
+                n: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(
+            pd_fanout_width(&vllm, PdProtocol::for_runtime(RuntimeType::Vllm).unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn fan_out_pd_request_gives_each_sample_its_own_id_seed_and_room() {
+        let request = tokenspeed_request(3, Some(7));
+        let mut next_room = 100;
+        let subs = fan_out_pd_request(&request, 3, |sub| {
+            sub.set_kv_bootstrap_info("prefill".to_string(), 8998, next_room);
+            next_room += 1;
+        });
+        assert_eq!(subs.len(), 3);
+        let mut rooms = Vec::new();
+        for (i, sub) in subs.iter().enumerate() {
+            assert_eq!(sub.request_id(), format!("req-{i}"));
+            assert_eq!(sub.sampling_n(), 1);
+            let ProtoGenerateRequest::TokenSpeed(req) = sub else {
+                panic!("sub-request changed runtime");
+            };
+            let params = req.sampling_params.as_ref().unwrap();
+            assert_eq!(params.sampling_seed, Some(7 + i as u64));
+            rooms.push(req.kv_bootstrap_info.as_ref().unwrap().bootstrap_room);
+        }
+        assert_eq!(rooms, vec![100, 101, 102]);
+        // The original still asks for its three samples.
+        assert_eq!(request.sampling_n(), 3);
+    }
+
+    #[test]
+    fn fan_out_pd_request_leaves_an_unset_seed_unset() {
+        for sub in &fan_out_pd_request(&tokenspeed_request(2, None), 2, |_| {}) {
+            let ProtoGenerateRequest::TokenSpeed(req) = sub else {
+                panic!("sub-request changed runtime");
+            };
+            assert_eq!(req.sampling_params.as_ref().unwrap().sampling_seed, None);
+        }
+    }
+
+    #[test]
+    fn plan_sub_requests_counts_fanned_out_samples() {
+        let workers = tokenspeed_pair();
+        let fanned = ExecutionPlan::PrefillDecode(tokenspeed_request(4, None));
+        assert_eq!(plan_sub_requests(&fanned, Some(&workers)), 4);
+        // Without a disaggregated selection there is no PD protocol to fan out on.
+        assert_eq!(plan_sub_requests(&fanned, None), 1);
+
+        let plain = ExecutionPlan::PrefillDecode(tokenspeed_request(1, None));
+        assert_eq!(plan_sub_requests(&plain, Some(&workers)), 1);
+
+        let batch = ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::PrefillDecode,
+            shared_request_id: "cmpl-1".to_string(),
+            requests: vec![tokenspeed_request(2, None), tokenspeed_request(1, None)],
+        };
+        assert_eq!(plan_sub_requests(&batch, Some(&workers)), 3);
+    }
 
     /// A leg that never answers — the decode leg stuck behind the engine's
     /// transfer deadline while the prefill leg has already given up.
@@ -1023,7 +1291,7 @@ mod tests {
     #[test]
     fn plan_sub_requests_counts_every_batched_prompt() {
         let single = ExecutionPlan::PrefillDecode(ProtoGenerateRequest::Vllm(Box::default()));
-        assert_eq!(plan_sub_requests(&single), 1);
+        assert_eq!(plan_sub_requests(&single, None), 1);
 
         let batch = ExecutionPlan::Batch {
             kind: ExecutionPlanKind::PrefillDecode,
@@ -1032,7 +1300,7 @@ mod tests {
                 .map(|_| ProtoGenerateRequest::Vllm(Box::default()))
                 .collect(),
         };
-        assert_eq!(plan_sub_requests(&batch), 4);
+        assert_eq!(plan_sub_requests(&batch, None), 4);
     }
 
     #[test]
