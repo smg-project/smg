@@ -492,14 +492,7 @@ fn queue_due_probes(
         in_flight.insert(worker_id.clone());
         probes.push(Box::pin(async move {
             let probe_result = worker.check_health_async().await;
-            // A recovery, or a pending PD worker that registered before its
-            // engine reported an id.
-            let engine_may_have_changed = matches!(
-                launched_status,
-                WorkerStatus::Failed | WorkerStatus::NotReady
-            ) || (launched_status == WorkerStatus::Pending
-                && worker.kv_engine_id().is_none());
-            if probe_result.is_ok() && engine_may_have_changed {
+            if probe_result.is_ok() && engine_id_may_be_stale(launched_status, worker.as_ref()) {
                 let timeout = Duration::from_secs(health_config.timeout_secs.max(1));
                 refresh_kv_engine_id_after_recovery(&worker, timeout).await;
             }
@@ -709,6 +702,19 @@ fn schedule_worker_at(
         now,
         immediate,
     );
+}
+
+/// Whether a probe launched at `launched_status` that succeeds should re-read
+/// the worker's KV engine id: after a failure (the engine may be a new
+/// process), or while a worker that registered before its engine reported an
+/// id is still pending. A Ready or Draining worker, or a pending one that
+/// already has an id, is the same process registration read.
+fn engine_id_may_be_stale(launched_status: WorkerStatus, worker: &dyn Worker) -> bool {
+    match launched_status {
+        WorkerStatus::Failed | WorkerStatus::NotReady => true,
+        WorkerStatus::Pending => worker.kv_engine_id().is_none(),
+        WorkerStatus::Ready | WorkerStatus::Draining => false,
+    }
 }
 
 /// A PD worker that answers its probe again may be a new engine process on
@@ -1235,6 +1241,42 @@ mod tests {
             Arc,
         },
     };
+
+    /// The re-read gate: after a failure always, while pending only without
+    /// an id, never on a Ready or Draining probe.
+    #[test]
+    fn the_engine_id_is_re_read_after_a_failure_or_while_pending_without_one() {
+        let worker = |kv_engine_id: Option<&str>| -> Arc<dyn Worker> {
+            let mut builder = BasicWorkerBuilder::new("grpc://p:1")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("MooncakeConnector");
+            if let Some(id) = kv_engine_id {
+                builder = builder.kv_engine_id(id);
+            }
+            Arc::new(builder.build())
+        };
+        let with_id = worker(Some("eng"));
+        let without_id = worker(None);
+        let cases = [
+            (WorkerStatus::Failed, &with_id, true),
+            (WorkerStatus::NotReady, &with_id, true),
+            (WorkerStatus::Pending, &with_id, false),
+            (WorkerStatus::Pending, &without_id, true),
+            (WorkerStatus::Ready, &with_id, false),
+            (WorkerStatus::Ready, &without_id, false),
+            (WorkerStatus::Draining, &with_id, false),
+        ];
+        for (status, worker, expected) in cases {
+            assert_eq!(
+                engine_id_may_be_stale(status, worker.as_ref()),
+                expected,
+                "{status:?} with id {:?}",
+                worker.kv_engine_id()
+            );
+        }
+    }
 
     /// A recovered worker whose engine accepts the connection but never
     /// answers the metadata read must not hold the probe slot: the read
