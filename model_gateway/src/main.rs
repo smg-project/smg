@@ -14,9 +14,10 @@ use smg::{
     config::{
         resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
-        RoutingMode, SchemaConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PdPairingMode,
+        PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
+        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
+        TokenizerCacheConfig, TraceConfig,
     },
     observability::{
         metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
@@ -439,6 +440,18 @@ struct CliArgs {
         help_heading = "Routing Policy"
     )]
     routing_key_override: bool,
+
+    /// How strictly PD placement pairs a prefill with a decode on their KV
+    /// transfer protocol (transport, engine version, KV layout). `lenient`
+    /// lets a component an engine does not report pair with anything;
+    /// `strict` treats it as a mismatch.
+    #[arg(
+        long,
+        value_parser = ["lenient", "strict"],
+        default_value = "lenient",
+        help_heading = "Routing Policy"
+    )]
+    pd_pairing_mode: String,
 
     /// Ordered header names checked for the routing key; the first header
     /// present with a valid value wins. Header keys get the same
@@ -1907,6 +1920,7 @@ impl CliArgs {
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
+            .pd_pairing_mode(PdPairingMode::parse(&self.pd_pairing_mode).unwrap_or_default())
             .routing_key_override(RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval,

@@ -71,6 +71,9 @@ enum PdSelectionFailure {
     /// The pre-existing string: no workers configured, all unhealthy or
     /// circuit-broken, or the policy declined.
     Unavailable(String),
+    /// Both legs are up, but no prefill shares a KV transfer protocol with
+    /// any decode (#2483).
+    Incompatible(String),
 }
 
 #[derive(Debug)]
@@ -207,6 +210,10 @@ impl PDRouter {
             // counter; re-describing it as a circuit-breaker/health failure is
             // exactly the misdiagnosis this path used to hand operators.
             PdSelectionFailure::Shed(shed) => shed,
+            PdSelectionFailure::Incompatible(error) => {
+                error!("Failed to select PD pair error={}", error);
+                error::service_unavailable("no_compatible_pd_pair", error)
+            }
             PdSelectionFailure::Unavailable(error) => {
                 error!("Failed to select PD pair error={}", error);
                 // Same code the regular HTTP router and the gRPC routers use
@@ -1382,6 +1389,12 @@ impl PDRouter {
             PlacementFailure::PolicyDeclined(policy) => PdSelectionFailure::Unavailable(
                 format!("Policy {policy} failed to select a {leg} worker"),
             ),
+            PlacementFailure::NoCompatiblePair { prefill, decode } => {
+                PdSelectionFailure::Incompatible(format!(
+                    "No prefill/decode pair shares a KV transfer protocol \
+                     (prefill: {prefill:?}, decode: {decode:?})"
+                ))
+            }
         }
     }
 
@@ -1776,6 +1789,9 @@ impl RouterTrait for PDRouter {
                 // broken one already did.
                 Err(failure) => match *failure {
                     PdSelectionFailure::Shed(shed) => return shed,
+                    PdSelectionFailure::Incompatible(e) => {
+                        return error::service_unavailable("no_compatible_pd_pair", e);
+                    }
                     PdSelectionFailure::Unavailable(e) => {
                         return error::service_unavailable(
                             "no_healthy_worker_pair",
@@ -2364,6 +2380,9 @@ mod tests {
                 assert!(error.contains("No prefill workers available"));
             }
             PdSelectionFailure::Shed(_) => panic!("an empty fleet is not an overload shed"),
+            PdSelectionFailure::Incompatible(_) => {
+                panic!("an empty fleet has no pairing to be incompatible about")
+            }
         }
     }
 

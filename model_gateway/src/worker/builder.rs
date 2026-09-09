@@ -17,7 +17,10 @@ use super::{
         WorkerType,
     },
 };
-use crate::{observability::metrics::Metrics, routers::grpc::backend_client::BackendClient};
+use crate::{
+    observability::metrics::Metrics, routers::grpc::backend_client::BackendClient,
+    worker::pd_pairing::PdPairing,
+};
 
 /// Builder for creating BasicWorker instances with fluent API.
 ///
@@ -319,6 +322,7 @@ impl BasicWorkerBuilder {
 
         let metadata = WorkerMetadata {
             overload: OverloadThresholds::resolve(&self.spec.overload, self.overload_defaults),
+            pd_pairing: PdPairing::derive(&self.spec),
             spec: Arc::new(self.spec),
             health_config,
             health_endpoint: self.health_endpoint,

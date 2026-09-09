@@ -80,6 +80,12 @@ pub(crate) enum PlacementFailure {
     Unavailable,
     /// Available candidates existed but the named policy picked none.
     PolicyDeclined(&'static str),
+    /// Both legs had available workers, but no prefill shares a KV transfer
+    /// protocol with any decode (#2483). Carries each leg's pairing keys.
+    NoCompatiblePair {
+        prefill: Vec<String>,
+        decode: Vec<String>,
+    },
 }
 
 /// The two legs of a disaggregated placement, each the pool it selects over
@@ -219,6 +225,14 @@ pub(crate) fn single_failure(
 }
 
 /// Classify a failed placement from the candidates it drew from.
+/// The distinct pairing keys of one leg's candidates, sorted.
+fn pairing_keys(leg: &[Arc<dyn Worker>]) -> Vec<String> {
+    let mut keys: Vec<String> = leg.iter().map(|w| w.pd_pairing().key()).collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 pub(crate) fn failure_from(candidates: &[Arc<dyn Worker>], model_id: &str) -> PlacementFailure {
     if candidates.is_empty() {
         return PlacementFailure::NoCandidates;
@@ -304,6 +318,36 @@ pub(crate) fn select_pair(
         }
     }
 
+    // A rendezvous only works between legs that share a KV transfer
+    // protocol (transport, engine version, KV layout, or an explicit
+    // pairing protocol). Narrow the prefill pool to workers with at least
+    // one compatible decode, so the policy's pick always has a partner; the
+    // decode pool narrows to that pick's partners below.
+    let pairing_mode = policies.pd_pairing_mode();
+    let prefill_keys = pairing_keys(&prefill);
+    prefill.retain(|p| {
+        decode
+            .iter()
+            .any(|d| p.pd_pairing().compatible(d.pd_pairing(), pairing_mode))
+    });
+    if prefill.is_empty() {
+        let decode_keys = pairing_keys(&decode);
+        warn!(
+            model_id,
+            mode = pairing_mode.as_str(),
+            ?prefill_keys,
+            ?decode_keys,
+            "No prefill/decode pair shares a KV transfer protocol"
+        );
+        return Err(Box::new(PairFailure {
+            leg: WorkerLeg::Decode,
+            verdict: PlacementFailure::NoCompatiblePair {
+                prefill: prefill_keys,
+                decode: decode_keys,
+            },
+        }));
+    }
+
     // Independent prefill/decode policies so stateful ones (round robin) do
     // not share a counter; each leg tags the sticky key with its own prefix.
     let prefill_policy = policies.get_prefill_policy();
@@ -330,12 +374,18 @@ pub(crate) fn select_pair(
     let Some(prefill_idx) = policies.select_worker(&prefill_policy, &prefill, &info) else {
         return Err(declined(WorkerLeg::Prefill, prefill_policy.name()));
     };
+    let selected_prefill = prefill[prefill_idx].clone();
+    // Non-empty by construction: the prefill pool was narrowed to workers
+    // with a compatible decode.
+    decode.retain(|d| {
+        selected_prefill
+            .pd_pairing()
+            .compatible(d.pd_pairing(), pairing_mode)
+    });
     info.leg = WorkerLeg::Decode;
     let Some(decode_idx) = policies.select_worker(&decode_policy, &decode, &info) else {
         return Err(declined(WorkerLeg::Decode, decode_policy.name()));
     };
-
-    let selected_prefill = prefill[prefill_idx].clone();
     let selected_decode = decode[decode_idx].clone();
     Metrics::record_worker_selection(
         metrics_labels::WORKER_PREFILL,
@@ -363,11 +413,147 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::types::PolicyConfig,
+        config::types::{PdPairingMode, PolicyConfig},
         worker::{BasicWorkerBuilder, ModelCard, WorkerType},
     };
 
     const MODEL: &str = "m";
+
+    /// A vLLM gRPC PD fleet whose legs carry the given KV connectors
+    /// (`None` leaves the transport unknown).
+    fn pd_registry(workers: &[(&str, WorkerType, Option<&str>)]) -> WorkerRegistry {
+        let registry = WorkerRegistry::new();
+        for (url, worker_type, connector) in workers {
+            let mut builder = BasicWorkerBuilder::new(*url)
+                .model(ModelCard::new(MODEL))
+                .worker_type(*worker_type)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                });
+            if let Some(connector) = connector {
+                builder = builder.kv_connector(*connector);
+            }
+            registry
+                .register(Arc::new(builder.build()))
+                .expect("worker registers");
+        }
+        registry
+    }
+
+    fn pair_from(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+    ) -> Result<Pair, Box<PairFailure>> {
+        let snapshot = registry.get_routing_snapshot(MODEL);
+        let prefill = snapshot.pool(RoutingPool::GrpcPrefill);
+        let decode = snapshot.pool(RoutingPool::GrpcDecode);
+        select_pair(
+            registry,
+            policies,
+            MODEL,
+            PairCandidates {
+                prefill: &prefill,
+                decode: &decode,
+            },
+            None,
+            true,
+            PlacementInputs::default(),
+        )
+    }
+
+    #[test]
+    fn a_pair_shares_its_kv_transport() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("MooncakeConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("MooncakeConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let snapshot = registry.get_routing_snapshot(MODEL);
+        let prefill = snapshot.pool(RoutingPool::GrpcPrefill);
+        let decode = snapshot.pool(RoutingPool::GrpcDecode);
+
+        // Whichever prefill worker the policy is handed, the decode leg is
+        // narrowed to the worker that speaks the same transport.
+        for p in prefill.iter() {
+            let pair = select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                PairCandidates {
+                    prefill: std::slice::from_ref(p),
+                    decode: &decode,
+                },
+                None,
+                true,
+                PlacementInputs::default(),
+            )
+            .ok()
+            .expect("every prefill worker has a partner");
+            assert_eq!(pair.prefill.url(), p.url());
+            assert_eq!(
+                pair.prefill.pd_pairing().transport(),
+                pair.decode.pd_pairing().transport(),
+                "{} paired with {}",
+                pair.prefill.url(),
+                pair.decode.url()
+            );
+        }
+        // And the unnarrowed fleet still yields a matching pair.
+        let pair = pair_from(&registry, &policies)
+            .ok()
+            .expect("the fleet has matching pairs");
+        assert_eq!(
+            pair.prefill.pd_pairing().transport(),
+            pair.decode.pd_pairing().transport()
+        );
+    }
+
+    #[test]
+    fn a_fleet_without_a_shared_transport_names_both_legs() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("MooncakeConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+
+        let failure = pair_from(&registry, &policies)
+            .err()
+            .expect("no pair shares a transport");
+        assert_eq!(failure.leg, WorkerLeg::Decode);
+        match failure.verdict {
+            PlacementFailure::NoCompatiblePair { prefill, decode } => {
+                assert_eq!(prefill, ["vllm/nixl/?/?"]);
+                assert_eq!(decode, ["vllm/mooncake/?/?"]);
+            }
+            _ => panic!("expected NoCompatiblePair"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_transport_pairs_leniently_and_fails_strictly() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, None),
+        ]);
+
+        let lenient = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        assert!(pair_from(&registry, &lenient).is_ok());
+
+        let strict = PolicyRegistry::new(PolicyConfig::RoundRobin)
+            .with_pd_pairing_mode(PdPairingMode::Strict);
+        let failure = pair_from(&registry, &strict)
+            .err()
+            .expect("strict mode refuses an unknown transport");
+        assert!(matches!(
+            failure.verdict,
+            PlacementFailure::NoCompatiblePair { .. }
+        ));
+    }
 
     fn registry_with(workers: &[(&str, ConnectionMode, RuntimeType)]) -> WorkerRegistry {
         let typed: Vec<_> = workers

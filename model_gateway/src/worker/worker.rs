@@ -26,8 +26,8 @@ use tokio::{
 };
 
 use super::{
-    event::WorkerConnected, overload::OverloadThresholds, CircuitBreaker, ResolvedResilience,
-    WorkerError, WorkerResult, UNKNOWN_MODEL_ID,
+    event::WorkerConnected, overload::OverloadThresholds, pd_pairing::PdPairing, CircuitBreaker,
+    ResolvedResilience, WorkerError, WorkerResult, UNKNOWN_MODEL_ID,
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
@@ -425,6 +425,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Get worker-specific metadata
     fn metadata(&self) -> &WorkerMetadata;
+
+    /// The PD pairing descriptor placement compares across a prefill and a
+    /// decode.
+    fn pd_pairing(&self) -> &PdPairing {
+        &self.metadata().pd_pairing
+    }
 
     /// Worker-reported in-flight capacity, if available.
     ///
@@ -888,6 +894,9 @@ pub struct WorkerMetadata {
     /// `spec.http_pool.http2` when declared, else negotiated at registration
     /// under `upstream_http2`.
     pub http2: bool,
+    /// What this worker offers a PD rendezvous partner, derived once from
+    /// the spec and its discovered labels (#2483).
+    pub pd_pairing: PdPairing,
 }
 
 impl WorkerMetadata {
@@ -1954,6 +1963,9 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
     let metadata = worker.metadata();
     let spec = metadata.spec.clone();
     let status = worker.status();
+    // Only PD legs pair; a regular worker's descriptor would be noise.
+    let pd_pairing = matches!(spec.worker_type, WorkerType::Prefill | WorkerType::Decode)
+        .then(|| metadata.pd_pairing.key());
 
     WorkerInfo {
         id: worker.url().to_string(),
@@ -1963,6 +1975,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         status: Some(status),
         load: worker.load(),
         http2: metadata.http2,
+        pd_pairing,
         engine_load: None,
         job_status: None,
     }
@@ -2850,6 +2863,7 @@ mod tests {
     #[test]
     fn test_worker_metadata_empty_models_accepts_all() {
         let metadata = WorkerMetadata {
+            pd_pairing: PdPairing::derive(&WorkerSpec::new("http://test:8080")),
             spec: Arc::new(WorkerSpec::new("http://test:8080")),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
@@ -2875,6 +2889,7 @@ mod tests {
         let mut spec = WorkerSpec::new("http://test:8080");
         spec.models = WorkerModels::from(vec![model1, model2]);
         let metadata = WorkerMetadata {
+            pd_pairing: PdPairing::derive(&spec),
             spec: Arc::new(spec),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),

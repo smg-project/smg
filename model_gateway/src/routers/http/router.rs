@@ -515,12 +515,12 @@ impl Router {
                 ) {
                     PlacementFailure::NoCandidates => error::model_not_found(model_id),
                     PlacementFailure::AllOverloaded(shed) => shed,
-                    PlacementFailure::Unavailable | PlacementFailure::PolicyDeclined(_) => {
-                        error::service_unavailable(
-                            "no_available_workers",
-                            "All workers are unavailable (circuit breaker open or unhealthy)",
-                        )
-                    }
+                    PlacementFailure::Unavailable
+                    | PlacementFailure::PolicyDeclined(_)
+                    | PlacementFailure::NoCompatiblePair { .. } => error::service_unavailable(
+                        "no_available_workers",
+                        "All workers are unavailable (circuit breaker open or unhealthy)",
+                    ),
                 };
             }
         };
@@ -822,7 +822,8 @@ impl Router {
                 PlacementFailure::AllOverloaded(shed) => shed,
                 PlacementFailure::NoCandidates
                 | PlacementFailure::Unavailable
-                | PlacementFailure::PolicyDeclined(_) => {
+                | PlacementFailure::PolicyDeclined(_)
+                | PlacementFailure::NoCompatiblePair { .. } => {
                     // The verdict cannot tell a policy miss from a drained
                     // pool; the pool can.
                     let message = if non_dp_workers.iter().any(|w| w.is_available()) {

@@ -13,6 +13,7 @@ pub mod manager;
 pub mod metrics_aggregator;
 pub mod monitor;
 pub mod overload;
+pub mod pd_pairing;
 pub mod registry;
 pub mod resilience;
 pub mod sampling_defaults;
@@ -44,6 +45,7 @@ pub use openai_protocol::{
     worker::{ProviderType, WorkerGroupKey},
 };
 pub use overload::OverloadThresholds;
+pub use pd_pairing::{PairingMismatch, PdPairing};
 pub(crate) use registry::{ModelWorkerSnapshot, RoutingPool};
 pub use registry::{WorkerOrigin, WorkerRegistry};
 pub use resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_STATUS_CODES};

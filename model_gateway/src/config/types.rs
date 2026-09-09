@@ -43,6 +43,10 @@ pub struct RouterConfig {
     /// Per-request sticky-session routing (rid-lineage keys, header fallback).
     #[serde(default, alias = "sticky_sessions")]
     pub routing_key_override: RoutingKeyOverrideConfig,
+    /// How strictly PD placement pairs a prefill with a decode on their KV
+    /// transfer protocol (transport, engine version, KV layout).
+    #[serde(default)]
+    pub pd_pairing_mode: PdPairingMode,
     pub host: String,
     pub port: u16,
     /// Dedicated port for the isolated Kubernetes liveness/readiness/health
@@ -537,6 +541,39 @@ pub enum ManualAssignmentMode {
 /// configured header carrying a valid value is the fallback when no rid is
 /// present. An enabled override keeps automatic body forwarding buffered so
 /// body `rid` precedence is preserved.
+/// How strictly PD placement pairs a prefill with a decode on their KV
+/// transfer protocol (#2483). A descriptor component an engine does not report
+/// is "unknown": lenient pairing lets it match anything (a fleet that reports
+/// nothing keeps working), strict pairing treats it as a mismatch.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PdPairingMode {
+    /// Unknown components pair with anything; known components must agree.
+    #[default]
+    Lenient,
+    /// Every component must be known on both sides and agree.
+    Strict,
+}
+
+impl PdPairingMode {
+    /// Parse the CLI spelling (`lenient` / `strict`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "lenient" => Some(Self::Lenient),
+            "strict" => Some(Self::Strict),
+            _ => None,
+        }
+    }
+
+    /// The CLI spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lenient => "lenient",
+            Self::Strict => "strict",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingKeyOverrideConfig {
     /// When false, policies are used unchanged.
@@ -1063,6 +1100,7 @@ impl Default for RouterConfig {
             policy: PolicyConfig::Random,
             cache_boundaries: Vec::new(),
             routing_key_override: RoutingKeyOverrideConfig::default(),
+            pd_pairing_mode: PdPairingMode::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
             health_check_port: None,

@@ -686,6 +686,12 @@ pub struct WorkerSpec {
     /// Typically matches the backend engine's page size (e.g. 16 for SGLang).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_block_size: Option<usize>,
+    /// Explicit PD pairing protocol. A prefill and a decode with this set
+    /// pair only when the values are equal, and nothing derived about their
+    /// transport, engine version or KV layout is compared. Absent: the router
+    /// derives the pairing descriptor from the worker's discovered labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing_protocol: Option<String>,
 
     /// Per-worker health check overrides (partial — only `Some` fields override router defaults).
     #[serde(default, skip_serializing_if = "HealthCheckUpdate::is_empty")]
@@ -758,6 +764,7 @@ impl WorkerSpec {
             kv_role: None,
             kv_engine_id: None,
             kv_block_size: None,
+            pairing_protocol: None,
             health: HealthCheckUpdate::default(),
             http_pool: HttpPoolConfig::default(),
             resilience: ResilienceUpdate::default(),
@@ -866,6 +873,13 @@ pub struct WorkerInfo {
     #[serde(default)]
     pub http2: bool,
 
+    /// The effective PD pairing key of a prefill or decode worker: the
+    /// explicit `pairing_protocol`, else the descriptor derived from the
+    /// engine's labels (`runtime/transport/version/layout`). Prefill and
+    /// decode workers pair only within one key. Absent on regular workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pd_pairing: Option<String>,
+
     /// The worker's last polled engine load, as published by the load
     /// monitor. `None` when load monitoring has produced nothing for this
     /// worker yet. Unrelated to `load` above, which counts in-flight
@@ -888,6 +902,7 @@ impl WorkerInfo {
             status: Some(WorkerStatus::Pending),
             load: 0,
             http2: false,
+            pd_pairing: None,
             engine_load: None,
             job_status,
         }

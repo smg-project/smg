@@ -358,7 +358,9 @@ impl WorkerSelectionStage {
             };
             match verdict {
                 PlacementFailure::AllOverloaded(shed) => return shed,
-                PlacementFailure::Unavailable | PlacementFailure::PolicyDeclined(_) => {
+                PlacementFailure::Unavailable
+                | PlacementFailure::PolicyDeclined(_)
+                | PlacementFailure::NoCompatiblePair { .. } => {
                     unavailable = true;
                 }
                 PlacementFailure::NoCandidates => {}
@@ -403,6 +405,23 @@ impl WorkerSelectionStage {
             PlacementFailure::AllOverloaded(shed) => shed,
             PlacementFailure::Unavailable | PlacementFailure::PolicyDeclined(_) => {
                 self.workers_unavailable(model_id)
+            }
+            PlacementFailure::NoCompatiblePair { prefill, decode } => {
+                error!(
+                    function = "WorkerSelectionStage::execute",
+                    mode = ?self.mode,
+                    model_id = %model_id,
+                    ?prefill,
+                    ?decode,
+                    "No prefill/decode pair shares a KV transfer protocol"
+                );
+                error::service_unavailable(
+                    "no_compatible_pd_pair",
+                    format!(
+                        "No prefill/decode pair for model '{model_id}' shares a KV transfer \
+                         protocol (prefill: {prefill:?}, decode: {decode:?})"
+                    ),
+                )
             }
             PlacementFailure::NoCandidates => {
                 error!(
