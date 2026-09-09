@@ -43,7 +43,7 @@ from pathlib import Path
 import httpx
 import pytest
 from infra import ConnectionMode, Gateway, WorkerType, cleanup_pool, start_workers, stop_workers
-from infra.constants import get_runtime, is_tokenspeed
+from infra.constants import get_runtime, is_sglang, is_tokenspeed
 from infra.model_specs import get_model_spec
 from infra.pd_logs import LOG_FLUSH_TIMEOUT_S, read_logs, worker_log_dir
 
@@ -90,12 +90,13 @@ _TOPOLOGIES = (
     ]
     + [
         # The HTTP PD router is its own code path (pairing, KV handoff, error
-        # answers); SGLang is the only engine that serves it.
+        # answers). SGLang and vLLM both serve it; the TokenSpeed e2e worker
+        # has no HTTP frontend.
         pytest.param(
             ("pd_http", (p, d)),
             id=f"{p}p{d}d-http",
             marks=pytest.mark.skip_for_runtime(
-                "vllm", "tokenspeed", reason="HTTP PD is SGLang-only"
+                "tokenspeed", reason="the TokenSpeed e2e worker has no HTTP frontend"
             ),
         )
         for p, d in [(1, 1), (2, 2)]
@@ -514,11 +515,12 @@ class TestPDTopology:
     def test_batched_completion_serves_every_choice(self, setup_backend, request):
         """Every choice of an ``n>1`` request must come back through the PD pair."""
         mode, model, _, gateway = setup_backend
-        if mode == "pd_http":
+        if mode == "pd_http" and is_sglang():
             # Same shape as the TokenSpeed gRPC case: the HTTP PD router mints
             # one room for a single-prompt request whatever ``n`` is, the engine
             # broadcasts it to every sample, and the decode's children wait on
-            # a transfer that never comes until the decode aborts them.
+            # a transfer that never comes until the decode aborts them. vLLM
+            # over HTTP skips the handoff for n>1 and lets decode own the prompt.
             request.node.add_marker(
                 pytest.mark.xfail(
                     strict=True,
