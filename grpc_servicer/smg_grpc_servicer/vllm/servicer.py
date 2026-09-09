@@ -45,6 +45,7 @@ from smg_grpc_servicer.vllm.kv_events import (
     stream_kv_events,
 )
 from smg_grpc_servicer.vllm.kv_transfer import (
+    pairing_fields,
     params_from_request,
     params_to_response_fields,
     resolve_pd_connector,
@@ -524,6 +525,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             kv_engine_id=kv_engine_id,
             data_parallel_size=parallel.data_parallel_size,
             shm_namespace_id=mm_shm.shm_namespace_id(),
+            **pairing_fields(self.engine.vllm_config),
         )
 
     async def GetLoads(

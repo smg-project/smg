@@ -360,6 +360,15 @@ message GetServerInfoResponse {
   // the router can verify a shared /dev/shm before using the SHM tensor
   // transport under `auto`. Empty when it can't be determined.
   string shm_namespace_id = 10;
+
+  // PD pairing protocol: what a prefill and a decode must agree on for a KV
+  // handoff to work. These mirror the factors vLLM's NIXL compatibility hash
+  // is built from, so the router can keep incompatible legs apart before the
+  // engines reject each other at handshake.
+  string kv_cache_dtype = 11;     // cache_config.cache_dtype ("auto", "fp8", ...)
+  int32 block_size = 12;          // cache_config.block_size (0 until the engine resolves it)
+  string attention_backend = 13;  // attention_config.backend name, "" when auto-selected
+  string model_dtype = 14;        // model_config.dtype ("torch.bfloat16", ...)
 }
 
 // =====================

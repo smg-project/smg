@@ -285,6 +285,8 @@ async fn fetch_grpc_metadata(
 fn normalize_grpc_keys(labels: &mut HashMap<String, String>) {
     for &(from, to) in &[
         ("tensor_parallel_size", "tp_size"),
+        // TokenSpeed's spelling of the attention TP width.
+        ("attn_tp_size", "tp_size"),
         ("pipeline_parallel_size", "pp_size"),
         ("context_parallel_size", "cp_size"),
         ("data_parallel_size", "dp_size"),
@@ -418,6 +420,36 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every engine's spelling of the parallelism widths folds into the
+    /// canonical labels, and an existing canonical label is never overwritten.
+    #[test]
+    fn normalize_grpc_keys_canonicalises_every_parallelism_spelling() {
+        let mut labels: HashMap<String, String> = [
+            ("attn_tp_size", "2"),
+            ("pipeline_parallel_size", "1"),
+            ("data_parallel_size", "4"),
+            ("context_parallel_size", "1"),
+            ("uptime_seconds", "12.5"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        normalize_grpc_keys(&mut labels);
+        assert_eq!(labels.get("tp_size").map(String::as_str), Some("2"));
+        assert_eq!(labels.get("pp_size").map(String::as_str), Some("1"));
+        assert_eq!(labels.get("dp_size").map(String::as_str), Some("4"));
+        assert_eq!(labels.get("cp_size").map(String::as_str), Some("1"));
+        assert!(!labels.contains_key("attn_tp_size"));
+        assert!(!labels.contains_key("uptime_seconds"));
+
+        let mut both: HashMap<String, String> = [("tp_size", "8"), ("tensor_parallel_size", "2")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        normalize_grpc_keys(&mut both);
+        assert_eq!(both.get("tp_size").map(String::as_str), Some("8"));
+    }
 
     #[expect(clippy::print_stderr)]
     fn dump_labels(title: &str, labels: &HashMap<String, String>) {
