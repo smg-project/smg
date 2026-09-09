@@ -24,7 +24,10 @@ use crate::{
         WorkerLeg,
     },
     routers::common::overload,
-    worker::{ConnectionMode, ConnectionModeExt, RoutingPool, RuntimeType, Worker, WorkerRegistry},
+    worker::{
+        ConnectionMode, ConnectionModeExt, PdPairingMode, RoutingPool, RuntimeType, Worker,
+        WorkerRegistry,
+    },
 };
 
 /// The wire a retained plan was built for. Retry re-selection filters
@@ -319,18 +322,19 @@ pub(crate) fn select_pair(
     }
 
     // A rendezvous only works between legs that share a KV transfer
-    // protocol (transport, engine version, KV layout, or an explicit
-    // pairing protocol). Narrow the prefill pool to workers with at least
-    // one compatible decode, so the policy's pick always has a partner; the
-    // decode pool narrows to that pick's partners below.
+    // protocol (transport, KV layout, or an explicit pairing protocol).
+    // Narrow the prefill pool to workers with at least one compatible
+    // decode, so the policy's pick always has a partner; the decode pool
+    // narrows to that pick's partners below. The keys are only built for
+    // the failure report.
     let pairing_mode = policies.pd_pairing_mode();
-    let prefill_keys = pairing_keys(&prefill);
-    prefill.retain(|p| {
+    let has_partner = |p: &Arc<dyn Worker>| {
         decode
             .iter()
             .any(|d| p.pd_pairing().compatible(d.pd_pairing(), pairing_mode))
-    });
-    if prefill.is_empty() {
+    };
+    if pairing_mode != PdPairingMode::Off && !prefill.iter().any(&has_partner) {
+        let prefill_keys = pairing_keys(&prefill);
         let decode_keys = pairing_keys(&decode);
         warn!(
             model_id,
@@ -347,6 +351,7 @@ pub(crate) fn select_pair(
             },
         }));
     }
+    prefill.retain(has_partner);
 
     // Independent prefill/decode policies so stateful ones (round robin) do
     // not share a counter; each leg tags the sticky key with its own prefix.
@@ -413,7 +418,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::types::{PdPairingMode, PolicyConfig},
+        config::types::PolicyConfig,
         worker::{BasicWorkerBuilder, ModelCard, WorkerType},
     };
 
@@ -532,6 +537,11 @@ mod tests {
             }
             _ => panic!("expected NoCompatiblePair"),
         }
+
+        // `off` restores pre-pairing placement for the same fleet.
+        let off =
+            PolicyRegistry::new(PolicyConfig::RoundRobin).with_pd_pairing_mode(PdPairingMode::Off);
+        assert!(pair_from(&registry, &off).is_ok());
     }
 
     #[test]

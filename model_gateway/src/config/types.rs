@@ -44,7 +44,7 @@ pub struct RouterConfig {
     #[serde(default, alias = "sticky_sessions")]
     pub routing_key_override: RoutingKeyOverrideConfig,
     /// How strictly PD placement pairs a prefill with a decode on their KV
-    /// transfer protocol (transport, engine version, KV layout).
+    /// transfer protocol; see [`PdPairingMode`].
     #[serde(default)]
     pub pd_pairing_mode: PdPairingMode,
     pub host: String,
@@ -530,6 +530,44 @@ pub enum ManualAssignmentMode {
     Delegate,
 }
 
+/// How strictly PD placement pairs a prefill with a decode on their KV
+/// transfer protocol (#2483). A descriptor component an engine does not report
+/// is "unknown".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PdPairingMode {
+    /// Pair on nothing: placement behaves as if no descriptor existed.
+    Off,
+    /// A known difference in runtime, transport or KV layout refuses the
+    /// pair; unknown components and engine versions pair with anything.
+    #[default]
+    Lenient,
+    /// Runtime, transport and KV layout must be known on both sides and
+    /// agree, and reported engine versions must match.
+    Strict,
+}
+
+impl PdPairingMode {
+    /// Parse the CLI spelling (`off` / `lenient` / `strict`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "lenient" => Some(Self::Lenient),
+            "strict" => Some(Self::Strict),
+            _ => None,
+        }
+    }
+
+    /// The CLI spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Lenient => "lenient",
+            Self::Strict => "strict",
+        }
+    }
+}
+
 /// Per-request sticky-routing override: when a sticky key is present, any
 /// eligible policy routes via manual sticky-map semantics. Reuses the manual
 /// policy knobs for the sticky map; eviction defaults match the manual policy so
@@ -541,39 +579,6 @@ pub enum ManualAssignmentMode {
 /// configured header carrying a valid value is the fallback when no rid is
 /// present. An enabled override keeps automatic body forwarding buffered so
 /// body `rid` precedence is preserved.
-/// How strictly PD placement pairs a prefill with a decode on their KV
-/// transfer protocol (#2483). A descriptor component an engine does not report
-/// is "unknown": lenient pairing lets it match anything (a fleet that reports
-/// nothing keeps working), strict pairing treats it as a mismatch.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum PdPairingMode {
-    /// Unknown components pair with anything; known components must agree.
-    #[default]
-    Lenient,
-    /// Every component must be known on both sides and agree.
-    Strict,
-}
-
-impl PdPairingMode {
-    /// Parse the CLI spelling (`lenient` / `strict`).
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "lenient" => Some(Self::Lenient),
-            "strict" => Some(Self::Strict),
-            _ => None,
-        }
-    }
-
-    /// The CLI spelling.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Lenient => "lenient",
-            Self::Strict => "strict",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingKeyOverrideConfig {
     /// When false, policies are used unchanged.

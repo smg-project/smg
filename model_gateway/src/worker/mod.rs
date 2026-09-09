@@ -45,7 +45,7 @@ pub use openai_protocol::{
     worker::{ProviderType, WorkerGroupKey},
 };
 pub use overload::OverloadThresholds;
-pub use pd_pairing::{PairingMismatch, PdPairing};
+pub use pd_pairing::{PairingMismatch, PdPairing, PdPairingMode};
 pub(crate) use registry::{ModelWorkerSnapshot, RoutingPool};
 pub use registry::{WorkerOrigin, WorkerRegistry};
 pub use resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_STATUS_CODES};

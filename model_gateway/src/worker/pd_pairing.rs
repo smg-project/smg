@@ -2,13 +2,15 @@
 //! KV handoff to work (#2483).
 //!
 //! A rendezvous only succeeds between two workers that share a transport
-//! (NIXL vs Mooncake), a compatible engine version and a compatible KV
-//! layout. Each PD worker carries a [`PdPairing`] derived from the labels its
+//! (NIXL vs Mooncake) and a compatible KV layout, and normally an engine
+//! version. Each PD worker carries a [`PdPairing`] derived from the labels its
 //! engine reports at discovery, or from an explicit `pairing_protocol` the
 //! operator sets on the worker; placement pairs a prefill only with a decode
-//! whose descriptor is compatible. [`PdPairingMode::Lenient`] lets an
-//! unknown component pair with anything, so a fleet that reports nothing keeps
-//! working; [`PdPairingMode::Strict`] treats unknown as a mismatch.
+//! whose descriptor is compatible. [`PdPairingMode::Lenient`] refuses only a
+//! known difference in transport or KV layout, so a fleet that reports
+//! nothing keeps working and a rolling engine upgrade keeps pairing;
+//! [`PdPairingMode::Strict`] also refuses unknown components and version
+//! differences; [`PdPairingMode::Off`] pairs on nothing.
 
 use std::collections::HashMap;
 
@@ -31,7 +33,7 @@ pub enum PairingMismatch {
     Explicit,
     /// Different KV transports (NIXL vs Mooncake).
     Transport,
-    /// Different engine versions.
+    /// Different engine versions (strict mode only).
     Version,
     /// Different KV cache layouts (dtype, page size, attention backend).
     KvLayout,
@@ -106,32 +108,41 @@ impl PdPairing {
     }
 
     /// The first component the two descriptors disagree on, if any.
+    ///
+    /// Runtime, transport and KV layout are hard facts: a known difference
+    /// refuses the pair in every mode but `Off`, an unknown one only under
+    /// `Strict`. Version is a soft fact: engines report it unevenly (vLLM's
+    /// gRPC server info carries none) and a rolling upgrade legitimately
+    /// mixes versions, so it counts only under `Strict`, and only when both
+    /// sides report one.
     pub fn mismatch(&self, other: &Self, mode: PdPairingMode) -> Option<PairingMismatch> {
-        if self.runtime != other.runtime {
-            return Some(PairingMismatch::Runtime);
+        if mode == PdPairingMode::Off {
+            return None;
+        }
+        let strict = mode == PdPairingMode::Strict;
+        let unknown = |name: &'static str| strict.then_some(PairingMismatch::Unknown(name));
+        match (self.runtime, other.runtime) {
+            (RuntimeType::Unspecified, _) | (_, RuntimeType::Unspecified) => {
+                if let Some(mismatch) = unknown("runtime") {
+                    return Some(mismatch);
+                }
+            }
+            (mine, theirs) if mine != theirs => return Some(PairingMismatch::Runtime),
+            _ => {}
         }
         // An explicit protocol is the operator's assertion: it is compared
         // whole and nothing derived is consulted.
         match (&self.explicit, &other.explicit) {
             (Some(a), Some(b)) => return (a != b).then_some(PairingMismatch::Explicit),
             (None, None) => {}
-            _ => {
-                return (mode == PdPairingMode::Strict)
-                    .then_some(PairingMismatch::Unknown("pairing_protocol"))
-            }
+            _ => return unknown("pairing_protocol"),
         }
-        let components = [
+        let hard_facts = [
             (
                 "transport",
                 &self.transport,
                 &other.transport,
                 PairingMismatch::Transport,
-            ),
-            (
-                "version",
-                &self.version,
-                &other.version,
-                PairingMismatch::Version,
             ),
             (
                 "kv_layout",
@@ -140,14 +151,21 @@ impl PdPairing {
                 PairingMismatch::KvLayout,
             ),
         ];
-        for (name, mine, theirs, mismatch) in components {
+        for (name, mine, theirs, mismatch) in hard_facts {
             match (mine, theirs) {
                 (Some(a), Some(b)) if a != b => return Some(mismatch),
                 (Some(_), Some(_)) => {}
                 _ => {
-                    if mode == PdPairingMode::Strict {
-                        return Some(PairingMismatch::Unknown(name));
+                    if let Some(mismatch) = unknown(name) {
+                        return Some(mismatch);
                     }
+                }
+            }
+        }
+        if strict {
+            if let (Some(mine), Some(theirs)) = (&self.version, &other.version) {
+                if mine != theirs {
+                    return Some(PairingMismatch::Version);
                 }
             }
         }
@@ -305,6 +323,7 @@ mod tests {
             &[
                 ("disaggregation_transfer_backend", "nixl"),
                 ("version", "1"),
+                ("kv_cache_dtype", "auto"),
             ],
         ));
         let mooncake = PdPairing::derive(&spec(
@@ -312,6 +331,7 @@ mod tests {
             &[
                 ("disaggregation_transfer_backend", "mooncake"),
                 ("version", "1"),
+                ("kv_cache_dtype", "auto"),
             ],
         ));
         assert_eq!(
@@ -323,10 +343,14 @@ mod tests {
             &[
                 ("disaggregation_transfer_backend", "nixl"),
                 ("version", "0"),
+                ("kv_cache_dtype", "auto"),
             ],
         ));
+        // A version difference is tolerated leniently (rolling upgrades) and
+        // refused strictly.
+        assert!(nixl.compatible(&older, PdPairingMode::Lenient));
         assert_eq!(
-            nixl.mismatch(&older, PdPairingMode::Lenient),
+            nixl.mismatch(&older, PdPairingMode::Strict),
             Some(PairingMismatch::Version)
         );
         let fp8 = PdPairing::derive(&spec(
@@ -349,8 +373,7 @@ mod tests {
             fp8.mismatch(&auto, PdPairingMode::Strict),
             Some(PairingMismatch::KvLayout)
         );
-        assert!(nixl.compatible(&nixl.clone(), PdPairingMode::Lenient));
-        assert!(fp8.compatible(&fp8.clone(), PdPairingMode::Strict));
+        assert!(nixl.compatible(&nixl.clone(), PdPairingMode::Strict));
     }
 
     #[test]
@@ -387,12 +410,37 @@ mod tests {
     }
 
     #[test]
-    fn different_runtimes_never_pair() {
+    fn different_runtimes_never_pair_but_an_undetected_one_is_unknown() {
         let sglang = PdPairing::derive(&spec(RuntimeType::Sglang, &[]));
         let vllm = PdPairing::derive(&spec(RuntimeType::Vllm, &[]));
         assert_eq!(
             sglang.mismatch(&vllm, PdPairingMode::Lenient),
             Some(PairingMismatch::Runtime)
         );
+        // A worker whose runtime probe failed has an unknown runtime, not a
+        // different one.
+        let undetected = PdPairing::derive(&spec(RuntimeType::Unspecified, &[]));
+        assert!(vllm.compatible(&undetected, PdPairingMode::Lenient));
+        assert_eq!(
+            vllm.mismatch(&undetected, PdPairingMode::Strict),
+            Some(PairingMismatch::Unknown("runtime"))
+        );
+    }
+
+    #[test]
+    fn off_pairs_anything() {
+        let nixl = PdPairing::derive(&spec(
+            RuntimeType::Sglang,
+            &[("disaggregation_transfer_backend", "nixl")],
+        ));
+        let mooncake = PdPairing::derive(&spec(
+            RuntimeType::Vllm,
+            &[("kv_connector", "MooncakeConnector")],
+        ));
+        assert_eq!(
+            nixl.mismatch(&mooncake, PdPairingMode::Lenient),
+            Some(PairingMismatch::Runtime)
+        );
+        assert!(nixl.compatible(&mooncake, PdPairingMode::Off));
     }
 }

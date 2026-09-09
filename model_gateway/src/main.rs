@@ -442,12 +442,13 @@ struct CliArgs {
     routing_key_override: bool,
 
     /// How strictly PD placement pairs a prefill with a decode on their KV
-    /// transfer protocol (transport, engine version, KV layout). `lenient`
-    /// lets a component an engine does not report pair with anything;
-    /// `strict` treats it as a mismatch.
+    /// transfer protocol. `lenient` refuses only a known difference in
+    /// runtime, transport or KV layout (unknown components and engine
+    /// versions pair with anything); `strict` also refuses unknown
+    /// components and version differences; `off` pairs on nothing.
     #[arg(
         long,
-        value_parser = ["lenient", "strict"],
+        value_parser = ["off", "lenient", "strict"],
         default_value = "lenient",
         help_heading = "Routing Policy"
     )]
