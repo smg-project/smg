@@ -242,9 +242,9 @@ pub(crate) fn failure_from(candidates: &[Arc<dyn Worker>], model_id: &str) -> Pl
 /// live for availability, and a prefill counts only while one of its
 /// partners is available, so the policy's pick can always be paired; `wire`
 /// pins both legs to the retained plan's runtime and transport on a retry;
-/// `homogeneous_runtime` narrows both legs to the first open prefill
-/// worker's runtime, which the gRPC wire needs because its rendezvous is
-/// runtime-specific. A miss names the leg and carries the verdict judged
+/// `homogeneous_runtime` narrows both legs to the runtime of the first
+/// prefill worker open under its own runtime, which the gRPC wire needs
+/// because its rendezvous is runtime-specific. A miss names the leg and carries the verdict judged
 /// from that leg's own candidates.
 pub(crate) fn select_pair(
     registry: &WorkerRegistry,
@@ -295,30 +295,58 @@ pub(crate) fn select_pair(
     // Live state: a prefill is open when it is available and so is one of
     // its partners, so the policy's pick can always be paired. Where the
     // wire's rendezvous is runtime-specific, both legs must also share a
-    // runtime, the first available prefill worker's; the index keeps
-    // runtimes apart already unless pairing is off or a runtime is unknown.
+    // runtime: that of the first prefill worker open under its own runtime,
+    // so a prefill whose partners are all down never shuts out a healthy
+    // pair on another runtime. The index keeps runtimes apart already
+    // unless pairing is off or a runtime is unknown.
     let partner_open = |d: &Arc<dyn Worker>, runtime: Option<RuntimeType>| {
         eligible(d) && runtime.is_none_or(|r| d.metadata().spec.runtime_type == r)
     };
-    let open_prefills = |runtime: Option<RuntimeType>| -> Vec<usize> {
-        (0..pairs.prefill.len())
-            .filter(|&i| {
-                let p = &pairs.prefill[i];
-                eligible(p)
-                    && runtime.is_none_or(|r| p.metadata().spec.runtime_type == r)
-                    && pairs.partners[i].iter().any(|d| partner_open(d, runtime))
-            })
-            .collect()
+    let can_pair_on = |i: usize, runtime: Option<RuntimeType>| {
+        pairs.partners[i].iter().any(|d| partner_open(d, runtime))
     };
-    let Some(first) = pairs.prefill.iter().find(|p| eligible(p)) else {
+    if !pairs.prefill.iter().any(&eligible) {
         debug!("No available prefill workers");
         return Err(fail(
             WorkerLeg::Prefill,
             failure_from(&pairs.prefill, model_id),
         ));
-    };
-    let leg_runtime = homogeneous_runtime.then_some(first.metadata().spec.runtime_type);
-    let open = open_prefills(leg_runtime);
+    }
+    let leg_runtime = homogeneous_runtime
+        .then(|| {
+            pairs.prefill.iter().enumerate().find_map(|(i, p)| {
+                let runtime = p.metadata().spec.runtime_type;
+                (eligible(p) && can_pair_on(i, Some(runtime))).then_some(runtime)
+            })
+        })
+        .flatten();
+    // One pass: the open prefills on the leg's runtime, counting the
+    // pairable ones the narrowing excluded so the exclusion leaves a trace.
+    let mut excluded = 0usize;
+    let open: Vec<usize> = (0..pairs.prefill.len())
+        .filter(|&i| {
+            let p = &pairs.prefill[i];
+            if !eligible(p) {
+                return false;
+            }
+            let own = p.metadata().spec.runtime_type;
+            if leg_runtime.is_some_and(|runtime| own != runtime) {
+                if can_pair_on(i, Some(own)) {
+                    excluded += 1;
+                }
+                return false;
+            }
+            can_pair_on(i, leg_runtime)
+        })
+        .collect();
+    if excluded > 0 {
+        warn!(
+            model_id,
+            ?leg_runtime,
+            excluded,
+            "Mixed runtime types in PD workers; pairable prefill workers on another runtime were excluded"
+        );
+    }
     if open.is_empty() {
         debug!(?leg_runtime, "No available PD pair");
         return Err(fail(
@@ -400,7 +428,7 @@ pub(crate) fn select_pair(
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::HealthCheckConfig;
+    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
 
     use super::*;
     use crate::{
@@ -522,6 +550,55 @@ mod tests {
             assert_eq!(pair.prefill.url(), "grpc://p:2");
             assert_eq!(pair.decode.url(), "grpc://d:2");
             assert_eq!(pair.runtime, RuntimeType::Vllm);
+        }
+    }
+
+    #[test]
+    fn a_pair_whose_partners_are_down_does_not_shut_out_a_healthy_pair_on_another_runtime() {
+        // One model served by a vLLM pair and an SGLang pair mid-migration.
+        // The vLLM decode goes down: the vLLM prefill, first in pool order,
+        // must not dictate the runtime, so the SGLang pair keeps serving.
+        let registry = registry_of(&[
+            (
+                "grpc://p:vllm",
+                WorkerType::Prefill,
+                ConnectionMode::Grpc,
+                RuntimeType::Vllm,
+            ),
+            (
+                "grpc://p:sglang",
+                WorkerType::Prefill,
+                ConnectionMode::Grpc,
+                RuntimeType::Sglang,
+            ),
+            (
+                "grpc://d:vllm",
+                WorkerType::Decode,
+                ConnectionMode::Grpc,
+                RuntimeType::Vllm,
+            ),
+            (
+                "grpc://d:sglang",
+                WorkerType::Decode,
+                ConnectionMode::Grpc,
+                RuntimeType::Sglang,
+            ),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let vllm_decode = registry
+            .get_all()
+            .into_iter()
+            .find(|w| w.url() == "grpc://d:vllm")
+            .expect("registered");
+        vllm_decode.set_status(WorkerStatus::NotReady);
+
+        for _ in 0..3 {
+            let pair = pair_from(&registry, &policies)
+                .ok()
+                .expect("the SGLang pair is healthy");
+            assert_eq!(pair.prefill.url(), "grpc://p:sglang");
+            assert_eq!(pair.decode.url(), "grpc://d:sglang");
+            assert_eq!(pair.runtime, RuntimeType::Sglang);
         }
     }
 
