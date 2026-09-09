@@ -99,8 +99,12 @@ impl HarmonyPreparationStage {
 
         // Step 2: Build structural tag constraint
         let tool_constraint = if let Some(tools) = body_ref.tools.as_ref() {
-            Self::generate_tool_call_constraint(tools, body_ref.tool_choice.as_ref())
-                .map_err(|e| *e)?
+            Self::generate_tool_call_constraint(
+                tools,
+                body_ref.tool_choice.as_ref(),
+                body_ref.parallel_tool_calls,
+            )
+            .map_err(|e| *e)?
         } else {
             None
         };
@@ -183,8 +187,12 @@ impl HarmonyPreparationStage {
         let tool_constraint = if function_tools.is_empty() {
             None
         } else {
-            Self::generate_tool_call_constraint(&function_tools, chat_tool_choice.as_ref())
-                .map_err(|e| *e)?
+            Self::generate_tool_call_constraint(
+                &function_tools,
+                chat_tool_choice.as_ref(),
+                request.parallel_tool_calls,
+            )
+            .map_err(|e| *e)?
         };
 
         let text_constraint = if let Some(text_config) = &request.text {
@@ -303,26 +311,36 @@ impl HarmonyPreparationStage {
     ///
     /// Uses structural tags with `triggered_tags` format to force Harmony format output.
     /// This ensures the model outputs in Harmony format (with channels) even when constrained.
+    ///
+    /// `parallel_tool_calls` is the request's setting; `Some(false)` bounds a
+    /// `required`-style constraint to a single call. Named-function constraints
+    /// are single-call regardless.
     fn generate_tool_call_constraint(
         tools: &[Tool],
         tool_choice: Option<&ToolChoice>,
+        parallel_tool_calls: Option<bool>,
     ) -> Result<Option<(String, String)>, Box<Response>> {
         let Some(choice) = tool_choice else {
             return Ok(None);
         };
+        let single_tool_call = parallel_tool_calls == Some(false);
 
         match choice {
             ToolChoice::Function { function, .. } => {
-                let tag = Self::build_tool_call_structural_tag(tools, Some(&function.name))?;
+                let tag = Self::build_tool_call_structural_tag(
+                    tools,
+                    Some(&function.name),
+                    single_tool_call,
+                )?;
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
             ToolChoice::Value(ToolChoiceValue::Required) => {
-                let tag = Self::build_tool_call_structural_tag(tools, None)?;
+                let tag = Self::build_tool_call_structural_tag(tools, None, single_tool_call)?;
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
             ToolChoice::AllowedTools { mode, .. } => {
                 if mode == "required" {
-                    let tag = Self::build_tool_call_structural_tag(tools, None)?;
+                    let tag = Self::build_tool_call_structural_tag(tools, None, single_tool_call)?;
                     Ok(Some(("structural_tag".to_string(), tag)))
                 } else {
                     Ok(None)
@@ -337,9 +355,15 @@ impl HarmonyPreparationStage {
     /// Supports both reasoning-enabled and reasoning-disabled modes:
     /// - With reasoning: triggers on `<|start|>assistant<|channel|>commentary` (waits for analysis)
     /// - Without reasoning: triggers on `<|channel|>commentary` (goes directly to commentary)
+    ///
+    /// `single_tool_call` requests a repeat bound: the grammar stops accepting
+    /// further tool-call tags after the first one completes. A named function
+    /// is always single-call; a `required` constraint is single-call only when
+    /// the request disabled parallel tool calls.
     fn build_tool_call_structural_tag(
         tools: &[Tool],
         specific_function: Option<&str>,
+        single_tool_call: bool,
     ) -> Result<String, Box<Response>> {
         let mut tags = Vec::new();
 
@@ -395,7 +419,9 @@ impl HarmonyPreparationStage {
             }));
         }
 
-        let stop_after_first = specific_function.is_some();
+        // Each tag is exactly one call, so `stop_after_first` is the repeat
+        // bound: set for a named function and for parallel_tool_calls=false.
+        let stop_after_first = specific_function.is_some() || single_tool_call;
 
         let structural_tag = json!({
             "format": {
@@ -463,4 +489,94 @@ pub(crate) fn build_text_format_structural_tag(
 
     serde_json::to_string(&structural_tag)
         .map_err(|e| format!("Failed to serialize structural tag for structured output: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::common::{Function, FunctionChoice, Tool, ToolChoice, ToolChoiceValue};
+
+    use super::HarmonyPreparationStage;
+
+    fn tools() -> Vec<Tool> {
+        ["get_weather", "get_time"]
+            .into_iter()
+            .map(|name| Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: name.to_string(),
+                    description: None,
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                    strict: None,
+                },
+            })
+            .collect()
+    }
+
+    fn stop_after_first(
+        tool_choice: &ToolChoice,
+        parallel_tool_calls: Option<bool>,
+    ) -> (bool, usize) {
+        let (_, tag) = HarmonyPreparationStage::generate_tool_call_constraint(
+            &tools(),
+            Some(tool_choice),
+            parallel_tool_calls,
+        )
+        .unwrap()
+        .expect("constraint expected");
+        let tag: serde_json::Value = serde_json::from_str(&tag).unwrap();
+        let format = &tag["format"];
+        (
+            format["stop_after_first"].as_bool().unwrap(),
+            format["tags"].as_array().unwrap().len(),
+        )
+    }
+
+    fn required() -> ToolChoice {
+        ToolChoice::Value(ToolChoiceValue::Required)
+    }
+
+    #[test]
+    fn required_bounds_to_single_call_when_parallel_disabled() {
+        let (stop, tag_count) = stop_after_first(&required(), Some(false));
+        assert!(stop, "parallel_tool_calls=false must set the repeat bound");
+        // Both tools stay eligible; only the repeat count is bounded.
+        assert_eq!(tag_count, 4);
+    }
+
+    #[test]
+    fn required_stays_unbounded_unless_parallel_disabled() {
+        for parallel in [None, Some(true)] {
+            let (stop, _) = stop_after_first(&required(), parallel);
+            assert!(
+                !stop,
+                "required must not carry a repeat bound for parallel_tool_calls={parallel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_tools_required_mode_honors_parallel_setting() {
+        let choice = ToolChoice::AllowedTools {
+            tool_type: "allowed_tools".to_string(),
+            mode: "required".to_string(),
+            tools: vec![],
+        };
+        assert!(stop_after_first(&choice, Some(false)).0);
+        assert!(!stop_after_first(&choice, None).0);
+    }
+
+    #[test]
+    fn named_function_is_single_call_regardless_of_parallel_setting() {
+        let named = ToolChoice::Function {
+            tool_type: "function".to_string(),
+            function: FunctionChoice {
+                name: "get_weather".to_string(),
+            },
+        };
+        for parallel in [None, Some(true), Some(false)] {
+            let (stop, tag_count) = stop_after_first(&named, parallel);
+            assert!(stop, "named function must always be single-call");
+            assert_eq!(tag_count, 2, "named choice keeps only the named tool");
+        }
+    }
 }

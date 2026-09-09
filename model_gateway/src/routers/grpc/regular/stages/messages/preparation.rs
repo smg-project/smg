@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::{
     common::{StringOrArray, ToolChoice, ToolChoiceValue},
-    messages::CreateMessageRequest,
+    messages::{CreateMessageRequest, ToolChoice as MessagesToolChoice},
 };
 use tracing::{debug, error};
 
@@ -259,6 +259,21 @@ impl MessagePreparationStage {
             }
         }
 
+        // Anthropic spells the parallelism setting inversely on tool_choice.
+        let parallel_tool_calls = request.tool_choice.as_ref().and_then(|tc| match tc {
+            MessagesToolChoice::Auto {
+                disable_parallel_tool_use,
+            }
+            | MessagesToolChoice::Any {
+                disable_parallel_tool_use,
+            }
+            | MessagesToolChoice::Tool {
+                disable_parallel_tool_use,
+                ..
+            } => disable_parallel_tool_use.map(|disable| !disable),
+            MessagesToolChoice::None => None,
+        });
+
         // Step 4: Build tool constraints if tools present
         let tool_call_constraint = if let (false, Some(tool_choice)) =
             (filtered_tools.is_empty(), chat_tool_choice.as_ref())
@@ -273,6 +288,7 @@ impl MessagePreparationStage {
                         .as_deref(),
                     &filtered_tools,
                     tool_choice,
+                    parallel_tool_calls,
                 )
                 .map_err(|e| {
                     error!(function = "MessagePreparationStage::execute", error = %e, "Invalid tool configuration");

@@ -64,7 +64,12 @@ fn preprocess_impl(
         chat_request.tools.as_ref(),
         chat_request.tool_choice.as_ref(),
     ) {
-        match registry.generate_tool_constraint(None, tools, tool_choice) {
+        match registry.generate_tool_constraint(
+            None,
+            tools,
+            tool_choice,
+            chat_request.parallel_tool_calls,
+        ) {
             Ok(Some(c)) => {
                 let json_str = serde_json::to_string(&c.to_tuple()).map_err(|e| {
                     (

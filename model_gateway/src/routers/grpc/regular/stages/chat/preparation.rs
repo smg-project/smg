@@ -273,6 +273,7 @@ pub(crate) async fn prepare_chat_like(
                         .as_deref(),
                     tools,
                     tool_choice,
+                    request.parallel_tool_calls,
                 )
                 .map_err(|e| {
                     error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
