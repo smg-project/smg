@@ -418,6 +418,7 @@ class Gateway:
                 "connection_mode": w.get("connection_mode"),
                 "priority": w.get("priority"),
                 "cost": w.get("cost"),
+                "pd_pairing": w.get("pd_pairing"),
             },
         )
 

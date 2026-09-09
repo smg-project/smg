@@ -163,6 +163,25 @@ def _wait_for_pairs(minimum: int, timeout: float = LOG_FLUSH_TIMEOUT_S) -> list[
     return pairs
 
 
+def _pairing_keys(gateway: Gateway) -> dict[str, str]:
+    """Each PD worker's `pd_pairing` key as the gateway reports it on /workers."""
+    return {
+        worker.url: worker.metadata["pd_pairing"]
+        for worker in gateway.list_workers(strict=True)
+        if worker.metadata.get("pd_pairing")
+    }
+
+
+def _wait_for_healthy_workers(gateway: Gateway, count: int, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        healthy = [w for w in gateway.list_workers() if w.status == "healthy"]
+        if len(healthy) >= count:
+            return
+        time.sleep(1.0)
+    raise AssertionError(f"fewer than {count} healthy workers after {timeout}s")
+
+
 def _workers_by_role(gateway: Gateway) -> dict[str, list]:
     by_role: dict[str, list] = {}
     for worker in gateway.list_workers(strict=True):
@@ -652,28 +671,70 @@ class TestPDTopology:
 class TestPDMixedTransport:
     """One NIXL pair and one Mooncake pair share a model.
 
-    Placement pairs a prefill with a decode on runtime and wire alone, so
-    it will hand a NIXL prefill's handoff to a Mooncake decode and the
-    engine fails the request. #2483 adds the pairing protocol that keeps
-    the legs on one transport; until then this is the record of what a
-    mixed fleet does.
+    Placement pairs a prefill with a decode on their KV transfer protocol
+    (#2483): a NIXL prefill's handoff never lands on a Mooncake decode, and
+    the gateway reports which protocol each leg speaks.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="placement pairs across KV transports; pairing protocol pending (#2483)",
-    )
     def test_every_request_lands_on_a_matching_pair(self, setup_backend):
         _, model, _, gateway = setup_backend
+        _wait_for_healthy_workers(gateway, 4, timeout=120.0)
+        keys = _pairing_keys(gateway)
+        logger.info("mixed fleet pairing keys: %s", keys)
+        assert len(keys) == 4, keys
+        transports = {key.split("/")[1] for key in keys.values()}
+        assert transports == {"nixl", "mooncake"}, keys
+
         before = len(_pairs_logged())
         statuses = []
         for i in range(12):
             resp = _raw_chat(gateway, model, f"Say hello, {_WORDS[i % len(_WORDS)]}.", timeout=60.0)
             statuses.append((resp.status_code, _error_code(resp)))
-        pairs = _pairs_logged()[before:]
+        pairs = _wait_for_pairs(before + 12)[before:]
         logger.info("mixed fleet: statuses=%s pairs=%s", statuses, pairs)
         failed = [s for s in statuses if s[0] != 200]
         assert not failed, f"{len(failed)} of 12 requests failed on a mixed fleet: {failed}"
+        crossed = [(p, d) for p, d in pairs if keys.get(p) != keys.get(d)]
+        assert not crossed, f"pairs crossed KV transports: {crossed}"
+        logger.info(
+            "mixed fleet transports served: %s",
+            sorted({keys[p].split("/")[1] for p, _ in pairs if p in keys}),
+        )
+
+
+@pytest.mark.engine("vllm")
+@pytest.mark.gpu(4)
+@pytest.mark.e2e
+@pytest.mark.model(_MODEL)
+@pytest.mark.workers(parallel_start=True)
+@pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=_GATEWAY_ARGS)
+@pytest.mark.parametrize(
+    "setup_backend",
+    [
+        pytest.param(
+            ("pd_grpc", (1, 1, {"prefill_kv": ["nixl"], "decode_kv": ["mooncake"]})),
+            id="1p1d-kv-mismatch",
+        )
+    ],
+    indirect=True,
+)
+class TestPDMismatchedTransport:
+    """A NIXL prefill and a Mooncake decode can never complete a handoff.
+
+    Placement refuses the pair up front with `no_compatible_pd_pair`
+    (#2483) instead of letting the engine time out on the rendezvous.
+    """
+
+    def test_request_is_refused_at_placement(self, setup_backend):
+        _, model, _, gateway = setup_backend
+        _wait_for_healthy_workers(gateway, 2, timeout=120.0)
+        keys = _pairing_keys(gateway)
+        logger.info("mismatched fleet pairing keys: %s", keys)
+        assert len(keys) == 2, keys
+
+        resp = _raw_chat(gateway, model, "Say hello.", timeout=60.0)
+        assert resp.status_code == 503, resp.text
+        assert _error_code(resp) == "no_compatible_pd_pair", resp.text
 
 
 # ---------------------------------------------------------------------------
