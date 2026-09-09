@@ -47,6 +47,9 @@ static QUARANTINED: AtomicUsize = AtomicUsize::new(0);
 #[derive(Debug, Default)]
 struct PairState {
     consecutive_failures: u32,
+    /// When the last failure was recorded: a run older than one quarantine
+    /// window is not consecutive any more.
+    last_failure: Option<Instant>,
     quarantined_until: Option<Instant>,
 }
 
@@ -126,13 +129,24 @@ pub fn record_failure(prefill: &str, decode: &str) -> bool {
         return false;
     }
     let now = Instant::now();
+    let quarantine = Duration::from_secs(QUARANTINE_SECS.load(Ordering::Relaxed));
     let by_decode = PAIRS.entry(prefill.to_string()).or_default();
     let mut state = by_decode.entry(decode.to_string()).or_default();
+    // Failures count as a run only within one quarantine window of each
+    // other: an unrelated failure hours later does not extend a run. A pair
+    // that already reached the threshold keeps its count, so the one probe
+    // placement lets through after expiry re-quarantines it at once.
+    let aged_out = state
+        .last_failure
+        .is_some_and(|last| now.duration_since(last) > quarantine);
+    if aged_out && state.consecutive_failures < FAILURES.load(Ordering::Relaxed) {
+        state.consecutive_failures = 0;
+    }
+    state.last_failure = Some(now);
     state.consecutive_failures = state.consecutive_failures.saturating_add(1);
     if state.consecutive_failures < FAILURES.load(Ordering::Relaxed) || state.quarantined(now) {
         return false;
     }
-    let quarantine = Duration::from_secs(QUARANTINE_SECS.load(Ordering::Relaxed));
     // An expired quarantine nobody looked up yet is still counted.
     let counted = state.quarantined_until.is_some();
     state.quarantined_until = Some(now + quarantine);
@@ -269,6 +283,32 @@ mod tests {
         forget(p);
         assert_eq!(quarantined_count(), 0);
         assert_eq!(tracked_pairs(), 0);
+        configure(
+            DEFAULT_PD_PAIR_QUARANTINE_FAILURES,
+            DEFAULT_PD_PAIR_QUARANTINE_SECS,
+        );
+    }
+
+    #[test]
+    fn failures_further_apart_than_the_window_are_not_a_run() {
+        let _guard = test_guard();
+        configure(2, 1);
+        let (p, d) = ("grpc://stale-p:1", "grpc://stale-d:1");
+        assert!(!record_failure(p, d));
+        std::thread::sleep(Duration::from_millis(1100));
+        // The old failure has aged out: this one starts a new run.
+        assert!(!record_failure(p, d));
+        assert!(!is_quarantined(p, d));
+        // Two within the window do quarantine.
+        assert!(record_failure(p, d));
+        assert!(is_quarantined(p, d));
+        // Past the threshold the count is kept: the one probe placement
+        // lets through after expiry re-quarantines at once.
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(!is_quarantined(p, d));
+        assert!(record_failure(p, d));
+        assert!(is_quarantined(p, d));
+        forget(p);
         configure(
             DEFAULT_PD_PAIR_QUARANTINE_FAILURES,
             DEFAULT_PD_PAIR_QUARANTINE_SECS,

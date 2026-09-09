@@ -1,4 +1,9 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{ready, Context, Poll},
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -654,7 +659,6 @@ impl PDRouter {
         // parsed request and its routing derivatives now when retries are
         // disabled.
         lease.release_dispatch();
-        let is_stream = context.is_stream;
 
         let response = self
             .execute_dual_dispatch_internal(
@@ -671,13 +675,11 @@ impl PDRouter {
         prefill.record_outcome(status.as_u16());
         decode.record_outcome(status.as_u16());
         // Pair health (see `pd_pair_health`): an engine-side failure counts
-        // against the pair. A buffered success proves the handoff; a
-        // streaming 200 is only the decode's header, sent before any token,
-        // so it is left neutral rather than clearing a real failure run.
+        // against the pair. Successes are reported by `forward_decode_body`,
+        // where the decode's body is seen: a 200 header is sent before any
+        // token and proves nothing about the handoff.
         if pd_pair_health::pair_attributable(status.as_u16()) {
             pd_pair_health::record_failure(prefill.url(), decode.url());
-        } else if status.is_success() && !is_stream {
-            pd_pair_health::record_success(prefill.url(), decode.url());
         }
 
         // Record worker errors for server errors (5xx)
@@ -939,6 +941,7 @@ impl PDRouter {
             decode_response,
             status,
             &context,
+            Some(&prefill),
             decode,
             load_guards,
             prefill_body,
@@ -1138,6 +1141,10 @@ impl PDRouter {
             }
             _ => None,
         };
+        // Pair health (see `pd_pair_health`) is judged only when a handoff was
+        // attempted: a fan-out or a prefill that minted nothing lets decode
+        // recompute the prompt, which proves nothing about the pair.
+        let handoff = relay && decode_params.is_some();
         if let (Some(obj), Some(params)) = (decode_json.as_object_mut(), decode_params) {
             obj.insert("kv_transfer_params".to_string(), params);
         }
@@ -1176,6 +1183,11 @@ impl PDRouter {
         let status = StatusCode::from_u16(decode_response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         Self::record_sequential_leg(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
+        // The sequential path returns before the parallel path's pair-health
+        // block, so an engine-side decode failure is counted here.
+        if handoff && pd_pair_health::pair_attributable(status.as_u16()) {
+            pd_pair_health::record_failure(prefill.url(), decode.url());
+        }
         if !status.is_success() {
             error!(
                 "Decode server returned error status decode_url={} status={}",
@@ -1196,8 +1208,16 @@ impl PDRouter {
             dispatch_start.elapsed(),
         );
 
-        self.forward_decode_body(decode_response, status, &context, decode, load_guards, None)
-            .await
+        self.forward_decode_body(
+            decode_response,
+            status,
+            &context,
+            handoff.then_some(&prefill),
+            decode,
+            load_guards,
+            None,
+        )
+        .await
     }
 
     /// Map a failed prefill response to a client-facing error. The exact
@@ -1237,16 +1257,20 @@ impl PDRouter {
 
     /// Forward a successful decode response to the client, streaming or not,
     /// merging prefill logprobs when requested. Shared by the parallel and
-    /// sequential PD dispatch paths.
+    /// sequential PD dispatch paths. `prefill` is the leg a KV handoff was
+    /// attempted from, if any: only then does the body speak for the pair.
+    #[expect(clippy::too_many_arguments)]
     async fn forward_decode_body(
         &self,
         decode_response: reqwest::Response,
         status: StatusCode,
         context: &PDRequestContext<'_>,
+        prefill: Option<&Arc<dyn Worker>>,
         decode: Arc<dyn Worker>,
         load_guards: Vec<WorkerLoadGuard>,
         prefill_body: Option<Bytes>,
     ) -> Response {
+        let pair = prefill.map(|prefill| (prefill.url().to_string(), decode.url().to_string()));
         if context.is_stream {
             // Streaming response
             let prefill_logprobs = if context.return_logprob {
@@ -1262,8 +1286,14 @@ impl PDRouter {
                 header_utils::preserve_response_headers(decode_response.headers());
             header_utils::insert_routed_worker_id(&mut response_headers, decode.url());
 
+            // The first body chunk is the proof the handoff completed (see
+            // `ObservedDecodeBody`); the header above came before any token.
+            let body = ObservedDecodeBody {
+                inner: Box::pin(decode_response.bytes_stream()),
+                pair,
+            };
             self.create_streaming_response(
-                decode_response.bytes_stream(),
+                body,
                 status,
                 prefill_logprobs,
                 context.return_logprob,
@@ -1299,6 +1329,13 @@ impl PDRouter {
                     }
                 }
             };
+            // The body was read in full, so a success here proves the
+            // handoff; a failure was already counted at the dispatch site.
+            if let Some((prefill, decode)) = &pair {
+                if response.status().is_success() {
+                    pd_pair_health::record_success(prefill, decode);
+                }
+            }
 
             // The decode worker is the one that produced the body the client
             // sees, on both the merged-logprob and passthrough paths.
@@ -2122,6 +2159,34 @@ impl RouterTrait for PDRouter {
 
     fn router_type(&self) -> &'static str {
         "pd"
+    }
+}
+
+/// A decode body whose first chunk is reported to the pair-health table: a
+/// chunk proves the handoff, an error or a close before any chunk counts
+/// against the pair. The 200 header alone is sent before any token and proves
+/// nothing (the gRPC leg's `ObservedStream` makes the same call). With no pair
+/// (no handoff was attempted) the body is forwarded untouched.
+struct ObservedDecodeBody {
+    inner: Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    pair: Option<(String, String)>,
+}
+
+impl futures_util::Stream for ObservedDecodeBody {
+    type Item = Result<Bytes, reqwest::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let item = ready!(this.inner.as_mut().poll_next(cx));
+        if let Some((prefill, decode)) = this.pair.take() {
+            match &item {
+                Some(Ok(_)) => pd_pair_health::record_success(&prefill, &decode),
+                _ => {
+                    pd_pair_health::record_failure(&prefill, &decode);
+                }
+            }
+        }
+        Poll::Ready(item)
     }
 }
 

@@ -411,13 +411,20 @@ pub(crate) fn select_pair(
         return Err(declined(WorkerLeg::Prefill, prefill_policy.name()));
     };
     let selected_prefill = prefill[prefill_idx].clone();
-    // The pick's open partners: non-empty by construction, short of an
-    // availability flip between the two reads.
-    let decode: Vec<Arc<dyn Worker>> = pairs.partners[open[prefill_idx]]
-        .iter()
-        .filter(|d| partner_open(&selected_prefill, d, leg_runtime, steer))
-        .cloned()
-        .collect();
+    // The pick's open partners. A quarantine entered between the two reads
+    // falls back the way the first pass does; what is left empty went
+    // unavailable in between.
+    let partners_open = |steer: bool| -> Vec<Arc<dyn Worker>> {
+        pairs.partners[open[prefill_idx]]
+            .iter()
+            .filter(|d| partner_open(&selected_prefill, d, leg_runtime, steer))
+            .cloned()
+            .collect()
+    };
+    let mut decode = partners_open(steer);
+    if decode.is_empty() && steer {
+        decode = partners_open(false);
+    }
     if decode.is_empty() {
         debug!(
             ?leg_runtime,
