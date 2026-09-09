@@ -1389,12 +1389,14 @@ impl PDRouter {
             PlacementFailure::PolicyDeclined(policy) => PdSelectionFailure::Unavailable(
                 format!("Policy {policy} failed to select a {leg} worker"),
             ),
-            PlacementFailure::NoCompatiblePair { prefill, decode } => {
-                PdSelectionFailure::Incompatible(format!(
-                    "No prefill/decode pair shares a KV transfer protocol \
-                     (prefill: {prefill:?}, decode: {decode:?})"
-                ))
-            }
+            PlacementFailure::NoCompatiblePair {
+                prefill,
+                decode,
+                mismatches,
+            } => PdSelectionFailure::Incompatible(format!(
+                "No prefill/decode pair shares a KV transfer protocol (mismatch on \
+                 {mismatches:?}; prefill: {prefill:?}, decode: {decode:?})"
+            )),
         }
     }
 

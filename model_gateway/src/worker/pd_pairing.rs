@@ -1,18 +1,19 @@
 //! PD pairing descriptors: what a prefill and a decode must agree on for a
 //! KV handoff to work (#2483).
 //!
-//! A rendezvous only succeeds between two workers that share a transport
-//! (NIXL vs Mooncake) and a compatible KV layout, and normally an engine
-//! version. Each PD worker carries a [`PdPairing`] derived from the labels its
-//! engine reports at discovery, or from an explicit `pairing_protocol` the
-//! operator sets on the worker; placement pairs a prefill only with a decode
-//! whose descriptor is compatible. [`PdPairingMode::Lenient`] refuses only a
-//! known difference in transport or KV layout, so a fleet that reports
-//! nothing keeps working and a rolling engine upgrade keeps pairing;
-//! [`PdPairingMode::Strict`] also refuses unknown components and version
-//! differences; [`PdPairingMode::Off`] pairs on nothing.
+//! A rendezvous only succeeds between two workers of one runtime that share
+//! a KV transport (NIXL vs Mooncake) and a compatible KV layout, and normally
+//! an engine version. Each PD worker carries a [`PdPairing`] derived from the
+//! labels its engine reports at discovery, or from an explicit
+//! `pairing_protocol` the operator sets on the worker; placement pairs a
+//! prefill only with a decode whose descriptor is compatible.
+//! [`PdPairingMode::Lenient`] refuses only a known difference in runtime,
+//! transport or a KV layout fact, so a fleet that reports nothing keeps
+//! working and a rolling engine upgrade keeps pairing;
+//! [`PdPairingMode::Strict`] also refuses a component one side does not
+//! report and a version difference; [`PdPairingMode::Off`] pairs on nothing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use openai_protocol::worker::{RuntimeType, WorkerSpec};
 
@@ -23,6 +24,16 @@ pub use crate::config::types::PdPairingMode;
 pub const PAIRING_PROTOCOL_LABEL: &str = "pairing_protocol";
 /// The Kubernetes annotation flattened into the same label.
 pub const PAIRING_PROTOCOL_ANNOTATION_LABEL: &str = "smg.ai/pairing-protocol";
+
+/// The KV layout facts engines report: the short name used in the pairing
+/// key, the canonical label, and alias labels (vLLM's `block_size` is the
+/// page size before canonicalisation).
+const LAYOUT_FACTS: [(&str, &str, &[&str]); 4] = [
+    ("dtype", "kv_cache_dtype", &[]),
+    ("page", "page_size", &["block_size"]),
+    ("attn", "attention_backend", &[]),
+    ("model", "model_dtype", &[]),
+];
 
 /// The component two descriptors disagree on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,10 +46,24 @@ pub enum PairingMismatch {
     Transport,
     /// Different engine versions (strict mode only).
     Version,
-    /// Different KV cache layouts (dtype, page size, attention backend).
-    KvLayout,
+    /// Both sides report the named KV layout fact and disagree.
+    KvLayout(&'static str),
     /// A component one side does not report, rejected under strict mode.
     Unknown(&'static str),
+}
+
+impl PairingMismatch {
+    /// The component, for logs and the placement failure.
+    pub fn describe(self) -> String {
+        match self {
+            Self::Runtime => "runtime".to_string(),
+            Self::Explicit => "pairing_protocol".to_string(),
+            Self::Transport => "transport".to_string(),
+            Self::Version => "version".to_string(),
+            Self::KvLayout(fact) => fact.to_string(),
+            Self::Unknown(component) => format!("unknown {component}"),
+        }
+    }
 }
 
 /// What one PD worker offers a rendezvous partner.
@@ -48,7 +73,8 @@ pub struct PdPairing {
     explicit: Option<String>,
     transport: Option<String>,
     version: Option<String>,
-    kv_layout: Option<String>,
+    /// The reported KV layout facts by short name (see `LAYOUT_FACTS`).
+    kv_layout: BTreeMap<&'static str, String>,
 }
 
 impl PdPairing {
@@ -86,19 +112,36 @@ impl PdPairing {
         self.transport.as_deref()
     }
 
-    /// One string that names the pairing group: the explicit protocol, else
-    /// `runtime/transport/version/layout` with `?` for an unknown component.
+    /// The engine version, when reported.
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+
+    /// The group a worker pairs in: the explicit protocol, else
+    /// `runtime/transport/layout` with `?` for an unknown component. Version
+    /// is left out: it only counts under strict mode, and a rolling upgrade
+    /// would otherwise show two keys for workers that do pair.
     pub fn key(&self) -> String {
         if let Some(explicit) = &self.explicit {
             return explicit.clone();
         }
-        let part = |value: &Option<String>| value.as_deref().unwrap_or("?").to_string();
+        let layout: Vec<String> = LAYOUT_FACTS
+            .iter()
+            .filter_map(|(short, _, _)| {
+                self.kv_layout
+                    .get(short)
+                    .map(|value| format!("{short}={value}"))
+            })
+            .collect();
         format!(
-            "{}/{}/{}/{}",
+            "{}/{}/{}",
             self.runtime.as_str(),
-            part(&self.transport),
-            part(&self.version),
-            part(&self.kv_layout),
+            self.transport.as_deref().unwrap_or("?"),
+            if layout.is_empty() {
+                "?".to_string()
+            } else {
+                layout.join(",")
+            },
         )
     }
 
@@ -109,12 +152,13 @@ impl PdPairing {
 
     /// The first component the two descriptors disagree on, if any.
     ///
-    /// Runtime, transport and KV layout are hard facts: a known difference
-    /// refuses the pair in every mode but `Off`, an unknown one only under
-    /// `Strict`. Version is a soft fact: engines report it unevenly (vLLM's
-    /// gRPC server info carries none) and a rolling upgrade legitimately
-    /// mixes versions, so it counts only under `Strict`, and only when both
-    /// sides report one.
+    /// Runtime, transport and each KV layout fact are hard facts: a known
+    /// difference refuses the pair in every mode but `Off`, a fact one side
+    /// reports and the other does not only under `Strict`, and a layout fact
+    /// neither side reports is not compared. Version is a soft fact: engines
+    /// report it unevenly (vLLM's gRPC server info carries none) and a
+    /// rolling upgrade legitimately mixes versions, so it counts only under
+    /// `Strict`, and only when both sides report one.
     pub fn mismatch(&self, other: &Self, mode: PdPairingMode) -> Option<PairingMismatch> {
         if mode == PdPairingMode::Off {
             return None;
@@ -130,33 +174,34 @@ impl PdPairing {
             (mine, theirs) if mine != theirs => return Some(PairingMismatch::Runtime),
             _ => {}
         }
-        // An explicit protocol is the operator's assertion: it is compared
-        // whole and nothing derived is consulted.
+        // Two explicit protocols are the operators' assertion, compared
+        // whole. One explicit protocol cannot be checked against derived
+        // facts: strict refuses, lenient falls through to the facts rather
+        // than pairing blindly.
         match (&self.explicit, &other.explicit) {
             (Some(a), Some(b)) => return (a != b).then_some(PairingMismatch::Explicit),
             (None, None) => {}
-            _ => return unknown("pairing_protocol"),
+            _ => {
+                if let Some(mismatch) = unknown("pairing_protocol") {
+                    return Some(mismatch);
+                }
+            }
         }
-        let hard_facts = [
-            (
-                "transport",
-                &self.transport,
-                &other.transport,
-                PairingMismatch::Transport,
-            ),
-            (
-                "kv_layout",
-                &self.kv_layout,
-                &other.kv_layout,
-                PairingMismatch::KvLayout,
-            ),
-        ];
-        for (name, mine, theirs, mismatch) in hard_facts {
-            match (mine, theirs) {
-                (Some(a), Some(b)) if a != b => return Some(mismatch),
-                (Some(_), Some(_)) => {}
+        match (&self.transport, &other.transport) {
+            (Some(a), Some(b)) if a != b => return Some(PairingMismatch::Transport),
+            (Some(_), Some(_)) => {}
+            _ => {
+                if let Some(mismatch) = unknown("transport") {
+                    return Some(mismatch);
+                }
+            }
+        }
+        for (short, label, _) in LAYOUT_FACTS {
+            match (self.kv_layout.get(short), other.kv_layout.get(short)) {
+                (Some(a), Some(b)) if a != b => return Some(PairingMismatch::KvLayout(label)),
+                (Some(_), Some(_)) | (None, None) => {}
                 _ => {
-                    if let Some(mismatch) = unknown(name) {
+                    if let Some(mismatch) = unknown(label) {
                         return Some(mismatch);
                     }
                 }
@@ -220,25 +265,18 @@ fn normalise_connector(connector: &str) -> String {
     }
 }
 
-/// The KV layout facts the engines report: cache dtype, page or block size,
-/// attention backend, model dtype. `None` when the worker reports none of
-/// them.
-fn kv_layout_of(labels: &HashMap<String, String>) -> Option<String> {
-    const FACTS: [(&str, &str); 5] = [
-        ("kv_cache_dtype", "dtype"),
-        ("page_size", "page"),
-        ("block_size", "page"),
-        ("attention_backend", "attn"),
-        ("model_dtype", "model"),
-    ];
-    let parts: Vec<String> = FACTS
+/// The KV layout facts the engine reports, by short name; a fact the labels
+/// do not carry is absent.
+fn kv_layout_of(labels: &HashMap<String, String>) -> BTreeMap<&'static str, String> {
+    LAYOUT_FACTS
         .iter()
-        .filter_map(|(label, short)| {
-            non_empty(labels.get(*label))
-                .map(|value| format!("{short}={}", value.to_ascii_lowercase()))
+        .filter_map(|(short, label, aliases)| {
+            std::iter::once(label)
+                .chain(aliases.iter())
+                .find_map(|name| non_empty(labels.get(*name)))
+                .map(|value| (*short, value.to_ascii_lowercase()))
         })
-        .collect();
-    (!parts.is_empty()).then(|| parts.join(","))
+        .collect()
 }
 
 #[cfg(test)]
@@ -270,9 +308,10 @@ mod tests {
         s.kv_connector = Some("NixlConnector".to_string());
         let pairing = PdPairing::derive(&s);
         assert_eq!(pairing.transport(), Some("nixl"));
+        assert_eq!(pairing.version(), Some("0.27.1"));
         assert_eq!(
             pairing.key(),
-            "vllm/nixl/0.27.1/dtype=auto,page=16,attn=flash_attn,model=torch.bfloat16"
+            "vllm/nixl/dtype=auto,page=16,attn=flash_attn,model=torch.bfloat16"
         );
         // The connector may also arrive as a discovered label.
         let s = spec(
@@ -292,15 +331,12 @@ mod tests {
                 ("page_size", "64"),
             ],
         );
-        assert_eq!(
-            PdPairing::derive(&sglang).key(),
-            "sglang/nixl/0.5.18/page=64"
-        );
+        assert_eq!(PdPairing::derive(&sglang).key(), "sglang/nixl/page=64");
         // TokenSpeed has only Mooncake, so an unreported backend is Mooncake.
         let tokenspeed = spec(RuntimeType::TokenSpeed, &[("version", "0.3.0")]);
         assert_eq!(
             PdPairing::derive(&tokenspeed).key(),
-            "tokenspeed/mooncake/0.3.0/?"
+            "tokenspeed/mooncake/?"
         );
     }
 
@@ -361,19 +397,42 @@ mod tests {
                 ("kv_cache_dtype", "fp8_e5m2"),
             ],
         ));
-        let auto = PdPairing::derive(&spec(
-            RuntimeType::Sglang,
+        assert_eq!(
+            fp8.mismatch(&nixl, PdPairingMode::Lenient),
+            Some(PairingMismatch::KvLayout("kv_cache_dtype"))
+        );
+        assert_eq!(
+            fp8.mismatch(&nixl, PdPairingMode::Strict),
+            Some(PairingMismatch::KvLayout("kv_cache_dtype"))
+        );
+        assert!(nixl.compatible(&nixl.clone(), PdPairingMode::Strict));
+    }
+
+    #[test]
+    fn a_layout_fact_one_side_omits_is_unknown_and_one_neither_reports_is_not_a_fact() {
+        let requested = PdPairing::derive(&spec(
+            RuntimeType::Vllm,
             &[
-                ("disaggregation_transfer_backend", "nixl"),
-                ("version", "1"),
+                ("kv_connector", "NixlConnector"),
+                ("kv_cache_dtype", "auto"),
+                ("attention_backend", "FLASH_ATTN"),
+            ],
+        ));
+        // The auto path reports no attention backend.
+        let auto = PdPairing::derive(&spec(
+            RuntimeType::Vllm,
+            &[
+                ("kv_connector", "NixlConnector"),
                 ("kv_cache_dtype", "auto"),
             ],
         ));
+        assert!(requested.compatible(&auto, PdPairingMode::Lenient));
         assert_eq!(
-            fp8.mismatch(&auto, PdPairingMode::Strict),
-            Some(PairingMismatch::KvLayout)
+            requested.mismatch(&auto, PdPairingMode::Strict),
+            Some(PairingMismatch::Unknown("attention_backend"))
         );
-        assert!(nixl.compatible(&nixl.clone(), PdPairingMode::Strict));
+        // Neither side reports the backend: nothing to compare, even strictly.
+        assert!(auto.compatible(&auto.clone(), PdPairingMode::Strict));
     }
 
     #[test]
@@ -388,8 +447,8 @@ mod tests {
             known.mismatch(&silent, PdPairingMode::Strict),
             Some(PairingMismatch::Unknown("transport"))
         );
-        // Explicit on one side only: the operator's assertion cannot be
-        // checked against a derived descriptor.
+        // Explicit on one side only: strict refuses, lenient still compares
+        // the derived facts, so a known transport difference is refused.
         let mut asserted = spec(RuntimeType::Vllm, &[("kv_connector", "NixlConnector")]);
         asserted.pairing_protocol = Some("blue".to_string());
         let asserted = PdPairing::derive(&asserted);
@@ -397,6 +456,14 @@ mod tests {
         assert_eq!(
             asserted.mismatch(&known, PdPairingMode::Strict),
             Some(PairingMismatch::Unknown("pairing_protocol"))
+        );
+        let mooncake = PdPairing::derive(&spec(
+            RuntimeType::Vllm,
+            &[("kv_connector", "MooncakeConnector")],
+        ));
+        assert_eq!(
+            asserted.mismatch(&mooncake, PdPairingMode::Lenient),
+            Some(PairingMismatch::Transport)
         );
         let other = PdPairing::derive(&{
             let mut s = spec(RuntimeType::Vllm, &[]);
@@ -442,5 +509,18 @@ mod tests {
             Some(PairingMismatch::Runtime)
         );
         assert!(nixl.compatible(&mooncake, PdPairingMode::Off));
+    }
+
+    #[test]
+    fn a_mismatch_describes_its_component() {
+        assert_eq!(PairingMismatch::Transport.describe(), "transport");
+        assert_eq!(
+            PairingMismatch::KvLayout("page_size").describe(),
+            "page_size"
+        );
+        assert_eq!(
+            PairingMismatch::Unknown("attention_backend").describe(),
+            "unknown attention_backend"
+        );
     }
 }

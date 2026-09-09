@@ -406,11 +406,16 @@ impl WorkerSelectionStage {
             PlacementFailure::Unavailable | PlacementFailure::PolicyDeclined(_) => {
                 self.workers_unavailable(model_id)
             }
-            PlacementFailure::NoCompatiblePair { prefill, decode } => {
+            PlacementFailure::NoCompatiblePair {
+                prefill,
+                decode,
+                mismatches,
+            } => {
                 error!(
                     function = "WorkerSelectionStage::execute",
                     mode = ?self.mode,
                     model_id = %model_id,
+                    ?mismatches,
                     ?prefill,
                     ?decode,
                     "No prefill/decode pair shares a KV transfer protocol"
@@ -419,7 +424,8 @@ impl WorkerSelectionStage {
                     "no_compatible_pd_pair",
                     format!(
                         "No prefill/decode pair for model '{model_id}' shares a KV transfer \
-                         protocol (prefill: {prefill:?}, decode: {decode:?})"
+                         protocol (mismatch on {mismatches:?}; prefill: {prefill:?}, decode: \
+                         {decode:?})"
                     ),
                 )
             }

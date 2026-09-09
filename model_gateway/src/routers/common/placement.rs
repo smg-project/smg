@@ -25,8 +25,8 @@ use crate::{
     },
     routers::common::overload,
     worker::{
-        ConnectionMode, ConnectionModeExt, PdPairingMode, RoutingPool, RuntimeType, Worker,
-        WorkerRegistry,
+        ConnectionMode, ConnectionModeExt, PairingMismatch, PdPairingMode, RoutingPool,
+        RuntimeType, Worker, WorkerRegistry,
     },
 };
 
@@ -84,10 +84,12 @@ pub(crate) enum PlacementFailure {
     /// Available candidates existed but the named policy picked none.
     PolicyDeclined(&'static str),
     /// Both legs had available workers, but no prefill shares a KV transfer
-    /// protocol with any decode (#2483). Carries each leg's pairing keys.
+    /// protocol with any decode (#2483). Carries each leg's pairing keys and
+    /// the components the legs disagreed on.
     NoCompatiblePair {
         prefill: Vec<String>,
         decode: Vec<String>,
+        mismatches: Vec<String>,
     },
 }
 
@@ -228,6 +230,26 @@ pub(crate) fn single_failure(
 }
 
 /// Classify a failed placement from the candidates it drew from.
+/// The distinct components on which the legs' descriptors disagree, sorted.
+fn pairing_mismatches(
+    prefill: &[Arc<dyn Worker>],
+    decode: &[Arc<dyn Worker>],
+    mode: PdPairingMode,
+) -> Vec<String> {
+    let mut mismatches: Vec<String> = prefill
+        .iter()
+        .flat_map(|p| {
+            decode
+                .iter()
+                .filter_map(move |d| p.pd_pairing().mismatch(d.pd_pairing(), mode))
+        })
+        .map(PairingMismatch::describe)
+        .collect();
+    mismatches.sort();
+    mismatches.dedup();
+    mismatches
+}
+
 /// The distinct pairing keys of one leg's candidates, sorted.
 fn pairing_keys(leg: &[Arc<dyn Worker>]) -> Vec<String> {
     let mut keys: Vec<String> = leg.iter().map(|w| w.pd_pairing().key()).collect();
@@ -322,7 +344,8 @@ pub(crate) fn select_pair(
     }
 
     // A rendezvous only works between legs that share a KV transfer
-    // protocol (transport, KV layout, or an explicit pairing protocol).
+    // protocol (runtime, transport, KV layout, or an explicit pairing
+    // protocol).
     // Narrow the prefill pool to workers with at least one compatible
     // decode, so the policy's pick always has a partner; the decode pool
     // narrows to that pick's partners below. The keys are only built for
@@ -336,9 +359,11 @@ pub(crate) fn select_pair(
     if pairing_mode != PdPairingMode::Off && !prefill.iter().any(&has_partner) {
         let prefill_keys = pairing_keys(&prefill);
         let decode_keys = pairing_keys(&decode);
+        let mismatches = pairing_mismatches(&prefill, &decode, pairing_mode);
         warn!(
             model_id,
             mode = pairing_mode.as_str(),
+            ?mismatches,
             ?prefill_keys,
             ?decode_keys,
             "No prefill/decode pair shares a KV transfer protocol"
@@ -348,6 +373,7 @@ pub(crate) fn select_pair(
             verdict: PlacementFailure::NoCompatiblePair {
                 prefill: prefill_keys,
                 decode: decode_keys,
+                mismatches,
             },
         }));
     }
@@ -531,9 +557,14 @@ mod tests {
             .expect("no pair shares a transport");
         assert_eq!(failure.leg, WorkerLeg::Decode);
         match failure.verdict {
-            PlacementFailure::NoCompatiblePair { prefill, decode } => {
-                assert_eq!(prefill, ["vllm/nixl/?/?"]);
-                assert_eq!(decode, ["vllm/mooncake/?/?"]);
+            PlacementFailure::NoCompatiblePair {
+                prefill,
+                decode,
+                mismatches,
+            } => {
+                assert_eq!(prefill, ["vllm/nixl/?"]);
+                assert_eq!(decode, ["vllm/mooncake/?"]);
+                assert_eq!(mismatches, ["transport"]);
             }
             _ => panic!("expected NoCompatiblePair"),
         }
