@@ -209,12 +209,22 @@ def wait_for_gpu_memory_release(
     success), or ``None`` when ``nvidia-smi`` is unavailable.
     """
     deadline = time.monotonic() + timeout
+    last_over: dict[int, int] | None = None
+    last_change = time.monotonic()
     while True:
         used = gpu_memory_used_mib(gpu_ids)
         if used is None:
             return None
         over = {gpu: mib for gpu, mib in used.items() if mib > baseline.get(gpu, 0) + slack_mib}
-        if not over or time.monotonic() >= deadline:
+        now = time.monotonic()
+        if not over or now >= deadline:
+            return over
+        # A region that another live process still maps (a decode holding a
+        # dead prefill's KV) never drains; a teardown in progress shrinks the
+        # figure every second. Give up once it has sat still for 5 s.
+        if over != last_over:
+            last_over, last_change = over, now
+        elif now - last_change >= 5.0:
             return over
         time.sleep(0.5)
 
