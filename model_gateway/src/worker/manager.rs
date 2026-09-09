@@ -706,14 +706,16 @@ fn schedule_worker_at(
 
 /// Whether a probe launched at `launched_status` that succeeds should re-read
 /// the worker's KV engine id: after a failure (the engine may be a new
-/// process), or while a worker that registered before its engine reported an
-/// id is still pending. A Ready or Draining worker, or a pending one that
-/// already has an id, is the same process registration read.
+/// process), while a worker that registered before its engine reported an id
+/// is still pending, or while a Ready worker's last recovery re-read has not
+/// been confirmed. A Draining worker, or a pending one that already has an
+/// id, is the same process registration read.
 fn engine_id_may_be_stale(launched_status: WorkerStatus, worker: &dyn Worker) -> bool {
     match launched_status {
         WorkerStatus::Failed | WorkerStatus::NotReady => true,
         WorkerStatus::Pending => worker.kv_engine_id().is_none(),
-        WorkerStatus::Ready | WorkerStatus::Draining => false,
+        WorkerStatus::Ready => !worker.kv_engine_id_confirmed(),
+        WorkerStatus::Draining => false,
     }
 }
 
@@ -740,6 +742,10 @@ async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: 
         discover_grpc_kv_engine_id(worker.url(), spec.runtime_type.as_str()),
     )
     .await;
+    // Anything but a confirmed id leaves the flag set, so the next probe
+    // retries instead of the worker serving with a possibly stale id until
+    // its next outage.
+    worker.set_kv_engine_id_confirmed(false);
     match read {
         Ok(Ok(Some(discovered))) => {
             let previous = worker.kv_engine_id();
@@ -751,23 +757,30 @@ async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: 
                     "Recovered PD worker reports a new KV engine id"
                 );
             }
+            worker.set_kv_engine_id_confirmed(true);
         }
         // A partial read (server info tolerated as missing) or an engine
         // that reports no id: a known id must never be cleared by it.
-        Ok(Ok(None)) => warn!(
-            worker_url = %worker.url(),
-            previous = ?worker.kv_engine_id(),
-            "Recovered PD worker reported no KV engine id; keeping the previous one"
-        ),
+        Ok(Ok(None)) => match worker.kv_engine_id() {
+            Some(previous) => warn!(
+                worker_url = %worker.url(),
+                previous,
+                "Recovered PD worker reported no KV engine id; keeping the previous one until it does"
+            ),
+            None => warn!(
+                worker_url = %worker.url(),
+                "PD worker reports no KV engine id yet; handoffs carry none until it does"
+            ),
+        },
         Ok(Err(error)) => warn!(
             worker_url = %worker.url(),
             %error,
-            "Could not re-read the KV engine id of a recovered PD worker; keeping the previous one"
+            "Could not re-read the KV engine id of a recovered PD worker; keeping the previous one and retrying on the next probe"
         ),
         Err(_) => warn!(
             worker_url = %worker.url(),
             timeout_secs = timeout.as_secs(),
-            "Re-reading the KV engine id of a recovered PD worker timed out; keeping the previous one"
+            "Re-reading the KV engine id of a recovered PD worker timed out; keeping the previous one and retrying on the next probe"
         ),
     }
 }
@@ -1259,6 +1272,8 @@ mod tests {
         };
         let with_id = worker(Some("eng"));
         let without_id = worker(None);
+        let unconfirmed = worker(Some("eng"));
+        unconfirmed.set_kv_engine_id_confirmed(false);
         let cases = [
             (WorkerStatus::Failed, &with_id, true),
             (WorkerStatus::NotReady, &with_id, true),
@@ -1266,7 +1281,8 @@ mod tests {
             (WorkerStatus::Pending, &without_id, true),
             (WorkerStatus::Ready, &with_id, false),
             (WorkerStatus::Ready, &without_id, false),
-            (WorkerStatus::Draining, &with_id, false),
+            (WorkerStatus::Ready, &unconfirmed, true),
+            (WorkerStatus::Draining, &unconfirmed, false),
         ];
         for (status, worker, expected) in cases {
             assert_eq!(
@@ -1318,6 +1334,9 @@ mod tests {
             "the re-read must be bounded by the timeout"
         );
         assert_eq!(worker.kv_engine_id().as_deref(), Some("eng-old"));
+        // Not confirmed: a later Ready probe re-reads instead of giving up.
+        assert!(!worker.kv_engine_id_confirmed());
+        assert!(engine_id_may_be_stale(WorkerStatus::Ready, worker.as_ref()));
         hold.abort();
     }
 

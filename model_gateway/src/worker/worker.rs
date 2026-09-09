@@ -630,6 +630,17 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         false
     }
 
+    /// Whether the engine id in force has been confirmed by the engine since
+    /// the worker last recovered. `false` after a re-read that failed,
+    /// expired or returned no id, so the next probe tries again instead of
+    /// the worker serving with a possibly stale id until its next outage.
+    fn kv_engine_id_confirmed(&self) -> bool {
+        true
+    }
+
+    /// Record the outcome of a re-read (see [`Self::kv_engine_id_confirmed`]).
+    fn set_kv_engine_id_confirmed(&self, _confirmed: bool) {}
+
     /// Transform a request for DP-aware routing.
     ///
     /// When the worker has a `dp_rank`, injects `data_parallel_rank`
@@ -1303,6 +1314,9 @@ pub struct BasicWorker {
     /// own spec, and one rebuilt by a properties update starts from that
     /// spec's (unrefreshed) id.
     pub kv_engine_id: ArcSwapOption<String>,
+    /// Set while a recovery re-read of the engine id has not succeeded yet
+    /// (see [`Worker::kv_engine_id_confirmed`]).
+    pub kv_engine_id_unconfirmed: AtomicBool,
     /// Worker-directed HTTP client, shared across same-config workers, built
     /// on first use (see [`LazyHttpClient`]).
     pub http_client: Arc<LazyHttpClient>,
@@ -1322,6 +1336,9 @@ impl Clone for BasicWorker {
             connect_signal_tx: self.connect_signal_tx.clone(),
             models_override: Arc::clone(&self.models_override),
             kv_engine_id: ArcSwapOption::new(self.kv_engine_id.load_full()),
+            kv_engine_id_unconfirmed: AtomicBool::new(
+                self.kv_engine_id_unconfirmed.load(Ordering::Relaxed),
+            ),
             http_client: Arc::clone(&self.http_client),
             resilience: self.resilience.clone(),
         }
@@ -1468,6 +1485,15 @@ impl Worker for BasicWorker {
         }
         self.kv_engine_id.store(kv_engine_id.map(Arc::new));
         true
+    }
+
+    fn kv_engine_id_confirmed(&self) -> bool {
+        !self.kv_engine_id_unconfirmed.load(Ordering::Relaxed)
+    }
+
+    fn set_kv_engine_id_confirmed(&self, confirmed: bool) {
+        self.kv_engine_id_unconfirmed
+            .store(!confirmed, Ordering::Relaxed);
     }
 
     fn as_any(&self) -> &dyn Any {
