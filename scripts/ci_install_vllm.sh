@@ -65,9 +65,13 @@ echo "nixl import canary OK"
 python3 -c "import torch, torchcodec, vllm"
 echo "vllm/torchcodec import canary OK"
 
-# Mooncake transfer engine, only on the MooncakeConnector PD leg so a broken
-# wheel cannot fail the unrelated vLLM jobs
-if [ "${E2E_VLLM_KV_BACKEND:-nixl}" = "mooncake" ]; then
+# Mooncake transfer engine, only where a lane runs MooncakeConnector PD
+# workers (its own backend, the lane-wide E2E_KV_BACKEND, or an extra backend
+# for a fleet that mixes transports) so a broken wheel cannot fail the
+# unrelated vLLM jobs
+if [ "${E2E_VLLM_KV_BACKEND:-nixl}" = "mooncake" ] \
+    || [ "${E2E_KV_BACKEND:-}" = "mooncake" ] \
+    || [[ ",${E2E_VLLM_EXTRA_KV_BACKENDS:-}," == *",mooncake,"* ]]; then
     # Mooncake's native extension links libibverbs/libnuma at load time even
     # when the transfer protocol is tcp — without these the import fails with
     # "libibverbs.so.1: cannot open shared object file".

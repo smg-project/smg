@@ -59,6 +59,11 @@ on:
         type: string
         default: ""
         description: "KV transfer backend for every PD worker, whatever the engine (nixl or mooncake); empty keeps each engine's default"
+      vllm_extra_kv_backends:
+        required: false
+        type: string
+        default: ""
+        description: "Additional vLLM KV transfer backends to install beside the lane's own (e.g. mooncake), for fleets that mix transports"
       connection_mode:
         required: false
         type: string
@@ -93,6 +98,7 @@ jobs:
       E2E_GPU_TIER: ${{ inputs.gpu_tier }}
       E2E_VLLM_KV_BACKEND: ${{ inputs.vllm_kv_backend }}
       E2E_KV_BACKEND: ${{ inputs.kv_backend }}
+      E2E_VLLM_EXTRA_KV_BACKENDS: ${{ inputs.vllm_extra_kv_backends }}
       E2E_CONNECTION_MODE: ${{ inputs.connection_mode }}
       E2E_ZMQ_ENGINE_COUNT: ${{ inputs.zmq_engine_count }}
       TOKENSPEED_PREBUILT_IMAGE: ${{ inputs.tokenspeed_prebuilt_image }}

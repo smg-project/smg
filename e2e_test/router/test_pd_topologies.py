@@ -29,6 +29,7 @@ Usage:
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 import re
@@ -161,6 +162,17 @@ def _wait_for_pairs(minimum: int, timeout: float = LOG_FLUSH_TIMEOUT_S) -> list[
         f"is --log-level debug reaching {_LOG_DIR}/smg*?"
     )
     return pairs
+
+
+def _vllm_transport_installed(*packages: str) -> bool:
+    """Whether every KV transport package is importable in the engine venv."""
+    return all(importlib.util.find_spec(package) is not None for package in packages)
+
+
+_NEEDS_BOTH_VLLM_TRANSPORTS = pytest.mark.skipif(
+    not _vllm_transport_installed("nixl", "mooncake"),
+    reason="a fleet that mixes NIXL and Mooncake needs both transfer engines installed",
+)
 
 
 def _pairing_keys(gateway: Gateway) -> dict[str, str]:
@@ -668,6 +680,7 @@ class TestPDTopology:
     ],
     indirect=True,
 )
+@_NEEDS_BOTH_VLLM_TRANSPORTS
 class TestPDMixedTransport:
     """One NIXL pair and one Mooncake pair share a model.
 
@@ -718,6 +731,7 @@ class TestPDMixedTransport:
     ],
     indirect=True,
 )
+@_NEEDS_BOTH_VLLM_TRANSPORTS
 class TestPDMismatchedTransport:
     """A NIXL prefill and a Mooncake decode can never complete a handoff.
 

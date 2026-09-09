@@ -1075,6 +1075,9 @@ jobs:
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
       min_selected: ${{ matrix.min_selected || 116 }} # floor ≈ 95% of the 122 collected cases
       kv_backend: ${{ matrix.kv_backend || '' }}
+      vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
+      # The mixed-transport fleet needs both vLLM backends installed whatever the lane's own
+      vllm_extra_kv_backends: ${{ matrix.engine == 'vllm' && 'mooncake' || '' }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
