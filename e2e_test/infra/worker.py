@@ -256,6 +256,10 @@ class Worker:
             return self.kv_backend.lower()
         if self.engine == "sglang":
             return sglang_transfer_backend()
+        if self.engine == "tokenspeed":
+            # TokenSpeed moves KV over Mooncake only; the lane-wide setting
+            # exists for the engines that have a choice.
+            return "mooncake"
         return vllm_kv_backend()
 
     def _build_cmd(self) -> list[str]:
