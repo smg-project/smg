@@ -25,6 +25,7 @@ from .constants import (
     WorkerType,
     get_runtime,
     get_zmq_engine_count,
+    sglang_transfer_backend,
     vllm_kv_backend,
 )
 from .model_specs import get_model_spec
@@ -59,6 +60,9 @@ class Worker:
     extra_engine_args: list[str] | None = None
     # Overrides the model spec's tp, so a PD pair can run asymmetric legs.
     tp: int | None = None
+    # KV transfer backend for this PD worker ("nixl" or "mooncake"); None
+    # takes the lane's default, so one fleet can mix transports.
+    kv_backend: str | None = None
     process: subprocess.Popen | None = field(default=None, repr=False)
     _log_file: IO[Any] | None = field(default=None, repr=False)
     # Used memory per GPU just before launch; ``stop`` waits for it to come back.
@@ -246,6 +250,14 @@ class Worker:
         """Check if the worker process is still running."""
         return self.process is not None and self.process.poll() is None
 
+    def effective_kv_backend(self) -> str:
+        """This worker's KV transfer backend: its own override, else the lane's."""
+        if self.kv_backend:
+            return self.kv_backend.lower()
+        if self.engine == "sglang":
+            return sglang_transfer_backend()
+        return vllm_kv_backend()
+
     def _build_cmd(self) -> list[str]:
         """Build engine-specific launch command using model specs."""
         spec = get_model_spec(self.model_id)
@@ -381,7 +393,7 @@ class Worker:
         # PD disaggregation: KV transfer roles (backend via E2E_VLLM_KV_BACKEND)
         if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
             kv_role = "kv_producer" if self.worker_type == WorkerType.PREFILL else "kv_consumer"
-            if vllm_kv_backend() == "mooncake":
+            if self.effective_kv_backend() == "mooncake":
                 config = {"kv_connector": "MooncakeConnector", "kv_role": kv_role}
             else:
                 config = {"kv_connector": "NixlConnector", "kv_role": kv_role}
@@ -465,7 +477,7 @@ class Worker:
             cmd.extend(["--disaggregation-mode", self.worker_type.value])
             if self.bootstrap_port is not None:
                 cmd.extend(["--disaggregation-bootstrap-port", str(self.bootstrap_port)])
-            cmd.extend(["--disaggregation-transfer-backend", "mooncake"])
+            cmd.extend(["--disaggregation-transfer-backend", self.effective_kv_backend()])
             if self.dist_init_addr:
                 cmd.extend(["--dist-init-addr", self.dist_init_addr])
             if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
@@ -531,7 +543,7 @@ class Worker:
 
         # vLLM PD workers need per-worker side-channel ports for their KV backend
         if self.engine == "vllm" and self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
-            if vllm_kv_backend() == "mooncake":
+            if self.effective_kv_backend() == "mooncake":
                 # The producer's bootstrap server must listen on the port the
                 # gateway advertises in remote_bootstrap_addr
                 if self.bootstrap_port is not None:
@@ -657,6 +669,7 @@ def start_workers(
     gpus: int | None = None,
     extra_engine_args: list[str] | None = None,
     tp: int | None = None,
+    kv_backend: str | None = None,
 ) -> list[Worker]:
     """Start N workers for a model. GPU IDs assigned sequentially.
 
@@ -676,6 +689,8 @@ def start_workers(
         extra_engine_args: Extra CLI args appended to the engine launch command.
         tp: Tensor-parallel size for these workers; defaults to the model
             spec's tp. Also sizes the GPU slice unless ``gpus`` says otherwise.
+        kv_backend: KV transfer backend for PD workers ("nixl" or
+            "mooncake"); defaults to the lane's setting.
 
     Returns:
         List of started Worker instances.
@@ -739,6 +754,7 @@ def start_workers(
                 log_dir=log_dir,
                 extra_engine_args=extra_engine_args,
                 tp=tp,
+                kv_backend=kv_backend,
             )
 
             # Stagger launches to avoid resource contention

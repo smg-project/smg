@@ -71,6 +71,7 @@ class WorkerPool:
         extra_engine_args: list[str] | None = None,
         wait_ready: bool = True,
         tp: int | None = None,
+        kv_backend: str | None = None,
     ) -> list[Worker]:
         """Return ``count`` healthy workers for the given key.
 
@@ -118,10 +119,13 @@ class WorkerPool:
                     extra_engine_args=extra_engine_args,
                     wait_ready=wait_ready,
                     tp=tp,
+                    kv_backend=kv_backend,
                 )
 
-            if tp is not None:
-                raise ValueError("a per-leg tp is only meaningful for PD prefill/decode workers")
+            if tp is not None or kv_backend is not None:
+                raise ValueError(
+                    "a per-leg tp or kv_backend is only meaningful for PD prefill/decode workers"
+                )
 
             # REGULAR workers always start at gpu 0; ``gpu_offset`` is only
             # meaningful for non-REGULAR (PD decode) callers.

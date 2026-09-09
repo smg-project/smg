@@ -60,6 +60,10 @@ _WORKER_DEFAULTS = {
     # PD only: per-leg tensor parallelism (None = the model spec's tp).
     "prefill_tp": None,
     "decode_tp": None,
+    # PD only: KV transfer backend per worker of each leg ("nixl" /
+    # "mooncake"), a list one entry per worker; None = the lane's default.
+    "prefill_kv": None,
+    "decode_kv": None,
     "gpus": None,
     "extra_engine_args": None,
     # PD only: spawn every prefill/decode worker first and wait afterwards.
@@ -206,7 +210,9 @@ def setup_backend(request: pytest.FixtureRequest):
         GPU count and extra engine CLI args (local workers only)
       - ``@pytest.mark.workers(prefill=1, decode=1)``: PD worker counts
       - ``("pd_grpc", (n_prefill, n_decode[, prefill_tp, decode_tp]))`` as
-        the param: PD counts, optionally with asymmetric per-leg tp
+        the param: PD counts, optionally with asymmetric per-leg tp; a
+        trailing dict may add ``prefill_kv`` / ``decode_kv`` lists naming
+        each worker's KV transfer backend, so one fleet can mix transports
       - ``@pytest.mark.gateway(policy=..., timeout=..., extra_args=...)``: Gateway config
 
     Returns:
@@ -249,10 +255,15 @@ def setup_backend(request: pytest.FixtureRequest):
     if is_pd and leg_counts is not None:
         # ``("pd_grpc", (n_prefill, n_decode))`` lets one class sweep PD
         # topologies; setup_backend is class-scoped, so counts ride in the param.
+        leg_options: dict = {}
+        if leg_counts and isinstance(leg_counts[-1], dict):
+            leg_options = dict(leg_counts[-1])
+            leg_counts = tuple(leg_counts[:-1])
         if len(leg_counts) not in (2, 4):
             raise ValueError(
                 "pd_* backend params take (n_prefill, n_decode) or "
-                "(n_prefill, n_decode, prefill_tp, decode_tp)"
+                "(n_prefill, n_decode, prefill_tp, decode_tp), optionally followed by "
+                "a dict of per-worker options"
             )
         workers_config = {**workers_config, "prefill": leg_counts[0], "decode": leg_counts[1]}
         if len(leg_counts) == 4:
@@ -261,6 +272,9 @@ def setup_backend(request: pytest.FixtureRequest):
                 "prefill_tp": leg_counts[2],
                 "decode_tp": leg_counts[3],
             }
+        for key in ("prefill_kv", "decode_kv"):
+            if key in leg_options:
+                workers_config = {**workers_config, key: list(leg_options[key])}
     log_dir = os.environ.get("E2E_LOG_DIR") or gateway_config.get("log_dir")
 
     fail_count = _worker_start_failures.get(engine, 0)
@@ -382,6 +396,62 @@ def _setup_local(
 # ---------------------------------------------------------------------------
 
 
+def _per_worker_kv(raw, count: int, leg: str) -> list[str] | None:
+    """Normalise a per-worker KV backend list for one PD leg (None = lane default)."""
+    if raw is None:
+        return None
+    backends = [str(b).lower() for b in raw]
+    if len(backends) != count:
+        raise ValueError(f"{leg}_kv names {len(backends)} backends for {count} {leg} workers")
+    return backends
+
+
+def _start_pd_leg(
+    *,
+    model_id: str,
+    engine: str,
+    mode,
+    count: int,
+    worker_type,
+    log_dir,
+    gpu_offset: int,
+    wait_ready: bool,
+    tp,
+    kv_backends: list[str] | None,
+) -> list:
+    """Start one PD leg; a per-worker KV backend list starts the workers one by one."""
+    if kv_backends is None:
+        return _start_workers_tracked(
+            model_id=model_id,
+            engine=engine,
+            mode=mode,
+            count=count,
+            worker_type=worker_type,
+            log_dir=log_dir,
+            gpu_offset=gpu_offset,
+            wait_ready=wait_ready,
+            tp=tp,
+        )
+    spec_tp = tp or get_model_spec(model_id).get("tp", 1)
+    workers: list = []
+    for i, backend in enumerate(kv_backends):
+        workers.extend(
+            _start_workers_tracked(
+                model_id=model_id,
+                engine=engine,
+                mode=mode,
+                count=1,
+                worker_type=worker_type,
+                log_dir=log_dir,
+                gpu_offset=gpu_offset + i * spec_tp,
+                wait_ready=wait_ready,
+                tp=tp,
+                kv_backend=backend,
+            )
+        )
+    return workers
+
+
 def _setup_pd(
     model_id,
     model_path,
@@ -398,37 +468,43 @@ def _setup_pd(
     num_decode = workers_config.get("decode") or 1
     prefill_tp = workers_config.get("prefill_tp")
     decode_tp = workers_config.get("decode_tp")
+    prefill_kv = _per_worker_kv(workers_config.get("prefill_kv"), num_prefill, "prefill")
+    decode_kv = _per_worker_kv(workers_config.get("decode_kv"), num_decode, "decode")
     backend_name = f"pd_{connection_mode.value}"
     runtime_label = RUNTIME_LABELS.get(engine, engine)
 
     logger.info(
-        "Starting %s PD backend: model=%s, %d prefill (tp=%s) + %d decode (tp=%s)",
+        "Starting %s PD backend: model=%s, %d prefill (tp=%s, kv=%s) + %d decode (tp=%s, kv=%s)",
         runtime_label,
         model_id,
         num_prefill,
         prefill_tp or spec.get("tp", 1),
+        prefill_kv or "lane default",
         num_decode,
         decode_tp or spec.get("tp", 1),
+        decode_kv or "lane default",
     )
 
     parallel_start = bool(workers_config.get("parallel_start"))
     all_workers: list = []
     try:
-        prefill_workers = _start_workers_tracked(
+        prefill_workers = _start_pd_leg(
             model_id=model_id,
             engine=engine,
             mode=connection_mode,
             count=num_prefill,
             worker_type=WorkerType.PREFILL,
             log_dir=log_dir,
+            gpu_offset=0,
             wait_ready=not parallel_start,
             tp=prefill_tp,
+            kv_backends=prefill_kv,
         )
         all_workers.extend(prefill_workers)
 
         # Decode workers start on GPUs after prefill workers
         decode_gpu_offset = num_prefill * (prefill_tp or spec.get("tp", 1))
-        decode_workers = _start_workers_tracked(
+        decode_workers = _start_pd_leg(
             model_id=model_id,
             engine=engine,
             mode=connection_mode,
@@ -438,6 +514,7 @@ def _setup_pd(
             gpu_offset=decode_gpu_offset,
             wait_ready=not parallel_start,
             tp=decode_tp,
+            kv_backends=decode_kv,
         )
         all_workers.extend(decode_workers)
         if parallel_start:

@@ -1018,7 +1018,7 @@ jobs:
   # topology sweep (1p1d .. 3p1d) runs in nightly-pd.yml; this lane guards
   # every PR with the topology that exercises both legs' load balancing.
   e2e-4gpu-pd:
-    name: e2e-4gpu-pd (${{ matrix.engine }})
+    name: e2e-4gpu-pd (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
     # PD-ONLY ITERATION MODE — TEMPORARY, REVERT BEFORE MERGE: depends on
     # build-wheel instead of e2e-1gpu-gateway, honours `pd-only`, and runs
     # the whole topology sweep with the nightly budgets instead of the
@@ -1050,6 +1050,19 @@ jobs:
           - engine: tokenspeed
             timeout: 190
             test_timeout: 170
+          # The other KV transport of each engine (TokenSpeed only has
+          # Mooncake): the whole sweep on vLLM over Mooncake, and a 1p1d
+          # smoke of SGLang over NIXL, which has never run in CI.
+          - engine: vllm
+            kv_backend: mooncake
+            timeout: 170
+            test_timeout: 150
+          - engine: sglang
+            kv_backend: nixl
+            timeout: 60
+            test_timeout: 50
+            test_filter: -k "1p1d and not http"
+            min_selected: 11
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -1058,9 +1071,10 @@ jobs:
       timeout: ${{ matrix.timeout }}
       test_timeout: ${{ matrix.test_timeout }}
       test_dirs: e2e_test/router/test_pd_topologies.py
-      test_filter: "" # PD-only iteration mode: the whole sweep (98 cases per engine)
+      test_filter: ${{ matrix.test_filter || '' }} # PD-only iteration mode: the whole sweep unless the row narrows it
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
-      min_selected: 116 # floor ≈ 95% of the 122 collected cases
+      min_selected: ${{ matrix.min_selected || 116 }} # floor ≈ 95% of the 122 collected cases
+      kv_backend: ${{ matrix.kv_backend || '' }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 

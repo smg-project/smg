@@ -626,6 +626,57 @@ class TestPDTopology:
 
 
 # ---------------------------------------------------------------------------
+# a fleet that mixes KV transfer backends
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.engine("vllm")
+@pytest.mark.gpu(4)
+@pytest.mark.e2e
+@pytest.mark.model(_MODEL)
+@pytest.mark.workers(parallel_start=True)
+@pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=_GATEWAY_ARGS)
+@pytest.mark.parametrize(
+    "setup_backend",
+    [
+        pytest.param(
+            (
+                "pd_grpc",
+                (2, 2, {"prefill_kv": ["nixl", "mooncake"], "decode_kv": ["nixl", "mooncake"]}),
+            ),
+            id="2p2d-mixed-kv",
+        )
+    ],
+    indirect=True,
+)
+class TestPDMixedTransport:
+    """One NIXL pair and one Mooncake pair share a model.
+
+    Placement pairs a prefill with a decode on runtime and wire alone, so
+    it will hand a NIXL prefill's handoff to a Mooncake decode and the
+    engine fails the request. #2483 adds the pairing protocol that keeps
+    the legs on one transport; until then this is the record of what a
+    mixed fleet does.
+    """
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="placement pairs across KV transports; pairing protocol pending (#2483)",
+    )
+    def test_every_request_lands_on_a_matching_pair(self, setup_backend):
+        _, model, _, gateway = setup_backend
+        before = len(_pairs_logged())
+        statuses = []
+        for i in range(12):
+            resp = _raw_chat(gateway, model, f"Say hello, {_WORDS[i % len(_WORDS)]}.", timeout=60.0)
+            statuses.append((resp.status_code, _error_code(resp)))
+        pairs = _pairs_logged()[before:]
+        logger.info("mixed fleet: statuses=%s pairs=%s", statuses, pairs)
+        failed = [s for s in statuses if s[0] != 200]
+        assert not failed, f"{len(failed)} of 12 requests failed on a mixed fleet: {failed}"
+
+
+# ---------------------------------------------------------------------------
 # a decode window smaller than the burst
 # ---------------------------------------------------------------------------
 
