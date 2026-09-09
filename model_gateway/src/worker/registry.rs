@@ -34,6 +34,8 @@ use crate::{
         circuit_breaker::CircuitState,
         event::{WorkerConnected, WorkerEvent},
         hash_ring::HashRing,
+        pd_pair_index::{PdPairIndex, PdWire},
+        pd_pairing::PdPairingMode,
         worker::{RuntimeType, WorkerType},
         ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
     },
@@ -177,6 +179,9 @@ impl RoutingPool {
 pub(crate) struct ModelWorkerSnapshot {
     all: WorkerSnapshot,
     pools: [LazyRoutingPool; RoutingPool::COUNT],
+    /// The compatible prefill/decode pairs per wire and pairing mode, built
+    /// once from the pools above (see [`PdPairIndex`]).
+    pd_pairs: [[OnceLock<Arc<PdPairIndex>>; PdPairingMode::COUNT]; PdWire::COUNT],
 }
 
 impl ModelWorkerSnapshot {
@@ -184,7 +189,24 @@ impl ModelWorkerSnapshot {
         Self {
             all,
             pools: std::array::from_fn(|_| OnceLock::new()),
+            pd_pairs: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
         }
+    }
+
+    /// The compatible prefill/decode pairs of `wire` under `mode`: descriptor
+    /// comparisons happen here, once per membership snapshot, never on the
+    /// request path.
+    pub(crate) fn pd_pairs(&self, wire: PdWire, mode: PdPairingMode) -> Arc<PdPairIndex> {
+        self.pd_pairs[wire.index()][mode.index()]
+            .get_or_init(|| {
+                let (prefill, decode) = wire.pools();
+                Arc::new(PdPairIndex::build(
+                    self.pool(prefill),
+                    self.pool(decode),
+                    mode,
+                ))
+            })
+            .clone()
     }
 
     pub(crate) fn pool(&self, pool: RoutingPool) -> WorkerSnapshot {
@@ -629,11 +651,6 @@ impl WorkerRegistry {
         }
         self.model_routing_snapshot(model_id)
             .unwrap_or_else(Self::empty_routing_snapshot)
-    }
-
-    /// Shared empty candidate slice.
-    pub(crate) fn empty_pool() -> Arc<[Arc<dyn Worker>]> {
-        Arc::from(Self::EMPTY_WORKERS)
     }
 
     /// Shared empty snapshot for unknown models.

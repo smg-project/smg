@@ -14,7 +14,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
-        common::placement::{self, PairCandidates, PairFailure, PlacementFailure, PlacementInputs},
+        common::placement::{self, PairFailure, PlacementFailure, PlacementInputs},
         error,
         grpc::{
             context::{
@@ -25,7 +25,7 @@ use crate::{
         },
     },
     worker::{
-        ConnectionModeExt, HashRing, ModelWorkerSnapshot, RoutingPool, RuntimeType, Worker,
+        ConnectionModeExt, HashRing, ModelWorkerSnapshot, PdWire, RoutingPool, RuntimeType, Worker,
         WorkerRegistry, WorkerType,
     },
 };
@@ -531,16 +531,12 @@ impl WorkerSelectionStage {
         // share a runtime, the rendezvous being runtime-specific, and a retry
         // pins both to the retained plan's runtime.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
-        let prefill = snapshot.pool(RoutingPool::GrpcPrefill);
-        let decode = snapshot.pool(RoutingPool::GrpcDecode);
+        let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
         let pair = placement::select_pair(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
-            PairCandidates {
-                prefill: &prefill,
-                decode: &decode,
-            },
+            &pairs,
             wire,
             true,
             PlacementInputs {

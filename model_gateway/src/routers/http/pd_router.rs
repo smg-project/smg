@@ -42,7 +42,7 @@ use crate::{
                 KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
             },
             overload,
-            placement::{self, PairCandidates, PairFailure, PlacementFailure, PlacementInputs},
+            placement::{self, PairFailure, PlacementFailure, PlacementInputs},
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, RetryExecutor},
             serialize_json_sized,
@@ -54,7 +54,10 @@ use crate::{
         http::router::send_with_stale_conn_retry,
         RouterTrait,
     },
-    worker::{RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID},
+    worker::{
+        PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
+        UNKNOWN_MODEL_ID,
+    },
 };
 
 /// Why PD pair selection produced nothing.
@@ -1321,40 +1324,34 @@ impl PDRouter {
         // and win when present; only an empty entry widens to every HTTP
         // prefill/decode worker ("auto" means pick any).
         let is_unknown_model = model_id == UNKNOWN_MODEL_ID;
-        let model_snapshot = self.worker_registry.model_routing_snapshot(model_id);
-        let global_snapshot =
-            is_unknown_model.then(|| self.worker_registry.get_routing_snapshot(UNKNOWN_MODEL_ID));
-
-        let prefill_workers = {
-            let by_model = match &model_snapshot {
-                Some(snapshot) => snapshot.pool(RoutingPool::HttpPrefill),
-                None => WorkerRegistry::empty_pool(),
-            };
-            match &global_snapshot {
-                Some(global) if by_model.is_empty() => global.pool(RoutingPool::HttpPrefill),
-                _ => by_model,
+        let mode = self.policy_registry.pd_pairing_mode();
+        let by_model = self
+            .worker_registry
+            .model_routing_snapshot(model_id)
+            .map(|snapshot| snapshot.pd_pairs(PdWire::Http, mode));
+        let pairs = match by_model {
+            // The literal "unknown" entry wins while it can pair; the
+            // wildcard widens to the global snapshot (both legs from one
+            // snapshot, a superset of the entry) only when a leg is empty.
+            Some(index)
+                if !is_unknown_model
+                    || (!index.prefill_pool.is_empty() && !index.decode_pool.is_empty()) =>
+            {
+                index
             }
-        };
-
-        let decode_workers = {
-            let by_model = match &model_snapshot {
-                Some(snapshot) => snapshot.pool(RoutingPool::HttpDecode),
-                None => WorkerRegistry::empty_pool(),
-            };
-            match &global_snapshot {
-                Some(global) if by_model.is_empty() => global.pool(RoutingPool::HttpDecode),
-                _ => by_model,
-            }
+            _ if is_unknown_model => self
+                .worker_registry
+                .get_routing_snapshot(UNKNOWN_MODEL_ID)
+                .pd_pairs(PdWire::Http, mode),
+            Some(index) => index,
+            None => Arc::new(PdPairIndex::empty()),
         };
 
         let pair = placement::select_pair(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
-            PairCandidates {
-                prefill: &prefill_workers,
-                decode: &decode_workers,
-            },
+            &pairs,
             None,
             false,
             PlacementInputs {

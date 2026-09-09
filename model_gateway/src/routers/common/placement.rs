@@ -25,8 +25,8 @@ use crate::{
     },
     routers::common::overload,
     worker::{
-        ConnectionMode, ConnectionModeExt, PairingMismatch, PdPairingMode, RoutingPool,
-        RuntimeType, Worker, WorkerRegistry,
+        ConnectionMode, ConnectionModeExt, PdPairIndex, RoutingPool, RuntimeType, Worker,
+        WorkerRegistry,
     },
 };
 
@@ -91,14 +91,6 @@ pub(crate) enum PlacementFailure {
         decode: Vec<String>,
         mismatches: Vec<String>,
     },
-}
-
-/// The two legs of a disaggregated placement, each the pool it selects over
-/// before the availability filter. Both must come from one registry snapshot
-/// so the pair cannot straddle a membership change.
-pub(crate) struct PairCandidates<'a> {
-    pub prefill: &'a [Arc<dyn Worker>],
-    pub decode: &'a [Arc<dyn Worker>],
 }
 
 /// A selected prefill/decode pair.
@@ -229,34 +221,6 @@ pub(crate) fn single_failure(
     failure_from(candidates.as_slice(), model_id)
 }
 
-/// The distinct components on which the legs' descriptors disagree, sorted.
-fn pairing_mismatches(
-    prefill: &[Arc<dyn Worker>],
-    decode: &[Arc<dyn Worker>],
-    mode: PdPairingMode,
-) -> Vec<String> {
-    let mut mismatches: Vec<String> = prefill
-        .iter()
-        .flat_map(|p| {
-            decode
-                .iter()
-                .filter_map(move |d| p.pd_pairing().mismatch(d.pd_pairing(), mode))
-        })
-        .map(PairingMismatch::describe)
-        .collect();
-    mismatches.sort();
-    mismatches.dedup();
-    mismatches
-}
-
-/// The distinct pairing keys of one leg's candidates, sorted.
-fn pairing_keys(leg: &[Arc<dyn Worker>]) -> Vec<String> {
-    let mut keys: Vec<String> = leg.iter().map(|w| w.pd_pairing().key()).collect();
-    keys.sort();
-    keys.dedup();
-    keys
-}
-
 /// Classify a failed placement from the candidates it drew from.
 pub(crate) fn failure_from(candidates: &[Arc<dyn Worker>], model_id: &str) -> PlacementFailure {
     if candidates.is_empty() {
@@ -271,113 +235,97 @@ pub(crate) fn failure_from(candidates: &[Arc<dyn Worker>], model_id: &str) -> Pl
 /// Pick a prefill/decode pair for `model_id`, one worker per leg, each under
 /// its own policy and sticky namespace.
 ///
-/// Every leg is judged live for availability; `wire` pins both legs to the
-/// retained plan's runtime and transport on a retry; `homogeneous_runtime` narrows both
-/// legs to the first available prefill worker's runtime, which the gRPC
-/// wire needs because its rendezvous is runtime-specific. A miss names the
-/// leg and carries the verdict judged from that leg's own candidates.
+/// `pairs` is the snapshot's compatibility index (see [`PdPairIndex`]):
+/// which decodes each prefill may hand off to was decided when membership
+/// last changed, so this path compares no descriptors. Every leg is judged
+/// live for availability, and a prefill counts only while one of its
+/// partners is available, so the policy's pick can always be paired; `wire`
+/// pins both legs to the retained plan's runtime and transport on a retry;
+/// `homogeneous_runtime` narrows both legs to the first open prefill
+/// worker's runtime, which the gRPC wire needs because its rendezvous is
+/// runtime-specific. A miss names the leg and carries the verdict judged
+/// from that leg's own candidates.
 pub(crate) fn select_pair(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
     model_id: &str,
-    candidates: PairCandidates<'_>,
+    pairs: &PdPairIndex,
     wire: Option<WireConstraint>,
     homogeneous_runtime: bool,
     inputs: PlacementInputs<'_>,
 ) -> Result<Pair, Box<PairFailure>> {
-    let available = |leg: &[Arc<dyn Worker>]| -> Vec<Arc<dyn Worker>> {
-        leg.iter()
-            .filter(|w| {
-                w.is_available()
-                    && wire.is_none_or(|wire| {
-                        w.metadata().spec.runtime_type == wire.runtime
-                            && *w.connection_mode() == wire.connection
-                    })
+    let eligible = |w: &Arc<dyn Worker>| {
+        w.is_available()
+            && wire.is_none_or(|wire| {
+                w.metadata().spec.runtime_type == wire.runtime
+                    && *w.connection_mode() == wire.connection
             })
-            .cloned()
-            .collect()
     };
-    let mut prefill = available(candidates.prefill);
-    let mut decode = available(candidates.decode);
+    let fail = |leg: WorkerLeg, verdict: PlacementFailure| Box::new(PairFailure { leg, verdict });
 
-    if prefill.is_empty() {
-        debug!("No available prefill workers");
-        return Err(Box::new(PairFailure {
-            leg: WorkerLeg::Prefill,
-            verdict: failure_from(candidates.prefill, model_id),
-        }));
+    // A leg with no worker at all names itself before pairing is judged.
+    if pairs.prefill_pool.is_empty() {
+        debug!("No prefill workers");
+        return Err(fail(WorkerLeg::Prefill, PlacementFailure::NoCandidates));
     }
-    if decode.is_empty() {
-        debug!("No available decode workers");
-        return Err(Box::new(PairFailure {
-            leg: WorkerLeg::Decode,
-            verdict: failure_from(candidates.decode, model_id),
-        }));
+    if pairs.decode_pool.is_empty() {
+        debug!("No decode workers");
+        return Err(fail(WorkerLeg::Decode, PlacementFailure::NoCandidates));
+    }
+    if let Some(refusal) = &pairs.refusal {
+        warn!(
+            model_id,
+            mode = policies.pd_pairing_mode().as_str(),
+            mismatches = ?refusal.mismatches,
+            prefill = ?refusal.prefill,
+            decode = ?refusal.decode,
+            "No prefill/decode pair shares a KV transfer protocol"
+        );
+        return Err(fail(
+            WorkerLeg::Decode,
+            PlacementFailure::NoCompatiblePair {
+                prefill: refusal.prefill.clone(),
+                decode: refusal.decode.clone(),
+                mismatches: refusal.mismatches.clone(),
+            },
+        ));
+    }
+
+    // Live state: a prefill is open when it is available and so is one of
+    // its partners.
+    let mut open: Vec<usize> = (0..pairs.prefill.len())
+        .filter(|&i| eligible(&pairs.prefill[i]) && pairs.partners[i].iter().any(eligible))
+        .collect();
+    if open.is_empty() {
+        // Name the leg that is short: the prefills, else their partners.
+        let (leg, candidates): (WorkerLeg, &[Arc<dyn Worker>]) =
+            if pairs.prefill.iter().any(eligible) {
+                (WorkerLeg::Decode, &pairs.decode_pool)
+            } else {
+                (WorkerLeg::Prefill, &pairs.prefill)
+            };
+        debug!(?leg, "No available PD pair");
+        return Err(fail(leg, failure_from(candidates, model_id)));
     }
 
     // Where the wire's rendezvous is runtime-specific, both legs must share a
-    // runtime: take the first prefill worker's and narrow both legs to it.
-    let runtime = prefill[0].metadata().spec.runtime_type;
+    // runtime: take the first open prefill worker's and narrow both legs to
+    // it. The index already keeps runtimes apart unless pairing is off.
+    let runtime = pairs.prefill[open[0]].metadata().spec.runtime_type;
     if homogeneous_runtime {
-        let prefill_mixed = prefill
-            .iter()
-            .skip(1)
-            .any(|w| w.metadata().spec.runtime_type != runtime);
-        let decode_mixed = decode
-            .iter()
-            .any(|w| w.metadata().spec.runtime_type != runtime);
-        if prefill_mixed || decode_mixed {
+        let before = open.len();
+        open.retain(|&i| pairs.prefill[i].metadata().spec.runtime_type == runtime);
+        if open.len() != before {
             warn!(
-                "Mixed runtime types in PD workers (prefill_mixed={}, decode_mixed={}). Using {:?}.",
-                prefill_mixed, decode_mixed, runtime
+                ?runtime,
+                "Mixed runtime types among open prefill workers; using the first"
             );
         }
-        prefill.retain(|w| w.metadata().spec.runtime_type == runtime);
-        decode.retain(|w| w.metadata().spec.runtime_type == runtime);
-        if decode.is_empty() {
-            debug!("No available PD pair for runtime {:?}", runtime);
-            return Err(Box::new(PairFailure {
-                leg: WorkerLeg::Decode,
-                verdict: PlacementFailure::Unavailable,
-            }));
-        }
     }
-
-    // A rendezvous only works between legs that share a KV transfer
-    // protocol (runtime, transport, KV layout, or an explicit pairing
-    // protocol).
-    // Narrow the prefill pool to workers with at least one compatible
-    // decode, so the policy's pick always has a partner; the decode pool
-    // narrows to that pick's partners below. The keys are only built for
-    // the failure report.
-    let pairing_mode = policies.pd_pairing_mode();
-    let has_partner = |p: &Arc<dyn Worker>| {
-        decode
-            .iter()
-            .any(|d| p.pd_pairing().compatible(d.pd_pairing(), pairing_mode))
-    };
-    if pairing_mode != PdPairingMode::Off && !prefill.iter().any(&has_partner) {
-        let prefill_keys = pairing_keys(&prefill);
-        let decode_keys = pairing_keys(&decode);
-        let mismatches = pairing_mismatches(&prefill, &decode, pairing_mode);
-        warn!(
-            model_id,
-            mode = pairing_mode.as_str(),
-            ?mismatches,
-            ?prefill_keys,
-            ?decode_keys,
-            "No prefill/decode pair shares a KV transfer protocol"
-        );
-        return Err(Box::new(PairFailure {
-            leg: WorkerLeg::Decode,
-            verdict: PlacementFailure::NoCompatiblePair {
-                prefill: prefill_keys,
-                decode: decode_keys,
-                mismatches,
-            },
-        }));
-    }
-    prefill.retain(has_partner);
+    let prefill: Vec<Arc<dyn Worker>> = open
+        .iter()
+        .map(|&i| Arc::clone(&pairs.prefill[i]))
+        .collect();
 
     // Independent prefill/decode policies so stateful ones (round robin) do
     // not share a counter; each leg tags the sticky key with its own prefix.
@@ -406,18 +354,25 @@ pub(crate) fn select_pair(
         return Err(declined(WorkerLeg::Prefill, prefill_policy.name()));
     };
     let selected_prefill = prefill[prefill_idx].clone();
-    // Non-empty by construction: the prefill pool was narrowed to workers
-    // with a compatible decode.
-    decode.retain(|d| {
-        selected_prefill
-            .pd_pairing()
-            .compatible(d.pd_pairing(), pairing_mode)
-    });
+    // The pick's partners, live-filtered; non-empty by construction unless
+    // the runtime narrowing (pairing off, mixed runtimes) emptied it.
+    let decode: Vec<Arc<dyn Worker>> = pairs.partners[open[prefill_idx]]
+        .iter()
+        .filter(|d| {
+            eligible(d) && (!homogeneous_runtime || d.metadata().spec.runtime_type == runtime)
+        })
+        .cloned()
+        .collect();
+    if decode.is_empty() {
+        debug!("No available PD pair for runtime {:?}", runtime);
+        return Err(fail(WorkerLeg::Decode, PlacementFailure::Unavailable));
+    }
     info.leg = WorkerLeg::Decode;
     let Some(decode_idx) = policies.select_worker(&decode_policy, &decode, &info) else {
         return Err(declined(WorkerLeg::Decode, decode_policy.name()));
     };
     let selected_decode = decode[decode_idx].clone();
+    let runtime = selected_prefill.metadata().spec.runtime_type;
     Metrics::record_worker_selection(
         metrics_labels::WORKER_PREFILL,
         selected_prefill.connection_mode().as_metric_label(),
@@ -444,8 +399,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::types::PolicyConfig,
-        worker::{BasicWorkerBuilder, ModelCard, WorkerType},
+        config::types::{PdPairingMode, PolicyConfig},
+        worker::{BasicWorkerBuilder, ModelCard, PdWire, WorkerType},
     };
 
     const MODEL: &str = "m";
@@ -474,21 +429,21 @@ mod tests {
         registry
     }
 
+    fn pairs_of(registry: &WorkerRegistry, policies: &PolicyRegistry) -> Arc<PdPairIndex> {
+        registry
+            .get_routing_snapshot(MODEL)
+            .pd_pairs(PdWire::Grpc, policies.pd_pairing_mode())
+    }
+
     fn pair_from(
         registry: &WorkerRegistry,
         policies: &PolicyRegistry,
     ) -> Result<Pair, Box<PairFailure>> {
-        let snapshot = registry.get_routing_snapshot(MODEL);
-        let prefill = snapshot.pool(RoutingPool::GrpcPrefill);
-        let decode = snapshot.pool(RoutingPool::GrpcDecode);
         select_pair(
             registry,
             policies,
             MODEL,
-            PairCandidates {
-                prefill: &prefill,
-                decode: &decode,
-            },
+            &pairs_of(registry, policies),
             None,
             true,
             PlacementInputs::default(),
@@ -504,37 +459,21 @@ mod tests {
             ("grpc://d:2", WorkerType::Decode, Some("MooncakeConnector")),
         ]);
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        let snapshot = registry.get_routing_snapshot(MODEL);
-        let prefill = snapshot.pool(RoutingPool::GrpcPrefill);
-        let decode = snapshot.pool(RoutingPool::GrpcDecode);
 
-        // Whichever prefill worker the policy is handed, the decode leg is
-        // narrowed to the worker that speaks the same transport.
-        for p in prefill.iter() {
-            let pair = select_pair(
-                &registry,
-                &policies,
-                MODEL,
-                PairCandidates {
-                    prefill: std::slice::from_ref(p),
-                    decode: &decode,
-                },
-                None,
-                true,
-                PlacementInputs::default(),
-            )
-            .ok()
-            .expect("every prefill worker has a partner");
-            assert_eq!(pair.prefill.url(), p.url());
+        // The snapshot's index pairs each prefill with the decode that
+        // speaks its transport, once, for every request to read.
+        let pairs = pairs_of(&registry, &policies);
+        assert_eq!(pairs.prefill.len(), 2);
+        for (prefill, partners) in pairs.prefill.iter().zip(&pairs.partners) {
+            assert_eq!(partners.len(), 1, "{}", prefill.url());
             assert_eq!(
-                pair.prefill.pd_pairing().transport(),
-                pair.decode.pd_pairing().transport(),
-                "{} paired with {}",
-                pair.prefill.url(),
-                pair.decode.url()
+                prefill.pd_pairing().transport(),
+                partners[0].pd_pairing().transport()
             );
         }
-        // And the unnarrowed fleet still yields a matching pair.
+        assert!(Arc::ptr_eq(&pairs, &pairs_of(&registry, &policies)));
+
+        // And a placement lands on a matching pair.
         let pair = pair_from(&registry, &policies)
             .ok()
             .expect("the fleet has matching pairs");
@@ -716,24 +655,10 @@ mod tests {
             ),
         ]);
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        let snapshot = registry.get_routing_snapshot(MODEL);
-        let prefill = snapshot.pool(RoutingPool::GrpcPrefill);
-        let decode = snapshot.pool(RoutingPool::GrpcDecode);
 
-        let pair = select_pair(
-            &registry,
-            &policies,
-            MODEL,
-            PairCandidates {
-                prefill: &prefill,
-                decode: &decode,
-            },
-            None,
-            true,
-            PlacementInputs::default(),
-        )
-        .ok()
-        .expect("a pair exists under either runtime");
+        let pair = pair_from(&registry, &policies)
+            .ok()
+            .expect("a pair exists under either runtime");
         assert_eq!(pair.prefill.metadata().spec.runtime_type, pair.runtime);
         assert_eq!(pair.decode.metadata().spec.runtime_type, pair.runtime);
 
@@ -744,23 +669,9 @@ mod tests {
             ConnectionMode::Grpc,
             RuntimeType::Sglang,
         )]);
-        let snapshot = only_prefill.get_routing_snapshot(MODEL);
-        let prefill = snapshot.pool(RoutingPool::GrpcPrefill);
-        let decode = snapshot.pool(RoutingPool::GrpcDecode);
-        let failure = select_pair(
-            &only_prefill,
-            &policies,
-            MODEL,
-            PairCandidates {
-                prefill: &prefill,
-                decode: &decode,
-            },
-            None,
-            true,
-            PlacementInputs::default(),
-        )
-        .err()
-        .expect("no decode worker exists");
+        let failure = pair_from(&only_prefill, &policies)
+            .err()
+            .expect("no decode worker exists");
         assert_eq!(failure.leg, WorkerLeg::Decode);
         assert!(matches!(failure.verdict, PlacementFailure::NoCandidates));
     }
@@ -790,19 +701,19 @@ mod tests {
                 .filter(|w| *w.worker_type() == worker_type)
                 .collect()
         };
-        let prefill = by_type(WorkerType::Prefill);
-        let decode = by_type(WorkerType::Decode);
-        let candidates = || PairCandidates {
-            prefill: &prefill,
-            decode: &decode,
-        };
+        // Built from raw legs, as a caller with its own candidate lists would.
+        let pairs = PdPairIndex::build(
+            by_type(WorkerType::Prefill).into(),
+            by_type(WorkerType::Decode).into(),
+            policies.pd_pairing_mode(),
+        );
 
         // Unpinned, the ZMQ decode worker is a candidate like any other.
         assert!(select_pair(
             &registry,
             &policies,
             MODEL,
-            candidates(),
+            &pairs,
             None,
             false,
             PlacementInputs::default(),
@@ -814,7 +725,7 @@ mod tests {
             &registry,
             &policies,
             MODEL,
-            candidates(),
+            &pairs,
             Some(WireConstraint {
                 runtime: RuntimeType::Sglang,
                 connection: ConnectionMode::Grpc,

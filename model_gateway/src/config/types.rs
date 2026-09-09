@@ -548,6 +548,18 @@ pub enum PdPairingMode {
 }
 
 impl PdPairingMode {
+    /// Number of modes, for per-mode caches.
+    pub const COUNT: usize = 3;
+
+    /// A dense index for per-mode caches.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Off => 0,
+            Self::Lenient => 1,
+            Self::Strict => 2,
+        }
+    }
+
     /// Parse the CLI spelling (`off` / `lenient` / `strict`).
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
