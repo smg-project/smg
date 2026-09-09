@@ -2280,6 +2280,16 @@ impl ProtoStream {
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
         match self {
+            // Dispatched here so the observed leg polls its inner stream
+            // through `next_inner` without boxing (see [`ObservedStream`]).
+            Self::Observed(stream) => stream.next().await,
+            _ => self.next_inner().await,
+        }
+    }
+
+    /// The per-engine dispatch behind [`Self::next`].
+    async fn next_inner(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        match self {
             Self::Sglang(stream) => stream
                 .next()
                 .await
@@ -2313,7 +2323,9 @@ impl ProtoStream {
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
-            Self::Observed(stream) => stream.next().await,
+            // `observe_pd_pair` never nests an observed stream, so this arm
+            // is not reached; boxing keeps the future type finite.
+            Self::Observed(stream) => Box::pin(stream.next()).await,
         }
     }
 
@@ -2356,20 +2368,26 @@ impl ProtoStream {
     }
 
     /// Report this decode leg's first item to the PD pair-health table for
-    /// the (prefill, decode) pair it belongs to.
+    /// the (prefill, decode) pair it belongs to. An already observed stream
+    /// gets the new observer rather than a second wrapper.
     #[must_use]
     pub fn observe_pd_pair(self, prefill: &str, decode: &str) -> Self {
-        Self::Observed(Box::new(ObservedStream {
-            inner: self,
-            observer: Some(PdPairObserver::new(prefill, decode)),
-        }))
+        let observer = Some(PdPairObserver::new(prefill, decode));
+        match self {
+            Self::Observed(mut stream) => {
+                stream.observer = observer;
+                Self::Observed(stream)
+            }
+            inner => Self::Observed(Box::new(ObservedStream { inner, observer })),
+        }
     }
 }
 
 /// A disaggregated decode leg whose first item is reported to the PD
 /// pair-health table: a response proves the handoff and clears the pair, an
-/// engine-side error before any response counts against it, and a stream
-/// dropped before either (the client went away) reports nothing.
+/// engine-side error or a clean close before any response counts against
+/// it. A stream dropped before it is polled (the client went away) reports
+/// nothing. After the first item the wrapper only forwards.
 pub struct ObservedStream {
     inner: ProtoStream,
     observer: Option<PdPairObserver>,
@@ -2377,8 +2395,9 @@ pub struct ObservedStream {
 
 impl ObservedStream {
     async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
-        // Boxed: `ProtoStream::next` reaches back here for a nested stream.
-        let item = Box::pin(self.inner.next()).await;
+        // `next_inner`, not `next`: the inner stream is never observed
+        // itself, and going through `next` would make this future recursive.
+        let item = self.inner.next_inner().await;
         if let Some(observer) = self.observer.take() {
             observer.observe(item.as_ref());
         }
@@ -2412,12 +2431,17 @@ impl PdPairObserver {
     pub fn observe(self, item: Option<&Result<ProtoGenerateResponse, tonic::Status>>) {
         match item {
             Some(Ok(_)) => pd_pair_health::record_success(&self.prefill, &self.decode),
-            Some(Err(status))
-                if pd_pair_health::pair_attributable(status.http_status().as_u16()) =>
-            {
+            Some(Err(status)) => {
+                if pd_pair_health::pair_attributable(status.http_status().as_u16()) {
+                    pd_pair_health::record_failure(&self.prefill, &self.decode);
+                }
+            }
+            // Closed without a response: the engine accepted the leg and
+            // produced nothing, which is a failed handoff. A client that
+            // goes away drops the stream unpolled and never reaches here.
+            None => {
                 pd_pair_health::record_failure(&self.prefill, &self.decode);
             }
-            _ => {}
         }
     }
 }

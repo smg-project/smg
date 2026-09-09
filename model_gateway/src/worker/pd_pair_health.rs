@@ -12,11 +12,12 @@
 //!
 //! Like the PD admission wait, the thresholds and the table are
 //! process-global: the dispatch paths that observe a rendezvous carry no
-//! handle on the registry.
+//! handle on the registry. The placement path pays nothing while no pair is
+//! quarantined: `QUARANTINED` gates every lookup.
 
 use std::{
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
         LazyLock,
     },
     time::{Duration, Instant},
@@ -35,8 +36,13 @@ pub const DEFAULT_PD_PAIR_QUARANTINE_SECS: u64 = 30;
 static FAILURES: AtomicU32 = AtomicU32::new(DEFAULT_PD_PAIR_QUARANTINE_FAILURES);
 static QUARANTINE_SECS: AtomicU64 = AtomicU64::new(DEFAULT_PD_PAIR_QUARANTINE_SECS);
 /// Prefill URL, then decode URL: two levels so a lookup borrows `&str`
-/// instead of allocating a pair key on the placement path.
+/// instead of allocating a pair key on the placement path. An inner map is
+/// dropped as soon as it empties, so the table is empty whenever no pair has
+/// a pending failure.
 static PAIRS: LazyLock<DashMap<String, DashMap<String, PairState>>> = LazyLock::new(DashMap::new);
+/// Pairs whose `quarantined_until` is set. Counts an expired quarantine
+/// until a lookup on that pair clears it, so it never undercounts.
+static QUARANTINED: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Default)]
 struct PairState {
@@ -68,17 +74,49 @@ pub fn pair_attributable(status: u16) -> bool {
     status >= 500 && status != 503
 }
 
+/// Pairs currently counted as quarantined (the `smg_pd_pairs_quarantined`
+/// gauge). An expired quarantine stays counted until the next lookup on
+/// that pair clears it, which placement does on its next decision.
+pub fn quarantined_count() -> usize {
+    QUARANTINED.load(Ordering::Relaxed)
+}
+
+fn uncount(pairs: usize) {
+    let _ = QUARANTINED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_sub(pairs))
+    });
+    Metrics::set_pd_pairs_quarantined(quarantined_count());
+}
+
 /// Whether placement should steer around this pair right now.
 pub fn is_quarantined(prefill: &str, decode: &str) -> bool {
-    if !enabled() || PAIRS.is_empty() {
+    if !enabled() || quarantined_count() == 0 {
         return false;
     }
     let now = Instant::now();
-    PAIRS.get(prefill).is_some_and(|by_decode| {
-        by_decode
-            .get(decode)
-            .is_some_and(|state| state.quarantined(now))
-    })
+    let Some(by_decode) = PAIRS.get(prefill) else {
+        return false;
+    };
+    match by_decode
+        .get(decode)
+        .and_then(|state| state.quarantined_until)
+    {
+        Some(until) if now < until => true,
+        // Expired since it was entered: clear the flag so the count and
+        // gauge follow. The failure count stays, so the next failure
+        // re-quarantines at once.
+        Some(_) => {
+            if let Some(mut state) = by_decode.get_mut(decode) {
+                if state.quarantined_until.is_some_and(|until| until <= now) {
+                    state.quarantined_until = None;
+                    drop(state);
+                    uncount(1);
+                }
+            }
+            false
+        }
+        None => false,
+    }
 }
 
 /// A rendezvous or first-response failure on the pair. Returns `true` when
@@ -95,17 +133,22 @@ pub fn record_failure(prefill: &str, decode: &str) -> bool {
         return false;
     }
     let quarantine = Duration::from_secs(QUARANTINE_SECS.load(Ordering::Relaxed));
+    // An expired quarantine nobody looked up yet is still counted.
+    let counted = state.quarantined_until.is_some();
     state.quarantined_until = Some(now + quarantine);
+    let consecutive_failures = state.consecutive_failures;
+    drop(state);
+    drop(by_decode);
+    if !counted {
+        QUARANTINED.fetch_add(1, Ordering::Relaxed);
+    }
     warn!(
         prefill,
         decode,
-        consecutive_failures = state.consecutive_failures,
+        consecutive_failures,
         quarantine_secs = quarantine.as_secs(),
         "Quarantining PD pair after consecutive rendezvous failures"
     );
-    // Both guards must be released before the count walks the table.
-    drop(state);
-    drop(by_decode);
     Metrics::record_pd_pair_quarantine(quarantined_count());
     true
 }
@@ -118,16 +161,18 @@ pub fn record_success(prefill: &str, decode: &str) {
     let Some(by_decode) = PAIRS.get(prefill) else {
         return;
     };
-    let Some((_, state)) = by_decode.remove(decode) else {
-        return;
-    };
+    let removed = by_decode.remove(decode).map(|(_, state)| state);
+    let emptied = by_decode.is_empty();
     drop(by_decode);
-    if state.quarantined_until.is_some() {
+    if emptied {
+        PAIRS.remove_if(prefill, |_, by_decode| by_decode.is_empty());
+    }
+    if removed.is_some_and(|state| state.quarantined_until.is_some()) {
         debug!(
             prefill,
             decode, "PD pair cleared quarantine after a successful handoff"
         );
-        Metrics::set_pd_pairs_quarantined(quarantined_count());
+        uncount(1);
     }
 }
 
@@ -136,34 +181,34 @@ pub fn forget(url: &str) {
     if PAIRS.is_empty() {
         return;
     }
-    PAIRS.remove(url);
+    let flagged = |state: &PairState| state.quarantined_until.is_some();
+    let mut cleared = 0;
+    if let Some((_, by_decode)) = PAIRS.remove(url) {
+        cleared += by_decode.iter().filter(|state| flagged(state)).count();
+    }
     for by_decode in PAIRS.iter() {
-        by_decode.remove(url);
+        if let Some((_, state)) = by_decode.remove(url) {
+            cleared += usize::from(flagged(&state));
+        }
     }
     PAIRS.retain(|_, by_decode| !by_decode.is_empty());
+    if cleared > 0 {
+        uncount(cleared);
+    }
 }
 
-/// Pairs currently in quarantine.
-pub fn quarantined_count() -> usize {
-    let now = Instant::now();
-    PAIRS
-        .iter()
-        .map(|by_decode| {
-            by_decode
-                .iter()
-                .filter(|state| state.quarantined(now))
-                .count()
-        })
-        .sum()
-}
-
-/// Serialises tests that change the thresholds or count the whole table;
-/// tests that only touch their own URLs need not take it.
+/// Serialises tests that touch the table; they assert on its global state.
 #[cfg(test)]
 pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Pairs with a pending failure count, quarantined or not.
+#[cfg(test)]
+pub(crate) fn tracked_pairs() -> usize {
+    PAIRS.iter().map(|by_decode| by_decode.len()).sum()
 }
 
 #[cfg(test)]
@@ -180,15 +225,20 @@ mod tests {
         }
         assert!(record_failure(p, d));
         assert!(is_quarantined(p, d));
+        assert_eq!(quarantined_count(), 1);
         // Only the failing pair is affected.
         assert!(!is_quarantined(p, "grpc://health-d:2"));
         assert!(!is_quarantined("grpc://health-p:2", d));
         // Already quarantined: another failure does not re-quarantine.
         assert!(!record_failure(p, d));
+        assert_eq!(quarantined_count(), 1);
 
         record_success(p, d);
         assert!(!is_quarantined(p, d));
-        forget(p);
+        assert_eq!(quarantined_count(), 0);
+        // A success on the only pending pair leaves the table empty, so the
+        // placement fast path is back.
+        assert_eq!(tracked_pairs(), 0);
     }
 
     #[test]
@@ -198,16 +248,27 @@ mod tests {
         let (p, d) = ("grpc://expiry-p:1", "grpc://expiry-d:1");
         assert!(record_failure(p, d));
         assert!(is_quarantined(p, d));
+        assert_eq!(quarantined_count(), 1);
         std::thread::sleep(Duration::from_millis(1100));
+        // The lookup that sees the expiry clears the count.
         assert!(!is_quarantined(p, d));
-        // The count persists, so the next failure re-quarantines at once.
+        assert_eq!(quarantined_count(), 0);
+        // The failure count persists, so the next failure re-quarantines.
         assert!(record_failure(p, d));
         assert!(is_quarantined(p, d));
+        assert_eq!(quarantined_count(), 1);
 
+        // Removing the decode drops the pair and its quarantine.
         forget(d);
         assert!(!is_quarantined(p, d));
-        assert!(!record_failure(p, d) || quarantined_count() >= 1);
+        assert_eq!(quarantined_count(), 0);
+        assert_eq!(tracked_pairs(), 0);
+
+        // Removing the prefill drops every pair it led.
+        assert!(record_failure(p, d));
         forget(p);
+        assert_eq!(quarantined_count(), 0);
+        assert_eq!(tracked_pairs(), 0);
         configure(
             DEFAULT_PD_PAIR_QUARANTINE_FAILURES,
             DEFAULT_PD_PAIR_QUARANTINE_SECS,
@@ -223,6 +284,7 @@ mod tests {
             assert!(!record_failure(p, d));
         }
         assert!(!is_quarantined(p, d));
+        assert_eq!(tracked_pairs(), 0);
         configure(
             DEFAULT_PD_PAIR_QUARANTINE_FAILURES,
             DEFAULT_PD_PAIR_QUARANTINE_SECS,
