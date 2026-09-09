@@ -83,9 +83,11 @@ pub(crate) enum PlacementFailure {
     Unavailable,
     /// Available candidates existed but the named policy picked none.
     PolicyDeclined(&'static str),
-    /// Both legs had available workers, but no prefill shares a KV transfer
-    /// protocol with any decode (#2483). Carries each leg's pairing keys and
-    /// the components the legs disagreed on.
+    /// Both legs have workers, whatever their availability, but no prefill
+    /// shares a KV transfer protocol with any decode (#2483): judged from
+    /// membership alone, since it cannot change until membership does.
+    /// Carries each leg's pairing keys and the components the legs
+    /// disagreed on.
     NoCompatiblePair {
         prefill: Vec<String>,
         decode: Vec<String>,
@@ -97,9 +99,8 @@ pub(crate) enum PlacementFailure {
 pub(crate) struct Pair {
     pub prefill: Arc<dyn Worker>,
     pub decode: Arc<dyn Worker>,
-    /// The runtime both legs run when homogeneity was required. Otherwise
-    /// it is the first available prefill worker's, which says nothing about
-    /// the selected pair; only a homogeneous caller should read it.
+    /// The selected prefill worker's runtime, which under a homogeneous
+    /// caller is the runtime both legs run.
     pub runtime: RuntimeType,
 }
 
@@ -292,35 +293,38 @@ pub(crate) fn select_pair(
     }
 
     // Live state: a prefill is open when it is available and so is one of
-    // its partners.
-    let mut open: Vec<usize> = (0..pairs.prefill.len())
-        .filter(|&i| eligible(&pairs.prefill[i]) && pairs.partners[i].iter().any(eligible))
-        .collect();
+    // its partners, so the policy's pick can always be paired. Where the
+    // wire's rendezvous is runtime-specific, both legs must also share a
+    // runtime, the first available prefill worker's; the index keeps
+    // runtimes apart already unless pairing is off or a runtime is unknown.
+    let partner_open = |d: &Arc<dyn Worker>, runtime: Option<RuntimeType>| {
+        eligible(d) && runtime.is_none_or(|r| d.metadata().spec.runtime_type == r)
+    };
+    let open_prefills = |runtime: Option<RuntimeType>| -> Vec<usize> {
+        (0..pairs.prefill.len())
+            .filter(|&i| {
+                let p = &pairs.prefill[i];
+                eligible(p)
+                    && runtime.is_none_or(|r| p.metadata().spec.runtime_type == r)
+                    && pairs.partners[i].iter().any(|d| partner_open(d, runtime))
+            })
+            .collect()
+    };
+    let Some(first) = pairs.prefill.iter().find(|p| eligible(p)) else {
+        debug!("No available prefill workers");
+        return Err(fail(
+            WorkerLeg::Prefill,
+            failure_from(&pairs.prefill, model_id),
+        ));
+    };
+    let leg_runtime = homogeneous_runtime.then_some(first.metadata().spec.runtime_type);
+    let open = open_prefills(leg_runtime);
     if open.is_empty() {
-        // Name the leg that is short: the prefills, else their partners.
-        let (leg, candidates): (WorkerLeg, &[Arc<dyn Worker>]) =
-            if pairs.prefill.iter().any(eligible) {
-                (WorkerLeg::Decode, &pairs.decode_pool)
-            } else {
-                (WorkerLeg::Prefill, &pairs.prefill)
-            };
-        debug!(?leg, "No available PD pair");
-        return Err(fail(leg, failure_from(candidates, model_id)));
-    }
-
-    // Where the wire's rendezvous is runtime-specific, both legs must share a
-    // runtime: take the first open prefill worker's and narrow both legs to
-    // it. The index already keeps runtimes apart unless pairing is off.
-    let runtime = pairs.prefill[open[0]].metadata().spec.runtime_type;
-    if homogeneous_runtime {
-        let before = open.len();
-        open.retain(|&i| pairs.prefill[i].metadata().spec.runtime_type == runtime);
-        if open.len() != before {
-            warn!(
-                ?runtime,
-                "Mixed runtime types among open prefill workers; using the first"
-            );
-        }
+        debug!(?leg_runtime, "No available PD pair");
+        return Err(fail(
+            WorkerLeg::Decode,
+            failure_from(&pairs.decode_pool, model_id),
+        ));
     }
     let prefill: Vec<Arc<dyn Worker>> = open
         .iter()
@@ -354,17 +358,18 @@ pub(crate) fn select_pair(
         return Err(declined(WorkerLeg::Prefill, prefill_policy.name()));
     };
     let selected_prefill = prefill[prefill_idx].clone();
-    // The pick's partners, live-filtered; non-empty by construction unless
-    // the runtime narrowing (pairing off, mixed runtimes) emptied it.
+    // The pick's open partners: non-empty by construction, short of an
+    // availability flip between the two reads.
     let decode: Vec<Arc<dyn Worker>> = pairs.partners[open[prefill_idx]]
         .iter()
-        .filter(|d| {
-            eligible(d) && (!homogeneous_runtime || d.metadata().spec.runtime_type == runtime)
-        })
+        .filter(|d| partner_open(d, leg_runtime))
         .cloned()
         .collect();
     if decode.is_empty() {
-        debug!("No available PD pair for runtime {:?}", runtime);
+        debug!(
+            ?leg_runtime,
+            "The selected prefill's partners went unavailable"
+        );
         return Err(fail(WorkerLeg::Decode, PlacementFailure::Unavailable));
     }
     info.leg = WorkerLeg::Decode;
@@ -481,6 +486,43 @@ mod tests {
             pair.prefill.pd_pairing().transport(),
             pair.decode.pd_pairing().transport()
         );
+    }
+
+    #[test]
+    fn a_homogeneous_pair_skips_a_prefill_whose_only_partner_runs_another_runtime() {
+        // P1 (NIXL) pairs only with D1, whose runtime probe failed; P2
+        // (Mooncake) pairs with D1 and D2. On the gRPC wire both legs must
+        // share a runtime, so P1 is never open and every placement lands on
+        // P2/D2 instead of failing every other request.
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("MooncakeConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("MooncakeConnector")),
+        ]);
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("grpc://d:1")
+                    .model(ModelCard::new(MODEL))
+                    .worker_type(WorkerType::Decode)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(RuntimeType::Unspecified)
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            ))
+            .expect("worker registers");
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+
+        for _ in 0..4 {
+            let pair = pair_from(&registry, &policies)
+                .ok()
+                .expect("P2 and D2 pair on one runtime");
+            assert_eq!(pair.prefill.url(), "grpc://p:2");
+            assert_eq!(pair.decode.url(), "grpc://d:2");
+            assert_eq!(pair.runtime, RuntimeType::Vllm);
+        }
     }
 
     #[test]

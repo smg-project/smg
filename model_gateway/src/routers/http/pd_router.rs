@@ -1316,13 +1316,9 @@ impl PDRouter {
 
         // Shared HTTP-transport projections: this router proxies plain HTTP
         // to the selected worker's URL, so a gRPC or ZMQ worker must never
-        // be selectable. Both legs derive from ONE model snapshot (and, for
-        // the wildcard fallback, ONE global snapshot) — separate lookups
-        // could straddle a concurrent membership change and pair workers
-        // that never coexisted. The fallback stays conditional, matching the
-        // old code: untagged workers index under the literal "unknown" entry
-        // and win when present; only an empty entry widens to every HTTP
-        // prefill/decode worker ("auto" means pick any).
+        // be selectable. Both legs derive from ONE snapshot's pair index:
+        // separate lookups could straddle a concurrent membership change and
+        // pair workers that never coexisted.
         let is_unknown_model = model_id == UNKNOWN_MODEL_ID;
         let mode = self.policy_registry.pd_pairing_mode();
         let by_model = self
@@ -1330,21 +1326,18 @@ impl PDRouter {
             .model_routing_snapshot(model_id)
             .map(|snapshot| snapshot.pd_pairs(PdWire::Http, mode));
         let pairs = match by_model {
-            // The literal "unknown" entry wins while it can pair; the
-            // wildcard widens to the global snapshot (both legs from one
-            // snapshot, a superset of the entry) only when a leg is empty.
-            Some(index)
-                if !is_unknown_model
-                    || (!index.prefill_pool.is_empty() && !index.decode_pool.is_empty()) =>
-            {
-                index
-            }
+            // A named model routes within its own entry. The wildcard's
+            // literal "unknown" entry wins while it can pair at all; when it
+            // cannot (a leg empty, or no compatible pair) both legs widen
+            // together to the global snapshot, a superset of the entry. This
+            // widening is all-or-nothing per index, unlike the old per-leg
+            // widening, so the two legs always come from one snapshot.
+            Some(index) if !is_unknown_model || index.can_pair() => index,
             _ if is_unknown_model => self
                 .worker_registry
                 .get_routing_snapshot(UNKNOWN_MODEL_ID)
                 .pd_pairs(PdWire::Http, mode),
-            Some(index) => index,
-            None => Arc::new(PdPairIndex::empty()),
+            _ => Arc::new(PdPairIndex::empty()),
         };
 
         let pair = placement::select_pair(

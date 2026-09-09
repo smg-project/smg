@@ -118,6 +118,12 @@ impl PdPairIndex {
         }
     }
 
+    /// Whether some prefill can pair at all: both legs have workers and at
+    /// least one pair is compatible. Availability is not consulted.
+    pub(crate) fn can_pair(&self) -> bool {
+        !self.prefill.is_empty()
+    }
+
     /// An index over two empty pools.
     pub(crate) fn empty() -> Self {
         Self::build(Arc::from([]), Arc::from([]), PdPairingMode::Off)
