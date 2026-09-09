@@ -716,9 +716,11 @@ fn schedule_worker_at(
 /// registered while its engine was still coming up may have none at all.
 /// Re-read the id before the worker is promoted, so the next handoff is
 /// minted for the engine that is actually there. Only gRPC engines report
-/// the id. The read is bounded by the probe timeout: one that fails or
-/// expires keeps the previous id and says so, since a stale id is a better
-/// outcome than a probe slot held forever.
+/// the id. The read is bounded by the probe timeout: one that fails, expires
+/// or comes back without an id keeps the previous id and says so, since a
+/// stale id is a better outcome than a probe slot held forever or a handoff
+/// with no id at all. An id the engine does report wins over the spec's: it
+/// is the one a handoff must target.
 async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: Duration) {
     let spec = &worker.metadata().spec;
     if !matches!(spec.worker_type, WorkerType::Prefill | WorkerType::Decode)
@@ -733,17 +735,24 @@ async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: 
     )
     .await;
     match read {
-        Ok(Ok(discovered)) => {
+        Ok(Ok(Some(discovered))) => {
             let previous = worker.kv_engine_id();
-            if worker.refresh_kv_engine_id(discovered.clone()) {
+            if worker.refresh_kv_engine_id(Some(discovered.clone())) {
                 info!(
                     worker_url = %worker.url(),
                     ?previous,
-                    ?discovered,
+                    discovered,
                     "Recovered PD worker reports a new KV engine id"
                 );
             }
         }
+        // A partial read (server info tolerated as missing) or an engine
+        // that reports no id: a known id must never be cleared by it.
+        Ok(Ok(None)) => warn!(
+            worker_url = %worker.url(),
+            previous = ?worker.kv_engine_id(),
+            "Recovered PD worker reported no KV engine id; keeping the previous one"
+        ),
         Ok(Err(error)) => warn!(
             worker_url = %worker.url(),
             %error,
