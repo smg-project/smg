@@ -81,10 +81,14 @@ def _serving_worker(gateway, send: Callable[[], None]) -> str:
 @pytest.mark.e2e
 @pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
 @pytest.mark.workers(count=2)
-@pytest.mark.gateway(policy="manual", extra_args=_GATEWAY_ARGS)
+# The sticky override is what lets a body rid outrank the header, and it only
+# wraps policies that do not key on the header themselves: under ``manual``
+# (and ``consistent_hashing``) the policy reads the header alone and a body
+# rid is ignored.
+@pytest.mark.gateway(policy="round_robin", extra_args=_GATEWAY_ARGS)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestRoutingKeyPinning:
-    """Two workers, manual policy: keys pin, and the body rid decides the key."""
+    """Two workers, sticky override on round_robin: keys pin, and the body rid decides the key."""
 
     def test_header_key_is_sticky(self, setup_backend):
         _, model, _, gateway = setup_backend
