@@ -55,8 +55,8 @@ use crate::{
         RouterTrait,
     },
     worker::{
-        PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
-        UNKNOWN_MODEL_ID,
+        pd_pair_health, PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker, WorkerLoadGuard,
+        WorkerRegistry, UNKNOWN_MODEL_ID,
     },
 };
 
@@ -654,6 +654,7 @@ impl PDRouter {
         // parsed request and its routing derivatives now when retries are
         // disabled.
         lease.release_dispatch();
+        let is_stream = context.is_stream;
 
         let response = self
             .execute_dual_dispatch_internal(
@@ -669,6 +670,15 @@ impl PDRouter {
         let status = response.status();
         prefill.record_outcome(status.as_u16());
         decode.record_outcome(status.as_u16());
+        // Pair health (see `pd_pair_health`): an engine-side failure counts
+        // against the pair. A buffered success proves the handoff; a
+        // streaming 200 is only the decode's header, sent before any token,
+        // so it is left neutral rather than clearing a real failure run.
+        if pd_pair_health::pair_attributable(status.as_u16()) {
+            pd_pair_health::record_failure(prefill.url(), decode.url());
+        } else if status.is_success() && !is_stream {
+            pd_pair_health::record_success(prefill.url(), decode.url());
+        }
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {

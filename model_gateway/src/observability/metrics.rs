@@ -263,6 +263,14 @@ pub(crate) fn init_metrics() {
         "smg_pd_kv_transfer_failures_total",
         "PD KV-transfer failures (missing connector params at decode handoff)"
     );
+    describe_counter!(
+        "smg_pd_pair_quarantines_total",
+        "Prefill/decode pairs quarantined after consecutive rendezvous failures"
+    );
+    describe_gauge!(
+        "smg_pd_pairs_quarantined",
+        "Prefill/decode pairs currently quarantined"
+    );
 
     // Layer 3: Worker metrics
     describe_gauge!(
@@ -1124,6 +1132,18 @@ impl Metrics {
     /// Record a PD KV-transfer failure (missing connector params at handoff).
     pub fn record_pd_kv_transfer_failure() {
         counter!("smg_pd_kv_transfer_failures_total").increment(1);
+    }
+
+    /// Record a prefill/decode pair entering quarantine, and how many pairs
+    /// are quarantined now.
+    pub fn record_pd_pair_quarantine(quarantined: usize) {
+        counter!("smg_pd_pair_quarantines_total").increment(1);
+        Self::set_pd_pairs_quarantined(quarantined);
+    }
+
+    /// The number of prefill/decode pairs currently quarantined.
+    pub fn set_pd_pairs_quarantined(quarantined: usize) {
+        gauge!("smg_pd_pairs_quarantined").set(quarantined as f64);
     }
 
     /// Record a PD dispatch that had to wait for a decode admission slot.

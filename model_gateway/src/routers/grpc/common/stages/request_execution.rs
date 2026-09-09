@@ -34,7 +34,7 @@ use crate::{
             utils::tonic_ext::{TonicResultExt, TonicStatusExt},
         },
     },
-    worker::{ConnectionModeExt, Worker},
+    worker::{pd_pair_health, ConnectionModeExt, Worker},
 };
 
 type StreamResult = Result<ProtoStream, tonic::Status>;
@@ -168,6 +168,13 @@ fn fan_out_pd_request(
             sub
         })
         .collect()
+}
+
+/// The (prefill, decode) URLs of a disaggregated selection, for pair health.
+fn pd_pair_urls(workers: &WorkerSelection) -> Option<(&str, &str)> {
+    workers
+        .disaggregated_pair()
+        .map(|(prefill, decode)| (prefill.url(), decode.url()))
 }
 
 /// Metric connection labels for the PD legs (a leg can be gRPC or ZMQ).
@@ -619,6 +626,19 @@ async fn execute_parallel_pd(
                 prefill_result.cb_status_code(),
                 decode_result.cb_status_code(),
             );
+            // An engine-side failure on either leg at the rendezvous counts
+            // against the pair (see `pd_pair_health`).
+            if let Some((prefill_url, decode_url)) = pd_pair_urls(workers) {
+                let engine_failed = [
+                    prefill_result.cb_status_code(),
+                    decode_result.cb_status_code(),
+                ]
+                .into_iter()
+                .any(pd_pair_health::pair_attributable);
+                if engine_failed {
+                    pd_pair_health::record_failure(prefill_url, decode_url);
+                }
+            }
 
             // Both legs are translated before either is propagated: a
             // decode-side failure is logged and counted even when the prefill
@@ -642,6 +662,14 @@ async fn execute_parallel_pd(
             // if prefill is still running there is nothing to hand off yet, and
             // stopping it promptly frees capacity.
             let decode_stream = decode_stream.defer_abort_until_first_item();
+            // The first decode response proves the handoff; an engine error
+            // before it counts against the pair.
+            let decode_stream = match pd_pair_urls(workers) {
+                Some((prefill_url, decode_url)) => {
+                    decode_stream.observe_pd_pair(prefill_url, decode_url)
+                }
+                None => decode_stream,
+            };
 
             Ok(ExecutionResult::PrefillDecode {
                 prefill: prefill_stream,
@@ -658,6 +686,11 @@ async fn execute_parallel_pd(
             partner,
         } => {
             let status = error.http_status().as_u16();
+            if pd_pair_health::pair_attributable(status) {
+                if let Some((prefill_url, decode_url)) = pd_pair_urls(workers) {
+                    pd_pair_health::record_failure(prefill_url, decode_url);
+                }
+            }
             // Only the leg that answered is recorded: the abandoned one has
             // said nothing about its worker yet, and `retire_pd_leg` records
             // it when it finally does.
@@ -1038,7 +1071,15 @@ async fn execute_sequential_pd(
 
     // Send request to decode
     let decode_stream = decode_client.generate(decode_request).await.map_err(|e| {
-        workers.record_outcome_decode(e.http_status().as_u16());
+        let status = e.http_status().as_u16();
+        workers.record_outcome_decode(status);
+        // The prefill already finished alone, so a decode-side engine
+        // failure is about the handoff (see `pd_pair_health`).
+        if pd_pair_health::pair_attributable(status) {
+            if let Some((prefill_url, decode_url)) = pd_pair_urls(workers) {
+                pd_pair_health::record_failure(prefill_url, decode_url);
+            }
+        }
         Metrics::record_worker_error(
             metrics_labels::WORKER_DECODE,
             decode_label,
@@ -1073,6 +1114,10 @@ async fn execute_sequential_pd(
     // decode response proves the handoff finished (see the parallel PD
     // path for the same invariant).
     let decode_stream = decode_stream.defer_abort_until_first_item();
+    let decode_stream = match pd_pair_urls(workers) {
+        Some((prefill_url, decode_url)) => decode_stream.observe_pd_pair(prefill_url, decode_url),
+        None => decode_stream,
+    };
 
     Ok(ExecutionResult::Single {
         stream: decode_stream,

@@ -12,7 +12,10 @@ use super::{validation::ConfigValidator, ConfigResult};
 use crate::{
     routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
-    worker::{ConnectionMode, RuntimeType},
+    worker::{
+        pd_pair_health::{DEFAULT_PD_PAIR_QUARANTINE_FAILURES, DEFAULT_PD_PAIR_QUARANTINE_SECS},
+        ConnectionMode, RuntimeType,
+    },
 };
 
 /// Main router configuration
@@ -104,6 +107,15 @@ pub struct RouterConfig {
     /// that report no running window.
     #[serde(default = "default_pd_admission_wait_secs")]
     pub pd_admission_wait_secs: u64,
+    /// Consecutive rendezvous failures on one prefill/decode pair before
+    /// placement quarantines the pair and steers around it while another
+    /// compatible pair is open. `0` disables pair quarantine.
+    #[serde(default = "default_pd_pair_quarantine_failures")]
+    pub pd_pair_quarantine_failures: u32,
+    /// Seconds a quarantined prefill/decode pair is steered around before it
+    /// is tried again. `0` disables pair quarantine.
+    #[serde(default = "default_pd_pair_quarantine_secs")]
+    pub pd_pair_quarantine_secs: u64,
     /// Restore the conditional load-monitor poll gate: only poll worker groups
     /// when a load-aware routing policy, `engine_metrics`, or overload
     /// protection needs the data. Default `false` — the monitor polls every
@@ -344,6 +356,14 @@ pub struct TokenizerCacheConfig {
 
 fn default_load_monitor_interval_secs() -> u64 {
     10
+}
+
+fn default_pd_pair_quarantine_failures() -> u32 {
+    DEFAULT_PD_PAIR_QUARANTINE_FAILURES
+}
+
+fn default_pd_pair_quarantine_secs() -> u64 {
+    DEFAULT_PD_PAIR_QUARANTINE_SECS
 }
 
 fn default_pd_admission_wait_secs() -> u64 {
@@ -1134,6 +1154,8 @@ impl Default for RouterConfig {
             job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
             pd_admission_wait_secs: default_pd_admission_wait_secs(),
+            pd_pair_quarantine_failures: default_pd_pair_quarantine_failures(),
+            pd_pair_quarantine_secs: default_pd_pair_quarantine_secs(),
             disable_load_monitoring: false,
             worker_overload_protection: false,
             worker_overload_waiting_requests: None,

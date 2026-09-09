@@ -42,7 +42,13 @@ use smg_grpc_client::{
 };
 use smg_mm_rdma::RdmaExporter;
 
-use crate::routers::grpc::{multimodal::mm_rdma_exporter, zmq_client::ZmqGenerateStream};
+use crate::{
+    routers::grpc::{
+        multimodal::mm_rdma_exporter, utils::tonic_ext::TonicStatusExt,
+        zmq_client::ZmqGenerateStream,
+    },
+    worker::pd_pair_health,
+};
 
 /// How a streaming response's per-token payloads (token ids, sampled
 /// logprobs, token counts) relate across the responses of one stream.
@@ -2265,6 +2271,9 @@ pub enum ProtoStream {
     /// An n>1 fan-out over rendezvous-room PD pairs: one child per sample,
     /// each response stamped with its sample's index (see [`FanoutStream`]).
     Fanout(FanoutStream),
+    /// A disaggregated decode leg whose first item is reported to the PD
+    /// pair-health table (see [`ObservedStream`]).
+    Observed(Box<ObservedStream>),
 }
 
 impl ProtoStream {
@@ -2304,6 +2313,7 @@ impl ProtoStream {
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
+            Self::Observed(stream) => stream.next().await,
         }
     }
 
@@ -2317,6 +2327,7 @@ impl ProtoStream {
             Self::TokenSpeed(stream) => stream.mark_completed(),
             Self::Zmq(stream) => stream.mark_completed(),
             Self::Fanout(stream) => stream.mark_completed(),
+            Self::Observed(stream) => stream.inner.mark_completed(),
         }
     }
 
@@ -2338,6 +2349,75 @@ impl ProtoStream {
             Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_until_first_item()),
             Self::Zmq(stream) => Self::Zmq(stream),
             Self::Fanout(stream) => Self::Fanout(stream.defer_abort_until_first_item()),
+            Self::Observed(stream) => {
+                Self::Observed(Box::new(stream.defer_abort_until_first_item()))
+            }
+        }
+    }
+
+    /// Report this decode leg's first item to the PD pair-health table for
+    /// the (prefill, decode) pair it belongs to.
+    #[must_use]
+    pub fn observe_pd_pair(self, prefill: &str, decode: &str) -> Self {
+        Self::Observed(Box::new(ObservedStream {
+            inner: self,
+            observer: Some(PdPairObserver::new(prefill, decode)),
+        }))
+    }
+}
+
+/// A disaggregated decode leg whose first item is reported to the PD
+/// pair-health table: a response proves the handoff and clears the pair, an
+/// engine-side error before any response counts against it, and a stream
+/// dropped before either (the client went away) reports nothing.
+pub struct ObservedStream {
+    inner: ProtoStream,
+    observer: Option<PdPairObserver>,
+}
+
+impl ObservedStream {
+    async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        // Boxed: `ProtoStream::next` reaches back here for a nested stream.
+        let item = Box::pin(self.inner.next()).await;
+        if let Some(observer) = self.observer.take() {
+            observer.observe(item.as_ref());
+        }
+        item
+    }
+
+    fn defer_abort_until_first_item(self) -> Self {
+        Self {
+            inner: self.inner.defer_abort_until_first_item(),
+            observer: self.observer,
+        }
+    }
+}
+
+/// The pair a decode leg belongs to, reported once.
+#[derive(Debug, Clone)]
+pub struct PdPairObserver {
+    prefill: String,
+    decode: String,
+}
+
+impl PdPairObserver {
+    pub fn new(prefill: &str, decode: &str) -> Self {
+        Self {
+            prefill: prefill.to_string(),
+            decode: decode.to_string(),
+        }
+    }
+
+    /// Report the leg's first item.
+    pub fn observe(self, item: Option<&Result<ProtoGenerateResponse, tonic::Status>>) {
+        match item {
+            Some(Ok(_)) => pd_pair_health::record_success(&self.prefill, &self.decode),
+            Some(Err(status))
+                if pd_pair_health::pair_attributable(status.http_status().as_u16()) =>
+            {
+                pd_pair_health::record_failure(&self.prefill, &self.decode);
+            }
+            _ => {}
         }
     }
 }

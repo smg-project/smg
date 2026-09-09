@@ -25,8 +25,8 @@ use crate::{
     },
     routers::common::overload,
     worker::{
-        ConnectionMode, ConnectionModeExt, PdPairIndex, RoutingPool, RuntimeType, Worker,
-        WorkerRegistry,
+        pd_pair_health, ConnectionMode, ConnectionModeExt, PdPairIndex, RoutingPool, RuntimeType,
+        Worker, WorkerRegistry,
     },
 };
 
@@ -298,12 +298,22 @@ pub(crate) fn select_pair(
     // runtime: that of the first prefill worker open under its own runtime,
     // so a prefill whose partners are all down never shuts out a healthy
     // pair on another runtime. The index keeps runtimes apart already
-    // unless pairing is off or a runtime is unknown.
-    let partner_open = |d: &Arc<dyn Worker>, runtime: Option<RuntimeType>| {
-        eligible(d) && runtime.is_none_or(|r| d.metadata().spec.runtime_type == r)
-    };
-    let can_pair_on = |i: usize, runtime: Option<RuntimeType>| {
-        pairs.partners[i].iter().any(|d| partner_open(d, runtime))
+    // unless pairing is off or a runtime is unknown. A pair in quarantine
+    // (consecutive rendezvous failures, see `pd_pair_health`) is steered
+    // around while another open pair exists; when every open pair is
+    // quarantined, placement serves through it, since the quarantine is a
+    // hint drawn from failures, not a veto.
+    let partner_open =
+        |p: &Arc<dyn Worker>, d: &Arc<dyn Worker>, runtime: Option<RuntimeType>, steer: bool| {
+            eligible(d)
+                && runtime.is_none_or(|r| d.metadata().spec.runtime_type == r)
+                && (!steer || !pd_pair_health::is_quarantined(p.url(), d.url()))
+        };
+    let can_pair_on = |i: usize, runtime: Option<RuntimeType>, steer: bool| {
+        let p = &pairs.prefill[i];
+        pairs.partners[i]
+            .iter()
+            .any(|d| partner_open(p, d, runtime, steer))
     };
     if !pairs.prefill.iter().any(&eligible) {
         debug!("No available prefill workers");
@@ -316,29 +326,44 @@ pub(crate) fn select_pair(
         .then(|| {
             pairs.prefill.iter().enumerate().find_map(|(i, p)| {
                 let runtime = p.metadata().spec.runtime_type;
-                (eligible(p) && can_pair_on(i, Some(runtime))).then_some(runtime)
+                (eligible(p) && can_pair_on(i, Some(runtime), false)).then_some(runtime)
             })
         })
         .flatten();
     // One pass: the open prefills on the leg's runtime, counting the
     // pairable ones the narrowing excluded so the exclusion leaves a trace.
-    let mut excluded = 0usize;
-    let open: Vec<usize> = (0..pairs.prefill.len())
-        .filter(|&i| {
-            let p = &pairs.prefill[i];
-            if !eligible(p) {
-                return false;
-            }
-            let own = p.metadata().spec.runtime_type;
-            if leg_runtime.is_some_and(|runtime| own != runtime) {
-                if can_pair_on(i, Some(own)) {
-                    excluded += 1;
+    let open_on = |steer: bool| -> (Vec<usize>, usize) {
+        let mut excluded = 0usize;
+        let open: Vec<usize> = (0..pairs.prefill.len())
+            .filter(|&i| {
+                let p = &pairs.prefill[i];
+                if !eligible(p) {
+                    return false;
                 }
-                return false;
-            }
-            can_pair_on(i, leg_runtime)
-        })
-        .collect();
+                let own = p.metadata().spec.runtime_type;
+                if leg_runtime.is_some_and(|runtime| own != runtime) {
+                    if can_pair_on(i, Some(own), steer) {
+                        excluded += 1;
+                    }
+                    return false;
+                }
+                can_pair_on(i, leg_runtime, steer)
+            })
+            .collect();
+        (open, excluded)
+    };
+    let mut steer = true;
+    let (mut open, mut excluded) = open_on(true);
+    if open.is_empty() {
+        steer = false;
+        (open, excluded) = open_on(false);
+        if !open.is_empty() {
+            debug!(
+                model_id,
+                "Every open PD pair is quarantined; placing through the quarantine"
+            );
+        }
+    }
     if excluded > 0 {
         warn!(
             model_id,
@@ -390,7 +415,7 @@ pub(crate) fn select_pair(
     // availability flip between the two reads.
     let decode: Vec<Arc<dyn Worker>> = pairs.partners[open[prefill_idx]]
         .iter()
-        .filter(|d| partner_open(d, leg_runtime))
+        .filter(|d| partner_open(&selected_prefill, d, leg_runtime, steer))
         .cloned()
         .collect();
     if decode.is_empty() {
@@ -631,6 +656,40 @@ mod tests {
         let off =
             PolicyRegistry::new(PolicyConfig::RoundRobin).with_pd_pairing_mode(PdPairingMode::Off);
         assert!(pair_from(&registry, &off).is_ok());
+    }
+
+    #[test]
+    fn a_quarantined_pair_is_steered_around_while_another_is_open() {
+        let _guard = pd_pair_health::test_guard();
+        let (p1, d1, d2) = ("grpc://qp:1", "grpc://qd:1", "grpc://qd:2");
+        let registry = pd_registry(&[
+            (p1, WorkerType::Prefill, Some("NixlConnector")),
+            (d1, WorkerType::Decode, Some("NixlConnector")),
+            (d2, WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+
+        for _ in 0..pd_pair_health::DEFAULT_PD_PAIR_QUARANTINE_FAILURES {
+            pd_pair_health::record_failure(p1, d1);
+        }
+        assert!(pd_pair_health::is_quarantined(p1, d1));
+        for _ in 0..4 {
+            let pair = pair_from(&registry, &policies)
+                .ok()
+                .expect("the other decode is open");
+            assert_eq!(pair.decode.url(), d2);
+        }
+
+        // Every pair quarantined: placement still serves.
+        for _ in 0..pd_pair_health::DEFAULT_PD_PAIR_QUARANTINE_FAILURES {
+            pd_pair_health::record_failure(p1, d2);
+        }
+        assert!(pair_from(&registry, &policies).is_ok());
+
+        // A completed handoff clears the pair.
+        pd_pair_health::record_success(p1, d1);
+        assert!(!pd_pair_health::is_quarantined(p1, d1));
+        pd_pair_health::forget(p1);
     }
 
     #[test]
