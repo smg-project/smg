@@ -52,8 +52,15 @@ def test_pairing_fields_omits_what_the_config_does_not_carry():
 def test_pairing_fields_round_trip_the_proto():
     from smg_grpc_proto import vllm_engine_pb2 as pb2
 
-    if not hasattr(pb2.GetServerInfoResponse, "kv_cache_dtype"):
-        pytest.skip("installed smg_grpc_proto predates the pairing fields")
+    # Field presence is a descriptor fact; `hasattr` on the generated class
+    # only holds under the pure-Python protobuf runtime.
+    fields = pb2.GetServerInfoResponse.DESCRIPTOR.fields_by_name
+    if "kv_cache_dtype" not in fields:
+        pytest.skip(
+            "smg_grpc_proto stubs predate the GetServerInfoResponse pairing fields; "
+            "regenerate from crates/grpc_client/proto"
+        )
+    assert {"kv_cache_dtype", "block_size", "attention_backend", "model_dtype"} <= set(fields)
     info = pb2.GetServerInfoResponse(**pairing_fields(_config()))
     parsed = pb2.GetServerInfoResponse.FromString(info.SerializeToString())
     assert parsed.kv_cache_dtype == "fp8"

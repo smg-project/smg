@@ -8,7 +8,7 @@ version = "0.9.1"
 description = "SMG gRPC servicer implementations for LLM inference engines (vLLM, MLX, TokenSpeed, SGLang)"
 requires-python = ">=3.10"
 dependencies = [
-    "smg-grpc-proto>=0.4.16",  # 0.4.16: first release with GenerateRequest.data_parallel_rank (field 12)
+    "smg-grpc-proto>=0.4.17",  # 0.4.17: first release with the vLLM GetServerInfoResponse pairing fields (11-14)
     "grpcio>=1.81.1",
     "grpcio-reflection>=1.81.1",
     "grpcio-health-checking>=1.81.1",

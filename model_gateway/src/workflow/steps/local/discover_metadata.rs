@@ -285,11 +285,16 @@ async fn fetch_grpc_metadata(
 fn normalize_grpc_keys(labels: &mut HashMap<String, String>) {
     for &(from, to) in &[
         ("tensor_parallel_size", "tp_size"),
-        // TokenSpeed's spelling of the attention TP width.
+        // TokenSpeed reports no `tp_size`: `attn_tp_size` is its attention
+        // TP width, the full width for a dense model and narrower than
+        // `world_size` only under attention DP or CP. A `tp_size` the engine
+        // does report wins, as for every canonical label below.
         ("attn_tp_size", "tp_size"),
         ("pipeline_parallel_size", "pp_size"),
         ("context_parallel_size", "cp_size"),
         ("data_parallel_size", "dp_size"),
+        // vLLM's name for the KV page granularity SGLang calls `page_size`.
+        ("block_size", "page_size"),
     ] {
         if let Some(val) = labels.remove(from) {
             labels.entry(to.to_string()).or_insert(val);
@@ -430,6 +435,7 @@ mod tests {
             ("pipeline_parallel_size", "1"),
             ("data_parallel_size", "4"),
             ("context_parallel_size", "1"),
+            ("block_size", "16"),
             ("uptime_seconds", "12.5"),
         ]
         .into_iter()
@@ -441,7 +447,18 @@ mod tests {
         assert_eq!(labels.get("dp_size").map(String::as_str), Some("4"));
         assert_eq!(labels.get("cp_size").map(String::as_str), Some("1"));
         assert!(!labels.contains_key("attn_tp_size"));
+        assert_eq!(labels.get("page_size").map(String::as_str), Some("16"));
+        assert!(!labels.contains_key("block_size"));
         assert!(!labels.contains_key("uptime_seconds"));
+
+        // An engine that reports both keeps its own `tp_size`.
+        let mut attn: HashMap<String, String> = [("tp_size", "8"), ("attn_tp_size", "2")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        normalize_grpc_keys(&mut attn);
+        assert_eq!(attn.get("tp_size").map(String::as_str), Some("8"));
+        assert!(!attn.contains_key("attn_tp_size"));
 
         let mut both: HashMap<String, String> = [("tp_size", "8"), ("tensor_parallel_size", "2")]
             .into_iter()

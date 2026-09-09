@@ -14,11 +14,12 @@ _SUPPORTED_PD_CONNECTORS = frozenset({"MooncakeConnector", "NixlConnector"})
 def pairing_fields(vllm_config: object) -> dict:
     """The KV-layout facts a PD peer must share, read off the engine config.
 
-    They mirror the factors vLLM folds into its NIXL compatibility hash
-    (model dtype, KV cache dtype, attention backend) plus the block size the
-    handshake negotiates, so the router can keep incompatible prefill and
-    decode workers apart before the engines reject each other. Every field
-    degrades to its proto default when the config does not carry it.
+    Model dtype, KV cache dtype and block size are the config-level factors
+    vLLM folds into its NIXL compatibility hash. The attention backend is the
+    *requested* one (`--attention-backend`): the resolved backend is picked
+    inside the worker process, so on the common auto path this field is
+    absent and the router treats it as unknown rather than as a match. Every
+    field degrades to its proto default when the config does not carry it.
     """
     fields: dict = {}
     cache = getattr(vllm_config, "cache_config", None)
