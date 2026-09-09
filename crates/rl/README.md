@@ -14,25 +14,31 @@ Response bodies are the `openai_protocol::rl` types (`RlWorkersResponse`,
 `clients/openapi-gen` so the generated SDKs carry them. `GET /v1/rl/workers`
 reports `protocol_version` (currently 1), bumped only for incompatible changes.
 
+Only HTTP workers can be proxied. A gRPC or ZMQ worker that matches a selector is
+reported in `failed[]` as `unsupported_connection_mode` (HTTP 422 on the per-worker
+route), so a fan-out over a mixed fleet answers 207 and `smg.rl.RL.fanout` raises
+`FanoutError` unless `allow_partial=True`.
+
 Flags: `--enable-rl`, `--rl-control-timeout-secs` (600), `--rl-fanout-concurrency` (32).
 Recommended RL launch profile: `--enable-rl --disable-health-check --disable-circuit-breaker --request-timeout-secs 14400`.
 
 ## Python client
 
 ```python
-from smg.rl import RL
+from smg.rl import RL, paused
 rl = RL("http://smg:30000")                     # api_key="..." if control-plane auth is on
 for w in rl.workers():
     print(w.id, w.engine, w.tp_size, w.health, w.weight_version)
 rl.call(w.id, "server_info", method="GET")
-rl.fanout("pause_generation", {}, selector="engine=sglang")
-rl.fanout("update_weights_from_disk", {"model_path": "/ckpt/42", "weight_version": "42"},
-          selector="engine=sglang")
-rl.fanout("continue_generation", {}, selector="engine=sglang")
+with paused(rl, "engine=sglang"):               # pause_generation ... continue_generation
+    rl.fanout("update_weights_from_disk", {"model_path": "/ckpt/42", "weight_version": "42"},
+              selector="engine=sglang")
 ```
 
-SGLang's `pause_generation` and `continue_generation` require a JSON body; pass `{}`
-(a bodyless POST returns 400).
+`paused` always resumes: a pause that failed on some engines, or a refit that
+failed, still gets `continue_generation` so nothing stays paused. SGLang's
+`pause_generation` and `continue_generation` require a JSON body; `paused`
+sends `{}`, and so must direct `fanout` calls (a bodyless POST returns 400).
 
 `fanout` raises `FanoutError` (with `.result.failed`) unless `allow_partial=True`.
 Keep the client connected for the whole call: the gateway cancels outstanding

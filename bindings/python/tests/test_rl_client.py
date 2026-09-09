@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from smg.rl import RL, FanoutError, RlError, Worker
+from smg.rl import RL, FanoutError, RlError, Worker, paused
 
 WORKER = {
     "id": "w1",
@@ -217,3 +217,81 @@ def test_fanout_error_reports_response_status(stub):
         rl.fanout("pause", selector="engine=sglang")
     assert ei.value.status == 200
     assert ei.value.result.failed[0].worker_id == "w2"
+
+
+def test_rejects_non_positive_timeouts(stub):
+    with pytest.raises(ValueError):
+        RL(stub, timeout=0)
+    rl = RL(stub)
+    for bad in (0, -1):
+        with pytest.raises(ValueError):
+            rl.call("w1", "pause", timeout=bad)
+        with pytest.raises(ValueError):
+            rl.fanout("pause", selector="engine=sglang", timeout=bad)
+    assert _Stub.seen == [], "nothing was sent"
+
+
+_ONE_OK = {"w1": {"url": "u", "status": 200, "latency_ms": 1, "body": {}}}
+FANOUT_OK = (200, {"results": _ONE_OK, "failed": [], "total": 1, "succeeded": 1})
+FANOUT_PARTIAL = (
+    207,
+    {
+        "results": _ONE_OK,
+        "failed": [
+            {
+                "worker_id": "w2",
+                "url": "u2",
+                "error": "upstream_unreachable",
+                "message": "refused",
+            }
+        ],
+        "total": 2,
+        "succeeded": 1,
+    },
+)
+RESUME_FAILS = (502, {"error": "upstream_unreachable", "message": "gone"})
+
+
+def _paths():
+    return [s["path"] for s in _Stub.seen]
+
+
+def test_paused_resumes_even_when_the_pause_itself_partially_failed(stub):
+    _Stub.stub_responses["/v1/rl/engine/pause_generation"] = FANOUT_PARTIAL
+    _Stub.stub_responses["/v1/rl/engine/continue_generation"] = FANOUT_OK
+    with pytest.raises(FanoutError) as ei:
+        with paused(RL(stub), "engine=sglang"):
+            raise AssertionError("the body must not run when the pause failed")
+    assert [f.worker_id for f in ei.value.result.failed] == ["w2"]
+    assert _paths() == ["/v1/rl/engine/pause_generation", "/v1/rl/engine/continue_generation"]
+    assert _Stub.seen[0]["body"] == {} and _Stub.seen[1]["body"] == {}
+    assert _Stub.seen[1]["query"] == {"selector": ["engine=sglang"]}
+
+
+def test_paused_resumes_after_a_body_failure_and_keeps_the_original_error(stub):
+    _Stub.stub_responses["/v1/rl/engine/pause_generation"] = FANOUT_OK
+    _Stub.stub_responses["/v1/rl/engine/continue_generation"] = RESUME_FAILS
+    with pytest.raises(RuntimeError, match="refit exploded") as ei:
+        with paused(RL(stub), "engine=sglang", mode="abort"):
+            raise RuntimeError("refit exploded")
+    assert _paths() == ["/v1/rl/engine/pause_generation", "/v1/rl/engine/continue_generation"]
+    assert _Stub.seen[0]["body"] == {"mode": "abort"}
+    resume_error = ei.value.__context__
+    assert isinstance(resume_error, RlError) and resume_error.code == "upstream_unreachable"
+
+
+def test_paused_raises_the_resume_failure_when_nothing_else_failed(stub):
+    _Stub.stub_responses["/v1/rl/engine/pause_generation"] = FANOUT_OK
+    _Stub.stub_responses["/v1/rl/engine/continue_generation"] = RESUME_FAILS
+    with pytest.raises(RlError) as ei:
+        with paused(RL(stub), "engine=sglang") as pause:
+            assert pause.succeeded == 1
+    assert ei.value.code == "upstream_unreachable"
+
+
+def test_paused_happy_path_pauses_then_resumes(stub):
+    _Stub.stub_responses["/v1/rl/engine/pause_generation"] = FANOUT_OK
+    _Stub.stub_responses["/v1/rl/engine/continue_generation"] = FANOUT_OK
+    with paused(RL(stub), "engine=sglang"):
+        assert _paths() == ["/v1/rl/engine/pause_generation"]
+    assert _paths() == ["/v1/rl/engine/pause_generation", "/v1/rl/engine/continue_generation"]

@@ -1,10 +1,16 @@
 """Client for the SMG RL control plane (`/v1/rl/*`). Standard library only.
 
-from smg.rl import RL
+from smg.rl import RL, paused
 rl = RL("http://smg:30000")
-rl.fanout("pause_generation", selector="engine=sglang")
-rl.fanout("update_weights_from_disk", {"model_path": p, "weight_version": "42"}, selector="engine=sglang")
-rl.fanout("continue_generation", selector="engine=sglang")
+with paused(rl, "engine=sglang"):   # pause_generation ... continue_generation, always
+    rl.fanout("update_weights_from_disk", {"model_path": p, "weight_version": "42"}, selector="engine=sglang")
+
+SGLang requires a JSON body on `pause_generation` and `continue_generation`
+(a bodyless POST is a 400), so bodyless routes are sent as `{}`.
+
+Only HTTP workers can be proxied. A gRPC or ZMQ worker matched by a selector is
+reported in `failed[]` as `unsupported_connection_mode`, which makes `fanout`
+raise `FanoutError` unless `allow_partial=True`.
 """
 
 from __future__ import annotations
@@ -13,6 +19,8 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -127,7 +135,7 @@ class RL:
     def __init__(self, base_url: str, api_key: str | None = None, timeout: float = 600.0):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
-        self.timeout = timeout
+        self.timeout = _positive_timeout(timeout)
 
     # -- transport -----------------------------------------------------------
 
@@ -139,6 +147,7 @@ class RL:
         params: dict[str, Any] | None = None,
         timeout: float | None = None,
     ) -> tuple[int, Any]:
+        deadline = self.timeout if timeout is None else _positive_timeout(timeout)
         url = f"{self.base_url}{path}"
         if params:
             url = f"{url}?{urllib.parse.urlencode(params)}"
@@ -151,7 +160,7 @@ class RL:
             headers["authorization"] = f"Bearer {self.api_key}"
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=deadline) as resp:
                 return resp.status, _decode(resp.read())
         except urllib.error.HTTPError as e:
             return e.code, _decode(e.read())
@@ -207,6 +216,48 @@ class RL:
             return result
         _raise_for(status, payload)
         raise RlError(status, {"error": "unexpected_response", "message": str(payload)})
+
+
+@contextmanager
+def paused(
+    rl: RL,
+    selector: str,
+    *,
+    mode: str | None = None,
+    timeout: float | None = None,
+) -> Iterator[FanoutResult]:
+    """Pause every worker matching `selector`, run the body, and always resume.
+
+    A pause that fails on some workers (`FanoutError`) is still resumed, so the
+    workers that did pause do not stay paused, and the error is re-raised
+    without running the body. A body failure is resumed and re-raised; if the
+    resume fails too, the body's error wins and the resume error is attached
+    as its `__context__`. With no other failure, a resume failure is raised.
+    """
+    body: dict[str, Any] = {"mode": mode} if mode else {}
+    failure: BaseException | None = None
+    try:
+        yield rl.fanout("pause_generation", body, selector=selector, timeout=timeout)
+    except BaseException as e:
+        failure = e
+        raise
+    finally:
+        resume_error: Exception | None = None
+        try:
+            rl.fanout("continue_generation", {}, selector=selector, timeout=timeout)
+        except Exception as e:
+            resume_error = e
+        if resume_error is not None:
+            if failure is None:
+                raise resume_error
+            if failure.__context__ is None:
+                failure.__context__ = resume_error
+
+
+def _positive_timeout(timeout: float) -> float:
+    if timeout <= 0:
+        raise ValueError(f"timeout must be > 0 seconds, got {timeout}")
+    return timeout
 
 
 def _decode(raw: bytes) -> Any:

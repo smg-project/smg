@@ -6,7 +6,10 @@
 
 Sequence: pause_generation -> update_weights_from_disk -> continue_generation,
 each as one fan-out, then one /generate through SMG to confirm the engine
-reports the new meta_info.weight_version.
+reports the new meta_info.weight_version. The pause/resume pair is
+`smg.rl.paused`, so a failure at any stage still resumes the engines that did
+pause. Only HTTP workers can be proxied: a gRPC or ZMQ worker matched by
+`--selector` fails the fan-out with `unsupported_connection_mode`.
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ import json
 import sys
 import urllib.request
 
-from smg.rl import RL
+from smg.rl import RL, paused
 
 
 def main() -> int:
@@ -38,18 +41,20 @@ def main() -> int:
     print(f"{len(workers)} worker(s) registered; selector={args.selector!r}")
 
     print("pause_generation ...")
-    # SGLang requires a JSON body on these routes; a bodyless POST is a 400.
-    rl.fanout("pause_generation", {}, selector=args.selector)
-    print("update_weights_from_disk ...")
-    res = rl.fanout(
-        "update_weights_from_disk",
-        {"model_path": args.model_path, "weight_version": args.weight_version, "flush_cache": True},
-        selector=args.selector,
-    )
-    for wid, r in res.results.items():
-        print(f"  {wid}: HTTP {r.status} in {r.latency_ms} ms -> {json.dumps(r.body)[:120]}")
-    print("continue_generation ...")
-    rl.fanout("continue_generation", {}, selector=args.selector)
+    with paused(rl, args.selector):
+        print("update_weights_from_disk ...")
+        res = rl.fanout(
+            "update_weights_from_disk",
+            {
+                "model_path": args.model_path,
+                "weight_version": args.weight_version,
+                "flush_cache": True,
+            },
+            selector=args.selector,
+        )
+        for wid, r in res.results.items():
+            print(f"  {wid}: HTTP {r.status} in {r.latency_ms} ms -> {json.dumps(r.body)[:120]}")
+    print("continue_generation ... resumed")
 
     req = urllib.request.Request(
         f"{args.smg}/generate",
