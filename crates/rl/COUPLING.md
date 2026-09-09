@@ -26,4 +26,26 @@ Wire types are not a gateway coupling: they live in `crates/protocols/src/rl.rs`
 (`openai_protocol::rl`) next to the `/workers` types, and
 `clients/openapi-gen/src/main.rs` registers the `/v1/rl/*` paths.
 
+## Why the proxy is separate
+
+`crates/rl/src/proxy.rs` re-implements header selection and a bounded body
+read rather than calling the data-plane proxy in `routers/http/router.rs`.
+The mechanism overlaps; the policy is deliberately different and is what
+makes this a control plane:
+
+| Concern | Data-plane proxy | RL proxy |
+|---|---|---|
+| Retry | `RetryExecutor` per router config | none: a refit is not idempotent |
+| Streaming | SSE relayed through a bounded channel | none: control routes answer once |
+| Breaker and load accounting | `WorkerLoadGuard`, breaker outcome recorded | none: an engine that is paused or refitting must not trip inference routing |
+| Over-cap body | reject with 502 `upstream_response_too_large` | keep the first 1 MiB and flag `body_truncated` |
+| Deadline | `request_timeout_secs` on the worker client | `--rl-control-timeout-secs` applied per request on the same client |
+| Failure of one target | one request, one status | 207 with every outcome and `failed[]` |
+| Forwarded request headers | the router allow-list | `x-request-id`, `traceparent`, `tracestate` only; caller `authorization` never forwarded |
+
+The workspace already compiles with `lto = "fat"` and `codegen-units = 1`,
+so the duplicated loop costs nothing at runtime. The shared mechanism (the
+header allow-list and one bounded reader for the four readers now in the
+tree) is tracked in #2489.
+
 Not touched: policies, routers, worker trait, response pipeline (M2).
