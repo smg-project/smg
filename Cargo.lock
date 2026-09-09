@@ -4876,7 +4876,7 @@ dependencies = [
 
 [[package]]
 name = "openai-protocol"
-version = "1.13.0"
+version = "2.0.0"
 dependencies = [
  "axum",
  "bitflags 2.13.1",
