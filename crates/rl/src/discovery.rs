@@ -9,37 +9,10 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use openai_protocol::rl::{RlWorkerEntry, RlWorkersResponse, RL_PROTOCOL_VERSION};
 use serde::Serialize;
-use serde_json::json;
 
-use crate::{
-    capability::{capabilities_for, Capabilities},
-    error::RlError,
-    state::RlState,
-    view::RlWorkerInfo,
-};
-
-/// One row of `GET /workers`.
-#[derive(Debug, Serialize)]
-pub struct WorkerEntry {
-    pub id: String,
-    pub url: String,
-    pub base_url: String,
-    pub engine: String,
-    pub engine_version: Option<String>,
-    pub model_id: String,
-    pub worker_type: String,
-    pub connection_mode: String,
-    pub tp_size: Option<u64>,
-    pub dp_size: Option<u64>,
-    pub pp_size: Option<u64>,
-    pub dp_ranks: usize,
-    pub role: Option<String>,
-    pub health: String,
-    pub weight_version: Option<String>,
-    pub labels: HashMap<String, String>,
-    pub capabilities: Capabilities,
-}
+use crate::{capability::capabilities_for, error::RlError, state::RlState, view::RlWorkerInfo};
 
 /// Serialize an enum through serde to get its canonical wire string.
 pub(crate) fn enum_str<T: Serialize>(v: &T) -> String {
@@ -124,8 +97,9 @@ pub fn merged_labels(info: &RlWorkerInfo) -> HashMap<String, String> {
     m
 }
 
-pub fn entry(info: &RlWorkerInfo, dp_ranks: usize) -> WorkerEntry {
-    WorkerEntry {
+/// One row of `GET /workers` for `info`, with `dp_ranks` collapsed into it.
+pub fn entry(info: &RlWorkerInfo, dp_ranks: usize) -> RlWorkerEntry {
+    RlWorkerEntry {
         id: info.id.clone(),
         url: info.url.clone(),
         base_url: info.base_url.clone(),
@@ -147,14 +121,18 @@ pub fn entry(info: &RlWorkerInfo, dp_ranks: usize) -> WorkerEntry {
 }
 
 pub(crate) async fn list_workers(State(state): State<Arc<RlState>>) -> Response {
-    let rows: Vec<WorkerEntry> = collapse(state.view.list())
+    let workers: Vec<RlWorkerEntry> = collapse(state.view.list())
         .iter()
         .map(|(w, n)| entry(w, *n))
         .collect();
-    let total = rows.len();
+    let total = workers.len();
     (
         StatusCode::OK,
-        Json(json!({ "workers": rows, "total": total })),
+        Json(RlWorkersResponse {
+            protocol_version: RL_PROTOCOL_VERSION,
+            workers,
+            total,
+        }),
     )
         .into_response()
 }
@@ -271,6 +249,18 @@ mod tests {
         assert_eq!(m["weight_version"], "default");
         assert_eq!(m["role"], "reward");
         assert_eq!(m["tp_size"], "1");
+    }
+
+    #[tokio::test]
+    async fn list_reports_the_protocol_version() {
+        let app = crate::router::<()>(state(vec![worker("w1", "http://a:1", RuntimeType::Sglang)]));
+        let resp = app
+            .oneshot(Request::get("/workers").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["protocol_version"], 1);
     }
 
     #[tokio::test]

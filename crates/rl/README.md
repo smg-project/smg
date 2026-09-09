@@ -9,6 +9,11 @@ RL control plane for the Shepherd Model Gateway. Enabled with `--enable-rl`.
 | `GET\|POST /v1/rl/workers/{id}/engine/{path}` | proxy one engine-native route to one worker |
 | `GET\|POST /v1/rl/engine/{path}?selector=...` | the same call fanned out to every matching worker |
 
+Response bodies are the `openai_protocol::rl` types (`RlWorkersResponse`,
+`RlWorkerEntry`, `RlCallOutcome`, `RlFanoutResponse`), registered in
+`clients/openapi-gen` so the generated SDKs carry them. `GET /v1/rl/workers`
+reports `protocol_version` (currently 1), bumped only for incompatible changes.
+
 Flags: `--enable-rl`, `--rl-control-timeout-secs` (600), `--rl-fanout-concurrency` (32).
 Recommended RL launch profile: `--enable-rl --disable-health-check --disable-circuit-breaker --request-timeout-secs 14400`.
 

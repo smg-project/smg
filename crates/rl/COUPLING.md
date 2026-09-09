@@ -22,4 +22,8 @@ because the struct grew a field. The gateway-level test relies on
 `TestRouterConfig` disabling health checks, so the mock stopped mid-test
 stays registered and the fan-out still targets it.
 
+Wire types are not a gateway coupling: they live in `crates/protocols/src/rl.rs`
+(`openai_protocol::rl`) next to the `/workers` types, and
+`clients/openapi-gen/src/main.rs` registers the `/v1/rl/*` paths.
+
 Not touched: policies, routers, worker trait, response pipeline (M2).

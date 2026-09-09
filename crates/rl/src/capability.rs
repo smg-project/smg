@@ -2,30 +2,19 @@
 
 use std::collections::HashMap;
 
-use openai_protocol::worker::RuntimeType;
-use serde::Serialize;
-
-/// What an engine can do for RL control, as reported by discovery.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Capabilities {
-    /// `"static"` from the built-in table, `"label"` when any `rl.*` label overrode it.
-    pub source: &'static str,
-    pub pause_modes: Vec<String>,
-    pub update_from: Vec<String>,
-    pub abort: bool,
-    pub flush_cache: bool,
-    pub sleep_wake: bool,
-    pub reports_weight_version: bool,
-}
+use openai_protocol::{
+    rl::{RlCapabilities, RlCapabilitySource},
+    worker::RuntimeType,
+};
 
 fn strings(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
 
-fn static_for(runtime: RuntimeType) -> Capabilities {
+fn static_for(runtime: RuntimeType) -> RlCapabilities {
     match runtime {
-        RuntimeType::Sglang => Capabilities {
-            source: "static",
+        RuntimeType::Sglang => RlCapabilities {
+            source: RlCapabilitySource::Static,
             pause_modes: strings(&["abort", "retract", "in_place"]),
             update_from: strings(&["disk", "tensor", "distributed"]),
             abort: true,
@@ -33,8 +22,8 @@ fn static_for(runtime: RuntimeType) -> Capabilities {
             sleep_wake: true,
             reports_weight_version: true,
         },
-        RuntimeType::Vllm => Capabilities {
-            source: "static",
+        RuntimeType::Vllm => RlCapabilities {
+            source: RlCapabilitySource::Static,
             pause_modes: strings(&["abort", "wait", "keep"]),
             update_from: strings(&["disk", "distributed"]),
             abort: false,
@@ -42,8 +31,8 @@ fn static_for(runtime: RuntimeType) -> Capabilities {
             sleep_wake: true,
             reports_weight_version: false,
         },
-        _ => Capabilities {
-            source: "static",
+        _ => RlCapabilities {
+            source: RlCapabilitySource::Static,
             pause_modes: Vec::new(),
             update_from: Vec::new(),
             abort: false,
@@ -71,7 +60,7 @@ fn bool_label(labels: &HashMap<String, String>, key: &str) -> Option<bool> {
 }
 
 /// Static table row for `runtime`, with any `rl.*` label overrides applied.
-pub fn capabilities_for(runtime: RuntimeType, labels: &HashMap<String, String>) -> Capabilities {
+pub fn capabilities_for(runtime: RuntimeType, labels: &HashMap<String, String>) -> RlCapabilities {
     let mut caps = static_for(runtime);
     let mut overridden = false;
     if let Some(v) = list_label(labels, "rl.pause_modes") {
@@ -97,7 +86,7 @@ pub fn capabilities_for(runtime: RuntimeType, labels: &HashMap<String, String>) 
         }
     }
     if overridden {
-        caps.source = "label";
+        caps.source = RlCapabilitySource::Label;
     }
     caps
 }
@@ -120,7 +109,7 @@ mod tests {
     #[test]
     fn sglang_and_vllm_static_rows() {
         let s = capabilities_for(RuntimeType::Sglang, &HashMap::new());
-        assert_eq!(s.source, "static");
+        assert_eq!(s.source, RlCapabilitySource::Static);
         assert_eq!(s.pause_modes, ["abort", "retract", "in_place"]);
         assert_eq!(s.update_from, ["disk", "tensor", "distributed"]);
         assert!(s.abort && s.flush_cache && s.sleep_wake && s.reports_weight_version);
@@ -163,7 +152,7 @@ mod tests {
                 ("rl.reports_weight_version", "yes"),
             ]),
         );
-        assert_eq!(c.source, "label");
+        assert_eq!(c.source, RlCapabilitySource::Label);
         assert_eq!(c.pause_modes, ["abort", "keep"]);
         assert_eq!(c.update_from, ["disk"]);
         assert!(c.abort && c.flush_cache && !c.sleep_wake);
@@ -173,7 +162,7 @@ mod tests {
     #[test]
     fn partial_override_keeps_static_rest() {
         let c = capabilities_for(RuntimeType::Sglang, &labels(&[("rl.abort", "false")]));
-        assert_eq!(c.source, "label");
+        assert_eq!(c.source, RlCapabilitySource::Label);
         assert!(!c.abort);
         assert!(c.flush_cache);
         assert_eq!(c.pause_modes, ["abort", "retract", "in_place"]);

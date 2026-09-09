@@ -15,8 +15,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use openai_protocol::worker::ConnectionMode;
-use serde_json::{json, Value};
+use openai_protocol::{rl::RlCallOutcome, worker::ConnectionMode};
+use serde_json::Value;
 use tracing::info;
 
 use crate::{
@@ -85,37 +85,6 @@ impl ProxyRequest {
     }
 }
 
-/// One completed engine call (any HTTP status).
-#[derive(Debug, Clone)]
-pub struct CallOutcome {
-    pub worker_id: String,
-    pub url: String,
-    pub status: u16,
-    pub latency_ms: u64,
-    pub body: Value,
-    pub body_truncated: bool,
-}
-
-impl CallOutcome {
-    pub fn to_json(&self) -> Value {
-        let mut v = json!({
-            "worker_id": self.worker_id,
-            "url": self.url,
-            "status": self.status,
-            "latency_ms": self.latency_ms,
-            "body": self.body,
-        });
-        if self.body_truncated {
-            v["body_truncated"] = json!(true);
-        }
-        v
-    }
-
-    pub fn is_success(&self) -> bool {
-        (200..300).contains(&self.status)
-    }
-}
-
 /// JSON when the content type says JSON and the bytes parse; otherwise text,
 /// capped at `BODY_CAP`. When `truncated_by_read` is true, the bytes were
 /// already cut off while reading the response stream, so JSON parsing is
@@ -154,7 +123,7 @@ pub async fn call_worker(
     state: &RlState,
     worker: &RlWorkerInfo,
     req: &ProxyRequest,
-) -> Result<CallOutcome, RlError> {
+) -> Result<RlCallOutcome, RlError> {
     // A worker the gateway never speaks HTTP to has no client to borrow.
     let client = match &worker.http_client {
         Some(client) if worker.connection_mode == ConnectionMode::Http => client,
@@ -243,7 +212,7 @@ pub async fn call_worker(
     }
     let elapsed = started.elapsed();
     let (body, body_truncated) = parse_body(content_type.as_ref(), &collected, truncated_by_read);
-    let outcome = CallOutcome {
+    let outcome = RlCallOutcome {
         worker_id: worker.id.clone(),
         url: worker.url.clone(),
         status,
@@ -287,7 +256,7 @@ pub(crate) async fn proxy_handler(
     match call_worker(&state, &worker, &req).await {
         Ok(outcome) => {
             let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
-            (status, Json(outcome.to_json())).into_response()
+            (status, Json(outcome)).into_response()
         }
         Err(e) => e.into_response(),
     }

@@ -1,6 +1,6 @@
 //! Fan a proxied engine call out to every worker matching a selector.
 
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
 use axum::{
     body::Bytes,
@@ -10,15 +10,15 @@ use axum::{
     Json,
 };
 use futures::{stream, StreamExt};
+use openai_protocol::rl::{RlCallOutcome, RlFailedCall, RlFanoutResponse};
 use serde::Deserialize;
-use serde_json::{json, Value};
 use tracing::info;
 
 use crate::{
     discovery::{collapse, merged_labels},
     error::RlError,
     metrics::record_fanout,
-    proxy::{call_worker, CallOutcome, ProxyRequest},
+    proxy::{call_worker, ProxyRequest},
     selector::Selector,
     state::RlState,
     view::{RlWorkerInfo, RlWorkerView},
@@ -38,31 +38,13 @@ pub fn resolve_targets(view: &dyn RlWorkerView, selector: &Selector) -> Vec<RlWo
         .collect()
 }
 
-/// Aggregated result of one fan-out. Never reports partial success as success.
-#[derive(Debug, Default)]
-pub struct FanoutReport {
-    pub results: BTreeMap<String, Value>,
-    pub failed: Vec<Value>,
-    pub total: usize,
-    pub succeeded: usize,
-}
-
-impl FanoutReport {
-    pub fn status(&self) -> StatusCode {
-        if self.failed.is_empty() {
-            StatusCode::OK
-        } else {
-            StatusCode::MULTI_STATUS
-        }
-    }
-
-    pub fn to_json(&self) -> Value {
-        json!({
-            "results": self.results,
-            "failed": self.failed,
-            "total": self.total,
-            "succeeded": self.succeeded,
-        })
+/// HTTP status of a fan-out envelope. Partial success is never reported
+/// as success.
+pub fn fanout_status(report: &RlFanoutResponse) -> StatusCode {
+    if report.failed.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::MULTI_STATUS
     }
 }
 
@@ -72,9 +54,9 @@ pub async fn run_fanout(
     state: &RlState,
     targets: Vec<RlWorkerInfo>,
     req: &ProxyRequest,
-) -> FanoutReport {
+) -> RlFanoutResponse {
     let total = targets.len();
-    let outcomes: Vec<(RlWorkerInfo, Result<CallOutcome, RlError>)> = stream::iter(targets)
+    let outcomes: Vec<(RlWorkerInfo, Result<RlCallOutcome, RlError>)> = stream::iter(targets)
         .map(|w| async move {
             let r = call_worker(state, &w, req).await;
             (w, r)
@@ -83,34 +65,44 @@ pub async fn run_fanout(
         .collect()
         .await;
 
-    let mut report = FanoutReport {
+    let mut report = RlFanoutResponse {
         total,
-        ..FanoutReport::default()
+        ..RlFanoutResponse::default()
     };
     for (w, r) in outcomes {
         match r {
             Ok(o) if o.is_success() => {
                 report.succeeded += 1;
-                report.results.insert(w.id.clone(), o.to_json());
+                report.results.insert(w.id.clone(), o);
             }
             Ok(o) => {
-                report.failed.push(json!({
-                    "worker_id": w.id, "url": w.url, "status": o.status,
-                    "error": "upstream_error", "message": format!("HTTP {}", o.status),
-                }));
-                report.results.insert(w.id.clone(), o.to_json());
+                report.failed.push(RlFailedCall {
+                    worker_id: w.id.clone(),
+                    url: w.url.clone(),
+                    error: "upstream_error".to_string(),
+                    message: format!("HTTP {}", o.status),
+                    status: Some(o.status),
+                    connection_mode: None,
+                });
+                report.results.insert(w.id.clone(), o);
             }
             Err(e) => {
-                let mut f = e.to_json();
-                f["worker_id"] = json!(w.id);
-                f["url"] = json!(w.url);
-                report.failed.push(f);
+                let connection_mode = match &e {
+                    RlError::UnsupportedConnectionMode { mode, .. } => Some(mode.clone()),
+                    _ => None,
+                };
+                report.failed.push(RlFailedCall {
+                    worker_id: w.id.clone(),
+                    url: w.url.clone(),
+                    error: e.code().to_string(),
+                    message: e.to_string(),
+                    status: None,
+                    connection_mode,
+                });
             }
         }
     }
-    report
-        .failed
-        .sort_by(|a, b| a["worker_id"].as_str().cmp(&b["worker_id"].as_str()));
+    report.failed.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
     report
 }
 
@@ -157,7 +149,7 @@ pub(crate) async fn fanout_handler(
         succeeded = report.succeeded, failed = report.failed.len(),
         latency_ms = elapsed.as_millis() as u64, "rl.fanout"
     );
-    (report.status(), Json(report.to_json())).into_response()
+    (fanout_status(&report), Json(report)).into_response()
 }
 
 #[cfg(test)]
@@ -167,7 +159,7 @@ mod tests {
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
     use openai_protocol::worker::{ConnectionMode, RuntimeType};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use tower::ServiceExt;
 
     use super::*;
