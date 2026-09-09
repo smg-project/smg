@@ -42,7 +42,13 @@ use smg_grpc_client::{
 };
 use smg_mm_rdma::RdmaExporter;
 
-use crate::routers::grpc::{multimodal::mm_rdma_exporter, zmq_client::ZmqGenerateStream};
+use crate::{
+    routers::grpc::{
+        multimodal::mm_rdma_exporter, utils::tonic_ext::TonicStatusExt,
+        zmq_client::ZmqGenerateStream,
+    },
+    worker::pd_pair_health,
+};
 
 /// How a streaming response's per-token payloads (token ids, sampled
 /// logprobs, token counts) relate across the responses of one stream.
@@ -2265,11 +2271,24 @@ pub enum ProtoStream {
     /// An n>1 fan-out over rendezvous-room PD pairs: one child per sample,
     /// each response stamped with its sample's index (see [`FanoutStream`]).
     Fanout(FanoutStream),
+    /// A disaggregated decode leg whose first item is reported to the PD
+    /// pair-health table (see [`ObservedStream`]).
+    Observed(Box<ObservedStream>),
 }
 
 impl ProtoStream {
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        match self {
+            // Dispatched here so the observed leg polls its inner stream
+            // through `next_inner` without boxing (see [`ObservedStream`]).
+            Self::Observed(stream) => stream.next().await,
+            _ => self.next_inner().await,
+        }
+    }
+
+    /// The per-engine dispatch behind [`Self::next`].
+    async fn next_inner(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
         match self {
             Self::Sglang(stream) => stream
                 .next()
@@ -2304,6 +2323,9 @@ impl ProtoStream {
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
+            // `observe_pd_pair` never nests an observed stream, so this arm
+            // is not reached; boxing keeps the future type finite.
+            Self::Observed(stream) => Box::pin(stream.next()).await,
         }
     }
 
@@ -2317,6 +2339,7 @@ impl ProtoStream {
             Self::TokenSpeed(stream) => stream.mark_completed(),
             Self::Zmq(stream) => stream.mark_completed(),
             Self::Fanout(stream) => stream.mark_completed(),
+            Self::Observed(stream) => stream.inner.mark_completed(),
         }
     }
 
@@ -2338,6 +2361,87 @@ impl ProtoStream {
             Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_until_first_item()),
             Self::Zmq(stream) => Self::Zmq(stream),
             Self::Fanout(stream) => Self::Fanout(stream.defer_abort_until_first_item()),
+            Self::Observed(stream) => {
+                Self::Observed(Box::new(stream.defer_abort_until_first_item()))
+            }
+        }
+    }
+
+    /// Report this decode leg's first item to the PD pair-health table for
+    /// the (prefill, decode) pair it belongs to. An already observed stream
+    /// gets the new observer rather than a second wrapper.
+    #[must_use]
+    pub fn observe_pd_pair(self, prefill: &str, decode: &str) -> Self {
+        let observer = Some(PdPairObserver::new(prefill, decode));
+        match self {
+            Self::Observed(mut stream) => {
+                stream.observer = observer;
+                Self::Observed(stream)
+            }
+            inner => Self::Observed(Box::new(ObservedStream { inner, observer })),
+        }
+    }
+}
+
+/// A disaggregated decode leg whose first item is reported to the PD
+/// pair-health table: a response proves the handoff and clears the pair, an
+/// engine-side error or a clean close before any response counts against
+/// it. A stream dropped before it is polled (the client went away) reports
+/// nothing. After the first item the wrapper only forwards.
+pub struct ObservedStream {
+    inner: ProtoStream,
+    observer: Option<PdPairObserver>,
+}
+
+impl ObservedStream {
+    async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        // `next_inner`, not `next`: the inner stream is never observed
+        // itself, and going through `next` would make this future recursive.
+        let item = self.inner.next_inner().await;
+        if let Some(observer) = self.observer.take() {
+            observer.observe(item.as_ref());
+        }
+        item
+    }
+
+    fn defer_abort_until_first_item(self) -> Self {
+        Self {
+            inner: self.inner.defer_abort_until_first_item(),
+            observer: self.observer,
+        }
+    }
+}
+
+/// The pair a decode leg belongs to, reported once.
+#[derive(Debug, Clone)]
+pub struct PdPairObserver {
+    prefill: String,
+    decode: String,
+}
+
+impl PdPairObserver {
+    pub fn new(prefill: &str, decode: &str) -> Self {
+        Self {
+            prefill: prefill.to_string(),
+            decode: decode.to_string(),
+        }
+    }
+
+    /// Report the leg's first item.
+    pub fn observe(self, item: Option<&Result<ProtoGenerateResponse, tonic::Status>>) {
+        match item {
+            Some(Ok(_)) => pd_pair_health::record_success(&self.prefill, &self.decode),
+            Some(Err(status)) => {
+                if pd_pair_health::pair_attributable(status.http_status().as_u16()) {
+                    pd_pair_health::record_failure(&self.prefill, &self.decode);
+                }
+            }
+            // Closed without a response: the engine accepted the leg and
+            // produced nothing, which is a failed handoff. A client that
+            // goes away drops the stream unpolled and never reaches here.
+            None => {
+                pd_pair_health::record_failure(&self.prefill, &self.decode);
+            }
         }
     }
 }

@@ -28,7 +28,10 @@ use crate::{
         grpc::multimodal::MultimodalConfigRegistry,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    worker::{KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService},
+    worker::{
+        pd_pair_health, KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry,
+        WorkerService,
+    },
     workflow::{JobQueue, WorkflowEngines},
 };
 
@@ -639,6 +642,11 @@ impl AppContextBuilder {
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
         pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
+        // Pair-level quarantine after consecutive rendezvous failures.
+        pd_pair_health::configure(
+            config.pd_pair_quarantine_failures,
+            config.pd_pair_quarantine_secs,
+        );
         // Wire the backend load-snapshot feed into every policy that consumes
         // it; the monitor polls every group by default, conditionally under
         // `--disable-load-monitoring`.

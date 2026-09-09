@@ -559,6 +559,17 @@ struct CliArgs {
     #[arg(long, default_value_t = 30, help_heading = "Load Monitoring")]
     pd_admission_wait_secs: u64,
 
+    /// Consecutive rendezvous failures on one prefill/decode pair before
+    /// placement quarantines the pair and steers around it while another
+    /// compatible pair is open. 0 disables pair quarantine.
+    #[arg(long, default_value_t = 3, help_heading = "Routing Policy")]
+    pd_pair_quarantine_failures: u32,
+
+    /// Seconds a quarantined prefill/decode pair is steered around before it
+    /// is tried again. 0 disables pair quarantine.
+    #[arg(long, default_value_t = 30, help_heading = "Routing Policy")]
+    pd_pair_quarantine_secs: u64,
+
     /// TTL in seconds for event-driven cache-aware indexer entries: entries
     /// neither stored nor read by a query within this window are pruned.
     /// Bounds index growth when a backend stops emitting removal events.
@@ -1839,6 +1850,8 @@ impl CliArgs {
             .job_queue_concurrency(self.job_queue_concurrency)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
+            .pd_pair_quarantine_failures(self.pd_pair_quarantine_failures)
+            .pd_pair_quarantine_secs(self.pd_pair_quarantine_secs)
             .disable_load_monitoring(self.disable_load_monitoring)
             .worker_overload_protection(self.worker_overload_protection)
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)

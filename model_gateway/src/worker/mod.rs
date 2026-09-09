@@ -13,6 +13,7 @@ pub mod manager;
 pub mod metrics_aggregator;
 pub mod monitor;
 pub mod overload;
+pub mod pd_pair_health;
 pub mod pd_pair_index;
 pub mod pd_pairing;
 pub mod registry;
