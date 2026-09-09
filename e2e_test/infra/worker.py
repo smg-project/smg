@@ -208,10 +208,12 @@ class Worker:
             if stragglers:
                 logger.error("Worker %s: PIDs %s survived SIGKILL", self.model_id, stragglers)
         if self._gpu_mem_baseline is not None:
-            held = wait_for_gpu_memory_release(self.gpu_ids, self._gpu_mem_baseline, timeout=60.0)
+            # A region another process still maps (a decode holding a dead
+            # prefill's KV) never frees, so the wait is a bounded courtesy.
+            held = wait_for_gpu_memory_release(self.gpu_ids, self._gpu_mem_baseline, timeout=30.0)
             if held:
                 logger.warning(
-                    "Worker %s: GPU memory still held 60s after stop: used %s MiB, baseline %s MiB",
+                    "Worker %s: GPU memory still held 30s after stop: used %s MiB, baseline %s MiB",
                     self.model_id,
                     held,
                     self._gpu_mem_baseline,
