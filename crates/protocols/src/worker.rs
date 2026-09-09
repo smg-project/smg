@@ -875,7 +875,8 @@ pub struct WorkerInfo {
 
     /// The effective PD pairing key of a prefill or decode worker: the
     /// explicit `pairing_protocol`, else the descriptor derived from the
-    /// engine's labels (`runtime/transport/version/layout`). Prefill and
+    /// engine's labels (`runtime/transport/layout`; the engine version is
+    /// left out because it only counts under strict mode). Prefill and
     /// decode workers pair only within one key. Absent on regular workers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pd_pairing: Option<String>,

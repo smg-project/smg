@@ -229,7 +229,6 @@ pub(crate) fn single_failure(
     failure_from(candidates.as_slice(), model_id)
 }
 
-/// Classify a failed placement from the candidates it drew from.
 /// The distinct components on which the legs' descriptors disagree, sorted.
 fn pairing_mismatches(
     prefill: &[Arc<dyn Worker>],
@@ -258,6 +257,7 @@ fn pairing_keys(leg: &[Arc<dyn Worker>]) -> Vec<String> {
     keys
 }
 
+/// Classify a failed placement from the candidates it drew from.
 pub(crate) fn failure_from(candidates: &[Arc<dyn Worker>], model_id: &str) -> PlacementFailure {
     if candidates.is_empty() {
         return PlacementFailure::NoCandidates;
