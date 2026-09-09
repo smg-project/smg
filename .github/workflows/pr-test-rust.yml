@@ -1182,7 +1182,10 @@ jobs:
                   || needs.detect-changes.outputs.go-bindings == 'true')))
     runs-on: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
-    timeout-minutes: 20
+    # 19 min on a quiet host (SGLang setup ~6.5 min, Go ~4 min, tests ~6.5
+    # min); under runner contention the setup step reached 10 min and the
+    # job was cancelled as the last test passed. Keep ~35% headroom.
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
