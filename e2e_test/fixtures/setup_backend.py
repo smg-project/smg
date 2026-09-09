@@ -148,6 +148,16 @@ def _make_openai_client(gateway: Gateway) -> openai.OpenAI:
 # Statuses a fresh gateway returns while it is still wiring up (no worker
 # routable yet, tokenizer not registered) rather than rejecting the request.
 _NOT_SERVING_YET = frozenset({404, 408, 425, 429, 500, 502, 503, 504})
+# Error codes that are a settled verdict on the fleet, not a gateway still
+# wiring up: waiting longer cannot change them, and a test that builds such
+# a fleet asserts the verdict itself.
+_SETTLED_VERDICTS = frozenset({"no_compatible_pd_pair"})
+
+
+def _error_code_of(exc: openai.APIStatusError) -> str | None:
+    body = exc.body if isinstance(exc.body, dict) else {}
+    error = body.get("error", body)
+    return error.get("code") if isinstance(error, dict) else None
 
 
 def _wait_for_serving(
@@ -177,6 +187,14 @@ def _wait_for_serving(
             )
             return
         except openai.APIStatusError as exc:
+            if _error_code_of(exc) in _SETTLED_VERDICTS:
+                logger.info(
+                    "Gateway at %s settled on %s for %s; not waiting for it to serve",
+                    gateway.base_url,
+                    _error_code_of(exc),
+                    model_path,
+                )
+                return
             if exc.status_code not in _NOT_SERVING_YET:
                 raise
             last_error = exc
