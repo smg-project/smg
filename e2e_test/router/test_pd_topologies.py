@@ -270,11 +270,15 @@ def _require_load_reports(backend: str) -> None:
 
 
 def _assert_fleet_idle_within(gateway: Gateway, timeout: float) -> None:
-    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    deadline = started + timeout
     idle, loads = _fleet_idle(gateway)
     while not idle and time.monotonic() < deadline:
         time.sleep(1.0)
         idle, loads = _fleet_idle(gateway)
+    # How long the engines keep working after the client is gone is the
+    # abort-propagation latency of the pair; log it so sweeps can compare.
+    logger.info("fleet idle after %.1fs (idle=%s)", time.monotonic() - started, idle)
     assert idle, f"engines still hold work after {timeout:.0f}s: {loads}"
 
 
