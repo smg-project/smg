@@ -627,9 +627,12 @@ jobs:
             timeout: 36
             test_timeout: 28
             min_selected: 204 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+          # 21 min end to end on a quiet host (setup ~6 min, tests ~15 min);
+          # under runner contention setup alone reached 9 min and the 24 min
+          # budget cut the run short. Keep ~30% headroom like the other rows.
           - engine: vllm
-            timeout: 24
-            test_timeout: 18
+            timeout: 32
+            test_timeout: 24
             min_selected: 202 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: trtllm
             timeout: 36
