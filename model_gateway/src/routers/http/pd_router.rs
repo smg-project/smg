@@ -209,8 +209,12 @@ impl PDRouter {
             PdSelectionFailure::Shed(shed) => shed,
             PdSelectionFailure::Unavailable(error) => {
                 error!("Failed to select PD pair error={}", error);
+                // Same code the regular HTTP router and the gRPC routers use
+                // for a leg that is merely down, so a client can key its
+                // retry on one code whatever the transport; the message
+                // still names the leg.
                 error::service_unavailable(
-                    "server_selection_failed",
+                    "no_available_workers",
                     format!("No available servers: {error}"),
                 )
             }
