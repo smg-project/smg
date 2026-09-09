@@ -21,7 +21,7 @@ use super::execution::ToolResult;
 use crate::routers::{
     common::openai_bridge::{self, FormatRegistry, ResponseFormat},
     error,
-    grpc::common::responses::ResponsesContext,
+    grpc::common::responses::{utils::resolve_function_identity, ResponsesContext},
 };
 
 /// Record of a single MCP tool call execution
@@ -120,10 +120,13 @@ pub(super) fn build_next_request_with_tools(
 
     // Add function tool calls (from commentary channel)
     for tool_call in tool_calls {
+        let (name, namespace) =
+            resolve_function_identity(request.tools.as_deref(), &tool_call.function.name);
         items.push(ResponseInputOutputItem::FunctionToolCall {
             id: Some(tool_call.id.clone()),
             call_id: tool_call.id.clone(),
-            name: tool_call.function.name.clone(),
+            name,
+            namespace,
             arguments: tool_call
                 .function
                 .arguments
@@ -362,5 +365,26 @@ pub(super) fn strip_image_generation_from_request_tools(
                  MCP session exposes an image_generation-routed dispatcher",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+    use crate::routers::grpc::common::responses::utils::namespace_test_request;
+    #[test]
+    fn namespace_replay_preserves_structured_identity() {
+        let request: ResponsesRequest = namespace_test_request();
+        let call = from_value(serde_json::json!({"id":"call_test","type":"function","function":{"name":"weather.lookup","arguments":"{}"}})).unwrap();
+        let replay =
+            build_next_request_with_tools(request, vec![call], vec![], None, String::new());
+        let ResponseInput::Items(items) = replay.input else {
+            panic!("expected replay items");
+        };
+        let wire = serde_json::to_value(items.last().unwrap()).unwrap();
+
+        assert_eq!(wire["name"], "lookup");
+        assert_eq!(wire["namespace"], "weather");
+        assert_eq!(wire["call_id"], "call_test");
     }
 }

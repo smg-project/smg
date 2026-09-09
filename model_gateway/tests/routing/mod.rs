@@ -1,6 +1,7 @@
 //! Routing integration tests
 
 pub mod cache_aware_backward_compat_test;
+pub mod cache_namespace_routing_test;
 pub mod grpc_completion_batch_test;
 pub mod header_forwarding_test;
 pub mod header_routing_hints_test;
@@ -15,6 +16,7 @@ pub mod prefix_hash_test;
 pub mod service_discovery_test;
 pub mod stream_relay_disconnect_test;
 pub mod stream_request_body_test;
+#[cfg(feature = "provider-openai")]
 pub mod test_openai_routing;
 pub mod test_pd_routing;
 pub mod upstream_http2_test;

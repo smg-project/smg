@@ -16,8 +16,9 @@
 #   - the payload lives under /opt/smg-ci (venv + stamp) and
 #     /opt/tokenspeed-src (checkout the venv's editable installs point at),
 #     extracted to identical absolute paths;
-#   - the CUDA toolkit is NOT part of the payload; the install script
-#     apt-installs it on the runner when missing, same as the source path.
+#   - the CUDA toolkit and the Python dev headers are NOT part of the
+#     payload; the install script apt-installs them on the runner when
+#     missing, same as the source path.
 #
 # Built by .github/workflows/ci-tokenspeed-image.yml on every bump of
 # .github/versions/tokenspeed.ref or of the image tooling, and tagged
@@ -29,18 +30,22 @@
 ARG BASE_IMAGE=ubuntu:24.04
 FROM ${BASE_IMAGE}
 
+WORKDIR /opt/smg-ci
+
+# Copied ahead of the apt bootstrap so that bootstrap can retry too.
+COPY scripts/ci_retry.sh scripts/
+
 # Build prerequisites the bare base lacks (the runner pods already carry
 # these). python3 is 3.12 on noble, matching the CI interpreter pin.
 # python3-dev: tokenspeed-scheduler's CMake does
 # find_package(Python COMPONENTS Interpreter Development.Module), which
 # needs Python.h — without it the configure step fails.
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN bash scripts/ci_retry.sh 3 10 apt-get update \
+    && bash scripts/ci_retry.sh 3 10 apt-get install -y --no-install-recommends \
         ca-certificates curl git build-essential pkg-config \
         python3 python3-dev python3-venv python3-pip \
     && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /opt/smg-ci
 
 COPY scripts/ci_setup_python_venv.sh scripts/ci_install_tokenspeed.sh scripts/
 COPY .github/versions/tokenspeed.ref .github/versions/tokenspeed.ref

@@ -104,7 +104,7 @@ pub fn create_test_app(
         probe_state: start_probe_state(&app_context),
         context: app_context,
         admission_queue: None,
-        router_manager: None,
+        gateway: None,
         mesh_handler: None,
         mesh_adapters: None,
     });
@@ -169,7 +169,7 @@ pub fn create_test_app_with_context(
         probe_state: start_probe_state(&app_context),
         context: app_context.clone(),
         admission_queue: None,
-        router_manager: None,
+        gateway: None,
         mesh_handler: None,
         mesh_adapters: None,
     });

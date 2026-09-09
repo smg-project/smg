@@ -39,15 +39,24 @@ pub(crate) struct SamplingDefaultsMask {
 }
 
 impl SamplingDefaultsMask {
+    /// Mask for a chat-shaped request: a knob left unset by the client is
+    /// filled from model defaults. Shared by the chat endpoint and the
+    /// transcription endpoint (whose backend request is chat-shaped).
+    pub(crate) fn from_chat_request(
+        request: &openai_protocol::chat::ChatCompletionRequest,
+    ) -> Self {
+        Self {
+            temperature: request.temperature.is_none(),
+            top_p: request.top_p.is_none(),
+            top_k: request.top_k.is_none(),
+            min_p: request.min_p.is_none(),
+            repetition_penalty: request.repetition_penalty.is_none(),
+        }
+    }
+
     pub(crate) fn from_request_type(request_type: &RequestType) -> Option<Self> {
         match request_type {
-            RequestType::Chat(request) => Some(Self {
-                temperature: request.temperature.is_none(),
-                top_p: request.top_p.is_none(),
-                top_k: request.top_k.is_none(),
-                min_p: request.min_p.is_none(),
-                repetition_penalty: request.repetition_penalty.is_none(),
-            }),
+            RequestType::Chat(request) => Some(Self::from_chat_request(request)),
             RequestType::Completion(request) => Some(Self {
                 temperature: request.temperature.is_none(),
                 top_p: request.top_p.is_none(),
@@ -76,9 +85,12 @@ impl SamplingDefaultsMask {
                 min_p: true,
                 repetition_penalty: true,
             }),
-            RequestType::Responses(_) | RequestType::Embedding(_) | RequestType::Classify(_) => {
-                None
-            }
+            // Transcription builds its mask from the synthesized chat request
+            // via `from_chat_request`, not this path.
+            RequestType::Responses(_)
+            | RequestType::Embedding(_)
+            | RequestType::Classify(_)
+            | RequestType::Transcription { .. } => None,
         }
     }
 

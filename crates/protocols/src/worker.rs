@@ -15,7 +15,7 @@ use axum::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(feature = "axum")]
-use serde_json::{json, Value};
+use serde_json::json;
 
 use super::model_card::ModelCard;
 
@@ -866,6 +866,13 @@ pub struct WorkerInfo {
     #[serde(default)]
     pub http2: bool,
 
+    /// The worker's last polled engine load, as published by the load
+    /// monitor. `None` when load monitoring has produced nothing for this
+    /// worker yet. Unrelated to `load` above, which counts in-flight
+    /// requests the router has sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_load: Option<WorkerLoadResponse>,
+
     /// Job status for async operations (if available).
     pub job_status: Option<JobStatus>,
 }
@@ -881,6 +888,7 @@ impl WorkerInfo {
             status: Some(WorkerStatus::Pending),
             load: 0,
             http2: false,
+            engine_load: None,
             job_status,
         }
     }
@@ -1251,22 +1259,20 @@ pub struct StopProfileRequest {
     pub url: Option<String>,
 }
 
-/// Result from getting worker loads
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct WorkerLoadsResult {
-    pub loads: Vec<WorkerLoadInfo>,
-    pub total_workers: usize,
-    pub successful: usize,
-    pub failed: usize,
-}
-
 /// Per-DP-rank load snapshot from a backend.
 ///
 /// Contains core metrics from the sglang `/v1/loads` endpoint or `GetLoads` gRPC RPC.
 /// Each snapshot represents one data-parallel rank's scheduler state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SchedulerLoadSnapshot {
+    /// URL of the worker this rank belongs to. Set by a gateway serving a
+    /// fleet-wide `/loads`; engines reporting their own load leave it unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
+    /// `regular`, `prefill`, `decode`, or `encode`. Set alongside `worker`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_type: Option<String>,
     pub dp_rank: i32,
     pub num_running_reqs: i32,
     pub num_waiting_reqs: i32,
@@ -1303,7 +1309,7 @@ pub struct SchedulerLoadSnapshot {
     pub disagg_mode: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct EngineMemoryMetricsSnapshot {
     pub weight_gb: f64,
@@ -1312,7 +1318,7 @@ pub struct EngineMemoryMetricsSnapshot {
     pub token_capacity: i32,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct EngineQueueMetricsSnapshot {
     pub waiting: i32,
@@ -1321,7 +1327,7 @@ pub struct EngineQueueMetricsSnapshot {
     pub retracted: i32,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct EngineAggregateMetricsSnapshot {
     pub total_running_reqs: i32,
@@ -1332,8 +1338,41 @@ pub struct EngineAggregateMetricsSnapshot {
     pub avg_utilization: f64,
 }
 
+impl EngineAggregateMetricsSnapshot {
+    /// Roll per-rank snapshots up into one summary. Counts sum, ratios
+    /// average, rounded the way the engine servicers round so a gateway
+    /// aggregate and an engine aggregate read the same.
+    ///
+    /// Returns `None` for an empty slice: no ranks reported means no load
+    /// data, which must not read as an idle fleet.
+    pub fn from_ranks(loads: &[SchedulerLoadSnapshot]) -> Option<Self> {
+        if loads.is_empty() {
+            return None;
+        }
+        let n = loads.len() as f64;
+        let sum_i32 = |f: fn(&SchedulerLoadSnapshot) -> i32| {
+            loads.iter().map(f).fold(0i32, i32::saturating_add)
+        };
+        let avg = |f: fn(&SchedulerLoadSnapshot) -> f64, decimals: i32| {
+            let scale = 10f64.powi(decimals);
+            (loads.iter().map(f).sum::<f64>() / n * scale).round() / scale
+        };
+
+        let total_running_reqs = sum_i32(|l| l.num_running_reqs);
+        let total_waiting_reqs = sum_i32(|l| l.num_waiting_reqs);
+        Some(Self {
+            total_running_reqs,
+            total_waiting_reqs,
+            total_reqs: total_running_reqs.saturating_add(total_waiting_reqs),
+            avg_token_usage: avg(|l| l.token_usage, 4),
+            avg_throughput: avg(|l| l.gen_throughput, 2),
+            avg_utilization: avg(|l| l.utilization, 4),
+        })
+    }
+}
+
 /// Full load response for a single worker across all DP ranks.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct WorkerLoadResponse {
     pub timestamp: String,
@@ -1365,9 +1404,10 @@ impl WorkerLoadResponse {
     /// A running engine always reports its KV token capacity, so a positive
     /// `max_total_num_tokens` on any rank marks the absolute-token fields
     /// (`num_used_tokens`, `dp_rank_loads`, `total_used_tokens`) as
-    /// meaningful. Callers that need absolute tokens — the `/get_loads`
-    /// scalar and the DP-rank load cache — should gate on this so a
-    /// ratio-only snapshot is not read as "0 tokens used".
+    /// meaningful. Callers that need absolute tokens — the DP-rank load
+    /// cache — should gate on this so a ratio-only snapshot is not read as
+    /// "0 tokens used", and on [`Self::ranks_are_dp_ranks`] so a fleet
+    /// rollup is not read as one engine's ranks.
     pub fn has_absolute_token_data(&self) -> bool {
         self.loads.iter().any(|l| l.max_total_num_tokens > 0)
     }
@@ -1390,6 +1430,17 @@ impl WorkerLoadResponse {
         self.loads.iter().map(|l| l.gen_throughput).sum()
     }
 
+    /// Whether these ranks are one engine's DP ranks rather than a
+    /// gateway's fleet rollup, where every entry names its own `worker`.
+    ///
+    /// `dp_rank` is only unique within an engine, so a rollup repeats
+    /// `dp_rank: 0` once per non-DP worker. Callers that key by rank — the
+    /// DP-rank load cache — must gate on this, or one worker's entry
+    /// overwrites another's.
+    pub fn ranks_are_dp_ranks(&self) -> bool {
+        self.loads.iter().all(|l| l.worker.is_none())
+    }
+
     pub fn dp_rank_loads(&self) -> HashMap<isize, isize> {
         let mut map = HashMap::new();
         for snapshot in &self.loads {
@@ -1397,17 +1448,6 @@ impl WorkerLoadResponse {
         }
         map
     }
-}
-
-/// Individual worker load information
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct WorkerLoadInfo {
-    pub worker: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker_type: Option<String>,
-    pub load: isize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<WorkerLoadResponse>,
 }
 
 #[cfg(feature = "axum")]
@@ -1475,24 +1515,6 @@ impl IntoResponse for ProfileResult {
         }
 
         (status, Json(body)).into_response()
-    }
-}
-
-#[cfg(feature = "axum")]
-impl IntoResponse for WorkerLoadsResult {
-    fn into_response(self) -> Response {
-        let loads: Vec<Value> = self
-            .loads
-            .iter()
-            .map(|info| {
-                let mut entry = json!({"worker": &info.worker, "load": info.load});
-                if let Some(ref details) = info.details {
-                    entry["details"] = json!(details);
-                }
-                entry
-            })
-            .collect();
-        Json(json!({"workers": loads})).into_response()
     }
 }
 
@@ -1716,5 +1738,75 @@ mod overload_update_tests {
             token_usage: Some(1.0),
         };
         assert!(!update.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod aggregate_rollup_tests {
+    use super::{EngineAggregateMetricsSnapshot, SchedulerLoadSnapshot};
+
+    fn rank(
+        num_running_reqs: i32,
+        num_waiting_reqs: i32,
+        token_usage: f64,
+        gen_throughput: f64,
+        utilization: f64,
+    ) -> SchedulerLoadSnapshot {
+        SchedulerLoadSnapshot {
+            num_running_reqs,
+            num_waiting_reqs,
+            token_usage,
+            gen_throughput,
+            utilization,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_ranks_is_none_not_idle() {
+        assert!(EngineAggregateMetricsSnapshot::from_ranks(&[]).is_none());
+    }
+
+    #[test]
+    fn counts_sum_and_ratios_average() {
+        let aggregate = EngineAggregateMetricsSnapshot::from_ranks(&[
+            rank(4, 1, 0.2, 100.0, 0.3),
+            rank(6, 3, 0.6, 200.0, 0.7),
+        ])
+        .expect("aggregate");
+
+        assert_eq!(aggregate.total_running_reqs, 10);
+        assert_eq!(aggregate.total_waiting_reqs, 4);
+        assert_eq!(aggregate.total_reqs, 14);
+        assert_eq!(aggregate.avg_token_usage, 0.4);
+        assert_eq!(aggregate.avg_throughput, 150.0);
+        assert_eq!(aggregate.avg_utilization, 0.5);
+    }
+
+    #[test]
+    fn averages_round_the_way_the_engines_round() {
+        // 1/3 at 4 decimals for ratios, 2 for throughput.
+        let aggregate = EngineAggregateMetricsSnapshot::from_ranks(&[
+            rank(0, 0, 1.0, 1.0, 1.0),
+            rank(0, 0, 0.0, 0.0, 0.0),
+            rank(0, 0, 0.0, 0.0, 0.0),
+        ])
+        .expect("aggregate");
+
+        assert_eq!(aggregate.avg_token_usage, 0.3333);
+        assert_eq!(aggregate.avg_throughput, 0.33);
+        assert_eq!(aggregate.avg_utilization, 0.3333);
+    }
+
+    #[test]
+    fn counts_saturate_instead_of_overflowing() {
+        let aggregate = EngineAggregateMetricsSnapshot::from_ranks(&[
+            rank(i32::MAX, i32::MAX, 0.0, 0.0, 0.0),
+            rank(1, 1, 0.0, 0.0, 0.0),
+        ])
+        .expect("aggregate");
+
+        assert_eq!(aggregate.total_running_reqs, i32::MAX);
+        assert_eq!(aggregate.total_reqs, i32::MAX);
     }
 }

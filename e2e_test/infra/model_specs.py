@@ -187,8 +187,6 @@ MODEL_SPECS: dict[str, dict] = {
             "fa3",
             "--max-model-len",
             "8192",
-            "--max-num-seqs",
-            "4",
             "--gpu-memory-utilization",
             "0.8",
             # This model's hybrid-attention KV pool opts into tokenspeed's

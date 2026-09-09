@@ -15,9 +15,9 @@ use serde::{
 use serde_json::value::{to_raw_value, RawValue};
 
 use crate::{
-    routers::{
-        common::{serialize_json_sized, serialized_capacity},
-        openai::{is_stripped_sglang_default, strip_default_sglang_fields, SGLANG_FIELDS},
+    routers::common::{
+        serialize_json_sized, serialized_capacity,
+        sglang_fields::{is_stripped_sglang_default, strip_default_sglang_fields, SGLANG_FIELDS},
     },
     worker::{Worker, WorkerError},
 };
@@ -375,6 +375,31 @@ mod tests {
             aliased,
             value_path_bytes(&req, Some("canonical-model"), &worker)
         );
+    }
+
+    #[test]
+    fn chat_completion_body_preserves_unknown_content_parts() {
+        let content = json!([
+            {"type": "text", "text": "Describe this attachment"},
+            {"type": "vendor_special", "payload": {"items": [1, null, true]}, "option": "keep"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+        ]);
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "alias-model",
+            "messages": [{"role": "user", "content": content}]
+        }))
+        .unwrap();
+
+        // Exercise both direct serialization and the worker's Value-based
+        // prepare_request path, with and without a model rewrite.
+        for worker in [worker(), dp_worker()] {
+            for canonical_model in [None, Some("canonical-model")] {
+                let body = serialize_request_body(&req, canonical_model, &worker, None).unwrap();
+                let parsed: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(parsed["messages"][0]["content"], content);
+                assert_eq!(parsed["model"], canonical_model.unwrap_or("alias-model"));
+            }
+        }
     }
 
     #[test]

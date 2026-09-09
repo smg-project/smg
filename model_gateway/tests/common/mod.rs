@@ -2,6 +2,7 @@
 #![allow(dead_code, clippy::allow_attributes, clippy::large_futures)]
 
 pub mod mock_mcp_server;
+#[cfg(feature = "provider-openai")]
 pub mod mock_openai_server;
 pub mod mock_worker;
 pub mod streaming_helpers;
@@ -29,7 +30,7 @@ use smg::{
     config::{RouterConfig, RoutingMode},
     middleware::TokenBucket,
     policies::PolicyRegistry,
-    routers::{router_manager::RouterManager, RouterFactory, RouterTrait},
+    routers::{gateway::Gateway, RouterFactory, RouterTrait},
     worker::{
         BasicWorkerBuilder, ModelCard, RuntimeType, Worker, WorkerMonitor, WorkerRegistry,
         WorkerType,
@@ -275,12 +276,8 @@ impl AppTestContext {
             }
 
             let inner_router = RouterFactory::create_router(&app_context).await.unwrap();
-            let manager = RouterManager::new(
-                app_context.worker_registry.clone(),
-                app_context.client.clone(),
-            );
-            let router_id =
-                RouterManager::determine_router_id(&config.mode, config.connection_mode);
+            let manager = Gateway::new(app_context.worker_registry.clone());
+            let router_id = Gateway::determine_router_id(&config.mode, config.connection_mode);
             let manager = Arc::new(manager);
             manager.register_router(router_id, Arc::from(inner_router));
             let router: Arc<dyn RouterTrait> = manager;

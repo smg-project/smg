@@ -4,6 +4,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RETRY="bash ${SCRIPT_DIR}/ci_retry.sh"
+
 # Every CI lane must agree on the interpreter. A bare `python3 -m venv` resolves
 # to whatever the host ships (3.12 in the containerised pools, 3.10 on the
 # bare-metal GPU runners), so which Python a job ran on depended on which
@@ -61,8 +64,8 @@ elif [ "$HOST_VERSION" = "$PY_VERSION" ]; then
             exit 1
         fi
         echo "venv creation failed - installing python3-venv/python3-pip, then retrying"
-        $SUDO apt-get update
-        $SUDO apt-get install -y python3-pip python3-venv
+        $RETRY 3 10 $SUDO apt-get update
+        $RETRY 3 10 $SUDO apt-get install -y python3-pip python3-venv
         rm -rf .venv
         python3 -m venv .venv
     fi
@@ -75,10 +78,10 @@ else
         # install uv and they all skip when it is present, so the pin holds for
         # the whole job.
         echo "Installing uv $UV_VERSION..."
-        curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
+        $RETRY 3 5 bash -c "set -o pipefail; curl -LsSf 'https://astral.sh/uv/${UV_VERSION}/install.sh' | sh"
         export PATH="$HOME/.local/bin:$PATH"
     fi
-    uv python install "$PY_VERSION"
+    $RETRY 3 10 uv python install "$PY_VERSION"
     # --seed: a uv venv ships without pip, and downstream CI steps run
     # `python3 -m pip install` inside this venv.
     uv venv --python "$PY_VERSION" --seed .venv

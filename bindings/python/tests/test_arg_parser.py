@@ -1464,6 +1464,7 @@ class TestRouterArgsFieldOrder:
         "kv_connector_annotation",
         "kv_engine_id_annotation",
         "mm_per_request_image_limit",
+        "pd_admission_wait_secs",
         "enable_rl",
         "rl_control_timeout_secs",
         "rl_fanout_concurrency",

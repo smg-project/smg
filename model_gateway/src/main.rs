@@ -551,6 +551,16 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
     engine_metrics: bool,
 
+    /// Seconds a prefill/decode dispatch waits for a free slot in the decode
+    /// engine's running window (--max-num-seqs / --max-running-requests)
+    /// before shedding with 503 worker_overload_protection_shed. Keep it well
+    /// under the engine's bootstrap deadline (120s on TokenSpeed) so a
+    /// request that waits still dispatches with the deadline ahead of it. 0
+    /// sheds immediately. Engines that report no running window are never
+    /// gated
+    #[arg(long, default_value_t = 30, help_heading = "Load Monitoring")]
+    pd_admission_wait_secs: u64,
+
     /// TTL in seconds for event-driven cache-aware indexer entries: entries
     /// neither stored nor read by a query within this window are pruned.
     /// Bounds index growth when a backend stops emitting removal events.
@@ -861,16 +871,16 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Health Checks")]
     disable_health_check: bool,
 
-    /// Let workers recover after prolonged failure: a worker that stays
-    /// unhealthy long enough is removed from the registry so service
-    /// discovery re-registers and re-probes it once its engine returns
-    /// (without this, a worker unreachable for ~12 minutes reaches a
-    /// terminal Failed state and is never probed again). Defaults to the
-    /// --service-discovery setting: recovery works by removal plus
-    /// discovery re-registration, so discovery-managed fleets get it for
-    /// free, while without discovery nothing would re-add the worker and
-    /// removal would permanently shrink a static fleet. Pass =false to
-    /// keep it off under discovery.
+    /// Recover failed workers by removal: a worker that stays unhealthy
+    /// long enough (Failed, ~12 minutes at the default thresholds) is
+    /// removed from the registry so service discovery re-registers and
+    /// re-probes it once its engine returns. Without this a Failed worker
+    /// stays registered, out of rotation, and keeps being probed, so it
+    /// rejoins in place as soon as it answers again. Defaults to the
+    /// --service-discovery setting: discovery-managed fleets recover by
+    /// removal plus re-registration, while a static fleet has nothing to
+    /// re-add a removed worker and recovers in place instead. Pass =false
+    /// to keep it off under discovery.
     #[arg(
         long,
         visible_alias = "worker-auto-recovery",
@@ -1830,6 +1840,7 @@ impl CliArgs {
             .job_queue_capacity(self.job_queue_capacity)
             .job_queue_concurrency(self.job_queue_concurrency)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .disable_load_monitoring(self.disable_load_monitoring)
             .worker_overload_protection(self.worker_overload_protection)
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
@@ -2286,6 +2297,20 @@ mod tests {
                 "{flag} {bad} should be rejected"
             );
         }
+    }
+
+    /// The PD admission wait is a router-only setting and must flow into
+    /// `RouterConfig`, where the dispatch path latches it at startup.
+    #[test]
+    fn pd_admission_wait_flag_flows_into_router_config() {
+        let cli = cli_args_from(&["--pd-admission-wait-secs", "5"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.pd_admission_wait_secs, 5);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.pd_admission_wait_secs, 5);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.pd_admission_wait_secs, 30);
     }
 
     /// The streamed-body stall timeout is a router-only setting and must

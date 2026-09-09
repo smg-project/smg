@@ -1108,7 +1108,10 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::routers::{common::openai_bridge, grpc::multimodal::MultimodalConfigRegistry};
+    use crate::{
+        middleware::AuthConfig,
+        routers::{common::openai_bridge, grpc::multimodal::MultimodalConfigRegistry},
+    };
 
     fn create_k8s_pod(
         name: Option<&str>,
@@ -1206,6 +1209,7 @@ mod tests {
         // Note: Using uninitialized queue for tests to avoid spawning background workers
         // Jobs submitted during tests will queue but not be processed
         Arc::new(AppContext {
+            gateway_auth: AuthConfig::new(None),
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
@@ -1217,7 +1221,7 @@ mod tests {
             )),
             reasoning_parser_factory: None,
             tool_parser_factory: None,
-            router_manager: None,
+            gateway: None,
             response_storage: Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             conversation_storage: Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             conversation_item_storage: Arc::new(

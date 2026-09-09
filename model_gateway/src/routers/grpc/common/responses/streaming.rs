@@ -580,12 +580,36 @@ impl ResponseStreamEventEmitter {
     // Output Item Wrapper Events
     // ========================================================================
 
+    /// Restore declared namespace identities for streamed function items.
+    fn normalize_function_item<'a>(
+        &self,
+        item: &'a serde_json::Value,
+    ) -> std::borrow::Cow<'a, serde_json::Value> {
+        if item["type"] == "function_call" && item["namespace"].is_null() {
+            if let Some(name) = item["name"].as_str() {
+                let tools = self
+                    .original_request
+                    .as_ref()
+                    .and_then(|req| req.tools.as_deref());
+                let (name, namespace) = super::utils::resolve_function_identity(tools, name);
+                if let Some(namespace) = namespace {
+                    let mut item = item.clone();
+                    item["name"] = json!(name);
+                    item["namespace"] = json!(namespace);
+                    return std::borrow::Cow::Owned(item);
+                }
+            }
+        }
+        std::borrow::Cow::Borrowed(item)
+    }
+
     /// Emit response.output_item.added event
     pub fn emit_output_item_added(
         &mut self,
         output_index: usize,
         item: &serde_json::Value,
     ) -> serde_json::Value {
+        let item = self.normalize_function_item(item);
         json!({
             "type": OutputItemEvent::ADDED,
             "sequence_number": self.next_sequence(),
@@ -600,6 +624,7 @@ impl ResponseStreamEventEmitter {
         output_index: usize,
         item: &serde_json::Value,
     ) -> serde_json::Value {
+        let item = self.normalize_function_item(item).into_owned();
         // Store the item data for later use in emit_completed
         self.store_output_item_data(output_index, item.clone());
 
@@ -1038,5 +1063,31 @@ mod tests {
         );
         assert!(usage.get("prompt_tokens").is_none());
         assert!(usage.get("completion_tokens").is_none());
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+    use crate::routers::grpc::common::responses::utils::namespace_test_request;
+    #[test]
+    fn namespace_stream_events_and_completed_output_agree() {
+        let request: ResponsesRequest = namespace_test_request();
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        emitter.set_original_request(request);
+        let (index, id) = emitter.allocate_output_index(OutputItemKind::FunctionCall);
+        let item = json!({"id":id,"type":"function_call","call_id":"call_test","name":"weather.lookup","arguments":"{}","status":"completed"});
+        for event in [
+            emitter.emit_output_item_added(index, &item),
+            emitter.emit_output_item_done(index, &item),
+        ] {
+            assert_eq!(event["item"]["name"], "lookup");
+            assert_eq!(event["item"]["namespace"], "weather");
+        }
+        emitter.complete_output_item(index);
+        let event = emitter.emit_completed(None);
+        assert_eq!(event["response"]["output"][0]["name"], "lookup");
+        assert_eq!(event["response"]["output"][0]["namespace"], "weather");
     }
 }

@@ -421,6 +421,112 @@ async fn test_m3_streaming_no_markers_passthrough() {
 }
 
 #[tokio::test]
+async fn test_m3_streaming_wrapper_and_invoke_across_every_chunk_boundary() {
+    let tools = create_test_tools();
+    let full = tool_block(&[("get_weather", element("city", "Seattle"))]);
+    let invoke_header = "name=\"get_weather\">";
+    let prefix_end = full.find(invoke_header).unwrap() + invoke_header.len();
+
+    for split in 1..prefix_end {
+        let mut parser = MinimaxM3Parser::new();
+
+        let first = parser
+            .parse_incremental(&full[..split], &tools)
+            .await
+            .unwrap();
+        assert!(first.normal_text.is_empty(), "split {split}");
+        assert!(first.calls.is_empty(), "split {split}");
+
+        let second = parser
+            .parse_incremental(&full[split..], &tools)
+            .await
+            .unwrap();
+        assert!(second.normal_text.is_empty(), "split {split}");
+        assert_eq!(
+            second.calls.iter().find_map(|call| call.name.as_deref()),
+            Some("get_weather"),
+            "split {split}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_m3_streaming_false_invoke_prefix_recovers_at_every_divergence() {
+    let tools = create_test_tools();
+    let wrapper = format!("{NS}<tool_call>");
+    let possible_invoke = format!("\n\t{NS}<invoke");
+
+    // Every prefix through the complete marker remains viable, including
+    // whitespace after the wrapper. The first divergent byte must release the
+    // entire candidate, including when it follows a complete invoke marker.
+    for split in 0..=possible_invoke.len() {
+        let mut parser = MinimaxM3Parser::new();
+        let held = format!("{wrapper}{}", &possible_invoke[..split]);
+
+        let first = parser.parse_incremental(&held, &tools).await.unwrap();
+        assert!(first.normal_text.is_empty(), "split {split}");
+        assert!(first.calls.is_empty(), "split {split}");
+
+        let recovered = parser.parse_incremental("X", &tools).await.unwrap();
+        assert_eq!(recovered.normal_text, format!("{held}X"), "split {split}");
+        assert!(recovered.calls.is_empty(), "split {split}");
+
+        let tail = parser
+            .parse_incremental(" ordinary tail", &tools)
+            .await
+            .unwrap();
+        assert_eq!(tail.normal_text, " ordinary tail", "split {split}");
+        assert!(tail.calls.is_empty(), "split {split}");
+    }
+}
+
+#[tokio::test]
+async fn test_m3_streaming_eof_returns_incomplete_candidates_and_resets_state() {
+    let tools = create_test_tools();
+    let wrapper = format!("{NS}<tool_call>");
+    let candidates = [
+        wrapper[..wrapper.len() - 1].to_string(),
+        format!("{wrapper}\n  {NS}<invoke name=\"get_weather\">"),
+    ];
+
+    for candidate in candidates {
+        let mut parser = MinimaxM3Parser::new();
+        let result = parser.parse_incremental(&candidate, &tools).await.unwrap();
+        assert!(result.normal_text.is_empty(), "candidate {candidate:?}");
+        assert!(result.calls.is_empty(), "candidate {candidate:?}");
+
+        assert_eq!(parser.take_unstreamed_normal_text(), candidate);
+        assert_eq!(parser.take_unstreamed_normal_text(), "");
+
+        let next = parser
+            .parse_incremental("ordinary text", &tools)
+            .await
+            .unwrap();
+        assert_eq!(next.normal_text, "ordinary text");
+        assert!(next.calls.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_m3_streaming_eof_returns_new_candidate_after_completed_call() {
+    let tools = create_test_tools();
+    let mut parser = MinimaxM3Parser::new();
+    let call = tool_block(&[("get_weather", element("city", "Seattle"))]);
+
+    let complete = parser.parse_incremental(&call, &tools).await.unwrap();
+    assert_eq!(
+        complete.calls.iter().find_map(|item| item.name.as_deref()),
+        Some("get_weather")
+    );
+
+    let incomplete = format!("{NS}<tool_call>\n{NS}<invoke name=\"search\">");
+    let pending = parser.parse_incremental(&incomplete, &tools).await.unwrap();
+    assert!(pending.normal_text.is_empty());
+    assert!(pending.calls.is_empty());
+    assert_eq!(parser.take_unstreamed_normal_text(), incomplete);
+}
+
+#[tokio::test]
 async fn test_m3_reset_between_requests() {
     let mut parser = MinimaxM3Parser::new();
     let tools = create_test_tools();
@@ -911,6 +1017,137 @@ async fn test_empty_leaf_without_schema_is_unchanged() {
     let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
 
     assert_eq!(args["avoid_aisles"], json!(""));
+}
+
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper; allow-unwrap-in-tests only covers #[test] fns"
+)]
+fn composite_schema_tools(combinator: &str) -> Vec<Tool> {
+    let branches = json!([
+        {
+            "type": "object",
+            "properties": {
+                "string_list": {"type": "array", "items": {"type": "string"}}
+            }
+        },
+        {
+            "type": "object",
+            "properties": {
+                "number_list": {"type": "array", "items": {"type": "number"}}
+            }
+        }
+    ]);
+    let mut nested = json!({"type": "object"});
+    nested
+        .as_object_mut()
+        .unwrap()
+        .insert(combinator.to_string(), branches.clone());
+    let mut parameters = json!({
+        "type": "object",
+        "properties": {
+            "plain": {"type": "string"},
+            "nested": nested
+        }
+    });
+    parameters
+        .as_object_mut()
+        .unwrap()
+        .insert(combinator.to_string(), branches);
+
+    vec![Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "composite_schema".to_string(),
+            description: None,
+            parameters,
+            strict: None,
+        },
+    }]
+}
+
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper; allow-unwrap-in-tests only covers #[test] fns"
+)]
+async fn assert_composite_property_schemas(combinator: &str) {
+    let parser = MinimaxM3Parser::new();
+    let tools = composite_schema_tools(combinator);
+    let string_items = format!("{}{}", element("item", "12"), element("item", "34"));
+    let number_items = format!("{}{}", element("item", "12"), element("item", "34"));
+    let input = tool_block(&[
+        ("composite_schema", element("plain", "007")),
+        ("composite_schema", element("string_list", &string_items)),
+        ("composite_schema", element("number_list", &number_items)),
+    ]);
+
+    let (_, calls) = parser
+        .parse_complete_with_tools(&input, &tools)
+        .await
+        .unwrap();
+    let arguments = calls
+        .iter()
+        .map(|call| serde_json::from_str::<serde_json::Value>(&call.function.arguments).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(arguments[0], json!({"plain": "007"}));
+    assert_eq!(arguments[1], json!({"string_list": ["12", "34"]}));
+    assert_eq!(arguments[2], json!({"number_list": [12, 34]}));
+}
+
+#[tokio::test]
+async fn test_m3_resolves_property_schemas_in_top_level_one_of() {
+    assert_composite_property_schemas("oneOf").await;
+}
+
+#[tokio::test]
+async fn test_m3_resolves_property_schemas_in_top_level_any_of() {
+    assert_composite_property_schemas("anyOf").await;
+}
+
+#[tokio::test]
+async fn test_m3_resolves_property_schemas_in_top_level_all_of() {
+    assert_composite_property_schemas("allOf").await;
+}
+
+#[tokio::test]
+async fn test_m3_resolves_nested_composite_property_schemas() {
+    for combinator in ["oneOf", "anyOf", "allOf"] {
+        let parser = MinimaxM3Parser::new();
+        let tools = composite_schema_tools(combinator);
+        let string_items = format!("{}{}", element("item", "12"), element("item", "34"));
+        let number_items = format!("{}{}", element("item", "12"), element("item", "34"));
+        let input = tool_block(&[
+            (
+                "composite_schema",
+                element("nested", &element("string_list", &string_items)),
+            ),
+            (
+                "composite_schema",
+                element("nested", &element("number_list", &number_items)),
+            ),
+        ]);
+
+        let (_, calls) = parser
+            .parse_complete_with_tools(&input, &tools)
+            .await
+            .unwrap();
+        let string_args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let number_args: serde_json::Value =
+            serde_json::from_str(&calls[1].function.arguments).unwrap();
+
+        assert_eq!(
+            string_args,
+            json!({"nested": {"string_list": ["12", "34"]}}),
+            "{combinator} must preserve nested string array items"
+        );
+        assert_eq!(
+            number_args,
+            json!({"nested": {"number_list": [12, 34]}}),
+            "{combinator} must coerce nested number array items"
+        );
+    }
 }
 
 #[tokio::test]

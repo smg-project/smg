@@ -4288,6 +4288,7 @@ dependencies = [
  "smg-grpc-client",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",
@@ -7453,6 +7454,7 @@ dependencies = [
  "sha2 0.11.0",
  "smg",
  "smg-auth",
+ "smg-external-router",
  "smg-grpc-client",
  "smg-mcp",
  "smg-mesh",
@@ -7469,7 +7471,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
- "toml 1.1.4+spec-1.1.0",
+ "toml 1.1.5+spec-1.1.0",
  "tonic",
  "tonic-prost",
  "tool-parser",
@@ -7484,7 +7486,7 @@ dependencies = [
  "url",
  "uuid",
  "validator",
- "wasm-encoder 0.255.0",
+ "wasm-encoder 0.257.1",
  "wasmtime",
  "wasmtime-wasi",
  "wat",
@@ -7530,6 +7532,46 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "smg-external-router"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "dashmap",
+ "data-connector",
+ "futures",
+ "futures-util",
+ "http",
+ "http-body-util",
+ "memchr",
+ "metrics",
+ "multer",
+ "once_cell",
+ "openai-protocol",
+ "rand 0.10.2",
+ "regex",
+ "reqwest 0.13.4",
+ "rmcp",
+ "rustls",
+ "serde",
+ "serde_json",
+ "smg-mcp",
+ "str0m",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite 0.30.0",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -8451,9 +8493,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
-version = "0.26.4"
+version = "0.26.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
+checksum = "b0c85f2c3ef0b1cd58b36682f4b17aaa995f0e5db534d85692b4903abce21f67"
 dependencies = [
  "rustls",
  "tokio",
@@ -8533,9 +8575,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.1.4+spec-1.1.0"
+version = "1.1.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
+checksum = "12c0ba9680044b4ce98d391a62094047eada0d64860b80166c39f4a6b5640785"
 dependencies = [
  "indexmap 2.14.0",
  "serde_core",
@@ -9359,16 +9401,6 @@ dependencies = [
 
 [[package]]
 name = "wasm-encoder"
-version = "0.255.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b524283fb5df62eec102ed0574838961bdd7ba5ac9c50d38e2756c51c971a42"
-dependencies = [
- "leb128fmt",
- "wasmparser 0.255.0",
-]
-
-[[package]]
-name = "wasm-encoder"
 version = "0.257.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8ad9f0a39050867bda22e6486c316e2e52d20a42154d5bc433934bf738d085"
@@ -9414,17 +9446,6 @@ dependencies = [
  "indexmap 2.14.0",
  "semver",
  "serde",
-]
-
-[[package]]
-name = "wasmparser"
-version = "0.255.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8e329ef4b5d46e73b91d3ac6924417cad55a8cbbf869c199283383427c3320b"
-dependencies = [
- "bitflags 2.13.1",
- "indexmap 2.14.0",
- "semver",
 ]
 
 [[package]]

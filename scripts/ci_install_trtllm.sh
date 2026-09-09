@@ -17,6 +17,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RETRY="bash ${SCRIPT_DIR}/ci_retry.sh"
+
 TRTLLM_VERSION="1.3.0rc24"
 NCCL_VERSION_CONSTRAINT="nvidia-nccl-cu13>=2.28.9,<=2.29.2"
 
@@ -32,14 +35,14 @@ sudo dpkg --configure -a --force-confnew 2>/dev/null || true
 # Add NVIDIA apt repository if needed
 if ! dpkg -l cuda-keyring 2>/dev/null | grep -q '^ii'; then
     echo "Setting up NVIDIA apt repository..."
-    curl -fsSL -o /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+    $RETRY 3 10 curl -fsSL -o /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
     sudo dpkg -i /tmp/cuda-keyring.deb
     rm -f /tmp/cuda-keyring.deb
 fi
 
-sudo apt-get update
+$RETRY 3 10 sudo apt-get update
 # Runtime deps: wheel links against CUDA 13 + TensorRT libs
-sudo apt-get install -y libopenmpi-dev libnvinfer10 cuda-toolkit-13-0
+$RETRY 3 10 sudo apt-get install -y libopenmpi-dev libnvinfer10 cuda-toolkit-13-0
 
 # ── CUDA runtime setup ───────────────────────────────────────────────────────
 if [ -d "/usr/local/cuda-13.0" ]; then
@@ -51,8 +54,8 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${LD_LIBRARY_PATH:-}"
 
 # ── Install pip and NCCL runtime ─────────────────────────────────────────────
-pip install --upgrade pip
-pip install --no-cache-dir "$NCCL_VERSION_CONSTRAINT"
+$RETRY 3 10 pip install --upgrade pip
+$RETRY 3 10 pip install --no-cache-dir "$NCCL_VERSION_CONSTRAINT"
 
 # ── Install TensorRT-LLM pre-release wheel from NVIDIA's index ───────────────
 # PyPI only hosts the source tarball for tensorrt-llm — installing from there
@@ -63,7 +66,7 @@ pip install --no-cache-dir "$NCCL_VERSION_CONSTRAINT"
 # (cuda-bindings==13.x) instead of the default PyPI torch (cuda-bindings==12.9.4),
 # which conflicts with tensorrt-llm's cuda-python>=13 requirement.
 echo "Installing tensorrt-llm==${TRTLLM_VERSION} from pypi.nvidia.com..."
-pip install --no-cache-dir --pre \
+$RETRY 3 10 pip install --no-cache-dir --pre \
     --extra-index-url https://pypi.nvidia.com \
     --extra-index-url https://download.pytorch.org/whl/cu130 \
     "tensorrt-llm==${TRTLLM_VERSION}"
@@ -71,7 +74,7 @@ pip install --no-cache-dir --pre \
 # typer >= 0.26 leaks click.exceptions.Exit through its main on CLI exit, so
 # every `hf` invocation (model downloads) exits 1 even on success. The
 # transformers pulled by tensorrt-llm has an unbounded typer dependency.
-pip install --no-cache-dir "typer<0.26"
+$RETRY 3 10 pip install --no-cache-dir "typer<0.26"
 
 # ── Setup LD_LIBRARY_PATH ────────────────────────────────────────────────────
 SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")

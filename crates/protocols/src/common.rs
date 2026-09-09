@@ -55,6 +55,31 @@ where
 // GenerationRequest Trait
 // ============================================================================
 
+/// The request fields that partition a backend's prefix cache.
+///
+/// Engines namespace their prefix (KV) caches by client-supplied values: a
+/// cache salt, an extra classification key, and the LoRA adapter. Two
+/// requests that share a prompt but differ in any of these can never share
+/// cached blocks on the engine, so routing derives its cache namespace from
+/// this projection. All fields absent means the request is unpartitioned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CachePartition<'a> {
+    pub cache_salt: Option<&'a str>,
+    pub extra_key: Option<&'a str>,
+    pub lora_path: Option<&'a str>,
+}
+
+impl CachePartition<'_> {
+    /// True when no partitioning field is set. An empty string is "unset":
+    /// engines treat an empty salt or adapter as absent, so it must not
+    /// split the request off from the shared unpartitioned cache.
+    pub fn is_empty(&self) -> bool {
+        [self.cache_salt, self.extra_key, self.lora_path]
+            .iter()
+            .all(|field| field.is_none_or(str::is_empty))
+    }
+}
+
 /// Trait for unified access to generation request properties
 /// Implemented by ChatCompletionRequest, CompletionRequest, GenerateRequest,
 /// EmbeddingRequest, RerankRequest, and ResponsesRequest
@@ -79,6 +104,12 @@ pub trait GenerationRequest: Send + Sync {
     /// derive a session-affinity key from it; a batch reports its first id.
     fn rid(&self) -> Option<&str> {
         None
+    }
+
+    /// The fields that partition the backend's prefix cache for this request.
+    /// Protocols without such fields are unpartitioned.
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition::default()
     }
 }
 
@@ -231,6 +262,10 @@ pub enum ContentPart {
     InputAudio { input_audio: InputAudio },
     #[serde(rename = "video_url")]
     VideoUrl { video_url: VideoUrl },
+    /// Pass through unknown content objects to HTTP backends.
+    /// Also matches malformed known types; gRPC backends reject this variant.
+    #[serde(untagged)]
+    Unknown(Map<String, Value>),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
@@ -1041,6 +1076,49 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn content_part_round_trips_unknown_type() {
+        let value = json!({
+            "type": "vendor_special",
+            "payload": {"items": [1, "two", null], "enabled": true},
+            "vendor_option": "keep"
+        });
+        let part: ContentPart = serde_json::from_value(value.clone()).unwrap();
+
+        assert!(
+            matches!(&part, ContentPart::Unknown(fields) if fields["type"] == "vendor_special")
+        );
+        assert_eq!(serde_json::to_value(&part).unwrap(), value);
+    }
+
+    #[test]
+    fn content_part_rejects_non_objects() {
+        for value in [
+            json!(null),
+            json!(true),
+            json!(42),
+            json!("text"),
+            json!([]),
+        ] {
+            assert!(serde_json::from_value::<ContentPart>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn content_part_known_types_take_precedence_over_fallback() {
+        for value in [
+            json!({"type": "text", "text": "hello"}),
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}),
+            json!({"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}}),
+            json!({"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}),
+            json!({"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}),
+        ] {
+            let part: ContentPart = serde_json::from_value(value.clone()).unwrap();
+            assert!(!matches!(&part, ContentPart::Unknown(_)));
+            assert_eq!(serde_json::to_value(&part).unwrap(), value);
+        }
     }
 
     #[test]

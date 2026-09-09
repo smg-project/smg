@@ -165,10 +165,12 @@ impl MiniMaxM3VisionProcessor {
 
     /// Build a processor from a preprocessor config, falling back to M3's
     /// defaults for anything the config does not specify.
-    pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
-        Self::new()
-            .layered_over(config)
-            .unwrap_or_else(|_| Self::new())
+    ///
+    /// A present but malformed `img_token_compression_config` value fails
+    /// here, at construction, rather than silently falling back to the
+    /// defaults and hiding the real cause until the first request.
+    pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Result<Self, TransformError> {
+        Self::new().layered_over(config)
     }
 
     /// Layer a request's config over this processor's settings.
@@ -328,7 +330,8 @@ mod tests {
 
     #[test]
     fn reads_merge_params_from_the_nested_compression_block() {
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config());
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config())
+            .expect("checkpoint config is valid");
 
         // Neither key exists at the top level of M3's config; both must be
         // picked up from img_token_compression_config.
@@ -341,7 +344,8 @@ mod tests {
     fn checkpoint_config_keeps_m3_pixel_bounds() {
         // M3's config carries no min_pixels/max_pixels, so the M3 defaults must
         // survive rather than falling back to Qwen2-VL's much larger bounds.
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config());
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config())
+            .expect("checkpoint config is valid");
         assert_eq!(processor.min_pixels(), 3136);
         assert_eq!(processor.max_pixels(), 451_584);
     }
@@ -352,7 +356,8 @@ mod tests {
         config.merge_size = Some(4);
         config.temporal_patch_size = Some(1);
 
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config);
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config)
+            .expect("checkpoint config is valid");
         assert_eq!(processor.merge_size(), 4);
         assert_eq!(processor.temporal_patch_size(), 1);
     }
@@ -418,6 +423,18 @@ mod tests {
             .unwrap();
         assert_eq!(layered.merge_size(), DEFAULT_MERGE_SIZE);
         assert_eq!(layered.temporal_patch_size(), DEFAULT_TEMPORAL_PATCH_SIZE);
+    }
+
+    #[test]
+    fn from_preprocessor_config_rejects_a_malformed_compression_block() {
+        // Construction must fail loudly rather than fall back to the defaults
+        // and hide the real cause until the first request.
+        let config: PreProcessorConfig = serde_json::from_str(
+            r#"{"patch_size": 14,
+                 "img_token_compression_config": {"spatial_merge_size": "two"}}"#,
+        )
+        .unwrap();
+        assert!(MiniMaxM3VisionProcessor::from_preprocessor_config(&config).is_err());
     }
 
     #[test]

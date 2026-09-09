@@ -121,6 +121,8 @@ pub struct ResponsesFunctionToolChoice {
     #[serde(rename = "type")]
     pub tool_type: FunctionToolChoiceTag,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for ResponsesFunctionToolChoice {
@@ -141,6 +143,8 @@ impl<'de> Deserialize<'de> for ResponsesFunctionToolChoice {
             name: Option<String>,
             #[serde(default)]
             function: Option<FunctionChoice>,
+            #[serde(default)]
+            namespace: Option<String>,
         }
 
         let helper = Helper::deserialize(deserializer)?;
@@ -155,6 +159,7 @@ impl<'de> Deserialize<'de> for ResponsesFunctionToolChoice {
         Ok(Self {
             tool_type: helper.tool_type,
             name,
+            namespace: helper.namespace,
         })
     }
 }
@@ -312,7 +317,10 @@ impl ResponsesToolChoice {
             Self::Function(payload) => ChatToolChoice::Function {
                 tool_type: "function".to_string(),
                 function: FunctionChoice {
-                    name: payload.name.clone(),
+                    name: match &payload.namespace {
+                        Some(namespace) => format!("{namespace}.{}", payload.name),
+                        None => payload.name.clone(),
+                    },
                 },
             },
             Self::AllowedTools { mode, tools, .. } => ChatToolChoice::AllowedTools {
@@ -1184,6 +1192,8 @@ pub struct WebSearchPreviewTool {
 #[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WebSearchTool {
+    /// Whether the tool may fetch live external sources rather than cached results.
+    pub external_web_access: Option<bool>,
     /// Optional domain allowlist applied to candidate sources.
     pub filters: Option<WebSearchFilters>,
     /// Search-result context token budget. Spec enum: `"default" | "unlimited"`.
@@ -1591,6 +1601,35 @@ pub enum StringOrContentParts {
     Array(Vec<ResponseContentPart>),
 }
 
+impl StringOrContentParts {
+    /// Project tool output into a text-only backend without silently losing media.
+    pub fn to_text_only(&self) -> Result<String, String> {
+        match self {
+            Self::String(text) => Ok(text.clone()),
+            Self::Array(parts) => {
+                let mut text = String::new();
+                for part in parts {
+                    match part {
+                        ResponseContentPart::InputText { text: part }
+                        | ResponseContentPart::OutputText { text: part, .. } => text.push_str(part),
+                        _ => return Err(
+                            "Multimodal function output is not supported by this text-only backend"
+                                .to_string(),
+                        ),
+                    }
+                }
+                Ok(text)
+            }
+        }
+    }
+}
+
+impl From<String> for StringOrContentParts {
+    fn from(text: String) -> Self {
+        Self::String(text)
+    }
+}
+
 /// Phase label for assistant messages in the Responses API.
 ///
 /// For gpt-5.3-codex+ multi-turn conversations, preserving and resending the
@@ -1644,6 +1683,8 @@ pub enum ResponseInputOutputItem {
         id: Option<String>,
         call_id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
         arguments: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<String>,
@@ -1655,7 +1696,7 @@ pub enum ResponseInputOutputItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         call_id: String,
-        output: String,
+        output: StringOrContentParts,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
@@ -2254,6 +2295,8 @@ pub enum ResponseOutputItem {
         id: Option<String>,
         call_id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
         arguments: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
@@ -3347,12 +3390,21 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
 
     // Validate tool references exist
     match tool_choice {
-        ResponsesToolChoice::Function(_) => {
+        ResponsesToolChoice::Function(choice) => {
             // Accessor goes through `function_name()` so we stay agnostic to
             // the underlying wire shape (flat vs. legacy nested) — both are
             // normalized at deserialize time.
             if let Some(name) = tool_choice.function_name() {
-                if !function_tool_names.contains(&name) {
+                let found = tools.iter().any(|tool| match (tool, choice.namespace.as_deref()) {
+                    (ResponseTool::Function(function), None) => function.function.name == name,
+                    (ResponseTool::Namespace(namespace), Some(selected_namespace)) => {
+                        namespace.name == selected_namespace && namespace.tools.iter().any(|member| {
+                            matches!(member, NamespaceTool::Function(function) if function.function.name == name)
+                        })
+                    }
+                    _ => false,
+                });
+                if !found {
                     let mut e = ValidationError::new("tool_choice_function_not_found");
                     e.message = Some(
                         format!(
@@ -3521,13 +3573,7 @@ fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), ValidationE
         ResponseInputOutputItem::Reasoning { .. } => {
             // Reasoning content can be empty - no validation needed
         }
-        ResponseInputOutputItem::FunctionCallOutput { output, .. } => {
-            if output.is_empty() {
-                let mut e = ValidationError::new("function_output_empty");
-                e.message = Some("Function call output cannot be empty".into());
-                return Err(e);
-            }
-        }
+        ResponseInputOutputItem::FunctionCallOutput { .. } => {}
         ResponseInputOutputItem::FunctionToolCall { .. } => {}
         ResponseInputOutputItem::McpApprovalRequest { .. } => {}
         ResponseInputOutputItem::McpApprovalResponse { .. } => {}
@@ -3961,6 +4007,7 @@ impl ResponseOutputItem {
             id: Some(id),
             call_id,
             name,
+            namespace: None,
             arguments,
             output,
             status,

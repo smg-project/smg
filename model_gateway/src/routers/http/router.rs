@@ -44,7 +44,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{policy_filters_unavailable_workers, PolicyRegistry, SelectWorkerInfo},
+    policies::{CacheNamespace, PolicyRegistry},
     routers::{
         common::{
             attach_sized_body,
@@ -54,6 +54,7 @@ use crate::{
                 REASON_WORKER_MUTATES_BODY,
             },
             header_utils, overload,
+            placement::{self, PlacementFailure, PlacementInputs},
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
@@ -64,12 +65,13 @@ use crate::{
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
+        external::GatewayWorker,
+        gateway::Gateway,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         http::{
             request_body::{serialize_request_body, RequestBodyError},
             request_stream::{CappedBodyStream, StreamProgress},
         },
-        router_manager::RouterManager,
         BodyPolicy, RouterTrait,
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
@@ -241,59 +243,24 @@ impl Router {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
+        cache_namespace: Option<CacheNamespace>,
     ) -> Option<Arc<dyn Worker>> {
-        let candidates = self
-            .worker_registry
-            .get_routing_pool(model_id, RoutingPool::HttpRegular);
-
-        // Get the appropriate policy for this model
-        let policy = self.policy_registry.get_policy_or_default(model_id);
-
-        // Most policies already apply the complete availability predicate.
-        // Give them the shared registry snapshot directly instead of cloning
-        // every available worker into a second per-request Vec. Hash policies
-        // currently use a weaker health predicate and retain the pre-filter.
-        let filtered;
-        let available: &[Arc<dyn Worker>] = if policy_filters_unavailable_workers(policy.as_ref()) {
-            &candidates
-        } else {
-            filtered = candidates
-                .iter()
-                .filter(|worker| worker.is_available())
-                .cloned()
-                .collect::<Vec<_>>();
-            &filtered
-        };
-        if available.is_empty() {
-            return None;
-        }
-
-        // Get cached hash ring for consistent hashing (O(log n) lookup)
-        let hash_ring = self.worker_registry.get_hash_ring(model_id);
-
-        let idx = self.policy_registry.select_worker(
-            &policy,
-            available,
-            &SelectWorkerInfo {
-                request_text: text,
+        // This router proxies plain HTTP to the worker's URL, so only HTTP
+        // workers are candidates; nothing pins a wire on this path.
+        placement::select_single(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            RoutingPool::HttpRegular,
+            None,
+            PlacementInputs {
+                text,
                 tokens,
                 headers,
-                routing_key: self.policy_registry.resolve_routing_key(headers),
                 rid_key,
-                hash_ring,
-                leg: crate::policies::WorkerLeg::Single,
+                cache_namespace,
             },
-        )?;
-
-        // Record worker selection metric (Layer 3)
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_REGULAR,
-            metrics_labels::CONNECTION_HTTP,
-            model_id,
-            policy.name(),
-        );
-
-        Some(available[idx].clone())
+        )
     }
 
     /// Select a local, realtime-capable worker for the given model.
@@ -335,7 +302,7 @@ impl Router {
             body.set_model(canonical_model.to_string());
             forward_realtime_rest(
                 RealtimeLabels::HTTP,
-                worker,
+                worker.map(GatewayWorker::handle),
                 headers,
                 &body,
                 model,
@@ -346,7 +313,7 @@ impl Router {
         } else {
             forward_realtime_rest(
                 RealtimeLabels::HTTP,
-                worker,
+                worker.map(GatewayWorker::handle),
                 headers,
                 body,
                 model,
@@ -382,6 +349,7 @@ impl Router {
             .policy_registry
             .derive_rid_key(typed_req.rid())
             .map(str::to_string);
+        let cache_namespace = CacheNamespace::derive(&typed_req.cache_partition());
         // Resolve once, here, so every registry, policy and metrics lookup
         // below is keyed by the canonical model ID. Only `get_by_model`
         // understands aliases; retry configs, hash rings and policies do not,
@@ -415,6 +383,7 @@ impl Router {
                 tokens: routing_tokens,
                 text,
                 rid_key,
+                cache_namespace,
             },
             ReleasePoint::from_retry_config(retry_config),
         );
@@ -523,27 +492,35 @@ impl Router {
         is_stream: bool,
     ) -> Response {
         let worker = match lease.with_view(|view| {
-            self.select_worker_for_model(model_id, view.text, view.tokens, headers, view.rid_key)
+            self.select_worker_for_model(
+                model_id,
+                view.text,
+                view.tokens,
+                headers,
+                view.rid_key,
+                view.cache_namespace,
+            )
         }) {
             Some(w) => w,
             None => {
-                // Distinguish "no workers for this model" from "workers exist but unavailable"
-                let total = self
-                    .worker_registry
-                    .get_routing_pool(model_id, RoutingPool::HttpRegular);
-                // `total` is exactly the pool selection drew from, wildcard
-                // model included — classifying from it rather than from the
-                // model index is what makes the shed fire for a model-less
-                // `/generate` and for a model that is also served over gRPC.
-                return if total.is_empty() {
-                    error::model_not_found(model_id)
-                } else if let Some(shed) = overload::shed_if_all_overloaded(&total, model_id) {
-                    shed
-                } else {
-                    error::service_unavailable(
-                        "no_available_workers",
-                        "All workers are unavailable (circuit breaker open or unhealthy)",
-                    )
+                // The verdict is judged from exactly the pool selection drew
+                // from, wildcard model included: that is what makes the shed
+                // fire for a model-less `/generate` and for a model that is
+                // also served over gRPC.
+                return match placement::single_failure(
+                    &self.worker_registry,
+                    model_id,
+                    RoutingPool::HttpRegular,
+                    None,
+                ) {
+                    PlacementFailure::NoCandidates => error::model_not_found(model_id),
+                    PlacementFailure::AllOverloaded(shed) => shed,
+                    PlacementFailure::Unavailable | PlacementFailure::PolicyDeclined(_) => {
+                        error::service_unavailable(
+                            "no_available_workers",
+                            "All workers are unavailable (circuit breaker open or unhealthy)",
+                        )
+                    }
                 };
             }
         };
@@ -825,69 +802,40 @@ impl Router {
             record_pre_send_error(&resp);
             return resp;
         }
-        let policy = self.policy_registry.get_policy_or_default(model_id);
-        let filtered;
-        let available: &[Arc<dyn Worker>] = if policy_filters_unavailable_workers(policy.as_ref()) {
-            &non_dp_workers
-        } else {
-            filtered = non_dp_workers
-                .iter()
-                .filter(|worker| worker.is_available())
-                .cloned()
-                .collect::<Vec<_>>();
-            &filtered
-        };
-        if available.is_empty() {
-            let resp =
-                overload::shed_if_all_overloaded(&non_dp_workers, model_id).unwrap_or_else(|| {
-                    error::service_unavailable(
-                        "no_available_workers",
-                        "All workers are unavailable (circuit breaker open or unhealthy)",
-                    )
-                });
-            record_pre_send_error(&resp);
-            return resp;
-        }
-
-        let hash_ring = self.worker_registry.get_hash_ring(model_id);
-        let idx = match self.policy_registry.select_worker(
-            &policy,
-            available,
-            &SelectWorkerInfo {
-                request_text: text.as_deref(),
+        let Some(worker) = placement::select_from(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            &non_dp_workers,
+            PlacementInputs {
+                text: text.as_deref(),
                 tokens: hinted_tokens.as_deref(),
                 headers,
-                routing_key: self.policy_registry.resolve_routing_key(headers),
                 rid_key: None,
-                hash_ring,
-                leg: crate::policies::WorkerLeg::Single,
+                cache_namespace: None,
             },
-        ) {
-            Some(i) => i,
-            None => {
-                // Self-filtering policies see the unfiltered pool, so "all
-                // workers overloaded" surfaces here as a policy miss instead
-                // of an empty pre-filter above. Classify the shed on this arm
-                // too, or the 503 loses Retry-After, retryability marking,
-                // and the overload-shed metric.
-                let resp = overload::shed_if_all_overloaded(&non_dp_workers, model_id)
-                    .unwrap_or_else(|| {
-                        error::service_unavailable(
-                            "no_available_workers",
-                            "Policy returned no eligible worker",
-                        )
-                    });
-                record_pre_send_error(&resp);
-                return resp;
-            }
+        ) else {
+            // Judged from the same candidates whether the pre-filter emptied
+            // or a self-filtering policy missed on an all-overloaded pool, so
+            // a shed keeps its Retry-After, retryability and metric.
+            let resp = match placement::failure_from(&non_dp_workers, model_id) {
+                PlacementFailure::AllOverloaded(shed) => shed,
+                PlacementFailure::NoCandidates
+                | PlacementFailure::Unavailable
+                | PlacementFailure::PolicyDeclined(_) => {
+                    // The verdict cannot tell a policy miss from a drained
+                    // pool; the pool can.
+                    let message = if non_dp_workers.iter().any(|w| w.is_available()) {
+                        "Policy returned no eligible worker"
+                    } else {
+                        "All workers are unavailable (circuit breaker open or unhealthy)"
+                    };
+                    error::service_unavailable("no_available_workers", message)
+                }
+            };
+            record_pre_send_error(&resp);
+            return resp;
         };
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_REGULAR,
-            metrics_labels::CONNECTION_HTTP,
-            model_id,
-            policy.name(),
-        );
-        let worker = available[idx].clone();
 
         // Same dispatch-time re-check the regular path takes. A transcription
         // occupies its worker for far longer than a chat completion, so a
@@ -1686,14 +1634,17 @@ impl Router {
         let model_id = crate::worker::UNKNOWN_MODEL_ID;
         // Buffered-path parity: a valid tokens hint is exactly what selection
         // would have received there (text is never extracted alongside it).
-        // Streamed requests have no readable body, hence no rid key;
-        // routing-key override is excluded by the body-path gate above.
+        // Streamed requests have no readable body, hence no rid key and no
+        // cache namespace: selection keys unpartitioned here, so a request
+        // that needs partitioned affinity must take the buffered path.
+        // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
         let Some(worker) = self.select_worker_for_model(
             model_id,
             None,
             hinted_tokens.as_deref(),
             Some(req.headers()),
+            None,
             None,
         ) else {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
@@ -1846,7 +1797,7 @@ pub async fn stream_eligible_request_bodies(
     // ForwardCapable: resolve the concrete regular router behind an optional
     // manager. Either arm can only fail on a registration race that turned
     // dispatch model-addressed again.
-    let resolved = match state.router.as_any().downcast_ref::<RouterManager>() {
+    let resolved = match state.router.as_any().downcast_ref::<Gateway>() {
         Some(manager) => match manager.select_router_for_request(None) {
             Some(selected) => selected,
             None => {
@@ -2084,7 +2035,7 @@ impl RouterTrait for Router {
             RealtimeLabels::HTTP,
             parts,
             model.to_owned(),
-            worker,
+            worker.map(GatewayWorker::handle),
             auth_header,
             Arc::clone(&self.realtime_registry),
         )
@@ -2133,7 +2084,7 @@ impl RouterTrait for Router {
             RealtimeLabels::HTTP,
             parts.headers,
             parsed,
-            worker,
+            worker.map(GatewayWorker::handle),
             auth_header,
             bind_addr,
             self.webrtc_stun_server.clone(),
@@ -2154,7 +2105,7 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
     };
 
-    use axum::http::header::CONTENT_LENGTH;
+    use axum::http::header::{CONTENT_LENGTH, RETRY_AFTER};
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
@@ -2353,7 +2304,14 @@ mod tests {
         let router = create_test_unhealthy_router();
 
         let selected = router
-            .select_worker_for_model(crate::worker::UNKNOWN_MODEL_ID, None, None, None, None)
+            .select_worker_for_model(
+                crate::worker::UNKNOWN_MODEL_ID,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert!(selected.is_available());
 
@@ -2361,8 +2319,45 @@ mod tests {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
         }
         assert!(router
-            .select_worker_for_model(crate::worker::UNKNOWN_MODEL_ID, None, None, None, None)
+            .select_worker_for_model(
+                crate::worker::UNKNOWN_MODEL_ID,
+                None,
+                None,
+                None,
+                None,
+                None
+            )
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn unavailable_workers_keep_generic_503_without_retry_after() {
+        let router = create_test_regular_router();
+        for worker in router.worker_registry.get_all() {
+            worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        }
+
+        let response = router
+            .route_typed_request(
+                None,
+                DropProbeRequest {
+                    text: "unavailable".to_string(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .expect("gateway error code header"),
+            "no_available_workers"
+        );
+        assert!(response.headers().get(RETRY_AFTER).is_none());
     }
 
     fn rerank_request() -> RerankRequest {

@@ -19,7 +19,9 @@ use openai_protocol::{
 };
 use tracing::warn;
 
-use crate::routers::grpc::common::responses::utils::extract_tools_from_response_tools;
+use crate::routers::grpc::common::responses::utils::{
+    extract_tools_from_response_tools, resolve_function_identity,
+};
 
 /// Convert a ResponsesRequest to ChatCompletionRequest for processing through the chat pipeline
 ///
@@ -84,6 +86,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                     ResponseInputOutputItem::FunctionToolCall {
                         call_id,
                         name,
+                        namespace,
                         arguments,
                         output,
                         ..
@@ -100,7 +103,10 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                                 id: tool_call_id.clone(),
                                 tool_type: "function".to_string(),
                                 function: FunctionCallResponse {
-                                    name: name.clone(),
+                                    name: match namespace {
+                                        Some(namespace) => format!("{namespace}.{name}"),
+                                        None => name.clone(),
+                                    },
                                     arguments: Some(arguments.clone()),
                                 },
                             }]),
@@ -139,7 +145,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                         // Note: The function name is looked up from prev_outputs in Harmony path
                         // For Chat path, we just use the call_id
                         messages.push(ChatMessage::Tool {
-                            content: MessageContent::Text(output.clone()),
+                            content: MessageContent::Text(output.to_text_only()?),
                             tool_call_id: call_id.clone(),
                         });
                     }
@@ -383,10 +389,13 @@ pub(crate) fn chat_to_responses(
     // Convert tool calls if present
     if let Some(tool_calls) = &choice.message.tool_calls {
         for tool_call in tool_calls {
+            let (name, namespace) =
+                resolve_function_identity(original_req.tools.as_deref(), &tool_call.function.name);
             output.push(ResponseOutputItem::FunctionToolCall {
                 id: Some(tool_call.id.clone()),
                 call_id: tool_call.id.clone(),
-                name: tool_call.function.name.clone(),
+                name,
+                namespace,
                 arguments: tool_call.function.arguments.clone().unwrap_or_default(),
                 output: None, // Tool hasn't been executed yet
                 status: "in_progress".to_string(),
@@ -438,6 +447,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::routers::grpc::common::responses::utils::namespace_test_request;
 
     #[test]
     fn chat_to_responses_serializes_responses_api_usage() {
@@ -594,6 +604,7 @@ mod tests {
                 id: Some("fc_item_id".to_string()),
                 call_id: "call_tool_id".to_string(),
                 name: "lookup".to_string(),
+                namespace: Some("weather".to_string()),
                 arguments: "{\"q\":\"rust\"}".to_string(),
                 output: Some("done".to_string()),
                 status: Some("completed".to_string()),
@@ -608,7 +619,10 @@ mod tests {
             ChatMessage::Assistant {
                 tool_calls: Some(tool_calls),
                 ..
-            } => assert_eq!(tool_calls[0].id, "call_tool_id"),
+            } => {
+                assert_eq!(tool_calls[0].id, "call_tool_id");
+                assert_eq!(tool_calls[0].function.name, "weather.lookup");
+            }
             other => panic!("expected assistant tool call, got {other:?}"),
         }
 
@@ -753,5 +767,28 @@ mod tests {
         let result = responses_to_chat(&req);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Unsupported input item type");
+    }
+    #[test]
+    fn namespace_chat_response_roundtrips_identity() {
+        let request: ResponsesRequest = namespace_test_request();
+        let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+            "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                {"id":"call_weather","type":"function","function":{"name":"weather.lookup","arguments":"{}"}}
+            ]},"finish_reason":"tool_calls"}]
+        })).unwrap();
+        let response = chat_to_responses(&chat, &request, None).unwrap();
+        let wire = serde_json::to_value(&response.output[0]).unwrap();
+        assert_eq!(wire["name"], "lookup");
+        assert_eq!(wire["namespace"], "weather");
+        let mut replay = request;
+        replay.input = ResponseInput::Items(vec![serde_json::from_value(wire).unwrap()]);
+        let converted = responses_to_chat(&replay).unwrap();
+        let wire = serde_json::to_value(converted).unwrap();
+        assert_eq!(
+            wire["messages"][0]["tool_calls"][0]["function"]["name"],
+            "weather.lookup"
+        );
+        assert_eq!(wire["tools"][0]["function"]["name"], "weather.lookup");
     }
 }

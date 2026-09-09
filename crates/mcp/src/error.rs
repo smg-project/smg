@@ -57,6 +57,22 @@ pub enum McpError {
     #[error("Tool execution denied: {0}")]
     ToolDenied(String),
 
+    #[error(
+        "Tool call outcome unknown: server '{server}' disconnected while executing '{tool}'; \
+         the call was not retried because the tool is not marked idempotent or read-only"
+    )]
+    OutcomeUnknown { server: String, tool: String },
+
+    #[error(
+        "Tool call timed out after {secs}s on server '{server}' while executing '{tool}'; \
+         the outcome is unknown and the call was not retried"
+    )]
+    CallTimeout {
+        server: String,
+        tool: String,
+        secs: u64,
+    },
+
     #[error(transparent)]
     Sdk(#[from] Box<rmcp::RmcpError>),
 

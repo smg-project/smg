@@ -1,6 +1,6 @@
 //! Request execution: dispatch one attempt of the retained execution plan.
 
-use std::time::Instant;
+use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use axum::response::Response;
 use futures::future::{join_all, try_join_all};
@@ -10,9 +10,12 @@ use super::pd_protocol::{DpPlacement, PdDispatch, PdProtocol};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
-        common::kv_transfer::{
-            connector_mode_for_worker, mooncake_decode_params, mooncake_prefill_params,
-            KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
+        common::{
+            kv_transfer::{
+                connector_mode_for_worker, mooncake_decode_params, mooncake_prefill_params,
+                KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
+            },
+            pd_admission,
         },
         error,
         grpc::{
@@ -28,10 +31,82 @@ use crate::{
             utils::tonic_ext::{TonicResultExt, TonicStatusExt},
         },
     },
-    worker::ConnectionModeExt,
+    worker::{ConnectionModeExt, Worker},
 };
 
 type StreamResult = Result<ProtoStream, tonic::Status>;
+
+/// One leg's owned dispatch. Owned (rather than borrowed from the client
+/// selection) so the leg still in flight when its partner fails can be moved
+/// off the request path — see [`retire_pd_leg`].
+type PdLegDispatch = Pin<Box<dyn Future<Output = StreamResult> + Send>>;
+
+/// Which leg of a disaggregated dispatch a result belongs to. The error code
+/// and message are part of the client contract, so they live per leg here
+/// rather than being reconstructed at each call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdLeg {
+    Prefill,
+    Decode,
+}
+
+impl PdLeg {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Prefill => metrics_labels::WORKER_PREFILL,
+            Self::Decode => metrics_labels::WORKER_DECODE,
+        }
+    }
+
+    fn error_code(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill_worker_failed_to_start",
+            Self::Decode => "decode_worker_failed_to_start",
+        }
+    }
+
+    fn error_message(self) -> &'static str {
+        match self {
+            Self::Prefill => "Prefill worker failed to start",
+            Self::Decode => "Decode worker failed to start",
+        }
+    }
+
+    fn partner(self) -> Self {
+        match self {
+            Self::Prefill => Self::Decode,
+            Self::Decode => Self::Prefill,
+        }
+    }
+}
+
+/// How the two parallel legs resolved.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "consumed by its caller on the next line; boxing would add an allocation to the success path to save one stack move"
+)]
+enum PdDispatchOutcome {
+    /// Both legs answered; either or both may carry an error.
+    Both(StreamResult, StreamResult),
+    /// One leg failed while its partner was still dispatching. The partner is
+    /// handed back so the caller can retire it instead of waiting it out.
+    FailedFirst {
+        leg: PdLeg,
+        error: tonic::Status,
+        partner: PdLegDispatch,
+    },
+}
+
+/// Backend requests one plan dispatches — one per batched prompt, else one.
+///
+/// This is both the load-guard scale and the number of PD bootstrap rooms the
+/// plan will post, which is why admission and the guards read the same count.
+fn plan_sub_requests(plan: &ExecutionPlan) -> usize {
+    match plan {
+        ExecutionPlan::Batch { requests, .. } => requests.len(),
+        _ => 1,
+    }
+}
 
 /// Metric connection labels for the PD legs (a leg can be gRPC or ZMQ).
 fn pd_leg_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
@@ -56,6 +131,30 @@ pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     execution_plan: ExecutionPlan,
 ) -> Result<(), Response> {
+    // One bootstrap room per backend request the plan will post: a batched
+    // completion fans out one PD dispatch per sub-request, so admission has
+    // to claim for all of them or the siblings walk past a gate that only
+    // ever asked about one.
+    let sub_requests = plan_sub_requests(&execution_plan);
+
+    // Admission runs before this attempt claims anything else. The decode
+    // leg's engine window is what clears the prefill's bootstrap deadline, so
+    // a request the decode cannot admit yet waits here rather than in the
+    // engine's queue — where it would burn the prefill's deadline and strand
+    // both rooms. Waiting ahead of the encode take below also keeps the
+    // encode jobs' SHM unclaimed for the duration: under the burst this gate
+    // targets, holding it would queue a second scarce resource behind the
+    // decode window and throw the finished encode work away on a shed. The
+    // gate abstains when the engine reports no window.
+    let admission = match ctx
+        .workers
+        .as_ref()
+        .and_then(WorkerSelection::decode_worker)
+    {
+        Some(decode) => pd_admission::admit_decode(decode, &ctx.model_id, sub_requests).await?,
+        None => None,
+    };
+
     // `None` for non-EPD, text-only EPD, or an EPD retry (the first dispatch
     // consumed it). Taking it transfers the encode jobs' SHM Drop guards
     // here: dispatch consumes them, while an early error before dispatch
@@ -84,14 +183,9 @@ pub(crate) async fn execute_plan(
         )
     })?;
 
-    let sub_requests = match &execution_plan {
-        ExecutionPlan::Batch { requests, .. } => requests.len(),
-        _ => 1,
-    };
-    ctx.load_guards = Some(LoadGuards::scaled(
-        workers,
-        ctx.sticky_key.as_deref(),
-        sub_requests,
+    ctx.load_guards = Some(LoadGuards::admitted(
+        admission,
+        LoadGuards::scaled(workers, ctx.sticky_key.as_deref(), sub_requests),
     ));
 
     // Extract dispatch metadata for the tracing span and PD metric labels.
@@ -378,65 +472,211 @@ async fn execute_parallel_pd(
     // it on this path), so prefill duration cannot be measured — only TTFT,
     // recorded at the first decode token in streaming. prefill_start anchors it.
     let prefill_start = Instant::now();
-    let (prefill_result, decode_result): (StreamResult, StreamResult) = tokio::join!(
-        prefill_client.generate(prefill_request),
-        decode_client.generate(decode_request)
-    );
-
-    // Record circuit breaker outcomes (client errors don't count as failures)
-    workers.record_prefill_decode_outcomes(
-        prefill_result.cb_status_code(),
-        decode_result.cb_status_code(),
-    );
-
     let (prefill_label, decode_label) = pd_leg_labels(workers);
+    // Each leg owns its client handle (a cheap channel clone, the same one
+    // batched dispatch takes per sub-request) so the leg still in flight when
+    // its partner fails can be moved off the request path.
+    let mut prefill_client = prefill_client.clone();
+    let mut decode_client = decode_client.clone();
+    let prefill_dispatch: PdLegDispatch =
+        Box::pin(async move { prefill_client.generate(prefill_request).await });
+    let decode_dispatch: PdLegDispatch =
+        Box::pin(async move { decode_client.generate(decode_request).await });
 
-    // Handle prefill result
-    let prefill_stream = prefill_result.map_err(|e| {
-        Metrics::record_worker_error(
-            metrics_labels::WORKER_PREFILL,
-            prefill_label,
-            metrics_labels::ERROR_BACKEND,
-        );
-        error!(function = "execute_parallel_pd", error = %e, "Prefill worker failed to start");
-        e.to_http_error(
-            "prefill_worker_failed_to_start",
-            format!("Prefill worker failed to start: {}", e.message()),
-        )
-    })?;
+    match dispatch_pd_legs(prefill_dispatch, decode_dispatch).await {
+        PdDispatchOutcome::Both(prefill_result, decode_result) => {
+            // Record circuit breaker outcomes (client errors don't count as failures)
+            workers.record_prefill_decode_outcomes(
+                prefill_result.cb_status_code(),
+                decode_result.cb_status_code(),
+            );
 
-    // Handle decode result
-    let decode_stream = decode_result.map_err(|e| {
-        Metrics::record_worker_error(
-            metrics_labels::WORKER_DECODE,
-            decode_label,
-            metrics_labels::ERROR_BACKEND,
-        );
-        error!(function = "execute_parallel_pd", error = %e, "Decode worker failed to start");
-        e.to_http_error(
-            "decode_worker_failed_to_start",
-            format!("Decode worker failed to start: {}", e.message()),
-        )
-    })?;
+            // Both legs are translated before either is propagated: a
+            // decode-side failure is logged and counted even when the prefill
+            // error is the one the client sees.
+            let prefill =
+                prefill_result.map_err(|e| pd_leg_error(PdLeg::Prefill, prefill_label, &e));
+            let decode = decode_result.map_err(|e| pd_leg_error(PdLeg::Decode, decode_label, &e));
+            let (prefill_stream, decode_stream) = match (prefill, decode) {
+                (Ok(prefill), Ok(decode)) => (prefill, decode),
+                // The surviving leg's stream drops here, which aborts its
+                // room on the worker.
+                (Err(response), _) | (Ok(_), Err(response)) => return Err(response),
+            };
 
-    // A client disconnect drops both leg streams, which normally fires an
-    // immediate abort to each worker. The decode leg must not be aborted
-    // while it is still receiving the KV handoff from prefill — tearing
-    // the request down mid-transfer can crash or leak on the engine — so
-    // its abort is deferred until the first decode response (the proof
-    // the handoff completed). The prefill leg keeps the immediate abort:
-    // if prefill is still running there is nothing to hand off yet, and
-    // stopping it promptly frees capacity.
-    let decode_stream = decode_stream.defer_abort_until_first_item();
+            // A client disconnect drops both leg streams, which normally fires an
+            // immediate abort to each worker. The decode leg must not be aborted
+            // while it is still receiving the KV handoff from prefill — tearing
+            // the request down mid-transfer can crash or leak on the engine — so
+            // its abort is deferred until the first decode response (the proof
+            // the handoff completed). The prefill leg keeps the immediate abort:
+            // if prefill is still running there is nothing to hand off yet, and
+            // stopping it promptly frees capacity.
+            let decode_stream = decode_stream.defer_abort_until_first_item();
 
-    Ok(ExecutionResult::PrefillDecode {
-        prefill: prefill_stream,
-        decode: Box::new(decode_stream),
-        pd_timing: PdTiming {
-            prefill_start,
-            runtime,
-        },
-    })
+            Ok(ExecutionResult::PrefillDecode {
+                prefill: prefill_stream,
+                decode: Box::new(decode_stream),
+                pd_timing: PdTiming {
+                    prefill_start,
+                    runtime,
+                },
+            })
+        }
+        PdDispatchOutcome::FailedFirst {
+            leg,
+            error,
+            partner,
+        } => {
+            let status = error.http_status().as_u16();
+            // Only the leg that answered is recorded: the abandoned one has
+            // said nothing about its worker yet, and `retire_pd_leg` records
+            // it when it finally does.
+            let (label, partner_label, partner_worker) = match leg {
+                PdLeg::Prefill => {
+                    workers.record_outcome_prefill(status);
+                    (prefill_label, decode_label, workers.decode_worker())
+                }
+                PdLeg::Decode => {
+                    workers.record_outcome_decode(status);
+                    (decode_label, prefill_label, workers.prefill_worker())
+                }
+            };
+            if let Some(worker) = partner_worker {
+                retire_pd_leg(leg.partner(), partner_label, Arc::clone(worker), partner);
+            }
+            Err(pd_leg_error(leg, label, &error))
+        }
+    }
+}
+
+/// Dispatch both legs together and answer with the first failure.
+///
+/// The legs rendezvous on one bootstrap room, so a leg that cannot start
+/// leaves its partner's room unreachable — and the engine holding that room
+/// for the whole of its own deadline. Waiting for the second verdict before
+/// reporting the first failure is what turned a 120 s prefill bootstrap
+/// timeout into a 300 s decode transfer timeout for the client, with the
+/// pair's slot held throughout. A leg that has already answered is never
+/// discarded, so the success path is byte-for-byte what a join produced.
+async fn dispatch_pd_legs(
+    mut prefill: PdLegDispatch,
+    mut decode: PdLegDispatch,
+) -> PdDispatchOutcome {
+    /// One turn of the dispatch loop. The `select!` handlers may only
+    /// classify — moving a still-pending leg out happens after the macro's
+    /// borrows end.
+    enum LegStep {
+        /// The prefill leg answered; a failure here was beaten to the finish
+        /// by its partner, so both verdicts are in.
+        Prefill(StreamResult),
+        Decode(StreamResult),
+        /// This leg failed while its partner was still dispatching.
+        Alone(PdLeg, tonic::Status),
+    }
+
+    // At most one of these is `Some` at the top of the loop: the second
+    // answer returns rather than being stored, which is also what keeps both
+    // `select!` branches from being disabled at once.
+    let mut prefill_result: Option<StreamResult> = None;
+    let mut decode_result: Option<StreamResult> = None;
+
+    loop {
+        let step = tokio::select! {
+            result = &mut prefill, if prefill_result.is_none() => match result {
+                Err(error) if decode_result.is_none() => LegStep::Alone(PdLeg::Prefill, error),
+                result => LegStep::Prefill(result),
+            },
+            result = &mut decode, if decode_result.is_none() => match result {
+                Err(error) if prefill_result.is_none() => LegStep::Alone(PdLeg::Decode, error),
+                result => LegStep::Decode(result),
+            },
+        };
+
+        match step {
+            LegStep::Alone(leg, error) => {
+                let partner = match leg {
+                    PdLeg::Prefill => decode,
+                    PdLeg::Decode => prefill,
+                };
+                return PdDispatchOutcome::FailedFirst {
+                    leg,
+                    error,
+                    partner,
+                };
+            }
+            LegStep::Prefill(result) => match decode_result.take() {
+                Some(decode) => return PdDispatchOutcome::Both(result, decode),
+                None => prefill_result = Some(result),
+            },
+            LegStep::Decode(result) => match prefill_result.take() {
+                Some(prefill) => return PdDispatchOutcome::Both(prefill, result),
+                None => decode_result = Some(result),
+            },
+        }
+    }
+}
+
+/// Log, count and translate one leg's dispatch failure into the client answer.
+fn pd_leg_error(leg: PdLeg, connection: &'static str, error: &tonic::Status) -> Response {
+    Metrics::record_worker_error(leg.name(), connection, metrics_labels::ERROR_BACKEND);
+    match leg {
+        PdLeg::Prefill => {
+            error!(function = "execute_parallel_pd", error = %error, "Prefill worker failed to start");
+        }
+        PdLeg::Decode => {
+            error!(function = "execute_parallel_pd", error = %error, "Decode worker failed to start");
+        }
+    }
+    error.to_http_error(
+        leg.error_code(),
+        format!("{}: {}", leg.error_message(), error.message()),
+    )
+}
+
+/// Finish off the leg that was still dispatching when its partner failed.
+///
+/// The request is already answered; what is left is the engine-side room,
+/// which the abandoned leg will allocate the moment its dispatch lands and
+/// then hold for its own deadline. Dropping the leg's stream as soon as it
+/// arrives is the abort path the router already uses on a client disconnect,
+/// and it is the only thing that releases that room early. The abort is *not*
+/// deferred here: deferral exists to protect an in-flight KV handoff, and the
+/// peer that would have written it is the leg that just failed.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the abandoned PD leg is retired off the request path; its dispatch is bounded by the engine's own deadline"
+)]
+fn retire_pd_leg(
+    leg: PdLeg,
+    connection: &'static str,
+    worker: Arc<dyn Worker>,
+    dispatch: PdLegDispatch,
+) {
+    tokio::spawn(async move {
+        let result = dispatch.await;
+        worker.record_outcome(result.cb_status_code());
+        match result {
+            Ok(stream) => {
+                debug!(
+                    leg = leg.name(),
+                    worker = worker.url(),
+                    "Aborting the room of the PD leg abandoned after its partner failed"
+                );
+                drop(stream);
+            }
+            Err(error) => {
+                Metrics::record_worker_error(leg.name(), connection, metrics_labels::ERROR_BACKEND);
+                error!(
+                    function = "retire_pd_leg",
+                    leg = leg.name(),
+                    worker = worker.url(),
+                    error = %error,
+                    "PD leg failed after its partner had already failed"
+                );
+            }
+        }
+    });
 }
 
 /// Execute vLLM PD: send to prefill with max_tokens=1 first, wait for completion,
@@ -712,12 +952,88 @@ async fn execute_sequential_pd(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use smg_grpc_client::{tokenspeed_proto as ts, vllm_proto as vllm};
 
     use super::*;
     use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType};
+
+    /// A leg that never answers — the decode leg stuck behind the engine's
+    /// transfer deadline while the prefill leg has already given up.
+    fn never_answers() -> PdLegDispatch {
+        Box::pin(std::future::pending())
+    }
+
+    fn fails_now(message: &'static str) -> PdLegDispatch {
+        Box::pin(async move { Err(tonic::Status::deadline_exceeded(message)) })
+    }
+
+    fn answers_after(delay: Duration) -> PdLegDispatch {
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Err(tonic::Status::unavailable("late leg"))
+        })
+    }
+
+    /// A prefill that times out must be reported without waiting for the
+    /// decode leg, and the decode's dispatch must come back so its room can
+    /// be released instead of being left to the engine's own deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_prefill_answers_without_waiting_for_the_decode_leg() {
+        let started = tokio::time::Instant::now();
+        let outcome = dispatch_pd_legs(fails_now("bootstrap timeout"), never_answers()).await;
+
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "the prefill error must not wait on the decode leg"
+        );
+        match outcome {
+            PdDispatchOutcome::FailedFirst { leg, error, .. } => {
+                assert_eq!(leg, PdLeg::Prefill);
+                assert_eq!(error.message(), "bootstrap timeout");
+            }
+            PdDispatchOutcome::Both(..) => panic!("expected a fail-fast outcome"),
+        }
+    }
+
+    /// The mirror case: a decode leg that cannot start is answered without
+    /// waiting out the prefill's bootstrap deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_decode_answers_without_waiting_for_the_prefill_leg() {
+        let outcome = dispatch_pd_legs(
+            answers_after(Duration::from_secs(120)),
+            fails_now("decode refused"),
+        )
+        .await;
+
+        match outcome {
+            PdDispatchOutcome::FailedFirst { leg, error, .. } => {
+                assert_eq!(leg, PdLeg::Decode);
+                assert_eq!(error.message(), "decode refused");
+            }
+            PdDispatchOutcome::Both(..) => panic!("expected a fail-fast outcome"),
+        }
+    }
+
+    /// Admission and the load guards read the same count, so a batched plan
+    /// claims one room per prompt instead of walking past a gate that only
+    /// asked about one.
+    #[test]
+    fn plan_sub_requests_counts_every_batched_prompt() {
+        let single = ExecutionPlan::PrefillDecode(ProtoGenerateRequest::Vllm(Box::default()));
+        assert_eq!(plan_sub_requests(&single), 1);
+
+        let batch = ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::PrefillDecode,
+            shared_request_id: "cmpl-1".to_string(),
+            requests: (0..4)
+                .map(|_| ProtoGenerateRequest::Vllm(Box::default()))
+                .collect(),
+        };
+        assert_eq!(plan_sub_requests(&batch), 4);
+    }
 
     #[test]
     fn pd_leg_labels_reflect_each_legs_transport() {

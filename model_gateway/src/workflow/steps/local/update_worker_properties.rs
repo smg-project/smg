@@ -202,6 +202,7 @@ mod tests {
     use super::*;
     use crate::{
         app_context::AppContext,
+        middleware::AuthConfig,
         routers::grpc::{
             backend_client::BackendClient,
             zmq_client::{EosTokenIds, ZmqEngineClient},
@@ -231,6 +232,7 @@ mod tests {
         let job_queue = Arc::new(std::sync::OnceLock::new());
 
         Arc::new(AppContext {
+            gateway_auth: AuthConfig::new(None),
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
@@ -241,7 +243,7 @@ mod tests {
             )),
             reasoning_parser_factory: None,
             tool_parser_factory: None,
-            router_manager: None,
+            gateway: None,
             response_storage: Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             conversation_storage: Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             conversation_item_storage: Arc::new(

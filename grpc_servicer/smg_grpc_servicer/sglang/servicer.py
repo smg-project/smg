@@ -43,7 +43,6 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -58,6 +57,7 @@ from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
+from smg_grpc_servicer.sglang.loads import convert_loads_to_protobuf
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
 from smg_grpc_servicer.sglang.utils import abort_code_from_output, to_token_id_array
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
@@ -95,81 +95,6 @@ def _filtered_sampling_defaults(params: dict | None) -> dict:
         for key in SAMPLING_DEFAULT_KEYS
         if key in params and params[key] is not None
     }
-
-
-def _convert_loads_to_protobuf(
-    result: LoadSnapshot,
-) -> sglang_scheduler_pb2.SchedulerLoad:
-    """Convert a LoadSnapshot to a protobuf SchedulerLoad message."""
-    scheduler_load = sglang_scheduler_pb2.SchedulerLoad(
-        dp_rank=result.dp_rank,
-        num_running_reqs=result.num_running_reqs,
-        num_waiting_reqs=result.num_waiting_reqs,
-        num_total_reqs=result.num_running_reqs + result.num_waiting_reqs,
-        num_used_tokens=result.num_used_tokens,
-        max_total_num_tokens=result.max_total_num_tokens,
-        token_usage=result.token_usage,
-        gen_throughput=result.gen_throughput,
-        cache_hit_rate=result.cache_hit_rate,
-        utilization=result.utilization,
-        max_running_requests=result.max_running_requests,
-        # Queued token-work: waiting-queue tokens not served from cache.
-        num_waiting_uncached_tokens=result.num_waiting_uncached_tokens,
-    )
-
-    # Add optional sections using CopyFrom for proper protobuf assignment
-    if result.memory:
-        scheduler_load.memory.CopyFrom(
-            sglang_scheduler_pb2.MemoryMetrics(
-                weight_gb=result.memory.weight_gb,
-                kv_cache_gb=result.memory.kv_cache_gb,
-                graph_gb=result.memory.graph_gb,
-                token_capacity=result.memory.token_capacity,
-            )
-        )
-
-    if result.speculative:
-        scheduler_load.speculative.CopyFrom(
-            sglang_scheduler_pb2.SpeculativeMetrics(
-                accept_length=result.speculative.accept_length,
-                accept_rate=result.speculative.accept_rate,
-            )
-        )
-
-    if result.lora:
-        scheduler_load.lora.CopyFrom(
-            sglang_scheduler_pb2.LoRAMetrics(
-                slots_used=result.lora.slots_used,
-                slots_total=result.lora.slots_total,
-                utilization=result.lora.utilization,
-            )
-        )
-
-    if result.disaggregation:
-        scheduler_load.disaggregation.CopyFrom(
-            sglang_scheduler_pb2.DisaggregationMetrics(
-                mode=result.disaggregation.mode,
-                prefill_prealloc_queue_reqs=result.disaggregation.prefill_prealloc_queue_reqs,
-                prefill_inflight_queue_reqs=result.disaggregation.prefill_inflight_queue_reqs,
-                decode_prealloc_queue_reqs=result.disaggregation.decode_prealloc_queue_reqs,
-                decode_transfer_queue_reqs=result.disaggregation.decode_transfer_queue_reqs,
-                decode_retracted_queue_reqs=result.disaggregation.decode_retracted_queue_reqs,
-                kv_transfer_speed_gb_s=result.disaggregation.kv_transfer_speed_gb_s,
-                kv_transfer_latency_ms=result.disaggregation.kv_transfer_latency_ms,
-            )
-        )
-
-    if result.queues:
-        scheduler_load.queues.CopyFrom(
-            sglang_scheduler_pb2.QueueMetrics(
-                waiting=result.queues.waiting,
-                grammar=result.queues.grammar,
-                paused=result.queues.paused,
-                retracted=result.queues.retracted,
-            )
-        )
-
-    return scheduler_load
 
 
 def _compute_aggregate_protobuf(
@@ -630,7 +555,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             context.set_details(f"Failed to get load metrics: {e}")
             return sglang_scheduler_pb2.GetLoadsResponse()
 
-        loads = [_convert_loads_to_protobuf(r) for r in results]
+        loads = [convert_loads_to_protobuf(r) for r in results]
 
         return sglang_scheduler_pb2.GetLoadsResponse(
             timestamp=datetime.now(timezone.utc).isoformat(),

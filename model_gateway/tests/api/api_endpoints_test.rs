@@ -875,10 +875,9 @@ mod responses_endpoint_tests {
 
     #[tokio::test]
     async fn test_v1_responses_input_items() {
-        // This test uses OpenAI mode because the input_items endpoint
-        // is only implemented in OpenAIRouter and reads from storage (no workers needed)
+        // The input_items endpoint is storage-backed and needs no workers.
         let mut config = RouterConfig::builder()
-            .openai_mode(vec!["http://dummy.local".to_string()]) // Dummy URL (won't be called)
+            .regular_mode(vec![])
             .random_policy()
             .host("127.0.0.1")
             .port(3002)
@@ -999,6 +998,7 @@ mod responses_endpoint_tests {
         ctx.shutdown().await;
     }
 
+    #[cfg(feature = "provider-openai")]
     async fn create_openai_ctx(port: u16) -> AppTestContext {
         use smg::config::RouterConfig;
         let mut config = RouterConfig::builder()
@@ -1029,6 +1029,7 @@ mod responses_endpoint_tests {
         .await
     }
 
+    #[cfg(feature = "provider-openai")]
     async fn create_response(
         app: &axum::Router,
         payload: serde_json::Value,
@@ -1048,6 +1049,7 @@ mod responses_endpoint_tests {
         (status, json)
     }
 
+    #[cfg(feature = "provider-openai")]
     #[tokio::test]
     async fn test_v1_responses_store_false_retrieve_404() {
         let ctx = create_openai_ctx(18970).await;
@@ -1077,6 +1079,7 @@ mod responses_endpoint_tests {
         ctx.shutdown().await;
     }
 
+    #[cfg(feature = "provider-openai")]
     #[tokio::test]
     async fn test_v1_responses_store_true_retrieve_200() {
         let ctx = create_openai_ctx(18971).await;
@@ -1112,6 +1115,7 @@ mod responses_endpoint_tests {
         ctx.shutdown().await;
     }
 
+    #[cfg(feature = "provider-openai")]
     #[tokio::test]
     async fn test_v1_responses_store_omitted_retrieve_200() {
         let ctx = create_openai_ctx(18973).await;
@@ -1146,6 +1150,7 @@ mod responses_endpoint_tests {
         ctx.shutdown().await;
     }
 
+    #[cfg(feature = "provider-openai")]
     #[tokio::test]
     async fn test_v1_responses_store_false_as_previous_response_id() {
         let ctx = create_openai_ctx(18972).await;
@@ -1414,6 +1419,20 @@ mod cache_tests {
         ctx.shutdown().await;
     }
 
+    async fn loads_body(ctx: &AppTestContext, uri: &str) -> serde_json::Value {
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let resp = ctx.create_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
     #[tokio::test]
     async fn test_get_loads() {
         let ctx = AppTestContext::new(vec![
@@ -1434,25 +1453,57 @@ mod cache_tests {
         ])
         .await;
 
-        let app = ctx.create_app();
+        // Both mocks serve `/v1/loads`, and the monitor polls each group as
+        // it is created. Wait for that first tick so the assertions run
+        // against a populated snapshot rather than an empty one.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        loop {
+            let body = loads_body(&ctx, "/loads").await;
+            if body["loads"].as_array().is_some_and(|l| l.len() == 2) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for both workers to report load: {body}"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
 
-        let req = Request::builder()
-            .method("GET")
-            .uri("/get_loads")
-            .body(Body::empty())
-            .unwrap();
+        // `/get_loads` is a deprecated alias and must answer identically.
+        for uri in ["/loads", "/get_loads"] {
+            let body_json = loads_body(&ctx, uri).await;
 
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+            let loads = body_json["loads"].as_array().expect("loads array");
+            assert_eq!(body_json["dp_rank_count"], loads.len(), "{uri}");
+            assert!(body_json["version"].as_str().is_some_and(|v| !v.is_empty()));
+            assert!(body_json["timestamp"]
+                .as_str()
+                .is_some_and(|t| !t.is_empty()));
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            // Every rank names the worker it came from — the two fields a
+            // fleet view adds to the engine schema.
+            let mut reporters: Vec<&str> = loads
+                .iter()
+                .map(|entry| entry["worker"].as_str().expect("worker"))
+                .collect();
+            reporters.sort_unstable();
+            assert_eq!(
+                reporters,
+                vec!["http://127.0.0.1:18502", "http://127.0.0.1:18503"],
+                "{uri}"
+            );
+            for entry in loads {
+                assert_eq!(entry["worker_type"], "regular", "{uri}");
+                assert_eq!(entry["num_running_reqs"], 2, "{uri}");
+                assert_eq!(entry["num_used_tokens"], 1024, "{uri}");
+            }
 
-        assert!(body_json.is_object());
-        // The exact structure depends on the implementation
-        // but should contain worker load information
+            // The aggregate rolls up the fleet, not one engine.
+            assert_eq!(body_json["aggregate"]["total_running_reqs"], 4, "{uri}");
+            assert_eq!(body_json["aggregate"]["total_waiting_reqs"], 2, "{uri}");
+            assert_eq!(body_json["aggregate"]["total_reqs"], 6, "{uri}");
+            assert_eq!(body_json["aggregate"]["avg_token_usage"], 0.125, "{uri}");
+        }
 
         ctx.shutdown().await;
     }

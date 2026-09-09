@@ -11,15 +11,12 @@ use std::{
 };
 
 use axum::response::{IntoResponse, Response};
-use dashmap::DashSet;
-use futures::{
-    future,
-    stream::{self, FuturesUnordered, StreamExt},
-};
+use chrono::Utc;
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use http::StatusCode;
 use openai_protocol::worker::{
-    FlushCacheResult, HealthCheckConfig, ProfileOptions, ProfileResult, WorkerLoadInfo,
-    WorkerLoadsResult, WorkerStatus,
+    EngineAggregateMetricsSnapshot, FlushCacheResult, HealthCheckConfig, ProfileOptions,
+    ProfileResult, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus,
 };
 use tokio::{
     sync::{broadcast, mpsc, Notify},
@@ -31,11 +28,11 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     worker::{
         event::{WorkerConnected, WorkerEvent},
+        load_state::LoadSnapshot,
         metrics_aggregator::{self, MetricPack},
-        monitor::WorkerMonitor,
         registry::{WorkerDescriptor, WorkerId},
         worker::WorkerTypeExt,
-        ConnectionMode, Worker, WorkerOrigin, WorkerRegistry, WorkerResult, WorkerType,
+        ConnectionMode, Worker, WorkerOrigin, WorkerRegistry, WorkerResult,
     },
     workflow::{Job, JobQueue},
 };
@@ -112,9 +109,9 @@ impl IntoResponse for EngineMetricsResult {
 /// events to keep its internal schedule in sync with registrations,
 /// removals, and replacements.
 ///
-/// The static fan-out helpers (`get_worker_urls`, `flush_cache_all`,
-/// `get_all_worker_loads`, `get_engine_metrics`) are operational commands
-/// that don't depend on lifecycle state and remain associated functions.
+/// The static helpers (`get_worker_urls`, `flush_cache_all`,
+/// `get_engine_metrics`, `fleet_loads`) are operational commands that
+/// don't depend on lifecycle state and remain associated functions.
 pub struct WorkerManager {
     handle: Option<JoinHandle<()>>,
     shutdown_notify: Arc<Notify>,
@@ -347,7 +344,10 @@ async fn run_health_loop(
                 if matches!(
                     apply_probe_completion(&registry, completion, job_queue.as_ref()).await,
                     ProbeApplyResult::Applied(Some((_, WorkerStatus::Failed)))
-                ) {
+                ) && config.remove_unhealthy
+                {
+                    // Removal is in flight; stop probing. Without removal the
+                    // worker stays scheduled so a restart rejoins.
                     next_check.remove(&worker_id);
                 }
             }
@@ -462,15 +462,16 @@ fn queue_due_probes(
 
         let launched_status = worker.status();
         let expected_revision = worker.revision();
-        if launched_status == WorkerStatus::Failed {
+        if launched_status == WorkerStatus::Failed && config.remove_unhealthy {
+            // Removal takes it from here. A Failed worker that is not being
+            // removed keeps its probe slot below, so an engine that comes back
+            // on the same address is noticed and promoted.
             next_check.remove(&worker_id);
-            if config.remove_unhealthy {
-                removals.push(RemovalCandidate {
-                    worker_id: worker_id.clone(),
-                    url: worker.base_url().to_string(),
-                    expected_revision,
-                });
-            }
+            removals.push(RemovalCandidate {
+                worker_id: worker_id.clone(),
+                url: worker.base_url().to_string(),
+                expected_revision,
+            });
             continue;
         }
         if launched_status == WorkerStatus::Draining {
@@ -612,8 +613,9 @@ fn apply_connect_signal(
     match registry.transition_status_if_revision(&worker_id, revision, WorkerStatus::Ready) {
         Some((old, new)) => {
             debug!(worker_url = %url, ?old, ?new, "Promoted worker on connect signal");
-            // A Failed worker was dropped from the schedule; a promoted one is
-            // serving traffic, so it must be probed again — otherwise a later
+            // A Failed worker may have been dropped from the schedule (removal
+            // enabled); a promoted one is serving traffic, so it must be probed
+            // again — otherwise a later
             // engine death would leave it Ready with a dead client forever.
             if let Some(worker) = registry.get(&worker_id) {
                 schedule_worker_at(
@@ -654,9 +656,11 @@ fn schedule_descriptor_at(
         next_check.remove(&descriptor.worker_id);
         return;
     }
-    if descriptor.status == WorkerStatus::Failed {
-        // Startup reconcile and lagged rebuild must be side-effect-free:
-        // do not reschedule already-failed workers for probing or removal.
+    if descriptor.status == WorkerStatus::Failed && config.remove_unhealthy {
+        // Startup reconcile and lagged rebuild must be side-effect-free, and
+        // scheduling a Failed worker under removal would queue its removal.
+        // Without removal the probe is the only effect, and it is how a
+        // restarted engine rejoins.
         next_check.remove(&descriptor.worker_id);
         return;
     }
@@ -705,7 +709,10 @@ fn schedule_worker_at(
 ///   - NotReady → Ready on `success_threshold` consecutive successes
 ///   - NotReady → Failed on `liveness_failure_threshold` (3 × failure_threshold)
 ///   - Ready → NotReady on `failure_threshold` consecutive failures
-///   - Failed: terminal (handled outside this function — no transitions)
+///   - Failed → Ready on `success_threshold` consecutive successes: the engine
+///     came back on the same address (a restart), and without
+///     `--remove-unhealthy-workers` this is the only way it rejoins
+///   - Failed stays Failed on failure; Draining never transitions here
 fn compute_next_status(
     worker: &Arc<dyn Worker>,
     probe_ok: bool,
@@ -726,7 +733,7 @@ fn compute_next_status(
 
         if matches!(
             current_status,
-            WorkerStatus::Pending | WorkerStatus::NotReady
+            WorkerStatus::Pending | WorkerStatus::NotReady | WorkerStatus::Failed
         ) && successes >= success_threshold
         {
             worker.consecutive_successes_reset();
@@ -770,9 +777,10 @@ fn compute_next_status(
                 }
             }
             WorkerStatus::Failed | WorkerStatus::Draining => {
-                // Terminal for the health-state machine. Failed is removed
-                // by `--remove-unhealthy-workers`; Draining is removed by
-                // the discovery drain timer once in-flight requests settle.
+                // Nowhere further down to go. Failed is removed by
+                // `--remove-unhealthy-workers` and otherwise stays probed so
+                // a restart is noticed; Draining is removed by the discovery
+                // drain timer once in-flight requests settle.
             }
         }
 
@@ -1065,60 +1073,47 @@ impl WorkerManager {
         }
     }
 
-    pub async fn get_all_worker_loads(
+    /// Build the fleet-wide load body from the monitor's published
+    /// snapshot: the same numbers the routing policies are acting on.
+    ///
+    /// No request reaches a worker. That is what makes the route safe to
+    /// stack — a gateway registered as a worker under another gateway
+    /// answers from its cache instead of fanning one upstream poll out
+    /// across its whole fleet.
+    ///
+    /// Workers the monitor has no load for are left out rather than reported
+    /// as idle, so a gateway that has not polled yet answers with an empty
+    /// `loads` array.
+    pub(crate) fn fleet_loads(
         worker_registry: &WorkerRegistry,
-        native_loads_absent: Option<&DashSet<String>>,
-    ) -> WorkerLoadsResult {
-        let workers = worker_registry.get_all();
-        let total_workers = workers.len();
+        snapshot: &LoadSnapshot,
+        model_id: Option<&str>,
+    ) -> WorkerLoadResponse {
+        let mut workers = worker_registry.get_all();
+        workers.sort_by(|a, b| a.url().cmp(b.url()));
 
-        let futures: Vec<_> = workers
-            .iter()
-            .map(|worker| {
-                let worker_type = match worker.worker_type() {
-                    WorkerType::Regular => None,
-                    WorkerType::Prefill => Some("prefill".to_string()),
-                    WorkerType::Decode => Some("decode".to_string()),
-                    WorkerType::Encode => Some("encode".to_string()),
-                };
-                let connection_mode = worker.connection_mode();
-                let worker = Arc::clone(worker);
+        let mut loads = Vec::new();
+        for worker in workers {
+            if model_id.is_some_and(|model| !worker.supports_model(model)) {
+                continue;
+            }
+            let Some(report) = snapshot.get(worker.url()) else {
+                continue;
+            };
+            let worker_type = worker.worker_type().to_string();
+            loads.extend(report.loads.iter().map(|rank| SchedulerLoadSnapshot {
+                worker: Some(worker.url().to_string()),
+                worker_type: Some(worker_type.clone()),
+                ..rank.clone()
+            }));
+        }
 
-                async move {
-                    let details = match connection_mode {
-                        ConnectionMode::Http => {
-                            WorkerMonitor::fetch_http_load(&worker, native_loads_absent).await
-                        }
-                        ConnectionMode::Grpc | ConnectionMode::Zmq => {
-                            WorkerMonitor::fetch_backend_load(&worker).await
-                        }
-                    };
-                    // `load` is the absolute used-token count. Report it only
-                    // when the backend actually provides absolute tokens
-                    let load = details
-                        .as_ref()
-                        .filter(|d| d.has_absolute_token_data())
-                        .map(|d| d.total_used_tokens() as isize)
-                        .unwrap_or(-1);
-                    WorkerLoadInfo {
-                        worker: worker.url().to_string(),
-                        worker_type,
-                        load,
-                        details,
-                    }
-                }
-            })
-            .collect();
-
-        let loads = future::join_all(futures).await;
-        let successful = loads.iter().filter(|l| l.load >= 0).count();
-        let failed = loads.iter().filter(|l| l.load < 0).count();
-
-        WorkerLoadsResult {
+        WorkerLoadResponse {
+            timestamp: Utc::now().to_rfc3339(),
+            version: format!("smg-{}", env!("CARGO_PKG_VERSION")),
+            dp_rank_count: loads.len() as i32,
+            aggregate: EngineAggregateMetricsSnapshot::from_ranks(&loads),
             loads,
-            total_workers,
-            successful,
-            failed,
         }
     }
 
@@ -1175,7 +1170,10 @@ mod tests {
         },
     };
 
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, WorkerStatus},
+    };
 
     use super::*;
     use crate::worker::{
@@ -1657,17 +1655,22 @@ mod tests {
     }
 
     #[test]
-    fn test_state_machine_failed_is_terminal() {
+    fn test_state_machine_failed_recovers_after_success_threshold() {
         let worker = make_worker("http://w:1", 2, 3);
         worker.set_status(WorkerStatus::Failed);
 
-        // Successful probes don't recover Failed.
-        assert_eq!(compute_next_status(&worker, true, &cfg(2, 3)), None);
-        assert_eq!(compute_next_status(&worker, true, &cfg(2, 3)), None);
+        // Failures keep it Failed.
+        assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
         assert_eq!(worker.status(), WorkerStatus::Failed);
 
-        // Failed probes don't transition Failed anywhere either.
-        assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
+        // The engine came back on the same address: success_threshold
+        // consecutive successes promote it exactly like NotReady, because a
+        // static fleet has no other way to rejoin.
+        assert_eq!(compute_next_status(&worker, true, &cfg(2, 3)), None);
+        assert_eq!(
+            compute_next_status(&worker, true, &cfg(2, 3)),
+            Some(WorkerStatus::Ready)
+        );
     }
 
     #[test]
@@ -1766,6 +1769,29 @@ mod tests {
         assert!(
             !next_check.contains_key(&failed_id),
             "bootstrap reconcile must not reschedule failed workers"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_from_registry_keeps_failed_workers_probed_without_removal() {
+        // Without --remove-unhealthy-workers a Failed worker is kept on the
+        // schedule: the probe is how a restart on the same address rejoins.
+        let registry = Arc::new(WorkerRegistry::new());
+        let failed_worker = make_worker("http://failed:1", 2, 3);
+        failed_worker.set_status(WorkerStatus::Failed);
+        let failed_id = registry.register(failed_worker).unwrap();
+        let mut next_check = HashMap::new();
+        reconcile_from_registry(
+            &registry,
+            &mut next_check,
+            &WorkerManagerConfig {
+                default_check_interval_secs: 5,
+                remove_unhealthy: false,
+            },
+        );
+        assert!(
+            next_check.contains_key(&failed_id),
+            "a failed worker that is not being removed must keep being probed"
         );
     }
 
@@ -1950,6 +1976,141 @@ mod tests {
         let result = WorkerManager::stop_profile_all(&registry, Some(url_a.as_str())).await;
         assert_eq!(result.total_workers, 1);
         assert_eq!(result.successful, vec![url_a]);
+    }
+
+    fn load_report(ranks: &[(i32, i32, i32, f64)]) -> WorkerLoadResponse {
+        let loads: Vec<SchedulerLoadSnapshot> = ranks
+            .iter()
+            .map(
+                |&(dp_rank, num_running_reqs, num_waiting_reqs, token_usage)| {
+                    SchedulerLoadSnapshot {
+                        dp_rank,
+                        num_running_reqs,
+                        num_waiting_reqs,
+                        token_usage,
+                        ..Default::default()
+                    }
+                },
+            )
+            .collect();
+        WorkerLoadResponse {
+            timestamp: "2026-09-03T00:00:00Z".to_string(),
+            version: "engine-test".to_string(),
+            dp_rank_count: loads.len() as i32,
+            aggregate: None,
+            loads,
+        }
+    }
+
+    fn make_model_worker(url: &str, model: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .models(vec![ModelCard::new(model)])
+                .build(),
+        )
+    }
+
+    #[test]
+    fn fleet_loads_tags_ranks_and_aggregates() {
+        let registry = WorkerRegistry::new();
+        // Registered out of order to prove the response sorts by URL.
+        registry.register(make_worker("http://w:2", 1, 1)).unwrap();
+        registry.register(make_worker("http://w:1", 1, 1)).unwrap();
+
+        let snapshot = LoadSnapshot::from_loads_for_test(vec![
+            (
+                "http://w:1".to_string(),
+                load_report(&[(0, 4, 1, 0.25), (1, 6, 3, 0.75)]),
+            ),
+            ("http://w:2".to_string(), load_report(&[(0, 2, 0, 0.5)])),
+        ]);
+
+        let body = WorkerManager::fleet_loads(&registry, &snapshot, None);
+
+        assert_eq!(body.dp_rank_count, 3);
+        assert_eq!(body.loads.len(), 3);
+        assert!(body.version.starts_with("smg-"));
+        assert!(!body.timestamp.is_empty());
+
+        let tagged: Vec<(&str, &str, i32)> = body
+            .loads
+            .iter()
+            .map(|rank| {
+                (
+                    rank.worker.as_deref().expect("worker url"),
+                    rank.worker_type.as_deref().expect("worker type"),
+                    rank.dp_rank,
+                )
+            })
+            .collect();
+        assert_eq!(
+            tagged,
+            vec![
+                ("http://w:1", "regular", 0),
+                ("http://w:1", "regular", 1),
+                ("http://w:2", "regular", 0),
+            ]
+        );
+
+        let aggregate = body.aggregate.expect("aggregate");
+        assert_eq!(aggregate.total_running_reqs, 12);
+        assert_eq!(aggregate.total_waiting_reqs, 4);
+        assert_eq!(aggregate.total_reqs, 16);
+        assert_eq!(aggregate.avg_token_usage, 0.5);
+    }
+
+    #[test]
+    fn fleet_loads_filters_by_model() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(make_model_worker("http://a:1", "gpt-4o"))
+            .unwrap();
+        registry
+            .register(make_model_worker("http://b:1", "o3"))
+            .unwrap();
+
+        let snapshot = LoadSnapshot::from_loads_for_test(vec![
+            ("http://a:1".to_string(), load_report(&[(0, 5, 0, 0.5)])),
+            ("http://b:1".to_string(), load_report(&[(0, 9, 0, 0.9)])),
+        ]);
+
+        let body = WorkerManager::fleet_loads(&registry, &snapshot, Some("gpt-4o"));
+
+        assert_eq!(body.dp_rank_count, 1);
+        assert_eq!(body.loads[0].worker.as_deref(), Some("http://a:1"));
+        assert_eq!(body.aggregate.expect("aggregate").total_running_reqs, 5);
+    }
+
+    #[test]
+    fn fleet_loads_omits_workers_without_a_report() {
+        let registry = WorkerRegistry::new();
+        registry.register(make_worker("http://w:1", 1, 1)).unwrap();
+        registry.register(make_worker("http://w:2", 1, 1)).unwrap();
+
+        // Only one worker has been polled: the other must be absent rather
+        // than reported as idle.
+        let snapshot = LoadSnapshot::from_loads_for_test(vec![(
+            "http://w:2".to_string(),
+            load_report(&[(0, 7, 2, 0.4)]),
+        )]);
+
+        let body = WorkerManager::fleet_loads(&registry, &snapshot, None);
+
+        assert_eq!(body.dp_rank_count, 1);
+        assert_eq!(body.loads[0].worker.as_deref(), Some("http://w:2"));
+    }
+
+    #[test]
+    fn fleet_loads_with_no_polled_workers_has_no_aggregate() {
+        let registry = WorkerRegistry::new();
+        registry.register(make_worker("http://w:1", 1, 1)).unwrap();
+
+        let body = WorkerManager::fleet_loads(&registry, &LoadSnapshot::default(), None);
+
+        assert_eq!(body.dp_rank_count, 0);
+        assert!(body.loads.is_empty());
+        assert!(body.aggregate.is_none());
     }
 
     #[tokio::test]

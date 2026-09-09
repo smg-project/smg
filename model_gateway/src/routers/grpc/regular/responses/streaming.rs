@@ -58,6 +58,7 @@ use crate::{
             common::responses::{
                 build_sse_response, persist_response_if_needed,
                 streaming::{attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter},
+                utils::resolve_function_identity,
                 ResponsesContext,
             },
             utils,
@@ -325,6 +326,7 @@ impl StreamingResponseAccumulator {
                             id: None,
                             call_id: String::new(),
                             name: String::new(),
+                            namespace: None,
                             arguments: String::new(),
                             output: None,
                             status: "in_progress".to_string(),
@@ -399,7 +401,16 @@ impl StreamingResponseAccumulator {
         }
 
         // Add tool calls
-        output.extend(self.tool_calls);
+        output.extend(self.tool_calls.into_iter().map(|mut item| {
+            if let ResponseOutputItem::FunctionToolCall {
+                name, namespace, ..
+            } = &mut item
+            {
+                (*name, *namespace) =
+                    resolve_function_identity(self.original_request.tools.as_deref(), name);
+            }
+            item
+        }));
 
         // Determine final status
         let status = match self.finish_reason.as_deref() {
@@ -520,7 +531,7 @@ async fn execute_tool_loop_streaming_internal(
     mcp_servers: Vec<McpServerBinding>,
     tx: SseSender,
 ) -> Result<(), String> {
-    let mut state = ToolLoopState::new(original_request.input.clone());
+    let mut state = ToolLoopState::new(original_request);
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     // Generate response ID first so we can use it for both emitter and session
@@ -1104,6 +1115,7 @@ impl ChatResponseAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routers::grpc::common::responses::utils::namespace_test_request;
 
     #[test]
     fn streaming_accumulator_serializes_responses_api_usage() {
@@ -1155,5 +1167,24 @@ mod tests {
             }
             other => panic!("expected function tool call, got {other:?}"),
         }
+    }
+    #[test]
+    fn namespace_streaming_accumulator_resolves_fragmented_name() {
+        let request: ResponsesRequest = namespace_test_request();
+        let mut accumulator = StreamingResponseAccumulator::new(&request);
+        accumulator.process_chunk(
+            &ChatCompletionStreamResponse::builder("chat_test", "test-model")
+                .add_choice_tool_name(0, "call_test", "weather.")
+                .build(),
+        );
+        let chunk = serde_json::from_value(serde_json::json!({
+            "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+            "choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}]
+        })).unwrap();
+        accumulator.process_chunk(&chunk);
+        let wire = serde_json::to_value(accumulator.finalize()).unwrap();
+        assert_eq!(wire["output"][0]["name"], "lookup");
+        assert_eq!(wire["output"][0]["namespace"], "weather");
+        assert_eq!(wire["output"][0]["arguments"], "{}");
     }
 }

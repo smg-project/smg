@@ -263,6 +263,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn pd_admission_wait_secs(mut self, secs: u64) -> Self {
+        self.config.pd_admission_wait_secs = secs;
+        self
+    }
+
     pub fn disable_load_monitoring(mut self, disabled: bool) -> Self {
         self.config.disable_load_monitoring = disabled;
         self
