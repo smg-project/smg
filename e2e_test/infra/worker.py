@@ -57,6 +57,8 @@ class Worker:
     dist_init_port: int | None = None
     log_dir: str | None = None
     extra_engine_args: list[str] | None = None
+    # Overrides the model spec's tp, so a PD pair can run asymmetric legs.
+    tp: int | None = None
     process: subprocess.Popen | None = field(default=None, repr=False)
     _log_file: IO[Any] | None = field(default=None, repr=False)
     # Used memory per GPU just before launch; ``stop`` waits for it to come back.
@@ -248,7 +250,7 @@ class Worker:
         """Build engine-specific launch command using model specs."""
         spec = get_model_spec(self.model_id)
         model_path = spec["model"]
-        tp_size = spec.get("tp", 1)
+        tp_size = self.tp or spec.get("tp", 1)
         features = spec.get("features", [])
 
         if self.engine == "sglang":
@@ -654,6 +656,7 @@ def start_workers(
     wait_ready: bool = True,
     gpus: int | None = None,
     extra_engine_args: list[str] | None = None,
+    tp: int | None = None,
 ) -> list[Worker]:
     """Start N workers for a model. GPU IDs assigned sequentially.
 
@@ -671,6 +674,8 @@ def start_workers(
             If False, spawn processes and return immediately.
         gpus: GPUs per worker; defaults to the model spec's tp (e.g. DP needs dp*tp).
         extra_engine_args: Extra CLI args appended to the engine launch command.
+        tp: Tensor-parallel size for these workers; defaults to the model
+            spec's tp. Also sizes the GPU slice unless ``gpus`` says otherwise.
 
     Returns:
         List of started Worker instances.
@@ -682,7 +687,7 @@ def start_workers(
         engine = get_runtime()
 
     spec = get_model_spec(model_id)
-    gpus_per_worker = gpus or spec.get("tp", 1)
+    gpus_per_worker = gpus or tp or spec.get("tp", 1)
     if gpus is None and mode == ConnectionMode.ZMQ:
         # A grouped ZMQ worker launches get_zmq_engine_count() engines, each
         # tp-wide, in one process — size its GPU slice accordingly. vLLM and
@@ -733,6 +738,7 @@ def start_workers(
                 dist_init_port=dist_init_port,
                 log_dir=log_dir,
                 extra_engine_args=extra_engine_args,
+                tp=tp,
             )
 
             # Stagger launches to avoid resource contention

@@ -1060,7 +1060,7 @@ jobs:
       test_dirs: e2e_test/router/test_pd_topologies.py
       test_filter: "" # PD-only iteration mode: the whole sweep (98 cases per engine)
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
-      min_selected: 93 # floor ≈ 95% of the 98 collected cases
+      min_selected: 116 # floor ≈ 95% of the 122 collected cases
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 

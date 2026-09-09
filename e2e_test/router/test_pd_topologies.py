@@ -76,19 +76,31 @@ _GATEWAY_ARGS = [
     "2",
     *_HEALTH_ARGS,
 ]
-_TOPOLOGIES = [
-    pytest.param(("pd_grpc", (p, d)), id=f"{p}p{d}d")
-    for p, d in [(1, 1), (1, 2), (2, 1), (1, 3), (3, 1), (2, 2)]
-] + [
-    # The HTTP PD router is its own code path (pairing, KV handoff, error
-    # answers); SGLang is the only engine that serves it.
-    pytest.param(
-        ("pd_http", (p, d)),
-        id=f"{p}p{d}d-http",
-        marks=pytest.mark.skip_for_runtime("vllm", "tokenspeed", reason="HTTP PD is SGLang-only"),
-    )
-    for p, d in [(1, 1), (2, 2)]
-]
+_TOPOLOGIES = (
+    [
+        pytest.param(("pd_grpc", (p, d)), id=f"{p}p{d}d")
+        for p, d in [(1, 1), (1, 2), (2, 1), (1, 3), (3, 1), (2, 2)]
+    ]
+    + [
+        # Asymmetric tensor parallelism: the KV layout changes across the
+        # handoff. A prefill wider than its decodes and the reverse both fit
+        # four GPUs.
+        pytest.param(("pd_grpc", (p, d, ptp, dtp)), id=f"{p}p{d}d-ptp{ptp}-dtp{dtp}")
+        for p, d, ptp, dtp in [(1, 2, 2, 1), (2, 1, 1, 2)]
+    ]
+    + [
+        # The HTTP PD router is its own code path (pairing, KV handoff, error
+        # answers); SGLang is the only engine that serves it.
+        pytest.param(
+            ("pd_http", (p, d)),
+            id=f"{p}p{d}d-http",
+            marks=pytest.mark.skip_for_runtime(
+                "vllm", "tokenspeed", reason="HTTP PD is SGLang-only"
+            ),
+        )
+        for p, d in [(1, 1), (2, 2)]
+    ]
+)
 # A decode window a modest burst overruns. The gateway's admission gate, bounded
 # by the window the engine reports, is what keeps the excess out of the engine,
 # where the prefill's bootstrap deadline would expire on merely queued requests.

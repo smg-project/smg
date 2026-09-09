@@ -57,6 +57,9 @@ _WORKER_DEFAULTS = {
     "count": 1,
     "prefill": None,
     "decode": None,
+    # PD only: per-leg tensor parallelism (None = the model spec's tp).
+    "prefill_tp": None,
+    "decode_tp": None,
     "gpus": None,
     "extra_engine_args": None,
     # PD only: spawn every prefill/decode worker first and wait afterwards.
@@ -202,6 +205,8 @@ def setup_backend(request: pytest.FixtureRequest):
       - ``@pytest.mark.workers(gpus=2, extra_engine_args=[...])``: Per-worker
         GPU count and extra engine CLI args (local workers only)
       - ``@pytest.mark.workers(prefill=1, decode=1)``: PD worker counts
+      - ``("pd_grpc", (n_prefill, n_decode[, prefill_tp, decode_tp]))`` as
+        the param: PD counts, optionally with asymmetric per-leg tp
       - ``@pytest.mark.gateway(policy=..., timeout=..., extra_args=...)``: Gateway config
 
     Returns:
@@ -244,9 +249,18 @@ def setup_backend(request: pytest.FixtureRequest):
     if is_pd and leg_counts is not None:
         # ``("pd_grpc", (n_prefill, n_decode))`` lets one class sweep PD
         # topologies; setup_backend is class-scoped, so counts ride in the param.
-        if len(leg_counts) != 2:
-            raise ValueError("pd_* backend params take (n_prefill, n_decode) counts")
+        if len(leg_counts) not in (2, 4):
+            raise ValueError(
+                "pd_* backend params take (n_prefill, n_decode) or "
+                "(n_prefill, n_decode, prefill_tp, decode_tp)"
+            )
         workers_config = {**workers_config, "prefill": leg_counts[0], "decode": leg_counts[1]}
+        if len(leg_counts) == 4:
+            workers_config = {
+                **workers_config,
+                "prefill_tp": leg_counts[2],
+                "decode_tp": leg_counts[3],
+            }
     log_dir = os.environ.get("E2E_LOG_DIR") or gateway_config.get("log_dir")
 
     fail_count = _worker_start_failures.get(engine, 0)
@@ -382,15 +396,19 @@ def _setup_pd(
     spec = get_model_spec(model_id)
     num_prefill = workers_config.get("prefill") or 1
     num_decode = workers_config.get("decode") or 1
+    prefill_tp = workers_config.get("prefill_tp")
+    decode_tp = workers_config.get("decode_tp")
     backend_name = f"pd_{connection_mode.value}"
     runtime_label = RUNTIME_LABELS.get(engine, engine)
 
     logger.info(
-        "Starting %s PD backend: model=%s, %d prefill + %d decode",
+        "Starting %s PD backend: model=%s, %d prefill (tp=%s) + %d decode (tp=%s)",
         runtime_label,
         model_id,
         num_prefill,
+        prefill_tp or spec.get("tp", 1),
         num_decode,
+        decode_tp or spec.get("tp", 1),
     )
 
     parallel_start = bool(workers_config.get("parallel_start"))
@@ -404,11 +422,12 @@ def _setup_pd(
             worker_type=WorkerType.PREFILL,
             log_dir=log_dir,
             wait_ready=not parallel_start,
+            tp=prefill_tp,
         )
         all_workers.extend(prefill_workers)
 
         # Decode workers start on GPUs after prefill workers
-        decode_gpu_offset = num_prefill * spec.get("tp", 1)
+        decode_gpu_offset = num_prefill * (prefill_tp or spec.get("tp", 1))
         decode_workers = _start_workers_tracked(
             model_id=model_id,
             engine=engine,
@@ -418,6 +437,7 @@ def _setup_pd(
             log_dir=log_dir,
             gpu_offset=decode_gpu_offset,
             wait_ready=not parallel_start,
+            tp=decode_tp,
         )
         all_workers.extend(decode_workers)
         if parallel_start:
