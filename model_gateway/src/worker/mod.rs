@@ -29,7 +29,7 @@ pub mod service;
 pub mod worker;
 
 // Re-export commonly used types for convenience
-pub use builder::BasicWorkerBuilder;
+pub use builder::{next_worker_instance_id, BasicWorkerBuilder};
 pub use capacity::{CapacitySource, CapacityTrackerSettings, WorkerCapacity};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 pub use error::{WorkerError, WorkerResult};

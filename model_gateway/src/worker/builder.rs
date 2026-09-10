@@ -62,6 +62,13 @@ pub struct BasicWorkerBuilder {
 /// The next [`Worker::instance_id`]: one per constructed worker, never reused.
 static NEXT_WORKER_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
+/// Mint a [`Worker::instance_id`]. Every `Worker` implementation in the
+/// process draws from this one sequence, so ids never collide across
+/// implementations either.
+pub fn next_worker_instance_id() -> u64 {
+    NEXT_WORKER_INSTANCE.fetch_add(1, Ordering::Relaxed)
+}
+
 impl BasicWorkerBuilder {
     /// Create a new builder with only the URL (uses default WorkerSpec)
     pub fn new(url: impl Into<String>) -> Self {
@@ -372,7 +379,7 @@ impl BasicWorkerBuilder {
         let resilience = self.resilience.unwrap_or_default();
 
         BasicWorker {
-            instance_id: NEXT_WORKER_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            instance_id: next_worker_instance_id(),
             kv_engine_id: ArcSwapOption::new(metadata.spec.kv_engine_id.clone().map(Arc::new)),
             kv_engine_id_unconfirmed: AtomicBool::new(false),
             runtime: ArcSwap::from_pointee(WorkerRuntime::new(&metadata.spec.url, initial_status)),

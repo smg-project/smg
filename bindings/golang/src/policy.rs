@@ -11,7 +11,7 @@ use std::{
     os::raw::c_char,
     ptr,
     sync::{
-        atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -30,6 +30,7 @@ use smg::{
     routers::grpc::{backend_client::BackendClient, utils::process_chat_messages},
     worker::{
         circuit_breaker::{CircuitBreaker, CircuitState},
+        next_worker_instance_id,
         resilience::ResolvedResilience,
         worker::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
         ConnectionMode, OverloadThresholds, PdPairing, Worker, WorkerResult, WorkerType,
@@ -50,9 +51,6 @@ use super::{
 
 /// FFI worker that implements the gateway's `Worker` trait so policies
 /// can select workers using their real selection logic (not a fallback).
-/// The next [`Worker::instance_id`] for a Go-side worker: one per constructed worker, never reused.
-static NEXT_WORKER_INSTANCE: AtomicU64 = AtomicU64::new(1);
-
 pub struct GrpcWorker {
     /// Minted at construction; see [`Worker::instance_id`].
     pub(crate) instance_id: u64,
@@ -84,7 +82,7 @@ impl GrpcWorker {
             http2: false,
         };
         Self {
-            instance_id: NEXT_WORKER_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            instance_id: next_worker_instance_id(),
             client,
             routing_key_load: WorkerRoutingKeyLoad::new(&endpoint),
             endpoint,
