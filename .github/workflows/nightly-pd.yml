@@ -36,11 +36,11 @@ jobs:
           ENGINES: ${{ inputs.engines }}
         run: |
           wanted="${ENGINES:-sglang vllm tokenspeed}"
-          # One row per engine; vLLM also runs over Mooncake next to its NIXL default.
+          # One row per engine; vLLM also runs over Mooncake next to its NIXL
+          # default. SGLang over NIXL waits on a NIXL install for its venv (#2498).
           matrix=$(printf '%s\n' $wanted | jq -Rsc '
             split("\n") | map(select(length > 0)) |
             map(if . == "vllm" then [{engine: "vllm"}, {engine: "vllm", kv_backend: "mooncake"}]
-                elif . == "sglang" then [{engine: "sglang"}, {engine: "sglang", kv_backend: "nixl"}]
                 else [{engine: .}] end) | add')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "matrix: $matrix"
@@ -122,12 +122,14 @@ jobs:
         id: resolve
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_ACTOR: ${{ github.actor }}
+          REPO_OWNER: ${{ github.repository_owner }}
         run: |
           tag="$(bash scripts/ci_tokenspeed_image_tag.sh 2>/dev/null || true)"
           image=""
           if [ -n "$tag" ]; then
-            candidate="ghcr.io/${{ github.repository_owner }}/smg:${tag}"
-            if docker login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "$GH_TOKEN" > /dev/null 2>&1 \
+            candidate="ghcr.io/${REPO_OWNER}/smg:${tag}"
+            if docker login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN" > /dev/null 2>&1 \
                && docker manifest inspect "$candidate" > /dev/null 2>&1; then
               image="$candidate"
             fi
@@ -147,8 +149,10 @@ jobs:
       engine: ${{ matrix.engine }}
       gpu_tier: "4"
       runner: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
-      # Six topologies, each with worker restarts; TokenSpeed also extracts
-      # its engine image and loads a slower model.
+      # The whole sweep: eight topologies on SGLang (six gRPC, two HTTP), six
+      # elsewhere, each with worker restarts; TokenSpeed also extracts its
+      # engine image and loads a slower model. Run 34433711319 took 58 min
+      # (sglang), 55 (vllm), 35 (vllm-mooncake) and 78 (tokenspeed) end to end.
       timeout: ${{ matrix.engine == 'tokenspeed' && 190 || 170 }}
       test_timeout: ${{ matrix.engine == 'tokenspeed' && 170 || 150 }}
       test_dirs: e2e_test/router/test_pd_topologies.py

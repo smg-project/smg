@@ -1,8 +1,10 @@
 """Prefill/decode disaggregation under every worker topology a 4-GPU node allows.
 
-One class sweeps the topologies 1p1d, 1p2d, 2p1d, 1p3d, 3p1d and 2p2d. The
-counts ride in the ``setup_backend`` param because the fixture is
-class-scoped, and every test runs once per topology. The gateway logs each
+One class sweeps the topologies 1p1d, 1p2d, 2p1d, 1p3d, 3p1d and 2p2d, two
+asymmetric-tp pairs (1p2d-ptp2-dtp1, 2p1d-ptp1-dtp2) and the HTTP PD router's
+1p1d and 2p2d. The counts, and the per-leg tp when the legs differ, ride in
+the ``setup_backend`` param because the fixture is class-scoped, and every
+test runs once per topology. The gateway logs each
 selected pair at debug level, so requests are attributed to workers from the
 router log instead of guessed.
 
@@ -44,9 +46,14 @@ from pathlib import Path
 import httpx
 import pytest
 from infra import ConnectionMode, Gateway, WorkerType, cleanup_pool, start_workers, stop_workers
-from infra.constants import get_runtime, is_sglang
+from infra.constants import DEFAULT_STARTUP_TIMEOUT, get_runtime, is_sglang
 from infra.model_specs import get_model_spec
-from infra.pd_logs import LOG_FLUSH_TIMEOUT_S, read_logs, worker_log_dir
+from infra.pd_logs import (
+    LOG_FLUSH_TIMEOUT_S,
+    assert_worker_logs_captured,
+    read_logs,
+    worker_log_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +65,11 @@ _PAIR_RE = re.compile(r"prefill=(\S+)\s+decode=(\S+)")
 
 _MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 _MODEL_BY_ENGINE = {"tokenspeed": "Qwen/Qwen3.5-9B"}
+# A restart reloads the model on the same GPUs: give it the budget the model
+# declares for its first load, not Worker.start()'s default.
+_RESTART_TIMEOUT = get_model_spec(_MODEL_BY_ENGINE.get(get_runtime(), _MODEL)).get(
+    "startup_timeout", DEFAULT_STARTUP_TIMEOUT
+)
 _HEALTH_ARGS = [
     "--health-check-interval-secs",
     "1",
@@ -90,9 +102,12 @@ _TOPOLOGIES = (
         for p, d, ptp, dtp in [(1, 2, 2, 1), (2, 1, 1, 2)]
     ]
     + [
-        # The HTTP PD router is its own code path (pairing, KV handoff, error
-        # answers). SGLang and vLLM both serve it; the TokenSpeed e2e worker
-        # has no HTTP frontend.
+        # The HTTP PD router is its own code path: pairing and error answers
+        # on both engines, the KV handoff on SGLang. A vLLM leg registered by
+        # URL carries no kv_connector, so the router passes the request
+        # through and decode recomputes the prompt; vLLM's handoff is covered
+        # by the gRPC rows, where the worker reports its connector. The
+        # TokenSpeed e2e worker has no HTTP frontend.
         pytest.param(
             ("pd_http", (p, d)),
             id=f"{p}p{d}d-http",
@@ -165,12 +180,22 @@ def _wait_for_pairs(minimum: int, timeout: float = LOG_FLUSH_TIMEOUT_S) -> list[
 
 
 def _vllm_transport_installed(*packages: str) -> bool:
-    """Whether every KV transport package is importable in the engine venv."""
+    """Whether every KV transport package is importable from this interpreter."""
     return all(importlib.util.find_spec(package) is not None for package in packages)
 
 
+def _vllm_transports_requested() -> set[str]:
+    """The vLLM transports the lane asked to have installed."""
+    names = [os.environ.get("E2E_VLLM_KV_BACKEND", ""), os.environ.get("E2E_KV_BACKEND", "")]
+    names += os.environ.get("E2E_VLLM_EXTRA_KV_BACKENDS", "").split(",")
+    return {name.strip().lower() for name in names if name.strip()}
+
+
+# Skip only where the lane never asked for both transports; where it did, a
+# missing one fails at worker startup instead of vanishing as a skip.
 _NEEDS_BOTH_VLLM_TRANSPORTS = pytest.mark.skipif(
-    not _vllm_transport_installed("nixl", "mooncake"),
+    not _vllm_transport_installed("nixl", "mooncake")
+    and not {"nixl", "mooncake"} <= _vllm_transports_requested(),
     reason="a fleet that mixes NIXL and Mooncake needs both transfer engines installed",
 )
 
@@ -290,6 +315,12 @@ def _fleet_idle(gateway: Gateway) -> tuple[bool, list[dict]]:
     resp = httpx.get(f"{gateway.base_url}/loads", timeout=5.0)
     assert resp.status_code == 200, resp.text
     loads = resp.json().get("loads", [])
+    # /loads omits workers the monitor has no report for; an unreported leg
+    # is not evidence of idleness.
+    reported = {e.get("worker") for e in loads}
+    expected = {w.base_url for w in gateway.prefill_workers + gateway.decode_workers}
+    if not expected <= reported:
+        return (False, loads)
     busy = [e for e in loads if e.get("num_running_reqs", 0) + e.get("num_waiting_reqs", 0) > 0]
     return (not busy, loads)
 
@@ -307,9 +338,11 @@ def _assert_fleet_idle_within(gateway: Gateway, timeout: float) -> None:
     while not idle and time.monotonic() < deadline:
         time.sleep(1.0)
         idle, loads = _fleet_idle(gateway)
-    # How long the engines keep working after the client is gone is the
-    # abort-propagation latency of the pair; log it so sweeps can compare.
-    logger.info("fleet idle after %.1fs (idle=%s)", time.monotonic() - started, idle)
+    # A floor on how long the engines kept working after the clients left:
+    # the clock starts once the callers joined their threads, and /loads is
+    # a 2 s-interval report, so only differences well above that mean much.
+    if idle:
+        logger.info("fleet idle within %.1fs of the clients leaving", time.monotonic() - started)
     assert idle, f"engines still hold work after {timeout:.0f}s: {loads}"
 
 
@@ -325,8 +358,11 @@ def _run_all(fns: list[Callable[[], None]], timeout: float) -> list[BaseExceptio
     threads = [threading.Thread(target=_wrap, args=(fn,), daemon=True) for fn in fns]
     for t in threads:
         t.start()
+    deadline = time.monotonic() + timeout
     for t in threads:
-        t.join(timeout=timeout)
+        t.join(timeout=max(0.0, deadline - time.monotonic()))
+        if t.is_alive():
+            errors.append(TimeoutError(f"a request was still running {timeout:.0f}s in"))
     return errors
 
 
@@ -543,13 +579,15 @@ class TestPDTopology:
     def test_batched_completion_serves_every_choice(self, setup_backend, request):
         """Every choice of an ``n>1`` request must come back through the PD pair.
 
-        Over gRPC the gateway fans the request out into one single-sample
-        pair per choice, each with its own bootstrap room (#2482).
+        On the room-based engines (SGLang, TokenSpeed) the gRPC router fans
+        the request out into one single-sample pair per choice, each with its
+        own bootstrap room (#2482); vLLM dispatches sequentially and skips the
+        handoff for ``n>1``, leaving decode to recompute the prompt.
         """
         mode, model, _, gateway = setup_backend
         if mode == "pd_http" and is_sglang():
-            # Same shape as the TokenSpeed gRPC case: the HTTP PD router mints
-            # one room for a single-prompt request whatever ``n`` is, the engine
+            # The shape the gRPC fan-out fixed: the HTTP PD router mints one
+            # room for a single-prompt request whatever ``n`` is, the engine
             # broadcasts it to every sample, and the decode's children wait on
             # a transfer that never comes until the decode aborts them. vLLM
             # over HTTP skips the handoff for n>1 and lets decode own the prompt.
@@ -597,8 +635,10 @@ class TestPDTopology:
         assert victim.base_url not in used, f"gateway kept routing to the dead {role} worker"
         assert used <= peers, f"unknown {role} workers in placement: {used - peers}"
 
-        victim.start()
-        _wait_for_status(gateway, victim.base_url, "healthy", timeout=300.0)
+        victim.start(timeout=_RESTART_TIMEOUT)
+        # start() blocked on the worker's own health; the gateway's monitor
+        # notices within a few of its 1 s intervals.
+        _wait_for_status(gateway, victim.base_url, "healthy", timeout=60.0)
         before = len(_pairs_logged())
         count = 4 * len(workers)
         for i in range(count):
@@ -637,22 +677,21 @@ class TestPDTopology:
             )
             assert elapsed < 20.0, f"request hung for {elapsed:.1f}s while the only {role} was down"
             # The model exists and its leg is merely down: a 503 the client can
-            # retry, never a 404 that says the model is gone (#2465). The gRPC
-            # router answers no_available_workers; the HTTP PD router answers
-            # server_selection_failed with the leg named in the message.
+            # retry, never a 404 that says the model is gone (#2465). Every
+            # router answers no_available_workers (#2479); the HTTP PD router
+            # may name the leg instead.
             assert resp.status_code == 503, (
                 f"unexpected outage answer: {resp.status_code} {resp.text[:200]}"
             )
             assert code in (
                 "no_available_workers",
-                "server_selection_failed",
                 f"no_{role}_servers",
                 f"{role}_unavailable",
             ), f"outage answer carried an unexpected code: {code!r} {resp.text[:200]}"
         finally:
             # Whatever the verdict, the class's later tests need the leg back.
-            victim.start()
-            _wait_for_status(gateway, victim.base_url, "healthy", timeout=300.0)
+            victim.start(timeout=_RESTART_TIMEOUT)
+            _wait_for_status(gateway, victim.base_url, "healthy", timeout=60.0)
         _wait_until_served(gateway, model, timeout=120.0)
 
 
@@ -782,6 +821,20 @@ class TestPDSmallWindow:
     def test_burst_beyond_decode_window_is_shed_not_stalled(self, setup_backend):
         _, model, _, gateway = setup_backend
         _wait_until_served(gateway, model, timeout=60.0)
+        # The window must have reached the engine, or the burst fits and the
+        # gate is never crossed. Engines that report their window on /loads
+        # (SGLang, TokenSpeed) are checked; vLLM reports none.
+        _, loads = _fleet_idle(gateway)
+        decode_urls = {w.base_url for w in gateway.decode_workers}
+        windows = {
+            e["worker"]: e["max_running_requests"]
+            for e in loads
+            if e.get("worker") in decode_urls and e.get("max_running_requests", 0) > 0
+        }
+        assert all(w == _WINDOW for w in windows.values()), f"decode window not applied: {windows}"
+        logger.info("decode windows reported: %s", windows or "none (engine reports no window)")
+        worker_dir = worker_log_dir(_LOG_DIR)
+        before = len(read_logs(worker_dir, "worker-*.log"))
         results: list[httpx.Response] = []
 
         def _one(i: int) -> None:
@@ -824,9 +877,12 @@ class TestPDSmallWindow:
                 assert resp.headers.get("retry-after"), "a shed must say when to retry"
         assert elapsed < 90.0, f"the burst took {elapsed:.0f}s; queued rooms are timing out"
 
-        logs = read_logs(worker_log_dir(_LOG_DIR), "worker-*.log")
+        # Only this burst's lines: earlier classes kill workers out from under
+        # their peers, and an empty capture must fail rather than pass.
+        logs = read_logs(worker_dir, "worker-*.log")
+        assert_worker_logs_captured(logs, "prefill bootstrap timeouts")
         for marker in _BOOTSTRAP_TIMEOUT_MARKERS:
-            assert marker not in logs, f"an engine leg timed out a bootstrap: {marker!r}"
+            assert marker not in logs[before:], f"an engine leg timed out a bootstrap: {marker!r}"
         _wait_until_served(gateway, model, timeout=60.0)
 
 
@@ -849,25 +905,27 @@ class TestPDAssembledAtRuntime:
         model_path = get_model_spec(model_id)["model"]
         cleanup_pool()  # the sweep above owns no cached workers, but be explicit about the GPUs
         log_dir = os.environ.get("E2E_LOG_DIR")
-        prefill = start_workers(
-            model_id,
-            engine,
-            mode=ConnectionMode.GRPC,
-            count=1,
-            worker_type=WorkerType.PREFILL,
-            log_dir=log_dir,
-        )
-        decode = start_workers(
-            model_id,
-            engine,
-            mode=ConnectionMode.GRPC,
-            count=1,
-            worker_type=WorkerType.DECODE,
-            log_dir=log_dir,
-            gpu_offset=1,
-        )
+        prefill: list = []
+        decode: list = []
         gateway = Gateway()
         try:
+            prefill = start_workers(
+                model_id,
+                engine,
+                mode=ConnectionMode.GRPC,
+                count=1,
+                worker_type=WorkerType.PREFILL,
+                log_dir=log_dir,
+            )
+            decode = start_workers(
+                model_id,
+                engine,
+                mode=ConnectionMode.GRPC,
+                count=1,
+                worker_type=WorkerType.DECODE,
+                log_dir=log_dir,
+                gpu_offset=1,
+            )
             gateway.start(
                 igw_mode=True, log_level="debug", log_dir=str(_LOG_DIR), extra_args=_HEALTH_ARGS
             )
@@ -891,6 +949,9 @@ class TestPDAssembledAtRuntime:
 
             ok, detail = gateway.remove_worker(decode[0].base_url)
             assert ok, f"removing the decode worker failed: {detail}"
+            # The removal is accepted (202) and drained in the background; the
+            # outage exists once the worker has left /workers.
+            _wait_for_removal(gateway, decode[0].base_url, timeout=60.0)
             started = time.monotonic()
             resp = _raw_chat(gateway, model_path, "Say hello.", timeout=60.0)
             elapsed = time.monotonic() - started
@@ -904,9 +965,6 @@ class TestPDAssembledAtRuntime:
                 f"with no decode worker the gateway answered {resp.status_code} after {elapsed:.1f}s"
             )
 
-            # Re-adding the same URL while the removal is still draining is
-            # refused as a duplicate, so wait for the worker to actually leave.
-            _wait_for_removal(gateway, decode[0].base_url, timeout=60.0)
             ok, detail = gateway.add_worker(decode[0].base_url, worker_type="decode")
             assert ok, f"re-registering the decode worker failed: {detail}"
             _wait_until_served(gateway, model_path, timeout=120.0)

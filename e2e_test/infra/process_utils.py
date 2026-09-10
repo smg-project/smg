@@ -205,8 +205,10 @@ def wait_for_gpu_memory_release(
     An engine's child processes release their CUDA contexts after the launcher
     exits; a replacement started on the same GPU before that reads the old
     allocation as its own shortfall and dies on its startup memory check.
-    Returns the GPUs still above the threshold at the deadline (empty on
-    success), or ``None`` when ``nvidia-smi`` is unavailable.
+    Returns the GPUs still above the threshold (empty on success), or ``None``
+    when ``nvidia-smi`` is unavailable. Gives up before ``timeout`` once that
+    set has held the same values for 5 s: a region another live process still
+    maps never drains, so a static figure is the answer, not a wait.
     """
     deadline = time.monotonic() + timeout
     last_over: dict[int, int] | None = None

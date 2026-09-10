@@ -216,11 +216,15 @@ class Worker:
         if self._gpu_mem_baseline is not None:
             # A region another process still maps (a decode holding a dead
             # prefill's KV) never frees, so the wait is a bounded courtesy.
+            waited = time.monotonic()
             held = wait_for_gpu_memory_release(self.gpu_ids, self._gpu_mem_baseline, timeout=30.0)
             if held:
+                # The wait gives up once the figure stops moving, usually well
+                # inside the 30 s cap; report what was actually waited.
                 logger.warning(
-                    "Worker %s: GPU memory still held 30s after stop: used %s MiB, baseline %s MiB",
+                    "Worker %s: GPU memory still held %.0fs after stop: used %s MiB, baseline %s MiB",
                     self.model_id,
+                    time.monotonic() - waited,
                     held,
                     self._gpu_mem_baseline,
                 )
@@ -328,12 +332,14 @@ class Worker:
         # PD disaggregation arguments
         if self.worker_type == WorkerType.PREFILL:
             cmd.extend(["--disaggregation-mode", "prefill"])
+            cmd.extend(["--disaggregation-transfer-backend", self.effective_kv_backend()])
             if self.bootstrap_port:
                 cmd.extend(["--disaggregation-bootstrap-port", str(self.bootstrap_port)])
             if self.ib_device:
                 cmd.extend(["--disaggregation-ib-device", self.ib_device])
         elif self.worker_type == WorkerType.DECODE:
             cmd.extend(["--disaggregation-mode", "decode"])
+            cmd.extend(["--disaggregation-transfer-backend", self.effective_kv_backend()])
             cmd.extend(["--base-gpu-id", "0"])
             if self.ib_device:
                 cmd.extend(["--disaggregation-ib-device", self.ib_device])

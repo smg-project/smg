@@ -1036,19 +1036,13 @@ jobs:
           - engine: tokenspeed
             timeout: 85
             test_timeout: 60
-          # The other KV transport of each engine (TokenSpeed only has
-          # Mooncake): the same slice on vLLM over Mooncake, and a 1p1d
-          # smoke of SGLang over NIXL. The full sweeps run in nightly-pd.
+          # vLLM's other KV transport: the same slice over Mooncake. TokenSpeed
+          # only has Mooncake; SGLang over NIXL waits on a NIXL install for its
+          # venv (#2498). The full sweeps run in nightly-pd.
           - engine: vllm
             kv_backend: mooncake
             timeout: 50
             test_timeout: 42
-          - engine: sglang
-            kv_backend: nixl
-            timeout: 60
-            test_timeout: 50
-            test_filter: -k "1p1d and not http"
-            min_selected: 11
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -1060,9 +1054,10 @@ jobs:
       # The 2p2d slice (which carries the mixed-transport fleet on vLLM), the
       # runtime-assembled fleet, the over-window burst, and the mismatched
       # fleet that placement must refuse; the full sweep runs in nightly-pd.
-      test_filter: ${{ matrix.test_filter || '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport"' }}
+      # Run 34440725835: 9-16 min of tests per row against the 42/60 budgets.
+      test_filter: -k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport"
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
-      min_selected: ${{ matrix.min_selected || 13 }} # floor ≈ 95% of the 14 cases the slice keeps on every engine
+      min_selected: 13 # floor ≈ 95% of the slice: 14 cases on sglang/tokenspeed, 16 on vllm (its two transport classes)
       kv_backend: ${{ matrix.kv_backend || '' }}
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
       # The mixed-transport fleet needs both vLLM backends installed whatever the lane's own

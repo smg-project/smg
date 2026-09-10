@@ -174,6 +174,7 @@ def _wait_for_serving(
     client = _make_openai_client(gateway).with_options(max_retries=0)
     deadline = time.monotonic() + timeout
     last_error: Exception | None = None
+    settled_once: str | None = None
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -187,16 +188,24 @@ def _wait_for_serving(
             )
             return
         except openai.APIStatusError as exc:
-            if _error_code_of(exc) in _SETTLED_VERDICTS:
-                logger.info(
-                    "Gateway at %s settled on %s for %s; not waiting for it to serve",
-                    gateway.base_url,
-                    _error_code_of(exc),
-                    model_path,
-                )
-                return
-            if exc.status_code not in _NOT_SERVING_YET:
-                raise
+            code = _error_code_of(exc)
+            if code in _SETTLED_VERDICTS:
+                # A fleet still registering shows one worker per leg and can
+                # refuse a pair it accepts moments later; only a verdict that
+                # survives a poll is the fleet's.
+                if code == settled_once:
+                    logger.info(
+                        "Gateway at %s settled on %s for %s; not waiting for it to serve",
+                        gateway.base_url,
+                        code,
+                        model_path,
+                    )
+                    return
+                settled_once = code
+            else:
+                settled_once = None
+                if exc.status_code not in _NOT_SERVING_YET:
+                    raise
             last_error = exc
         except (openai.APIConnectionError, openai.APITimeoutError) as exc:
             last_error = exc
@@ -283,6 +292,8 @@ def setup_backend(request: pytest.FixtureRequest):
                 "(n_prefill, n_decode, prefill_tp, decode_tp), optionally followed by "
                 "a dict of per-worker options"
             )
+        if any(not isinstance(n, int) or isinstance(n, bool) or n < 1 for n in leg_counts):
+            raise ValueError(f"pd_* leg counts and tp must be positive integers, got {leg_counts}")
         workers_config = {**workers_config, "prefill": leg_counts[0], "decode": leg_counts[1]}
         if len(leg_counts) == 4:
             workers_config = {
@@ -436,6 +447,7 @@ def _start_pd_leg(
     wait_ready: bool,
     tp,
     kv_backends: list[str] | None,
+    extra_engine_args: list[str] | None = None,
 ) -> list:
     """Start one PD leg; a per-worker KV backend list starts the workers one by one."""
     if kv_backends is None:
@@ -449,6 +461,7 @@ def _start_pd_leg(
             gpu_offset=gpu_offset,
             wait_ready=wait_ready,
             tp=tp,
+            extra_engine_args=extra_engine_args,
         )
     spec_tp = tp or get_model_spec(model_id).get("tp", 1)
     workers: list = []
@@ -465,6 +478,7 @@ def _start_pd_leg(
                 wait_ready=wait_ready,
                 tp=tp,
                 kv_backend=backend,
+                extra_engine_args=extra_engine_args,
             )
         )
     return workers
@@ -504,6 +518,9 @@ def _setup_pd(
     )
 
     parallel_start = bool(workers_config.get("parallel_start"))
+    # The class marker's engine flags (a decode window, a context length)
+    # reach every leg, as they do for regular workers.
+    extra_engine_args = workers_config.get("extra_engine_args")
     all_workers: list = []
     try:
         prefill_workers = _start_pd_leg(
@@ -517,6 +534,7 @@ def _setup_pd(
             wait_ready=not parallel_start,
             tp=prefill_tp,
             kv_backends=prefill_kv,
+            extra_engine_args=extra_engine_args,
         )
         all_workers.extend(prefill_workers)
 
@@ -533,6 +551,7 @@ def _setup_pd(
             wait_ready=not parallel_start,
             tp=decode_tp,
             kv_backends=decode_kv,
+            extra_engine_args=extra_engine_args,
         )
         all_workers.extend(decode_workers)
         if parallel_start:
@@ -540,9 +559,15 @@ def _setup_pd(
             # makes a topology cost one model load instead of one per worker.
             # It also brings the legs up in no particular order, which is what
             # a user launching a fleet does.
-            startup_timeout = spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
-            for worker in all_workers:
-                worker.wait_ready(startup_timeout)
+            # One deadline for the fleet, and a failed load still counts toward
+            # the session's fail-fast budget as it does on the sequential path.
+            deadline = time.monotonic() + spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+            try:
+                for worker in all_workers:
+                    worker.wait_ready(max(1, int(deadline - time.monotonic())))
+            except (TimeoutError, RuntimeError):
+                _worker_start_failures[engine] = _worker_start_failures.get(engine, 0) + 1
+                raise
 
         _start_gateway(
             gateway,
