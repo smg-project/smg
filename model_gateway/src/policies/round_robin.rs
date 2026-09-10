@@ -57,16 +57,14 @@ impl RoundRobinPolicy {
         }
     }
 
-    /// The identity of a candidate set: its healthy workers, in order, by
-    /// [`Worker::instance_id`] (an integer mix per worker, no string
-    /// hashing). The id is minted per constructed worker and never reused,
-    /// so a replacement under the same URL is a new set (its rotation starts
-    /// from the shared position) and a retired set's position is never
-    /// inherited.
+    /// The identity of a candidate set: its healthy workers' URLs, in
+    /// order. A worker that re-registers under the same URL resumes its
+    /// sets' rotations, which is harmless; the hashing is a short string
+    /// per healthy candidate, on every selection.
     fn set_key(workers: &[Arc<dyn Worker>], healthy: &[usize]) -> u64 {
         let mut hasher = DefaultHasher::new();
         for &i in healthy {
-            workers[i].instance_id().hash(&mut hasher);
+            workers[i].url().hash(&mut hasher);
         }
         hasher.finish()
     }

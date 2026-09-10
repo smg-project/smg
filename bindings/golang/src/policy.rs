@@ -30,7 +30,6 @@ use smg::{
     routers::grpc::{backend_client::BackendClient, utils::process_chat_messages},
     worker::{
         circuit_breaker::{CircuitBreaker, CircuitState},
-        next_worker_instance_id,
         resilience::ResolvedResilience,
         worker::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
         ConnectionMode, OverloadThresholds, PdPairing, Worker, WorkerResult, WorkerType,
@@ -52,8 +51,6 @@ use super::{
 /// FFI worker that implements the gateway's `Worker` trait so policies
 /// can select workers using their real selection logic (not a fallback).
 pub struct GrpcWorker {
-    /// Minted at construction; see [`Worker::instance_id`].
-    pub(crate) instance_id: u64,
     pub(crate) client: Arc<SglangSchedulerClient>,
     pub(crate) endpoint: String,
     pub(crate) status: AtomicU8,
@@ -82,7 +79,6 @@ impl GrpcWorker {
             http2: false,
         };
         Self {
-            instance_id: next_worker_instance_id(),
             client,
             routing_key_load: WorkerRoutingKeyLoad::new(&endpoint),
             endpoint,
@@ -118,10 +114,6 @@ impl Worker for GrpcWorker {
 
     fn url(&self) -> &str {
         &self.endpoint
-    }
-
-    fn instance_id(&self) -> u64 {
-        self.instance_id
     }
 
     fn api_key(&self) -> Option<&String> {
