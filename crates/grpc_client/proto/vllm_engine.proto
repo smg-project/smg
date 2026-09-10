@@ -371,7 +371,7 @@ message GetServerInfoResponse {
   string model_dtype = 14;        // model_config.dtype ("torch.bfloat16", ...)
   // Operator-set PD pairing protocol, read from the SMG_PAIRING_PROTOCOL
   // environment variable of the engine process; "" when unset. A prefill and
-  // a decode carrying one pair only when the values are equal.
+  // a decode that both carry one can pair only when the values are equal.
   string pairing_protocol = 15;
 }
 
