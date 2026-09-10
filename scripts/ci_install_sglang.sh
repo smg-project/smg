@@ -83,6 +83,23 @@ $RETRY 3 10 sudo apt-get install -y --no-install-recommends libnuma-dev libibver
 echo "Installing mooncake..."
 $RETRY 3 10 uv pip install mooncake-transfer-engine-cuda13==0.3.12.post1 nvidia-cuda-nvrtc
 
+# NIXL for SGLang PD disaggregation over NIXL (--disaggregation-transfer-backend
+# nixl), only on lanes that ask for it: Mooncake stays the default. Package,
+# pin and install shape track upstream sglang v0.5.18 CI (nixl and the backend
+# matching torch's CUDA, both --no-deps):
+# https://github.com/sgl-project/sglang/blob/v0.5.18/scripts/ci/cuda/ci_install_dependency.sh
+if [ "${E2E_KV_BACKEND:-}" = "nixl" ] || [ "${E2E_SGLANG_TRANSFER_BACKEND:-}" = "nixl" ]; then
+    NIXL_VERSION="1.3.0"
+    CUDA_MAJOR=$(python3 -c "import torch; print(torch.version.cuda.split('.')[0])")
+    echo "Installing nixl==${NIXL_VERSION} (cu${CUDA_MAJOR}) for SGLang PD over NIXL..."
+    $RETRY 3 10 uv pip install --no-deps "nixl==${NIXL_VERSION}" "nixl-cu${CUDA_MAJOR}==${NIXL_VERSION}"
+    # Import canary: fail here (not mid-e2e) if the install is broken. The
+    # bindings SGLang's NixlTransferEngine imports are checked, torch first so
+    # its bundled CUDA libraries are loaded.
+    python3 -c "import torch; from nixl._api import nixl_agent; from nixl._bindings import nixlRemoteDisconnectError"
+    echo "nixl import canary OK"
+fi
+
 # Install gRPC packages from source (not PyPI) so PR changes are always tested
 echo "Installing smg-grpc-proto and smg-grpc-servicer from source..."
 $RETRY 3 10 uv pip install -e crates/grpc_client/python/

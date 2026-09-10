@@ -36,11 +36,13 @@ jobs:
           ENGINES: ${{ inputs.engines }}
         run: |
           wanted="${ENGINES:-sglang vllm tokenspeed}"
-          # One row per engine; vLLM also runs over Mooncake next to its NIXL
-          # default. SGLang over NIXL waits on a NIXL install for its venv (#2498).
+          # One row per engine, plus each engine's other KV transport: vLLM over
+          # Mooncake next to its NIXL default, SGLang over NIXL next to its
+          # Mooncake default (TokenSpeed only has Mooncake).
           matrix=$(printf '%s\n' $wanted | jq -Rsc '
             split("\n") | map(select(length > 0)) |
             map(if . == "vllm" then [{engine: "vllm"}, {engine: "vllm", kv_backend: "mooncake"}]
+                elif . == "sglang" then [{engine: "sglang"}, {engine: "sglang", kv_backend: "nixl"}]
                 else [{engine: .}] end) | add')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "matrix: $matrix"

@@ -551,6 +551,15 @@ class Worker:
             env.setdefault("NO_PROXY", "*")
             env.setdefault("no_proxy", "*")
 
+        if (
+            self.engine == "sglang"
+            and self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE)
+            and self.effective_kv_backend() == "nixl"
+        ):
+            # SGLang's NIXL transfer engine rides on UCX too; see the vLLM
+            # branch below for why the CUDA IPC cache is off.
+            env.setdefault("UCX_CUDA_IPC_CACHE", "n")
+
         # vLLM PD workers need per-worker side-channel ports for their KV backend
         if self.engine == "vllm" and self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
             if self.effective_kv_backend() == "mooncake":
