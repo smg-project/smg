@@ -3,7 +3,7 @@
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -14,9 +14,17 @@ use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::worker::Worker;
 
 /// Distinct candidate sets one instance keeps a rotation for; past this a
-/// new set evicts one it no longer sees. Sets come and go with worker
+/// new set evicts the least recently used one. Sets come and go with worker
 /// health, so this is a bound on memory, not a limit on fleets.
 const MAX_TRACKED_SETS: usize = 4096;
+
+/// One candidate set's rotation.
+#[derive(Debug)]
+struct Rotation {
+    next: AtomicUsize,
+    /// The policy's tick when the set was last selected from, for eviction.
+    last_used: AtomicU64,
+}
 
 /// Round-robin selection policy
 ///
@@ -35,8 +43,9 @@ const MAX_TRACKED_SETS: usize = 4096;
 /// index 0.
 #[derive(Debug, Default)]
 pub struct RoundRobinPolicy {
-    counters: DashMap<u64, AtomicUsize>,
+    counters: DashMap<u64, Rotation>,
     next_start: AtomicUsize,
+    tick: AtomicU64,
 }
 
 impl RoundRobinPolicy {
@@ -44,12 +53,17 @@ impl RoundRobinPolicy {
         Self {
             counters: DashMap::new(),
             next_start: AtomicUsize::new(0),
+            tick: AtomicU64::new(0),
         }
     }
 
     /// The identity of a candidate set: its healthy workers, in order, by
-    /// object identity (an integer mix per worker, no string hashing). A
-    /// replaced worker is a new object, so its sets start afresh.
+    /// object identity (an integer mix per worker, no string hashing). The
+    /// candidates are clones of the registry's `Arc`s, so a shape keys the
+    /// same while its workers live. A worker that re-registers is a new
+    /// object and its sets are new (their rotation starts from the shared
+    /// position); a freed address the allocator reuses can inherit a retired
+    /// set's position, which only means resuming mid-cycle.
     fn set_key(workers: &[Arc<dyn Worker>], healthy: &[usize]) -> u64 {
         let mut hasher = DefaultHasher::new();
         for &i in healthy {
@@ -59,14 +73,24 @@ impl RoundRobinPolicy {
     }
 
     /// This set's next position, creating its rotation on first sight.
+    ///
+    /// The steady state is a read guard and two atomics. A miss is a new
+    /// shape: at the cap it evicts the least recently used set first, a
+    /// scan of the tracked sets that only a churning fleet at the cap pays.
     fn advance(&self, key: u64) -> usize {
-        if let Some(counter) = self.counters.get(&key) {
-            return counter.fetch_add(1, Ordering::Relaxed);
+        let now = self.tick.fetch_add(1, Ordering::Relaxed);
+        if let Some(rotation) = self.counters.get(&key) {
+            rotation.last_used.store(now, Ordering::Relaxed);
+            return rotation.next.fetch_add(1, Ordering::Relaxed);
         }
         if self.counters.len() >= MAX_TRACKED_SETS {
-            // Evict one set rather than every rotation; the iterator guard
-            // is dropped before the removal takes the shard's write lock.
-            let stale = self.counters.iter().next().map(|entry| *entry.key());
+            // The iterator's shard guards are dropped with the statement,
+            // before the removal takes its shard's write lock.
+            let stale = self
+                .counters
+                .iter()
+                .min_by_key(|entry| entry.last_used.load(Ordering::Relaxed))
+                .map(|entry| *entry.key());
             if let Some(stale) = stale {
                 self.counters.remove(&stale);
             }
@@ -74,7 +98,11 @@ impl RoundRobinPolicy {
         let start = self.next_start.fetch_add(1, Ordering::Relaxed);
         self.counters
             .entry(key)
-            .or_insert_with(|| AtomicUsize::new(start))
+            .or_insert_with(|| Rotation {
+                next: AtomicUsize::new(start),
+                last_used: AtomicU64::new(now),
+            })
+            .next
             .fetch_add(1, Ordering::Relaxed)
     }
 }
@@ -104,6 +132,7 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
     fn reset(&self) {
         self.counters.clear();
         self.next_start.store(0, Ordering::Relaxed);
+        self.tick.store(0, Ordering::Relaxed);
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -286,25 +315,33 @@ mod tests {
     }
 
     #[test]
-    fn test_past_the_cap_a_new_set_evicts_one_rotation_not_all() {
+    fn test_past_the_cap_a_new_set_evicts_the_least_recently_used() {
         let info = SelectWorkerInfo::default();
         let policy = RoundRobinPolicy::new();
         let hot = make_regular_workers("hot", 2);
         assert_eq!(policy.select_worker(&hot, &info), Some(0));
-        // Fill the map with distinct one-worker sets.
-        let filler: Vec<Vec<Arc<dyn Worker>>> = (0..MAX_TRACKED_SETS)
+        // Distinct one-worker sets fill the map to just under the cap.
+        let filler: Vec<Vec<Arc<dyn Worker>>> = (0..MAX_TRACKED_SETS + 3)
             .map(|i| make_regular_workers(&format!("f{i}-"), 1))
             .collect();
-        for set in &filler {
+        for set in &filler[..MAX_TRACKED_SETS - 2] {
             policy.select_worker(set, &info);
         }
-        assert!(policy.counters.len() <= MAX_TRACKED_SETS + 1);
-        // The hot set most likely kept its rotation (one eviction, not a
-        // wipe): it continues, or at worst restarts from the shared position,
-        // never from a cleared map's index 0 for every set at once.
-        let next = policy.select_worker(&hot, &info).unwrap();
-        assert!(next < 2);
-        assert!(policy.counters.len() <= MAX_TRACKED_SETS + 1);
+        // The hot set is used again, so it is recent when the cap is hit.
+        assert_eq!(policy.select_worker(&hot, &info), Some(1));
+        for set in &filler[MAX_TRACKED_SETS - 2..] {
+            policy.select_worker(set, &info);
+        }
+        // Evictions took the oldest fillers, one per miss: the map stays at
+        // the cap and the hot set kept its rotation, which continues.
+        assert_eq!(policy.counters.len(), MAX_TRACKED_SETS);
+        assert!(policy
+            .counters
+            .contains_key(&RoundRobinPolicy::set_key(&hot, &[0, 1])));
+        assert!(!policy
+            .counters
+            .contains_key(&RoundRobinPolicy::set_key(&filler[0], &[0])));
+        assert_eq!(policy.select_worker(&hot, &info), Some(0));
     }
 
     #[test]
