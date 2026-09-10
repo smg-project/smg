@@ -425,7 +425,7 @@ class TestPDTopology:
     # -- registration ------------------------------------------------------
 
     def test_workers_registered_by_role(self, setup_backend):
-        _, model, _, gateway = setup_backend
+        mode, model, _, gateway = setup_backend
         expected = {
             "prefill": {w.base_url for w in gateway.prefill_workers},
             "decode": {w.base_url for w in gateway.decode_workers},
@@ -438,6 +438,26 @@ class TestPDTopology:
         unhealthy = [w.url for ws in by_role.values() for w in ws if w.status != "healthy"]
         assert not unhealthy, f"unhealthy legs after startup: {unhealthy}"
         assert any(m.get("id") for m in gateway.list_models()), "no model listed"
+
+        # Every leg reports the KV transport the lane launched it with: a row
+        # that names a transport its workers never took sweeps the wrong thing
+        # (#2498). gRPC discovery reads the engine's own server args, so the
+        # transport is known there; HTTP discovery's curated server_info does
+        # not carry it and reads as "?".
+        keys = _pairing_keys(gateway)
+        logger.info("pairing keys: %s", keys)
+        legs = gateway.prefill_workers + gateway.decode_workers
+        reported = {w.base_url: keys.get(w.base_url, "?/?").split("/")[1] for w in legs}
+        launched = {w.base_url: w.effective_kv_backend() for w in legs}
+        wrong = {
+            u: (reported[u], launched[u]) for u in launched if reported[u] not in ("?", launched[u])
+        }
+        assert not wrong, (
+            f"legs report a different KV transport than they were launched with: {wrong}"
+        )
+        if mode == "pd_grpc":
+            unknown = [u for u, t in reported.items() if t == "?"]
+            assert not unknown, f"gRPC legs without a known KV transport on /workers: {unknown}"
 
     # -- placement ---------------------------------------------------------
 
