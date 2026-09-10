@@ -73,15 +73,20 @@ impl RoundRobinPolicy {
 
     /// This set's next position, creating its rotation on first sight.
     ///
-    /// The steady state is a read guard and two atomics. A miss is a new
-    /// shape: at the cap it evicts the least recently used set first, a
-    /// scan of the tracked sets that only a churning fleet at the cap pays.
+    /// Age is measured in misses, since only misses evict: the steady state
+    /// is a read guard, a relaxed load of the miss count and two per-set
+    /// atomics, with no shared write. A miss is a new shape: at the cap it
+    /// evicts the least recently used set first, a scan of the tracked sets
+    /// that only a churning fleet at the cap pays. `last_used` only moves
+    /// forward, so selections completing out of order cannot age a set.
     fn advance(&self, key: u64) -> usize {
-        let now = self.tick.fetch_add(1, Ordering::Relaxed);
         if let Some(rotation) = self.counters.get(&key) {
-            rotation.last_used.store(now, Ordering::Relaxed);
+            rotation
+                .last_used
+                .fetch_max(self.tick.load(Ordering::Relaxed), Ordering::Relaxed);
             return rotation.next.fetch_add(1, Ordering::Relaxed);
         }
+        let now = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
         if self.counters.len() >= MAX_TRACKED_SETS {
             // The iterator's shard guards are dropped with the statement,
             // before the removal takes its shard's write lock.
@@ -95,15 +100,14 @@ impl RoundRobinPolicy {
             }
         }
         // The shared position advances only for the request that inserts,
-        // so concurrent first sightings of one set do not skip starts.
-        self.counters
-            .entry(key)
-            .or_insert_with(|| Rotation {
-                next: AtomicUsize::new(self.next_start.fetch_add(1, Ordering::Relaxed)),
-                last_used: AtomicU64::new(now),
-            })
-            .next
-            .fetch_add(1, Ordering::Relaxed)
+        // so concurrent first sightings of one set do not skip starts; a
+        // set another request inserted meanwhile is refreshed as used now.
+        let rotation = self.counters.entry(key).or_insert_with(|| Rotation {
+            next: AtomicUsize::new(self.next_start.fetch_add(1, Ordering::Relaxed)),
+            last_used: AtomicU64::new(now),
+        });
+        rotation.last_used.fetch_max(now, Ordering::Relaxed);
+        rotation.next.fetch_add(1, Ordering::Relaxed)
     }
 }
 
