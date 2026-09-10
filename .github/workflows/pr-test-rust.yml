@@ -388,7 +388,6 @@ jobs:
   # uploaded and summarized.
   benchmarks:
     needs: build-wheel
-    if: false # PD-ONLY ITERATION MODE — TEMPORARY, REVERT BEFORE MERGE (frees the 4-GPU runner)
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     continue-on-error: true
@@ -470,20 +469,14 @@ jobs:
       pull-requests: read
       packages: read
     outputs:
-      # PD-ONLY ITERATION MODE — TEMPORARY, REVERT BEFORE MERGE.
-      # Every change flag is forced off so only e2e-4gpu-pd runs on this
-      # branch (build-wheel and the CPU checks are unaffected). Restore the
-      # `steps.filter.outputs.*` values and drop `pd-only` when the sweep is
-      # done finding bugs.
-      pd-only: "true"
-      common: "false"
-      chat-completions: "false"
-      completions: "false"
-      agentic: "false"
-      embeddings: "false"
-      realtime: "false"
-      go-bindings: "false"
-      rust-ci: "false"
+      common: ${{ steps.filter.outputs.common }}
+      chat-completions: ${{ steps.filter.outputs.chat-completions }}
+      completions: ${{ steps.filter.outputs.completions }}
+      agentic: ${{ steps.filter.outputs.agentic }}
+      embeddings: ${{ steps.filter.outputs.embeddings }}
+      realtime: ${{ steps.filter.outputs.realtime }}
+      go-bindings: ${{ steps.filter.outputs.go-bindings }}
+      rust-ci: ${{ steps.filter.outputs.rust-ci }}
       tokenspeed-image: ${{ steps.tokenspeed-image.outputs.image }}
     steps:
       - uses: actions/checkout@v7
@@ -1019,44 +1012,37 @@ jobs:
   # every PR with the topology that exercises both legs' load balancing.
   e2e-4gpu-pd:
     name: e2e-4gpu-pd (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
-    # PD-ONLY ITERATION MODE — TEMPORARY, REVERT BEFORE MERGE: depends on
-    # build-wheel instead of e2e-1gpu-gateway, honours `pd-only`, and runs
-    # the whole topology sweep with the nightly budgets instead of the
-    # 2p2d slice. Restore `needs: [e2e-1gpu-gateway, detect-changes]`, the
-    # gateway result check, the 50/42 and 85/60 budgets, the `-k` filter
-    # and `min_selected: 13` afterwards.
-    needs: [build-wheel, detect-changes]
+    needs: [e2e-1gpu-gateway, detect-changes]
     if: >-
       always()
       && !cancelled()
-      && needs.build-wheel.result == 'success'
+      && needs.e2e-1gpu-gateway.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.pd-only == 'true'
-                  || needs.detect-changes.outputs.common == 'true'
+              && (needs.detect-changes.outputs.common == 'true'
                   || needs.detect-changes.outputs.chat-completions == 'true')))
     strategy:
       fail-fast: false
       matrix:
         include:
           - engine: sglang
-            timeout: 170
-            test_timeout: 150
+            timeout: 50
+            test_timeout: 42
           - engine: vllm
-            timeout: 170
-            test_timeout: 150
+            timeout: 50
+            test_timeout: 42
           # Qwen3.5-9B loads slower and the prebuilt image is extracted first;
           # a cold path builds the engine from source.
           - engine: tokenspeed
-            timeout: 190
-            test_timeout: 170
+            timeout: 85
+            test_timeout: 60
           # The other KV transport of each engine (TokenSpeed only has
-          # Mooncake): the whole sweep on vLLM over Mooncake, and a 1p1d
-          # smoke of SGLang over NIXL, which has never run in CI.
+          # Mooncake): the same slice on vLLM over Mooncake, and a 1p1d
+          # smoke of SGLang over NIXL. The full sweeps run in nightly-pd.
           - engine: vllm
             kv_backend: mooncake
-            timeout: 170
-            test_timeout: 150
+            timeout: 50
+            test_timeout: 42
           - engine: sglang
             kv_backend: nixl
             timeout: 60
@@ -1071,9 +1057,12 @@ jobs:
       timeout: ${{ matrix.timeout }}
       test_timeout: ${{ matrix.test_timeout }}
       test_dirs: e2e_test/router/test_pd_topologies.py
-      test_filter: ${{ matrix.test_filter || '' }} # PD-only iteration mode: the whole sweep unless the row narrows it
+      # The 2p2d slice (which carries the mixed-transport fleet on vLLM), the
+      # runtime-assembled fleet, the over-window burst, and the mismatched
+      # fleet that placement must refuse; the full sweep runs in nightly-pd.
+      test_filter: ${{ matrix.test_filter || '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport"' }}
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
-      min_selected: ${{ matrix.min_selected || 116 }} # floor ≈ 95% of the 122 collected cases
+      min_selected: ${{ matrix.min_selected || 13 }} # floor ≈ 95% of the 14 cases the slice keeps on every engine
       kv_backend: ${{ matrix.kv_backend || '' }}
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
       # The mixed-transport fleet needs both vLLM backends installed whatever the lane's own

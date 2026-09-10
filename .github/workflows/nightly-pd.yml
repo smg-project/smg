@@ -40,6 +40,7 @@ jobs:
           matrix=$(printf '%s\n' $wanted | jq -Rsc '
             split("\n") | map(select(length > 0)) |
             map(if . == "vllm" then [{engine: "vllm"}, {engine: "vllm", kv_backend: "mooncake"}]
+                elif . == "sglang" then [{engine: "sglang"}, {engine: "sglang", kv_backend: "nixl"}]
                 else [{engine: .}] end) | add')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "matrix: $matrix"
@@ -151,7 +152,10 @@ jobs:
       timeout: ${{ matrix.engine == 'tokenspeed' && 190 || 170 }}
       test_timeout: ${{ matrix.engine == 'tokenspeed' && 170 || 150 }}
       test_dirs: e2e_test/router/test_pd_topologies.py
+      kv_backend: ${{ matrix.kv_backend || '' }}
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
+      # The mixed-transport fleet needs both vLLM backends installed whatever the row's own
+      vllm_extra_kv_backends: ${{ matrix.engine == 'vllm' && 'mooncake' || '' }}
       test_filter: ${{ inputs.filter != '' && format('-k "{0}"', inputs.filter) || '' }}
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
       min_selected: 0
