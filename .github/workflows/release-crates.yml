@@ -85,12 +85,22 @@ jobs:
   tier3:
     needs: tier2
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - crate: llm-multimodal
+            path: crates/multimodal
+          # radix-index: the shared prefix-cache index service. Depends on
+          # radix-tree (tier 1) and smg-grpc-client (tier 2, event bridge).
+          - crate: smg-radix-index
+            path: crates/radix_index
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/publish-crate
         with:
-          crate: llm-multimodal
-          path: crates/multimodal
+          crate: ${{ matrix.crate }}
+          path: ${{ matrix.path }}
           token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   # Tier 4: Main crate depending on all others
