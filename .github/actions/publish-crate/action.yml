@@ -50,6 +50,15 @@ runs:
       with:
         repo-token: ${{ github.token }}
 
+    # A path dependency becomes a plain version requirement in the packaged
+    # manifest. If that version is not on crates.io the verify build fails
+    # deep in rustc output after the earlier tiers already ran; name the
+    # missing crates up front instead.
+    - name: Check workspace dependencies are on crates.io
+      if: steps.check.outputs.changed == 'true'
+      shell: bash
+      run: bash scripts/check_publish_deps.sh ${{ inputs.crate }}
+
     - name: Publish to crates.io
       if: steps.check.outputs.changed == 'true'
       shell: bash
