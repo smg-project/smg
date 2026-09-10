@@ -58,16 +58,15 @@ impl RoundRobinPolicy {
     }
 
     /// The identity of a candidate set: its healthy workers, in order, by
-    /// object identity (an integer mix per worker, no string hashing). The
-    /// candidates are clones of the registry's `Arc`s, so a shape keys the
-    /// same while its workers live. A worker that re-registers is a new
-    /// object and its sets are new (their rotation starts from the shared
-    /// position); a freed address the allocator reuses can inherit a retired
-    /// set's position, which only means resuming mid-cycle.
+    /// [`Worker::instance_id`] (an integer mix per worker, no string
+    /// hashing). The id is minted per constructed worker and never reused,
+    /// so a replacement under the same URL is a new set (its rotation starts
+    /// from the shared position) and a retired set's position is never
+    /// inherited.
     fn set_key(workers: &[Arc<dyn Worker>], healthy: &[usize]) -> u64 {
         let mut hasher = DefaultHasher::new();
         for &i in healthy {
-            (Arc::as_ptr(&workers[i]) as *const () as usize).hash(&mut hasher);
+            workers[i].instance_id().hash(&mut hasher);
         }
         hasher.finish()
     }
@@ -95,11 +94,12 @@ impl RoundRobinPolicy {
                 self.counters.remove(&stale);
             }
         }
-        let start = self.next_start.fetch_add(1, Ordering::Relaxed);
+        // The shared position advances only for the request that inserts,
+        // so concurrent first sightings of one set do not skip starts.
         self.counters
             .entry(key)
             .or_insert_with(|| Rotation {
-                next: AtomicUsize::new(start),
+                next: AtomicUsize::new(self.next_start.fetch_add(1, Ordering::Relaxed)),
                 last_used: AtomicU64::new(now),
             })
             .next

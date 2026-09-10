@@ -300,6 +300,17 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Get the worker's URL
     fn url(&self) -> &str;
+    /// An identity for this worker: minted when it is built and never
+    /// reused, unlike its URL (a replacement re-registers under the same
+    /// one) or its address (which the allocator recycles); a clone carries
+    /// its source's id, being the same registration rebuilt. Policies key
+    /// per-candidate-set state on it. The default hashes the URL, for
+    /// implementations that do not mint one.
+    fn instance_id(&self) -> u64 {
+        let mut hasher = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(self.url(), &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    }
     /// Get the worker's API key
     fn api_key(&self) -> Option<&String>;
     /// Get the worker's type (Regular, Prefill, or Decode)
@@ -1281,6 +1292,8 @@ impl WorkerRuntime {
 
 /// Basic worker implementation
 pub struct BasicWorker {
+    /// Minted at construction; see [`Worker::instance_id`].
+    pub(crate) instance_id: u64,
     pub metadata: WorkerMetadata,
     pub runtime: ArcSwap<WorkerRuntime>,
     pub circuit_breaker: ArcSwap<CircuitBreaker>,
@@ -1327,6 +1340,8 @@ pub struct BasicWorker {
 impl Clone for BasicWorker {
     fn clone(&self) -> Self {
         Self {
+            // A clone is the same registration rebuilt, not a new worker.
+            instance_id: self.instance_id,
             metadata: self.metadata.clone(),
             runtime: ArcSwap::from(self.runtime.load_full()),
             circuit_breaker: ArcSwap::from(self.circuit_breaker.load_full()),
@@ -1502,6 +1517,10 @@ impl Worker for BasicWorker {
 
     fn url(&self) -> &str {
         &self.metadata.spec.url
+    }
+
+    fn instance_id(&self) -> u64 {
+        self.instance_id
     }
 
     fn api_key(&self) -> Option<&String> {

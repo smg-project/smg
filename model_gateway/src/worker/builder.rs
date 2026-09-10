@@ -1,4 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use openai_protocol::{
@@ -52,6 +58,9 @@ pub struct BasicWorkerBuilder {
     /// for this worker.
     overload_defaults: OverloadThresholds,
 }
+
+/// The next [`Worker::instance_id`]: one per constructed worker, never reused.
+static NEXT_WORKER_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 impl BasicWorkerBuilder {
     /// Create a new builder with only the URL (uses default WorkerSpec)
@@ -363,6 +372,7 @@ impl BasicWorkerBuilder {
         let resilience = self.resilience.unwrap_or_default();
 
         BasicWorker {
+            instance_id: NEXT_WORKER_INSTANCE.fetch_add(1, Ordering::Relaxed),
             kv_engine_id: ArcSwapOption::new(metadata.spec.kv_engine_id.clone().map(Arc::new)),
             kv_engine_id_unconfirmed: AtomicBool::new(false),
             runtime: ArcSwap::from_pointee(WorkerRuntime::new(&metadata.spec.url, initial_status)),
