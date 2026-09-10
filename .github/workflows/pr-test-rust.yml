@@ -1049,7 +1049,7 @@ jobs:
             timeout: 60
             test_timeout: 50
             test_filter: -k "1p1d and not http"
-            min_selected: 11
+            min_selected: 12
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -1065,7 +1065,7 @@ jobs:
       test_filter: ${{ matrix.test_filter || '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport"' }}
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
       # floor ≈ 95% of the slice: 14 cases on sglang/tokenspeed, 16 on vllm
-      # (its two transport classes); the 1p1d smoke selects 13
+      # (its two transport classes); the 1p1d smoke selects 13, floor 12
       min_selected: ${{ matrix.min_selected || 13 }}
       kv_backend: ${{ matrix.kv_backend || '' }}
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
