@@ -46,7 +46,7 @@ jobs:
             map(if . == "vllm" then [{engine: "vllm"}, {engine: "vllm", kv_backend: "mooncake"}]
                 elif . == "sglang" then [{engine: "sglang"},
                   {engine: "sglang", kv_backend: "nixl",
-                   test_filter: "-k \"not sole_leg_outage and not survives_losing\""}]
+                   filter: "not sole_leg_outage and not survives_losing"}]
                 else [{engine: .}] end) | add')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "matrix: $matrix"
@@ -167,8 +167,13 @@ jobs:
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
       # The mixed-transport fleet needs both vLLM backends installed whatever the row's own
       vllm_extra_kv_backends: ${{ matrix.engine == 'vllm' && 'mooncake' || '' }}
-      # A row's own filter wins over the dispatch filter.
-      test_filter: ${{ matrix.test_filter || (inputs.filter != '' && format('-k "{0}"', inputs.filter)) || '' }}
+      # A row's own filter always applies; a dispatch filter narrows within it.
+      test_filter: >-
+        ${{ (inputs.filter != '' && matrix.filter != '')
+            && format('-k "({0}) and ({1})"', inputs.filter, matrix.filter)
+            || (inputs.filter != '' && format('-k "{0}"', inputs.filter))
+            || (matrix.filter != '' && format('-k "{0}"', matrix.filter))
+            || '' }}
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
       min_selected: 0
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.tokenspeed-image.outputs.image || '' }}
