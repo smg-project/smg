@@ -328,11 +328,17 @@ impl ResponsesToolChoice {
                 mode: mode.clone(),
                 tools: tools.clone(),
             },
+            // The regular router downgrades custom tools to function tools
+            // (single `input` string parameter), so pinning the chat
+            // tool_choice by name preserves the forcing semantics.
+            Self::Custom { name, .. } => ChatToolChoice::Function {
+                tool_type: "function".to_string(),
+                function: FunctionChoice { name: name.clone() },
+            },
             // No matching Chat spec variant — fall through to `auto` so
             // downstream Chat backends still see tool-calling enabled.
             Self::Types { .. }
             | Self::Mcp { .. }
-            | Self::Custom { .. }
             | Self::ApplyPatch { .. }
             | Self::Shell { .. } => ChatToolChoice::Value(ChatToolChoiceValue::Auto),
         }
@@ -2301,6 +2307,19 @@ pub enum ResponseOutputItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
         status: String,
+    },
+    /// `type: "custom_tool_call"` — the model's invocation of a user-declared
+    /// custom tool. Same wire shape as the [`ResponseInputOutputItem`] variant
+    /// so emitted items replay losslessly.
+    #[serde(rename = "custom_tool_call")]
+    CustomToolCall {
+        call_id: String,
+        input: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
     },
     #[serde(rename = "mcp_list_tools")]
     McpListTools {

@@ -11,7 +11,8 @@ use openai_protocol::{
         ResponseEvent,
     },
     responses::{
-        ResponseOutputItem, ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
+        IncludeField, ResponseOutputItem, ResponseStatus, ResponsesRequest, ResponsesResponse,
+        ResponsesUsage,
     },
 };
 use serde_json::json;
@@ -64,6 +65,19 @@ struct OutputItemState {
     item_data: Option<serde_json::Value>,
 }
 
+/// Streaming state for one in-flight chat tool-call being translated into a
+/// Responses `function_call` output item.
+struct ToolCallStreamItem {
+    /// `delta.tool_calls[].index` from the chat stream.
+    chat_index: u32,
+    output_index: usize,
+    item_id: String,
+    call_id: String,
+    name: String,
+    arguments: String,
+    added_emitted: bool,
+}
+
 /// OpenAI-compatible event emitter for /v1/responses streaming
 ///
 /// Manages state and sequence numbers to emit proper event types:
@@ -103,6 +117,17 @@ pub(crate) struct ResponseStreamEventEmitter {
     current_message_output_index: Option<usize>,
     current_item_id: Option<String>,
     original_request: Option<ResponsesRequest>,
+    tool_call_items: Vec<ToolCallStreamItem>,
+    /// In-flight reasoning item: opened on the first reasoning delta, closed
+    /// before the first message/tool item or on finish.
+    reasoning_item: Option<ReasoningStreamItem>,
+}
+
+/// Streaming state for the reasoning output item of the current turn.
+struct ReasoningStreamItem {
+    output_index: usize,
+    item_id: String,
+    text: String,
 }
 
 impl ResponseStreamEventEmitter {
@@ -123,6 +148,8 @@ impl ResponseStreamEventEmitter {
             current_message_output_index: None,
             current_item_id: None,
             original_request: None,
+            tool_call_items: Vec::new(),
+            reasoning_item: None,
         }
     }
 
@@ -753,12 +780,16 @@ impl ResponseStreamEventEmitter {
         // Allocate output index and generate ID
         let (output_index, item_id) = self.allocate_output_index(OutputItemKind::Reasoning);
 
-        // Build reasoning item structure
+        // Build reasoning item structure. `content` is an array of typed
+        // parts on the wire (a bare string breaks clients walking the
+        // content list).
         let item = json!({
             "id": item_id,
             "type": "reasoning",
             "summary": [],
-            "content": reasoning_content,
+            "content": reasoning_content
+                .map(|text| json!([{ "type": "reasoning_text", "text": text }]))
+                .unwrap_or(json!([])),
             "encrypted_content": null,
             "status": null
         });
@@ -777,6 +808,83 @@ impl ResponseStreamEventEmitter {
         Ok(())
     }
 
+    fn include_encrypted_reasoning(&self) -> bool {
+        self.original_request
+            .as_ref()
+            .and_then(|r| r.include.as_deref())
+            .is_some_and(|f| f.contains(&IncludeField::ReasoningEncryptedContent))
+    }
+
+    fn is_custom_tool(&self, name: &str) -> bool {
+        let tools = self
+            .original_request
+            .as_ref()
+            .and_then(|r| r.tools.as_deref());
+        super::utils::custom_tool_names(tools).contains(name)
+    }
+
+    fn emit_reasoning_text_delta(
+        &mut self,
+        output_index: usize,
+        item_id: &str,
+        delta: &str,
+    ) -> serde_json::Value {
+        json!({
+            "type": "response.reasoning_text.delta",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id,
+            "content_index": 0,
+            "delta": delta
+        })
+    }
+
+    fn emit_reasoning_text_done(
+        &mut self,
+        output_index: usize,
+        item_id: &str,
+        text: &str,
+    ) -> serde_json::Value {
+        json!({
+            "type": "response.reasoning_text.done",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id,
+            "content_index": 0,
+            "text": text
+        })
+    }
+
+    /// Close the in-flight reasoning item, if any: `reasoning_text.done`
+    /// followed by `output_item.done` carrying the full text.
+    async fn close_reasoning_item(&mut self, tx: &SseSender) -> Result<(), String> {
+        let Some(reasoning) = self.reasoning_item.take() else {
+            return Ok(());
+        };
+        let event = self.emit_reasoning_text_done(
+            reasoning.output_index,
+            &reasoning.item_id,
+            &reasoning.text,
+        );
+        self.send_event(&event, tx).await?;
+
+        let mut item = json!({
+            "id": reasoning.item_id,
+            "type": "reasoning",
+            "summary": [],
+            "content": [{ "type": "reasoning_text", "text": reasoning.text }],
+            "status": "completed"
+        });
+        if self.include_encrypted_reasoning() {
+            item["encrypted_content"] =
+                json!(super::utils::encode_reasoning_content(&reasoning.text));
+        }
+        let event = self.emit_output_item_done(reasoning.output_index, &item);
+        self.send_event(&event, tx).await?;
+        self.complete_output_item(reasoning.output_index);
+        Ok(())
+    }
+
     /// Process a chunk and emit appropriate events
     pub async fn process_chunk(
         &mut self,
@@ -785,10 +893,44 @@ impl ResponseStreamEventEmitter {
     ) -> Result<(), String> {
         // Process content if present
         if let Some(choice) = chunk.choices.first() {
+            // Reasoning streams as its own output item, opened on the first
+            // delta so it precedes the answer (OpenAI order).
+            if let Some(reasoning) = choice
+                .delta
+                .reasoning_content
+                .as_deref()
+                .filter(|r| !r.is_empty())
+            {
+                if self.reasoning_item.is_none() {
+                    let (output_index, item_id) =
+                        self.allocate_output_index(OutputItemKind::Reasoning);
+                    let item = json!({
+                        "id": item_id,
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": [],
+                        "status": "in_progress"
+                    });
+                    let event = self.emit_output_item_added(output_index, &item);
+                    self.send_event(&event, tx).await?;
+                    self.reasoning_item = Some(ReasoningStreamItem {
+                        output_index,
+                        item_id,
+                        text: String::new(),
+                    });
+                }
+                if let Some(item) = self.reasoning_item.as_mut() {
+                    item.text.push_str(reasoning);
+                    let (output_index, item_id) = (item.output_index, item.item_id.clone());
+                    let event = self.emit_reasoning_text_delta(output_index, &item_id, reasoning);
+                    self.send_event(&event, tx).await?;
+                }
+            }
             if let Some(content) = &choice.delta.content {
                 if !content.is_empty() {
                     // Allocate output_index and item_id for this message item (once per message)
                     if self.current_item_id.is_none() {
+                        self.close_reasoning_item(tx).await?;
                         let (output_index, item_id) =
                             self.allocate_output_index(OutputItemKind::Message);
 
@@ -834,9 +976,97 @@ impl ResponseStreamEventEmitter {
                 }
             }
 
+            // Translate chat tool-call deltas into Responses function_call
+            // events; without this the streamed call is dropped entirely.
+            if let Some(tool_calls) = &choice.delta.tool_calls {
+                for tc in tool_calls {
+                    let pos = match self
+                        .tool_call_items
+                        .iter()
+                        .position(|i| i.chat_index == tc.index)
+                    {
+                        Some(pos) => pos,
+                        None => {
+                            self.close_reasoning_item(tx).await?;
+                            let (output_index, item_id) =
+                                self.allocate_output_index(OutputItemKind::FunctionCall);
+                            self.tool_call_items.push(ToolCallStreamItem {
+                                chat_index: tc.index,
+                                output_index,
+                                item_id,
+                                call_id: tc
+                                    .id
+                                    .clone()
+                                    .unwrap_or_else(|| format!("call_{}", Uuid::now_v7())),
+                                name: String::new(),
+                                arguments: String::new(),
+                                added_emitted: false,
+                            });
+                            self.tool_call_items.len() - 1
+                        }
+                    };
+                    let function = tc.function.as_ref();
+                    let name_delta = function
+                        .and_then(|f| f.name.as_deref())
+                        .filter(|n| !n.is_empty());
+                    let args_delta = function
+                        .and_then(|f| f.arguments.as_deref())
+                        .filter(|a| !a.is_empty());
+
+                    let item = &mut self.tool_call_items[pos];
+                    if let (true, Some(name)) = (item.name.is_empty(), name_delta) {
+                        item.name = name.to_string();
+                    }
+                    if let Some(args) = args_delta {
+                        item.arguments.push_str(args);
+                    }
+                    let emit_added = !item.added_emitted
+                        && (!item.name.is_empty() || !item.arguments.is_empty());
+                    item.added_emitted |= emit_added;
+                    let (output_index, item_id, call_id, name) = (
+                        item.output_index,
+                        item.item_id.clone(),
+                        item.call_id.clone(),
+                        item.name.clone(),
+                    );
+                    let custom = self.is_custom_tool(&name);
+
+                    if emit_added {
+                        let item = if custom {
+                            json!({
+                                "id": item_id,
+                                "type": "custom_tool_call",
+                                "call_id": call_id,
+                                "name": name,
+                                "input": "",
+                            })
+                        } else {
+                            json!({
+                                "id": item_id,
+                                "type": "function_call",
+                                "call_id": call_id,
+                                "name": name,
+                                "arguments": "",
+                                "status": "in_progress",
+                            })
+                        };
+                        let event = self.emit_output_item_added(output_index, &item);
+                        self.send_event(&event, tx).await?;
+                    }
+                    // Custom tool calls carry their payload as the raw `input`
+                    // string of the final item, not as streamed JSON arguments.
+                    if let Some(delta) = args_delta.filter(|_| !custom) {
+                        let event =
+                            self.emit_function_call_arguments_delta(output_index, &item_id, delta);
+                        self.send_event(&event, tx).await?;
+                    }
+                }
+            }
+
             // Check for finish_reason to emit completion events
             if let Some(reason) = &choice.finish_reason {
-                if reason == "stop" || reason == "length" {
+                self.close_reasoning_item(tx).await?;
+                if reason == "stop" || reason == "length" || reason == "tool_calls" {
                     if let (Some(output_index), Some(item_id)) = (
                         self.current_message_output_index,
                         self.current_item_id.clone(),
@@ -869,6 +1099,54 @@ impl ResponseStreamEventEmitter {
 
                         // Mark item as completed
                         self.complete_output_item(output_index);
+                    }
+                }
+                if reason == "tool_calls" {
+                    // Close every streamed tool-call item: arguments (or custom
+                    // input) done, then output_item.done, as the non-streaming
+                    // path pairs them.
+                    for item in std::mem::take(&mut self.tool_call_items) {
+                        let full = if self.is_custom_tool(&item.name) {
+                            let input = super::utils::custom_tool_input(&item.arguments);
+                            for (event_type, field) in [
+                                ("response.custom_tool_call_input.delta", "delta"),
+                                ("response.custom_tool_call_input.done", "input"),
+                            ] {
+                                let event = json!({
+                                    "type": event_type,
+                                    "sequence_number": self.next_sequence(),
+                                    "output_index": item.output_index,
+                                    "item_id": item.item_id,
+                                    field: input,
+                                });
+                                self.send_event(&event, tx).await?;
+                            }
+                            json!({
+                                "id": item.item_id,
+                                "type": "custom_tool_call",
+                                "call_id": item.call_id,
+                                "name": item.name,
+                                "input": input,
+                            })
+                        } else {
+                            let event = self.emit_function_call_arguments_done(
+                                item.output_index,
+                                &item.item_id,
+                                &item.arguments,
+                            );
+                            self.send_event(&event, tx).await?;
+                            json!({
+                                "id": item.item_id,
+                                "type": "function_call",
+                                "call_id": item.call_id,
+                                "name": item.name,
+                                "arguments": item.arguments,
+                                "status": "completed",
+                            })
+                        };
+                        let event = self.emit_output_item_done(item.output_index, &full);
+                        self.send_event(&event, tx).await?;
+                        self.complete_output_item(item.output_index);
                     }
                 }
             }
@@ -1089,5 +1367,190 @@ mod namespace_tests {
         let event = emitter.emit_completed(None);
         assert_eq!(event["response"]["output"][0]["name"], "lookup");
         assert_eq!(event["response"]["output"][0]["namespace"], "weather");
+    }
+}
+
+#[cfg(test)]
+mod process_chunk_tests {
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::routers::grpc::common::responses::utils::decode_reasoning_content;
+
+    fn chunk(
+        delta: serde_json::Value,
+        finish_reason: Option<&str>,
+    ) -> ChatCompletionStreamResponse {
+        serde_json::from_value(json!({
+            "id": "chat_test",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "test-model",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
+        }))
+        .unwrap()
+    }
+
+    /// Drive `chunks` through a fresh emitter; return the emitted events in
+    /// order plus the `output` array of `response.completed`.
+    async fn stream(
+        request: serde_json::Value,
+        chunks: &[ChatCompletionStreamResponse],
+    ) -> (Vec<serde_json::Value>, serde_json::Value) {
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        emitter.set_original_request(serde_json::from_value(request).unwrap());
+        let (tx, mut rx) = mpsc::channel(256);
+        for chunk in chunks {
+            emitter.process_chunk(chunk, &tx).await.unwrap();
+        }
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            let data = text.lines().find_map(|l| l.strip_prefix("data: ")).unwrap();
+            events.push(serde_json::from_str(data).unwrap());
+        }
+        let completed = emitter.emit_completed(None);
+        (events, completed["response"]["output"].clone())
+    }
+
+    fn types(events: &[serde_json::Value]) -> Vec<&str> {
+        events.iter().map(|e| e["type"].as_str().unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn reasoning_then_function_call_stream_as_paired_items() {
+        let (events, output) = stream(
+            json!({"model": "test-model", "input": "hi", "include": ["reasoning.encrypted_content"]}),
+            &[
+                chunk(json!({"reasoning_content": "thi"}), None),
+                chunk(json!({"reasoning_content": "nk"}), None),
+                chunk(
+                    json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                        "function": {"name": "get_weather", "arguments": ""}}]}),
+                    None,
+                ),
+                chunk(
+                    json!({"tool_calls": [{"index": 0, "function": {"arguments": "{\"city\":"}}]}),
+                    None,
+                ),
+                chunk(
+                    json!({"tool_calls": [{"index": 0, "function": {"arguments": "\"Paris\"}"}}]}),
+                    None,
+                ),
+                chunk(json!({}), Some("tool_calls")),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            types(&events),
+            [
+                "response.output_item.added",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+            ]
+        );
+        let seq: Vec<u64> = events
+            .iter()
+            .map(|e| e["sequence_number"].as_u64().unwrap())
+            .collect();
+        assert!(seq.windows(2).all(|w| w[0] < w[1]));
+
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(
+            output[0]["content"],
+            json!([{"type": "reasoning_text", "text": "think"}])
+        );
+        assert_eq!(
+            decode_reasoning_content(output[0]["encrypted_content"].as_str().unwrap()).as_deref(),
+            Some("think")
+        );
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[1]["call_id"], "call_1");
+        assert_eq!(output[1]["name"], "get_weather");
+        assert_eq!(output[1]["arguments"], "{\"city\":\"Paris\"}");
+        assert_eq!(output[1]["status"], "completed");
+        // Each output_item.done carries the item response.completed reports.
+        assert_eq!(events[4]["item"], output[0]);
+        assert_eq!(events[9]["item"], output[1]);
+        assert_eq!(events[8]["arguments"], "{\"city\":\"Paris\"}");
+    }
+
+    #[tokio::test]
+    async fn custom_tool_call_streams_as_custom_input() {
+        let (events, output) = stream(
+            json!({"model": "test-model", "input": "hi",
+                "tools": [{"type": "custom", "name": "emit_command"}]}),
+            &[
+                chunk(
+                    json!({"tool_calls": [{"index": 0, "id": "call_c", "type": "function",
+                        "function": {"name": "emit_command", "arguments": "{\"input\": \"pwd\"}"}}]}),
+                    None,
+                ),
+                chunk(json!({}), Some("tool_calls")),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            types(&events),
+            [
+                "response.output_item.added",
+                "response.custom_tool_call_input.delta",
+                "response.custom_tool_call_input.done",
+                "response.output_item.done",
+            ]
+        );
+        assert_eq!(events[0]["item"]["type"], "custom_tool_call");
+        assert_eq!(events[1]["delta"], "pwd");
+        assert_eq!(events[2]["input"], "pwd");
+        assert_eq!(output[0]["type"], "custom_tool_call");
+        assert_eq!(output[0]["input"], "pwd");
+        assert_eq!(output[0]["call_id"], "call_c");
+        assert_eq!(events[3]["item"], output[0]);
+    }
+
+    #[tokio::test]
+    async fn text_after_reasoning_closes_the_reasoning_item_first() {
+        let (events, output) = stream(
+            json!({"model": "test-model", "input": "hi"}),
+            &[
+                chunk(json!({"reasoning_content": "why"}), None),
+                chunk(json!({"content": "Hel"}), None),
+                chunk(json!({"content": "lo"}), None),
+                chunk(json!({}), Some("stop")),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            types(&events),
+            [
+                "response.output_item.added",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+            ]
+        );
+        assert_eq!(output[0]["type"], "reasoning");
+        assert!(output[0].get("encrypted_content").is_none());
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "Hello");
     }
 }
