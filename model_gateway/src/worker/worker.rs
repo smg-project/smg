@@ -304,13 +304,8 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// reused, unlike its URL (a replacement re-registers under the same
     /// one) or its address (which the allocator recycles); a clone carries
     /// its source's id, being the same registration rebuilt. Policies key
-    /// per-candidate-set state on it. The default hashes the URL, for
-    /// implementations that do not mint one.
-    fn instance_id(&self) -> u64 {
-        let mut hasher = std::hash::DefaultHasher::new();
-        std::hash::Hash::hash(self.url(), &mut hasher);
-        std::hash::Hasher::finish(&hasher)
-    }
+    /// per-candidate-set state on it, so every implementation mints one.
+    fn instance_id(&self) -> u64;
     /// Get the worker's API key
     fn api_key(&self) -> Option<&String>;
     /// Get the worker's type (Regular, Prefill, or Decode)

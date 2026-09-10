@@ -11,7 +11,7 @@ use std::{
     os::raw::c_char,
     ptr,
     sync::{
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -50,7 +50,12 @@ use super::{
 
 /// FFI worker that implements the gateway's `Worker` trait so policies
 /// can select workers using their real selection logic (not a fallback).
+/// The next [`Worker::instance_id`] for a Go-side worker: one per constructed worker, never reused.
+static NEXT_WORKER_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
 pub struct GrpcWorker {
+    /// Minted at construction; see [`Worker::instance_id`].
+    pub(crate) instance_id: u64,
     pub(crate) client: Arc<SglangSchedulerClient>,
     pub(crate) endpoint: String,
     pub(crate) status: AtomicU8,
@@ -79,6 +84,7 @@ impl GrpcWorker {
             http2: false,
         };
         Self {
+            instance_id: NEXT_WORKER_INSTANCE.fetch_add(1, Ordering::Relaxed),
             client,
             routing_key_load: WorkerRoutingKeyLoad::new(&endpoint),
             endpoint,
@@ -114,6 +120,10 @@ impl Worker for GrpcWorker {
 
     fn url(&self) -> &str {
         &self.endpoint
+    }
+
+    fn instance_id(&self) -> u64 {
+        self.instance_id
     }
 
     fn api_key(&self) -> Option<&String> {
