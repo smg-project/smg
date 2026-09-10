@@ -21,6 +21,7 @@ _SPEC.loader.exec_module(module)
 
 
 def event(name="BlockStored", **overrides):
+    # Start with the oldest group-event schema; add optional fields per test.
     fields = dict(
         block_hashes=[bytes(range(32))],
         parent_block_hash=None,
@@ -30,8 +31,6 @@ def event(name="BlockStored", **overrides):
         medium="GPU",
         lora_id=None,
         lora_name=None,
-        locality=None,
-        ownership=None,
         extra_keys=[None],
         kv_cache_spec_kind="full_attention",
         kv_cache_spec_sliding_window=None,
@@ -55,6 +54,31 @@ def test_schema_selects_group_conversion_without_engine_config():
             "BlockStored", (), {"__struct_fields__": tuple(module._GROUP_FIELDS - {missing})}
         )
         assert module.resolve_group_event_converter(older) is None
+
+
+@pytest.mark.parametrize(
+    "name,operation",
+    [
+        ("BlockStored", common_pb2.KvGroupEvent.STORE),
+        ("BlockRemoved", common_pb2.KvGroupEvent.REMOVE),
+    ],
+)
+@pytest.mark.parametrize(
+    "optional_fields",
+    [
+        {},
+        dict(locality=None),
+        dict(locality="LOCAL"),
+        dict(locality=None, ownership=None),
+        dict(locality="LOCAL", ownership=None),
+    ],
+)
+def test_local_events_across_optional_field_versions(name, operation, optional_fields):
+    raw = event(name, **optional_fields)
+    for field in ("locality", "ownership"):
+        assert hasattr(raw, field) == (field in optional_fields)
+    converted, _ = batch([raw])
+    assert [e.operation for e in converted.group_events] == [operation]
 
 
 @pytest.mark.parametrize("rank", [None, 0, 2])

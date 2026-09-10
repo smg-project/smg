@@ -35,8 +35,8 @@ class GroupEventConverter:
             raise ValueError(f"Unknown KV event type: {name}")
         if (
             event.medium != "GPU"
-            or event.locality not in (None, "LOCAL")
-            or event.ownership is not None
+            or getattr(event, "locality", None) not in (None, "LOCAL")
+            or getattr(event, "ownership", None) is not None
         ):
             return None
         if not isinstance(event.block_hashes, list):
