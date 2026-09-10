@@ -443,7 +443,8 @@ class TestPDTopology:
         # that names a transport its workers never took sweeps the wrong thing
         # (#2498). gRPC discovery reads the engine's own server args, so the
         # transport is known there; HTTP discovery's curated server_info does
-        # not carry it and reads as "?".
+        # not carry it and reads as "?". TokenSpeed is not pinned by this: it
+        # only moves KV over Mooncake, so both sides are that constant.
         keys = _pairing_keys(gateway)
         logger.info("pairing keys: %s", keys)
         legs = gateway.prefill_workers + gateway.decode_workers
