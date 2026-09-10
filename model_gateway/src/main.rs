@@ -582,6 +582,21 @@ struct CliArgs {
     #[arg(long, help_heading = "Routing Policy")]
     kv_indexer_ttl_secs: Option<u64>,
 
+    /// Remote radix index endpoint (e.g. http://127.0.0.1:40000) for
+    /// cache-aware routing: overlap scores are prefetched from the shared
+    /// index on selection (hard deadline, expected-wait fallback) and
+    /// placements published after successful dispatch. Unset = off.
+    #[arg(long, help_heading = "Routing Policy")]
+    kv_indexer_url: Option<String>,
+
+    /// Keyspace block size for --kv-indexer-url queries: the ENGINE page
+    /// size the index was fed at (must match the bridge/worker events).
+    /// Zero is rejected up front: the keyspace key includes the block
+    /// size, so a silently clamped value would split the fleet's state
+    /// into a keyspace nothing else publishes to.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..), help_heading = "Routing Policy")]
+    kv_indexer_block_size: Option<u32>,
+
     /// Capacity ceiling per model for the event-driven cache-aware indexer;
     /// beyond it, oldest-touched entries are pruned down to 90% of the
     /// ceiling. Unset or 0 disables the ceiling.
@@ -1860,6 +1875,8 @@ impl CliArgs {
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
             .worker_overload_token_usage(self.worker_overload_token_usage)
             .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
+            .kv_indexer_url(self.kv_indexer_url.clone())
+            .kv_indexer_block_size(self.kv_indexer_block_size)
             .kv_indexer_max_entries(self.kv_indexer_max_entries)
             .engine_metrics(self.engine_metrics)
             .multimodal_tensor_transport(self.multimodal_tensor_transport)
@@ -2252,6 +2269,34 @@ mod tests {
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.kv_indexer_ttl_secs, None);
         assert_eq!(defaults.kv_indexer_max_entries, None);
+    }
+
+    /// The shared-index flags round-trip into RouterConfig, default to
+    /// unset (flag off), and a zero block size is rejected at parse time
+    /// rather than clamped into a keyspace nothing else publishes to.
+    #[test]
+    fn kv_indexer_remote_flags_flow_into_router_config_and_reject_zero_block() {
+        let cli = cli_args_from(&[
+            "--kv-indexer-url",
+            "http://127.0.0.1:40000",
+            "--kv-indexer-block-size",
+            "256",
+        ]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(
+            router_config.kv_indexer_url.as_deref(),
+            Some("http://127.0.0.1:40000")
+        );
+        assert_eq!(router_config.kv_indexer_block_size, Some(256));
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.kv_indexer_url, None);
+        assert_eq!(defaults.kv_indexer_block_size, None);
+
+        assert!(
+            Cli::try_parse_from(["smg", "--kv-indexer-block-size", "0"]).is_err(),
+            "--kv-indexer-block-size 0 should be rejected"
+        );
     }
 
     /// The retry-buffer cap must flow through both conversion paths.

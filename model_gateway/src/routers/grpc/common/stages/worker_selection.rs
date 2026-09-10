@@ -12,7 +12,10 @@ use tracing::{error, warn};
 use super::PipelineStage;
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
-    policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
+    policies::{
+        CacheNamespace, LoadBalancingPolicy, PolicyRegistry, RemoteLookup, SelectWorkerInfo,
+        WorkerLeg,
+    },
     routers::{
         common::placement::{self, PairFailure, PlacementFailure, PlacementInputs},
         error,
@@ -127,6 +130,26 @@ impl PipelineStage for WorkerSelectionStage {
         let rid_key = rid_key.as_deref();
 
         let model_id = ctx.input.model_id.as_str();
+
+        // Remote-index prefetch (--kv-indexer-url): the policy layer owns
+        // the overlap query so every routing mode shares one call. It
+        // returns `None` (plain select) whenever the index could not
+        // matter — flag off, no cache_aware policy, no tokens, no hashes,
+        // or a sticky override key that will win anyway. The overlap steers
+        // the leg that holds the prompt prefix — the sole worker in Regular
+        // mode, the PREFILL worker in disaggregated PD/EPD (decode and
+        // encode never hold the prompt KV).
+        let mut remote_overlap: Option<crate::policies::RemoteOverlap> = None;
+        if let Some((overlap, prediction)) = self
+            .policy_registry
+            .resolve_remote_overlap(model_id, tokens, headers, rid_key)
+            .await
+        {
+            remote_overlap = Some(overlap);
+            ctx.state.index_prediction = Some(prediction);
+        }
+        let remote = RemoteLookup::from_resolved(remote_overlap.as_ref());
+
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
                 match self.select_single_worker(
@@ -137,6 +160,7 @@ impl PipelineStage for WorkerSelectionStage {
                     rid_key,
                     cache_namespace,
                     None,
+                    remote,
                 ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
@@ -153,6 +177,7 @@ impl PipelineStage for WorkerSelectionStage {
                     rid_key,
                     cache_namespace,
                     None,
+                    remote,
                 ) {
                     Ok((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
@@ -186,6 +211,7 @@ impl PipelineStage for WorkerSelectionStage {
                     rid_key,
                     cache_namespace,
                     &encode_item_hashes,
+                    remote,
                 ) {
                     Some((encode_assignments, prefill, decode, runtime_type)) => {
                         WorkerSelection::Disaggregated {
@@ -275,6 +301,11 @@ impl WorkerSelectionStage {
                     rid_key,
                     cache_namespace,
                     wire,
+                    // Retry re-selection does not re-query the index (the
+                    // prompt is unchanged; the query already ran on the
+                    // first attempt): it never asked, so it places exactly
+                    // as a path without an index would.
+                    RemoteLookup::NotAttempted,
                 ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
@@ -291,6 +322,11 @@ impl WorkerSelectionStage {
                     rid_key,
                     cache_namespace,
                     wire,
+                    // Retry re-selection does not re-query the index (the
+                    // prompt is unchanged; the query already ran on the
+                    // first attempt): it never asked, so it places exactly
+                    // as a path without an index would.
+                    RemoteLookup::NotAttempted,
                 ) {
                     Ok((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
@@ -476,6 +512,7 @@ impl WorkerSelectionStage {
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
+        remote: RemoteLookup<'_>,
     ) -> Option<Arc<dyn Worker>> {
         // The gRPC router serves both gRPC and direct-ZMQ workers, so the pool
         // accepts either transport (not HTTP). A retry pins the retained wire.
@@ -491,6 +528,7 @@ impl WorkerSelectionStage {
                 headers,
                 rid_key,
                 cache_namespace,
+                remote,
             },
         )
     }
@@ -522,6 +560,7 @@ impl WorkerSelectionStage {
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
+        remote: RemoteLookup<'_>,
     ) -> Result<PdWorkerPair, Response> {
         // Both legs derive from ONE membership snapshot: separate pool
         // lookups could straddle a concurrent replacement and pair workers
@@ -545,6 +584,7 @@ impl WorkerSelectionStage {
                 headers,
                 rid_key,
                 cache_namespace,
+                remote,
             },
         )
         .map_err(|failure| self.pair_failure(model_id, *failure))?;
@@ -570,6 +610,7 @@ impl WorkerSelectionStage {
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
         encode_item_hashes: &[Vec<u8>],
+        remote: RemoteLookup<'_>,
     ) -> Option<EncodePrefillDecodeWorkerSelection> {
         // All three legs derive from ONE membership snapshot (see
         // select_pd_pair). The pools are strictly gRPC — encode dispatch is
@@ -680,9 +721,15 @@ impl WorkerSelectionStage {
             hash_ring: hash_ring.clone(),
             leg: WorkerLeg::Prefill,
         };
-        let prefill_idx =
-            self.policy_registry
-                .select_worker(&prefill_policy, &available_prefill, &info)?;
+        // The prefill worker holds the prompt-prefix KV, so the shared-index
+        // overlap steers this leg only; decode (and encode) never hold the
+        // prompt prefix and stay on their plain policies.
+        let prefill_idx = self.policy_registry.select_worker_with_remote(
+            &prefill_policy,
+            &available_prefill,
+            &info,
+            remote,
+        )?;
         info.leg = WorkerLeg::Decode;
         let decode_idx =
             self.policy_registry
@@ -894,7 +941,16 @@ mod tests {
         let mut decode_hits = HashMap::new();
         for _ in 0..iterations {
             let (prefill, decode, _) = stage
-                .select_pd_pair(model_id, None, None, None, None, None, None)
+                .select_pd_pair(
+                    model_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    RemoteLookup::NotAttempted,
+                )
                 .expect("select_pd_pair should return a pair");
             *prefill_hits.entry(prefill.url().to_string()).or_default() += 1;
             *decode_hits.entry(decode.url().to_string()).or_default() += 1;
@@ -920,7 +976,16 @@ mod tests {
             WorkerSelectionMode::PrefillDecode,
         );
         assert!(stage
-            .select_pd_pair(model_id, None, None, None, None, None, None)
+            .select_pd_pair(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                RemoteLookup::NotAttempted
+            )
             .is_ok());
 
         for url in &prefill_urls {
@@ -930,7 +995,16 @@ mod tests {
 
         assert!(
             stage
-                .select_pd_pair(model_id, None, None, None, None, None, None)
+                .select_pd_pair(
+                    model_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    RemoteLookup::NotAttempted
+                )
                 .is_err(),
             "the veto empties the prefill pool"
         );
@@ -1100,7 +1174,16 @@ mod tests {
 
         assert!(
             stage
-                .select_pd_pair(model_id, None, None, None, None, None, None)
+                .select_pd_pair(
+                    model_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    RemoteLookup::NotAttempted
+                )
                 .is_err(),
             "ZMQ-only PD pools must not yield a pair"
         );
@@ -1108,7 +1191,16 @@ mod tests {
         // Adding gRPC legs makes selection succeed, and it never picks the ZMQ ones.
         let (prefill_urls, decode_urls) = register_pd_workers(&worker_registry, model_id, 4);
         let (prefill, decode, _) = stage
-            .select_pd_pair(model_id, None, None, None, None, None, None)
+            .select_pd_pair(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                RemoteLookup::NotAttempted,
+            )
             .expect("gRPC PD pair should be selected");
         assert!(prefill_urls.contains(&prefill.url().to_string()));
         assert!(decode_urls.contains(&decode.url().to_string()));
@@ -1155,7 +1247,16 @@ mod tests {
         let mut poison = HeaderMap::new();
         poison.insert("x-smg-routing-key", "req-unique-1".parse().unwrap());
         let first = stage
-            .select_single_worker(model_id, None, None, Some(&poison), rid_key, None, None)
+            .select_single_worker(
+                model_id,
+                None,
+                None,
+                Some(&poison),
+                rid_key,
+                None,
+                None,
+                RemoteLookup::NotAttempted,
+            )
             .unwrap();
         for (i, rid) in ["conv7_t2", "conv7_t2_r1", "conv7_t3"].iter().enumerate() {
             let mut rotated = HeaderMap::new();
@@ -1172,6 +1273,7 @@ mod tests {
                     policy_registry.derive_rid_key(Some(rid)),
                     None,
                     None,
+                    RemoteLookup::NotAttempted,
                 )
                 .unwrap();
             assert_eq!(again.url(), first.url(), "follow-up must pin by rid key");
@@ -1209,13 +1311,31 @@ mod tests {
         );
 
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None, None)
+            .select_single_worker(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                RemoteLookup::NotAttempted
+            )
             .is_some());
 
         worker_registry.set_worker_overloaded(&workers[0], true);
         assert!(
             stage
-                .select_single_worker(model_id, None, None, None, None, None, None)
+                .select_single_worker(
+                    model_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    RemoteLookup::NotAttempted
+                )
                 .is_some(),
             "one eligible worker left still serves"
         );
@@ -1223,7 +1343,16 @@ mod tests {
         worker_registry.set_worker_overloaded(&workers[1], true);
         assert!(
             stage
-                .select_single_worker(model_id, None, None, None, None, None, None)
+                .select_single_worker(
+                    model_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    RemoteLookup::NotAttempted
+                )
                 .is_none(),
             "the veto empties the candidate pool"
         );
@@ -1239,7 +1368,16 @@ mod tests {
         // genuinely absent model.
         worker_registry.set_worker_overloaded(&workers[0], false);
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None, None)
+            .select_single_worker(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                RemoteLookup::NotAttempted
+            )
             .is_some());
         assert_eq!(
             stage
@@ -1276,7 +1414,16 @@ mod tests {
         // Any status but Ready is unavailable to routing.
         worker.set_status(WorkerStatus::NotReady);
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None, None)
+            .select_single_worker(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                RemoteLookup::NotAttempted,
+            )
             .is_none());
 
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None);
@@ -1346,6 +1493,7 @@ mod tests {
 
     fn dispatch_ctx(model_id: &str, wire: WireConstraint) -> DispatchContext {
         DispatchContext {
+            index_prediction: None,
             model_id: model_id.to_string(),
             dispatch_model: model_id.to_string(),
             streaming: false,
