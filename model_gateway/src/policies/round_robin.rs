@@ -13,9 +13,9 @@ use dashmap::DashMap;
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::worker::Worker;
 
-/// Distinct candidate sets one instance keeps a rotation for before it
-/// starts over; sets come and go with worker health, so this is a bound on
-/// memory, not a limit on fleets.
+/// Distinct candidate sets one instance keeps a rotation for; past this a
+/// new set evicts one it no longer sees. Sets come and go with worker
+/// health, so this is a bound on memory, not a limit on fleets.
 const MAX_TRACKED_SETS: usize = 4096;
 
 /// Round-robin selection policy
@@ -26,25 +26,56 @@ const MAX_TRACKED_SETS: usize = 4096;
 /// workers in turn. A single counter would advance on every call whatever
 /// the set, so its position modulo one set's size would follow how the sets
 /// happen to interleave, pinning each set to a subset of its workers.
+///
+/// A set is identified by its healthy workers in the order the caller lists
+/// them; callers hand over a stable order (a pool snapshot, a pair index's
+/// partners), which the rotation relies on either way. A set seen for the
+/// first time starts from a shared, advancing position rather than its
+/// first worker, so a fleet whose shape keeps changing does not lean on
+/// index 0.
 #[derive(Debug, Default)]
 pub struct RoundRobinPolicy {
     counters: DashMap<u64, AtomicUsize>,
+    next_start: AtomicUsize,
 }
 
 impl RoundRobinPolicy {
     pub fn new() -> Self {
         Self {
             counters: DashMap::new(),
+            next_start: AtomicUsize::new(0),
         }
     }
 
-    /// The identity of a candidate set: its healthy workers, in order.
+    /// The identity of a candidate set: its healthy workers, in order, by
+    /// object identity (an integer mix per worker, no string hashing). A
+    /// replaced worker is a new object, so its sets start afresh.
     fn set_key(workers: &[Arc<dyn Worker>], healthy: &[usize]) -> u64 {
         let mut hasher = DefaultHasher::new();
         for &i in healthy {
-            workers[i].url().hash(&mut hasher);
+            (Arc::as_ptr(&workers[i]) as *const () as usize).hash(&mut hasher);
         }
         hasher.finish()
+    }
+
+    /// This set's next position, creating its rotation on first sight.
+    fn advance(&self, key: u64) -> usize {
+        if let Some(counter) = self.counters.get(&key) {
+            return counter.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.counters.len() >= MAX_TRACKED_SETS {
+            // Evict one set rather than every rotation; the iterator guard
+            // is dropped before the removal takes the shard's write lock.
+            let stale = self.counters.iter().next().map(|entry| *entry.key());
+            if let Some(stale) = stale {
+                self.counters.remove(&stale);
+            }
+        }
+        let start = self.next_start.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .entry(key)
+            .or_insert_with(|| AtomicUsize::new(start))
+            .fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -60,16 +91,7 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
             return None;
         }
 
-        let key = Self::set_key(workers, &healthy_indices);
-        if !self.counters.contains_key(&key) && self.counters.len() >= MAX_TRACKED_SETS {
-            self.counters.clear();
-        }
-        // Get and increment this set's counter atomically
-        let count = self
-            .counters
-            .entry(key)
-            .or_default()
-            .fetch_add(1, Ordering::Relaxed);
+        let count = self.advance(Self::set_key(workers, &healthy_indices));
         let selected_idx = count % healthy_indices.len();
 
         Some(healthy_indices[selected_idx])
@@ -81,6 +103,7 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
 
     fn reset(&self) {
         self.counters.clear();
+        self.next_start.store(0, Ordering::Relaxed);
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -247,17 +270,41 @@ mod tests {
 
     #[test]
     fn test_a_set_that_shrinks_and_grows_keeps_rotating() {
-        // Health changes the set's identity; both shapes stay fair on their own.
+        // Health changes the set's identity. The shrunken set is new, so it
+        // starts from the shared position (1 by then), not from worker 0
+        // again; the full set resumes where it left off when it returns.
         let workers = make_regular_workers("w", 3);
         let info = SelectWorkerInfo::default();
         let policy = RoundRobinPolicy::new();
         assert_eq!(policy.select_worker(&workers, &info), Some(0));
         workers[1].set_status(WorkerStatus::NotReady);
-        assert_eq!(policy.select_worker(&workers, &info), Some(0));
         assert_eq!(policy.select_worker(&workers, &info), Some(2));
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
         workers[1].set_status(WorkerStatus::Ready);
         assert_eq!(policy.select_worker(&workers, &info), Some(1));
         assert_eq!(policy.select_worker(&workers, &info), Some(2));
+    }
+
+    #[test]
+    fn test_past_the_cap_a_new_set_evicts_one_rotation_not_all() {
+        let info = SelectWorkerInfo::default();
+        let policy = RoundRobinPolicy::new();
+        let hot = make_regular_workers("hot", 2);
+        assert_eq!(policy.select_worker(&hot, &info), Some(0));
+        // Fill the map with distinct one-worker sets.
+        let filler: Vec<Vec<Arc<dyn Worker>>> = (0..MAX_TRACKED_SETS)
+            .map(|i| make_regular_workers(&format!("f{i}-"), 1))
+            .collect();
+        for set in &filler {
+            policy.select_worker(set, &info);
+        }
+        assert!(policy.counters.len() <= MAX_TRACKED_SETS + 1);
+        // The hot set most likely kept its rotation (one eviction, not a
+        // wipe): it continues, or at worst restarts from the shared position,
+        // never from a cleared map's index 0 for every set at once.
+        let next = policy.select_worker(&hot, &info).unwrap();
+        assert!(next < 2);
+        assert!(policy.counters.len() <= MAX_TRACKED_SETS + 1);
     }
 
     #[test]
