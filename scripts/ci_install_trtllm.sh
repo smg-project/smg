@@ -65,11 +65,21 @@ $RETRY 3 10 pip install --no-cache-dir "$NCCL_VERSION_CONSTRAINT"
 # The cu130 torch index is also needed so pip resolves torch 2.10+cu130
 # (cuda-bindings==13.x) instead of the default PyPI torch (cuda-bindings==12.9.4),
 # which conflicts with tensorrt-llm's cuda-python>=13 requirement.
+#
+# cuda-bindings is pinned: 13.4.1 (2026-09-10) dropped the `reserved` field
+# of cudaIpcMemHandle_t that tensorrt-llm's IPC memory setup still reads, so
+# every multi-GPU engine died at startup with an AttributeError the moment
+# the release appeared. 13.3.1 is the last version the lane ran on.
 echo "Installing tensorrt-llm==${TRTLLM_VERSION} from pypi.nvidia.com..."
 $RETRY 3 10 pip install --no-cache-dir --pre \
     --extra-index-url https://pypi.nvidia.com \
     --extra-index-url https://download.pytorch.org/whl/cu130 \
-    "tensorrt-llm==${TRTLLM_VERSION}"
+    "tensorrt-llm==${TRTLLM_VERSION}" "cuda-bindings==13.3.1"
+
+# Import canary: fail here (not 20 minutes into the lane) if the pin above
+# no longer matches what tensorrt-llm's IPC path expects.
+python3 -c "from cuda.bindings import runtime; runtime.cudaIpcMemHandle_t().reserved"
+echo "cuda-bindings IPC handle canary OK"
 
 # typer >= 0.26 leaks click.exceptions.Exit through its main on CLI exit, so
 # every `hf` invocation (model downloads) exits 1 even on success. The
