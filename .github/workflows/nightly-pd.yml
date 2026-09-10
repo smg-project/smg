@@ -149,10 +149,11 @@ jobs:
       engine: ${{ matrix.engine }}
       gpu_tier: "4"
       runner: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
-      # The whole sweep: eight topologies on SGLang (six gRPC, two HTTP), six
-      # elsewhere, each with worker restarts; TokenSpeed also extracts its
-      # engine image and loads a slower model. Run 34433711319 took 58 min
-      # (sglang), 55 (vllm), 35 (vllm-mooncake) and 78 (tokenspeed) end to end.
+      # The whole sweep: ten topologies (eight gRPC, two HTTP), eight on
+      # TokenSpeed (no HTTP frontend), each with worker restarts; TokenSpeed
+      # also extracts its engine image and loads a slower model. Run
+      # 34433711319 took 58 min (sglang), 55 (vllm), 35 (vllm-mooncake) and
+      # 78 (tokenspeed) end to end.
       timeout: ${{ matrix.engine == 'tokenspeed' && 190 || 170 }}
       test_timeout: ${{ matrix.engine == 'tokenspeed' && 170 || 150 }}
       test_dirs: e2e_test/router/test_pd_topologies.py

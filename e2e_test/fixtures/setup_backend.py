@@ -152,6 +152,8 @@ _NOT_SERVING_YET = frozenset({404, 408, 425, 429, 500, 502, 503, 504})
 # wiring up: waiting longer cannot change them, and a test that builds such
 # a fleet asserts the verdict itself.
 _SETTLED_VERDICTS = frozenset({"no_compatible_pd_pair"})
+# How long a settled verdict must hold before it counts as the fleet's.
+_SETTLED_FOR_SECS = 5.0
 
 
 def _error_code_of(exc: openai.APIStatusError) -> str | None:
@@ -174,7 +176,8 @@ def _wait_for_serving(
     client = _make_openai_client(gateway).with_options(max_retries=0)
     deadline = time.monotonic() + timeout
     last_error: Exception | None = None
-    settled_once: str | None = None
+    settled_code: str | None = None
+    settled_since = 0.0
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -191,9 +194,11 @@ def _wait_for_serving(
             code = _error_code_of(exc)
             if code in _SETTLED_VERDICTS:
                 # A fleet still registering shows one worker per leg and can
-                # refuse a pair it accepts moments later; only a verdict that
-                # survives a poll is the fleet's.
-                if code == settled_once:
+                # refuse a pair it accepts moments later; only a verdict the
+                # gateway has held for a few seconds is the fleet's.
+                if code != settled_code:
+                    settled_code, settled_since = code, time.monotonic()
+                elif time.monotonic() - settled_since >= _SETTLED_FOR_SECS:
                     logger.info(
                         "Gateway at %s settled on %s for %s; not waiting for it to serve",
                         gateway.base_url,
@@ -201,13 +206,13 @@ def _wait_for_serving(
                         model_path,
                     )
                     return
-                settled_once = code
             else:
-                settled_once = None
+                settled_code = None
                 if exc.status_code not in _NOT_SERVING_YET:
                     raise
             last_error = exc
         except (openai.APIConnectionError, openai.APITimeoutError) as exc:
+            settled_code = None  # an unreachable gateway is not a settled one
             last_error = exc
         time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
     raise TimeoutError(

@@ -179,6 +179,23 @@ def _wait_for_pairs(minimum: int, timeout: float = LOG_FLUSH_TIMEOUT_S) -> list[
     return pairs
 
 
+def _log_sizes(log_dir: Path) -> dict[Path, int]:
+    """Byte size of every worker log now, to read only what is appended later."""
+    return {p: p.stat().st_size for p in log_dir.glob("worker-*.log") if p.is_file()}
+
+
+def _logs_since(log_dir: Path, sizes: dict[Path, int]) -> str:
+    """What each worker log gained since ``sizes`` was taken, per file."""
+    parts: list[str] = []
+    for path in sorted(log_dir.glob("worker-*.log")):
+        if not path.is_file():
+            continue
+        with path.open("rb") as fh:
+            fh.seek(sizes.get(path, 0))
+            parts.append(fh.read().decode("utf-8", errors="replace"))
+    return "\n".join(parts)
+
+
 def _vllm_transport_installed(*packages: str) -> bool:
     """Whether every KV transport package is importable from this interpreter."""
     return all(importlib.util.find_spec(package) is not None for package in packages)
@@ -823,8 +840,14 @@ class TestPDSmallWindow:
         _wait_until_served(gateway, model, timeout=60.0)
         # The window must have reached the engine, or the burst fits and the
         # gate is never crossed. Engines that report their window on /loads
-        # (SGLang, TokenSpeed) are checked; vLLM reports none.
-        _, loads = _fleet_idle(gateway)
+        # (SGLang, TokenSpeed) are checked; vLLM reports none. Every leg has
+        # to appear in /loads first, which takes the monitor an interval.
+        deadline = time.monotonic() + 30.0
+        reported, loads = _fleet_idle(gateway)
+        while not reported and time.monotonic() < deadline:
+            time.sleep(1.0)
+            reported, loads = _fleet_idle(gateway)
+        assert reported, f"a leg never reported a load: {loads}"
         decode_urls = {w.base_url for w in gateway.decode_workers}
         windows = {
             e["worker"]: e["max_running_requests"]
@@ -834,7 +857,7 @@ class TestPDSmallWindow:
         assert all(w == _WINDOW for w in windows.values()), f"decode window not applied: {windows}"
         logger.info("decode windows reported: %s", windows or "none (engine reports no window)")
         worker_dir = worker_log_dir(_LOG_DIR)
-        before = len(read_logs(worker_dir, "worker-*.log"))
+        before = _log_sizes(worker_dir)
         results: list[httpx.Response] = []
 
         def _one(i: int) -> None:
@@ -877,12 +900,13 @@ class TestPDSmallWindow:
                 assert resp.headers.get("retry-after"), "a shed must say when to retry"
         assert elapsed < 90.0, f"the burst took {elapsed:.0f}s; queued rooms are timing out"
 
-        # Only this burst's lines: earlier classes kill workers out from under
-        # their peers, and an empty capture must fail rather than pass.
-        logs = read_logs(worker_dir, "worker-*.log")
-        assert_worker_logs_captured(logs, "prefill bootstrap timeouts")
+        # Only what this burst appended, per file: earlier classes kill workers
+        # out from under their peers, and an empty capture must fail rather
+        # than pass.
+        assert_worker_logs_captured(read_logs(worker_dir, "worker-*.log"), "bootstrap timeouts")
+        new_lines = _logs_since(worker_dir, before)
         for marker in _BOOTSTRAP_TIMEOUT_MARKERS:
-            assert marker not in logs[before:], f"an engine leg timed out a bootstrap: {marker!r}"
+            assert marker not in new_lines, f"an engine leg timed out a bootstrap: {marker!r}"
         _wait_until_served(gateway, model, timeout=60.0)
 
 
