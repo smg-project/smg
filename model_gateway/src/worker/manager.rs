@@ -724,11 +724,12 @@ fn engine_id_may_be_stale(launched_status: WorkerStatus, worker: &dyn Worker) ->
 /// registered while its engine was still coming up may have none at all.
 /// Re-read the id before the worker is promoted, so the next handoff is
 /// minted for the engine that is actually there. Only gRPC engines report
-/// the id. The read is bounded by the probe timeout: one that fails, expires
-/// or comes back without an id keeps the previous id and says so, since a
-/// stale id is a better outcome than a probe slot held forever or a handoff
-/// with no id at all. An id the engine does report wins over the spec's: it
-/// is the one a handoff must target.
+/// the id. The read is bounded by the probe timeout: one that fails or
+/// expires keeps the previous id, says so, and is retried on the next probe;
+/// one that completes without an id keeps the previous id and is not
+/// retried. A stale id is a better outcome than a probe slot held forever or
+/// a handoff with no id at all, and an id the engine does report wins over
+/// the spec's: it is the one a handoff must target.
 async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: Duration) {
     let spec = &worker.metadata().spec;
     if !matches!(spec.worker_type, WorkerType::Prefill | WorkerType::Decode)
@@ -742,9 +743,10 @@ async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: 
         discover_grpc_kv_engine_id(worker.url(), spec.runtime_type.as_str()),
     )
     .await;
-    // Anything but a confirmed id leaves the flag set, so the next probe
-    // retries instead of the worker serving with a possibly stale id until
-    // its next outage.
+    // A read that did not complete leaves the id unconfirmed, so the next
+    // probe retries instead of the worker serving with a possibly stale id
+    // until its next outage. A completed read confirms it, whether or not
+    // the engine reports an id: there is nothing to retry.
     worker.set_kv_engine_id_confirmed(false);
     match read {
         Ok(Ok(Some(discovered))) => {
@@ -759,19 +761,23 @@ async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: 
             }
             worker.set_kv_engine_id_confirmed(true);
         }
-        // A partial read (server info tolerated as missing) or an engine
-        // that reports no id: a known id must never be cleared by it.
-        Ok(Ok(None)) => match worker.kv_engine_id() {
-            Some(previous) => warn!(
-                worker_url = %worker.url(),
-                previous,
-                "Recovered PD worker reported no KV engine id; keeping the previous one until it does"
-            ),
-            None => warn!(
-                worker_url = %worker.url(),
-                "PD worker reports no KV engine id yet; handoffs carry none until it does"
-            ),
-        },
+        // The engine completed the read and reports no id (a servicer that
+        // predates it, or a connector without one). A known id is kept, never
+        // cleared, and nothing is retried.
+        Ok(Ok(None)) => {
+            match worker.kv_engine_id() {
+                Some(previous) => warn!(
+                    worker_url = %worker.url(),
+                    previous,
+                    "Recovered PD worker reports no KV engine id; keeping the previous one"
+                ),
+                None => debug!(
+                    worker_url = %worker.url(),
+                    "PD worker reports no KV engine id; handoffs carry none"
+                ),
+            }
+            worker.set_kv_engine_id_confirmed(true);
+        }
         Ok(Err(error)) => warn!(
             worker_url = %worker.url(),
             %error,
@@ -1256,9 +1262,10 @@ mod tests {
     };
 
     /// The re-read gate: after a failure always, while pending only without
-    /// an id, never on a Ready or Draining probe.
+    /// an id, while Ready only until a re-read has confirmed the id, never
+    /// while draining.
     #[test]
-    fn the_engine_id_is_re_read_after_a_failure_or_while_pending_without_one() {
+    fn the_engine_id_is_re_read_after_a_failure_while_pending_without_one_or_until_confirmed() {
         let worker = |kv_engine_id: Option<&str>| -> Arc<dyn Worker> {
             let mut builder = BasicWorkerBuilder::new("grpc://p:1")
                 .worker_type(WorkerType::Prefill)
