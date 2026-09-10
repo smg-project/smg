@@ -42,6 +42,7 @@ from collections import Counter
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 import pytest
@@ -191,9 +192,19 @@ def _logs_since(log_dir: Path, sizes: dict[Path, int]) -> str:
         if not path.is_file():
             continue
         with path.open("rb") as fh:
-            fh.seek(sizes.get(path, 0))
+            # A restart truncates the log (mode "w"): a stale offset past EOF
+            # would silently read nothing, so fall back to the whole file.
+            start = sizes.get(path, 0)
+            fh.seek(start if start <= path.stat().st_size else 0)
             parts.append(fh.read().decode("utf-8", errors="replace"))
     return "\n".join(parts)
+
+
+def _fleet_logs(sizes: dict[Path, int], gateway: Gateway) -> str:
+    """The captured log files of this gateway's own legs, named by port."""
+    legs = gateway.prefill_workers + gateway.decode_workers
+    ports = {str(urlparse(w.base_url).port) for w in legs}
+    return "\n".join(str(p) for p in sorted(sizes) if p.stem.rsplit("_", 1)[-1] in ports)
 
 
 def _vllm_transport_installed(*packages: str) -> bool:
@@ -901,9 +912,9 @@ class TestPDSmallWindow:
         assert elapsed < 90.0, f"the burst took {elapsed:.0f}s; queued rooms are timing out"
 
         # Only what this burst appended, per file: earlier classes kill workers
-        # out from under their peers, and an empty capture must fail rather
-        # than pass.
-        assert_worker_logs_captured(read_logs(worker_dir, "worker-*.log"), "bootstrap timeouts")
+        # out from under their peers. The capture guard checks this fleet's own
+        # files exist, so an uncaptured leg cannot pass as a quiet one.
+        assert_worker_logs_captured(_fleet_logs(before, gateway), "bootstrap timeouts")
         new_lines = _logs_since(worker_dir, before)
         for marker in _BOOTSTRAP_TIMEOUT_MARKERS:
             assert marker not in new_lines, f"an engine leg timed out a bootstrap: {marker!r}"
