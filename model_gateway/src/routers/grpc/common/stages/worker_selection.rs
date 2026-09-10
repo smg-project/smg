@@ -1004,11 +1004,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "even PD round-robin coverage")]
-    fn select_pd_pair_shared_round_robin_fails_even_coverage() {
+    fn select_pd_pair_shared_round_robin_keeps_each_leg_even() {
         // Same correctness bar as the independent test. One shared RoundRobin
-        // Arc for P/D advances the counter twice per request, so even coverage
-        // must fail (this test is expected to panic on that assertion).
+        // Arc for P/D used to advance a single counter twice per request and
+        // pin each leg to half its workers; the rotation is per candidate
+        // set now, so even a shared instance covers both legs evenly.
         let model_id = "test-model-shared";
         let worker_registry = Arc::new(WorkerRegistry::new());
         let (prefill_urls, decode_urls) = register_pd_workers(&worker_registry, model_id, 4);

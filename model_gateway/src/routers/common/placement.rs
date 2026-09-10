@@ -433,11 +433,14 @@ pub(crate) fn select_pair(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
 
     use super::*;
     use crate::{
         config::types::{PdPairingMode, PolicyConfig},
+        policies::RoundRobinPolicy,
         worker::{BasicWorkerBuilder, ModelCard, PdWire, WorkerType},
     };
 
@@ -486,6 +489,92 @@ mod tests {
             true,
             PlacementInputs::default(),
         )
+    }
+
+    /// Two PD cohorts (here by KV transport) under round robin on both legs,
+    /// as production configures them: one policy instance per leg.
+    fn cohort_policies() -> PolicyRegistry {
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        policies.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
+        policies.set_decode_policy(Arc::new(RoundRobinPolicy::new()));
+        policies
+    }
+
+    /// Selections per worker URL over `requests` sequential placements.
+    fn hits(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        requests: usize,
+    ) -> BTreeMap<String, usize> {
+        let pairs = pairs_of(registry, policies);
+        let mut hits = BTreeMap::new();
+        for _ in 0..requests {
+            let pair = select_pair(
+                registry,
+                policies,
+                MODEL,
+                &pairs,
+                None,
+                true,
+                PlacementInputs::default(),
+            )
+            .ok()
+            .expect("a pair is open");
+            *hits.entry(pair.prefill.url().to_string()).or_insert(0) += 1;
+            *hits.entry(pair.decode.url().to_string()).or_insert(0) += 1;
+        }
+        hits
+    }
+
+    #[test]
+    fn two_cohorts_of_one_prefill_and_two_decodes_use_every_decode() {
+        // 1P2D beside 1P2D. Round robin over the two prefills alternates the
+        // cohorts; the decode rotation must be each cohort's own, or the
+        // alternation pins every cohort to one of its two decodes (reported
+        // from a rollout: 120 requests, decodes 60/0 and 60/0).
+        let registry = pd_registry(&[
+            ("grpc://p:a", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:b", WorkerType::Prefill, Some("MooncakeConnector")),
+            ("grpc://d:a1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:a2", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:b1", WorkerType::Decode, Some("MooncakeConnector")),
+            ("grpc://d:b2", WorkerType::Decode, Some("MooncakeConnector")),
+        ]);
+        let hits = hits(&registry, &cohort_policies(), 120);
+        assert_eq!(hits["grpc://p:a"], 60, "{hits:?}");
+        assert_eq!(hits["grpc://p:b"], 60, "{hits:?}");
+        for decode in ["grpc://d:a1", "grpc://d:a2", "grpc://d:b1", "grpc://d:b2"] {
+            assert_eq!(
+                hits.get(decode).copied().unwrap_or(0),
+                30,
+                "{decode}: {hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_two_prefill_cohort_beside_a_one_prefill_cohort_keeps_each_decode_leg_even() {
+        // 2P1D beside 1P2D. Today the prefill policy sees all three prefills,
+        // so the cohorts split 2:1 by prefill count (the decode legs then
+        // carry 120 and 30/30 of 180); weighting cohorts by their bottleneck
+        // leg is a separate change. Whatever the split, a cohort's decodes
+        // must share its traffic evenly and the legs must balance.
+        let registry = pd_registry(&[
+            ("grpc://p:a1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:a2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:b", WorkerType::Prefill, Some("MooncakeConnector")),
+            ("grpc://d:a", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:b1", WorkerType::Decode, Some("MooncakeConnector")),
+            ("grpc://d:b2", WorkerType::Decode, Some("MooncakeConnector")),
+        ]);
+        let hits = hits(&registry, &cohort_policies(), 180);
+        let cohort_a = hits["grpc://p:a1"] + hits["grpc://p:a2"];
+        let cohort_b = hits["grpc://p:b"];
+        assert_eq!(cohort_a + cohort_b, 180, "{hits:?}");
+        assert_eq!(hits["grpc://p:a1"], hits["grpc://p:a2"], "{hits:?}");
+        assert_eq!(hits["grpc://d:a"], cohort_a, "{hits:?}");
+        assert_eq!(hits["grpc://d:b1"], cohort_b / 2, "{hits:?}");
+        assert_eq!(hits["grpc://d:b2"], cohort_b / 2, "{hits:?}");
     }
 
     #[test]

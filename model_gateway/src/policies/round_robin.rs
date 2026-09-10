@@ -1,26 +1,50 @@
 //! Round-robin load balancing policy
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
+
+use dashmap::DashMap;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::worker::Worker;
 
+/// Distinct candidate sets one instance keeps a rotation for before it
+/// starts over; sets come and go with worker health, so this is a bound on
+/// memory, not a limit on fleets.
+const MAX_TRACKED_SETS: usize = 4096;
+
 /// Round-robin selection policy
 ///
 /// Selects workers in sequential order, cycling through all healthy workers.
+/// The rotation is kept per candidate set: one instance serves several sets
+/// (the decode partners of each PD cohort, say), and each set walks its own
+/// workers in turn. A single counter would advance on every call whatever
+/// the set, so its position modulo one set's size would follow how the sets
+/// happen to interleave, pinning each set to a subset of its workers.
 #[derive(Debug, Default)]
 pub struct RoundRobinPolicy {
-    counter: AtomicUsize,
+    counters: DashMap<u64, AtomicUsize>,
 }
 
 impl RoundRobinPolicy {
     pub fn new() -> Self {
         Self {
-            counter: AtomicUsize::new(0),
+            counters: DashMap::new(),
         }
+    }
+
+    /// The identity of a candidate set: its healthy workers, in order.
+    fn set_key(workers: &[Arc<dyn Worker>], healthy: &[usize]) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        for &i in healthy {
+            workers[i].url().hash(&mut hasher);
+        }
+        hasher.finish()
     }
 }
 
@@ -36,8 +60,16 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
             return None;
         }
 
-        // Get and increment counter atomically
-        let count = self.counter.fetch_add(1, Ordering::Relaxed);
+        let key = Self::set_key(workers, &healthy_indices);
+        if !self.counters.contains_key(&key) && self.counters.len() >= MAX_TRACKED_SETS {
+            self.counters.clear();
+        }
+        // Get and increment this set's counter atomically
+        let count = self
+            .counters
+            .entry(key)
+            .or_default()
+            .fetch_add(1, Ordering::Relaxed);
         let selected_idx = count % healthy_indices.len();
 
         Some(healthy_indices[selected_idx])
@@ -48,7 +80,7 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
     }
 
     fn reset(&self) {
-        self.counter.store(0, Ordering::Relaxed);
+        self.counters.clear();
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -193,9 +225,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "even two-pool round-robin coverage")]
-    fn test_shared_counter_fails_even_two_pool_coverage() {
-        // Same even-coverage bar as the independent test; a shared counter must fail it.
+    fn test_one_instance_keeps_each_candidate_set_fair() {
+        // One instance serving two interleaved sets: each set gets its own
+        // rotation, so the interleaving cannot pin a set to some of its
+        // workers (a single counter would give each set only two of four).
         let prefill_workers = make_regular_workers("p", 4);
         let decode_workers = make_regular_workers("d", 4);
         let info = SelectWorkerInfo::default();
@@ -210,6 +243,21 @@ mod tests {
             shared_decode[d] += 1;
         }
         assert_even_two_pool_coverage(shared_prefill, shared_decode);
+    }
+
+    #[test]
+    fn test_a_set_that_shrinks_and_grows_keeps_rotating() {
+        // Health changes the set's identity; both shapes stay fair on their own.
+        let workers = make_regular_workers("w", 3);
+        let info = SelectWorkerInfo::default();
+        let policy = RoundRobinPolicy::new();
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        workers[1].set_status(WorkerStatus::NotReady);
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        assert_eq!(policy.select_worker(&workers, &info), Some(2));
+        workers[1].set_status(WorkerStatus::Ready);
+        assert_eq!(policy.select_worker(&workers, &info), Some(1));
+        assert_eq!(policy.select_worker(&workers, &info), Some(2));
     }
 
     #[test]
