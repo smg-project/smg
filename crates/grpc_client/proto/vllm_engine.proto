@@ -369,6 +369,10 @@ message GetServerInfoResponse {
   int32 block_size = 12;          // cache_config.block_size (0 until the engine resolves it)
   string attention_backend = 13;  // attention_config.backend name, "" when auto-selected
   string model_dtype = 14;        // model_config.dtype ("torch.bfloat16", ...)
+  // Operator-set PD pairing protocol, read from the SMG_PAIRING_PROTOCOL
+  // environment variable of the engine process; "" when unset. A prefill and
+  // a decode carrying one pair only when the values are equal.
+  string pairing_protocol = 15;
 }
 
 // =====================

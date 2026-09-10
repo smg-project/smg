@@ -859,6 +859,9 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
     "kv_cache_dtype",
     "page_size",
     "attention_backend",
+    // The operator's explicit protocol, which the servicer reads from the
+    // engine's SMG_PAIRING_PROTOCOL environment.
+    "pairing_protocol",
 ];
 
 /// Keys worth extracting from TokenSpeed gRPC `server_args` (post-rename: bare
@@ -893,6 +896,7 @@ const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     "disaggregation_bootstrap_port",
     "kv_cache_dtype",
     "attention_backend",
+    "pairing_protocol",
 ];
 
 // ---------------------------------------------------------------------------
@@ -1109,6 +1113,7 @@ mod tests {
                     ("kv_cache_dtype".to_string(), string_value("fp8_e5m2")),
                     ("page_size".to_string(), number_value(64.0)),
                     ("attention_backend".to_string(), string_value("fa3")),
+                    ("pairing_protocol".to_string(), string_value("kv-v1")),
                     // Not in SGLANG_GRPC_KEYS — must not become a label.
                     ("api_key".to_string(), string_value("secret")),
                 ]),
@@ -1152,6 +1157,11 @@ mod tests {
         assert_eq!(
             labels.get("attention_backend").map(String::as_str),
             Some("fa3")
+        );
+        // The explicit protocol the servicer read from the engine's environment.
+        assert_eq!(
+            labels.get("pairing_protocol").map(String::as_str),
+            Some("kv-v1")
         );
     }
 

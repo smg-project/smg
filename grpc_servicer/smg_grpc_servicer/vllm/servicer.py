@@ -52,6 +52,8 @@ from smg_grpc_servicer.vllm.kv_transfer import (
 )
 from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, mm_identity_cache_salt
 
+from ..pd_pairing import pairing_protocol_from_env
+
 logger = init_logger(__name__)
 SAMPLING_DEFAULT_KEYS = (
     "temperature",
@@ -525,6 +527,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             kv_engine_id=kv_engine_id,
             data_parallel_size=parallel.data_parallel_size,
             shm_namespace_id=mm_shm.shm_namespace_id(),
+            pairing_protocol=pairing_protocol_from_env(),
             **pairing_fields(self.engine.vllm_config),
         )
 

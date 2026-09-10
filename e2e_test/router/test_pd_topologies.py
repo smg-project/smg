@@ -840,6 +840,62 @@ class TestPDMismatchedTransport:
 
 
 # ---------------------------------------------------------------------------
+# an explicit pairing protocol injected into the engines
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.engine("sglang", "vllm", "tokenspeed")
+@pytest.mark.gpu(4)
+@pytest.mark.e2e
+@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"])
+@pytest.mark.workers(parallel_start=True)
+@pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=_GATEWAY_ARGS)
+@pytest.mark.parametrize(
+    "setup_backend",
+    [
+        pytest.param(
+            (
+                "pd_grpc",
+                (
+                    1,
+                    1,
+                    {
+                        "prefill_env": {"SMG_PAIRING_PROTOCOL": "kv-v1"},
+                        "decode_env": {"SMG_PAIRING_PROTOCOL": "kv-v2"},
+                    },
+                ),
+            ),
+            id="1p1d-protocol-mismatch",
+        )
+    ],
+    indirect=True,
+)
+class TestPDMismatchedProtocol:
+    """A pairing protocol set in the engine's environment reaches placement.
+
+    A deployment injects ``SMG_PAIRING_PROTOCOL`` into the engine container;
+    the servicer reports it in server info and the gateway pairs on it alone.
+    Two legs with different values are refused with `no_compatible_pd_pair`,
+    whatever their transport and layout say.
+    """
+
+    def test_legs_with_different_protocols_are_refused(self, setup_backend):
+        _, model, _, gateway = setup_backend
+        _wait_for_healthy_workers(gateway, 2, timeout=120.0)
+        keys = _pairing_keys(gateway)
+        logger.info("explicit-protocol fleet pairing keys: %s", keys)
+        by_url = {w.base_url: role for role, ws in _workers_by_role(gateway).items() for w in ws}
+        reported = {by_url.get(url, url): key for url, key in keys.items()}
+        # The explicit value is the whole key: the engine's environment, as
+        # the servicer reported it, replaces runtime/transport/layout.
+        assert reported == {"prefill": "kv-v1", "decode": "kv-v2"}, keys
+
+        resp = _raw_chat(gateway, model, "Say hello.", timeout=60.0)
+        assert resp.status_code == 503, resp.text
+        assert _error_code(resp) == "no_compatible_pd_pair", resp.text
+
+
+# ---------------------------------------------------------------------------
 # a decode window smaller than the burst
 # ---------------------------------------------------------------------------
 

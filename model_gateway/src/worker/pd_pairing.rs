@@ -5,8 +5,11 @@
 //! a KV transport (NIXL vs Mooncake) and a compatible KV layout, and normally
 //! an engine version. Each PD worker carries a [`PdPairing`] derived from the
 //! labels its engine reports at discovery, or from an explicit
-//! `pairing_protocol` the operator sets on the worker; placement pairs a
-//! prefill only with a decode whose descriptor is compatible.
+//! `pairing_protocol` the operator sets: on the worker spec, as a worker
+//! label, or in the engine's own environment (`SMG_PAIRING_PROTOCOL`, which
+//! the gRPC servicers report in server info and so reaches the same label).
+//! Placement pairs a prefill only with a decode whose descriptor is
+//! compatible.
 //! [`PdPairingMode::Lenient`] refuses only a known difference in runtime,
 //! transport or a KV layout fact, so a fleet that reports nothing keeps
 //! working and a rolling engine upgrade keeps pairing;
@@ -19,11 +22,12 @@ use openai_protocol::worker::{RuntimeType, WorkerSpec};
 
 pub use crate::config::types::PdPairingMode;
 
-/// Label under which an operator may set the pairing protocol explicitly,
-/// alongside the `pairing_protocol` field on the worker spec.
+/// Label under which the pairing protocol arrives when it is not on the
+/// worker spec: set by the operator as a worker label, or reported by the
+/// engine's servicer from its `SMG_PAIRING_PROTOCOL` environment. A worker
+/// label wins over the reported value, since config labels are merged over
+/// discovered ones.
 pub const PAIRING_PROTOCOL_LABEL: &str = "pairing_protocol";
-/// The Kubernetes annotation flattened into the same label.
-pub const PAIRING_PROTOCOL_ANNOTATION_LABEL: &str = "smg.ai/pairing-protocol";
 
 /// The KV layout facts engines report: the short name used in the pairing
 /// key, the canonical label, and alias labels (vLLM's `block_size` is the
@@ -85,11 +89,6 @@ impl PdPairing {
             .pairing_protocol
             .as_deref()
             .or_else(|| labels.get(PAIRING_PROTOCOL_LABEL).map(String::as_str))
-            .or_else(|| {
-                labels
-                    .get(PAIRING_PROTOCOL_ANNOTATION_LABEL)
-                    .map(String::as_str)
-            })
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
@@ -345,9 +344,11 @@ mod tests {
         let mut s = spec(RuntimeType::Vllm, &[("version", "0.27.1")]);
         s.pairing_protocol = Some("blue".to_string());
         assert_eq!(PdPairing::derive(&s).key(), "blue");
+        // The label path, which both a worker label and the engine's
+        // SMG_PAIRING_PROTOCOL environment (via server info) arrive through.
         let labelled = spec(
             RuntimeType::Vllm,
-            &[("smg.ai/pairing-protocol", "green"), ("version", "0.1.0")],
+            &[("pairing_protocol", " green "), ("version", "0.1.0")],
         );
         assert_eq!(PdPairing::derive(&labelled).key(), "green");
     }

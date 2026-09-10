@@ -18,6 +18,11 @@ kv_transfer = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(kv_transfer)
 pairing_fields = kv_transfer.pairing_fields
 
+_PAIRING_PATH = Path(__file__).parents[1] / "smg_grpc_servicer" / "pd_pairing.py"
+_pspec = importlib.util.spec_from_file_location("pd_pairing", _PAIRING_PATH)
+pd_pairing = importlib.util.module_from_spec(_pspec)
+_pspec.loader.exec_module(pd_pairing)
+
 
 def _config(**overrides):
     base = {
@@ -67,3 +72,28 @@ def test_pairing_fields_round_trip_the_proto():
     assert parsed.block_size == 16
     assert parsed.attention_backend == "FLASH_ATTN"
     assert parsed.model_dtype == "torch.bfloat16"
+
+
+def test_pairing_protocol_comes_from_the_engine_environment():
+    assert pd_pairing.pairing_protocol_from_env({}) == ""
+    assert pd_pairing.pairing_protocol_from_env({"SMG_PAIRING_PROTOCOL": "  "}) == ""
+    assert pd_pairing.pairing_protocol_from_env({"SMG_PAIRING_PROTOCOL": " kv-v1 "}) == "kv-v1"
+    assert pd_pairing.PAIRING_PROTOCOL_ENV == "SMG_PAIRING_PROTOCOL"
+
+
+def test_pairing_protocol_round_trips_the_vllm_proto():
+    from smg_grpc_proto import vllm_engine_pb2 as pb2
+
+    fields = pb2.GetServerInfoResponse.DESCRIPTOR.fields_by_name
+    if "pairing_protocol" not in fields:
+        pytest.skip(
+            "smg_grpc_proto stubs predate GetServerInfoResponse.pairing_protocol; "
+            "regenerate from crates/grpc_client/proto"
+        )
+    assert fields["pairing_protocol"].number == 15
+    info = pb2.GetServerInfoResponse(
+        pairing_protocol=pd_pairing.pairing_protocol_from_env({"SMG_PAIRING_PROTOCOL": "kv-v1"})
+    )
+    assert (
+        pb2.GetServerInfoResponse.FromString(info.SerializeToString()).pairing_protocol == "kv-v1"
+    )

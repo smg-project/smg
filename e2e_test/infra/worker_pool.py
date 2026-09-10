@@ -72,6 +72,7 @@ class WorkerPool:
         wait_ready: bool = True,
         tp: int | None = None,
         kv_backend: str | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> list[Worker]:
         """Return ``count`` healthy workers for the given key.
 
@@ -120,11 +121,13 @@ class WorkerPool:
                     wait_ready=wait_ready,
                     tp=tp,
                     kv_backend=kv_backend,
+                    extra_env=extra_env,
                 )
 
-            if tp is not None or kv_backend is not None:
+            if tp is not None or kv_backend is not None or extra_env is not None:
                 raise ValueError(
-                    "a per-leg tp or kv_backend is only meaningful for PD prefill/decode workers"
+                    "a per-leg tp, kv_backend or extra_env is only meaningful for "
+                    "PD prefill/decode workers"
                 )
 
             # REGULAR workers always start at gpu 0; ``gpu_offset`` is only

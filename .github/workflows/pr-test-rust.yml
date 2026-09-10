@@ -1061,14 +1061,15 @@ jobs:
       test_timeout: ${{ matrix.test_timeout }}
       test_dirs: e2e_test/router/test_pd_topologies.py
       # The 2p2d slice (which carries the mixed-transport fleet on vLLM), the
-      # runtime-assembled fleet, the over-window burst, and the mismatched
-      # fleet that placement must refuse; the full sweep runs in nightly-pd.
+      # runtime-assembled fleet, the over-window burst, and the two fleets
+      # placement must refuse (mismatched transports, mismatched explicit
+      # protocols); the full sweep runs in nightly-pd.
       # Run 34440725835: 9-16 min of tests per row against the 42/60 budgets.
-      test_filter: ${{ matrix.test_filter || '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport"' }}
+      test_filter: ${{ matrix.test_filter || '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport or MismatchedProtocol"' }}
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
-      # floor ≈ 95% of the slice: 14 cases on sglang/tokenspeed, 16 on vllm
-      # (its two transport classes); the 1p1d smoke selects 12, floor 11
-      min_selected: ${{ matrix.min_selected || 13 }}
+      # floor ≈ 93% of the slice: 15 cases on sglang/tokenspeed, 17 on vllm
+      # (its two transport classes); the 1p1d smoke selects 13, floor 11
+      min_selected: ${{ matrix.min_selected || 14 }}
       kv_backend: ${{ matrix.kv_backend || '' }}
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
       # The mixed-transport fleet needs both vLLM backends installed whatever the lane's own

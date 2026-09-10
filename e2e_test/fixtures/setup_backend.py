@@ -244,7 +244,9 @@ def setup_backend(request: pytest.FixtureRequest):
       - ``("pd_grpc", (n_prefill, n_decode[, prefill_tp, decode_tp]))`` as
         the param: PD counts, optionally with asymmetric per-leg tp; a
         trailing dict may add ``prefill_kv`` / ``decode_kv`` lists naming
-        each worker's KV transfer backend, so one fleet can mix transports
+        each worker's KV transfer backend, so one fleet can mix transports,
+        and ``prefill_env`` / ``decode_env`` dicts of engine environment
+        for one leg (a deployment-injected ``SMG_PAIRING_PROTOCOL``)
       - ``@pytest.mark.gateway(policy=..., timeout=..., extra_args=...)``: Gateway config
 
     Returns:
@@ -309,6 +311,9 @@ def setup_backend(request: pytest.FixtureRequest):
         for key in ("prefill_kv", "decode_kv"):
             if key in leg_options:
                 workers_config = {**workers_config, key: list(leg_options[key])}
+        for key in ("prefill_env", "decode_env"):
+            if key in leg_options:
+                workers_config = {**workers_config, key: dict(leg_options[key])}
     log_dir = os.environ.get("E2E_LOG_DIR") or gateway_config.get("log_dir")
 
     fail_count = _worker_start_failures.get(engine, 0)
@@ -453,6 +458,7 @@ def _start_pd_leg(
     tp,
     kv_backends: list[str] | None,
     extra_engine_args: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> list:
     """Start one PD leg; a per-worker KV backend list starts the workers one by one."""
     if kv_backends is None:
@@ -467,6 +473,7 @@ def _start_pd_leg(
             wait_ready=wait_ready,
             tp=tp,
             extra_engine_args=extra_engine_args,
+            extra_env=extra_env,
         )
     spec_tp = tp or get_model_spec(model_id).get("tp", 1)
     workers: list = []
@@ -484,6 +491,7 @@ def _start_pd_leg(
                 tp=tp,
                 kv_backend=backend,
                 extra_engine_args=extra_engine_args,
+                extra_env=extra_env,
             )
         )
     return workers
@@ -540,6 +548,7 @@ def _setup_pd(
             tp=prefill_tp,
             kv_backends=prefill_kv,
             extra_engine_args=extra_engine_args,
+            extra_env=workers_config.get("prefill_env"),
         )
         all_workers.extend(prefill_workers)
 
@@ -557,6 +566,7 @@ def _setup_pd(
             tp=decode_tp,
             kv_backends=decode_kv,
             extra_engine_args=extra_engine_args,
+            extra_env=workers_config.get("decode_env"),
         )
         all_workers.extend(decode_workers)
         if parallel_start:

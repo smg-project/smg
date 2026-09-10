@@ -63,6 +63,9 @@ class Worker:
     # KV transfer backend for this PD worker ("nixl" or "mooncake"); None
     # takes the lane's default, so one fleet can mix transports.
     kv_backend: str | None = None
+    # Environment for the engine process on top of the infra's own settings
+    # (a deployment-injected SMG_PAIRING_PROTOCOL, for instance).
+    extra_env: dict[str, str] | None = None
     process: subprocess.Popen | None = field(default=None, repr=False)
     _log_file: IO[Any] | None = field(default=None, repr=False)
     # Used memory per GPU just before launch; ``stop`` waits for it to come back.
@@ -594,6 +597,8 @@ class Worker:
                 env["NCCL_SHM_DISABLE"] = "1"
                 env["TLLM_DISABLE_ALLREDUCE_AUTOTUNE"] = "1"
 
+        if self.extra_env:
+            env.update(self.extra_env)
         return env
 
     def _spawn_process(self, cmd: list[str], env: dict[str, str]) -> subprocess.Popen:
@@ -689,6 +694,7 @@ def start_workers(
     extra_engine_args: list[str] | None = None,
     tp: int | None = None,
     kv_backend: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> list[Worker]:
     """Start N workers for a model. GPU IDs assigned sequentially.
 
@@ -774,6 +780,7 @@ def start_workers(
                 extra_engine_args=extra_engine_args,
                 tp=tp,
                 kv_backend=kv_backend,
+                extra_env=extra_env,
             )
 
             # Stagger launches to avoid resource contention

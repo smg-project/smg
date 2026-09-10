@@ -688,8 +688,12 @@ pub struct WorkerSpec {
     pub kv_block_size: Option<usize>,
     /// Explicit PD pairing protocol. A prefill and a decode with this set
     /// pair only when the values are equal, and nothing derived about their
-    /// transport, engine version or KV layout is compared. Absent: the router
-    /// derives the pairing descriptor from the worker's discovered labels.
+    /// transport, engine version or KV layout is compared. The same value
+    /// can arrive as a `pairing_protocol` worker label, or from the engine
+    /// itself: the gRPC servicers report their `SMG_PAIRING_PROTOCOL`
+    /// environment in server info, so a deployment can inject it into the
+    /// engine container. Absent everywhere: the router derives the pairing
+    /// descriptor from the worker's discovered labels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pairing_protocol: Option<String>,
 

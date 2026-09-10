@@ -62,6 +62,8 @@ from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
 from smg_grpc_servicer.sglang.utils import abort_code_from_output, to_token_id_array
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 
+from ..pd_pairing import pairing_protocol_from_env
+
 logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 # Profile round-trips include trace serialization, which can take minutes.
@@ -493,6 +495,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 return str(obj)
 
         serializable_args = make_serializable(server_args_dict)
+        # The operator's PD pairing protocol rides with the server args, so
+        # the gateway reads it as the worker's `pairing_protocol` label.
+        pairing_protocol = pairing_protocol_from_env()
+        if pairing_protocol:
+            serializable_args["pairing_protocol"] = pairing_protocol
         server_args_struct.update(serializable_args)
 
         # Convert scheduler_info to Struct

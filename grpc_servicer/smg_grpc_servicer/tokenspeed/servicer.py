@@ -49,6 +49,8 @@ from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthService
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 from smg_grpc_servicer.tokenspeed.loads import convert_load_to_protobuf, running_window
 
+from ..pd_pairing import pairing_protocol_from_env
+
 if TYPE_CHECKING:
     # Type-only — keeps these out of the cold-path graph when the servicer is
     # imported by tooling that stubs the engine surface.
@@ -581,6 +583,11 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             if isinstance(dp_size, int) and dp_size > 1:
                 server_args_dict["dp_size"] = dp_size
 
+        # The operator's PD pairing protocol rides with the server args, so
+        # the gateway reads it as the worker's `pairing_protocol` label.
+        pairing_protocol = pairing_protocol_from_env()
+        if pairing_protocol:
+            server_args_dict["pairing_protocol"] = pairing_protocol
         server_args_struct = Struct()
         server_args_struct.update(_make_json_serializable(server_args_dict))
 
