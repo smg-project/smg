@@ -363,6 +363,8 @@ impl BasicWorkerBuilder {
         let resilience = self.resilience.unwrap_or_default();
 
         BasicWorker {
+            kv_engine_id: ArcSwapOption::new(metadata.spec.kv_engine_id.clone().map(Arc::new)),
+            kv_engine_id_unconfirmed: AtomicBool::new(false),
             runtime: ArcSwap::from_pointee(WorkerRuntime::new(&metadata.spec.url, initial_status)),
             circuit_breaker: ArcSwap::from_pointee(CircuitBreaker::with_config_and_label(
                 self.circuit_breaker_config,

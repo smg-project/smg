@@ -256,6 +256,30 @@ async fn fetch_vllm_http_metadata(
     labels
 }
 
+/// Re-read the KV transfer engine id a gRPC engine reports, for a PD worker
+/// that came back on the same address (#2491): a restarted engine process
+/// carries a new id, and a handoff minted for the old one strands the decode.
+///
+/// Unlike registration discovery, a server-info failure is an error here
+/// rather than a tolerated gap: the caller must tell a read that did not
+/// complete (retry later) from an engine that reports no id (nothing to
+/// retry).
+pub(crate) async fn discover_grpc_kv_engine_id(
+    url: &str,
+    runtime_type: &str,
+) -> Result<Option<String>, String> {
+    let client = GrpcClient::connect(&grpc_base_url(url), runtime_type)
+        .await
+        .map_err(|e| format!("Failed to connect to gRPC: {e}"))?;
+    let mut labels = client
+        .get_server_info()
+        .await
+        .map_err(|e| format!("Failed to fetch gRPC server info: {e}"))?
+        .to_labels();
+    normalize_grpc_keys(&mut labels);
+    Ok(labels.remove("kv_engine_id").filter(|id| !id.is_empty()))
+}
+
 async fn fetch_grpc_metadata(
     url: &str,
     runtime_type: &str,

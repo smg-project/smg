@@ -254,6 +254,9 @@ class RouterArgs:
     # Seconds a PD dispatch waits for a slot in the decode engine's running
     # window before shedding; 0 sheds immediately
     pd_admission_wait_secs: int = 30
+    enable_rl: bool = False  # Mount the RL control plane under /v1/rl
+    rl_control_timeout_secs: int = 600  # Timeout for one proxied engine control call
+    rl_fanout_concurrency: int = 32  # Max concurrent engine calls in one fan-out
 
     @staticmethod
     def add_cli_args(
@@ -332,6 +335,9 @@ class RouterArgs:
         )
         auth_group = parser.add_argument_group(
             "Control Plane Authentication", "API key and JWT/OIDC authentication"
+        )
+        rl_group = parser.add_argument_group(
+            "RL Control Plane", "Worker discovery and engine-route passthrough for RL training"
         )
 
         if use_router_prefix:
@@ -789,6 +795,23 @@ class RouterArgs:
             f"--{prefix}enable-igw",
             action="store_true",
             help="Enable IGW (Inference-Gateway) mode for multi-model support",
+        )
+        rl_group.add_argument(
+            f"--{prefix}enable-rl",
+            action="store_true",
+            help="Mount the RL control plane under /v1/rl (discovery, passthrough, fan-out)",
+        )
+        rl_group.add_argument(
+            f"--{prefix}rl-control-timeout-secs",
+            type=int,
+            default=RouterArgs.rl_control_timeout_secs,
+            help="Total timeout for one proxied engine control call (default: 600)",
+        )
+        rl_group.add_argument(
+            f"--{prefix}rl-fanout-concurrency",
+            type=int,
+            default=RouterArgs.rl_fanout_concurrency,
+            help="Maximum concurrent engine calls in one fan-out (default: 32)",
         )
 
         # PD/EPD-specific arguments

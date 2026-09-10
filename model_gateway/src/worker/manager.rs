@@ -32,9 +32,9 @@ use crate::{
         metrics_aggregator::{self, MetricPack},
         registry::{WorkerDescriptor, WorkerId},
         worker::WorkerTypeExt,
-        ConnectionMode, Worker, WorkerOrigin, WorkerRegistry, WorkerResult,
+        ConnectionMode, Worker, WorkerOrigin, WorkerRegistry, WorkerResult, WorkerType,
     },
-    workflow::{Job, JobQueue},
+    workflow::{steps::local::discover_grpc_kv_engine_id, Job, JobQueue},
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -492,6 +492,10 @@ fn queue_due_probes(
         in_flight.insert(worker_id.clone());
         probes.push(Box::pin(async move {
             let probe_result = worker.check_health_async().await;
+            if probe_result.is_ok() && engine_id_may_be_stale(launched_status, worker.as_ref()) {
+                let timeout = Duration::from_secs(health_config.timeout_secs.max(1));
+                refresh_kv_engine_id_after_recovery(&worker, timeout).await;
+            }
             ProbeCompletion {
                 worker_id,
                 worker,
@@ -698,6 +702,93 @@ fn schedule_worker_at(
         now,
         immediate,
     );
+}
+
+/// Whether a probe launched at `launched_status` that succeeds should re-read
+/// the worker's KV engine id: after a failure (the engine may be a new
+/// process), while a worker that registered before its engine reported an id
+/// is still pending, or while a Ready worker's last recovery re-read has not
+/// been confirmed. A Draining worker, or a pending one that already has an
+/// id, is the same process registration read.
+fn engine_id_may_be_stale(launched_status: WorkerStatus, worker: &dyn Worker) -> bool {
+    match launched_status {
+        WorkerStatus::Failed | WorkerStatus::NotReady => true,
+        WorkerStatus::Pending => worker.kv_engine_id().is_none(),
+        WorkerStatus::Ready => !worker.kv_engine_id_confirmed(),
+        WorkerStatus::Draining => false,
+    }
+}
+
+/// A PD worker that answers its probe again may be a new engine process on
+/// the same address, with a new KV transfer engine id (#2491); a worker
+/// registered while its engine was still coming up may have none at all.
+/// Re-read the id before the worker is promoted, so the next handoff is
+/// minted for the engine that is actually there. Only gRPC engines report
+/// the id. The read is bounded by the probe timeout: one that fails or
+/// expires keeps the previous id, says so, and is retried on the next probe;
+/// one that completes without an id keeps the previous id and is not
+/// retried. A stale id is a better outcome than a probe slot held forever or
+/// a handoff with no id at all, and an id the engine does report wins over
+/// the spec's: it is the one a handoff must target.
+async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: Duration) {
+    let spec = &worker.metadata().spec;
+    if !matches!(spec.worker_type, WorkerType::Prefill | WorkerType::Decode)
+        || *worker.connection_mode() != ConnectionMode::Grpc
+        || spec.kv_connector.is_none()
+    {
+        return;
+    }
+    let read = tokio::time::timeout(
+        timeout,
+        discover_grpc_kv_engine_id(worker.url(), spec.runtime_type.as_str()),
+    )
+    .await;
+    // A read that did not complete leaves the id unconfirmed, so the next
+    // probe retries instead of the worker serving with a possibly stale id
+    // until its next outage. A completed read confirms it, whether or not
+    // the engine reports an id: there is nothing to retry.
+    worker.set_kv_engine_id_confirmed(false);
+    match read {
+        Ok(Ok(Some(discovered))) => {
+            let previous = worker.kv_engine_id();
+            if worker.refresh_kv_engine_id(Some(discovered.clone())) {
+                info!(
+                    worker_url = %worker.url(),
+                    ?previous,
+                    discovered,
+                    "Recovered PD worker reports a new KV engine id"
+                );
+            }
+            worker.set_kv_engine_id_confirmed(true);
+        }
+        // The engine completed the read and reports no id (a servicer that
+        // predates it, or a connector without one). A known id is kept, never
+        // cleared, and nothing is retried.
+        Ok(Ok(None)) => {
+            match worker.kv_engine_id() {
+                Some(previous) => warn!(
+                    worker_url = %worker.url(),
+                    previous,
+                    "Recovered PD worker reports no KV engine id; keeping the previous one"
+                ),
+                None => debug!(
+                    worker_url = %worker.url(),
+                    "PD worker reports no KV engine id; handoffs carry none"
+                ),
+            }
+            worker.set_kv_engine_id_confirmed(true);
+        }
+        Ok(Err(error)) => warn!(
+            worker_url = %worker.url(),
+            %error,
+            "Could not re-read the KV engine id of a recovered PD worker; keeping the previous one and retrying on the next probe"
+        ),
+        Err(_) => warn!(
+            worker_url = %worker.url(),
+            timeout_secs = timeout.as_secs(),
+            "Re-reading the KV engine id of a recovered PD worker timed out; keeping the previous one and retrying on the next probe"
+        ),
+    }
 }
 
 /// Apply the state machine to a probe outcome. Returns the next status if
@@ -1170,6 +1261,92 @@ mod tests {
         },
     };
 
+    /// The re-read gate: after a failure always, while pending only without
+    /// an id, while Ready only until a re-read has confirmed the id, never
+    /// while draining.
+    #[test]
+    fn the_engine_id_is_re_read_after_a_failure_while_pending_without_one_or_until_confirmed() {
+        let worker = |kv_engine_id: Option<&str>| -> Arc<dyn Worker> {
+            let mut builder = BasicWorkerBuilder::new("grpc://p:1")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("MooncakeConnector");
+            if let Some(id) = kv_engine_id {
+                builder = builder.kv_engine_id(id);
+            }
+            Arc::new(builder.build())
+        };
+        let with_id = worker(Some("eng"));
+        let without_id = worker(None);
+        let unconfirmed = worker(Some("eng"));
+        unconfirmed.set_kv_engine_id_confirmed(false);
+        let cases = [
+            (WorkerStatus::Failed, &with_id, true),
+            (WorkerStatus::NotReady, &with_id, true),
+            (WorkerStatus::Pending, &with_id, false),
+            (WorkerStatus::Pending, &without_id, true),
+            (WorkerStatus::Ready, &with_id, false),
+            (WorkerStatus::Ready, &without_id, false),
+            (WorkerStatus::Ready, &unconfirmed, true),
+            (WorkerStatus::Draining, &unconfirmed, false),
+        ];
+        for (status, worker, expected) in cases {
+            assert_eq!(
+                engine_id_may_be_stale(status, worker.as_ref()),
+                expected,
+                "{status:?} with id {:?}",
+                worker.kv_engine_id()
+            );
+        }
+    }
+
+    /// A recovered worker whose engine accepts the connection but never
+    /// answers the metadata read must not hold the probe slot: the read
+    /// expires and the previous engine id stays (#2491).
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the held connections live for the duration of the test"
+    )]
+    async fn a_hanging_engine_id_read_expires_and_keeps_the_previous_id() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback listener");
+        let port = listener.local_addr().expect("listener address").port();
+        // Accept every connection and never answer on it.
+        let hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    held.push(socket);
+                }
+            }
+        });
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("MooncakeConnector")
+                .kv_engine_id("eng-old")
+                .build(),
+        );
+
+        let started = std::time::Instant::now();
+        refresh_kv_engine_id_after_recovery(&worker, Duration::from_millis(300)).await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the re-read must be bounded by the timeout"
+        );
+        assert_eq!(worker.kv_engine_id().as_deref(), Some("eng-old"));
+        // Not confirmed: a later Ready probe re-reads instead of giving up.
+        assert!(!worker.kv_engine_id_confirmed());
+        assert!(engine_id_may_be_stale(WorkerStatus::Ready, worker.as_ref()));
+        hold.abort();
+    }
+
     use openai_protocol::{
         model_card::ModelCard,
         worker::{HealthCheckConfig, WorkerStatus},
@@ -1177,7 +1354,8 @@ mod tests {
 
     use super::*;
     use crate::worker::{
-        BasicWorkerBuilder, ConnectionMode, Worker, WorkerError, WorkerRegistry, WorkerType,
+        BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerError, WorkerRegistry,
+        WorkerType,
     };
 
     fn make_worker(url: &str, success_threshold: u32, failure_threshold: u32) -> Arc<dyn Worker> {
