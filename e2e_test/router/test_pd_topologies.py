@@ -884,7 +884,7 @@ class TestPDMismatchedProtocol:
         _wait_for_healthy_workers(gateway, 2, timeout=120.0)
         keys = _pairing_keys(gateway)
         logger.info("explicit-protocol fleet pairing keys: %s", keys)
-        by_url = {w.base_url: role for role, ws in _workers_by_role(gateway).items() for w in ws}
+        by_url = {w.url: role for role, ws in _workers_by_role(gateway).items() for w in ws}
         reported = {by_url.get(url, url): key for url, key in keys.items()}
         # The explicit value is the whole key: the engine's environment, as
         # the servicer reported it, replaces runtime/transport/layout.
