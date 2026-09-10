@@ -36,6 +36,8 @@ pip install smg-grpc-servicer[sglang]
 vllm serve meta-llama/Llama-2-7b-hf --grpc
 ```
 
+For the pinned, group-aware cache-event contract, see [Group-aware vLLM KV events](docs/vllm-group-events.md).
+
 ### MLX
 
 ```bash

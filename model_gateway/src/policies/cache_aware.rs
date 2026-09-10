@@ -1144,7 +1144,12 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             // side alone would break every same-namespace match. It stays
             // unpartitioned here; the approximate and hash modes below key
             // under the request's cache namespace.
-            if self.has_event_indexer(model_id) {
+            let has_group_worker = self.kv_monitor.read().as_ref().is_some_and(|m| {
+                healthy_indices
+                    .iter()
+                    .any(|&idx| m.is_group_worker(workers[idx].url()))
+            });
+            if self.has_event_indexer(model_id) || has_group_worker {
                 self.select_worker_event_driven(
                     workers,
                     tokens,
@@ -1436,6 +1441,13 @@ impl CacheAwarePolicy {
     ) -> Option<usize> {
         let guard = self.kv_monitor.read();
         let monitor = guard.as_ref()?;
+        if info.cache_namespace.is_some()
+            && healthy_indices
+                .iter()
+                .any(|&idx| monitor.is_group_worker(workers[idx].url()))
+        {
+            return self.select_expected_wait(workers, healthy_indices, info);
+        }
         let indexer = monitor.get_indexer(model_id)?;
 
         // Per-model block_size: learned from events > config default
@@ -1450,13 +1462,14 @@ impl CacheAwarePolicy {
             waiting_prefill_tokens: waiting_prefill_tokens.as_deref(),
         };
 
-        let candidates = Self::overlap_candidates(
+        let candidates = Self::overlap_candidates_with_groups(
             workers,
             tokens,
             healthy_indices,
             &indexer,
             block_size,
             &tuning,
+            Some(monitor),
         );
         let affinity_candidates =
             Self::affinity_score_group(&candidates, tuning.selection_temperature);
@@ -1498,6 +1511,7 @@ impl CacheAwarePolicy {
     /// at temperature zero; a softmax-sampled group otherwise), and
     /// `select_final_from_affinity` uses LeastLoad to choose and credit one
     /// final worker from that group. An empty result means no full-block overlap.
+    #[cfg(test)]
     fn overlap_candidates(
         workers: &[Arc<dyn Worker>],
         tokens: &[u32],
@@ -1506,31 +1520,56 @@ impl CacheAwarePolicy {
         block_size: usize,
         tuning: &OverlapTuning<'_>,
     ) -> Vec<OverlapCandidate> {
+        Self::overlap_candidates_with_groups(
+            workers,
+            tokens,
+            healthy_indices,
+            indexer,
+            block_size,
+            tuning,
+            None,
+        )
+    }
+
+    fn overlap_candidates_with_groups(
+        workers: &[Arc<dyn Worker>],
+        tokens: &[u32],
+        healthy_indices: &[usize],
+        indexer: &PositionalIndexer,
+        block_size: usize,
+        tuning: &OverlapTuning<'_>,
+        monitor: Option<&KvEventMonitor>,
+    ) -> Vec<OverlapCandidate> {
         let content_hashes = compute_request_content_hashes(tokens, block_size);
-        if content_hashes.is_empty() {
+        if content_hashes.is_empty() && monitor.is_none() {
             return Vec::new();
         }
 
         let overlap = indexer.find_matches(&content_hashes, false);
-        if overlap.scores.is_empty() {
-            return Vec::new();
-        }
 
         // Gather the positive-overlap candidates once; both selection modes
         // and the decay's fleet-floor computation need the full set.
         let mut candidates: Vec<OverlapCandidate> = Vec::new();
         for &idx in healthy_indices {
-            let Some(score) = indexer
-                .worker_id(workers[idx].url())
-                .and_then(|id| overlap.scores.get(&id))
-                .copied()
-                .filter(|&s| s > 0)
-            else {
+            let score = if let Some(hit) =
+                monitor.and_then(|m| m.group_reusable_tokens(workers[idx].url(), tokens))
+            {
+                // Normalize reported group boundaries to the legacy block
+                // scale so load decay remains comparable across the fleet.
+                hit.map(|tokens| tokens as f64 / block_size as f64)
+            } else {
+                indexer
+                    .worker_id(workers[idx].url())
+                    .and_then(|id| overlap.scores.get(&id))
+                    .copied()
+                    .map(f64::from)
+            };
+            let Some(score) = score.filter(|&s| s > 0.0) else {
                 continue;
             };
             candidates.push(OverlapCandidate {
                 idx,
-                effective_score: f64::from(score),
+                effective_score: score,
             });
         }
         if candidates.is_empty() {
@@ -1540,7 +1579,7 @@ impl CacheAwarePolicy {
         Self::apply_overlap_decay(
             workers,
             &mut candidates,
-            content_hashes.len(),
+            content_hashes.len().max(1),
             block_size,
             tuning,
         );
@@ -4302,6 +4341,51 @@ mod tests {
     }
 
     // -- select_worker_event_driven integration tests --
+
+    #[test]
+    fn group_events_select_common_resume_point_across_two_workers() {
+        use prost::Message;
+        use smg_grpc_client::common_proto::KvEventBatch;
+        let data: serde_json::Value =
+            serde_json::from_str(include_str!("../worker/fixtures/vllm-group-events.json"))
+                .unwrap();
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://worker-a", "http://worker-b"]);
+        policy.init_workers(&workers);
+        update_expected_wait_loads(&policy, &workers, &[0, 0]);
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        monitor
+            .indexers
+            .insert("unknown".into(), Arc::new(PositionalIndexer::new(4)));
+        let rows = data["workers"].as_array().unwrap();
+        let apply = |row: &serde_json::Value| {
+            let bytes: Vec<u8> = serde_json::from_value(row["batch"].clone()).unwrap();
+            let batch = KvEventBatch::decode(bytes.as_slice()).unwrap();
+            monitor.test_group_batch(
+                &format!("http://{}", row["worker"].as_str().unwrap()),
+                &batch,
+            );
+        };
+        apply(&rows[0]);
+        apply(&rows[1]);
+        policy.set_kv_event_monitor(Some(Arc::clone(&monitor)));
+        let tokens: Vec<u32> = serde_json::from_value(data["request_tokens"].clone()).unwrap();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        assert_eq!(
+            monitor.group_reusable_tokens(workers[0].url(), &tokens),
+            Some(Some(24))
+        );
+        assert_eq!(
+            monitor.group_reusable_tokens(workers[1].url(), &tokens),
+            Some(Some(16))
+        );
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        apply(&rows[2]); // The full-attention block remains; Mamba checkpoint is gone.
+        assert_eq!(policy.select_worker(&workers, &info), Some(1));
+    }
 
     #[test]
     fn event_unique_hit_keeps_affinity_and_credits_expected_wait() {
