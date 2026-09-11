@@ -346,11 +346,13 @@ impl StreamingProcessor {
         let think_in_prefill = tokenizer.think_in_prefill();
 
         // Check if JSON schema constraint was used (specific function or required mode)
-        let has_structural_tag = self
-            .tool_parser_factory
-            .registry()
-            .has_structural_tag_for_parser(tool_parser_name.as_deref());
-        let used_json_schema = if has_structural_tag {
+        let native_tool_format = utils::uses_native_chat_tool_format(
+            &self.tool_parser_factory,
+            tool_parser_name.as_deref(),
+            original_request.tools.as_deref().unwrap_or_default(),
+            original_request.tool_choice.as_ref(),
+        );
+        let used_json_schema = if native_tool_format {
             false
         } else {
             match tool_choice {

@@ -258,32 +258,35 @@ pub(crate) async fn prepare_chat_like(
         }
 
         // Step 4: Build tool constraints if needed
-        // The tool parser registry handles both structural tag (for native format
-        // parsers like Mistral, KimiK2) and generic JSON schema fallback.
-        let tool_call_constraint = if let (Some(tools), Some(tool_choice)) =
-            (body_ref.tools.as_ref(), request.tool_choice.as_ref())
-        {
-            ctx.components
-                .tool_parser_factory
-                .registry()
-                .generate_tool_constraint(
-                    ctx.components
-                        .parser_resolver
-                        .tool_parser(&request.model)
-                        .as_deref(),
-                    tools,
-                    tool_choice,
+        let enable_thinking = utils::resolve_user_thinking(
+            request.chat_template_kwargs.as_ref(),
+            request.reasoning_effort.as_deref(),
+            tokenizer.as_ref(),
+        )
+        .unwrap_or(true);
+        let tool_call_constraint = ctx
+            .components
+            .tool_parser_factory
+            .registry()
+            .generate_chat_constraint(
+                ctx.components
+                    .parser_resolver
+                    .tool_parser(&request.model)
+                    .as_deref(),
+                body_ref.tools.as_deref().unwrap_or_default(),
+                request
+                    .tool_choice
+                    .as_ref()
+                    .unwrap_or(&ToolChoice::Value(ToolChoiceValue::Auto)),
+                enable_thinking,
+            )
+            .map_err(|e| {
+                error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
+                error::bad_request(
+                    "invalid_tool_configuration",
+                    format!("Invalid tool configuration: {e}"),
                 )
-                .map_err(|e| {
-                    error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
-                    error::bad_request(
-                        "invalid_tool_configuration",
-                        format!("Invalid tool configuration: {e}"),
-                    )
-                })?
-        } else {
-            None
-        };
+            })?;
 
         let preserve_reasoning_special_tokens = request.separate_reasoning
             && utils::reasoning_parser_requires_special_tokens(
