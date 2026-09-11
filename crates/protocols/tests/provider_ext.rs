@@ -629,13 +629,26 @@ fn non_k3_kimi_models_keep_openai_sampling() {
         bare.normalize();
         assert_eq!(bare.temperature, None, "{model}");
         assert_eq!(bare.top_p, None, "{model}");
+        // The dynamic-tools role rule stays profile-wide.
+        assert!(
+            error_codes(&request_with_tools_on_role(model, "user"))
+                .iter()
+                .any(|c| c == "tools_role_restricted"),
+            "{model} must keep the tools role rule"
+        );
     }
 }
 
 #[test]
 fn k3_ids_in_paths_and_prefixes_get_the_sampling_pins() {
     use openai_protocol::validated::Normalizable;
-    for model in ["/models/Kimi-K3", "moonshotai/kimi-k3", "KIMI-K3-thinking"] {
+    for model in [
+        "/models/Kimi-K3",
+        "moonshotai/kimi-k3",
+        "KIMI-K3-thinking",
+        "kimi_k3",
+        "moonshotai/Kimi_K3",
+    ] {
         let mut req = sampling_request(model, json!({}));
         req.normalize();
         assert_eq!(req.temperature, Some(1.0), "{model}");
