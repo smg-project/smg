@@ -68,9 +68,9 @@ if [ ! -w "${APT_ROOT}/apt.conf.d" ]; then
 fi
 
 reachable() {
-    local url="$1" rest host base status
+    local url="$1" suite="${2:-${codename}}" rest host base status
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --max-time 10 -o /dev/null "${url}/dists/${codename}/InRelease"
+        curl -fsSL --max-time 10 -o /dev/null "${url}/dists/${suite}/InRelease"
         return
     fi
     # A bare base image (docker build bootstrap) has no curl yet: speak just
@@ -86,7 +86,7 @@ reachable() {
         exec 3<>"/dev/tcp/$1/80" || exit 1
         printf "HEAD %s HTTP/1.0\r\nHost: %s\r\n\r\n" "$2" "$1" >&3
         IFS= read -r line <&3 && printf "%s" "${line}"
-    ' _ "${host}" "${base}/dists/${codename}/InRelease" 2>/dev/null)" || return 1
+    ' _ "${host}" "${base}/dists/${suite}/InRelease" 2>/dev/null)" || return 1
     case "${status}" in
         *" 200 "*) return 0 ;;
         *) return 1 ;;
@@ -107,22 +107,23 @@ source_files=("${APT_ROOT}/sources.list" "${APT_ROOT}"/sources.list.d/*.list "${
 current="$(cat "${source_files[@]}" 2>/dev/null | grep -Eo "${pattern}" | grep -vE '://(archive|security)\.ubuntu\.com/' | head -n 1 || true)"
 current="${current%/}"
 
+# The rewrite folds the security lines into the chosen host, so it has to
+# serve the security pocket as well as the release.
+serves_both() {
+    reachable "$1" && reachable "$1" "${codename}-security"
+}
+
 chosen=""
-if [ -n "${current}" ] && reachable "${current}"; then
+if [ -n "${current}" ] && serves_both "${current}"; then
     chosen="${current}"
 fi
 for mirror in "${MIRRORS[@]}"; do
     [ -z "${chosen}" ] || break
-    if ! reachable "${mirror}"; then
-        log "${mirror} did not answer"
-        continue
+    if serves_both "${mirror}"; then
+        chosen="${mirror}"
+    else
+        log "${mirror} did not answer for ${codename} and ${codename}-security"
     fi
-    # The main archive is two origins; keeping it means both must answer.
-    if [ "${mirror}" = "${MAIN_ARCHIVE}" ] && ! reachable "${SECURITY_ARCHIVE}"; then
-        log "${SECURITY_ARCHIVE} did not answer"
-        continue
-    fi
-    chosen="${mirror}"
 done
 
 # The marker records the outcome; "none" makes the next call probe again.
@@ -144,7 +145,11 @@ if [ -z "${chosen}" ]; then
     log "no mirror answered; leaving apt sources alone"
     exit 0
 fi
-if [ "${chosen}" = "${MAIN_ARCHIVE}" ] && [ -z "${current}" ]; then
+# Sources already on the main archive stay as they are, provided the
+# separate security origin answers too; if it does not, the rewrite below
+# moves the security lines onto the main archive, which serves that pocket.
+if [ "${chosen}" = "${MAIN_ARCHIVE}" ] && [ -z "${current}" ] \
+    && reachable "${SECURITY_ARCHIVE}" "${codename}-security"; then
     write_conf "${chosen}"
     log "main archive answers; leaving apt sources alone"
     exit 0
