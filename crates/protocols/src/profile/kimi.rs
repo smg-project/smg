@@ -1,4 +1,8 @@
 //! Kimi/Moonshot contract rules (Kimi-Vendor-Verifier).
+//!
+//! The sampling rules are K3's alone; other Kimi and Moonshot models keep
+//! OpenAI's ranges. Only requests entering through `ValidatedJson` reach
+//! these rules; the Responses conversion builds its chat request without them.
 
 use crate::{
     chat::{ChatCompletionRequest, ChatMessage},
@@ -9,8 +13,8 @@ use crate::{
 /// applied when the client omits the field so a self-hosted engine does not
 /// substitute its own. `max_tokens` is left to the engine: the manual's
 /// documented default is inconsistent (262144 vs 32768).
-const DEFAULT_TEMPERATURE: f32 = 1.0;
-const DEFAULT_TOP_P: f32 = 0.95;
+const DEFAULT_TEMPERATURE: f32 = TEMPERATURES[2];
+const DEFAULT_TOP_P: f32 = TOP_P;
 
 /// Sampling values the verifier requires accepted (KVV tests/params
 /// IMMUTABLE_PARAMS, thinking and non-thinking sets combined); anything else
@@ -20,6 +24,9 @@ const TEMPERATURES: [f32; 3] = [0.0, 0.6, 1.0];
 const TOP_P: f32 = 0.95;
 
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
+    if !is_k3(&req.model) {
+        return;
+    }
     req.temperature.get_or_insert(DEFAULT_TEMPERATURE);
     req.top_p.get_or_insert(DEFAULT_TOP_P);
     req.presence_penalty.get_or_insert(0.0);
@@ -37,7 +44,9 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
 /// function messages capture no such key, so serde drops it there as it
 /// always did.
 pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
-    validate_sampling(req)?;
+    if is_k3(&req.model) {
+        validate_sampling(req)?;
+    }
     for msg in &req.messages {
         let (code, role, message) = match msg {
             ChatMessage::User { ext, .. } if ext.tools.is_some() => {
@@ -67,6 +76,15 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
 
 fn is_malformed(tools: Option<&DeclaredTools>) -> bool {
     matches!(tools, Some(DeclaredTools::Malformed(_)))
+}
+
+/// Whether a model id names Kimi K3, the only Kimi model with pinned sampling.
+fn is_k3(model: &str) -> bool {
+    model.split('/').any(|segment| {
+        segment
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("kimi-k3"))
+    })
 }
 
 /// Immutable sampling parameters: the contract fixes them, so any other value
