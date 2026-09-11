@@ -63,15 +63,29 @@ impl ProviderProfile {
     /// field never reaches a backend or a chat template. Runs before
     /// validation and template rendering on every entry point. Only
     /// message-level extension structs are covered; see the module docs.
+    /// Dropped extensions are logged once per request.
     pub fn normalize_chat(self, req: &mut ChatCompletionRequest) {
+        let mut dropped: Vec<&'static str> = Vec::new();
         for message in &mut req.messages {
-            match message {
-                ChatMessage::System { ext, .. } => retain_if(ext, self, "system"),
-                ChatMessage::User { ext, .. } => retain_if(ext, self, "user"),
-                ChatMessage::Assistant { ext, .. } => retain_if(ext, self, "assistant"),
-                ChatMessage::Developer { ext, .. } => retain_if(ext, self, "developer"),
-                ChatMessage::Tool { .. } | ChatMessage::Function { .. } => {}
-            }
+            let role = match message {
+                ChatMessage::System { ext, .. } => retain_if(ext, self).then_some("system"),
+                ChatMessage::User { ext, .. } => retain_if(ext, self).then_some("user"),
+                ChatMessage::Assistant { ext, .. } => retain_if(ext, self).then_some("assistant"),
+                ChatMessage::Developer { ext, .. } => retain_if(ext, self).then_some("developer"),
+                ChatMessage::Tool { .. } | ChatMessage::Function { .. } => None,
+            };
+            dropped.extend(role);
+        }
+        if !dropped.is_empty() {
+            // One line per request rather than per message: the path is client
+            // controlled, and the model id is what makes a miss diagnosable.
+            tracing::warn!(
+                model = %req.model,
+                active = ?self,
+                dropped = dropped.len(),
+                roles = %dropped.join(","),
+                "dropped message extensions that belong to another provider's profile"
+            );
         }
     }
 

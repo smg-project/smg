@@ -33,19 +33,14 @@ pub trait ProviderExt: Default + PartialEq {
     }
 }
 
-/// Keep `ext` only when `active` is the profile it belongs to. Dropping a
-/// populated extension is logged: a model id that profile selection did not
-/// recognise is the usual cause, and a field that vanishes silently is hard
-/// to diagnose.
-pub fn retain_if<E: ProviderExt>(ext: &mut E, active: ProviderProfile, role: &str) {
+/// Keep `ext` only when `active` is the profile it belongs to. Returns
+/// whether a populated extension was dropped, so the caller can report it
+/// once per request: a model id that profile selection did not recognise is
+/// the usual cause, and a field that vanishes silently is hard to diagnose.
+pub fn retain_if<E: ProviderExt>(ext: &mut E, active: ProviderProfile) -> bool {
     if E::PROFILE == active || ext.is_empty() {
-        return;
+        return false;
     }
-    tracing::warn!(
-        role,
-        owner = ?E::PROFILE,
-        active = ?active,
-        "dropping a message extension that belongs to another provider's profile"
-    );
     ext.clear();
+    true
 }

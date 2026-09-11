@@ -29,7 +29,9 @@ pub struct KimiAssistantExt {
     pub tools: Option<Vec<Tool>>,
 }
 
-/// See [`KimiUserExt`].
+/// Dynamic-tool declaration on developer messages, handled like
+/// [`KimiSystemExt`]: the OpenAI spec defines `developer` as the successor of
+/// `system`, and this crate reads the two roles the same way.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct KimiDeveloperExt {
     #[serde(skip_serializing_if = "Option::is_none")]
