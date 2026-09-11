@@ -630,6 +630,31 @@ fn minimax_profile_rejects_unanswered_tool_calls() {
 }
 
 #[test]
+fn long_tool_histories_validate_in_linear_time() {
+    // 100k calls answered in reverse order: quadratic bookkeeping took
+    // seconds here, linear bookkeeping takes milliseconds.
+    let n = 100_000;
+    let calls: Vec<Value> = (0..n).map(|i| tool_call(&format!("call_{i}"))).collect();
+    let mut messages = vec![
+        json!({"role": "user", "content": "go"}),
+        json!({"role": "assistant", "content": null, "tool_calls": calls}),
+    ];
+    messages.extend(
+        (0..n)
+            .rev()
+            .map(|i| json!({"role": "tool", "tool_call_id": format!("call_{i}"), "content": "ok"})),
+    );
+    let req = history_request("MiniMax-M3", Value::Array(messages));
+    let start = std::time::Instant::now();
+    assert!(req.validate().is_ok(), "{:?}", error_codes(&req));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "took {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
 fn minimax_profile_rejects_reused_tool_call_ids_across_turns() {
     // Both calls are answered, so only conversation-wide uniqueness catches it.
     let req = history_request(
