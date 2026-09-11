@@ -6,8 +6,9 @@
 //! `patch_size * merge_size` grid, patchified into a flat
 //! `[total_patches, channels * temporal_patch_size * patch_size^2]` tensor
 //! alongside an `image_grid_thw` triple. vLLM's M3 vision tower consumes exactly
-//! that layout, so this processor wraps the shared [`QwenVLProcessorBase`] and
-//! only supplies M3's own parameters.
+//! that layout, so this processor wraps the shared [`QwenVLProcessorBase`],
+//! supplies M3's own parameters, and raises images below M3's short-side floor
+//! before delegating.
 //!
 //! # MiniMax-M3 parameters
 //!
@@ -18,6 +19,9 @@
 //! - min_pixels: 3,136 (4 * 28 * 28)
 //! - max_pixels: 451,584 (576 * 28 * 28) — matches `image_seq_length: 576`
 //! - video max_pixels: 602,112 (768 * 28 * 28)
+//! - min short side: 112 px (images below it are raised first; video frames are not);
+//!   past roughly 36:1 the raised image overshoots max_pixels, so the grid is its uniform
+//!   scale-down and the short side ends below 112 again
 //! - normalization: CLIP mean/std
 //!
 //! The bounds differ from Qwen2-VL's (200,704 / 1,003,520), so M3 cannot simply
@@ -25,7 +29,7 @@
 
 use std::ops::Deref;
 
-use image::DynamicImage;
+use image::{imageops::FilterType, DynamicImage};
 
 use super::{
     qwen2_vl::{CLIP_MEAN, CLIP_STD},
@@ -36,7 +40,7 @@ use crate::{
     vision::{
         preprocessor_config::PreProcessorConfig,
         processor::{PreprocessedEncoderInputs, VisionPreProcessor},
-        transforms::TransformError,
+        transforms::{pil_to_filter, resize, resize_bicubic_pil, TransformError},
     },
 };
 
@@ -61,6 +65,16 @@ pub const DEFAULT_MAX_PIXELS: usize = 576 * 28 * 28;
 
 /// Default maximum pixels per video frame (768 * 28 * 28 = 602,112).
 pub const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 28 * 28;
+
+/// Short side floor in pixels, four patch factors; smaller images are scaled up to it first.
+const MIN_SHORT_SIDE: u32 = 112;
+
+/// The base's aspect-ratio guard (`smart_resize` in qwen_vl_base.rs), which a staged image must
+/// satisfy too; keep the two in step.
+const MAX_ASPECT_RATIO: f64 = 200.0;
+
+/// How far over the pixel budget a shrunk staging image lands, so the base still scales it down.
+const STAGING_OVERSHOOT: f64 = 1.25;
 
 /// The config block holding M3's merge parameters.
 const COMPRESSION_CONFIG_KEY: &str = "img_token_compression_config";
@@ -215,6 +229,110 @@ impl MiniMaxM3VisionProcessor {
     fn for_request(&self, config: &PreProcessorConfig) -> Result<Self, TransformError> {
         self.layered_over(config)
     }
+
+    /// Dimensions with the short side raised to [`MIN_SHORT_SIDE`]; `None` if at it or zero.
+    fn raised_dimensions(width: u32, height: u32) -> Option<(u32, u32)> {
+        let short = width.min(height);
+        if short == 0 || short >= MIN_SHORT_SIDE {
+            return None;
+        }
+        let long = (f64::from(width.max(height)) * f64::from(MIN_SHORT_SIDE) / f64::from(short))
+            .round() as u32;
+        Some(if width <= height {
+            (MIN_SHORT_SIDE, long)
+        } else {
+            (long, MIN_SHORT_SIDE)
+        })
+    }
+
+    /// Dimensions to hand the base for an image below the floor; `None` if it is at the floor.
+    ///
+    /// Within the pixel budget that is the raised image itself. Above it the
+    /// base's own target is staged when the base would hand it back unchanged
+    /// (one resample, at most the budget). Otherwise, for a very thin image or
+    /// a lowered budget, the raised image is shrunk to just over the budget,
+    /// which trades about a percent of grid fidelity for the bound.
+    fn staging_dimensions(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<(u32, u32)>, TransformError> {
+        let Some((raised_w, raised_h)) = Self::raised_dimensions(width, height) else {
+            return Ok(None);
+        };
+        let (target_h, target_w) = self
+            .inner
+            .smart_resize(raised_h as usize, raised_w as usize)?;
+        let budget = self.inner.max_pixels();
+        if raised_w as usize * raised_h as usize <= budget {
+            return Ok(Some((raised_w, raised_h)));
+        }
+        let target_fits = target_w * target_h <= budget
+            && aspect_ratio(target_w, target_h) <= MAX_ASPECT_RATIO
+            && self.inner.smart_resize(target_h, target_w)? == (target_h, target_w);
+        if target_fits {
+            return Ok(Some((target_w as u32, target_h as u32)));
+        }
+        let shrink = (f64::from(raised_w) * f64::from(raised_h)
+            / (budget as f64 * STAGING_OVERSHOOT))
+            .sqrt();
+        // Round the short side up and the long side down so the ratio stays inside the guard.
+        let shrunk = |side: u32, short: bool| {
+            let scaled = f64::from(side) / shrink;
+            if short { scaled.ceil() } else { scaled.floor() }.max(1.0) as u32
+        };
+        let (w, h) = if raised_w <= raised_h {
+            (shrunk(raised_w, true), shrunk(raised_h, false))
+        } else {
+            (shrunk(raised_w, false), shrunk(raised_h, true))
+        };
+        let over_budget = w as usize * h as usize > budget;
+        if over_budget && aspect_ratio(w as usize, h as usize) <= MAX_ASPECT_RATIO {
+            Ok(Some((w, h)))
+        } else {
+            Ok(Some((raised_w, raised_h)))
+        }
+    }
+
+    /// Stage every image below the floor, or `None` when none needs it so the batch stays borrowed.
+    ///
+    /// Otherwise the whole batch is copied, not just the staged images, so the base gets one slice.
+    fn raise_images(
+        &self,
+        images: &[DynamicImage],
+        config: &PreProcessorConfig,
+    ) -> Result<Option<Vec<DynamicImage>>, TransformError> {
+        let below_floor =
+            |image: &DynamicImage| Self::raised_dimensions(image.width(), image.height()).is_some();
+        if !config.do_resize.unwrap_or(true) || !images.iter().any(below_floor) {
+            return Ok(None);
+        }
+        // Vet every image first so an off-contract input is rejected before any pixel work.
+        for image in images {
+            self.inner
+                .smart_resize(image.height() as usize, image.width() as usize)?;
+        }
+        // The base's grid stage picks its kernel the same way, so both stages use one filter.
+        let filter = pil_to_filter(config.resampling.or(Some(3)));
+        let mut staged = Vec::with_capacity(images.len());
+        for image in images {
+            staged.push(
+                match self.staging_dimensions(image.width(), image.height())? {
+                    Some((width, height)) if filter == FilterType::CatmullRom => {
+                        resize_bicubic_pil(image, width, height)
+                    }
+                    Some((width, height)) => resize(image, width, height, filter),
+                    None => image.clone(),
+                },
+            );
+        }
+        Ok(Some(staged))
+    }
+}
+
+/// Long side over short side.
+fn aspect_ratio(a: usize, b: usize) -> f64 {
+    a.max(b) as f64 / a.min(b).max(1) as f64
 }
 
 impl Deref for MiniMaxM3VisionProcessor {
@@ -239,7 +357,17 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         images: &[DynamicImage],
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        self.for_request(config)?.inner.preprocess(images, config)
+        let layered = self.for_request(config)?;
+        let Some(raised) = layered.raise_images(images, config)? else {
+            return layered.inner.preprocess(images, config);
+        };
+        let mut out = layered.inner.preprocess(&raised, config)?;
+        // Report the caller's sizes, not the raised ones.
+        out.item_sizes = images
+            .iter()
+            .map(|image| (image.width(), image.height()))
+            .collect();
+        Ok(out)
     }
 
     fn preprocess_video(
@@ -265,10 +393,14 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
     fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
         // Infallible signature: a malformed config surfaces on the preprocess
         // call, so fall back to this processor's own settings here.
-        self.for_request(config)
-            .unwrap_or_else(|_| self.clone())
-            .inner
-            .calculate_num_tokens(width, height, config)
+        let layered = self.for_request(config).unwrap_or_else(|_| self.clone());
+        let staged = config
+            .do_resize
+            .unwrap_or(true)
+            .then(|| layered.staging_dimensions(width, height).ok().flatten())
+            .flatten();
+        let (width, height) = staged.unwrap_or((width, height));
+        layered.inner.calculate_num_tokens(width, height, config)
     }
 
     fn model_name(&self) -> &'static str {
@@ -455,6 +587,329 @@ mod tests {
             .preprocess_video(&frames, &config)
             .expect("M3 supports video preprocessing");
         assert!(!out.feature_token_counts.is_empty());
+    }
+
+    #[test]
+    fn short_sides_below_the_floor_are_raised_before_the_patch_grid() {
+        let processor = MiniMaxM3VisionProcessor::new();
+        let config = m3_config();
+        // 400x40 is raised to 1120x112: an 8x80 patch grid, 160 tokens after the 2x2 merge.
+        assert_eq!(processor.calculate_num_tokens(400, 40, &config), 160);
+        assert_eq!(processor.calculate_num_tokens(40, 400, &config), 160);
+        // A short side already at the floor is left alone.
+        assert_eq!(processor.calculate_num_tokens(400, 112, &config), 56);
+    }
+
+    #[test]
+    fn raised_dimensions_raise_only_short_sides_below_the_floor() {
+        assert_eq!(
+            MiniMaxM3VisionProcessor::raised_dimensions(400, 40),
+            Some((1120, 112))
+        );
+        assert_eq!(
+            MiniMaxM3VisionProcessor::raised_dimensions(40, 400),
+            Some((112, 1120))
+        );
+        assert_eq!(
+            MiniMaxM3VisionProcessor::raised_dimensions(50, 50),
+            Some((112, 112))
+        );
+        assert_eq!(
+            MiniMaxM3VisionProcessor::raised_dimensions(112, 20),
+            Some((627, 112))
+        );
+        assert_eq!(MiniMaxM3VisionProcessor::raised_dimensions(112, 400), None);
+        assert_eq!(MiniMaxM3VisionProcessor::raised_dimensions(0, 40), None);
+    }
+
+    #[test]
+    fn tokens_do_not_decrease_as_the_short_side_shrinks_within_the_pixel_budget() {
+        // At a fixed long side, shrinking the short side below the floor raises
+        // it by a larger factor, so the token count must not decrease while the
+        // raised image still fits max_pixels (the verifier's 10_16 band).
+        let processor = MiniMaxM3VisionProcessor::new();
+        let config = m3_config();
+        let tokens: Vec<usize> = [90, 40, 20]
+            .into_iter()
+            .map(|short| processor.calculate_num_tokens(400, short, &config))
+            .collect();
+        assert_eq!(tokens, vec![72, 160, 320]);
+    }
+
+    #[test]
+    fn past_the_pixel_budget_the_uniform_clamp_wins() {
+        // Beyond roughly 36:1 the raised image overshoots max_pixels, so the
+        // base scales it down uniformly and the short side ends below 112
+        // again, as the reference processor does; monotonicity is not kept.
+        let processor = MiniMaxM3VisionProcessor::new();
+        let config = m3_config();
+        let tokens: Vec<usize> = [20, 10, 5]
+            .into_iter()
+            .map(|short| processor.calculate_num_tokens(400, short, &config))
+            .collect();
+        assert_eq!(tokens, vec![320, 453, 428]);
+    }
+
+    fn gradient(width: u32, height: u32) -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([(x % 256) as u8, (y * 6 % 256) as u8, ((x + y) % 256) as u8])
+        }))
+    }
+
+    #[test]
+    fn the_raise_uses_the_requests_resample_filter() {
+        // With `resample` = nearest, the wrapper's stage must produce the
+        // pixels the base would get from a nearest-neighbour raise, and they
+        // must differ from the bicubic ones.
+        let processor = MiniMaxM3VisionProcessor::new();
+        let image = gradient(400, 40);
+        let mut nearest = m3_config();
+        nearest.resampling = Some(0);
+        let mut bicubic = m3_config();
+        bicubic.resampling = Some(3);
+
+        let via_wrapper = processor
+            .preprocess(std::slice::from_ref(&image), &nearest)
+            .unwrap();
+        let staged = resize(&image, 1120, 112, FilterType::Nearest);
+        let via_base = processor.inner.preprocess(&[staged], &nearest).unwrap();
+        assert_eq!(via_wrapper.encoder_input, via_base.encoder_input);
+
+        let via_bicubic = processor.preprocess(&[image], &bicubic).unwrap();
+        assert_ne!(via_wrapper.encoder_input, via_bicubic.encoder_input);
+    }
+
+    #[test]
+    fn do_resize_false_skips_the_raise() {
+        // The caller asked for no resizing, so the floor does not apply and
+        // the base rejects the off-grid buffer exactly as it did before.
+        let processor = MiniMaxM3VisionProcessor::new();
+        let mut config = m3_config();
+        config.do_resize = Some(false);
+        assert!(processor
+            .preprocess(&[DynamicImage::new_rgb8(400, 40)], &config)
+            .is_err());
+        assert_eq!(processor.calculate_num_tokens(400, 40, &config), 14);
+    }
+
+    #[test]
+    fn staged_images_stay_near_the_pixel_budget() {
+        let processor = MiniMaxM3VisionProcessor::new();
+        let cap = (processor.max_pixels() as f64 * 1.3) as usize;
+        for (width, height) in [
+            (200, 1),
+            (150, 1),
+            (1000, 6),
+            (4000, 24),
+            (400, 10),
+            (400, 5),
+        ] {
+            let (w, h) = processor
+                .staging_dimensions(width, height)
+                .unwrap()
+                .expect("below the floor");
+            assert!(
+                w as usize * h as usize <= cap,
+                "{width}x{height} staged at {w}x{h}"
+            );
+            assert!(
+                aspect_ratio(w as usize, h as usize) <= MAX_ASPECT_RATIO,
+                "{width}x{height}"
+            );
+        }
+        // Within the budget the raised image itself is staged.
+        assert_eq!(
+            processor.staging_dimensions(400, 40).unwrap(),
+            Some((1120, 112))
+        );
+        // Over it, the base's own target is staged once its ratio is acceptable.
+        assert_eq!(
+            processor.staging_dimensions(400, 10).unwrap(),
+            Some((4228, 84))
+        );
+    }
+
+    #[test]
+    fn preprocess_resizes_a_flat_image_onto_the_raised_grid() {
+        let processor = MiniMaxM3VisionProcessor::new();
+        let config = m3_config();
+        let out = processor
+            .preprocess(&[DynamicImage::new_rgb8(400, 40)], &config)
+            .expect("flat image preprocesses");
+        assert_eq!(out.feature_token_counts, vec![160]);
+        let crate::ModelSpecificValue::IntTensor { data, .. } =
+            &out.model_specific["image_grid_thw"]
+        else {
+            panic!("image_grid_thw is an int tensor");
+        };
+        assert_eq!(data, &[1, 8, 80]);
+    }
+
+    #[test]
+    fn token_count_matches_preprocess_for_raised_images() {
+        // The placeholder count and the produced grid come from different
+        // entry points; they must agree, including where the raised long side
+        // rounds to the patch factor (112x20 -> 627x112 -> 616x112).
+        let processor = MiniMaxM3VisionProcessor::new();
+        let config = m3_config();
+        for (width, height) in [(400, 40), (40, 400), (112, 20), (50, 50), (300, 80)] {
+            let out = processor
+                .preprocess(&[DynamicImage::new_rgb8(width, height)], &config)
+                .unwrap();
+            assert_eq!(
+                out.feature_token_counts,
+                vec![processor.calculate_num_tokens(width, height, &config)],
+                "{width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn thin_images_within_the_aspect_limit_still_preprocess() {
+        // The base's 200:1 aspect guard must see the raised dimensions, whose
+        // ratio equals the original's, never an intermediate grid.
+        let processor = MiniMaxM3VisionProcessor::new();
+        let config = m3_config();
+        for (width, height) in [(672, 4), (1008, 6), (4000, 24), (150, 1), (200, 1)] {
+            let out = processor
+                .preprocess(&[DynamicImage::new_rgb8(width, height)], &config)
+                .unwrap_or_else(|err| panic!("{width}x{height}: {err}"));
+            assert_eq!(
+                out.feature_token_counts,
+                vec![processor.calculate_num_tokens(width, height, &config)],
+                "{width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn off_contract_aspect_ratios_are_still_rejected_with_the_callers_dimensions() {
+        // Raising keeps the aspect ratio, so the base's guard fires for the
+        // same inputs as before and names the dimensions the caller sent.
+        let processor = MiniMaxM3VisionProcessor::new();
+        let config = m3_config();
+        for (width, height) in [(201, 1), (2, 500), (30_000, 100)] {
+            let err = processor
+                .preprocess(&[DynamicImage::new_rgb8(width, height)], &config)
+                .expect_err("aspect ratio above 200:1 is rejected");
+            let TransformError::InvalidShape { actual, .. } = err else {
+                panic!("{width}x{height}: {err}");
+            };
+            assert_eq!(actual, vec![height as usize, width as usize]);
+        }
+    }
+
+    #[test]
+    fn a_mixed_batch_with_an_off_contract_image_is_rejected_as_a_whole() {
+        // The oversized image is at the floor and never raised; it must still
+        // be vetted before the batch is copied.
+        let processor = MiniMaxM3VisionProcessor::new();
+        let config = m3_config();
+        let images = [
+            DynamicImage::new_rgb8(112, 30_000),
+            DynamicImage::new_rgb8(50, 50),
+        ];
+        let err = processor
+            .preprocess(&images, &config)
+            .expect_err("rejected");
+        let TransformError::InvalidShape { actual, .. } = err else {
+            panic!("{err}");
+        };
+        assert_eq!(actual, vec![30_000, 112]);
+    }
+
+    #[test]
+    fn verifier_rule_b_cases_get_their_raised_grids() {
+        // m3_image_tests 10_15: the five (width, height) cases and the token
+        // count each produces once the short side is raised to 112.
+        let processor = MiniMaxM3VisionProcessor::new();
+        let config = m3_config();
+        let tokens: Vec<usize> = [(400, 40), (300, 80), (112, 20), (40, 400), (80, 300)]
+            .into_iter()
+            .map(|(width, height)| processor.calculate_num_tokens(width, height, &config))
+            .collect();
+        assert_eq!(tokens, vec![160, 60, 88, 160, 60]);
+    }
+
+    #[test]
+    fn token_count_matches_preprocess_under_pixel_overrides() {
+        let processor = MiniMaxM3VisionProcessor::new();
+        let mut config = m3_config();
+        config.max_pixels = Some(100_352);
+        config.min_pixels = Some(50_176);
+        for (width, height) in [(400, 40), (50, 50), (672, 4), (300, 80), (400, 3)] {
+            let out = processor
+                .preprocess(&[DynamicImage::new_rgb8(width, height)], &config)
+                .unwrap();
+            assert_eq!(
+                out.feature_token_counts,
+                vec![processor.calculate_num_tokens(width, height, &config)],
+                "{width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_over_a_lowered_budget_is_not_staged() {
+        // With max_pixels = 100,352 the base's target for 400x3 is 3640x28,
+        // over the budget, so the base would scale it again; the shrunk raise
+        // is staged instead and the grid is pinned.
+        let processor = MiniMaxM3VisionProcessor::new();
+        let mut config = m3_config();
+        config.max_pixels = Some(100_352);
+        let layered = processor.layered_over(&config).unwrap();
+        assert_eq!(
+            layered.staging_dimensions(400, 3).unwrap(),
+            Some((4089, 31))
+        );
+        assert_eq!(processor.calculate_num_tokens(400, 3, &config), 129);
+    }
+
+    #[test]
+    fn thin_band_grids_are_pinned() {
+        // Past 144:1 the raise is shrunk before staging; the grids are within
+        // a percent of the full raise's (293 and 339 tokens).
+        let processor = MiniMaxM3VisionProcessor::new();
+        let config = m3_config();
+        assert_eq!(processor.calculate_num_tokens(150, 1, &config), 292);
+        assert_eq!(processor.calculate_num_tokens(200, 1, &config), 336);
+    }
+
+    #[test]
+    fn mixed_batches_keep_their_order() {
+        let processor = MiniMaxM3VisionProcessor::new();
+        let config = m3_config();
+        let images = [
+            DynamicImage::new_rgb8(224, 224),
+            DynamicImage::new_rgb8(400, 40),
+            DynamicImage::new_rgb8(224, 224),
+        ];
+        let out = processor.preprocess(&images, &config).unwrap();
+        assert_eq!(out.feature_token_counts, vec![64, 160, 64]);
+    }
+
+    #[test]
+    fn item_sizes_report_the_callers_dimensions() {
+        let processor = MiniMaxM3VisionProcessor::new();
+        let config = m3_config();
+        let images = [
+            DynamicImage::new_rgb8(400, 40),
+            DynamicImage::new_rgb8(224, 224),
+        ];
+        let out = processor.preprocess(&images, &config).unwrap();
+        assert_eq!(out.item_sizes, vec![(400, 40), (224, 224)]);
+    }
+
+    #[test]
+    fn video_frames_follow_the_base_unchanged() {
+        // The floor is an image rule here; clips take the base's own path.
+        let processor = MiniMaxM3VisionProcessor::new();
+        let config = m3_config();
+        let frames = vec![DynamicImage::new_rgb8(400, 40); 2];
+        let out = processor.preprocess_video(&frames, &config).unwrap();
+        let base = processor.inner.preprocess_video(&frames, &config).unwrap();
+        assert_eq!(out.feature_token_counts, base.feature_token_counts);
+        assert_eq!(out.feature_token_counts, vec![14]);
     }
 
     #[test]
