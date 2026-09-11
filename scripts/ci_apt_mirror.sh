@@ -19,7 +19,9 @@
 # Environment:
 #   CI_APT_MIRRORS  space-separated base URLs tried in order. Default: the
 #                   Canonical-run mirrors for OCI Frankfurt, Azure and AWS
-#                   Frankfurt, then the main archive.
+#                   Frankfurt, then the main archive. A candidate must serve
+#                   both <codename> and <codename>-security; the security
+#                   lines are routed through it too.
 #   CI_APT_ROOT     apt configuration root (default /etc/apt).
 #   CI_OS_RELEASE   os-release file (default /etc/os-release).
 
@@ -110,7 +112,8 @@ current="${current%/}"
 # The rewrite folds the security lines into the chosen host, so it has to
 # serve the security pocket as well as the release.
 serves_both() {
-    reachable "$1" && reachable "$1" "${codename}-security"
+    reachable "$1" || { log "$1 did not answer for ${codename}"; return 1; }
+    reachable "$1" "${codename}-security" || { log "$1 did not answer for ${codename}-security"; return 1; }
 }
 
 chosen=""
@@ -121,8 +124,6 @@ for mirror in "${MIRRORS[@]}"; do
     [ -z "${chosen}" ] || break
     if serves_both "${mirror}"; then
         chosen="${mirror}"
-    else
-        log "${mirror} did not answer for ${codename} and ${codename}-security"
     fi
 done
 
