@@ -8,10 +8,13 @@ use openai_protocol::{model_card::ModelCard, model_type::ModelType, worker::Prov
 use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::workflow::data::{WorkerKind, WorkerWorkflowData};
+use crate::{
+    routers::provider_support,
+    workflow::data::{WorkerKind, WorkerWorkflowData},
+};
 
 // HTTP client for API calls
 #[expect(
@@ -303,6 +306,29 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverModelsStep {
             });
         }
 
+        // A discovered model reaches the provider router its id implies, which
+        // may not be compiled into this build. Keep what this build can route
+        // and say what the rest would need; a worker left with nothing is
+        // refused, since admission could not judge models it had not seen.
+        let (model_cards, unroutable) = provider_support::partition_routable(config, model_cards);
+        for (card, missing) in &unroutable {
+            warn!(
+                "Dropping model {} discovered from {}: this build carries no {} router; rebuild \
+                 with the `{}` Cargo feature to serve it",
+                card.id, config.url, missing.label, missing.feature
+            );
+        }
+        if model_cards.is_empty() {
+            let (_, missing) = &unroutable[0];
+            return Err(WorkflowError::StepFailed {
+                step_id: StepId::new("discover_models"),
+                message: format!(
+                    "every model discovered from {} needs the {} router, which this build does \
+                     not carry; rebuild with the `{}` Cargo feature",
+                    config.url, missing.label, missing.feature
+                ),
+            });
+        }
         info!(
             "Discovered {} models from {}: {:?}",
             model_cards.len(),

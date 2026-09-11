@@ -4,7 +4,10 @@
 //! targets a provider is admitted only when one of those routers takes it;
 //! nothing decides this at runtime.
 
-use openai_protocol::worker::{ProviderType, RuntimeType, WorkerModels, WorkerSpec};
+use openai_protocol::{
+    model_card::ModelCard,
+    worker::{ProviderType, RuntimeType, WorkerModels, WorkerSpec},
+};
 use smg_external_router::{home_among, known, ExternalRouterSpec};
 
 /// The router a provider target needs but this build lacks.
@@ -75,6 +78,48 @@ pub(crate) fn missing_router_among(
             }),
         }
     })
+}
+
+/// Split discovered model cards into the ones a router in `known` takes and
+/// the ones nothing compiled in can route, judged as dispatch will judge
+/// them: the card's own provider first, else the worker's.
+pub(crate) fn partition_routable_among(
+    spec: &WorkerSpec,
+    cards: Vec<ModelCard>,
+    known: &[ExternalRouterSpec],
+) -> (Vec<ModelCard>, Vec<(ModelCard, MissingRouter)>) {
+    let default = provider_of(spec);
+    let mut routable = Vec::with_capacity(cards.len());
+    let mut unroutable = Vec::new();
+    for card in cards {
+        let provider = card.provider.clone().or_else(|| default.clone());
+        match home_among(known, provider.as_ref()) {
+            Some(router) if router.compiled => routable.push(card),
+            Some(router) => unroutable.push((
+                card,
+                MissingRouter {
+                    label: router.label,
+                    feature: router.feature,
+                },
+            )),
+            None => unroutable.push((
+                card,
+                MissingRouter {
+                    label: "external",
+                    feature: "providers",
+                },
+            )),
+        }
+    }
+    (routable, unroutable)
+}
+
+/// [`partition_routable_among`] against this build.
+pub(crate) fn partition_routable(
+    spec: &WorkerSpec,
+    cards: Vec<ModelCard>,
+) -> (Vec<ModelCard>, Vec<(ModelCard, MissingRouter)>) {
+    partition_routable_among(spec, cards, &known::all())
 }
 
 /// [`missing_router_among`] against this build.
@@ -179,5 +224,26 @@ mod tests {
             Some("Gemini")
         );
         assert_eq!(missing_router_among(&mixed, &everything()), None);
+    }
+
+    #[test]
+    fn discovered_cards_are_kept_only_when_their_router_is_compiled_in() {
+        // A proxy that lists models of two providers on a build carrying
+        // only the OpenAI-compatible router keeps the routable models and
+        // names the feature for the rest.
+        let worker = spec(json!({"url": "https://llm.internal:8443", "runtime_type": "external"}));
+        let cards = vec![
+            ModelCard::new("gpt-4o"),
+            ModelCard::new("claude-3-5-sonnet").with_provider(ProviderType::Anthropic),
+        ];
+        let (routable, unroutable) =
+            partition_routable_among(&worker, cards, &with_compiled(&["openai"]));
+        assert_eq!(
+            routable.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["gpt-4o"]
+        );
+        assert_eq!(unroutable.len(), 1);
+        assert_eq!(unroutable[0].0.id, "claude-3-5-sonnet");
+        assert_eq!(unroutable[0].1.feature, "provider-anthropic");
     }
 }
