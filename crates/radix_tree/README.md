@@ -39,6 +39,19 @@ The contract — exact matching semantics, convergence scope, and the
 §4 alias rules — is what `tests/differential.rs` enforces: every core
 must equal the reference model on every run.
 
+Consumers that need ancestry after eviction can use `learn_context(parent,
+contents)` to register a complete historical prefix. `matching_contexts`
+returns fully matched registered endpoints in depth order without claiming
+holder membership. Contexts belong to their originating tree. Learning or
+retaining an endpoint pins its path until `release_context`; ownership is
+idempotent, so consumers sharing an endpoint must release it only after their
+last use. Released contexts remain usable while a holder, retained endpoint or
+child keeps their chain alive. The existing whole-chain collector frees unused
+chains; callers drain `drain_retired_contexts` to discard their native-identity
+mappings. It does not compact dead tails of live chains. `retained_contents()`
+reports retained content, not a total memory bound. `Config::max_chain_len`
+bounds each path, independently of the total retained content.
+
 ## Structure
 
 Prefixes form a trie of **chains**. A chain's contents are one

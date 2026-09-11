@@ -23,7 +23,7 @@ from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 from transformers import BatchFeature
 from vllm import PoolingParams, SamplingParams, TokensPrompt
-from vllm.distributed.kv_events import KVEventBatch
+from vllm.distributed.kv_events import BlockStored, KVEventBatch
 from vllm.engine.protocol import EngineClient
 from vllm.inputs.engine import MultiModalInput as VllmMultiModalInput
 from vllm.inputs.engine import mm_input, tokens_input
@@ -44,6 +44,7 @@ from smg_grpc_servicer.vllm.kv_events import (
     resolve_kv_events_config,
     stream_kv_events,
 )
+from smg_grpc_servicer.vllm.kv_group_events import resolve_group_event_converter
 from smg_grpc_servicer.vllm.kv_transfer import (
     pairing_fields,
     params_from_request,
@@ -1107,6 +1108,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         logger.info("SubscribeKvEvents: connected to ZMQ endpoint %s", pub_endpoint)
 
         decoder = msgspec.msgpack.Decoder(KVEventBatch)
+        group_converter = resolve_group_event_converter(BlockStored)
 
         try:
             async for proto_batch in stream_kv_events(
@@ -1114,6 +1116,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 decoder.decode,
                 lambda: context.send_initial_metadata(()),
                 context.cancelled,
+                **(
+                    {"convert": group_converter.convert_batch, "strict": True}
+                    if group_converter is not None
+                    else {}
+                ),
             ):
                 yield proto_batch
         except asyncio.CancelledError:

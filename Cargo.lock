@@ -3738,7 +3738,7 @@ dependencies = [
 
 [[package]]
 name = "kv-index"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "bincode",
  "blake3",
@@ -3751,6 +3751,7 @@ dependencies = [
  "rustc-hash 2.1.3",
  "serde",
  "serde_json",
+ "smg-radix-tree",
  "tokio",
  "tracing",
  "xxhash-rust",
@@ -7719,7 +7720,7 @@ dependencies = [
 
 [[package]]
 name = "smg-radix-tree"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "kv-index",
  "rustc-hash 2.1.3",
