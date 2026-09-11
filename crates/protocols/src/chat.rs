@@ -68,7 +68,6 @@ pub enum ChatMessage {
         content: MessageContent,
         name: Option<String>,
         #[serde(flatten)]
-        #[schemars(skip)]
         ext: KimiDeveloperExt,
     },
 }
@@ -489,11 +488,16 @@ fn validate_chat_cross_parameters(
 
     // 7. Validate tool_choice requires tools — except "none" and "auto", which are valid without tools
     if let Some(ref tool_choice) = req.tool_choice {
-        // Dynamic tools on system messages count as tools (Kimi K3)
+        // Dynamic tools on system and developer messages count as tools (Kimi K3)
         let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty())
-            || req.messages.iter().any(|m| {
-                matches!(m, ChatMessage::System { ext, .. }
-                    if ext.tools.as_ref().is_some_and(|t| !t.is_empty()))
+            || req.messages.iter().any(|m| match m {
+                ChatMessage::System { ext, .. } => {
+                    ext.tools.as_ref().is_some_and(|t| !t.is_empty())
+                }
+                ChatMessage::Developer { ext, .. } => {
+                    ext.tools.as_ref().is_some_and(|t| !t.is_empty())
+                }
+                _ => false,
             });
 
         let requires_tools = !matches!(

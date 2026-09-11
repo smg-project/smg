@@ -155,21 +155,23 @@ fn tool_choice_required_and_function_still_require_tools() {
 
 #[test]
 fn tool_choice_required_valid_with_only_dynamic_tools() {
-    let req: ChatCompletionRequest = serde_json::from_value(json!({
-        "model": "kimi-k3",
-        "messages": [
-            {"role": "system", "content": "", "tools": [
-                {"type": "function", "function": {"name": "get_weather"}}
-            ]},
-            {"role": "user", "content": "weather in beijing?"}
-        ],
-        "tool_choice": "required"
-    }))
-    .expect("request deserializes");
-    assert!(
-        req.validate().is_ok(),
-        "dynamic tools must satisfy tool_choice=required"
-    );
+    for role in ["system", "developer"] {
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": role, "content": "", "tools": [
+                    {"type": "function", "function": {"name": "get_weather"}}
+                ]},
+                {"role": "user", "content": "weather in beijing?"}
+            ],
+            "tool_choice": "required"
+        }))
+        .expect("request deserializes");
+        assert!(
+            req.validate().is_ok(),
+            "dynamic tools on {role} must satisfy tool_choice=required"
+        );
+    }
 }
 
 #[test]
@@ -215,8 +217,8 @@ fn error_codes(req: &ChatCompletionRequest) -> Vec<String> {
 }
 
 #[test]
-fn kimi_profile_rejects_tools_on_user_assistant_and_developer() {
-    for role in ["user", "assistant", "developer"] {
+fn kimi_profile_rejects_tools_on_user_and_assistant() {
+    for role in ["user", "assistant"] {
         let mut req = request_with_tools_on_role("kimi-k3", role);
         req.normalize();
         assert!(
@@ -225,6 +227,15 @@ fn kimi_profile_rejects_tools_on_user_assistant_and_developer() {
             error_codes(&req)
         );
     }
+}
+
+#[test]
+fn kimi_profile_allows_tools_on_developer_like_system() {
+    // `developer` supersedes `system` in the OpenAI spec, and the verifier
+    // has no case for it, so it follows the system rule.
+    let mut req = request_with_tools_on_role("kimi-k3", "developer");
+    req.normalize();
+    assert!(req.validate().is_ok(), "{:?}", error_codes(&req));
 }
 
 #[test]
