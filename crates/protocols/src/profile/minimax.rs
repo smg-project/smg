@@ -65,19 +65,33 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
     Ok(())
 }
 
-/// Rewrite `root` messages to system messages for dispatch: upstream MiniMax
-/// serving stacks take the top-priority instruction as the leading system
-/// message, and api.minimax.io itself rejects the literal role.
+/// Rewrite `root` messages to leading system messages for dispatch: upstream
+/// MiniMax serving stacks take the top-priority instruction as the leading
+/// system message, and api.minimax.io itself rejects the literal role. A
+/// `root` that was not first is hoisted above everything else.
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
-    for msg in &mut req.messages {
-        if let ChatMessage::Root { content, name } = msg {
-            *msg = ChatMessage::System {
-                content: std::mem::take(content),
-                name: name.take(),
-                ext: Default::default(),
-            };
-        }
+    let is_root = |msg: &ChatMessage| matches!(msg, ChatMessage::Root { .. });
+    if !req.messages.iter().any(is_root) {
+        return;
     }
+    let (roots, rest): (Vec<_>, Vec<_>) = req.messages.drain(..).partition(is_root);
+    tracing::debug!(
+        model = %req.model,
+        count = roots.len(),
+        "rewrote role root to leading system messages"
+    );
+    req.messages = roots
+        .into_iter()
+        .map(|msg| match msg {
+            ChatMessage::Root { content, name } => ChatMessage::System {
+                content,
+                name,
+                ext: Default::default(),
+            },
+            other => other,
+        })
+        .chain(rest)
+        .collect();
 }
 
 fn error(code: &'static str, message: String) -> validator::ValidationError {
