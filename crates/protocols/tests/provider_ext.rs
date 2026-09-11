@@ -368,11 +368,15 @@ fn stripping_runs_before_validation_so_tool_choice_required_needs_request_tools(
 }
 
 #[expect(clippy::expect_used, reason = "test helper")]
-fn dynamic_tools_request(request_tools: Value, tool_choice: Value) -> ChatCompletionRequest {
+fn dynamic_tools_request(
+    role: &str,
+    request_tools: Value,
+    tool_choice: Value,
+) -> ChatCompletionRequest {
     let mut req: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "kimi-k3",
         "messages": [
-            {"role": "system", "content": "", "tools": [
+            {"role": role, "content": "", "tools": [
                 {"type": "function", "function": {"name": "get_weather"}}
             ]},
             {"role": "user", "content": "weather in beijing?"}
@@ -387,34 +391,56 @@ fn dynamic_tools_request(request_tools: Value, tool_choice: Value) -> ChatComple
     req
 }
 
+fn named(name: &str) -> Value {
+    json!({"type": "function", "function": {"name": name}})
+}
+
+fn allowed(name: &str) -> Value {
+    json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": name}]})
+}
+
 #[test]
 fn named_tool_choice_resolves_against_dynamic_tools() {
-    // Only dynamic tools: a declared name is accepted, an unknown one is not.
-    let known = dynamic_tools_request(
-        Value::Null,
-        json!({"type": "function", "function": {"name": "get_weather"}}),
-    );
-    assert!(known.validate().is_ok(), "{:?}", error_codes(&known));
+    // Only dynamic tools, on either role that may declare them: a declared
+    // name is accepted and an unknown one rejected, for both choice shapes.
+    for role in ["system", "developer"] {
+        let known = dynamic_tools_request(role, Value::Null, named("get_weather"));
+        assert!(
+            known.validate().is_ok(),
+            "{role}: {:?}",
+            error_codes(&known)
+        );
+        let known = dynamic_tools_request(role, Value::Null, allowed("get_weather"));
+        assert!(
+            known.validate().is_ok(),
+            "{role}: {:?}",
+            error_codes(&known)
+        );
 
-    let unknown = dynamic_tools_request(
-        Value::Null,
-        json!({"type": "function", "function": {"name": "get_time"}}),
-    );
-    assert!(error_codes(&unknown).contains(&"tool_choice_function_not_found".to_string()));
-
-    let allowed_unknown = dynamic_tools_request(
-        Value::Null,
-        json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "get_time"}]}),
-    );
-    assert!(error_codes(&allowed_unknown).contains(&"tool_choice_tool_not_found".to_string()));
+        let unknown = dynamic_tools_request(role, Value::Null, named("get_time"));
+        assert!(
+            error_codes(&unknown).contains(&"tool_choice_function_not_found".to_string()),
+            "{role}: {:?}",
+            error_codes(&unknown)
+        );
+        let unknown = dynamic_tools_request(role, Value::Null, allowed("get_time"));
+        assert!(
+            error_codes(&unknown).contains(&"tool_choice_tool_not_found".to_string()),
+            "{role}: {:?}",
+            error_codes(&unknown)
+        );
+    }
 }
 
 #[test]
 fn named_tool_choice_sees_dynamic_tools_beside_request_tools() {
     // Unrelated request-level tools must not hide a dynamic tool's name.
-    let req = dynamic_tools_request(
-        json!([{"type": "function", "function": {"name": "unrelated"}}]),
-        json!({"type": "function", "function": {"name": "get_weather"}}),
-    );
-    assert!(req.validate().is_ok(), "{:?}", error_codes(&req));
+    for role in ["system", "developer"] {
+        let req = dynamic_tools_request(
+            role,
+            json!([{"type": "function", "function": {"name": "unrelated"}}]),
+            named("get_weather"),
+        );
+        assert!(req.validate().is_ok(), "{role}: {:?}", error_codes(&req));
+    }
 }
