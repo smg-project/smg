@@ -11,8 +11,11 @@
 //!
 //! Re-chunking trades a little time to first token for packet-size
 //! compliance; the relay flushes pending payload when the upstream goes idle.
-//! Single-choice chat streams only: a second choice, or `[DONE]`, switches
-//! the rest of the stream to byte pass-through.
+//! Single-choice chat streams only: a second choice, `[DONE]`, or an
+//! unterminated frame past `MAX_FRAME_BYTES` switches the rest of the stream
+//! to byte pass-through, and a chunk carrying choice metadata such as
+//! `logprobs` is forwarded whole, so a stream that requests logprobs is not
+//! re-chunked in practice.
 
 use std::collections::BTreeMap;
 
@@ -27,6 +30,9 @@ const EMIT_THRESHOLD: usize = 80;
 /// A split never leaves a tail shorter than this, so only a payload that is
 /// tiny in total can produce a tiny event.
 const MIN_TAIL_CHARS: usize = 5;
+
+/// Largest unterminated frame held back while waiting for its delimiter.
+const MAX_FRAME_BYTES: usize = 1 << 20;
 
 /// Delta string fields subject to re-chunking, in emission order.
 const PAYLOAD_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "content"];
@@ -52,6 +58,8 @@ struct Absorbed {
 #[derive(Default)]
 pub struct SseRechunker {
     raw: Vec<u8>,
+    /// Bytes of `raw` already searched for a delimiter.
+    scanned: usize,
     /// Envelope of the latest chat chunk (top-level fields minus choices/usage).
     envelope: Map<String, Value>,
     /// Buffered payload per delta string field.
@@ -63,7 +71,7 @@ pub struct SseRechunker {
     role_sent: bool,
     /// Forward bytes verbatim from here on.
     passthrough: bool,
-    /// Events forwarded structurally because of delta keys this module does not merge.
+    /// Events forwarded whole because of delta or choice keys this module does not merge.
     unknown_events: usize,
 }
 
@@ -81,16 +89,27 @@ impl SseRechunker {
         let raw = std::mem::take(&mut self.raw);
         let mut out = Vec::new();
         let mut cursor = 0;
-        while let Some((end, delimiter)) = find_frame_end(&raw[cursor..]) {
-            let frame_end = cursor + end + delimiter;
+        // Resume the search where it stopped, overlapping a split delimiter.
+        let mut from = self.scanned.saturating_sub(3);
+        while let Some((end, delimiter)) = find_frame_end(&raw, cursor + from) {
+            let frame_end = end + delimiter;
             self.handle_frame(&raw[cursor..frame_end], &mut out);
             cursor = frame_end;
+            from = 0;
             if self.passthrough {
                 out.extend_from_slice(&raw[cursor..]);
                 cursor = raw.len();
                 break;
             }
         }
+        if !self.passthrough && raw.len() - cursor > MAX_FRAME_BYTES {
+            // An event this large is not worth holding back: relay it as it comes.
+            self.flush_payload(&mut out);
+            out.extend_from_slice(&raw[cursor..]);
+            cursor = raw.len();
+            self.passthrough = true;
+        }
+        self.scanned = raw.len() - cursor;
         self.raw = raw[cursor..].to_vec();
         Bytes::from(out)
     }
@@ -119,7 +138,7 @@ impl SseRechunker {
         if self.unknown_events > 0 {
             tracing::debug!(
                 events = self.unknown_events,
-                "SSE re-chunking forwarded events with delta keys it does not merge"
+                "SSE re-chunking forwarded events with delta or choice keys it does not merge"
             );
         }
         Bytes::from(out)
@@ -129,8 +148,7 @@ impl SseRechunker {
         let mut data: Option<&[u8]> = None;
         let mut data_lines = 0usize;
         let mut other_lines = false;
-        for line in frame.split(|b| *b == b'\n') {
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
+        for line in frame.split(|b| *b == b'\n' || *b == b'\r') {
             if line.is_empty() {
                 continue;
             }
@@ -169,6 +187,21 @@ impl SseRechunker {
             self.flush_payload(out);
             out.extend_from_slice(frame);
             self.passthrough = true;
+            return;
+        }
+        if has_choice_metadata(&event) {
+            // logprobs and choice-level usage describe this event's own
+            // payload, so the event is forwarded whole rather than absorbed.
+            self.flush_payload(out);
+            if first_choice(&event)
+                .and_then(|c| c.get("delta"))
+                .and_then(Value::as_object)
+                .is_some_and(|d| d.get("role").is_some_and(|r| !r.is_null()))
+            {
+                self.role_sent = true;
+            }
+            out.extend_from_slice(frame);
+            self.unknown_events += 1;
             return;
         }
 
@@ -427,6 +460,23 @@ fn is_single_choice(event: &Map<String, Value>) -> bool {
     }
 }
 
+/// Whether the choice carries a non-null key beyond index, delta and finish_reason.
+fn has_choice_metadata(event: &Map<String, Value>) -> bool {
+    first_choice(event).is_some_and(|choice| {
+        choice.iter().any(|(key, value)| {
+            !matches!(key.as_str(), "index" | "delta" | "finish_reason") && !value.is_null()
+        })
+    })
+}
+
+fn first_choice(event: &Map<String, Value>) -> Option<&Map<String, Value>> {
+    event
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(Value::as_object)
+}
+
 /// A tool-call entry left with nothing but its index, type, or an emptied function.
 fn is_tool_call_shell(tc: &Value) -> bool {
     tc.as_object().is_some_and(|o| {
@@ -496,13 +546,14 @@ fn take_chars(buf: &mut String, max_chars: usize) -> String {
     }
 }
 
-/// Position and length of the first frame delimiter (`\n\n` or `\r\n\r\n`).
-fn find_frame_end(raw: &[u8]) -> Option<(usize, usize)> {
-    (0..raw.len()).find_map(|i| {
-        if raw[i..].starts_with(b"\n\n") {
-            Some((i, 2))
-        } else if raw[i..].starts_with(b"\r\n\r\n") {
+/// Position and length of the first frame delimiter at or after `from`:
+/// `\r\n\r\n`, `\n\n` or `\r\r`.
+fn find_frame_end(raw: &[u8], from: usize) -> Option<(usize, usize)> {
+    (from..raw.len()).find_map(|i| {
+        if raw[i..].starts_with(b"\r\n\r\n") {
             Some((i, 4))
+        } else if raw[i..].starts_with(b"\n\n") || raw[i..].starts_with(b"\r\r") {
+            Some((i, 2))
         } else {
             None
         }
@@ -609,6 +660,84 @@ mod tests {
         let sizes = content_sizes(&events(&run(&frames)));
         assert!(sizes.iter().all(|&s| s >= 5), "sizes: {sizes:?}");
         assert_eq!(sizes.iter().sum::<usize>(), 100);
+    }
+
+    #[test]
+    fn bare_cr_frames_are_recognised() {
+        let frame =
+            "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ab\"}}]}\r\r";
+        let frames = [frame; 50];
+        let sizes = content_sizes(&events(&run(&frames)));
+        assert!(sizes.iter().all(|&s| s >= 5), "sizes: {sizes:?}");
+        assert_eq!(sizes.iter().sum::<usize>(), 100);
+    }
+
+    #[test]
+    fn a_delimiter_split_across_feeds_is_found() {
+        let frame = content_event(&"z".repeat(100));
+        let bytes = frame.as_bytes();
+        let mut r = SseRechunker::new();
+        let mut all = Vec::new();
+        all.extend_from_slice(r.feed(&bytes[..bytes.len() - 1]).as_ref());
+        assert!(all.is_empty());
+        all.extend_from_slice(r.feed(&bytes[bytes.len() - 1..]).as_ref());
+        assert_eq!(content_sizes(&events(&all)), vec![100]);
+    }
+
+    #[test]
+    fn oversized_unterminated_frames_switch_to_passthrough() {
+        let mut r = SseRechunker::new();
+        assert!(r.feed(content_event("ab").as_bytes()).is_empty());
+        let fragment = vec![b'q'; 64 * 1024];
+        let mut forwarded = Vec::new();
+        for _ in 0..17 {
+            forwarded.extend_from_slice(r.feed(&fragment).as_ref());
+        }
+        // The pending payload came out first, then every raw byte.
+        let text = String::from_utf8_lossy(&forwarded);
+        assert!(text.starts_with("data: "), "pending payload flushed first");
+        assert!(text.ends_with(&"q".repeat(64 * 1024)));
+        assert_eq!(text.matches('q').count(), 17 * 64 * 1024);
+        assert_eq!(r.feed(b"more").as_ref(), b"more");
+    }
+
+    #[test]
+    fn choice_level_metadata_is_forwarded_once() {
+        let with_logprobs = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"logprobs\":{\"content\":[{\"token\":\"Hi\",\"logprob\":-0.1}]},\"finish_reason\":null}]}\n\n";
+        let evs = events(&run(&[
+            &content_event("ab"),
+            with_logprobs,
+            &content_event("cd"),
+        ]));
+        let logprob_events: Vec<&Value> = evs
+            .iter()
+            .filter(|e| e["choices"][0]["logprobs"].is_object())
+            .collect();
+        assert_eq!(logprob_events.len(), 1);
+        assert_eq!(
+            logprob_events[0]["choices"][0]["delta"]["content"],
+            Value::from("Hi")
+        );
+        // The logprobs stay attached to the content they describe.
+        let texts: Vec<&str> = evs
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(texts, vec!["ab", "Hi", "cd"]);
+        // A null logprobs field, the common shape when none were requested, still merges.
+        let null_logprobs = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ab\"},\"logprobs\":null}]}\n\n";
+        let frames = [null_logprobs; 50];
+        let sizes = content_sizes(&events(&run(&frames)));
+        assert!(sizes.iter().all(|&s| s >= 5), "sizes: {sizes:?}");
+    }
+
+    #[test]
+    fn choice_level_usage_is_forwarded() {
+        let with_usage = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"usage\":{\"total_tokens\":3}}]}\n\n";
+        let evs = events(&run(&[with_usage]));
+        assert!(evs
+            .iter()
+            .any(|e| e["choices"][0]["usage"]["total_tokens"] == 3));
     }
 
     #[test]
