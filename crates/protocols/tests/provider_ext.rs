@@ -230,6 +230,49 @@ fn kimi_profile_rejects_tools_on_user_and_assistant() {
 }
 
 #[test]
+fn non_kimi_models_ignore_message_tools_of_any_shape() {
+    // The capture is raw JSON, so a malformed value on a role that only the
+    // Kimi profile inspects is dropped as before rather than failing parsing.
+    for model in ["gpt-4o-mini", "MiniMax-M3"] {
+        for role in ["user", "assistant"] {
+            for tools in [json!({"name": "x"}), json!([{}]), json!("x")] {
+                let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+                    "model": model,
+                    "messages": [{"role": role, "content": "hi", "tools": tools}]
+                }))
+                .unwrap_or_else(|e| panic!("{model}/{role}/{tools}: {e}"));
+                req.normalize();
+                assert!(req.validate().is_ok(), "{model}/{role}/{tools}");
+                let out = serde_json::to_value(&req).expect("serializes");
+                assert!(
+                    out["messages"][0].get("tools").is_none(),
+                    "{model}/{role}/{tools}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn kimi_profile_rejects_tools_of_any_shape_on_user_and_assistant() {
+    for role in ["user", "assistant"] {
+        for tools in [json!({"name": "x"}), json!([{}]), json!("x"), json!([])] {
+            let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "kimi-k3",
+                "messages": [{"role": role, "content": "hi", "tools": tools}]
+            }))
+            .expect("request deserializes");
+            req.normalize();
+            assert!(
+                error_codes(&req).contains(&"tools_role_restricted".to_string()),
+                "{role}/{tools}: {:?}",
+                error_codes(&req)
+            );
+        }
+    }
+}
+
+#[test]
 fn kimi_profile_allows_tools_on_developer_like_system() {
     // `developer` supersedes `system` in the OpenAI spec, and the verifier
     // has no case for it, so it follows the system rule.

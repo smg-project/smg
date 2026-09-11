@@ -15,18 +15,20 @@ pub struct KimiSystemExt {
 
 /// Captured so the Kimi profile can reject tools on non-system roles with a
 /// 400 instead of dropping them silently (KVV test_dynamic_tools). Capture
-/// only: the use site keeps it out of the published schema.
+/// only, as raw JSON: the rule keys on the field being set (null counts as
+/// absent), and a malformed value must not fail parsing elsewhere.
+/// The use site keeps it out of the published schema.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct KimiUserExt {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<Tool>>,
+    pub tools: Option<serde_json::Value>,
 }
 
 /// See [`KimiUserExt`].
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct KimiAssistantExt {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<Tool>>,
+    pub tools: Option<serde_json::Value>,
 }
 
 /// Dynamic-tool declaration on developer messages, handled like
