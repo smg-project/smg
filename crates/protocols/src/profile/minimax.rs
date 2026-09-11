@@ -65,10 +65,10 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
     Ok(())
 }
 
-/// Rewrite `root` messages to leading system messages for dispatch: upstream
-/// MiniMax serving stacks take the top-priority instruction as the leading
-/// system message, and api.minimax.io itself rejects the literal role. A
-/// `root` that was not first is hoisted above everything else.
+/// Rewrite every `root` message to a leading system message for dispatch:
+/// upstream MiniMax serving stacks take the top-priority instruction as the
+/// leading system message, and api.minimax.io itself rejects the literal
+/// role. Roots are hoisted above everything else in their original order.
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
     let is_root = |msg: &ChatMessage| matches!(msg, ChatMessage::Root { .. });
     if !req.messages.iter().any(is_root) {
