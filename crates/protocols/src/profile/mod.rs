@@ -61,8 +61,8 @@ impl ProviderProfile {
     }
 
     /// Shape the request for dispatch under this profile: the provider's own
-    /// normalization first (MiniMax folds a root message into a leading
-    /// system message), then every message drops the extension struct that
+    /// normalization first (MiniMax folds every root message into a
+    /// leading system message), then every message drops the extension struct that
     /// belongs to another provider, so a foreign field never reaches a
     /// backend or a chat template. Runs from `Normalizable::normalize`, so it
     /// covers every request that enters through `ValidatedJson`; the HTTP

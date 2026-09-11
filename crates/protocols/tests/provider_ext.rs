@@ -776,10 +776,34 @@ fn root_requires_content() {
         "model": "MiniMax-M3",
         "messages": [{"role": "root"}, {"role": "user", "content": "hi"}]
     }));
+    let err = result.expect_err("a root message without content is meaningless");
     assert!(
-        result.is_err(),
-        "a root message without content is meaningless"
+        err.to_string().contains("missing field `content`"),
+        "root must fail on the missing content field, got: {err}"
     );
+}
+
+#[test]
+fn minimax_hoists_every_root_in_order() {
+    let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "MiniMax-M3",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "root", "content": "Answer in French"},
+            {"role": "root", "content": "Answer in German"}
+        ]
+    }))
+    .expect("root roles deserialize");
+    req.normalize();
+    let out = serde_json::to_value(&req).expect("serializes");
+    let messages = out["messages"].as_array().expect("messages");
+    let roles: Vec<&Value> = messages.iter().map(|m| &m["role"]).collect();
+    assert_eq!(
+        roles,
+        vec![&json!("system"), &json!("system"), &json!("user")]
+    );
+    assert_eq!(messages[0]["content"], json!("Answer in French"));
+    assert_eq!(messages[1]["content"], json!("Answer in German"));
 }
 
 #[test]
