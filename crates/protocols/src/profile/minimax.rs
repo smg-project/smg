@@ -10,8 +10,9 @@ use crate::chat::{ChatCompletionRequest, ChatMessage};
 /// historical `arguments`, when present, must be a JSON object.
 pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
     let mut seen: HashSet<&str> = HashSet::new();
-    // Pending ids in call order, so the reported one is stable.
-    let mut open: Vec<&str> = Vec::new();
+    let mut pending: HashSet<&str> = HashSet::new();
+    // Call order, so the reported unanswered id is stable.
+    let mut order: Vec<&str> = Vec::new();
 
     for msg in &req.messages {
         match msg {
@@ -23,7 +24,8 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
                             format!("duplicate tool_call id '{}'", tc.id),
                         ));
                     }
-                    open.push(tc.id.as_str());
+                    pending.insert(tc.id.as_str());
+                    order.push(tc.id.as_str());
                     // An empty string is how several providers spell a call without arguments.
                     let arguments = tc.function.arguments.as_deref();
                     if let Some(arguments) = arguments.filter(|a| !a.trim().is_empty()) {
@@ -40,20 +42,17 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
                     }
                 }
             }
-            ChatMessage::Tool { tool_call_id, .. } => {
-                let Some(position) = open.iter().position(|id| *id == tool_call_id.as_str()) else {
-                    return Err(error(
-                        "tool_call_id_mismatch",
-                        format!("no pending tool_call with id '{tool_call_id}'"),
-                    ));
-                };
-                open.remove(position);
+            ChatMessage::Tool { tool_call_id, .. } if !pending.remove(tool_call_id.as_str()) => {
+                return Err(error(
+                    "tool_call_id_mismatch",
+                    format!("no pending tool_call with id '{tool_call_id}'"),
+                ));
             }
             _ => {}
         }
     }
 
-    if let Some(id) = open.first() {
+    if let Some(id) = order.iter().find(|id| pending.contains(*id)) {
         return Err(error(
             "tool_call_unanswered",
             format!("tool_call '{id}' has no matching tool message"),
