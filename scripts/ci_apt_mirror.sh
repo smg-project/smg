@@ -29,6 +29,7 @@ APT_ROOT="${CI_APT_ROOT:-/etc/apt}"
 OS_RELEASE="${CI_OS_RELEASE:-/etc/os-release}"
 CONF="${APT_ROOT}/apt.conf.d/99-ci-mirror"
 MAIN_ARCHIVE="http://archive.ubuntu.com/ubuntu"
+SECURITY_ARCHIVE="http://security.ubuntu.com/ubuntu"
 DEFAULT_MIRRORS="http://eu-frankfurt-1.clouds.archive.ubuntu.com/ubuntu http://azure.archive.ubuntu.com/ubuntu http://eu-central-1.ec2.archive.ubuntu.com/ubuntu ${MAIN_ARCHIVE}"
 read -ra MIRRORS <<<"${CI_APT_MIRRORS:-${DEFAULT_MIRRORS}}"
 
@@ -101,7 +102,8 @@ pattern='https?://([a-z0-9-]+\.)*(archive|security)\.ubuntu\.com/ubuntu/?'
 source_files=("${APT_ROOT}/sources.list" "${APT_ROOT}"/sources.list.d/*.list "${APT_ROOT}"/sources.list.d/*.sources)
 
 # A host already on a Canonical mirror (GitHub-hosted runners use the Azure
-# one) keeps it while it answers; only a dead mirror is replaced.
+# one) keeps it while it answers; only a dead mirror is replaced. The rewrite
+# below still runs for it, so any line left on another host joins it.
 current="$(cat "${source_files[@]}" 2>/dev/null | grep -Eo "${pattern}" | grep -vE '://(archive|security)\.ubuntu\.com/' | head -n 1 || true)"
 current="${current%/}"
 
@@ -111,62 +113,84 @@ if [ -n "${current}" ] && reachable "${current}"; then
 fi
 for mirror in "${MIRRORS[@]}"; do
     [ -z "${chosen}" ] || break
-    if reachable "${mirror}"; then
-        chosen="${mirror}"
-        break
+    if ! reachable "${mirror}"; then
+        log "${mirror} did not answer"
+        continue
     fi
-    log "${mirror} did not answer"
+    # The main archive is two origins; keeping it means both must answer.
+    if [ "${mirror}" = "${MAIN_ARCHIVE}" ] && ! reachable "${SECURITY_ARCHIVE}"; then
+        log "${SECURITY_ARCHIVE} did not answer"
+        continue
+    fi
+    chosen="${mirror}"
 done
 
-# Written even when nothing answered: the timeouts still stop a dead host from
-# eating the job budget.
-if ! ${SUDO} tee "${CONF}" >/dev/null <<CONF_EOF
-// Written by scripts/ci_apt_mirror.sh (mirror=${chosen:-none}).
+# The marker records the outcome; "none" makes the next call probe again.
+write_conf() {
+    if ! ${SUDO} tee "${CONF}" >/dev/null <<CONF_EOF
+// Written by scripts/ci_apt_mirror.sh (mirror=$1).
 // Short timeouts fail a dead host in seconds instead of minutes.
 Acquire::http::Timeout "20";
 Acquire::https::Timeout "20";
 Acquire::Retries "2";
 CONF_EOF
-then
-    log "could not write ${CONF}; leaving apt configuration alone"
-    exit 0
-fi
+    then
+        log "could not write ${CONF}"
+    fi
+}
 
 if [ -z "${chosen}" ]; then
+    write_conf none
     log "no mirror answered; leaving apt sources alone"
     exit 0
 fi
-if [ "${chosen}" = "${MAIN_ARCHIVE}" ]; then
+if [ "${chosen}" = "${MAIN_ARCHIVE}" ] && [ -z "${current}" ]; then
+    write_conf "${chosen}"
     log "main archive answers; leaving apt sources alone"
     exit 0
 fi
-if [ "${chosen}" = "${current}" ]; then
-    log "current mirror ${current} answers; leaving apt sources alone"
-    exit 0
-fi
-
 # Both the deb822 (*.sources) and the legacy (sources.list, *.list) forms.
 # security.ubuntu.com is rewritten too: the cloud mirrors carry the security
 # pocket, and it fails together with the main archive.
+matched=0
 rewritten=0
+failed=0
 for file in "${source_files[@]}"; do
     [ -f "${file}" ] || continue
     grep -Eq "${pattern}" "${file}" || continue
+    matched=$((matched + 1))
     if ! tmp="$(mktemp)"; then
         log "mktemp failed; leaving ${file} alone"
+        failed=$((failed + 1))
         continue
     fi
-    if ! sed -E "s#${pattern}#${chosen}/#g" "${file}" >"${tmp}" || ! ${SUDO} cp "${tmp}" "${file}"; then
+    if ! sed -E "s#${pattern}#${chosen}/#g" "${file}" >"${tmp}"; then
         log "could not rewrite ${file}; leaving it alone"
         rm -f "${tmp}"
+        failed=$((failed + 1))
+        continue
+    fi
+    if cmp -s "${tmp}" "${file}"; then
+        rm -f "${tmp}"
+        continue
+    fi
+    if ! ${SUDO} cp "${tmp}" "${file}"; then
+        log "could not write ${file}; leaving it alone"
+        rm -f "${tmp}"
+        failed=$((failed + 1))
         continue
     fi
     rm -f "${tmp}"
     rewritten=$((rewritten + 1))
     log "rewrote ${file}"
 done
-if [ "${rewritten}" -eq 0 ]; then
+if [ "${failed}" -gt 0 ]; then
+    write_conf none
+    log "${failed} source file(s) could not be rewritten; the next call will try again"
+elif [ "${matched}" -eq 0 ]; then
+    write_conf unmatched
     log "chose ${chosen} but no Ubuntu source lines matched; apt sources left as they were"
 else
+    write_conf "${chosen}"
     log "using ${chosen} (${rewritten} source file(s) rewritten)"
 fi
