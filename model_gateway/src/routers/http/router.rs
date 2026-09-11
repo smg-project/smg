@@ -7,7 +7,10 @@ use std::{
 use axum::{
     body::{to_bytes, Body},
     extract::{Request, State},
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        HeaderMap, HeaderValue, Method, StatusCode,
+    },
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -93,7 +96,12 @@ const STREAMED_BODY_STALLED: &str = "request_body_stalled";
 const STREAMED_BODY_TOO_LARGE: &str = "request_body_too_large";
 const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
 
-/// How a worker response body is relayed to the client.
+/// Pending re-chunked payload is flushed after this much upstream silence,
+/// so packet sizing never holds a slow stream's first token.
+const RECHUNK_IDLE_FLUSH: Duration = Duration::from_millis(250);
+
+/// How a worker response body is relayed to the client. Re-chunking exists
+/// on this regular HTTP relay only; the PD and gRPC relays do not apply it.
 #[derive(Clone, Copy)]
 struct StreamRelayMode {
     is_stream: bool,
@@ -491,7 +499,7 @@ impl Router {
         response
     }
 
-    async fn route_typed_request_once<T: serde::Serialize>(
+    async fn route_typed_request_once<T: GenerationRequest + serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
         lease: &RequestLease<T>,
@@ -558,6 +566,15 @@ impl Router {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
+        // The profile comes from the model the client asked for, as request
+        // validation selects it, not from the alias-resolved id.
+        let rechunk = is_stream
+            && route == "/v1/chat/completions"
+            && lease.with_view(|view| {
+                view.request.get_model().is_some_and(|model| {
+                    ProviderProfile::for_model(model) == ProviderProfile::Minimax
+                })
+            });
         let response = match lease.serialize_with(|view| {
             serialize_request_body(view.request, canonical_model, worker.as_ref(), raw_body_len)
         }) {
@@ -566,11 +583,7 @@ impl Router {
                 // the lease frees the parsed request and its routing
                 // derivatives now when retries are disabled.
                 lease.release_dispatch();
-                let mode = StreamRelayMode {
-                    is_stream,
-                    rechunk: is_stream
-                        && ProviderProfile::for_model(model_id) == ProviderProfile::Minimax,
-                };
+                let mode = StreamRelayMode { is_stream, rechunk };
                 self.send_serialized_request(
                     headers,
                     body,
@@ -1218,12 +1231,21 @@ impl Router {
                     .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
             }
 
-            let upstream_sse = res
+            // The same rule as the header synthesis above: a successful
+            // stream with no content-type is relayed as SSE.
+            let upstream_sse = match res
                 .headers()
                 .get(CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                .is_some_and(|ct| ct.starts_with("text/event-stream"));
+            {
+                Some(ct) => ct.starts_with("text/event-stream"),
+                None => status.is_success(),
+            };
             let mut rechunker = (rechunk && upstream_sse).then(SseRechunker::new);
+            if rechunker.is_some() {
+                // Re-chunking changes the body length.
+                response_headers.remove(CONTENT_LENGTH);
+            }
             let stream = res.bytes_stream();
             // Bounded channel applies backpressure: a slow client makes the
             // relay await on `send` instead of buffering the whole response.
@@ -1273,6 +1295,15 @@ impl Router {
                                 break;
                             }
                         },
+                        () = tokio::time::sleep(RECHUNK_IDLE_FLUSH),
+                            if rechunker.as_ref().is_some_and(SseRechunker::has_pending) =>
+                        {
+                            if let Some(tail) = rechunker.as_mut().map(SseRechunker::flush_pending) {
+                                if !tail.is_empty() && tx.send(Ok(tail)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
                         // Client gone with no chunk in flight (long prefill,
                         // stalled upstream): break so the reqwest stream drops,
                         // closing the upstream connection and letting the
