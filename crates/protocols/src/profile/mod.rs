@@ -77,12 +77,17 @@ impl ProviderProfile {
             dropped.extend(role);
         }
         if !dropped.is_empty() {
-            // One line per request rather than per message: the path is client
-            // controlled, and the model id is what makes a miss diagnosable.
+            // One line per request rather than per message, and the distinct
+            // roles rather than one entry per message: the path is client
+            // controlled, so both the line count and the line size must be
+            // bounded. The model id is what makes a miss diagnosable.
+            let count = dropped.len();
+            dropped.sort_unstable();
+            dropped.dedup();
             tracing::warn!(
                 model = %req.model,
                 active = ?self,
-                dropped = dropped.len(),
+                dropped = count,
                 roles = %dropped.join(","),
                 "dropped message extensions that belong to another provider's profile"
             );

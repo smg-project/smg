@@ -366,3 +366,55 @@ fn stripping_runs_before_validation_so_tool_choice_required_needs_request_tools(
     req.normalize();
     assert!(req.validate().is_ok(), "{:?}", error_codes(&req));
 }
+
+#[expect(clippy::expect_used, reason = "test helper")]
+fn dynamic_tools_request(request_tools: Value, tool_choice: Value) -> ChatCompletionRequest {
+    let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [
+                {"type": "function", "function": {"name": "get_weather"}}
+            ]},
+            {"role": "user", "content": "weather in beijing?"}
+        ],
+        "tool_choice": tool_choice
+    }))
+    .expect("request deserializes");
+    if !request_tools.is_null() {
+        req.tools = Some(serde_json::from_value(request_tools).expect("tools deserialize"));
+    }
+    req.normalize();
+    req
+}
+
+#[test]
+fn named_tool_choice_resolves_against_dynamic_tools() {
+    // Only dynamic tools: a declared name is accepted, an unknown one is not.
+    let known = dynamic_tools_request(
+        Value::Null,
+        json!({"type": "function", "function": {"name": "get_weather"}}),
+    );
+    assert!(known.validate().is_ok(), "{:?}", error_codes(&known));
+
+    let unknown = dynamic_tools_request(
+        Value::Null,
+        json!({"type": "function", "function": {"name": "get_time"}}),
+    );
+    assert!(error_codes(&unknown).contains(&"tool_choice_function_not_found".to_string()));
+
+    let allowed_unknown = dynamic_tools_request(
+        Value::Null,
+        json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "get_time"}]}),
+    );
+    assert!(error_codes(&allowed_unknown).contains(&"tool_choice_tool_not_found".to_string()));
+}
+
+#[test]
+fn named_tool_choice_sees_dynamic_tools_beside_request_tools() {
+    // Unrelated request-level tools must not hide a dynamic tool's name.
+    let req = dynamic_tools_request(
+        json!([{"type": "function", "function": {"name": "unrelated"}}]),
+        json!({"type": "function", "function": {"name": "get_weather"}}),
+    );
+    assert!(req.validate().is_ok(), "{:?}", error_codes(&req));
+}

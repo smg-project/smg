@@ -488,17 +488,17 @@ fn validate_chat_cross_parameters(
 
     // 7. Validate tool_choice requires tools — except "none" and "auto", which are valid without tools
     if let Some(ref tool_choice) = req.tool_choice {
-        // Dynamic tools on system and developer messages count as tools (Kimi K3)
-        let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty())
-            || req.messages.iter().any(|m| match m {
-                ChatMessage::System { ext, .. } => {
-                    ext.tools.as_ref().is_some_and(|t| !t.is_empty())
-                }
-                ChatMessage::Developer { ext, .. } => {
-                    ext.tools.as_ref().is_some_and(|t| !t.is_empty())
-                }
-                _ => false,
-            });
+        // The effective tool set: request-level tools plus the dynamic tools
+        // declared on system and developer messages (Kimi K3). Both the
+        // "are there tools" decision and the named-choice checks below use
+        // it, so a name is resolved against everything the model will see.
+        let dynamic_tools = req.messages.iter().flat_map(|m| match m {
+            ChatMessage::System { ext, .. } => ext.tools.as_deref().unwrap_or_default(),
+            ChatMessage::Developer { ext, .. } => ext.tools.as_deref().unwrap_or_default(),
+            _ => &[],
+        });
+        let effective_tools: Vec<&Tool> = req.tools.iter().flatten().chain(dynamic_tools).collect();
+        let has_tools = !effective_tools.is_empty();
 
         let requires_tools = !matches!(
             tool_choice,
@@ -512,7 +512,8 @@ fn validate_chat_cross_parameters(
         }
 
         // Additional validation when tools are present
-        if let Some(tools) = req.tools.as_ref().filter(|t| !t.is_empty()) {
+        if has_tools {
+            let tools = &effective_tools;
             match tool_choice {
                 ToolChoice::Function { function, .. } => {
                     // Validate that the specified function name exists in tools
