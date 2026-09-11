@@ -37,8 +37,9 @@ struct ChainData {
     /// Child forks: (fork position ON THIS CHAIN, first child
     /// content, child chain), sorted.
     children: Vec<(u32, ContentHash, u32)>,
-    /// Explicit historical endpoints; these pin their path until tree drop.
-    contexts: BTreeMap<u32, u64>,
+    /// Historical endpoints: (lineage, retained by the caller).
+    contexts: BTreeMap<u32, (u64, bool)>,
+    context_pins: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +108,7 @@ pub struct RadixTree {
     /// positions with a non-empty holder set.
     distinct_entries: u64,
     retained_contents: usize,
+    retired_contexts: Vec<PrefixContext>,
 }
 
 impl RadixTree {
@@ -123,6 +125,7 @@ impl RadixTree {
             holder_blocks_total: 0,
             distinct_entries: 0,
             retained_contents: 0,
+            retired_contexts: Vec::new(),
         }
     }
 
@@ -313,6 +316,7 @@ impl RadixTree {
                             spans: Vec::new(),
                             children: Vec::new(),
                             contexts: BTreeMap::new(),
+                            context_pins: 0,
                         });
                         self.roots.entry(lineage).or_default().push(c);
                         (c, 0)
@@ -824,6 +828,7 @@ impl RadixTree {
             spans: Vec::new(),
             children: Vec::new(),
             contexts: BTreeMap::new(),
+            context_pins: 0,
         });
         let pd = &mut self.chains[parent as usize];
         let at = pd
@@ -1038,7 +1043,7 @@ impl RadixTree {
             if cd.contents.is_empty() {
                 return;
             }
-            if !cd.spans.is_empty() || !cd.children.is_empty() || !cd.contexts.is_empty() {
+            if !cd.spans.is_empty() || !cd.children.is_empty() || cd.context_pins > 0 {
                 return;
             }
             // In-contract this chain has no key-map references either:
@@ -1057,6 +1062,16 @@ impl RadixTree {
             let parent = cd.parent;
             let start_lineage = cd.start_lineage;
             let first_content = cd.contents.first().copied();
+            self.retired_contexts
+                .extend(
+                    cd.contexts
+                        .iter()
+                        .map(|(&position, &(lineage, _))| PrefixContext {
+                            chain,
+                            position,
+                            lineage,
+                        }),
+                );
             self.retained_contents -= cd.contents.len();
             self.chains[chain as usize] = ChainData::default();
             self.free_chains.push(chain);
@@ -1177,6 +1192,9 @@ impl RadixTree {
                 return Err(format!("live chain {ci} is empty"));
             }
             live_chains.insert(ci);
+            if cd.context_pins != cd.contexts.values().filter(|(_, pinned)| *pinned).count() {
+                return Err(format!("chain {ci} context pin count mismatch"));
+            }
             let mut prev_end = cd.base_pos;
             let mut prev_set: Option<&SetRef> = None;
             for s in &cd.spans {
@@ -1250,7 +1268,7 @@ impl RadixTree {
                 if i > 0 {
                     l = lineage_step(l, content);
                 }
-                if let Some(&(&position, &lineage)) = contexts.peek() {
+                if let Some(&(&position, &(lineage, _))) = contexts.peek() {
                     if position == cd.base_pos + i as u32 {
                         if lineage != l {
                             return Err(format!("chain {ci} context lineage mismatch"));
@@ -1367,7 +1385,7 @@ impl RadixTree {
             let cd = &self.chains[ci as usize];
             if cd.spans.is_empty()
                 && cd.children.is_empty()
-                && cd.contexts.is_empty()
+                && cd.context_pins == 0
                 && !key_ref_chains.contains(&ci)
             {
                 return Err(format!("live chain {ci} is orphaned (GC leak)"));

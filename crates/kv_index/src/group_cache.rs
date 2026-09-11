@@ -31,37 +31,30 @@ struct Group {
     reported: FxHashMap<CacheKey, usize>,
 }
 
-/// One worker's observation session. Context survives removals: a later child
-/// can still refer to an evicted parent. Discontinuity discards the view.
+/// One worker's observation session. Live descendants keep their ancestry;
+/// wholly evicted histories may be forgotten. Discontinuity discards the view.
 pub struct GroupCache {
     index: RadixTree,
     groups: FxHashMap<u32, Group>,
     positions: FxHashMap<CacheKey, PrefixContext>,
     by_prefix: FxHashMap<PrefixContext, Vec<CacheKey>>,
     pending: FxHashMap<CacheKey, FxHashMap<CacheKey, Vec<u32>>>,
-    pending_entries: usize,
-    pending_tokens: usize,
+    parents_by_child: FxHashMap<CacheKey, Vec<CacheKey>>,
     last_sequence: Option<u64>,
 }
-
-// Bound retained historical context as well as live membership. Overflow only
-// discards routing evidence; it does not change engine cache or reject requests.
-const MAX_ENTRIES: usize = 100_000;
-
-const MAX_CONTEXT_TOKENS: usize = 1_600_000;
 
 impl Default for GroupCache {
     fn default() -> Self {
         Self {
             index: RadixTree::new(Config {
-                max_chain_len: MAX_CONTEXT_TOKENS as u32,
+                // Token positions use u32; this is not a cache capacity policy.
+                max_chain_len: u32::MAX,
             }),
             groups: FxHashMap::default(),
             positions: FxHashMap::default(),
             by_prefix: FxHashMap::default(),
             pending: FxHashMap::default(),
-            pending_entries: 0,
-            pending_tokens: 0,
+            parents_by_child: FxHashMap::default(),
             last_sequence: None,
         }
     }
@@ -98,23 +91,32 @@ impl GroupCache {
                 self.invalidate();
             }
         }
+        let mut changed = Vec::new();
         for event in events {
-            if let Err(reason) = self.apply(event) {
+            if let Err(reason) = self.apply(event, &mut changed) {
                 self.invalidate();
                 return Err(reason);
             }
         }
+        self.reclaim(changed);
         self.last_sequence = Some(sequence);
         Ok(())
     }
 
-    fn apply(&mut self, event: &GroupEvent) -> Result<(), &'static str> {
+    fn apply(
+        &mut self,
+        event: &GroupEvent,
+        changed: &mut Vec<CacheKey>,
+    ) -> Result<(), &'static str> {
         match event {
             GroupEvent::Clear => {
                 // Clearing blocks does not retract the groups already reported.
                 for group in self.groups.values_mut() {
                     group.reported.clear();
                 }
+                changed.extend(self.positions.keys().cloned());
+                self.pending.clear();
+                self.parents_by_child.clear();
             }
             GroupEvent::Invalid => return Err("invalid group event"),
             GroupEvent::Remove { group_id, keys } => {
@@ -122,6 +124,7 @@ impl GroupCache {
                 for key in keys {
                     // A repeated STORE is not proof of another physical copy.
                     group.reported.remove(key);
+                    changed.push(key.clone());
                 }
             }
             GroupEvent::Store {
@@ -134,9 +137,6 @@ impl GroupCache {
                 block_size,
                 tokens_matchable,
             } => {
-                if tokens.len() > MAX_CONTEXT_TOKENS {
-                    return Err("group event token history capacity reached");
-                }
                 if *block_size == 0 || keys.iter().any(Vec::is_empty) {
                     return Err("invalid group block identity or span");
                 }
@@ -154,28 +154,18 @@ impl GroupCache {
                         .entry(key.clone())
                         .and_modify(|span| *span = (*span).max(*block_size))
                         .or_insert(*block_size);
+                    changed.push(key.clone());
                 }
                 // Sparse reports retain the entire token span but omit some
                 // hashes. Their positions can only come from other reports.
                 if *tokens_matchable && keys.len().checked_mul(*block_size) == Some(tokens.len()) {
                     let mut parent = parent.clone();
                     for (key, chunk) in keys.iter().zip(tokens.chunks(*block_size)) {
-                        self.learn(key.clone(), parent, chunk.to_vec())?;
+                        self.learn(key.clone(), parent, chunk.to_vec(), changed)?;
                         parent = Some(key.clone());
                     }
                 }
             }
-        }
-        let reported = self
-            .groups
-            .values()
-            .map(|g| g.reported.len())
-            .sum::<usize>();
-        if self.positions.len() + self.pending_entries > MAX_ENTRIES || reported > MAX_ENTRIES {
-            return Err("group event index capacity reached");
-        }
-        if self.index.retained_contents() + self.pending_tokens > MAX_CONTEXT_TOKENS {
-            return Err("group event token history capacity reached");
         }
         Ok(())
     }
@@ -185,6 +175,7 @@ impl GroupCache {
         key: CacheKey,
         parent: Option<CacheKey>,
         tokens: Vec<u32>,
+        changed: &mut Vec<CacheKey>,
     ) -> Result<(), &'static str> {
         let mut ready = vec![(key, parent, tokens)];
         while let Some((key, parent, tokens)) = ready.pop() {
@@ -198,14 +189,12 @@ impl GroupCache {
                         }
                         // Different groups can describe the same endpoint via
                         // different parent/span pairs. Resolve either path.
-                        let children = self.pending.entry(parent).or_default();
+                        let children = self.pending.entry(parent.clone()).or_default();
                         if children.get(&key).is_some_and(|old| *old != tokens) {
                             return Err("conflicting tokens for one parent and child");
                         }
-                        let count = tokens.len();
-                        if children.insert(key, tokens).is_none() {
-                            self.pending_entries += 1;
-                            self.pending_tokens += count;
+                        if children.insert(key.clone(), tokens).is_none() {
+                            self.parents_by_child.entry(key).or_default().push(parent);
                         }
                         continue;
                     }
@@ -216,9 +205,7 @@ impl GroupCache {
                 .index
                 .learn_context(base, &contents)
                 .map_err(|_| "invalid group prefix context")?;
-            if self.index.retained_contents() > MAX_CONTEXT_TOKENS {
-                return Err("group event token history capacity reached");
-            }
+            changed.push(key.clone());
             if let Some(old) = self.positions.get(&key) {
                 if *old != position {
                     return Err("conflicting native hash identity");
@@ -230,17 +217,78 @@ impl GroupCache {
                 .entry(position)
                 .or_default()
                 .push(key.clone());
+            // Once an identity is known, alternative unresolved descriptions
+            // are unnecessary. Dropping one can release its pending ancestors.
+            self.detach_pending_parents(&key, changed);
             if let Some(children) = self.pending.remove(&key) {
-                self.pending_entries -= children.len();
-                self.pending_tokens -= children.values().map(Vec::len).sum::<usize>();
-                ready.extend(
-                    children
-                        .into_iter()
-                        .map(|(child, tokens)| (child, Some(key.clone()), tokens)),
-                );
+                for (child, tokens) in children {
+                    if let Some(parents) = self.parents_by_child.get_mut(&child) {
+                        parents.retain(|parent| parent != &key);
+                        if parents.is_empty() {
+                            self.parents_by_child.remove(&child);
+                        }
+                    }
+                    ready.push((child, Some(key.clone()), tokens));
+                }
             }
         }
         Ok(())
+    }
+
+    fn needed(&self, key: &CacheKey) -> bool {
+        self.groups
+            .values()
+            .any(|group| group.reported.contains_key(key))
+            || self.pending.contains_key(key)
+    }
+
+    fn detach_pending_parents(&mut self, key: &CacheKey, changed: &mut Vec<CacheKey>) {
+        if let Some(parents) = self.parents_by_child.remove(key) {
+            for parent in parents {
+                if let Some(children) = self.pending.get_mut(&parent) {
+                    children.remove(key);
+                    if children.is_empty() {
+                        self.pending.remove(&parent);
+                    }
+                }
+                changed.push(parent);
+            }
+        }
+    }
+
+    fn reclaim(&mut self, mut changed: Vec<CacheKey>) {
+        // Re-pin returning evidence before releasing anything: a sparse STORE
+        // can revive an old endpoint while its last child is removed in this batch.
+        for key in &changed {
+            if self.needed(key) {
+                if let Some(&context) = self.positions.get(key) {
+                    self.index.retain_context(context);
+                }
+            }
+        }
+        while let Some(key) = changed.pop() {
+            if self.needed(&key) {
+                continue;
+            }
+            self.detach_pending_parents(&key, &mut changed);
+            if let Some(&context) = self.positions.get(&key) {
+                if !self.by_prefix[&context]
+                    .iter()
+                    .any(|alias| self.needed(alias))
+                {
+                    self.index.release_context(context);
+                }
+            }
+        }
+        // The core retains ancestors of live chains and collects whole chains.
+        // Forget native identities only when their backing chain is gone.
+        for context in self.index.drain_retired_contexts() {
+            if let Some(keys) = self.by_prefix.remove(&context) {
+                for key in keys {
+                    self.positions.remove(&key);
+                }
+            }
+        }
     }
 
     /// A common boundary supported by resolved reports for the observed groups.

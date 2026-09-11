@@ -1,4 +1,4 @@
-use radix_tree::{Config, OverlapScratch, RadixTree};
+use radix_tree::{Config, ContextError, OverlapScratch, RadixTree};
 
 #[test]
 fn contexts_share_paths_and_match_only_complete_endpoints() {
@@ -50,5 +50,35 @@ fn historical_parent_survives_point_eviction_and_unrelated_chain_reuse() {
     tree.overlap(&[1, 2, 3, 4], &mut scratch, &mut overlap);
     assert!(overlap.is_empty());
     assert_eq!(tree.retained_contents(), 4);
+    tree.audit().unwrap();
+}
+
+#[test]
+fn released_contexts_share_the_existing_whole_chain_lifecycle() {
+    let mut tree = RadixTree::new(Config::default());
+    let parent = tree.learn_context(None, &[1, 2]).unwrap();
+    let tail = tree.learn_context(Some(parent), &[3, 4]).unwrap();
+    let fork = tree.learn_context(Some(parent), &[8, 9]).unwrap();
+    assert!(tree.release_context(parent));
+    assert!(tree.release_context(tail));
+    assert_eq!(tree.retained_contents(), 6); // Existing GC keeps the parent chain's tail.
+    assert_eq!(tree.drain_retired_contexts().count(), 0);
+    assert!(tree.retain_context(parent));
+    assert!(tree.release_context(fork));
+    assert_eq!(tree.drain_retired_contexts().collect::<Vec<_>>(), [fork]);
+    assert_eq!(tree.retained_contents(), 4);
+    assert!(tree.release_context(parent));
+    let retired = tree.drain_retired_contexts().collect::<Vec<_>>();
+    assert_eq!(retired.len(), 2);
+    assert!(retired.contains(&parent) && retired.contains(&tail));
+    assert_eq!(tree.retained_contents(), 0);
+
+    // Slot reuse cannot turn an old handle into an unrelated prefix.
+    tree.learn_context(None, &[7, 8]).unwrap();
+    assert!(!tree.retain_context(parent));
+    assert_eq!(
+        tree.learn_context(Some(parent), &[3]),
+        Err(ContextError::InvalidParent)
+    );
     tree.audit().unwrap();
 }

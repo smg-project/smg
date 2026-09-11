@@ -357,7 +357,7 @@ fn sparse_hashes_are_not_ordinal_zipped_and_cross_group_context_resolves_them() 
 }
 
 #[test]
-fn unknown_parent_is_pending_and_eviction_keeps_prefix_context() {
+fn wholly_evicted_history_requires_a_new_anchor() {
     let mut cache = GroupCache::default();
     apply(&mut cache, 0, &[child_report(0, "mamba", 0, 2, 4)]);
     assert_eq!(query(&cache, &[3, 4, 5]), Some(0));
@@ -366,8 +366,82 @@ fn unknown_parent_is_pending_and_eviction_keeps_prefix_context() {
     assert_eq!(query(&cache, &tokens(5)), Some(4));
     apply(&mut cache, 2, &[remove(0, &[2, 4])]);
     assert_eq!(query(&cache, &tokens(7)), Some(0));
+    assert_eq!(cache.index.retained_contents(), 0);
+    assert!(cache.positions.is_empty());
+    assert!(cache.by_prefix.is_empty());
     apply(&mut cache, 3, &[child_report(0, "mamba", 0, 4, 6)]);
+    assert_eq!(query(&cache, &tokens(7)), Some(0));
+    assert_eq!(query(&cache, &[5, 6, 7]), Some(0));
+    apply(&mut cache, 4, &[root_report(0, "mamba", 0, 4, &[4], 4)]);
     assert_eq!(query(&cache, &tokens(7)), Some(6));
+}
+
+#[test]
+fn pending_ancestry_lives_only_while_a_report_needs_it() {
+    let mut cache = GroupCache::default();
+    apply(&mut cache, 0, &[child_report(0, "mamba", 0, 2, 4)]);
+    apply(&mut cache, 1, &[child_report(0, "mamba", 0, 4, 6)]);
+    apply(&mut cache, 2, &[remove(0, &[4])]);
+    assert_eq!(cache.pending.len(), 2);
+    apply(&mut cache, 3, &[root_report(0, "mamba", 0, 2, &[2], 2)]);
+    assert_eq!(query(&cache, &tokens(7)), Some(6));
+    assert!(cache.pending.is_empty());
+    assert!(cache.parents_by_child.is_empty());
+    apply(&mut cache, 4, &[remove(0, &[2, 6])]);
+    assert_eq!(cache.index.retained_contents(), 0);
+    assert!(cache.positions.is_empty());
+
+    // The same dependency chain can disappear before its anchor arrives.
+    apply(&mut cache, 5, &[child_report(0, "mamba", 0, 2, 4)]);
+    apply(&mut cache, 6, &[child_report(0, "mamba", 0, 4, 6)]);
+    apply(&mut cache, 7, &[remove(0, &[4, 6])]);
+    assert!(cache.pending.is_empty());
+    assert!(cache.parents_by_child.is_empty());
+    assert_eq!(query(&cache, &tokens(7)), Some(0));
+}
+
+#[test]
+fn one_batch_keeps_ancestry_until_new_reports_are_applied() {
+    let mut cache = GroupCache::default();
+    apply(&mut cache, 0, &[root_report(0, "mamba", 0, 2, &[2], 2)]);
+    apply(
+        &mut cache,
+        1,
+        &[remove(0, &[2]), child_report(0, "mamba", 0, 2, 4)],
+    );
+    assert_eq!(query(&cache, &tokens(5)), Some(4));
+    assert!(cache.pending.is_empty());
+}
+
+#[test]
+fn aliases_and_returning_sparse_reports_keep_their_shared_context() {
+    let mut cache = GroupCache::default();
+    apply(
+        &mut cache,
+        0,
+        &[
+            root_report(0, "mamba", 0, 2, &[2], 2),
+            store(0, "mamba", 0, 2, vec![opaque(99)], None, tokens(2)),
+        ],
+    );
+    apply(&mut cache, 1, &[remove(0, &[2])]);
+    assert_eq!(query(&cache, &tokens(3)), Some(2));
+    apply(&mut cache, 2, &[child_report(0, "mamba", 0, 2, 4)]);
+    apply(&mut cache, 3, &[remove(0, &[99])]);
+    // Endpoint 2 has been released, but its live descendant still holds the path.
+    let mut sparse = root_report(0, "mamba", 0, 2, &[2], 2);
+    if let GroupEvent::Store {
+        tokens_matchable, ..
+    } = &mut sparse
+    {
+        *tokens_matchable = false;
+    }
+    apply(&mut cache, 4, &[sparse, remove(0, &[4])]);
+    assert_eq!(query(&cache, &tokens(5)), Some(2));
+    apply(&mut cache, 5, &[remove(0, &[2])]);
+    assert_eq!(cache.index.retained_contents(), 0);
+    assert!(cache.positions.is_empty());
+    cache.index.audit().unwrap();
 }
 
 #[test]
@@ -404,6 +478,19 @@ fn clear_keeps_groups_but_gap_and_disconnect_start_new_observations() {
     assert_eq!(query(&cache, &tokens(5)), None);
     apply(&mut cache, 31, &[a]);
     assert_eq!(query(&cache, &tokens(5)), Some(4));
+    apply(
+        &mut cache,
+        32,
+        &[child_report(0, "full_attention", 0, 8, 10)],
+    );
+    assert!(!cache.pending.is_empty());
+    apply(&mut cache, 33, &[GroupEvent::Clear]);
+    assert_eq!(query(&cache, &tokens(5)), Some(0));
+    assert_eq!(cache.index.retained_contents(), 0);
+    assert!(cache.positions.is_empty());
+    assert!(cache.by_prefix.is_empty());
+    assert!(cache.pending.is_empty());
+    assert!(cache.parents_by_child.is_empty());
 }
 
 #[test]
@@ -623,6 +710,9 @@ fn either_unknown_parent_can_resolve_the_same_checkpoint() {
         );
         assert_eq!(query(&cache, &tokens(17)), Some(16));
 
+        assert!(cache.pending.is_empty());
+        assert!(cache.parents_by_child.is_empty());
+
         let other_parent = if first_parent == 8 { 14 } else { 8 };
         apply(
             &mut cache,
@@ -663,43 +753,31 @@ fn later_full_report_can_bridge_an_earlier_gap() {
 }
 
 #[test]
-fn accumulated_branch_history_resets_at_capacity_even_after_clear() {
+fn multiple_million_token_prefixes_keep_affinity() {
     let mut cache = GroupCache::default();
-    let length = MAX_CONTEXT_TOKENS / 2 + 1;
-    apply(
-        &mut cache,
-        0,
-        &[store(
-            0,
-            "full_attention",
-            0,
-            length,
-            vec![vec![1]],
-            None,
-            vec![1; length],
-        )],
-    );
-    apply(&mut cache, 1, &[GroupEvent::Clear]);
-    assert_eq!(
-        cache.apply_batch(
-            2,
+    let length = 1_048_576;
+    let block_size = 16;
+    let blocks = length / block_size;
+    // Two independent prompts on one worker exceed both former policy limits:
+    // 1.6M retained tokens and 100K native identities/live memberships.
+    for branch in 0..2 {
+        apply(
+            &mut cache,
+            branch as u64,
             &[store(
                 0,
                 "full_attention",
                 0,
-                length,
-                vec![vec![2]],
+                block_size,
+                (1..=blocks)
+                    .map(|block| opaque(branch * blocks + block))
+                    .collect(),
                 None,
-                vec![2; length]
-            )]
-        ),
-        Err("group event token history capacity reached")
-    );
-    assert_eq!(query(&cache, &[1, 1]), None);
-    apply(
-        &mut cache,
-        3,
-        &[root_report(0, "full_attention", 0, 2, &[2], 2)],
-    );
-    assert_eq!(query(&cache, &tokens(3)), Some(2));
+                vec![branch as u32 + 1; length],
+            )],
+        );
+    }
+    for token in [1, 2] {
+        assert_eq!(query(&cache, &vec![token; length + 1]), Some(length));
+    }
 }
