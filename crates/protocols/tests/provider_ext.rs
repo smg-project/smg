@@ -202,15 +202,41 @@ fn request_with_tools_on_role(model: &str, role: &str) -> ChatCompletionRequest 
     .expect("request deserializes")
 }
 
+/// Every validation error code the request produced, schema-level ones included.
+fn error_codes(req: &ChatCompletionRequest) -> Vec<String> {
+    match req.validate() {
+        Ok(()) => Vec::new(),
+        Err(errors) => errors
+            .field_errors()
+            .values()
+            .flat_map(|errs| errs.iter().map(|e| e.code.to_string()))
+            .collect(),
+    }
+}
+
 #[test]
-fn kimi_profile_rejects_tools_on_user_and_assistant() {
-    for role in ["user", "assistant"] {
-        let req = request_with_tools_on_role("kimi-k3", role);
+fn kimi_profile_rejects_tools_on_user_assistant_and_developer() {
+    for role in ["user", "assistant", "developer"] {
+        let mut req = request_with_tools_on_role("kimi-k3", role);
+        req.normalize();
         assert!(
-            req.validate().is_err(),
-            "kimi profile must reject tools on role {role}"
+            error_codes(&req).contains(&"tools_role_restricted".to_string()),
+            "kimi profile must reject tools on role {role} with its own code, got {:?}",
+            error_codes(&req)
         );
     }
+}
+
+#[test]
+fn kimi_profile_rejects_an_empty_tools_list_on_user() {
+    // The contract keys on the key being declared, not on its contents.
+    let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "kimi-k3",
+        "messages": [{"role": "user", "content": "hi", "tools": []}]
+    }))
+    .expect("request deserializes");
+    req.normalize();
+    assert!(error_codes(&req).contains(&"tools_role_restricted".to_string()));
 }
 
 #[test]
@@ -222,11 +248,14 @@ fn kimi_profile_allows_tools_on_system() {
 #[test]
 fn non_kimi_models_tolerate_tools_on_any_role() {
     for model in ["gpt-4o-mini", "MiniMax-M3"] {
-        let req = request_with_tools_on_role(model, "user");
-        assert!(
-            req.validate().is_ok(),
-            "{model} must not enforce the kimi role restriction"
-        );
+        for role in ["user", "assistant", "developer"] {
+            let mut req = request_with_tools_on_role(model, role);
+            req.normalize();
+            assert!(
+                req.validate().is_ok(),
+                "{model} must not enforce the kimi role restriction on {role}"
+            );
+        }
     }
 }
 
@@ -243,6 +272,7 @@ fn kimi_ext_request(model: &str) -> Value {
         "model": model,
         "messages": [
             {"role": "system", "content": "", "tools": [{"type": "function", "function": {"name": "f"}}]},
+            {"role": "developer", "content": "", "tools": [{"type": "function", "function": {"name": "d"}}]},
             {"role": "user", "content": "hi", "tools": [{"type": "function", "function": {"name": "g"}}]},
             {"role": "assistant", "content": "ok", "tools": [{"type": "function", "function": {"name": "h"}}]}
         ]
@@ -275,4 +305,53 @@ fn kimi_profile_keeps_its_extensions_on_normalize() {
     for message in out["messages"].as_array().expect("messages") {
         assert!(message.get("tools").is_some(), "{message}");
     }
+}
+
+#[test]
+fn vendor_model_ids_in_paths_and_aggregator_prefixes_keep_kimi_extensions() {
+    // Profile selection must agree with the parser factories, or a working
+    // feature disappears silently on a mis-detected id.
+    for model in [
+        "/models/Kimi-K3",
+        "moonshotai/kimi-k2",
+        "openrouter/moonshotai/kimi-k2",
+        "MoonshotAI/Kimi-K2-Instruct",
+    ] {
+        let out = normalized(kimi_ext_request(model));
+        assert!(
+            out["messages"][0].get("tools").is_some(),
+            "{model}: system tools must survive normalization: {out}"
+        );
+    }
+}
+
+#[test]
+fn stripping_runs_before_validation_so_tool_choice_required_needs_request_tools() {
+    // For a non-Kimi model the system-message tools are gone by the time
+    // rule 7 runs, so nothing can satisfy tool_choice=required: a 400, not a
+    // 200 that the backend then cannot honour.
+    let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": "", "tools": [{"type": "function", "function": {"name": "f"}}]},
+            {"role": "user", "content": "hi"}
+        ],
+        "tool_choice": "required"
+    }))
+    .expect("request deserializes");
+    req.normalize();
+    assert!(error_codes(&req).contains(&"tool_choice_requires_tools".to_string()));
+
+    // The Kimi profile keeps them, so the same request validates there.
+    let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [{"type": "function", "function": {"name": "f"}}]},
+            {"role": "user", "content": "hi"}
+        ],
+        "tool_choice": "required"
+    }))
+    .expect("request deserializes");
+    req.normalize();
+    assert!(req.validate().is_ok(), "{:?}", error_codes(&req));
 }

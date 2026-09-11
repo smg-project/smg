@@ -7,6 +7,12 @@
 //!
 //! Precedence for what a profile encodes: provider verifier > vendor manual >
 //! live API behavior.
+//!
+//! A profile also shapes the request before validation: message-level
+//! extension structs that belong to another provider are dropped (see
+//! [`crate::ext::ProviderExt`]). Provider fields typed directly onto content
+//! parts, such as MiniMax's `max_long_side_pixel` and `fps`, are not covered
+//! by that pass and are forwarded as sent.
 
 mod kimi;
 
@@ -27,28 +33,44 @@ pub enum ProviderProfile {
 }
 
 impl ProviderProfile {
+    /// Select the profile from a model id.
+    ///
+    /// Matches the way the tool and reasoning parser factories do: any
+    /// `/`-separated segment that starts with a vendor marker selects the
+    /// profile, so `kimi-k3`, `/models/Kimi-K3`, `moonshotai/kimi-k2` and
+    /// `openrouter/moonshotai/kimi-k2` all resolve to Kimi. Aliases are not
+    /// visible here, because normalization runs before alias resolution: an
+    /// aliased vendor model falls back to the OpenAI baseline, and any
+    /// extension it carried is dropped with a warning.
     pub fn for_model(model: &str) -> Self {
-        let m = model.to_ascii_lowercase();
-        if m.starts_with("kimi") || m.starts_with("moonshot") {
-            ProviderProfile::Kimi
-        } else if m.starts_with("minimax") || m.starts_with("abab") {
-            ProviderProfile::Minimax
-        } else {
-            ProviderProfile::OpenAi
+        for segment in model.split('/') {
+            if starts_with_ignore_ascii_case(segment, "kimi")
+                || starts_with_ignore_ascii_case(segment, "moonshot")
+            {
+                return ProviderProfile::Kimi;
+            }
+            if starts_with_ignore_ascii_case(segment, "minimax")
+                || starts_with_ignore_ascii_case(segment, "abab")
+            {
+                return ProviderProfile::Minimax;
+            }
         }
+        ProviderProfile::OpenAi
     }
 
     /// Shape the request for dispatch under this profile: every message drops
-    /// the extensions that belong to another provider, so a foreign field
-    /// never reaches a backend or a chat template. Runs before validation
-    /// and template rendering on every entry point.
+    /// the extension struct that belongs to another provider, so a foreign
+    /// field never reaches a backend or a chat template. Runs before
+    /// validation and template rendering on every entry point. Only
+    /// message-level extension structs are covered; see the module docs.
     pub fn normalize_chat(self, req: &mut ChatCompletionRequest) {
         for message in &mut req.messages {
             match message {
-                ChatMessage::System { ext, .. } => retain_if(ext, self),
-                ChatMessage::User { ext, .. } => retain_if(ext, self),
-                ChatMessage::Assistant { ext, .. } => retain_if(ext, self),
-                _ => {}
+                ChatMessage::System { ext, .. } => retain_if(ext, self, "system"),
+                ChatMessage::User { ext, .. } => retain_if(ext, self, "user"),
+                ChatMessage::Assistant { ext, .. } => retain_if(ext, self, "assistant"),
+                ChatMessage::Developer { ext, .. } => retain_if(ext, self, "developer"),
+                ChatMessage::Tool { .. } | ChatMessage::Function { .. } => {}
             }
         }
     }
@@ -65,25 +87,56 @@ impl ProviderProfile {
     }
 }
 
+/// Case-insensitive ASCII prefix test that does not allocate.
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn model_id_selects_profile() {
-        assert_eq!(ProviderProfile::for_model("kimi-k3"), ProviderProfile::Kimi);
-        assert_eq!(
-            ProviderProfile::for_model("Kimi-K2.6"),
-            ProviderProfile::Kimi
-        );
-        assert_eq!(
-            ProviderProfile::for_model("MiniMax-M3"),
-            ProviderProfile::Minimax
-        );
-        assert_eq!(
-            ProviderProfile::for_model("gpt-4o-mini"),
-            ProviderProfile::OpenAi
-        );
-        assert_eq!(ProviderProfile::for_model(""), ProviderProfile::OpenAi);
+        for model in [
+            "kimi-k3",
+            "Kimi-K2.6",
+            "/models/Kimi-K3",
+            "moonshotai/kimi-k2",
+            "openrouter/moonshotai/kimi-k2",
+            "MoonshotAI/Kimi-K2-Instruct",
+        ] {
+            assert_eq!(
+                ProviderProfile::for_model(model),
+                ProviderProfile::Kimi,
+                "{model}"
+            );
+        }
+        for model in [
+            "MiniMax-M3",
+            "/models/MiniMax-M2",
+            "MiniMaxAI/MiniMax-M2",
+            "abab6.5s-chat",
+        ] {
+            assert_eq!(
+                ProviderProfile::for_model(model),
+                ProviderProfile::Minimax,
+                "{model}"
+            );
+        }
+        for model in [
+            "gpt-4o-mini",
+            "",
+            "/models/llama-3",
+            "my-kimi-alias",
+            "openai/gpt-4o",
+        ] {
+            assert_eq!(
+                ProviderProfile::for_model(model),
+                ProviderProfile::OpenAi,
+                "{model}"
+            );
+        }
     }
 }
