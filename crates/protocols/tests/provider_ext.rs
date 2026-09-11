@@ -520,3 +520,96 @@ fn named_tool_choice_sees_dynamic_tools_beside_request_tools() {
         assert!(req.validate().is_ok(), "{role}: {:?}", error_codes(&req));
     }
 }
+
+#[expect(clippy::expect_used, reason = "test helper")]
+fn sampling_request(model: &str, fields: Value) -> ChatCompletionRequest {
+    let mut value = json!({"model": model, "messages": [{"role": "user", "content": "hi"}]});
+    if let (Some(base), Some(extra)) = (value.as_object_mut(), fields.as_object()) {
+        base.extend(extra.clone());
+    }
+    serde_json::from_value(value).expect("request deserializes")
+}
+
+#[test]
+fn kimi_profile_applies_contract_sampling_defaults() {
+    use openai_protocol::validated::Normalizable;
+    let mut req = sampling_request("kimi-k3", json!({}));
+    req.normalize();
+    assert_eq!(req.temperature, Some(1.0));
+    assert_eq!(req.top_p, Some(0.95));
+    assert_eq!(req.presence_penalty, Some(0.0));
+    assert_eq!(req.frequency_penalty, Some(0.0));
+    assert_eq!(req.n, Some(1));
+    assert!(req.validate().is_ok(), "defaults must satisfy the pins");
+}
+
+#[test]
+fn kimi_profile_keeps_explicit_sampling_on_normalize() {
+    use openai_protocol::validated::Normalizable;
+    let mut req = sampling_request("kimi-k3", json!({"temperature": 0.6}));
+    req.normalize();
+    assert_eq!(req.temperature, Some(0.6));
+}
+
+#[test]
+fn non_kimi_models_get_no_sampling_defaults() {
+    use openai_protocol::validated::Normalizable;
+    for model in ["gpt-4o-mini", "MiniMax-M3"] {
+        let mut req = sampling_request(model, json!({}));
+        req.normalize();
+        assert_eq!(req.temperature, None, "{model}");
+        assert_eq!(req.top_p, None, "{model}");
+    }
+}
+
+#[test]
+fn kimi_profile_accepts_the_verifier_sampling_set() {
+    for temperature in [0.0, 0.6, 1.0] {
+        let req = sampling_request(
+            "kimi-k3",
+            json!({"temperature": temperature, "top_p": 0.95, "presence_penalty": 0, "frequency_penalty": 0, "n": 1}),
+        );
+        assert!(error_codes(&req).is_empty(), "temperature={temperature}");
+    }
+}
+
+#[test]
+fn kimi_profile_rejects_off_contract_sampling() {
+    // KVV tests/params wrong_value cases, each pinned to its own rule.
+    for (fields, code) in [
+        (json!({"temperature": 1.1}), "temperature_not_allowed"),
+        (json!({"temperature": 2.0}), "temperature_not_allowed"),
+        (json!({"top_p": 0.8}), "top_p_not_allowed"),
+        (
+            json!({"presence_penalty": 0.5}),
+            "presence_penalty_not_allowed",
+        ),
+        (
+            json!({"frequency_penalty": 0.5}),
+            "frequency_penalty_not_allowed",
+        ),
+        (json!({"n": 2}), "n_not_allowed"),
+    ] {
+        let req = sampling_request("kimi-k3", fields.clone());
+        assert!(
+            error_codes(&req).iter().any(|c| c == code),
+            "{fields} must fail with {code}, got {:?}",
+            error_codes(&req)
+        );
+    }
+    // Out of the OpenAI range as well: rejected, by whichever rule fires first.
+    assert!(sampling_request("kimi-k3", json!({"temperature": -0.1}))
+        .validate()
+        .is_err());
+}
+
+#[test]
+fn non_kimi_models_keep_openai_sampling_freedom() {
+    for model in ["gpt-4o-mini", "MiniMax-M3"] {
+        let req = sampling_request(model, json!({"temperature": 1.5, "top_p": 0.8, "n": 2}));
+        assert!(
+            error_codes(&req).is_empty(),
+            "{model} must not enforce Kimi pins"
+        );
+    }
+}
