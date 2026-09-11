@@ -122,6 +122,7 @@ if [ -n "${current}" ] && serves_both "${current}"; then
 fi
 for mirror in "${MIRRORS[@]}"; do
     [ -z "${chosen}" ] || break
+    [ "${mirror%/}" != "${current}" ] || continue
     if serves_both "${mirror}"; then
         chosen="${mirror}"
     fi
