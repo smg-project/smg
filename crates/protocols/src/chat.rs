@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     builders::{ChatCompletionResponseBuilder, ChatCompletionStreamResponseBuilder},
-    ext::kimi::{KimiAssistantExt, KimiSystemExt, KimiUserExt},
+    ext::kimi::{KimiAssistantExt, KimiDeveloperExt, KimiSystemExt, KimiUserExt},
     profile::ProviderProfile,
     validated::Normalizable,
 };
@@ -42,6 +42,7 @@ pub enum ChatMessage {
         content: MessageContent,
         name: Option<String>,
         #[serde(flatten)]
+        #[schemars(skip)]
         ext: KimiUserExt,
     },
     #[serde(rename = "assistant")]
@@ -52,6 +53,7 @@ pub enum ChatMessage {
         /// Reasoning content for O1-style models (SGLang extension)
         reasoning_content: Option<String>,
         #[serde(flatten)]
+        #[schemars(skip)]
         ext: KimiAssistantExt,
     },
     #[serde(rename = "tool")]
@@ -64,8 +66,10 @@ pub enum ChatMessage {
     #[serde(rename = "developer")]
     Developer {
         content: MessageContent,
-        tools: Option<Vec<Tool>>,
         name: Option<String>,
+        #[serde(flatten)]
+        #[schemars(skip)]
+        ext: KimiDeveloperExt,
     },
 }
 
@@ -594,10 +598,13 @@ fn validate_chat_cross_parameters(
 // ============================================================================
 
 impl Normalizable for ChatCompletionRequest {
-    /// Normalize the request by applying migrations and defaults:
-    /// 1. Migrate deprecated fields to their replacements
-    /// 2. Clear deprecated fields and log warnings
-    /// 3. Apply OpenAI defaults for tool_choice
+    /// Normalize the request:
+    /// 1. Drop message extensions that belong to another provider's profile
+    ///    (the one place in the request lifecycle where caller data is removed;
+    ///    see [`ProviderProfile::normalize_chat`])
+    /// 2. Migrate deprecated fields to their replacements
+    /// 3. Clear deprecated fields and log warnings
+    /// 4. Apply OpenAI defaults for tool_choice
     fn normalize(&mut self) {
         ProviderProfile::for_model(&self.model).normalize_chat(self);
 

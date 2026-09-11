@@ -1008,11 +1008,7 @@ impl HarmonyBuilder {
                     };
                     harmony_messages.push(harmony_msg);
                 }
-                ChatMessage::Developer {
-                    content,
-                    name,
-                    tools: _,
-                } => {
+                ChatMessage::Developer { content, name, .. } => {
                     // Developer messages stay as-is
                     let harmony_msg = HarmonyMessage {
                         author: Author {

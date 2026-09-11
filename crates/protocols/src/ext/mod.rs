@@ -4,7 +4,9 @@
 //! are `#[serde(flatten)]`-ed into the core request types. Fields are promoted
 //! here only when a provider's vendor-acceptance contract enforces behavior on
 //! them; cosmetic extras stay out. Absent fields serialize to nothing, so
-//! OpenAI-only traffic is wire-identical.
+//! OpenAI-only traffic is wire-identical. A struct that exists only so a
+//! profile can reject the field is kept out of the published schema with
+//! `#[schemars(skip)]` at its use site.
 
 pub mod kimi;
 
@@ -15,16 +17,35 @@ use crate::profile::ProviderProfile;
 /// field then never reaches a backend or a chat template, which is what serde
 /// did before the field was typed. The owning profile keeps it, so its rules
 /// can reject misuse with a 400 instead of hiding it.
-pub trait ProviderExt {
+pub trait ProviderExt: Default + PartialEq {
     /// The profile whose contract defines these fields.
     const PROFILE: ProviderProfile;
-    /// Reset every field to "absent".
-    fn clear(&mut self);
+
+    /// Reset every field to "absent". Defaulted so that a field added to an
+    /// extension cannot leak to another provider by omission.
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Whether no field is set.
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
-/// Keep `ext` only when `active` is the profile it belongs to.
-pub fn retain_if<E: ProviderExt>(ext: &mut E, active: ProviderProfile) {
-    if E::PROFILE != active {
-        ext.clear();
+/// Keep `ext` only when `active` is the profile it belongs to. Dropping a
+/// populated extension is logged: a model id that profile selection did not
+/// recognise is the usual cause, and a field that vanishes silently is hard
+/// to diagnose.
+pub fn retain_if<E: ProviderExt>(ext: &mut E, active: ProviderProfile, role: &str) {
+    if E::PROFILE == active || ext.is_empty() {
+        return;
     }
+    tracing::warn!(
+        role,
+        owner = ?E::PROFILE,
+        active = ?active,
+        "dropping a message extension that belongs to another provider's profile"
+    );
+    ext.clear();
 }
