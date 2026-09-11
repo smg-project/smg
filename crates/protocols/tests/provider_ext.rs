@@ -5,6 +5,7 @@
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage},
     common::{ImageUrl, ToolChoice, ToolChoiceValue, VideoUrl},
+    validated::Normalizable,
 };
 use serde_json::{json, Value};
 use validator::Validate;
@@ -226,5 +227,52 @@ fn non_kimi_models_tolerate_tools_on_any_role() {
             req.validate().is_ok(),
             "{model} must not enforce the kimi role restriction"
         );
+    }
+}
+
+#[expect(clippy::expect_used, reason = "test helper")]
+fn normalized(value: Value) -> Value {
+    let mut req: ChatCompletionRequest =
+        serde_json::from_value(value).expect("request deserializes");
+    req.normalize();
+    serde_json::to_value(&req).expect("request serializes")
+}
+
+fn kimi_ext_request(model: &str) -> Value {
+    json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "", "tools": [{"type": "function", "function": {"name": "f"}}]},
+            {"role": "user", "content": "hi", "tools": [{"type": "function", "function": {"name": "g"}}]},
+            {"role": "assistant", "content": "ok", "tools": [{"type": "function", "function": {"name": "h"}}]}
+        ]
+    })
+}
+
+#[test]
+fn openai_profile_drops_kimi_extensions_on_normalize() {
+    // Typed so Kimi can reject them, they must not reach an OpenAI backend:
+    // the same outcome as when serde dropped the unknown key.
+    let out = normalized(kimi_ext_request("gpt-4o"));
+    for message in out["messages"].as_array().expect("messages") {
+        assert!(message.get("tools").is_none(), "{message}");
+    }
+}
+
+#[test]
+fn minimax_profile_drops_kimi_extensions_on_normalize() {
+    let out = normalized(kimi_ext_request("MiniMax-M3"));
+    for message in out["messages"].as_array().expect("messages") {
+        assert!(message.get("tools").is_none(), "{message}");
+    }
+}
+
+#[test]
+fn kimi_profile_keeps_its_extensions_on_normalize() {
+    // Kept on every role: the system tools are the feature, and the user and
+    // assistant ones stay for the profile's rules to reject with a 400.
+    let out = normalized(kimi_ext_request("kimi-k3"));
+    for message in out["messages"].as_array().expect("messages") {
+        assert!(message.get("tools").is_some(), "{message}");
     }
 }

@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::Tool;
+use crate::{common::Tool, ext::ProviderExt, profile::ProviderProfile};
 
 /// Dynamic-tool declaration on system messages (K3): tools may be declared on
 /// a system message with empty content, at any position in the conversation,
@@ -26,4 +26,25 @@ pub struct KimiUserExt {
 pub struct KimiAssistantExt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
+}
+
+impl ProviderExt for KimiSystemExt {
+    const PROFILE: ProviderProfile = ProviderProfile::Kimi;
+    fn clear(&mut self) {
+        self.tools = None;
+    }
+}
+
+impl ProviderExt for KimiUserExt {
+    const PROFILE: ProviderProfile = ProviderProfile::Kimi;
+    fn clear(&mut self) {
+        self.tools = None;
+    }
+}
+
+impl ProviderExt for KimiAssistantExt {
+    const PROFILE: ProviderProfile = ProviderProfile::Kimi;
+    fn clear(&mut self) {
+        self.tools = None;
+    }
 }

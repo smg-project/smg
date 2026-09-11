@@ -599,6 +599,8 @@ impl Normalizable for ChatCompletionRequest {
     /// 2. Clear deprecated fields and log warnings
     /// 3. Apply OpenAI defaults for tool_choice
     fn normalize(&mut self) {
+        ProviderProfile::for_model(&self.model).normalize_chat(self);
+
         // Migrate deprecated max_tokens → max_completion_tokens
         #[expect(deprecated)]
         if self.max_completion_tokens.is_none() && self.max_tokens.is_some() {

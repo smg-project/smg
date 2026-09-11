@@ -10,7 +10,10 @@
 
 mod kimi;
 
-use crate::chat::ChatCompletionRequest;
+use crate::{
+    chat::{ChatCompletionRequest, ChatMessage},
+    ext::retain_if,
+};
 
 /// Provider dialect for a request, selected from the model id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +35,21 @@ impl ProviderProfile {
             ProviderProfile::Minimax
         } else {
             ProviderProfile::OpenAi
+        }
+    }
+
+    /// Shape the request for dispatch under this profile: every message drops
+    /// the extensions that belong to another provider, so a foreign field
+    /// never reaches a backend or a chat template. Runs before validation
+    /// and template rendering on every entry point.
+    pub fn normalize_chat(self, req: &mut ChatCompletionRequest) {
+        for message in &mut req.messages {
+            match message {
+                ChatMessage::System { ext, .. } => retain_if(ext, self),
+                ChatMessage::User { ext, .. } => retain_if(ext, self),
+                ChatMessage::Assistant { ext, .. } => retain_if(ext, self),
+                _ => {}
+            }
         }
     }
 
