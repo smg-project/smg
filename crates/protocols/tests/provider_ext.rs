@@ -537,17 +537,46 @@ fn tool_history_request(model: &str, tool_call_id: &str, arguments: &str) -> Cha
     .expect("request deserializes")
 }
 
+fn has_code(req: &ChatCompletionRequest, code: &str) -> bool {
+    error_codes(req).iter().any(|c| c == code)
+}
+
+#[expect(clippy::expect_used, reason = "test helper")]
+fn history_request(model: &str, messages: Value) -> ChatCompletionRequest {
+    serde_json::from_value(json!({"model": model, "messages": messages}))
+        .expect("request deserializes")
+}
+
+fn tool_call(id: &str) -> Value {
+    json!({"id": id, "type": "function", "function": {"name": "get_weather", "arguments": "{}"}})
+}
+
+fn unanswered_request(model: &str) -> ChatCompletionRequest {
+    history_request(
+        model,
+        json!([
+            {"role": "user", "content": "weather in two cities?"},
+            {"role": "assistant", "content": null, "tool_calls": [tool_call("call_1"), tool_call("call_2")]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
+        ]),
+    )
+}
+
 #[test]
 fn minimax_profile_enforces_tool_history_strictness() {
     // MPV 16_08: unknown tool_call_id
-    assert!(tool_history_request("MiniMax-M3", "call_999", "{}")
-        .validate()
-        .is_err());
-    // MPV 16_12: invalid JSON arguments
+    let mismatch = tool_history_request("MiniMax-M3", "call_999", "{}");
     assert!(
-        tool_history_request("MiniMax-M3", "call_1", "{invalid json}")
-            .validate()
-            .is_err()
+        has_code(&mismatch, "tool_call_id_mismatch"),
+        "{:?}",
+        error_codes(&mismatch)
+    );
+    // MPV 16_12: invalid JSON arguments
+    let malformed = tool_history_request("MiniMax-M3", "call_1", "{invalid json}");
+    assert!(
+        has_code(&malformed, "tool_call_arguments_invalid_json"),
+        "{:?}",
+        error_codes(&malformed)
     );
     // valid history passes
     assert!(
@@ -558,20 +587,75 @@ fn minimax_profile_enforces_tool_history_strictness() {
 }
 
 #[test]
-fn minimax_profile_rejects_unanswered_tool_calls() {
-    let req: ChatCompletionRequest = serde_json::from_value(json!({
-        "model": "MiniMax-M3",
-        "messages": [
-            {"role": "user", "content": "weather in two cities?"},
+fn minimax_profile_requires_arguments_to_be_a_json_object_when_present() {
+    for arguments in ["42", "null", "\"x\"", "[1, 2]"] {
+        let req = tool_history_request("MiniMax-M3", "call_1", arguments);
+        assert!(
+            has_code(&req, "tool_call_arguments_invalid_json"),
+            "{arguments}: {:?}",
+            error_codes(&req)
+        );
+    }
+    // An absent field is not malformed JSON.
+    let absent = history_request(
+        "MiniMax-M3",
+        json!([
+            {"role": "user", "content": "weather?"},
             {"role": "assistant", "content": null, "tool_calls": [
-                {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}},
-                {"id": "call_2", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}
+                {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": null}}
             ]},
             {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
-        ]
-    }))
-    .expect("request deserializes");
-    assert!(req.validate().is_err());
+        ]),
+    );
+    assert!(absent.validate().is_ok(), "{:?}", error_codes(&absent));
+}
+
+#[test]
+fn minimax_profile_rejects_unanswered_tool_calls() {
+    let req = unanswered_request("MiniMax-M3");
+    assert!(
+        has_code(&req, "tool_call_unanswered"),
+        "{:?}",
+        error_codes(&req)
+    );
+}
+
+#[test]
+fn minimax_profile_rejects_reused_tool_call_ids_across_turns() {
+    // Both calls are answered, so only conversation-wide uniqueness catches it.
+    let req = history_request(
+        "MiniMax-M3",
+        json!([
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": null, "tool_calls": [tool_call("call_1")]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+            {"role": "assistant", "content": null, "tool_calls": [tool_call("call_1")]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "rainy"}
+        ]),
+    );
+    assert!(
+        has_code(&req, "tool_call_id_duplicate"),
+        "{:?}",
+        error_codes(&req)
+    );
+}
+
+#[test]
+fn minimax_profile_rejects_a_second_answer_to_an_answered_call() {
+    let req = history_request(
+        "MiniMax-M3",
+        json!([
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": null, "tool_calls": [tool_call("call_1")]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "sunny again"}
+        ]),
+    );
+    assert!(
+        has_code(&req, "tool_call_id_mismatch"),
+        "{:?}",
+        error_codes(&req)
+    );
 }
 
 #[test]
@@ -589,6 +673,10 @@ fn kimi_and_openai_tolerate_loose_tool_history() {
                 .validate()
                 .is_ok(),
             "{model} must tolerate id mismatch"
+        );
+        assert!(
+            unanswered_request(model).validate().is_ok(),
+            "{model} must tolerate unanswered tool calls"
         );
     }
 }
