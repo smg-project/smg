@@ -596,6 +596,15 @@ fn minimax_profile_requires_arguments_to_be_a_json_object_when_present() {
             error_codes(&req)
         );
     }
+    // An empty or blank string is how a zero-argument call is often spelled.
+    for arguments in ["", "  "] {
+        let req = tool_history_request("MiniMax-M3", "call_1", arguments);
+        assert!(
+            req.validate().is_ok(),
+            "{arguments:?}: {:?}",
+            error_codes(&req)
+        );
+    }
     // An absent field is not malformed JSON.
     let absent = history_request(
         "MiniMax-M3",
