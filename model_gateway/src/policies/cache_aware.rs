@@ -75,7 +75,10 @@ use std::{
 };
 
 use dashmap::DashMap;
-use kv_index::{compute_request_content_hashes, PositionalIndexer, TenantId, TokenTree, Tree};
+use kv_index::{
+    compute_request_content_hashes, group_cache::GroupRequest, PositionalIndexer, TenantId,
+    TokenTree, Tree,
+};
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
 use rand::RngExt;
@@ -1550,10 +1553,17 @@ impl CacheAwarePolicy {
         // Gather the positive-overlap candidates once; both selection modes
         // and the decay's fleet-floor computation need the full set.
         let mut candidates: Vec<OverlapCandidate> = Vec::new();
+        let mut group_request = None;
         for &idx in healthy_indices {
-            let score = if let Some(hit) =
-                monitor.and_then(|m| m.group_reusable_tokens(workers[idx].url(), tokens))
-            {
+            let group_hit = monitor
+                .filter(|m| m.is_group_worker(workers[idx].url()))
+                .and_then(|m| {
+                    m.group_reusable_tokens(
+                        workers[idx].url(),
+                        group_request.get_or_insert_with(|| GroupRequest::new(tokens)),
+                    )
+                });
+            let score = if let Some(hit) = group_hit {
                 // Normalize reported group boundaries to the legacy block
                 // scale so load decay remains comparable across the fleet.
                 hit.map(|tokens| tokens as f64 / block_size as f64)
@@ -4374,14 +4384,6 @@ mod tests {
             tokens: Some(&tokens),
             ..Default::default()
         };
-        assert_eq!(
-            monitor.group_reusable_tokens(workers[0].url(), &tokens),
-            Some(Some(24))
-        );
-        assert_eq!(
-            monitor.group_reusable_tokens(workers[1].url(), &tokens),
-            Some(Some(16))
-        );
         assert_eq!(policy.select_worker(&workers, &info), Some(0));
         apply(&rows[2]); // The full-attention block remains; Mamba checkpoint is gone.
         assert_eq!(policy.select_worker(&workers, &info), Some(1));

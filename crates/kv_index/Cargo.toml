@@ -1,6 +1,6 @@
 [package]
 name = "kv-index"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 description = "Radix tree implementations for prefix matching and cache-aware routing"
 license = "Apache-2.0"
@@ -14,6 +14,7 @@ keywords = ["radix-tree", "prefix-matching", "cache-routing", "llm"]
 categories = ["data-structures", "caching"]
 
 [dependencies]
+smg-radix-tree = { workspace = true }
 bincode = "1.3"
 blake3 = { workspace = true }
 dashmap = { workspace = true }

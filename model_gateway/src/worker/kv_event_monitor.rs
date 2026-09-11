@@ -16,7 +16,7 @@ use dashmap::DashMap;
 use futures::FutureExt as _;
 use kv_index::{
     compute_content_hash,
-    group_cache::{GroupCache, GroupEvent},
+    group_cache::{GroupCache, GroupEvent, GroupRequest},
     ApplyError, PositionalIndexer, SequenceHash, StoredBlock, WorkerBlockMap,
 };
 use smg_grpc_client::common_proto::{
@@ -363,11 +363,11 @@ impl KvEventMonitor {
     pub(crate) fn group_reusable_tokens(
         &self,
         worker_url: &str,
-        tokens: &[u32],
+        request: &GroupRequest,
     ) -> Option<Option<usize>> {
         self.group_caches
             .get(worker_url)
-            .map(|cache| cache.reusable_tokens(tokens))
+            .map(|cache| cache.reusable_tokens(request))
     }
 
     pub(crate) fn is_group_worker(&self, worker_url: &str) -> bool {
@@ -931,7 +931,7 @@ mod tests {
                 for replay in 0..replays {
                     monitor.test_group_batch(worker, &batch);
                     assert_eq!(
-                        monitor.group_reusable_tokens(worker, &tokens),
+                        monitor.group_reusable_tokens(worker, &GroupRequest::new(&tokens)),
                         Some(expected),
                         "{} replay {replay}",
                         row["name"]
@@ -959,7 +959,10 @@ mod tests {
             }
             monitor.test_group_batch("worker", &bad);
             assert_eq!(
-                monitor.group_reusable_tokens("worker", &[1, 2, 3, 4, 5, 6, 7, 8, 9]),
+                monitor.group_reusable_tokens(
+                    "worker",
+                    &GroupRequest::new(&[1, 2, 3, 4, 5, 6, 7, 8, 9])
+                ),
                 Some(None)
             );
         }

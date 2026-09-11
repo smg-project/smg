@@ -249,7 +249,7 @@ jobs:
       - name: Run Python unit tests
         run: |
           cd bindings/python
-          python3 -m pip install pytest pytest-cov pytest-xdist
+          python3 -m pip install pytest pytest-asyncio pytest-cov pytest-xdist
           pytest -q tests --cov=smg --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
 
       - name: Run grpc_servicer unit tests

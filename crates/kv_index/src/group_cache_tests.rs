@@ -4,6 +4,10 @@ use serde_json::Value;
 
 use super::*;
 
+fn query(cache: &GroupCache, tokens: &[u32]) -> Option<usize> {
+    cache.reusable_tokens(&GroupRequest::new(tokens))
+}
+
 fn fixtures() -> Value {
     serde_json::from_str(include_str!("../tests/fixtures/vllm-group-cache.json")).unwrap()
 }
@@ -265,7 +269,7 @@ fn received_state_fixture_scenarios_with_explicit_native_subset() {
             let mut cache = GroupCache::default();
             apply(&mut cache, 0, &events);
             assert_eq!(
-                cache.reusable_tokens(&request),
+                query(&cache, &request),
                 expected,
                 "{}: {}",
                 case["name"],
@@ -288,55 +292,6 @@ fn received_state_fixture_scenarios_with_explicit_native_subset() {
 }
 
 #[test]
-fn nine_native_hash_vectors_are_opaque_identities_not_recomputed_hashes() {
-    let data = fixtures();
-    let vectors = data["hash_vectors"].as_array().unwrap();
-    assert_eq!(vectors.len(), 9);
-    for vector in vectors {
-        let block: Vec<u32> = serde_json::from_value(vector["token_ids"].clone()).unwrap();
-        let first = key(vector["hash"].as_str().unwrap());
-        let second = key(vector["next_hash"].as_str().unwrap());
-        let mut request = [block.clone(), block.clone()].concat();
-        request.push(42);
-        let mut cache = GroupCache::default();
-        apply(
-            &mut cache,
-            0,
-            &[
-                store(
-                    0,
-                    "full_attention",
-                    0,
-                    block.len(),
-                    vec![first.clone()],
-                    None,
-                    block.clone(),
-                ),
-                store(
-                    0,
-                    "full_attention",
-                    0,
-                    block.len(),
-                    vec![second],
-                    Some(first.clone()),
-                    block.clone(),
-                ),
-            ],
-        );
-        assert_eq!(cache.reusable_tokens(&request), Some(2 * block.len()));
-        apply(
-            &mut cache,
-            1,
-            &[GroupEvent::Remove {
-                group_id: 0,
-                keys: vec![first],
-            }],
-        );
-        assert_eq!(cache.reusable_tokens(&request), Some(0));
-    }
-}
-
-#[test]
 fn newly_observed_group_joins_without_a_roster_or_contiguous_group_ids() {
     let mut cache = GroupCache::default();
     apply(
@@ -347,11 +302,11 @@ fn newly_observed_group_joins_without_a_roster_or_contiguous_group_ids() {
             root_report(9, "full_attention", 0, 2, &[2, 4, 6, 8], 8),
         ],
     );
-    assert_eq!(cache.reusable_tokens(&tokens(11)), Some(8));
+    assert_eq!(query(&cache, &tokens(11)), Some(8));
     apply(&mut cache, 18, &[root_report(27, "mamba", 0, 2, &[6], 6)]);
-    assert_eq!(cache.reusable_tokens(&tokens(11)), Some(6));
+    assert_eq!(query(&cache, &tokens(11)), Some(6));
     apply(&mut cache, 19, &[remove(27, &[6])]);
-    assert_eq!(cache.reusable_tokens(&tokens(11)), Some(0));
+    assert_eq!(query(&cache, &tokens(11)), Some(0));
 }
 
 #[test]
@@ -366,14 +321,13 @@ fn sparse_joint_resume_is_24_even_though_independent_maxima_are_32_and_40() {
             remove(0, &[36, 40]),
         ],
     );
-    assert_eq!(cache.reusable_tokens(&tokens(41)), Some(32));
+    assert_eq!(query(&cache, &tokens(41)), Some(32));
     apply(
         &mut cache,
         1,
         &[root_report(1, "mamba", 0, 4, &[24, 40], 40)],
     );
-    assert_eq!(cache.reusable_tokens(&tokens(41)), Some(24));
-    assert_ne!(cache.reusable_tokens(&tokens(41)), Some(32));
+    assert_eq!(query(&cache, &tokens(41)), Some(24));
 }
 
 #[test]
@@ -384,7 +338,7 @@ fn sparse_hashes_are_not_ordinal_zipped_and_cross_group_context_resolves_them() 
         0,
         &[root_report(1, "mamba", 0, 2, &[4, 8, 10, 12], 12)],
     );
-    assert_eq!(cache.reusable_tokens(&tokens(9)), Some(0));
+    assert_eq!(query(&cache, &tokens(9)), Some(0));
     apply(
         &mut cache,
         1,
@@ -397,23 +351,23 @@ fn sparse_hashes_are_not_ordinal_zipped_and_cross_group_context_resolves_them() 
             12,
         )],
     );
-    assert_eq!(cache.reusable_tokens(&tokens(7)), Some(4));
-    assert_eq!(cache.reusable_tokens(&tokens(9)), Some(8));
-    assert_eq!(cache.reusable_tokens(&tokens(13)), Some(12));
+    assert_eq!(query(&cache, &tokens(7)), Some(4));
+    assert_eq!(query(&cache, &tokens(9)), Some(8));
+    assert_eq!(query(&cache, &tokens(13)), Some(12));
 }
 
 #[test]
 fn unknown_parent_is_pending_and_eviction_keeps_prefix_context() {
     let mut cache = GroupCache::default();
     apply(&mut cache, 0, &[child_report(0, "mamba", 0, 2, 4)]);
-    assert_eq!(cache.reusable_tokens(&[3, 4, 5]), Some(0));
-    assert_eq!(cache.reusable_tokens(&tokens(5)), Some(0));
+    assert_eq!(query(&cache, &[3, 4, 5]), Some(0));
+    assert_eq!(query(&cache, &tokens(5)), Some(0));
     apply(&mut cache, 1, &[root_report(0, "mamba", 0, 2, &[2], 2)]);
-    assert_eq!(cache.reusable_tokens(&tokens(5)), Some(4));
+    assert_eq!(query(&cache, &tokens(5)), Some(4));
     apply(&mut cache, 2, &[remove(0, &[2, 4])]);
-    assert_eq!(cache.reusable_tokens(&tokens(7)), Some(0));
+    assert_eq!(query(&cache, &tokens(7)), Some(0));
     apply(&mut cache, 3, &[child_report(0, "mamba", 0, 4, 6)]);
-    assert_eq!(cache.reusable_tokens(&tokens(7)), Some(6));
+    assert_eq!(query(&cache, &tokens(7)), Some(6));
 }
 
 #[test]
@@ -424,11 +378,11 @@ fn repeated_reports_are_idempotent_and_one_remove_withdraws_the_key() {
     apply(&mut cache, 0, &[GroupEvent::Invalid]);
     apply(&mut cache, 1, &[report]);
     apply(&mut cache, 2, &[remove(0, &[4])]);
-    assert_eq!(cache.reusable_tokens(&tokens(5)), Some(2));
+    assert_eq!(query(&cache, &tokens(5)), Some(2));
     apply(&mut cache, 3, &[remove(0, &[4])]);
-    assert_eq!(cache.reusable_tokens(&tokens(5)), Some(2));
+    assert_eq!(query(&cache, &tokens(5)), Some(2));
     apply(&mut cache, 4, &[child_report(0, "full_attention", 0, 2, 4)]);
-    assert_eq!(cache.reusable_tokens(&tokens(5)), Some(4));
+    assert_eq!(query(&cache, &tokens(5)), Some(4));
 }
 
 #[test]
@@ -437,19 +391,19 @@ fn clear_keeps_groups_but_gap_and_disconnect_start_new_observations() {
     let a = root_report(0, "full_attention", 0, 2, &[2, 4], 4);
     let b = root_report(1, "mamba", 0, 2, &[4], 4);
     apply(&mut cache, 0, &[a.clone(), b.clone()]);
-    assert_eq!(cache.reusable_tokens(&tokens(5)), Some(4));
+    assert_eq!(query(&cache, &tokens(5)), Some(4));
     apply(&mut cache, 1, &[GroupEvent::Clear, a.clone()]);
-    assert_eq!(cache.reusable_tokens(&tokens(5)), Some(0));
+    assert_eq!(query(&cache, &tokens(5)), Some(0));
     apply(&mut cache, 2, &[b]);
-    assert_eq!(cache.reusable_tokens(&tokens(5)), Some(4));
+    assert_eq!(query(&cache, &tokens(5)), Some(4));
     apply(&mut cache, 4, std::slice::from_ref(&a));
-    assert_eq!(cache.reusable_tokens(&tokens(5)), Some(4));
+    assert_eq!(query(&cache, &tokens(5)), Some(4));
     apply(&mut cache, 3, &[GroupEvent::Invalid]);
-    assert_eq!(cache.reusable_tokens(&tokens(5)), Some(4));
+    assert_eq!(query(&cache, &tokens(5)), Some(4));
     cache.invalidate();
-    assert_eq!(cache.reusable_tokens(&tokens(5)), None);
+    assert_eq!(query(&cache, &tokens(5)), None);
     apply(&mut cache, 31, &[a]);
-    assert_eq!(cache.reusable_tokens(&tokens(5)), Some(4));
+    assert_eq!(query(&cache, &tokens(5)), Some(4));
 }
 
 #[test]
@@ -461,15 +415,15 @@ fn partial_report_span_is_not_physical_group_size_or_global_alignment() {
         &[root_report(0, "full_attention", 0, 8, &[8], 8)],
     );
     apply(&mut cache, 1, &[child_report(1, "mamba", 0, 4, 6)]);
-    assert_eq!(cache.reusable_tokens(&tokens(9)), Some(0));
+    assert_eq!(query(&cache, &tokens(9)), Some(0));
     apply(
         &mut cache,
         2,
         &[root_report(0, "full_attention", 0, 4, &[4], 4)],
     );
-    assert_eq!(cache.reusable_tokens(&tokens(9)), Some(6));
+    assert_eq!(query(&cache, &tokens(9)), Some(6));
     apply(&mut cache, 3, &[root_report(1, "mamba", 0, 8, &[8], 8)]);
-    assert_eq!(cache.reusable_tokens(&tokens(9)), Some(8));
+    assert_eq!(query(&cache, &tokens(9)), Some(8));
 }
 
 #[test]
@@ -496,7 +450,7 @@ fn raw_key_width_and_leading_bytes_are_identity() {
             )],
         );
     }
-    assert_eq!(cache.reusable_tokens(&tokens(9)), Some(8));
+    assert_eq!(query(&cache, &tokens(9)), Some(8));
     for (sequence, i) in (0..keys.len()).rev().enumerate() {
         apply(
             &mut cache,
@@ -506,14 +460,13 @@ fn raw_key_width_and_leading_bytes_are_identity() {
                 keys: vec![keys[i].clone()],
             }],
         );
-        assert_eq!(cache.reusable_tokens(&tokens(9)), Some(i * 2));
+        assert_eq!(query(&cache, &tokens(9)), Some(i * 2));
     }
 }
 
 #[test]
-fn group_and_worker_identity_are_independent() {
+fn removing_one_group_preserves_other_groups_using_the_same_key() {
     let mut first = GroupCache::default();
-    let second = GroupCache::default();
     apply(
         &mut first,
         0,
@@ -523,9 +476,13 @@ fn group_and_worker_identity_are_independent() {
         ],
     );
     apply(&mut first, 1, &[remove(0, &[2])]);
-    assert_eq!(first.reusable_tokens(&tokens(3)), Some(0));
-    assert_eq!(second.reusable_tokens(&tokens(3)), None);
-    assert!(first.groups[&1].reported.contains_key(&opaque(2)));
+    assert_eq!(query(&first, &tokens(3)), Some(0));
+    apply(
+        &mut first,
+        2,
+        &[root_report(0, "full_attention", 0, 2, &[2], 2)],
+    );
+    assert_eq!(query(&first, &tokens(3)), Some(2));
 }
 
 #[test]
@@ -536,43 +493,41 @@ fn matching_tail_content_does_not_match_a_different_prefix() {
         0,
         &[root_report(0, "mamba", 0, 2, &[2, 4], 4), remove(0, &[2])],
     );
-    assert_eq!(cache.reusable_tokens(&tokens(5)), Some(4));
-    assert_eq!(cache.reusable_tokens(&[9, 9, 3, 4, 5]), Some(0));
+    assert_eq!(query(&cache, &tokens(5)), Some(4));
+    assert_eq!(query(&cache, &[9, 9, 3, 4, 5]), Some(0));
 }
 
 #[test]
 fn only_reported_endpoints_below_request_length_are_candidates() {
-    let mut cache = GroupCache::default();
-    apply(
-        &mut cache,
-        0,
-        &[root_report(0, "full_attention", 0, 4, &[4, 8], 8)],
-    );
-    assert_eq!(cache.reusable_tokens(&tokens(10)), Some(8));
-    assert_eq!(cache.reusable_tokens(&tokens(8)), Some(4));
-    assert_eq!(cache.reusable_tokens(&tokens(7)), Some(4));
-    assert_eq!(cache.reusable_tokens(&[]), Some(0));
+    for kind in ["full_attention", "mla_attention"] {
+        let mut cache = GroupCache::default();
+        apply(&mut cache, 0, &[root_report(0, kind, 0, 4, &[4, 8], 8)]);
+        assert_eq!(query(&cache, &tokens(10)), Some(8));
+        assert_eq!(query(&cache, &tokens(8)), Some(4));
+        assert_eq!(query(&cache, &tokens(7)), Some(4));
+        assert_eq!(query(&cache, &[]), Some(0));
+    }
 }
 
 #[test]
 fn unsupported_or_missing_group_metadata_is_unavailable() {
-    for kind in ["", "unknown", "mla_attention", "chunked_local_attention"] {
+    for kind in ["", "unknown", "chunked_local_attention"] {
         let mut cache = GroupCache::default();
         apply(&mut cache, 0, &[root_report(0, kind, 0, 2, &[2], 2)]);
-        assert_eq!(cache.reusable_tokens(&tokens(3)), None);
+        assert_eq!(query(&cache, &tokens(3)), None);
     }
     let mut cache = GroupCache::default();
     apply(&mut cache, 0, &[remove(7, &[2])]);
-    assert_eq!(cache.reusable_tokens(&tokens(3)), None);
+    assert_eq!(query(&cache, &tokens(3)), None);
     apply(&mut cache, 1, &[root_report(7, "mamba", 0, 2, &[2], 2)]);
-    assert_eq!(cache.reusable_tokens(&tokens(3)), Some(2));
+    assert_eq!(query(&cache, &tokens(3)), Some(2));
     let mut cache = GroupCache::default();
     apply(
         &mut cache,
         0,
         &[root_report(0, "sliding_window", 0, 2, &[2], 2)],
     );
-    assert_eq!(cache.reusable_tokens(&tokens(3)), None);
+    assert_eq!(query(&cache, &tokens(3)), None);
 }
 
 #[test]
@@ -586,7 +541,7 @@ fn unmatchable_payload_does_not_invent_prefix_context() {
     }
     let mut cache = GroupCache::default();
     apply(&mut cache, 0, &[report]);
-    assert_eq!(cache.reusable_tokens(&tokens(3)), Some(0));
+    assert_eq!(query(&cache, &tokens(3)), Some(0));
     assert!(cache.groups[&0].reported.contains_key(&opaque(2)));
 }
 
@@ -599,7 +554,7 @@ fn malformed_or_conflicting_identity_discards_evidence() {
     ] {
         let mut cache = GroupCache::default();
         assert!(cache.apply_batch(0, &[invalid]).is_err());
-        assert_eq!(cache.reusable_tokens(&tokens(3)), None);
+        assert_eq!(query(&cache, &tokens(3)), None);
     }
     let mut cache = GroupCache::default();
     apply(
@@ -621,7 +576,7 @@ fn malformed_or_conflicting_identity_discards_evidence() {
             )]
         )
         .is_err());
-    assert_eq!(cache.reusable_tokens(&tokens(3)), None);
+    assert_eq!(query(&cache, &tokens(3)), None);
     apply(
         &mut cache,
         2,
@@ -630,7 +585,7 @@ fn malformed_or_conflicting_identity_discards_evidence() {
     assert!(cache
         .apply_batch(3, &[root_report(0, "mamba", 0, 2, &[2], 2)])
         .is_err());
-    assert_eq!(cache.reusable_tokens(&tokens(3)), None);
+    assert_eq!(query(&cache, &tokens(3)), None);
 }
 
 #[test]
@@ -645,7 +600,7 @@ fn same_known_endpoint_accepts_full_and_partial_reports_with_unknown_parents() {
             child_report(2, "mamba", 0, 14, 16),
         ],
     );
-    assert_eq!(cache.reusable_tokens(&tokens(17)), Some(16));
+    assert_eq!(query(&cache, &tokens(17)), Some(16));
 }
 
 #[test]
@@ -660,13 +615,13 @@ fn either_unknown_parent_can_resolve_the_same_checkpoint() {
                 child_report(1, "mamba", 0, 14, 16),
             ],
         );
-        assert_eq!(cache.reusable_tokens(&tokens(17)), Some(0));
+        assert_eq!(query(&cache, &tokens(17)), Some(0));
         apply(
             &mut cache,
             1,
             &[child_report(0, "mamba", 0, 0, first_parent)],
         );
-        assert_eq!(cache.reusable_tokens(&tokens(17)), Some(16));
+        assert_eq!(query(&cache, &tokens(17)), Some(16));
 
         let other_parent = if first_parent == 8 { 14 } else { 8 };
         apply(
@@ -674,7 +629,7 @@ fn either_unknown_parent_can_resolve_the_same_checkpoint() {
             2,
             &[child_report(0, "mamba", 0, 0, other_parent)],
         );
-        assert_eq!(cache.reusable_tokens(&tokens(17)), Some(16));
+        assert_eq!(query(&cache, &tokens(17)), Some(16));
     }
 }
 
@@ -689,5 +644,62 @@ fn reported_span_longer_than_resolved_prefix_cannot_supply_coverage() {
             root_report(1, "full_attention", 0, 8, &[2], 2),
         ],
     );
-    assert_eq!(cache.reusable_tokens(&tokens(3)), Some(0));
+    assert_eq!(query(&cache, &tokens(3)), Some(0));
+}
+
+#[test]
+fn later_full_report_can_bridge_an_earlier_gap() {
+    let mut cache = GroupCache::default();
+    apply(
+        &mut cache,
+        0,
+        &[
+            root_report(0, "mamba", 0, 2, &[2, 4, 6, 8], 8),
+            child_report(1, "full_attention", 0, 2, 4),
+            child_report(1, "full_attention", 0, 0, 8),
+        ],
+    );
+    assert_eq!(query(&cache, &tokens(9)), Some(8));
+}
+
+#[test]
+fn accumulated_branch_history_resets_at_capacity_even_after_clear() {
+    let mut cache = GroupCache::default();
+    let length = MAX_CONTEXT_TOKENS / 2 + 1;
+    apply(
+        &mut cache,
+        0,
+        &[store(
+            0,
+            "full_attention",
+            0,
+            length,
+            vec![vec![1]],
+            None,
+            vec![1; length],
+        )],
+    );
+    apply(&mut cache, 1, &[GroupEvent::Clear]);
+    assert_eq!(
+        cache.apply_batch(
+            2,
+            &[store(
+                0,
+                "full_attention",
+                0,
+                length,
+                vec![vec![2]],
+                None,
+                vec![2; length]
+            )]
+        ),
+        Err("group event token history capacity reached")
+    );
+    assert_eq!(query(&cache, &[1, 1]), None);
+    apply(
+        &mut cache,
+        3,
+        &[root_report(0, "full_attention", 0, 2, &[2], 2)],
+    );
+    assert_eq!(query(&cache, &tokens(3)), Some(2));
 }

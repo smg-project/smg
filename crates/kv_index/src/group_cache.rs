@@ -1,5 +1,6 @@
 //! Cache evidence reconstructed from received group events, not an engine snapshot.
 
+use radix_tree::{Config, OverlapScratch, PrefixContext, RadixTree};
 use rustc_hash::FxHashMap;
 
 pub type CacheKey = Vec<u8>;
@@ -24,12 +25,6 @@ pub enum GroupEvent {
     Invalid,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct Position {
-    end: usize,
-    prefix: u128,
-}
-
 #[derive(Default)]
 struct Group {
     metadata: Option<(String, usize)>,
@@ -38,12 +33,14 @@ struct Group {
 
 /// One worker's observation session. Context survives removals: a later child
 /// can still refer to an evicted parent. Discontinuity discards the view.
-#[derive(Default)]
 pub struct GroupCache {
+    index: RadixTree,
     groups: FxHashMap<u32, Group>,
-    positions: FxHashMap<CacheKey, Position>,
-    by_prefix: FxHashMap<Position, Vec<CacheKey>>,
+    positions: FxHashMap<CacheKey, PrefixContext>,
+    by_prefix: FxHashMap<PrefixContext, Vec<CacheKey>>,
     pending: FxHashMap<CacheKey, FxHashMap<CacheKey, Vec<u32>>>,
+    pending_entries: usize,
+    pending_tokens: usize,
     last_sequence: Option<u64>,
 }
 
@@ -51,11 +48,36 @@ pub struct GroupCache {
 // discards routing evidence; it does not change engine cache or reject requests.
 const MAX_ENTRIES: usize = 100_000;
 
-fn extend_prefix(prefix: u128, token: u32) -> u128 {
-    let mut bytes = [0u8; 20];
-    bytes[..16].copy_from_slice(&prefix.to_le_bytes());
-    bytes[16..].copy_from_slice(&token.to_le_bytes());
-    xxhash_rust::xxh3::xxh3_128(&bytes)
+const MAX_CONTEXT_TOKENS: usize = 1_600_000;
+
+impl Default for GroupCache {
+    fn default() -> Self {
+        Self {
+            index: RadixTree::new(Config {
+                max_chain_len: MAX_CONTEXT_TOKENS as u32,
+            }),
+            groups: FxHashMap::default(),
+            positions: FxHashMap::default(),
+            by_prefix: FxHashMap::default(),
+            pending: FxHashMap::default(),
+            pending_entries: 0,
+            pending_tokens: 0,
+            last_sequence: None,
+        }
+    }
+}
+
+/// Token identities prepared once across workers, before cache read guards.
+pub struct GroupRequest {
+    contents: Vec<u64>,
+}
+
+impl GroupRequest {
+    pub fn new(tokens: &[u32]) -> Self {
+        Self {
+            contents: tokens.iter().map(|&token| u64::from(token)).collect(),
+        }
+    }
 }
 
 impl GroupCache {
@@ -112,6 +134,9 @@ impl GroupCache {
                 block_size,
                 tokens_matchable,
             } => {
+                if tokens.len() > MAX_CONTEXT_TOKENS {
+                    return Err("group event token history capacity reached");
+                }
                 if *block_size == 0 || keys.iter().any(Vec::is_empty) {
                     return Err("invalid group block identity or span");
                 }
@@ -141,14 +166,16 @@ impl GroupCache {
                 }
             }
         }
-        let pending = self.pending.values().map(FxHashMap::len).sum::<usize>();
         let reported = self
             .groups
             .values()
             .map(|g| g.reported.len())
             .sum::<usize>();
-        if self.positions.len() + pending > MAX_ENTRIES || reported > MAX_ENTRIES {
+        if self.positions.len() + self.pending_entries > MAX_ENTRIES || reported > MAX_ENTRIES {
             return Err("group event index capacity reached");
+        }
+        if self.index.retained_contents() + self.pending_tokens > MAX_CONTEXT_TOKENS {
+            return Err("group event token history capacity reached");
         }
         Ok(())
     }
@@ -162,9 +189,9 @@ impl GroupCache {
         let mut ready = vec![(key, parent, tokens)];
         while let Some((key, parent, tokens)) = ready.pop() {
             let base = match parent {
-                None => Position { end: 0, prefix: 0 },
+                None => None,
                 Some(parent) => match self.positions.get(&parent).copied() {
-                    Some(position) => position,
+                    Some(position) => Some(position),
                     None => {
                         if self.positions.contains_key(&key) {
                             continue;
@@ -175,20 +202,23 @@ impl GroupCache {
                         if children.get(&key).is_some_and(|old| *old != tokens) {
                             return Err("conflicting tokens for one parent and child");
                         }
-                        children.insert(key, tokens);
+                        let count = tokens.len();
+                        if children.insert(key, tokens).is_none() {
+                            self.pending_entries += 1;
+                            self.pending_tokens += count;
+                        }
                         continue;
                     }
                 },
             };
-            let position = Position {
-                end: base
-                    .end
-                    .checked_add(tokens.len())
-                    .ok_or("prefix length overflow")?,
-                prefix: tokens
-                    .iter()
-                    .fold(base.prefix, |hash, &t| extend_prefix(hash, t)),
-            };
+            let contents: Vec<_> = tokens.iter().map(|&token| u64::from(token)).collect();
+            let position = self
+                .index
+                .learn_context(base, &contents)
+                .map_err(|_| "invalid group prefix context")?;
+            if self.index.retained_contents() > MAX_CONTEXT_TOKENS {
+                return Err("group event token history capacity reached");
+            }
             if let Some(old) = self.positions.get(&key) {
                 if *old != position {
                     return Err("conflicting native hash identity");
@@ -201,6 +231,8 @@ impl GroupCache {
                 .or_default()
                 .push(key.clone());
             if let Some(children) = self.pending.remove(&key) {
+                self.pending_entries -= children.len();
+                self.pending_tokens -= children.values().map(Vec::len).sum::<usize>();
                 ready.extend(
                     children
                         .into_iter()
@@ -215,25 +247,33 @@ impl GroupCache {
     /// Unresolved histories may hide additional matches. Native scheduling may
     /// impose other constraints; this is neither a cache reservation nor its
     /// exact current reusable-token count.
-    pub fn reusable_tokens(&self, tokens: &[u32]) -> Option<usize> {
+    pub fn reusable_tokens(&self, request: &GroupRequest) -> Option<usize> {
         if self.groups.is_empty() {
             return None;
         }
-        let limit = tokens.len().saturating_sub(1);
-        let mut prefix = 0;
-        let mut matching = Vec::new();
-        for (i, &token) in tokens.iter().enumerate() {
-            prefix = extend_prefix(prefix, token);
-            if let Some(keys) = self.by_prefix.get(&Position { end: i + 1, prefix }) {
-                matching.extend(keys.iter().map(|key| (key, i + 1)));
-            }
-        }
+        let mut limit = request.contents.len().saturating_sub(1);
+        let mut endpoints = Vec::new();
+        self.index.matching_contexts(
+            &request.contents,
+            &mut OverlapScratch::default(),
+            &mut endpoints,
+        );
+        let matching: Vec<_> = endpoints
+            .iter()
+            .flat_map(|endpoint| {
+                self.by_prefix[endpoint]
+                    .iter()
+                    .map(move |key| (key, endpoint.depth() as usize))
+            })
+            .collect();
         let mut views = Vec::new();
         let mut candidates = vec![0];
         for group in self.groups.values() {
             let (kind, window) = group.metadata.as_ref()?;
-            if !matches!(kind.as_str(), "full_attention" | "sliding_window" | "mamba")
-                || (kind == "sliding_window" && *window == 0)
+            if !matches!(
+                kind.as_str(),
+                "full_attention" | "mla_attention" | "sliding_window" | "mamba"
+            ) || (kind == "sliding_window" && *window == 0)
             {
                 return None;
             }
@@ -244,40 +284,71 @@ impl GroupCache {
                     end.checked_sub(*span).map(|start| (start, *end))
                 })
                 .collect();
-            intervals.sort_unstable();
+            if kind == "sliding_window" {
+                intervals.sort_unstable();
+            }
             candidates.extend(
                 intervals
                     .iter()
                     .map(|&(_, end)| end)
                     .filter(|&end| end <= limit),
             );
-            views.push((kind.as_str(), *window, intervals));
+            if matches!(kind.as_str(), "full_attention" | "mla_attention") {
+                // Full attention needs continuous coverage from zero. Compute
+                // its bound once, rather than again for every candidate.
+                let mut covered = 0;
+                for &(start, end) in &intervals {
+                    // Endpoints arrive in depth order. A later span may
+                    // bridge a gap; earlier skipped spans cannot extend it.
+                    if start <= covered {
+                        covered = end;
+                    }
+                }
+                limit = limit.min(covered);
+            } else {
+                views.push((kind.as_str(), *window, intervals));
+            }
         }
+        candidates.retain(|&end| end <= limit);
         candidates.sort_unstable();
         candidates.dedup();
-        candidates.into_iter().rev().find(|&position| {
-            position == 0
-                || views.iter().all(|(kind, window, intervals)| {
-                    if *kind == "mamba" {
-                        return intervals.iter().any(|&(_, end)| end == position);
-                    }
-                    let mut covered = if *kind == "sliding_window" {
-                        position.saturating_sub(window.saturating_sub(1).max(1))
+        // Each range/candidate cursor advances only once through its group.
+        for (kind, window, intervals) in views {
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            if kind == "mamba" {
+                ranges.extend(intervals.iter().map(|&(_, end)| (end, end)));
+            } else {
+                for (start, end) in intervals {
+                    if let Some(last) = ranges.last_mut().filter(|last| start <= last.1) {
+                        last.1 = last.1.max(end);
                     } else {
-                        0
-                    };
-                    for &(start, end) in intervals {
-                        if start > covered {
-                            break;
-                        }
-                        covered = covered.max(end);
-                        if covered >= position {
-                            return true;
-                        }
+                        ranges.push((start, end));
                     }
-                    false
-                })
-        })
+                }
+                let lookback = window.saturating_sub(1).max(1);
+                ranges.retain_mut(|(start, end)| {
+                    if *start == 0 {
+                        return true;
+                    }
+                    if *end - *start < lookback {
+                        return false;
+                    }
+                    *start += lookback;
+                    true
+                });
+            }
+            let mut cursor = 0;
+            candidates.retain(|&position| {
+                while cursor < ranges.len() && ranges[cursor].1 < position {
+                    cursor += 1;
+                }
+                position == 0
+                    || ranges
+                        .get(cursor)
+                        .is_some_and(|&(start, _)| start <= position)
+            });
+        }
+        candidates.last().copied()
     }
 }
 

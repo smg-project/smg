@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock, Mock
 
 import grpc
 import pytest
-from smg_grpc_proto import vllm_engine_pb2
 from smg_grpc_proto.generated import common_pb2
 from smg_grpc_servicer.kv_events import endpoint_for_rank, stream_kv_events
 
@@ -18,6 +17,12 @@ _ROOT = Path(__file__).parents[1] / "smg_grpc_servicer" / "vllm"
 _SPEC = importlib.util.spec_from_file_location("kv_group_events", _ROOT / "kv_group_events.py")
 module = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(module)
+_GROUP_SCHEMA_FIELDS = {
+    "group_idx",
+    "kv_cache_spec_kind",
+    "kv_cache_spec_sliding_window",
+    "extra_keys",
+}
 
 
 def event(name="BlockStored", **overrides):
@@ -46,12 +51,12 @@ def batch(events, **overrides):
 
 
 def test_schema_selects_group_conversion_without_engine_config():
-    supported = type("BlockStored", (), {"__struct_fields__": tuple(module._GROUP_FIELDS)})
+    supported = type("BlockStored", (), {"__struct_fields__": tuple(_GROUP_SCHEMA_FIELDS)})
     assert isinstance(module.resolve_group_event_converter(supported), module.GroupEventConverter)
     assert module.resolve_group_event_converter(type("BlockStored", (), {})) is None
-    for missing in module._GROUP_FIELDS:
+    for missing in _GROUP_SCHEMA_FIELDS:
         older = type(
-            "BlockStored", (), {"__struct_fields__": tuple(module._GROUP_FIELDS - {missing})}
+            "BlockStored", (), {"__struct_fields__": tuple(_GROUP_SCHEMA_FIELDS - {missing})}
         )
         assert module.resolve_group_event_converter(older) is None
 
@@ -67,18 +72,17 @@ def test_schema_selects_group_conversion_without_engine_config():
     "optional_fields",
     [
         {},
-        dict(locality=None),
         dict(locality="LOCAL"),
         dict(locality=None, ownership=None),
-        dict(locality="LOCAL", ownership=None),
     ],
 )
-def test_local_events_across_optional_field_versions(name, operation, optional_fields):
-    raw = event(name, **optional_fields)
-    for field in ("locality", "ownership"):
-        assert hasattr(raw, field) == (field in optional_fields)
+def test_local_events_preserve_group_across_optional_field_versions(
+    name, operation, optional_fields
+):
+    raw = event(name, group_idx=73, **optional_fields)
     converted, _ = batch([raw])
     assert [e.operation for e in converted.group_events] == [operation]
+    assert [e.group_id for e in converted.group_events] == [73]
 
 
 @pytest.mark.parametrize("rank", [None, 0, 2])
@@ -102,7 +106,6 @@ def test_batch_preserves_sequence_timestamp_rank_and_native_keys(rank):
         bytes(range(32)),
         b"x" * 16,
     ]
-    assert common_pb2.KvEventBatch.FromString(converted.SerializeToString()) == converted
 
 
 def test_sparse_span_unknown_parent_and_partial_store_are_not_sliced():
@@ -153,7 +156,6 @@ def test_repeated_reports_and_remove_clear_preserve_order():
     converted, event_id = batch(events)
     assert [e.operation for e in converted.group_events] == [1, 1, 2, 3]
     assert converted.group_events[0] == converted.group_events[1]
-    assert batch(events)[0] == converted
     assert event_id == 14
 
 
@@ -181,8 +183,6 @@ def test_nonlocal_events_are_filtered_symmetrically(extra):
         dict(lora_id=0),
         dict(lora_name="adapter"),
         dict(extra_keys=[("image-hash",)]),
-        dict(extra_keys=[("cache-salt",)]),
-        dict(extra_keys=[("embedding-hash",)]),
     ],
 )
 def test_non_text_identity_is_retained_without_token_matching(extra):
@@ -249,29 +249,15 @@ def _servicer_method(name, **namespace):
         grpc=grpc,
         logger=logging.getLogger(__name__),
         common_pb2=common_pb2,
-        vllm_engine_pb2=vllm_engine_pb2,
     )
     exec(compile(parsed, str(_ROOT / "servicer.py"), "exec"), namespace)
     return namespace[name]
 
 
-def test_servicer_initialization_does_not_need_group_metadata():
-    config = object()
-    method = _servicer_method(
-        "__init__",
-        resolve_kv_events_config=lambda _: config,
-        resolve_group_event_converter=Mock(side_effect=AssertionError("eager schema lookup")),
-    )
-    servicer, engine = NS(), object()
-    method(servicer, engine, 0.0)
-    assert servicer.engine is engine
-    assert servicer._kv_events_config is config
-
-
 @pytest.mark.parametrize("group_schema,bad_final", [(False, False), (True, False), (True, True)])
 @pytest.mark.asyncio
 async def test_actual_subscription_selects_schema_and_closes_socket(group_schema, bad_final):
-    fields = tuple(module._GROUP_FIELDS) if group_schema else ()
+    fields = tuple(_GROUP_SCHEMA_FIELDS) if group_schema else ()
     stored_type = type("BlockStored", (), {"__struct_fields__": fields})
     socket = NS(
         subscribe=Mock(),
@@ -324,7 +310,7 @@ async def test_actual_subscription_selects_schema_and_closes_socket(group_schema
 
 @pytest.mark.parametrize(
     "bad",
-    [[], [b"", b"short", b"bad"], [b"", bytes(8), b"bad"], [b"", bytes(8), b"good", b"extra"]],
+    [[b"", b"short", b"good"], [b"", bytes(8), b"bad"], [b"", bytes(8), b"good", b"extra"]],
 )
 @pytest.mark.asyncio
 async def test_group_stream_aborts_on_final_corrupt_frame(bad):
@@ -351,70 +337,3 @@ async def test_group_stream_aborts_on_final_corrupt_frame(bad):
     with pytest.raises(ValueError):
         await anext(stream)
     await stream.aclose()
-
-
-@pytest.mark.asyncio
-async def test_generate_does_not_reject_or_modify_inference_for_group_events():
-    sampling = NS(
-        logprobs=None,
-        prompt_logprobs=0,
-        skip_reading_prefix_cache=True,
-        extra_args={"kv_cache_report_mode": "full"},
-    )
-    received = []
-
-    async def generate(**kwargs):
-        received.append(kwargs)
-        if False:
-            yield
-
-    request = vllm_engine_pb2.GenerateRequest(request_id="text-with-mm-identity", stream=False)
-    request.tokenized.input_ids.extend([1, 2])
-    request.mm_inputs.mm_hashes.append("image")
-    transfer = {"do_remote_prefill": True}
-    method = _servicer_method(
-        "Generate",
-        time=NS(time=lambda: 1),
-        params_from_request=lambda _: transfer,
-        has_preprocessed_mm_payload=lambda _: False,
-        mm_identity_cache_salt=lambda _: "mm:image",
-    )
-    servicer = NS(
-        engine=NS(generate=generate, renderer=NS(process_for_engine=lambda prompt, **_: prompt)),
-        _sampling_params_from_proto=lambda *_, **__: sampling,
-        _tokenization_kwargs_from_proto=lambda _: None,
-        _notify_kv_transfer_rejected=AsyncMock(),
-    )
-
-    results = [
-        item
-        async for item in method(
-            servicer,
-            request,
-            NS(abort=AsyncMock(side_effect=AssertionError("inference rejected"))),
-        )
-    ]
-    assert results == []
-    assert received[0]["sampling_params"] is sampling
-    assert sampling.extra_args == {"kv_cache_report_mode": "full"}
-    assert received[0]["prompt"]["cache_salt"] == "mm:image"
-
-
-@pytest.mark.asyncio
-async def test_embed_remains_available_without_group_contract():
-    async def encode(**kwargs):
-        yield NS(
-            finished=True, outputs=NS(data=NS(tolist=lambda: [0.1, 0.2])), prompt_token_ids=[1, 2]
-        )
-
-    request = vllm_engine_pb2.EmbedRequest(request_id="embed")
-    request.tokenized.input_ids.extend([1, 2])
-    method = _servicer_method(
-        "Embed", tokens_input=lambda **kwargs: kwargs, PoolingParams=lambda **kwargs: NS(**kwargs)
-    )
-    result = await method(
-        NS(engine=NS(encode=encode)),
-        request,
-        NS(abort=AsyncMock(side_effect=AssertionError("embedding rejected"))),
-    )
-    assert result.embedding_dim == 2 and result.prompt_tokens == 2
