@@ -33,6 +33,7 @@ if [ ! -x "${CUDA_HOME}/bin/nvcc" ] || ! "${CUDA_HOME}/bin/nvcc" --version | gre
         https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
     sudo dpkg -i /tmp/cuda-keyring.deb
     rm /tmp/cuda-keyring.deb
+    bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
     $RETRY 3 10 sudo apt-get update -qq
     $RETRY 3 10 sudo apt-get install -y --no-install-recommends cuda-nvcc-13-0 cuda-cudart-dev-13-0
     # Ensure CUDA_HOME points to the installed toolkit
@@ -79,6 +80,8 @@ fi
 # (cuda13 wheel variant + nvrtc, since torch 2.13 defaults to CUDA 13):
 # https://github.com/sgl-project/sglang/blob/v0.5.18/scripts/ci/cuda/ci_install_dependency.sh
 echo "Installing mooncake system dependencies..."
+bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
+$RETRY 3 10 sudo apt-get update -qq
 $RETRY 3 10 sudo apt-get install -y --no-install-recommends libnuma-dev libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
 echo "Installing mooncake..."
 $RETRY 3 10 uv pip install mooncake-transfer-engine-cuda13==0.3.12.post1 nvidia-cuda-nvrtc

@@ -38,6 +38,7 @@ $RETRY 3 10 uv pip install "vllm==0.27.1" --torch-backend=auto
 # (the metapackage pulls the matching libav* sonames; torchcodec supports
 # FFmpeg 4-7). This step is unconditional, so refresh apt lists first.
 echo "Installing FFmpeg for torchcodec..."
+bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
 $RETRY 3 10 sudo apt-get update
 $RETRY 3 10 sudo apt-get install -y --no-install-recommends ffmpeg
 

@@ -80,6 +80,7 @@ setup_cuda_env() {
             https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
         $SUDO dpkg -i /tmp/cuda-keyring.deb
         rm /tmp/cuda-keyring.deb
+        bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
         $RETRY 3 10 $SUDO apt-get update -qq
         # Install the FULL CUDA 13.0 toolkit (mirrors the proven TRT-LLM lane in
         # ci_install_trtllm.sh) so the system headers -- which the kernel build
@@ -149,6 +150,7 @@ ensure_python_headers() {
         exit 1
     fi
     export DEBIAN_FRONTEND=noninteractive
+    bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
     $SUDO apt-get update -qq
     $SUDO apt-get install -y --no-install-recommends "python${py_version}-dev"
 
@@ -183,6 +185,7 @@ ensure_rdma_libs() {
         exit 1
     fi
     export DEBIAN_FRONTEND=noninteractive
+    bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
     $RETRY 3 10 $SUDO apt-get update -qq
     $RETRY 3 10 $SUDO apt-get install -y --no-install-recommends libnuma1 libibverbs1 ibverbs-providers
 }
@@ -207,6 +210,7 @@ install_tokenspeed_from_source() {
 
     # ── System dependencies (mirrors docker/Dockerfile) ────────────────────
     export DEBIAN_FRONTEND=noninteractive
+    bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
     $RETRY 3 10 $SUDO apt-get update -qq
     $RETRY 3 10 $SUDO apt-get install -y --no-install-recommends libssl-dev libopenmpi-dev cmake
 

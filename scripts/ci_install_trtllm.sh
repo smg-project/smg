@@ -40,6 +40,7 @@ if ! dpkg -l cuda-keyring 2>/dev/null | grep -q '^ii'; then
     rm -f /tmp/cuda-keyring.deb
 fi
 
+bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
 $RETRY 3 10 sudo apt-get update
 # Runtime deps: wheel links against CUDA 13 + TensorRT libs
 $RETRY 3 10 sudo apt-get install -y libopenmpi-dev libnvinfer10 cuda-toolkit-13-0

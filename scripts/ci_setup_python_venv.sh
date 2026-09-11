@@ -64,6 +64,7 @@ elif [ "$HOST_VERSION" = "$PY_VERSION" ]; then
             exit 1
         fi
         echo "venv creation failed - installing python3-venv/python3-pip, then retrying"
+        bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
         $RETRY 3 10 $SUDO apt-get update
         $RETRY 3 10 $SUDO apt-get install -y python3-pip python3-venv
         rm -rf .venv
