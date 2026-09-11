@@ -1258,9 +1258,14 @@ impl Router {
             )]
             tokio::spawn(async move {
                 let mut stream = stream;
+                // One timer, reset per chunk, instead of a fresh sleep per token.
+                let idle = tokio::time::sleep(RECHUNK_IDLE_FLUSH);
+                tokio::pin!(idle);
                 loop {
                     tokio::select! {
-                        chunk = stream.next() => match chunk {
+                        chunk = stream.next() => {
+                            idle.as_mut().reset(tokio::time::Instant::now() + RECHUNK_IDLE_FLUSH);
+                            match chunk {
                             // Same as the regular relay: an empty upstream chunk must
                             // not become an empty h2 DATA frame toward the client.
                             Some(Ok(bytes)) if bytes.is_empty() => {}
@@ -1294,10 +1299,10 @@ impl Router {
                                 }
                                 break;
                             }
+                            }
                         },
-                        () = tokio::time::sleep(RECHUNK_IDLE_FLUSH),
-                            if rechunker.as_ref().is_some_and(SseRechunker::has_pending) =>
-                        {
+                        () = &mut idle, if rechunker.as_ref().is_some_and(SseRechunker::has_pending) => {
+                            idle.as_mut().reset(tokio::time::Instant::now() + RECHUNK_IDLE_FLUSH);
                             if let Some(tail) = rechunker.as_mut().map(SseRechunker::flush_pending) {
                                 if !tail.is_empty() && tx.send(Ok(tail)).await.is_err() {
                                     break;

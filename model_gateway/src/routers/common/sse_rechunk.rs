@@ -188,7 +188,9 @@ impl SseRechunker {
             self.envelope = envelope;
         }
 
-        if opens || closes {
+        // Earlier payload must precede an opening event; a closing-only event
+        // flushes together with its own payload below, so nothing is split.
+        if opens {
             self.flush_payload(out);
         }
         match (opens, closes) {
@@ -286,6 +288,10 @@ impl SseRechunker {
                 absorbed.opens = true;
             } else if tool_calls.iter().all(is_tool_call_shell) {
                 delta.remove("tool_calls");
+            } else {
+                // A tool-call entry with something this module does not merge.
+                absorbed.closes = true;
+                self.unknown_events += 1;
             }
         }
         if delta.contains_key("role") {
@@ -632,6 +638,31 @@ mod tests {
         let fin = evs.last().unwrap();
         assert_eq!(fin["choices"][0]["finish_reason"], Value::from("stop"));
         assert!(fin["choices"][0]["delta"]["content"].is_null());
+    }
+
+    #[test]
+    fn a_closing_event_does_not_split_its_own_payload() {
+        // 79 pending chars plus a final "!" with finish_reason must leave as
+        // one 80-char event, not 79 + 1.
+        let last = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let sizes = content_sizes(&events(&run(&[&content_event(&"y".repeat(79)), last])));
+        assert_eq!(sizes, vec![80]);
+    }
+
+    #[test]
+    fn residual_tool_call_fields_are_forwarded_in_order() {
+        let frag = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ab\",\"parsed\":true}}]}}]}\n\n";
+        let evs = events(&run(&[frag]));
+        let args: String = evs
+            .iter()
+            .filter_map(|e| {
+                e["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+            })
+            .collect();
+        assert_eq!(args, "ab");
+        assert!(evs.iter().any(|e| {
+            e["choices"][0]["delta"]["tool_calls"][0]["function"]["parsed"] == Value::Bool(true)
+        }));
     }
 
     #[test]
