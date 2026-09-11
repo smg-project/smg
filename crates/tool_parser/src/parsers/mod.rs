@@ -7,6 +7,7 @@ pub mod cohere;
 pub mod deepseek;
 pub mod deepseek31;
 pub mod deepseek_dsml;
+pub(crate) mod glm47_grammar;
 pub mod glm4_moe;
 pub mod inkling;
 pub mod json;

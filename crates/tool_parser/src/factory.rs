@@ -9,10 +9,10 @@ use tokio::sync::Mutex;
 
 use crate::{
     parsers::{
-        CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser, Glm4MoeParser,
-        InklingParser, JsonParser, KimiK2Parser, KimiK3Parser, LlamaParser, MinimaxM2Parser,
-        MinimaxM3Parser, MistralParser, PassthroughParser, PythonicParser, QwenParser,
-        QwenXmlParser, SarashinaParser, Step3Parser,
+        glm47_grammar, CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser,
+        Glm4MoeParser, InklingParser, JsonParser, KimiK2Parser, KimiK3Parser, LlamaParser,
+        MinimaxM2Parser, MinimaxM3Parser, MistralParser, PassthroughParser, PythonicParser,
+        QwenParser, QwenXmlParser, SarashinaParser, Step3Parser,
     },
     traits::ToolParser,
 };
@@ -36,6 +36,8 @@ pub enum ToolConstraint {
     /// Structural tag constraint — output includes model-native framing tokens.
     /// The model-specific parser IS used to parse the response.
     StructuralTag(String),
+    /// EBNF covering the complete assistant turn, including native tool calls.
+    Ebnf(String),
 }
 
 impl ToolConstraint {
@@ -44,6 +46,7 @@ impl ToolConstraint {
         match self {
             ToolConstraint::JsonSchema(s) => ("json_schema".to_string(), s.clone()),
             ToolConstraint::StructuralTag(s) => ("structural_tag".to_string(), s.clone()),
+            ToolConstraint::Ebnf(s) => ("ebnf".to_string(), s.clone()),
         }
     }
 
@@ -181,6 +184,40 @@ impl ParserRegistry {
     /// via `--tool-call-parser`).
     pub fn has_structural_tag_for_parser(&self, configured: Option<&str>) -> bool {
         configured.is_some_and(|p| self.has_structural_tag(p))
+    }
+
+    /// Return whether `configured_parser` constrains the full assistant turn
+    /// for `tools`, which must already be filtered by the request's tool choice.
+    pub fn uses_full_assistant_constraint(
+        &self,
+        configured_parser: Option<&str>,
+        tools: &[Tool],
+    ) -> bool {
+        configured_parser == Some("glm47_moe")
+            && self.has_parser("glm47_moe")
+            && !tools.iter().any(|tool| tool.function.strict == Some(true))
+    }
+
+    /// Generate a chat constraint for the configured parser and effective tools.
+    /// `tool_choice` selects permitted calls; `enable_thinking` describes the
+    /// chat template's prefilled thinking mode. Returns a constraint or no grammar.
+    pub fn generate_chat_constraint(
+        &self,
+        configured_parser: Option<&str>,
+        tools: &[Tool],
+        tool_choice: &ToolChoice,
+        enable_thinking: bool,
+    ) -> Result<Option<ToolConstraint>, String> {
+        if self.uses_full_assistant_constraint(configured_parser, tools) {
+            let tools = if matches!(tool_choice, ToolChoice::Value(ToolChoiceValue::None)) {
+                &[]
+            } else {
+                tools
+            };
+            return glm47_grammar::generate(tools, enable_thinking)
+                .map(|grammar| Some(ToolConstraint::Ebnf(grammar)));
+        }
+        self.generate_tool_constraint(configured_parser, tools, tool_choice)
     }
 
     /// Generate tool call constraint.
