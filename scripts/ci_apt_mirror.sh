@@ -159,28 +159,29 @@ for file in "${source_files[@]}"; do
     [ -f "${file}" ] || continue
     grep -Eq "${pattern}" "${file}" || continue
     matched=$((matched + 1))
-    if ! tmp="$(mktemp)"; then
-        log "mktemp failed; leaving ${file} alone"
+    # Stage the copy next to the file so the final rename is atomic: apt
+    # never sees a partial file, whatever fails along the way.
+    if ! staged="$(${SUDO} mktemp "$(dirname "${file}")/.ci-apt-mirror.XXXXXX")"; then
+        log "could not stage a copy of ${file}; leaving it alone"
         failed=$((failed + 1))
         continue
     fi
-    if ! sed -E "s#${pattern}#${chosen}/#g" "${file}" >"${tmp}"; then
+    if ! sed -E "s#${pattern}#${chosen}/#g" "${file}" | ${SUDO} tee "${staged}" >/dev/null; then
         log "could not rewrite ${file}; leaving it alone"
-        rm -f "${tmp}"
+        ${SUDO} rm -f "${staged}"
         failed=$((failed + 1))
         continue
     fi
-    if cmp -s "${tmp}" "${file}"; then
-        rm -f "${tmp}"
+    if ${SUDO} cmp -s "${staged}" "${file}"; then
+        ${SUDO} rm -f "${staged}"
         continue
     fi
-    if ! ${SUDO} cp "${tmp}" "${file}"; then
+    if ! ${SUDO} chmod 644 "${staged}" || ! ${SUDO} mv -f "${staged}" "${file}"; then
         log "could not write ${file}; leaving it alone"
-        rm -f "${tmp}"
+        ${SUDO} rm -f "${staged}"
         failed=$((failed + 1))
         continue
     fi
-    rm -f "${tmp}"
     rewritten=$((rewritten + 1))
     log "rewrote ${file}"
 done
