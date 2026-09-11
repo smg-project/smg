@@ -13,8 +13,8 @@
 #
 # Idempotent: call it right before each `apt-get update`. It probes the
 # mirrors in order, rewrites the Ubuntu sources to the first one that answers,
-# and writes an apt.conf snippet that skips IPv6 (the runner pods have no IPv6
-# route) and fails a dead host in seconds instead of minutes.
+# and writes an apt.conf snippet that fails a dead host in seconds instead of
+# minutes.
 #
 # Environment:
 #   CI_APT_MIRRORS  space-separated base URLs tried in order. Default: the
@@ -67,20 +67,50 @@ if [ ! -w "${APT_ROOT}/apt.conf.d" ]; then
 fi
 
 reachable() {
-    local url="$1" host
+    local url="$1" rest host base status
     if command -v curl >/dev/null 2>&1; then
-        curl -4 -fsSL --max-time 10 -o /dev/null "${url}/dists/${codename}/InRelease"
+        curl -fsSL --max-time 10 -o /dev/null "${url}/dists/${codename}/InRelease"
         return
     fi
-    # A bare base image (docker build bootstrap) has no curl yet; settle for
-    # a TCP connect, which is exactly what fails when a front-end is down.
-    host="${url#*://}"
-    host="${host%%/*}"
-    timeout 10 bash -c "exec 3<>/dev/tcp/${host}/80" 2>/dev/null
+    # A bare base image (docker build bootstrap) has no curl yet: speak just
+    # enough HTTP over bash's /dev/tcp to check the suite is really served.
+    case "${url}" in
+        http://*) ;;
+        *) log "cannot probe ${url} without curl"; return 1 ;;
+    esac
+    rest="${url#http://}"
+    host="${rest%%/*}"
+    base="${rest#"${host}"}"
+    status="$(timeout 10 bash -c '
+        exec 3<>"/dev/tcp/$1/80" || exit 1
+        printf "HEAD %s HTTP/1.0\r\nHost: %s\r\n\r\n" "$2" "$1" >&3
+        IFS= read -r line <&3 && printf "%s" "${line}"
+    ' _ "${host}" "${base}/dists/${codename}/InRelease" 2>/dev/null)" || return 1
+    case "${status}" in
+        *" 200 "*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
+# Matches the main archive, its country aliases (us.archive...) and the cloud
+# mirrors (azure.archive..., *.clouds.archive..., *.ec2.archive...), so a host
+# that already carries a mirror, including one this script chose earlier, is
+# moved again if that mirror stops answering. ports.ubuntu.com (arm64) is
+# left alone: the x86 mirrors do not carry ubuntu-ports.
+pattern='https?://([a-z0-9-]+\.)*(archive|security)\.ubuntu\.com/ubuntu/?'
+source_files=("${APT_ROOT}/sources.list" "${APT_ROOT}"/sources.list.d/*.list "${APT_ROOT}"/sources.list.d/*.sources)
+
+# A host already on a Canonical mirror (GitHub-hosted runners use the Azure
+# one) keeps it while it answers; only a dead mirror is replaced.
+current="$(cat "${source_files[@]}" 2>/dev/null | grep -Eo "${pattern}" | grep -vE '://(archive|security)\.ubuntu\.com/' | head -n 1 || true)"
+current="${current%/}"
+
 chosen=""
+if [ -n "${current}" ] && reachable "${current}"; then
+    chosen="${current}"
+fi
 for mirror in "${MIRRORS[@]}"; do
+    [ -z "${chosen}" ] || break
     if reachable "${mirror}"; then
         chosen="${mirror}"
         break
@@ -90,14 +120,17 @@ done
 
 # Written even when nothing answered: the timeouts still stop a dead host from
 # eating the job budget.
-${SUDO} tee "${CONF}" >/dev/null <<CONF_EOF
+if ! ${SUDO} tee "${CONF}" >/dev/null <<CONF_EOF
 // Written by scripts/ci_apt_mirror.sh (mirror=${chosen:-none}).
-// The runner pods have no IPv6 route, so v6 addresses only add a failed
-// connect per fetch. Short timeouts fail a dead host in seconds.
-Acquire::ForceIPv4 "true";
+// Short timeouts fail a dead host in seconds instead of minutes.
 Acquire::http::Timeout "20";
+Acquire::https::Timeout "20";
 Acquire::Retries "2";
 CONF_EOF
+then
+    log "could not write ${CONF}; leaving apt configuration alone"
+    exit 0
+fi
 
 if [ -z "${chosen}" ]; then
     log "no mirror answered; leaving apt sources alone"
@@ -107,20 +140,33 @@ if [ "${chosen}" = "${MAIN_ARCHIVE}" ]; then
     log "main archive answers; leaving apt sources alone"
     exit 0
 fi
+if [ "${chosen}" = "${current}" ]; then
+    log "current mirror ${current} answers; leaving apt sources alone"
+    exit 0
+fi
 
 # Both the deb822 (*.sources) and the legacy (sources.list, *.list) forms.
 # security.ubuntu.com is rewritten too: the cloud mirrors carry the security
 # pocket, and it fails together with the main archive.
-pattern='https?://([a-z]{2}\.)?(archive|security)\.ubuntu\.com/ubuntu/?'
 rewritten=0
-for file in "${APT_ROOT}/sources.list" "${APT_ROOT}"/sources.list.d/*.list "${APT_ROOT}"/sources.list.d/*.sources; do
+for file in "${source_files[@]}"; do
     [ -f "${file}" ] || continue
     grep -Eq "${pattern}" "${file}" || continue
-    tmp="$(mktemp)"
-    sed -E "s#${pattern}#${chosen}/#g" "${file}" >"${tmp}"
-    ${SUDO} cp "${tmp}" "${file}"
+    if ! tmp="$(mktemp)"; then
+        log "mktemp failed; leaving ${file} alone"
+        continue
+    fi
+    if ! sed -E "s#${pattern}#${chosen}/#g" "${file}" >"${tmp}" || ! ${SUDO} cp "${tmp}" "${file}"; then
+        log "could not rewrite ${file}; leaving it alone"
+        rm -f "${tmp}"
+        continue
+    fi
     rm -f "${tmp}"
     rewritten=$((rewritten + 1))
     log "rewrote ${file}"
 done
-log "using ${chosen} (${rewritten} source file(s) rewritten)"
+if [ "${rewritten}" -eq 0 ]; then
+    log "chose ${chosen} but no Ubuntu source lines matched; apt sources left as they were"
+else
+    log "using ${chosen} (${rewritten} source file(s) rewritten)"
+fi
