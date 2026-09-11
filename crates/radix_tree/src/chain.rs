@@ -3,6 +3,8 @@
 //! public API and matching/convergence contract as the flat core;
 //! the differential referee proves equality.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -70,8 +72,12 @@ struct HolderState3 {
     /// key -> (chain, absolute pos). Per-holder (out-of-contract
     /// inputs can register one key differently across holders).
     keys: FxHashMap<BlockKey, (u32, u32)>,
-    /// Chains this holder covers (maintenance index).
-    chains: rustc_hash::FxHashSet<u32>,
+    /// Chains this holder covers -> the store tick that last landed
+    /// a block of this holder on the chain (maintenance index +
+    /// per-holder recency for `evict_oldest`). Atomic so the shared-
+    /// lock duplicate walk (`dup_prefix_touch`) can refresh it through
+    /// `&self`; the map itself only changes under `&mut self`.
+    chains: FxHashMap<u32, AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -98,6 +104,11 @@ pub struct RadixTree {
     /// Distinct covered (position, content, lineage) = chain
     /// positions with a non-empty holder set.
     distinct_entries: u64,
+    /// Monotonic store counter: every `store` that reaches the walk
+    /// (and every touching duplicate walk) gets the next tick, and
+    /// every chain a holder lands on records it. Recency, not wall
+    /// time — the tree has no clock.
+    store_tick: AtomicU64,
 }
 
 impl RadixTree {
@@ -113,6 +124,7 @@ impl RadixTree {
             interner: SetInterner::default(),
             holder_blocks_total: 0,
             distinct_entries: 0,
+            store_tick: AtomicU64::new(0),
         }
     }
 
@@ -206,6 +218,7 @@ impl RadixTree {
         if start_pos as u64 + blocks.len() as u64 > self.cfg.max_chain_len as u64 {
             return Err(StoreError::ChainTooLong);
         }
+        self.store_tick.fetch_add(1, Ordering::Relaxed);
 
         // Walk-insert: follow the trie from the anchor, consuming
         // blocks; matching content = membership add (or §4 alias
@@ -332,6 +345,14 @@ impl RadixTree {
         // plain duplicate, an alias (their other key), or a refused
         // move — all observably identical, all non-destructive.
         if self.chains[chain as usize].covered(pos, holder) {
+            // A re-store of what is already there is the recency
+            // signal `evict_oldest` keys on: a hot prefix republished
+            // every round must not age out under a holder that sits
+            // above capacity.
+            let tick = self.store_tick.load(Ordering::Relaxed);
+            if let Some(t) = self.state_of(holder).chains.get(&chain) {
+                t.store(tick, Ordering::Relaxed);
+            }
             return Ok(Placed::Duplicate);
         }
         // Not covered: a move relocates the key first, then join.
@@ -392,6 +413,30 @@ impl RadixTree {
         parent: Option<BlockKey>,
         blocks: &[(BlockKey, ContentHash)],
     ) -> (u32, bool) {
+        self.dup_walk(id, parent, blocks, false)
+    }
+
+    /// [`Self::dup_prefix`] that also counts as a publish for recency:
+    /// every chain a covered block resolves to takes a fresh tick, so a
+    /// holder republishing a resident prefix through the shared-lock
+    /// fast path keeps it young for `evict_oldest` exactly as a `store`
+    /// would. Observable state (keys, spans, answers) is untouched.
+    pub fn dup_prefix_touch(
+        &self,
+        id: HolderId,
+        parent: Option<BlockKey>,
+        blocks: &[(BlockKey, ContentHash)],
+    ) -> (u32, bool) {
+        self.dup_walk(id, parent, blocks, true)
+    }
+
+    fn dup_walk(
+        &self,
+        id: HolderId,
+        parent: Option<BlockKey>,
+        blocks: &[(BlockKey, ContentHash)],
+        touch: bool,
+    ) -> (u32, bool) {
         if self.live(id).is_none() {
             return (0, false);
         }
@@ -399,6 +444,12 @@ impl RadixTree {
         if blocks.is_empty() {
             return (0, true);
         }
+        let tick = if touch {
+            self.store_tick.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            0
+        };
+        let mut touched: Option<u32> = None;
         let anchor: Option<(u32, u32)> = match parent {
             Some(parent_key) => match self.state_of(holder).keys.get(&parent_key) {
                 None => return (0, false),
@@ -451,6 +502,12 @@ impl RadixTree {
             let (chain, pos) = target;
             if !self.chains[chain as usize].covered(pos, holder) {
                 return (run, false);
+            }
+            if touch && touched != Some(chain) {
+                if let Some(t) = self.state_of(holder).chains.get(&chain) {
+                    t.store(tick, Ordering::Relaxed);
+                }
+                touched = Some(chain);
             }
             if run_live {
                 if self.state_of(holder).keys.get(&key) == Some(&(chain, pos)) {
@@ -526,6 +583,122 @@ impl RadixTree {
         dropped
     }
 
+    /// Recency-ordered eviction: drop the holder's coverage one whole
+    /// chain at a time, least-recently-stored chain first, until
+    /// `keep` blocks remain. Returns dropped count.
+    ///
+    /// Recency is per (holder, chain): the tick of the holder's last
+    /// `store` that landed on the chain, applied or duplicate. A chain
+    /// inherits the recency of its most recently stored descendant
+    /// that this holder covers, so a shared parent prefix whose
+    /// children are still being published is as young as its youngest
+    /// child and never goes before them. Victims are taken in
+    /// ascending effective recency with deeper chains first on ties,
+    /// which is a reverse topological order of the holder's covered
+    /// forest: a chain's descendants are all gone before the chain
+    /// itself, so the survivors stay prefix-closed at every step. The
+    /// last victim is trimmed deepest-position-first instead of
+    /// dropped whole, so the result holds exactly `keep` blocks.
+    ///
+    /// Versus `truncate_tail` (deepest positions first, forest-wide):
+    /// that drops the freshest long-prompt tails and never removes a
+    /// chain head, so under a placement feed held above capacity the
+    /// chain slots of retired placements are never freed (measured:
+    /// chain count 1k -> 14k at a flat block count). Whole-chain
+    /// eviction frees the slot the moment the holder was its last
+    /// member. Cost is O(keys + chains x depth) per call — a cold
+    /// capacity path, not a per-apply one.
+    pub fn evict_oldest(&mut self, id: HolderId, keep: u64) -> u64 {
+        if self.live(id).is_none() {
+            return 0;
+        }
+        let holder = id.parts().0;
+        let state = self.state_of(holder);
+        let total = state.keys.len() as u64;
+        if total <= keep {
+            return 0;
+        }
+        // Effective recency + depth per covered chain. Propagate each
+        // chain's tick to every covered ancestor (max), and count
+        // ancestors for the tie-break.
+        let mut eff: FxHashMap<u32, (u64, u32)> = FxHashMap::default();
+        eff.reserve(state.chains.len());
+        for (c, t) in &state.chains {
+            eff.insert(*c, (t.load(Ordering::Relaxed), 0));
+        }
+        for (&c, t) in &state.chains {
+            let t = t.load(Ordering::Relaxed);
+            let mut depth = 0u32;
+            let mut cur = self.chains[c as usize].parent;
+            while let Some((p, _)) = cur {
+                depth += 1;
+                if let Some(e) = eff.get_mut(&p) {
+                    e.0 = e.0.max(t);
+                }
+                cur = self.chains[p as usize].parent;
+            }
+            eff.get_mut(&c).expect("inserted above").1 = depth;
+        }
+        // Keys grouped per chain, one pass.
+        let mut per_chain: FxHashMap<u32, Vec<(u32, BlockKey)>> = FxHashMap::default();
+        for (&k, &(c, p)) in &state.keys {
+            per_chain.entry(c).or_default().push((p, k));
+        }
+        // Ascending recency; deeper first on ties; chain id last for
+        // determinism.
+        let mut order: Vec<(u64, std::cmp::Reverse<u32>, u32)> = eff
+            .iter()
+            .map(|(&c, &(t, d))| (t, std::cmp::Reverse(d), c))
+            .collect();
+        order.sort_unstable();
+
+        let mut remaining = total;
+        let mut dropped = 0u64;
+        for (_, _, chain) in order {
+            if remaining <= keep {
+                break;
+            }
+            let Some(mut keys) = per_chain.remove(&chain) else {
+                continue;
+            };
+            let on_chain = keys.len() as u64;
+            if remaining - on_chain >= keep {
+                // Whole chain: keys first (the GC guard requires no
+                // key map entry to point at a chain it frees), then
+                // the coverage in one sweep.
+                let st = self.state_of_mut(holder);
+                for &(_, k) in &keys {
+                    st.keys.remove(&k);
+                }
+                st.chains.remove(&chain);
+                self.holder_blocks_total -= on_chain;
+                self.drop_holder_from_chain(holder, chain);
+                remaining -= on_chain;
+                dropped += on_chain;
+            } else {
+                // Final victim: trim deepest-first down to exactly
+                // `keep` (prefix-closed within the chain).
+                keys.sort_unstable();
+                while remaining > keep {
+                    let (pos, k) = keys.pop().expect("more keys than the shortfall");
+                    self.state_of_mut(holder).keys.remove(&k);
+                    self.remove_membership(holder, (chain, pos));
+                    remaining -= 1;
+                    dropped += 1;
+                }
+            }
+        }
+        dropped
+    }
+
+    /// Chain slots currently holding a chain (leak diagnostics).
+    pub fn live_chain_count(&self) -> usize {
+        self.chains
+            .iter()
+            .filter(|c| !c.contents.is_empty())
+            .count()
+    }
+
     pub fn clear(&mut self, id: HolderId) {
         if self.live(id).is_none() {
             return;
@@ -540,7 +713,7 @@ impl RadixTree {
         let state = self.state_of_mut(holder);
         let key_count = state.keys.len() as u64;
         state.keys = FxHashMap::default();
-        let chains: Vec<u32> = std::mem::take(&mut state.chains).into_iter().collect();
+        let chains: Vec<u32> = std::mem::take(&mut state.chains).into_keys().collect();
         self.holder_blocks_total -= key_count;
         for chain in chains {
             self.drop_holder_from_chain(holder, chain);
@@ -830,7 +1003,10 @@ impl RadixTree {
             self.distinct_entries += 1;
         }
         self.holder_blocks_total += 1;
-        self.state_of_mut(holder).chains.insert(chain);
+        let tick = self.store_tick.load(Ordering::Relaxed);
+        self.state_of_mut(holder)
+            .chains
+            .insert(chain, AtomicU64::new(tick));
     }
 
     fn remove_membership(&mut self, holder: u32, at: (u32, u32)) {
@@ -1058,11 +1234,7 @@ impl RadixTree {
 
     /// Internal structure sizes for leak hunting (soak diagnostics).
     pub fn debug_footprint(&self) -> String {
-        let live_chains = self
-            .chains
-            .iter()
-            .filter(|c| !c.contents.is_empty())
-            .count();
+        let live_chains = self.live_chain_count();
         let span_total: usize = self.chains.iter().map(|c| c.spans.len()).sum();
         let span_cap: usize = self.chains.iter().map(|c| c.spans.capacity()).sum();
         let content_cap: usize = self.chains.iter().map(|c| c.contents.capacity()).sum();
@@ -1248,7 +1420,7 @@ impl RadixTree {
             // `chains ⊇ covered` plus equal cardinality is set equality.
             seen_chains.clear();
             for &(c, _) in state.keys.values() {
-                if !state.chains.contains(&c) {
+                if !state.chains.contains_key(&c) {
                     return Err(format!(
                         "holder {idx} covers chain {c} but its chains index does not list it"
                     ));
