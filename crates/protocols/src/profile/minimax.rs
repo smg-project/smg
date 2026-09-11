@@ -24,7 +24,9 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
                         ));
                     }
                     open.push(tc.id.as_str());
-                    if let Some(arguments) = tc.function.arguments.as_deref() {
+                    // An empty string is how several providers spell a call without arguments.
+                    let arguments = tc.function.arguments.as_deref();
+                    if let Some(arguments) = arguments.filter(|a| !a.trim().is_empty()) {
                         if serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
                             arguments,
                         )
