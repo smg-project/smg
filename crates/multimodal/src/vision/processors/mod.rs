@@ -20,7 +20,10 @@
 //! - **Phi4-Vision** (`phi4_vision`): Dynamic HD transform with 448x448 tiles and SiGLIP encoder
 //! - **LLaMA 4 Vision** (`llama4_vision`): Tile-based processing with 336x336 tiles and global tile
 //! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
+//! - **DeepSeek V4 Vision** (`deepseek_v4`): aligner-grid resize solver with
+//!   N-layout sentinel blocks (official DeepSeek-V4-Flash-Vision recipe)
 
+pub mod deepseek_v4;
 pub mod glm53_flash;
 pub mod inkling;
 pub mod kimi_k25;
@@ -37,6 +40,7 @@ pub mod qwen3_omni_vision;
 pub mod qwen3_vl;
 pub mod qwen_vl_base;
 
+pub use deepseek_v4::DeepseekV4Processor;
 pub use glm53_flash::Glm53FlashProcessor;
 pub use inkling::InklingImageProcessor;
 pub use kimi_k25::KimiK25Processor;
