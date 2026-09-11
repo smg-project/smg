@@ -81,9 +81,8 @@ fn is_malformed(tools: Option<&DeclaredTools>) -> bool {
 /// Whether a model id names Kimi K3, the only Kimi model with pinned sampling.
 fn is_k3(model: &str) -> bool {
     model.split('/').any(|segment| {
-        segment
-            .get(..7)
-            .is_some_and(|p| p.eq_ignore_ascii_case("kimi-k3"))
+        super::starts_with_ignore_ascii_case(segment, "kimi-k3")
+            || super::starts_with_ignore_ascii_case(segment, "kimi_k3")
     })
 }
 
