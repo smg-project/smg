@@ -492,13 +492,16 @@ fn validate_chat_cross_parameters(
         // declared on system and developer messages (Kimi K3). Both the
         // "are there tools" decision and the named-choice checks below use
         // it, so a name is resolved against everything the model will see.
-        let dynamic_tools = req.messages.iter().flat_map(|m| match m {
-            ChatMessage::System { ext, .. } => ext.tools.as_deref().unwrap_or_default(),
-            ChatMessage::Developer { ext, .. } => ext.tools.as_deref().unwrap_or_default(),
-            _ => &[],
-        });
-        let effective_tools: Vec<&Tool> = req.tools.iter().flatten().chain(dynamic_tools).collect();
-        let has_tools = !effective_tools.is_empty();
+        let dynamic_tools = || {
+            req.messages.iter().flat_map(|m| match m {
+                ChatMessage::System { ext, .. } => ext.tools.as_deref().unwrap_or_default(),
+                ChatMessage::Developer { ext, .. } => ext.tools.as_deref().unwrap_or_default(),
+                _ => &[],
+            })
+        };
+        // Lazy on purpose: most tool traffic only needs the emptiness check.
+        let effective_tools = || req.tools.iter().flatten().chain(dynamic_tools());
+        let has_tools = effective_tools().next().is_some();
 
         let requires_tools = !matches!(
             tool_choice,
@@ -513,11 +516,10 @@ fn validate_chat_cross_parameters(
 
         // Additional validation when tools are present
         if has_tools {
-            let tools = &effective_tools;
             match tool_choice {
                 ToolChoice::Function { function, .. } => {
                     // Validate that the specified function name exists in tools
-                    let function_exists = tools.iter().any(|tool| {
+                    let function_exists = effective_tools().any(|tool| {
                         tool.tool_type == "function" && tool.function.name == function.name
                     });
 
@@ -553,7 +555,7 @@ fn validate_chat_cross_parameters(
                         match tool_ref {
                             ToolReference::Function { name } => {
                                 // Validate that the function exists in tools array
-                                let tool_exists = tools.iter().any(|tool| {
+                                let tool_exists = effective_tools().any(|tool| {
                                     tool.tool_type == "function" && tool.function.name == *name
                                 });
 
