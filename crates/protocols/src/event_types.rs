@@ -6,18 +6,21 @@ pub enum ResponseEvent {
     Created,
     InProgress,
     Completed,
+    Incomplete,
 }
 
 impl ResponseEvent {
     pub const CREATED: &'static str = "response.created";
     pub const IN_PROGRESS: &'static str = "response.in_progress";
     pub const COMPLETED: &'static str = "response.completed";
+    pub const INCOMPLETE: &'static str = "response.incomplete";
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Created => Self::CREATED,
             Self::InProgress => Self::IN_PROGRESS,
             Self::Completed => Self::COMPLETED,
+            Self::Incomplete => Self::INCOMPLETE,
         }
     }
 }
@@ -637,7 +640,10 @@ impl fmt::Display for RealtimeServerEvent {
 pub fn is_response_event(event_type: &str) -> bool {
     matches!(
         event_type,
-        ResponseEvent::CREATED | ResponseEvent::IN_PROGRESS | ResponseEvent::COMPLETED
+        ResponseEvent::CREATED
+            | ResponseEvent::IN_PROGRESS
+            | ResponseEvent::COMPLETED
+            | ResponseEvent::INCOMPLETE
     )
 }
 

@@ -11,8 +11,8 @@ use openai_protocol::{
         ResponseEvent,
     },
     responses::{
-        IncludeField, ResponseOutputItem, ResponseStatus, ResponsesRequest, ResponsesResponse,
-        ResponsesUsage,
+        IncludeField, IncompleteDetails, IncompleteReason, ResponseOutputItem, ResponseStatus,
+        ResponsesRequest, ResponsesResponse, ResponsesUsage,
     },
 };
 use serde_json::json;
@@ -86,6 +86,7 @@ struct ToolCallStreamItem {
 /// - response.output_item.added
 /// - response.output_item.done
 /// - response.completed
+/// - response.incomplete
 /// - response.content_part.added
 /// - response.content_part.done
 /// - response.output_text.delta
@@ -121,6 +122,9 @@ pub(crate) struct ResponseStreamEventEmitter {
     /// In-flight reasoning item: opened on the first reasoning delta, closed
     /// before the first message/tool item or on finish.
     reasoning_item: Option<ReasoningStreamItem>,
+    /// Chat `finish_reason` of the final chunk, e.g. `"length"` for a
+    /// `max_output_tokens` truncation. Drives the terminal event's status.
+    finish_reason: Option<String>,
 }
 
 /// Streaming state for the reasoning output item of the current turn.
@@ -150,6 +154,7 @@ impl ResponseStreamEventEmitter {
             original_request: None,
             tool_call_items: Vec::new(),
             reasoning_item: None,
+            finish_reason: None,
         }
     }
 
@@ -333,15 +338,24 @@ impl ResponseStreamEventEmitter {
             output
         };
 
+        // A `length` finish means max_output_tokens truncated the response;
+        // the Responses contract reports that as status=incomplete with
+        // incomplete_details and terminates the stream with
+        // response.incomplete, mirroring the non-streaming conversion.
+        let truncated = self.finish_reason.as_deref() == Some("length");
+
         // Build base response object
         let mut response_obj = json!({
             "id": self.response_id,
             "object": "response",
             "created_at": self.created_at,
-            "status": "completed",
+            "status": if truncated { "incomplete" } else { "completed" },
             "model": self.model,
             "output": output
         });
+        if truncated {
+            response_obj["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+        }
 
         // Add usage if provided
         if let Some(usage_val) = usage {
@@ -388,7 +402,11 @@ impl ResponseStreamEventEmitter {
         }
 
         json!({
-            "type": ResponseEvent::COMPLETED,
+            "type": if truncated {
+                ResponseEvent::INCOMPLETE
+            } else {
+                ResponseEvent::COMPLETED
+            },
             "sequence_number": self.next_sequence(),
             "response": response_obj
         })
@@ -758,14 +776,29 @@ impl ResponseStreamEventEmitter {
             ResponsesUsage::Modern(usage_info.to_response_usage())
         });
 
+        // Match the streamed terminal event: a `length` finish reports
+        // status=incomplete with the truncation reason.
+        let (status, incomplete_details) = match self.finish_reason.as_deref() {
+            Some("length") => (
+                ResponseStatus::Incomplete,
+                Some(IncompleteDetails {
+                    reason: IncompleteReason::MaxOutputTokens,
+                }),
+            ),
+            _ => (ResponseStatus::Completed, None),
+        };
+
         // Build response using builder
-        ResponsesResponse::builder(&self.response_id, &self.model)
+        let mut builder = ResponsesResponse::builder(&self.response_id, &self.model)
             .created_at(self.created_at as i64)
-            .status(ResponseStatus::Completed)
+            .status(status)
             .output(output)
             .maybe_copy_from_request(self.original_request.as_ref())
-            .maybe_usage(responses_usage)
-            .build()
+            .maybe_usage(responses_usage);
+        if let Some(details) = incomplete_details {
+            builder = builder.incomplete_details(details);
+        }
+        builder.build()
     }
 
     /// Emit reasoning item wrapper events (added + done)
@@ -882,6 +915,59 @@ impl ResponseStreamEventEmitter {
         let event = self.emit_output_item_done(reasoning.output_index, &item);
         self.send_event(&event, tx).await?;
         self.complete_output_item(reasoning.output_index);
+        Ok(())
+    }
+
+    /// Close every streamed tool-call item: arguments (or custom input) done,
+    /// then output_item.done, as the non-streaming path pairs them. Called on
+    /// `tool_calls` and on `length` finishes — grammar-constrained models can
+    /// keep emitting valid tool calls until `max_output_tokens` truncates the
+    /// turn, and those (possibly partial) calls still belong in the final
+    /// output, so they must be closed and collected here.
+    async fn close_tool_call_items(&mut self, tx: &SseSender) -> Result<(), String> {
+        for item in std::mem::take(&mut self.tool_call_items) {
+            let full = if self.is_custom_tool(&item.name) {
+                let input = super::utils::custom_tool_input(&item.arguments);
+                for (event_type, field) in [
+                    ("response.custom_tool_call_input.delta", "delta"),
+                    ("response.custom_tool_call_input.done", "input"),
+                ] {
+                    let event = json!({
+                        "type": event_type,
+                        "sequence_number": self.next_sequence(),
+                        "output_index": item.output_index,
+                        "item_id": item.item_id,
+                        field: input,
+                    });
+                    self.send_event(&event, tx).await?;
+                }
+                json!({
+                    "id": item.item_id,
+                    "type": "custom_tool_call",
+                    "call_id": item.call_id,
+                    "name": item.name,
+                    "input": input,
+                })
+            } else {
+                let event = self.emit_function_call_arguments_done(
+                    item.output_index,
+                    &item.item_id,
+                    &item.arguments,
+                );
+                self.send_event(&event, tx).await?;
+                json!({
+                    "id": item.item_id,
+                    "type": "function_call",
+                    "call_id": item.call_id,
+                    "name": item.name,
+                    "arguments": item.arguments,
+                    "status": "completed",
+                })
+            };
+            let event = self.emit_output_item_done(item.output_index, &full);
+            self.send_event(&event, tx).await?;
+            self.complete_output_item(item.output_index);
+        }
         Ok(())
     }
 
@@ -1065,6 +1151,7 @@ impl ResponseStreamEventEmitter {
 
             // Check for finish_reason to emit completion events
             if let Some(reason) = &choice.finish_reason {
+                self.finish_reason = Some(reason.clone());
                 self.close_reasoning_item(tx).await?;
                 if reason == "stop" || reason == "length" || reason == "tool_calls" {
                     if let (Some(output_index), Some(item_id)) = (
@@ -1101,53 +1188,11 @@ impl ResponseStreamEventEmitter {
                         self.complete_output_item(output_index);
                     }
                 }
-                if reason == "tool_calls" {
-                    // Close every streamed tool-call item: arguments (or custom
-                    // input) done, then output_item.done, as the non-streaming
-                    // path pairs them.
-                    for item in std::mem::take(&mut self.tool_call_items) {
-                        let full = if self.is_custom_tool(&item.name) {
-                            let input = super::utils::custom_tool_input(&item.arguments);
-                            for (event_type, field) in [
-                                ("response.custom_tool_call_input.delta", "delta"),
-                                ("response.custom_tool_call_input.done", "input"),
-                            ] {
-                                let event = json!({
-                                    "type": event_type,
-                                    "sequence_number": self.next_sequence(),
-                                    "output_index": item.output_index,
-                                    "item_id": item.item_id,
-                                    field: input,
-                                });
-                                self.send_event(&event, tx).await?;
-                            }
-                            json!({
-                                "id": item.item_id,
-                                "type": "custom_tool_call",
-                                "call_id": item.call_id,
-                                "name": item.name,
-                                "input": input,
-                            })
-                        } else {
-                            let event = self.emit_function_call_arguments_done(
-                                item.output_index,
-                                &item.item_id,
-                                &item.arguments,
-                            );
-                            self.send_event(&event, tx).await?;
-                            json!({
-                                "id": item.item_id,
-                                "type": "function_call",
-                                "call_id": item.call_id,
-                                "name": item.name,
-                                "arguments": item.arguments,
-                                "status": "completed",
-                            })
-                        };
-                        let event = self.emit_output_item_done(item.output_index, &full);
-                        self.send_event(&event, tx).await?;
-                        self.complete_output_item(item.output_index);
-                    }
+                // Tool-call items close on `tool_calls` and on `length`:
+                // truncation can hit mid-call, but whatever arguments
+                // arrived still form a (partial) function-call output item.
+                if reason == "tool_calls" || reason == "length" {
+                    self.close_tool_call_items(tx).await?;
                 }
             }
         }
@@ -1392,8 +1437,9 @@ mod process_chunk_tests {
     }
 
     /// Drive `chunks` through a fresh emitter; return the emitted events in
-    /// order plus the `output` array of `response.completed`.
-    async fn stream(
+    /// order plus the terminal `response.completed`/`response.incomplete`
+    /// event.
+    async fn stream_with_terminal(
         request: serde_json::Value,
         chunks: &[ChatCompletionStreamResponse],
     ) -> (Vec<serde_json::Value>, serde_json::Value) {
@@ -1411,8 +1457,18 @@ mod process_chunk_tests {
             let data = text.lines().find_map(|l| l.strip_prefix("data: ")).unwrap();
             events.push(serde_json::from_str(data).unwrap());
         }
-        let completed = emitter.emit_completed(None);
-        (events, completed["response"]["output"].clone())
+        let terminal = emitter.emit_completed(None);
+        (events, terminal)
+    }
+
+    /// Drive `chunks` through a fresh emitter; return the emitted events in
+    /// order plus the `output` array of the terminal event.
+    async fn stream(
+        request: serde_json::Value,
+        chunks: &[ChatCompletionStreamResponse],
+    ) -> (Vec<serde_json::Value>, serde_json::Value) {
+        let (events, terminal) = stream_with_terminal(request, chunks).await;
+        (events, terminal["response"]["output"].clone())
     }
 
     fn types(events: &[serde_json::Value]) -> Vec<&str> {
@@ -1552,5 +1608,124 @@ mod process_chunk_tests {
         assert!(output[0].get("encrypted_content").is_none());
         assert_eq!(output[1]["type"], "message");
         assert_eq!(output[1]["content"][0]["text"], "Hello");
+    }
+
+    #[tokio::test]
+    async fn length_truncation_closes_tool_calls_and_marks_incomplete() {
+        // Grammar-constrained turn: one full call, a second call truncated
+        // mid-arguments by max_output_tokens.
+        let (events, terminal) = stream_with_terminal(
+            json!({"model": "test-model", "input": "hi"}),
+            &[
+                chunk(
+                    json!({"tool_calls": [{"index": 0, "id": "call_a", "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]}),
+                    None,
+                ),
+                chunk(
+                    json!({"tool_calls": [{"index": 1, "id": "call_b", "type": "function",
+                        "function": {"name": "get_time", "arguments": "{\"tz\":"}}]}),
+                    None,
+                ),
+                chunk(json!({}), Some("length")),
+            ],
+        )
+        .await;
+
+        // Both streamed calls close even though the turn ended truncated.
+        assert_eq!(
+            types(&events),
+            [
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+            ]
+        );
+
+        assert_eq!(terminal["type"], "response.incomplete");
+        assert_eq!(terminal["response"]["status"], "incomplete");
+        assert_eq!(
+            terminal["response"]["incomplete_details"],
+            json!({"reason": "max_output_tokens"})
+        );
+
+        let output = &terminal["response"]["output"];
+        assert_eq!(output.as_array().map(Vec::len), Some(2));
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[0]["name"], "get_weather");
+        assert_eq!(output[0]["arguments"], "{\"city\":\"Paris\"}");
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[1]["name"], "get_time");
+        assert_eq!(output[1]["arguments"], "{\"tz\":");
+    }
+
+    #[tokio::test]
+    async fn length_truncated_text_ends_with_response_incomplete() {
+        let (events, terminal) = stream_with_terminal(
+            json!({"model": "test-model", "input": "hi"}),
+            &[
+                chunk(json!({"content": "He"}), None),
+                chunk(json!({"content": "y"}), None),
+                chunk(json!({}), Some("length")),
+            ],
+        )
+        .await;
+
+        // The text item still closes normally; only the terminal event and
+        // response status change.
+        assert_eq!(
+            types(&events),
+            [
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+            ]
+        );
+        assert_eq!(terminal["type"], "response.incomplete");
+        assert_eq!(terminal["response"]["status"], "incomplete");
+        assert_eq!(
+            terminal["response"]["incomplete_details"],
+            json!({"reason": "max_output_tokens"})
+        );
+        assert_eq!(
+            terminal["response"]["output"][0]["content"][0]["text"],
+            "Hey"
+        );
+    }
+
+    #[tokio::test]
+    async fn length_truncated_finalize_persists_incomplete_status() {
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        emitter.set_original_request(
+            serde_json::from_value(json!({"model": "test-model", "input": "hi"})).unwrap(),
+        );
+        let (tx, mut rx) = mpsc::channel(256);
+        emitter
+            .process_chunk(&chunk(json!({"content": "par"}), None), &tx)
+            .await
+            .unwrap();
+        emitter
+            .process_chunk(&chunk(json!({}), Some("length")), &tx)
+            .await
+            .unwrap();
+        drop(tx);
+        while rx.recv().await.is_some() {}
+
+        let wire = serde_json::to_value(emitter.finalize(None)).unwrap();
+        assert_eq!(wire["status"], "incomplete");
+        assert_eq!(
+            wire["incomplete_details"],
+            json!({"reason": "max_output_tokens"})
+        );
     }
 }
