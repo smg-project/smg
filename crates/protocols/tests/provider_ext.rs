@@ -613,3 +613,36 @@ fn non_kimi_models_keep_openai_sampling_freedom() {
         );
     }
 }
+
+#[test]
+fn non_k3_kimi_models_keep_openai_sampling() {
+    use openai_protocol::validated::Normalizable;
+    for model in ["moonshotai/kimi-k2", "Kimi-K2.6", "moonshot-v1-8k"] {
+        let mut req = sampling_request(model, json!({"temperature": 0.3, "top_p": 1.0}));
+        req.normalize();
+        assert!(
+            error_codes(&req).is_empty(),
+            "{model}: {:?}",
+            error_codes(&req)
+        );
+        let mut bare = sampling_request(model, json!({}));
+        bare.normalize();
+        assert_eq!(bare.temperature, None, "{model}");
+        assert_eq!(bare.top_p, None, "{model}");
+    }
+}
+
+#[test]
+fn k3_ids_in_paths_and_prefixes_get_the_sampling_pins() {
+    use openai_protocol::validated::Normalizable;
+    for model in ["/models/Kimi-K3", "moonshotai/kimi-k3", "KIMI-K3-thinking"] {
+        let mut req = sampling_request(model, json!({}));
+        req.normalize();
+        assert_eq!(req.temperature, Some(1.0), "{model}");
+        let bad = sampling_request(model, json!({"top_p": 0.8}));
+        assert!(
+            error_codes(&bad).iter().any(|c| c == "top_p_not_allowed"),
+            "{model}"
+        );
+    }
+}
