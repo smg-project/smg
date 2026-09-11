@@ -69,7 +69,8 @@ impl ProviderProfile {
     /// router's streamed pass-through forwards the raw body and skips it.
     /// Only message-level extension structs
     /// are covered; see the module docs. Dropped extensions are logged once
-    /// per request.
+    /// per request. The profile then applies its contract defaults to fields
+    /// the client omitted.
     pub fn normalize_chat(self, req: &mut ChatCompletionRequest) {
         match self {
             ProviderProfile::Minimax => minimax::normalize_chat(req),
@@ -103,6 +104,10 @@ impl ProviderProfile {
                 roles = %dropped.join(","),
                 "dropped message extensions that belong to another provider's profile"
             );
+        }
+        match self {
+            ProviderProfile::Kimi => kimi::normalize_chat(req),
+            ProviderProfile::OpenAi | ProviderProfile::Minimax => {}
         }
     }
 
