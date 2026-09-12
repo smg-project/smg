@@ -14,7 +14,7 @@ use super::engine::RejectionReason;
 use crate::{middleware::SHED_RETRY_AFTER_SECS, routers::error::create_error};
 
 /// Response header set on a preempted request so clients/proxies can tell a
-/// preemption 503 apart from an ordinary overload 503.
+/// preemption 503 apart from an ordinary capacity 429.
 pub const HEADER_X_SMG_PREEMPTED: &str = "X-SMG-Preempted";
 
 /// Client-Closed-Request (nginx convention). Used for `ClientCancelled`,
@@ -26,7 +26,7 @@ const STATUS_CLIENT_CLOSED_REQUEST: u16 = 499;
 pub enum SchedulerError {
     /// Per-class queue at its configured limit. → 429 + `Retry-After: 2`.
     QueueFull,
-    /// Queued waiter aged past `queue_timeout`. → 503 + `Retry-After: 2`.
+    /// Queued waiter aged past `queue_timeout`. → 429 + `Retry-After: 2`.
     QueueTimeout,
     /// Cancelled in-flight to admit a higher-priority waiter, before TTFT.
     /// → 503 + `Retry-After: 1` + `X-SMG-Preempted: true`.
@@ -40,7 +40,7 @@ impl SchedulerError {
     fn status(self) -> StatusCode {
         match self {
             Self::QueueFull => StatusCode::TOO_MANY_REQUESTS,
-            Self::QueueTimeout => StatusCode::SERVICE_UNAVAILABLE,
+            Self::QueueTimeout => StatusCode::TOO_MANY_REQUESTS,
             Self::Preempted => StatusCode::SERVICE_UNAVAILABLE,
             // `unwrap_or` (not `unwrap`/`expect`, both denied) — 499 is a
             // valid code so the fallback is never taken.
@@ -115,9 +115,9 @@ mod tests {
     }
 
     #[test]
-    fn test_queue_timeout_maps_to_503_with_retry_after() {
+    fn test_queue_timeout_maps_to_429_with_retry_after() {
         let resp = SchedulerError::QueueTimeout.into_response();
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             resp.headers().get(RETRY_AFTER),
             Some(&HeaderValue::from(SHED_RETRY_AFTER_SECS))

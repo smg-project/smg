@@ -831,6 +831,7 @@ impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadRespon
             version: resp.version,
             dp_rank_count: resp.dp_rank_count,
             loads: resp.loads.into_iter().map(Into::into).collect(),
+            admission_blocked: None,
             aggregate,
         }
     }

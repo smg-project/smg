@@ -69,7 +69,7 @@ type PdPair = (Arc<dyn Worker>, Arc<dyn Worker>);
 
 #[derive(Debug)]
 enum PdSelectionFailure {
-    /// Every worker on one leg is vetoed: a ready-made, already-counted 503.
+    /// Every worker on one leg is vetoed: a ready-made, already-counted 429.
     Shed(Response),
     /// The pre-existing string: no workers configured, all unhealthy or
     /// circuit-broken, or the policy declined.
@@ -207,11 +207,14 @@ impl PDRouter {
         })
     }
 
-    fn handle_server_selection_error(failure: PdSelectionFailure) -> Response {
+    fn handle_server_selection_error(
+        &self,
+        failure: PdSelectionFailure,
+        model_id: &str,
+    ) -> Response {
         match failure {
-            // Already a decision-logged 503 with the overload error code and
-            // counter; re-describing it as a circuit-breaker/health failure is
-            // exactly the misdiagnosis this path used to hand operators.
+            // Already a decision-logged 429 with the overload error code and
+            // counter; preserve that capacity classification.
             PdSelectionFailure::Shed(shed) => shed,
             PdSelectionFailure::Incompatible(error) => {
                 error!("Failed to select PD pair error={}", error);
@@ -219,12 +222,9 @@ impl PDRouter {
             }
             PdSelectionFailure::Unavailable(error) => {
                 error!("Failed to select PD pair error={}", error);
-                // Same code the regular HTTP router and the gRPC routers use
-                // for a leg that is merely down, so a client can key its
-                // retry on one code whatever the transport; the message
-                // still names the leg.
-                error::service_unavailable(
-                    "no_available_workers",
+                overload::unavailable_or_not_found(
+                    &self.worker_registry,
+                    model_id,
                     format!("No available servers: {error}"),
                 )
             }
@@ -234,6 +234,33 @@ impl PDRouter {
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
         error!("Failed to serialize request error={}", error);
         error::internal_error("serialization_failed", "Failed to serialize request")
+    }
+
+    /// Relay an engine admission response verbatim. Gateway-owned headers are
+    /// still filtered, while the engine's body and `Retry-After` survive.
+    async fn passthrough_capacity_response(
+        response: reqwest::Response,
+        worker_url: Option<&str>,
+    ) -> Response {
+        let status = StatusCode::from_u16(response.status().as_u16())
+            .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
+        let mut headers = header_utils::preserve_response_headers(response.headers());
+        if let Some(worker_url) = worker_url {
+            header_utils::insert_routed_worker_id(&mut headers, worker_url);
+        }
+        match response.bytes().await {
+            Ok(body) => {
+                let mut response = Response::new(Body::from(body));
+                *response.status_mut() = status;
+                *response.headers_mut() = headers;
+                overload::apply_capacity_contract(&mut response);
+                response
+            }
+            Err(e) => error::internal_error(
+                "read_capacity_response_failed",
+                format!("Failed to read engine capacity response: {e}"),
+            ),
+        }
     }
 
     fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
@@ -471,7 +498,7 @@ impl PDRouter {
         let (prefill, decode) = match selected {
             Ok(pair) => pair,
             Err(e) => {
-                return Self::handle_server_selection_error(*e);
+                return self.handle_server_selection_error(*e, context.model_id);
             }
         };
 
@@ -696,6 +723,9 @@ impl PDRouter {
         load_guards: Vec<WorkerLoadGuard>,
     ) -> Response {
         let status = res.status();
+        if status == StatusCode::TOO_MANY_REQUESTS && !context.is_stream {
+            return Self::passthrough_capacity_response(res, Some(decode.url())).await;
+        }
 
         if context.is_stream {
             // Handle streaming error response
@@ -720,7 +750,7 @@ impl PDRouter {
             let error_stream = tokio_stream::once(Ok(Bytes::from(sse_data)));
 
             let decode_url = decode.url().to_string();
-            self.create_streaming_response(
+            let mut response = self.create_streaming_response(
                 error_stream,
                 status,
                 None,
@@ -728,7 +758,9 @@ impl PDRouter {
                 Some(decode_url),
                 Some(response_headers),
                 load_guards,
-            )
+            );
+            overload::apply_capacity_contract(&mut response);
+            response
         } else {
             // Handle non-streaming error response
             match res.bytes().await {
@@ -833,23 +865,21 @@ impl PDRouter {
             false,
         );
 
-        // Send both requests concurrently and wait for both
-        // Note: Using borrowed references avoids heap allocation
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
             decode_url: decode.url(),
         }
         .emit();
 
-        // Send both requests concurrently. Use try_join so that if either side
-        // hits a transport error, the other is cancelled immediately — otherwise
-        // the surviving request hangs waiting for a PD bootstrap that will never
-        // come (see #831).
+        // Send both requests concurrently. Whichever response head arrives
+        // first is inspected before awaiting the other leg: a 429 means the
+        // engine rejected before doing useful work, so cancel its partner and
+        // return the capacity signal immediately.
         // Each leg captures its own head-arrival elapsed when its `send()`
-        // resolves, so the two are independent even though `try_join!` returns
-        // only once both heads arrive: decode TTFT isn't conflated with the
-        // prefill-head wait, and prefill duration isn't conflated with a slower
-        // decode head. Recorded on the success path only.
+        // resolves, so the two are independent even though the paired result
+        // is assembled only once both non-capacity heads arrive: decode TTFT
+        // isn't conflated with the prefill-head wait, and prefill duration
+        // isn't conflated with a slower decode head. Recorded on success only.
         let runtime = prefill.metadata().spec.runtime_type.as_str();
         let dispatch_start = Instant::now();
         let prefill_fut = async {
@@ -860,7 +890,41 @@ impl PDRouter {
             let resp = send_with_stale_conn_retry(decode_request).await?;
             Ok::<_, reqwest::Error>((dispatch_start.elapsed(), resp))
         };
-        let pd_result = tokio::try_join!(prefill_fut, decode_fut);
+        tokio::pin!(prefill_fut);
+        tokio::pin!(decode_fut);
+        let pd_result = tokio::select! {
+            prefill_result = &mut prefill_fut => match prefill_result {
+                Ok(prefill_result) => {
+                    if prefill_result.1.status() == StatusCode::TOO_MANY_REQUESTS {
+                        events::RequestReceivedEvent {}.emit();
+                        return Self::passthrough_capacity_response(
+                            prefill_result.1,
+                            Some(prefill.url()),
+                        )
+                        .await;
+                    }
+                    decode_fut.await.map(|decode_result| (prefill_result, decode_result))
+                }
+                Err(error) => Err(error),
+            },
+            decode_result = &mut decode_fut => match decode_result {
+                Ok(decode_result) => {
+                    if decode_result.1.status() == StatusCode::TOO_MANY_REQUESTS {
+                        events::RequestReceivedEvent {}.emit();
+                        return self
+                            .handle_decode_error_response(
+                                decode_result.1,
+                                &context,
+                                decode,
+                                load_guards,
+                            )
+                            .await;
+                    }
+                    prefill_fut.await.map(|prefill_result| (prefill_result, decode_result))
+                }
+                Err(error) => Err(error),
+            },
+        };
 
         events::RequestReceivedEvent {}.emit();
 
@@ -877,6 +941,13 @@ impl PDRouter {
                     );
                 }
             };
+
+        // If both heads were ready before the select branch ran, retain the
+        // prefill admission response even when decode also failed.
+        if prefill_response.status() == StatusCode::TOO_MANY_REQUESTS {
+            return Self::passthrough_capacity_response(prefill_response, Some(prefill.url()))
+                .await;
+        }
 
         // Process decode response
         let status = StatusCode::from_u16(decode_response.status().as_u16())
@@ -1194,6 +1265,9 @@ impl PDRouter {
     /// upstream status is preserved (not classified into a fixed set) so
     /// retryability and capacity-pushback handling see what the worker sent.
     async fn prefill_error_response(status: StatusCode, response: reqwest::Response) -> Response {
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Self::passthrough_capacity_response(response, None).await;
+        }
         let message = match response.bytes().await {
             Ok(body) => {
                 if let Ok(json) = serde_json::from_slice::<Value>(&body) {
@@ -1544,6 +1618,12 @@ impl PDRouter {
     ) -> Result<(StatusCode, Option<Bytes>), Response> {
         let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+        if prefill_status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(
+                Self::passthrough_capacity_response(prefill_response, Some(prefill_url)).await,
+            );
+        }
 
         // Check if prefill succeeded
         if !prefill_status.is_success() {
@@ -2410,6 +2490,43 @@ mod tests {
         (format!("http://{addr}"), seen)
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only servers live for the duration of the test process"
+    )]
+    async fn spawn_overloaded_and_hanging_stubs() -> (String, String) {
+        let overloaded = axum::Router::new().fallback(axum::routing::any(|| async {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(http::header::RETRY_AFTER, "7")],
+                r#"{"error":"prefill overloaded"}"#,
+            )
+        }));
+        let overloaded_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let overloaded_addr = overloaded_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(overloaded_listener, overloaded).await.unwrap();
+        });
+
+        let hanging = axum::Router::new().fallback(axum::routing::any(|| async {
+            std::future::pending::<Response>().await
+        }));
+        let hanging_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let hanging_addr = hanging_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(hanging_listener, hanging).await.unwrap();
+        });
+
+        (
+            format!("http://{overloaded_addr}"),
+            format!("http://{hanging_addr}"),
+        )
+    }
+
     #[tokio::test]
     async fn messages_and_responses_dispatch_to_their_worker_routes() {
         let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
@@ -2633,7 +2750,7 @@ mod tests {
         // The endpoint reaches PD selection (and fails on the empty fleet)
         // instead of falling through to the trait's 501 default.
         assert_ne!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let responses: ResponsesRequest = serde_json::from_value(json!({
             "model": "m",
@@ -2644,7 +2761,7 @@ mod tests {
             .route_responses(None, &tenant, responses, UNKNOWN_MODEL_ID)
             .await;
         assert_ne!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
@@ -2727,6 +2844,139 @@ mod tests {
             parsed.get("error").is_some(),
             "parsed SSE payload must contain an `error` field: {parsed}"
         );
+    }
+
+    #[tokio::test]
+    async fn non_streaming_decode_preserves_upstream_429_contract() {
+        let router = create_test_pd_router();
+        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://prefill".to_string(),
+            WorkerType::Prefill,
+            true,
+        ));
+        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+            true,
+        ));
+        let upstream_body = r#"{"error":"decode overloaded"}"#;
+        let upstream = http::Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(http::header::RETRY_AFTER, "13")
+            .body(upstream_body)
+            .unwrap();
+        let context = PDRequestContext {
+            route: "/v1/chat/completions",
+            batch_size: None,
+            is_stream: false,
+            return_logprob: false,
+            model_id: UNKNOWN_MODEL_ID,
+            headers: None,
+        };
+        let load_guards = vec![
+            WorkerLoadGuard::new(prefill.clone(), None),
+            WorkerLoadGuard::new(decode.clone(), None),
+        ];
+
+        let response = router
+            .handle_decode_error_response(
+                reqwest::Response::from(upstream),
+                &context,
+                decode,
+                load_guards,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get(http::header::RETRY_AFTER).unwrap(),
+            "13"
+        );
+        assert!(!is_retryable_response(&response));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], upstream_body.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn parallel_prefill_preserves_upstream_429_contract() {
+        let router = create_test_pd_router();
+        let upstream_body = r#"{"error":"prefill overloaded"}"#;
+        let upstream = http::Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(http::header::RETRY_AFTER, "11")
+            .body(upstream_body)
+            .unwrap();
+
+        let response = router
+            .process_prefill_response(
+                reqwest::Response::from(upstream),
+                "http://prefill",
+                false,
+            )
+            .await
+            .expect_err("engine admission must stop the parallel PD attempt");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get(http::header::RETRY_AFTER).unwrap(),
+            "11"
+        );
+        assert!(!is_retryable_response(&response));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], upstream_body.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn parallel_prefill_429_does_not_wait_for_hanging_decode() {
+        let (prefill_url, decode_url) = spawn_overloaded_and_hanging_stubs().await;
+        let router = create_test_pd_router();
+        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+            prefill_url,
+            WorkerType::Prefill,
+            true,
+        ));
+        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+            decode_url,
+            WorkerType::Decode,
+            true,
+        ));
+        let context = PDRequestContext {
+            route: "/generate",
+            batch_size: None,
+            is_stream: false,
+            return_logprob: false,
+            model_id: UNKNOWN_MODEL_ID,
+            headers: None,
+        };
+        let load_guards = vec![
+            WorkerLoadGuard::new(prefill.clone(), None),
+            WorkerLoadGuard::new(decode.clone(), None),
+        ];
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            router.execute_dual_dispatch_internal(
+                None,
+                (Bytes::from_static(b"{}"), Bytes::from_static(b"{}")),
+                context,
+                prefill,
+                decode,
+                load_guards,
+            ),
+        )
+        .await
+        .expect("prefill 429 must not wait for the hanging decode");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get(http::header::RETRY_AFTER).unwrap(),
+            "7"
+        );
+        assert!(!is_retryable_response(&response));
     }
 
     /// PD twin of the regular router's release test: with retries disabled

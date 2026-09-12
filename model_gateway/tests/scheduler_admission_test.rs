@@ -8,7 +8,7 @@
 //! | Outcome              | Status | Extra                                   |
 //! |----------------------|--------|-----------------------------------------|
 //! | queue full           | 429    | `X-SMG-Error-Code: scheduler_queue_full`, `Retry-After: 2` |
-//! | queue timeout        | 503    | `X-SMG-Error-Code: scheduler_queue_timeout`, `Retry-After: 2` |
+//! | queue timeout        | 429    | `X-SMG-Error-Code: scheduler_queue_timeout`, `Retry-After: 2` |
 //! | preempted (pre-TTFT) | 503    | `X-SMG-Preempted: true`, `Retry-After: 1` |
 //!
 //! ## How these are made deterministic
@@ -344,7 +344,7 @@ async fn queue_full_returns_429() {
     ctx.shutdown().await;
 }
 
-/// Queue timeout → 503 + Retry-After. Capacity 1, occupied by a held
+/// Queue timeout → 429 + Retry-After. Capacity 1, occupied by a held
 /// request; the probe enqueues (queue_size 1) but the slot never frees, so
 /// it ages out.
 #[expect(
@@ -353,7 +353,7 @@ async fn queue_full_returns_429() {
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn queue_timeout_returns_503() {
+async fn queue_timeout_returns_429() {
     let mut yaml = SchedulerYaml::base();
     yaml.default.queue_size = 4;
     yaml.default.queue_timeout_secs = 1; // short, but the mechanism — not a race
@@ -378,15 +378,15 @@ async fn queue_timeout_returns_503() {
     let resp = send(&app, generate_request("probe", None)).await;
     assert_eq!(
         resp.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "queue timeout must map to 503"
+        StatusCode::TOO_MANY_REQUESTS,
+        "queue timeout must map to 429"
     );
     assert_eq!(
         resp.headers()
             .get("retry-after")
             .map(|v| v.to_str().unwrap()),
         Some("2"),
-        "queue-timeout 503 must carry Retry-After: 2"
+        "queue-timeout 429 must carry Retry-After: 2"
     );
     assert_eq!(
         error_code(&resp).as_deref(),

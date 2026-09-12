@@ -22,7 +22,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use dashmap::{mapref::entry::Entry, DashMap};
+use dashmap::{mapref::entry::Entry, DashMap, DashSet};
 use openai_protocol::worker::WorkerStatus;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
@@ -299,6 +299,11 @@ pub struct WorkerRegistry {
     /// order somewhere else would deadlock.
     model_alias_index: ModelAliasIndex,
 
+    /// Model identities observed from workers or seeded by discovery.
+    /// Entries survive worker removal so an empty serving pool remains
+    /// distinguishable from a model name this router has never known.
+    known_models: Arc<DashSet<String>>,
+
     /// Consistent hash rings per model for O(log n) routing.
     /// Rebuilt on worker add/remove (copy-on-write).
     hash_rings: Arc<DashMap<String, Arc<HashRing>>>,
@@ -380,6 +385,7 @@ impl WorkerRegistry {
             global_membership_order: parking_lot::RwLock::new(()),
             global_routing_update: parking_lot::Mutex::new(()),
             model_alias_index: Arc::new(DashMap::new()),
+            known_models: Arc::new(DashSet::new()),
             hash_rings: Arc::new(DashMap::new()),
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
@@ -1021,6 +1027,22 @@ impl WorkerRegistry {
         self.model_alias_index
             .get(model_id)
             .is_some_and(|canonical_id| self.model_has_workers(canonical_id.as_ref()))
+    }
+
+    /// Remember a model independently of current worker membership.
+    ///
+    /// This is monotonic for the process lifetime: after the last worker goes
+    /// away, requests for the model remain capacity failures rather than false
+    /// "model not found" errors.
+    pub(crate) fn remember_model(&self, model_id: &str) {
+        if !model_id.is_empty() {
+            self.known_models.insert(model_id.to_string());
+        }
+    }
+
+    /// Whether this process has observed a model, even with no current worker.
+    pub(crate) fn is_known_model(&self, model_id: &str) -> bool {
+        self.known_models.contains(model_id)
     }
 
     fn model_has_workers(&self, canonical_id: &str) -> bool {
@@ -1862,6 +1884,17 @@ impl WorkerRegistry {
             return None;
         }
 
+        // Publish model identity first so a concurrent request cannot see a
+        // worker while still classifying its model as never known.
+        for model_id in Self::worker_model_ids(&worker) {
+            self.remember_model(&model_id);
+        }
+        for model in worker.models() {
+            for alias in model.aliases {
+                self.remember_model(&alias);
+            }
+        }
+
         // Record origin BEFORE the worker becomes visible in `workers`:
         // lock-free readers resolve workers by URL the moment the insert
         // lands, and a visible worker with no origin would be treated as
@@ -1994,6 +2027,7 @@ impl WorkerRegistry {
     /// Replaces any existing entry with the same URL so updates via replace()
     /// do not leave duplicate rows.
     fn add_worker_to_model_index(&self, model_id: &str, worker: Arc<dyn Worker>) {
+        self.remember_model(model_id);
         // The replaced snapshot (and its cached projections) must not drop
         // under the shard write guard: capture it and let it fall after the
         // entry expression releases the lock.
@@ -2136,6 +2170,8 @@ impl WorkerRegistry {
     }
 
     fn add_model_alias(&self, alias: &str, canonical_id: &str) {
+        self.remember_model(canonical_id);
+        self.remember_model(alias);
         if alias == canonical_id {
             return;
         }
@@ -3880,6 +3916,9 @@ mod tests {
             WorkerType::Regular,
         );
         let worker_id = registry.register(worker).unwrap();
+        assert!(registry.is_known_model("GLM-5.2"));
+        assert!(registry.is_known_model("GLM-5.2-Coding"));
+        assert!(!registry.is_known_model("GLM-5.2-Unknown"));
 
         assert!(registry.contains_model("GLM-5.2"));
         assert!(registry.contains_model("GLM-5.2-Coding"));
@@ -3890,6 +3929,8 @@ mod tests {
         assert!(registry.remove(&worker_id).is_some());
         assert!(!registry.contains_model("GLM-5.2"));
         assert!(!registry.contains_model("GLM-5.2-Coding"));
+        assert!(registry.is_known_model("GLM-5.2"));
+        assert!(registry.is_known_model("GLM-5.2-Coding"));
     }
 
     #[test]

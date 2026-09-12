@@ -1203,6 +1203,7 @@ impl WorkerManager {
             timestamp: Utc::now().to_rfc3339(),
             version: format!("smg-{}", env!("CARGO_PKG_VERSION")),
             dp_rank_count: loads.len() as i32,
+            admission_blocked: None,
             aggregate: EngineAggregateMetricsSnapshot::from_ranks(&loads),
             loads,
         }
@@ -2175,6 +2176,7 @@ mod tests {
             timestamp: "2026-09-03T00:00:00Z".to_string(),
             version: "engine-test".to_string(),
             dp_rank_count: loads.len() as i32,
+            admission_blocked: None,
             aggregate: None,
             loads,
         }

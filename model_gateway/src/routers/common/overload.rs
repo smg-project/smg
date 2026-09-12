@@ -25,14 +25,14 @@ use crate::{
             BRANCH_ALL_OVERLOADED_SHED, BRANCH_OVERLOADED_AT_DISPATCH, BRANCH_PD_ADMISSION_SHED,
             STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION,
         },
-        Worker,
+        Worker, WorkerRegistry,
     },
 };
 
-/// Retry-After seconds advertised on every shed: the load-monitor poll
-/// interval, since the veto provably cannot clear faster. Process-wide because
-/// the shed helpers are free functions called from every router; the value is
-/// a client hint, not a correctness input. Default matches the config default.
+/// Retry-After seconds advertised on capacity responses. The worker-overload
+/// veto cannot clear faster than the load-monitor poll interval; the same
+/// process-wide value is a conservative fallback for temporarily empty pools
+/// and upstream 429s without their own hint.
 static SHED_RETRY_AFTER_SECS: AtomicU64 = AtomicU64::new(10);
 
 /// Client-visible, gateway-owned code for a worker-overload-protection shed.
@@ -41,6 +41,9 @@ static SHED_RETRY_AFTER_SECS: AtomicU64 = AtomicU64::new(10);
 /// selection-to-dispatch re-check, where another worker may still be eligible.
 pub(crate) const WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE: &str =
     "worker_overload_protection_shed";
+
+/// Client-visible code for a known model with no currently usable worker.
+pub(crate) const NO_AVAILABLE_WORKERS_ERROR_CODE: &str = "no_available_workers";
 
 /// Latch the poll interval the shed responses advertise. Called once at
 /// startup when the load monitor is built.
@@ -116,6 +119,47 @@ pub(crate) fn shed_pd_admission(
     )
 }
 
+/// Apply the public capacity contract to an existing 429 without replacing
+/// an upstream response body or an upstream `Retry-After` value.
+pub(crate) fn apply_capacity_contract(response: &mut Response) {
+    if response.status() != axum::http::StatusCode::TOO_MANY_REQUESTS {
+        return;
+    }
+    if !response.headers().contains_key(RETRY_AFTER) {
+        response.headers_mut().insert(
+            RETRY_AFTER,
+            HeaderValue::from(SHED_RETRY_AFTER_SECS.load(Ordering::Relaxed)),
+        );
+    }
+    mark_non_retryable(response);
+}
+
+/// Return capacity pressure for a known model while preserving 404 for an
+/// identity this router has never observed.
+pub(crate) fn unavailable_or_not_found(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    message: impl Into<String>,
+) -> Response {
+    if registry.is_known_model(model_id) {
+        no_available_workers(message)
+    } else {
+        error::model_not_found(model_id)
+    }
+}
+
+/// Stable response for a known model whose workers cannot currently accept
+/// work.
+pub(crate) fn no_available_workers(message: impl Into<String>) -> Response {
+    capacity_response(NO_AVAILABLE_WORKERS_ERROR_CODE, message)
+}
+
+fn capacity_response(code: &'static str, message: impl Into<String>) -> Response {
+    let mut response = error::too_many_requests(code, message);
+    apply_capacity_contract(&mut response);
+    response
+}
+
 /// One decision line, one counter, one response — marked non-retryable: the
 /// veto clears at the poll interval, which no backoff window outlives, and a
 /// terminal shed is what keeps the counter per-request rather than per-attempt.
@@ -124,14 +168,7 @@ pub(crate) fn shed_pd_admission(
 fn shed(branch: &'static str, stage: &'static str, worker: &str, message: String) -> Response {
     Metrics::record_worker_overload_shed(stage);
     debug!(branch, stage, worker, "Overload shed");
-    let mut response =
-        error::service_unavailable(WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE, message);
-    response.headers_mut().insert(
-        RETRY_AFTER,
-        HeaderValue::from(SHED_RETRY_AFTER_SECS.load(Ordering::Relaxed)),
-    );
-    mark_non_retryable(&mut response);
-    response
+    capacity_response(WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE, message)
 }
 
 #[cfg(test)]
@@ -162,10 +199,10 @@ mod tests {
         )
     }
 
-    /// The shed is a distinct 503, taken from the candidate pool rather than
+    /// The shed is a distinct 429, taken from the candidate pool rather than
     /// the model index.
     #[test]
-    fn all_overloaded_sheds_with_distinct_503_code() {
+    fn all_overloaded_sheds_with_distinct_429_code() {
         let a = worker("http://127.0.0.1:9801", "m");
         let b = worker("http://127.0.0.1:9802", "m");
         let pool = vec![Arc::clone(&a), Arc::clone(&b)];
@@ -178,7 +215,7 @@ mod tests {
 
         b.set_overloaded(true);
         let response = shed_if_all_overloaded(&pool, "m").expect("shed");
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             extract_error_code_from_response(&response),
             "worker_overload_protection_shed"
@@ -202,7 +239,7 @@ mod tests {
         let selection = shed_if_all_overloaded(std::slice::from_ref(&a), "m").expect("shed");
         assert!(
             is_retryable_status(selection.status()),
-            "the status stays the retryable 503 clients already understand"
+            "429 is ordinarily retryable before the terminal marker is considered"
         );
         assert!(
             !is_retryable_response(&selection),
@@ -251,7 +288,7 @@ mod tests {
 
         w.set_overloaded(true);
         let response = shed_if_worker_overloaded(w.as_ref(), "m").expect("shed");
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             extract_error_code_from_response(&response),
             "worker_overload_protection_shed"
@@ -263,5 +300,51 @@ mod tests {
                 .expect("gateway error code header"),
             "worker_overload_protection_shed"
         );
+    }
+
+    #[test]
+    fn known_model_without_workers_is_capacity_but_unknown_model_is_not_found() {
+        let registry = WorkerRegistry::new();
+
+        let unknown = unavailable_or_not_found(&registry, "unknown", "no worker");
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        registry.remember_model("known");
+        let known = unavailable_or_not_found(&registry, "known", "no worker");
+        assert_eq!(known.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            extract_error_code_from_response(&known),
+            NO_AVAILABLE_WORKERS_ERROR_CODE
+        );
+        assert!(known.headers().contains_key(RETRY_AFTER));
+        assert!(!is_retryable_response(&known));
+    }
+
+    #[test]
+    fn capacity_contract_preserves_upstream_retry_after_and_adds_a_fallback() {
+        let mut hinted = error::too_many_requests("upstream_busy", "busy");
+        hinted
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("17"));
+        apply_capacity_contract(&mut hinted);
+        assert_eq!(hinted.headers().get(RETRY_AFTER).unwrap(), "17");
+        assert!(!is_retryable_response(&hinted));
+
+        let mut unhinted = error::too_many_requests("upstream_busy", "busy");
+        apply_capacity_contract(&mut unhinted);
+        assert!(
+            unhinted
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|seconds| seconds >= 1)
+        );
+        assert!(!is_retryable_response(&unhinted));
+
+        let mut unrelated = error::service_unavailable("unavailable", "down");
+        apply_capacity_contract(&mut unrelated);
+        assert!(!unrelated.headers().contains_key(RETRY_AFTER));
+        assert!(is_retryable_response(&unrelated));
     }
 }

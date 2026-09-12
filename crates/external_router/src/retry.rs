@@ -21,7 +21,7 @@ pub fn is_retryable_status(status: StatusCode) -> bool {
 
 /// Response extension marking a response terminal for the retry layer
 /// regardless of its status code — for outcomes whose cause cannot clear
-/// inside a backoff window (the load-shed 503: its veto moves at the poll
+/// inside a backoff window (the load-shed 429: its veto moves at the poll
 /// interval, not the retry interval).
 #[derive(Debug, Clone, Copy)]
 pub struct NonRetryable;

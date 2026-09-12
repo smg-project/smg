@@ -54,7 +54,7 @@ use std::{
     time::Duration,
 };
 
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use futures::future;
 use openai_protocol::worker::{
     RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey, WorkerLoadResponse, WorkerStatus,
@@ -127,6 +127,23 @@ impl PromScrape {
             .unwrap_or(0.0)
     }
 
+    /// Sum samples for `name`, preserving absence instead of conflating it
+    /// with a present zero-valued gauge.
+    fn optional_sum(&self, name: &str) -> Option<f64> {
+        self.samples
+            .get(name)
+            .filter(|values| !values.is_empty())
+            .map(|values| values.iter().sum())
+    }
+
+    /// Maximum sample for `name`, preserving absence. This is the aggregation
+    /// contract of multiprocess boolean gauges such as admission blocked.
+    fn optional_max(&self, name: &str) -> Option<f64> {
+        self.samples
+            .get(name)
+            .and_then(|values| values.iter().copied().reduce(f64::max))
+    }
+
     /// Mean across all label-set samples for `name` (0.0 if absent). Right for
     /// ratios like KV-cache usage that must not be double-counted.
     fn mean(&self, name: &str) -> f64 {
@@ -140,6 +157,86 @@ impl PromScrape {
     fn has(&self, name: &str) -> bool {
         self.samples.get(name).is_some_and(|v| !v.is_empty())
     }
+}
+
+/// MSL's pre-body vLLM admission state, scraped alongside scheduler load.
+///
+/// These values deliberately do not masquerade as scheduler queue depth: the
+/// guard runs before requests enter vLLM, so inflating `num_waiting_reqs` would
+/// corrupt load-aware routing and observability. Missing or malformed gauges
+/// are non-authoritative and preserve the legacy scheduler-only verdict.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct VllmIngressAdmission {
+    active_leases: Option<f64>,
+    max_leases: Option<f64>,
+    admission_blocked: Option<f64>,
+}
+
+impl VllmIngressAdmission {
+    fn from_scrape(metrics: &PromScrape) -> Self {
+        Self {
+            active_leases: metrics.optional_sum("msl_generate_preprocess_active_leases"),
+            max_leases: metrics.optional_sum("msl_generate_preprocess_max_leases"),
+            admission_blocked: metrics.optional_max("msl_generate_admission_blocked"),
+        }
+    }
+
+    /// Return an authoritative verdict only when a complete signal was
+    /// observed. This keeps an old engine (no MSL gauges) distinct from a new
+    /// engine explicitly publishing zero/false.
+    fn saturation(self) -> Option<bool> {
+        let explicitly_blocked = self.admission_blocked.and_then(|blocked| {
+            if blocked == 0.0 {
+                Some(false)
+            } else if blocked == 1.0 {
+                Some(true)
+            } else {
+                None
+            }
+        });
+        let leases_full = match (self.active_leases, self.max_leases) {
+            (Some(active), Some(max)) if active.is_finite() && max.is_finite() => {
+                if active >= 0.0 && max >= 0.0 {
+                    Some(max > 0.0 && active >= max)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        match (explicitly_blocked, leases_full) {
+            (None, None) => None,
+            (blocked, full) => Some(blocked.unwrap_or(false) || full.unwrap_or(false)),
+        }
+    }
+}
+
+/// One monitor poll's scheduler load plus any pre-scheduler admission verdict.
+/// The inner `Option<bool>` preserves absent versus explicitly open. `load` is
+/// optional because the admission gauges remain actionable even if a
+/// backend omits the KV-cache gauge required to construct a safe load snapshot.
+struct LoadObservation {
+    load: Option<WorkerLoadResponse>,
+    ingress_saturated: Option<bool>,
+}
+
+impl LoadObservation {
+    fn from_load_response(load: WorkerLoadResponse) -> Self {
+        let ingress_saturated = load.admission_blocked;
+        let load = (!load.loads.is_empty()).then_some(load);
+        Self {
+            load,
+            ingress_saturated,
+        }
+    }
+}
+
+/// Last explicit engine admission verdict for one worker incarnation.
+/// Keeping this separate from the combined worker flag prevents an absent
+/// signal from erasing a previously observed ingress veto.
+struct IngressSaturationState {
+    source: Weak<dyn Worker>,
+    saturated: bool,
 }
 
 /// DP rank load cache used by load-aware routing policies.
@@ -334,6 +431,10 @@ pub struct WorkerMonitor {
     /// in-place image upgrade that adds or removes an endpoint is
     /// re-discovered.
     native_loads_memo: Arc<DashMap<String, NativeLoadsMemo>>,
+    /// Last explicit ingress verdict, fenced to the worker incarnation at
+    /// each URL. Scheduler-threshold polling and ingress admission therefore
+    /// remain independent inputs to the combined overload flag.
+    ingress_saturation: DashMap<String, IngressSaturationState>,
     group_handles: Mutex<HashMap<WorkerGroupKey, GroupState>>,
     event_task: Mutex<Option<JoinHandle<()>>>,
     eviction_flush_task: Mutex<Option<JoinHandle<()>>>,
@@ -376,6 +477,7 @@ impl WorkerMonitor {
             conditional_polling,
             load_state,
             native_loads_memo: Arc::new(DashMap::new()),
+            ingress_saturation: DashMap::new(),
             group_handles: Mutex::new(HashMap::new()),
             event_task: Mutex::new(None),
             eviction_flush_task: Mutex::new(None),
@@ -484,6 +586,7 @@ impl WorkerMonitor {
         self.load_state.clear();
         self.worker_load_manager.clear();
         self.native_loads_memo.clear();
+        self.ingress_saturation.clear();
         // The feed that would clear the vetoes is being torn down: fail open,
         // but say so — a wiped gauge is otherwise indistinguishable from a
         // genuine recovery. With no thresholds anywhere no flag was ever
@@ -603,7 +706,61 @@ impl WorkerMonitor {
         self.worker_registry.set_worker_overloaded(worker, false);
         self.worker_load_manager.remove_worker(url);
         self.native_loads_memo.remove(url);
+        self.ingress_saturation.remove_if(url, |_, state| {
+            state
+                .source
+                .upgrade()
+                .is_some_and(|source| Arc::ptr_eq(&source, worker))
+        });
         self.load_state.enqueue_eviction(Arc::clone(worker));
+    }
+
+    /// Update or retrieve the engine-owned ingress verdict without allowing
+    /// an absent signal to erase it. A same-URL replacement cannot inherit a
+    /// stale verdict because the cached weak pointer fences the incarnation.
+    fn resolve_ingress_saturation(
+        &self,
+        worker: &Arc<dyn Worker>,
+        observed: Option<bool>,
+    ) -> Option<bool> {
+        if let Some(saturated) = observed {
+            // Hold the URL's map entry while checking registry identity and
+            // publishing. This orders same-URL polls: once a replacement has
+            // published its verdict, a late report from the old incarnation
+            // cannot overwrite it. If replacement lands after this identity
+            // check, its poll waits for this guard and then replaces the old
+            // entry; an absent first report still rejects the weak-pointer
+            // mismatch below rather than inheriting the old verdict.
+            let entry = self.ingress_saturation.entry(worker.url().to_string());
+            let is_current = self
+                .worker_registry
+                .get_by_url(worker.url())
+                .is_some_and(|current| Arc::ptr_eq(&current, worker));
+            if !is_current {
+                return None;
+            }
+
+            let state = IngressSaturationState {
+                source: Arc::downgrade(worker),
+                saturated,
+            };
+            match entry {
+                Entry::Occupied(mut occupied) => {
+                    occupied.insert(state);
+                }
+                Entry::Vacant(vacant) => {
+                    vacant.insert(state);
+                }
+            }
+            return Some(saturated);
+        }
+
+        let cached = self.ingress_saturation.get(worker.url())?;
+        cached
+            .source
+            .upgrade()
+            .filter(|source| Arc::ptr_eq(source, worker))
+            .map(|_| cached.saturated)
     }
 
     /// Apply every queued eviction in one snapshot rebuild, and sentinel the
@@ -666,6 +823,15 @@ impl WorkerMonitor {
         worker: &Arc<dyn Worker>,
         native_loads_memo: Option<&DashMap<String, NativeLoadsMemo>>,
     ) -> Option<WorkerLoadResponse> {
+        Self::fetch_http_load_observation(worker, native_loads_memo)
+            .await
+            .and_then(|observation| observation.load)
+    }
+
+    async fn fetch_http_load_observation(
+        worker: &Arc<dyn Worker>,
+        native_loads_memo: Option<&DashMap<String, NativeLoadsMemo>>,
+    ) -> Option<LoadObservation> {
         // Only workers already `Ready` are polled, so a definitive "no such
         // endpoint" cannot be a warm-up artifact and is safe to memoize.
         let known = native_loads_memo
@@ -692,13 +858,15 @@ impl WorkerMonitor {
                 store.insert(worker.url().to_string(), memo);
             }
         }
-        if response.is_some() {
-            return response;
+        if let Some(load) = response {
+            return Some(LoadObservation::from_load_response(load));
         }
 
         match worker.metadata().spec.runtime_type {
             RuntimeType::Vllm => Self::fetch_http_load_vllm(worker).await,
-            RuntimeType::Sglang => Self::fetch_http_load_sglang(worker).await,
+            RuntimeType::Sglang => Self::fetch_http_load_sglang(worker)
+                .await
+                .map(LoadObservation::from_load_response),
             // Custom engines expose no gauge schema we can parse; the native
             // routes above were their only path.
             _ => None,
@@ -732,8 +900,10 @@ impl WorkerMonitor {
         }
 
         match resp.json::<WorkerLoadResponse>().await {
-            Ok(response) if !response.loads.is_empty() => NativeLoads::Available(response),
-            // Our schema, no ranks reported yet — keep probing.
+            Ok(response) if !response.loads.is_empty() || response.admission_blocked.is_some() => {
+                NativeLoads::Available(response)
+            }
+            // Our schema, but neither ranks nor admission state — keep probing.
             Ok(_) => NativeLoads::Inconclusive,
             // A 200 that is not a load response means something else is
             // mounted here; that is as definitive as a 404.
@@ -745,25 +915,34 @@ impl WorkerMonitor {
     /// The KV-cache usage ratio (0.0–1.0) maps onto `token_usage`; it is
     /// exposed as `vllm:gpu_cache_usage_perc` in vLLM v0 and renamed to
     /// `vllm:kv_cache_usage_perc` in vLLM v1, so accept either.
-    async fn fetch_http_load_vllm(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
+    async fn fetch_http_load_vllm(worker: &Arc<dyn Worker>) -> Option<LoadObservation> {
         let url = format!("{}/metrics", worker.url());
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
         let m = PromScrape::parse(&body);
+        let ingress_saturated = VllmIngressAdmission::from_scrape(&m).saturation();
 
         // Require the KV-usage gauge: it is the signal load-aware routing acts
         // on, and without it `token_usage` would default to `0.0` and make a
-        // worker of unknown pressure look idle. v0 and v1 name it differently.
+        // worker of unknown pressure look idle. The independent ingress signal
+        // remains actionable without it. v0 and v1 name it differently.
         let kv_usage = ["vllm:gpu_cache_usage_perc", "vllm:kv_cache_usage_perc"]
             .into_iter()
-            .find(|name| m.has(name))?;
+            .find(|name| m.has(name));
 
-        Some(Self::single_rank(SchedulerLoadSnapshot {
-            num_running_reqs: m.sum("vllm:num_requests_running") as i32,
-            num_waiting_reqs: m.sum("vllm:num_requests_waiting") as i32,
-            token_usage: m.mean(kv_usage),
-            cache_hit_rate: m.mean("vllm:gpu_prefix_cache_hit_rate"),
-            ..Default::default()
-        }))
+        let load = kv_usage.map(|kv_usage| {
+            Self::single_rank(SchedulerLoadSnapshot {
+                num_running_reqs: m.sum("vllm:num_requests_running") as i32,
+                num_waiting_reqs: m.sum("vllm:num_requests_waiting") as i32,
+                token_usage: m.mean(kv_usage),
+                cache_hit_rate: m.mean("vllm:gpu_prefix_cache_hit_rate"),
+                ..Default::default()
+            })
+        });
+
+        Some(LoadObservation {
+            load,
+            ingress_saturated,
+        })
     }
 
     /// SGLang HTTP: try the custom `/v1/loads` endpoint first (some builds
@@ -1075,10 +1254,16 @@ async fn group_monitor_loop(
                 async move {
                     let response = match connection_mode {
                         ConnectionMode::Http => {
-                            WorkerMonitor::fetch_http_load(&worker, Some(&native_loads_memo)).await
+                            WorkerMonitor::fetch_http_load_observation(
+                                &worker,
+                                Some(&native_loads_memo),
+                            )
+                            .await
                         }
                         ConnectionMode::Grpc | ConnectionMode::Zmq => {
-                            WorkerMonitor::fetch_backend_load(&worker).await
+                            WorkerMonitor::fetch_backend_load(&worker)
+                                .await
+                                .map(LoadObservation::from_load_response)
                         }
                     };
                     (worker, response)
@@ -1093,20 +1278,30 @@ async fn group_monitor_loop(
         let mut dp_evict: Vec<String> = Vec::new();
         for (worker, response) in results {
             let url = worker.url().to_string();
-            // The overload predicate runs exactly here, once per report, never
-            // on a request path, against the worker's effective thresholds
-            // (resolved at registration). A failed fetch means no fresh
-            // signal, which clears the flag — absent means no opinion.
+            // Both overload predicates run here, once per report, never on a
+            // request path. The engine-owned ingress verdict is authoritative
+            // even without configured scheduler thresholds. The last explicit
+            // ingress verdict is retained when a later report omits it; if no
+            // ingress verdict has ever been observed and no threshold is
+            // configured, this loop leaves the flag untouched.
             let overload = worker.metadata().overload;
-            if overload.is_enabled() {
-                let verdict = response
-                    .as_ref()
-                    .is_some_and(|load| overload.is_overloaded(load));
-                monitor
-                    .worker_registry
-                    .set_worker_overloaded(&worker, verdict);
+            let observed_ingress = response
+                .as_ref()
+                .and_then(|observation| observation.ingress_saturated);
+            let ingress_verdict = monitor.resolve_ingress_saturation(&worker, observed_ingress);
+            if overload.is_enabled() || ingress_verdict.is_some() {
+                let threshold_verdict = overload.is_enabled()
+                    && response
+                        .as_ref()
+                        .and_then(|observation| observation.load.as_ref())
+                        .is_some_and(|load| overload.is_overloaded(load));
+                monitor.worker_registry.set_worker_overloaded(
+                    &worker,
+                    ingress_verdict.unwrap_or(false) || threshold_verdict,
+                );
             }
-            if let Some(load) = response {
+
+            if let Some(load) = response.and_then(|observation| observation.load) {
                 // Only feed the DP-rank cache from responses that carry real
                 // absolute per-rank token counts. Ratio-only snapshots,
                 // which would otherwise poison with a fake `{0: 0}`
@@ -1416,6 +1611,40 @@ mod worker_monitor_tests {
         );
     }
 
+    #[test]
+    fn stale_incarnation_cannot_overwrite_or_evict_replacement_ingress_verdict() {
+        let (registry, monitor) = build_monitor();
+        let url = "http://w:8080";
+        let old = ready_worker(url, "llama-3");
+        let id = registry.register(Arc::clone(&old)).unwrap();
+        assert_eq!(
+            monitor.resolve_ingress_saturation(&old, Some(true)),
+            Some(true)
+        );
+
+        let replacement = ready_worker(url, "llama-3");
+        assert!(registry.replace(&id, Arc::clone(&replacement)));
+
+        // A response already in flight from the detached worker cannot
+        // publish after replacement, even before the new worker reports.
+        assert_eq!(
+            monitor.resolve_ingress_saturation(&old, Some(false)),
+            None
+        );
+        assert_eq!(
+            monitor.resolve_ingress_saturation(&replacement, Some(false)),
+            Some(false)
+        );
+
+        // The delayed Replaced event for the old handle must only remove an
+        // entry owned by that incarnation, never the replacement's entry.
+        monitor.evict_worker_loads(&old);
+        assert_eq!(
+            monitor.resolve_ingress_saturation(&replacement, None),
+            Some(false)
+        );
+    }
+
     #[tokio::test]
     async fn stop_all_groups_clears_native_probe_memo() {
         // A worker removed during a `RecvError::Lagged` window never
@@ -1571,6 +1800,52 @@ sglang:utilization{model="llama"} 0.9
         let m = PromScrape::parse(text);
         assert_eq!(m.sum("g"), 40.0); // counts add
         assert_eq!(m.mean("r"), 0.5); // ratios average
+    }
+
+    #[test]
+    fn parses_msl_ingress_gauges_and_detects_a_full_gate() {
+        let text = "msl_generate_preprocess_active_leases{pid=\"1\"} 3\n\
+                    msl_generate_preprocess_active_leases{pid=\"2\"} 5\n\
+                    msl_generate_preprocess_max_leases{pid=\"1\"} 4\n\
+                    msl_generate_preprocess_max_leases{pid=\"2\"} 4\n\
+                    msl_generate_admission_blocked{pid=\"1\"} 0\n\
+                    msl_generate_admission_blocked{pid=\"2\"} 0\n";
+        let admission = VllmIngressAdmission::from_scrape(&PromScrape::parse(text));
+
+        assert_eq!(admission.active_leases, Some(8.0));
+        assert_eq!(admission.max_leases, Some(8.0));
+        assert_eq!(admission.admission_blocked, Some(0.0));
+        assert_eq!(admission.saturation(), Some(true));
+    }
+
+    #[test]
+    fn explicit_ingress_block_is_authoritative_below_lease_limit() {
+        let text = "msl_generate_preprocess_active_leases 1\n\
+                    msl_generate_preprocess_max_leases 8\n\
+                    msl_generate_admission_blocked 1\n";
+        let admission = VllmIngressAdmission::from_scrape(&PromScrape::parse(text));
+
+        assert_eq!(admission.saturation(), Some(true));
+    }
+
+    #[test]
+    fn absent_or_disabled_ingress_gauges_preserve_legacy_behavior() {
+        let absent = VllmIngressAdmission::from_scrape(&PromScrape::parse(VLLM_METRICS));
+        assert_eq!(absent, VllmIngressAdmission::default());
+        assert_eq!(absent.saturation(), None);
+
+        // A zero maximum means the preprocessing gate is disabled, not full.
+        let disabled = VllmIngressAdmission::from_scrape(&PromScrape::parse(
+            "msl_generate_preprocess_active_leases 0\n\
+             msl_generate_preprocess_max_leases 0\n\
+             msl_generate_admission_blocked 0\n",
+        ));
+        assert_eq!(disabled.saturation(), Some(false));
+
+        // Bad boolean-gauge values are not authoritative and cannot clear a
+        // veto owned by another source.
+        let invalid = PromScrape::parse("msl_generate_admission_blocked 0.5\n");
+        assert_eq!(VllmIngressAdmission::from_scrape(&invalid).saturation(), None);
     }
 
     #[test]
@@ -1734,6 +2009,18 @@ mod native_loads_tests {
          vllm:num_requests_waiting{m=\"a\"} 11.0\n\
          vllm:kv_cache_usage_perc{m=\"a\"} 0.5\n";
 
+    const VLLM_INGRESS_BLOCKED_METRICS: &str =
+        "msl_generate_preprocess_active_leases 1\n\
+         msl_generate_preprocess_max_leases 8\n\
+         msl_generate_admission_blocked 1\n";
+
+    const NATIVE_ADMISSION_BLOCKED_BODY: &str =
+        r#"{"admission_blocked":true,"loads":[{"dp_rank":0,"token_usage":0.25}]}"#;
+    const NATIVE_ADMISSION_OPEN_BODY: &str =
+        r#"{"admission_blocked":false,"loads":[{"dp_rank":0,"token_usage":0.25}]}"#;
+    const NATIVE_GUARD_ONLY_BODY: &str =
+        r#"{"admission_blocked":true,"loads":[]}"#;
+
     /// Carries `num_waiting_uncached_tokens`, which the `/metrics` arm has no
     /// gauge for — so its presence identifies which path answered.
     const NATIVE_BODY: &str = r#"{"loads":[{"dp_rank":0,"num_running_reqs":3,
@@ -1750,11 +2037,19 @@ mod native_loads_tests {
     }
 
     /// Loopback backend stub. Each native route answers with the status and
-    /// body it was given and counts its hits; `/metrics` always serves the
-    /// vLLM gauges.
+    /// body it was given and counts its hits; `/metrics` serves the selected
+    /// vLLM gauge fixture.
     async fn spawn_backend(
         gateway: (StatusCode, &'static str),
         engine: (StatusCode, &'static str),
+    ) -> Stub {
+        spawn_backend_with_metrics(gateway, engine, VLLM_METRICS).await
+    }
+
+    async fn spawn_backend_with_metrics(
+        gateway: (StatusCode, &'static str),
+        engine: (StatusCode, &'static str),
+        metrics: &'static str,
     ) -> Stub {
         fn route(
             hits: &Arc<AtomicUsize>,
@@ -1783,7 +2078,10 @@ mod native_loads_tests {
         let app = axum::Router::new()
             .route("/loads", route(&gateway_probes, &gateway_query, gateway))
             .route("/v1/loads", route(&probes, &engine_query, engine))
-            .route("/metrics", axum::routing::get(|| async { VLLM_METRICS }));
+            .route(
+                "/metrics",
+                axum::routing::get(move || async move { metrics }),
+            );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1983,12 +2281,12 @@ mod native_loads_tests {
         .await;
     }
 
-    /// With protection off and no spec block the feature is off: an engine
-    /// reporting a load that would trip either signal must still leave the
-    /// flag, the counters and every routing verdict exactly where they were.
+    /// Missing MSL ingress gauges preserve the scheduler-only behavior: with
+    /// no configured thresholds, an otherwise busy vLLM worker remains
+    /// eligible when the metrics fallback is used.
     #[tokio::test]
-    async fn unconfigured_thresholds_never_write_the_flag() {
-        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+    async fn absent_ingress_metrics_and_unconfigured_thresholds_stay_eligible() {
+        let stub = spawn_engine(StatusCode::NOT_FOUND, "").await;
         // cache_aware with overlap_decay on, so loads are polled and ingested
         // for reasons unrelated to overload protection.
         let (registry, monitor) = monitor_with(cache_aware_policy_config(1.0), false);
@@ -2011,6 +2309,124 @@ mod native_loads_tests {
         assert!(!worker.is_overloaded());
         assert!(worker.is_available());
         assert_eq!(registry.overloaded_worker_count("a"), 0);
+    }
+
+    /// The engine's pre-body admission guard is authoritative: it vetoes the
+    /// worker even with no router thresholds and even when no KV-cache gauge
+    /// is available to construct a scheduler load snapshot.
+    #[tokio::test]
+    async fn ingress_blocked_metric_vetoes_without_configured_thresholds() {
+        let stub = spawn_backend_with_metrics(
+            (StatusCode::NOT_FOUND, ""),
+            (StatusCode::NOT_FOUND, ""),
+            VLLM_INGRESS_BLOCKED_METRICS,
+        )
+        .await;
+        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, false);
+        let worker = vllm_worker(&stub.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+
+        wait_until("ingress-blocked worker to be vetoed", || {
+            worker.is_overloaded()
+        })
+        .await;
+        assert_eq!(registry.overloaded_worker_count("a"), 1);
+        assert!(!worker.is_available());
+        assert!(monitor.load_state.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_admission_blocked_vetoes_without_configured_thresholds() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_ADMISSION_BLOCKED_BODY).await;
+        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, false);
+        let worker = vllm_worker(&stub.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+
+        wait_until("native ingress-blocked worker to be vetoed", || {
+            worker.is_overloaded()
+        })
+        .await;
+        assert_eq!(registry.overloaded_worker_count("a"), 1);
+        assert!(!worker.is_available());
+    }
+
+    #[tokio::test]
+    async fn native_explicit_open_clears_an_ingress_veto() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_ADMISSION_OPEN_BODY).await;
+        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, false);
+        let worker = vllm_worker(&stub.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+
+        wait_until("initial native admission poll", || {
+            stub.probes.load(Ordering::SeqCst) > 0
+        })
+        .await;
+        registry.set_worker_overloaded(&worker, true);
+        let probes_before = stub.probes.load(Ordering::SeqCst);
+
+        wait_until("explicit admission-open verdict to clear the veto", || {
+            stub.probes.load(Ordering::SeqCst) > probes_before && !worker.is_overloaded()
+        })
+        .await;
+        assert_eq!(registry.overloaded_worker_count("a"), 0);
+        assert!(worker.is_available());
+    }
+
+    #[tokio::test]
+    async fn absent_ingress_signal_preserves_prior_ingress_veto() {
+        let stub = spawn_engine(StatusCode::NOT_FOUND, "").await;
+        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, false);
+        let worker = vllm_worker(&stub.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+
+        let mut rx = monitor.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !rx.borrow().contains(&stub.url) {
+                rx.changed().await.expect("watch sender alive");
+            }
+        })
+        .await
+        .expect("initial metrics fallback poll");
+
+        assert_eq!(
+            monitor.resolve_ingress_saturation(&worker, Some(true)),
+            Some(true)
+        );
+        registry.set_worker_overloaded(&worker, true);
+        let mut rx = monitor.subscribe();
+        tokio::time::timeout(Duration::from_secs(3), rx.changed())
+            .await
+            .expect("next metrics fallback poll")
+            .expect("watch sender alive");
+
+        assert!(worker.is_overloaded());
+        assert_eq!(registry.overloaded_worker_count("a"), 1);
+    }
+
+    #[tokio::test]
+    async fn native_guard_state_is_used_even_before_load_ranks_exist() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_GUARD_ONLY_BODY).await;
+        let worker = vllm_worker(&stub.url);
+        let memo = DashMap::new();
+
+        let observation = WorkerMonitor::fetch_http_load_observation(&worker, Some(&memo))
+            .await
+            .expect("native admission observation");
+
+        assert_eq!(observation.ingress_saturated, Some(true));
+        assert!(observation.load.is_none());
+        assert_eq!(
+            memo.get(worker.url()).and_then(|hit| hit.answered()),
+            Some(NativeLoadsPath::Engine)
+        );
     }
 
     /// A worker whose feed goes away has no verdict at all, so it must be

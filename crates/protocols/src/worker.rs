@@ -1399,6 +1399,11 @@ pub struct WorkerLoadResponse {
     pub version: String,
     pub dp_rank_count: i32,
     pub loads: Vec<SchedulerLoadSnapshot>,
+    /// Authoritative pre-scheduler admission state when reported by the
+    /// engine. `None` keeps responses from older engines distinguishable from
+    /// a new engine explicitly reporting that admission is open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_blocked: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<EngineAggregateMetricsSnapshot>,
 }
@@ -1758,6 +1763,44 @@ mod overload_update_tests {
             token_usage: Some(1.0),
         };
         assert!(!update.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod worker_load_admission_tests {
+    use serde_json::json;
+
+    use super::WorkerLoadResponse;
+
+    #[test]
+    fn omitted_admission_state_is_none_and_stays_omitted() {
+        let response: WorkerLoadResponse = serde_json::from_value(json!({
+            "timestamp": "t",
+            "version": "old-engine",
+            "dp_rank_count": 0,
+            "loads": [],
+        }))
+        .unwrap();
+
+        assert_eq!(response.admission_blocked, None);
+        let serialized = serde_json::to_value(response).unwrap();
+        assert!(serialized.get("admission_blocked").is_none());
+    }
+
+    #[test]
+    fn explicit_admission_state_round_trips_false_and_true() {
+        for blocked in [false, true] {
+            let response: WorkerLoadResponse = serde_json::from_value(json!({
+                "admission_blocked": blocked,
+            }))
+            .unwrap();
+
+            assert_eq!(response.admission_blocked, Some(blocked));
+            assert_eq!(
+                serde_json::to_value(response).unwrap()["admission_blocked"],
+                blocked
+            );
+        }
     }
 }
 

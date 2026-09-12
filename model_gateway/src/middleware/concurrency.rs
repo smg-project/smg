@@ -230,7 +230,7 @@ pub async fn concurrency_limit_middleware(
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
             Metrics::record_admission_rejected(metrics_labels::ADMISSION_REJECTED_TIMEOUT);
             shed_response(
-                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::TOO_MANY_REQUESTS,
                 "admission_queue_timeout",
                 "timed out waiting for an admission slot",
             )
@@ -746,7 +746,7 @@ mod tests {
         });
     }
 
-    /// A request that outlives the queue timeout sheds as 503 + Retry-After
+    /// A request that outlives the queue timeout sheds as 429 + Retry-After
     /// with reason="timeout" and releases its queue-depth slot.
     #[test]
     fn admission_metrics_record_timeout_rejections() {
@@ -765,7 +765,7 @@ mod tests {
 
                 let held = TokenPermit::try_acquire(bucket, 1.0).unwrap();
                 let response = app.oneshot(echo_request(Body::from("late"))).await.unwrap();
-                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
                 assert_eq!(
                     response.headers().get(RETRY_AFTER).unwrap(),
                     &HeaderValue::from(SHED_RETRY_AFTER_SECS)

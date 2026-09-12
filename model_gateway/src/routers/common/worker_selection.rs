@@ -10,12 +10,9 @@ use openai_protocol::models::ListModelsResponse;
 use smg_external_router::ExternalRouterSpec;
 
 use crate::{
-    routers::{
-        common::{
-            header_utils::{apply_provider_headers, extract_auth_header},
-            overload,
-        },
-        error,
+    routers::common::{
+        header_utils::{apply_provider_headers, extract_auth_header},
+        overload,
     },
     worker::{ProviderType, RuntimeType, Worker, WorkerRegistry},
 };
@@ -67,7 +64,7 @@ impl<'a> WorkerSelector<'a> {
         // 5 s timeout — and a fleet whose every worker is vetoed will not be
         // un-vetoed by re-reading model lists. Without this, saturation turns
         // each of these requests into three registry walks and up to 5 s of
-        // network wait to reach a 503 that carries neither the shed error code
+        // network wait to reach a 429 that carries neither the shed error code
         // nor the shed counter.
         if let Some(shed) = self.shed_if_all_overloaded(req) {
             return Err(shed);
@@ -84,15 +81,19 @@ impl<'a> WorkerSelector<'a> {
 
         self.find_best_worker(req).ok_or_else(|| {
             if self.any_worker_supports_model(req) {
-                error::service_unavailable(
-                    "service_unavailable",
+                overload::no_available_workers(format!(
+                    "All workers for model '{}' are temporarily unavailable",
+                    req.model_id
+                ))
+            } else {
+                overload::unavailable_or_not_found(
+                    self.registry,
+                    req.model_id,
                     format!(
-                        "All workers for model '{}' are temporarily unavailable",
+                        "No workers are currently available for model '{}'",
                         req.model_id
                     ),
                 )
-            } else {
-                error::model_not_found(req.model_id)
             }
         })
     }
@@ -195,7 +196,7 @@ impl<'a> WorkerSelector<'a> {
 
         let futures: Vec<_> = external_workers
             .iter()
-            .map(|w| refresh_worker_models(w, auth_header))
+            .map(|w| refresh_worker_models(self.registry, w, auth_header))
             .collect();
 
         // Timeout prevents a slow/unresponsive worker from blocking all
@@ -239,6 +240,7 @@ fn filter_by_router(
 /// Anthropic uses `x-api-key`, OpenAI uses `Authorization: Bearer`). The
 /// response is parsed via [`ListModelsResponse::parse_upstream`].
 async fn refresh_worker_models(
+    registry: &WorkerRegistry,
     worker: &Arc<dyn Worker>,
     auth_header: Option<&HeaderValue>,
 ) -> bool {
@@ -269,6 +271,12 @@ async fn refresh_worker_models(
                             model_cards.len(),
                             url
                         );
+                        for model in &model_cards {
+                            registry.remember_model(&model.id);
+                            for alias in &model.aliases {
+                                registry.remember_model(alias);
+                            }
+                        }
                         worker.set_models(model_cards);
                         return true;
                     }
@@ -421,6 +429,22 @@ mod tests {
             })
             .await;
         assert!(res.is_ok(), "gate off => a plain worker is eligible");
+    }
+
+    #[tokio::test]
+    async fn known_model_without_workers_returns_capacity_429() {
+        let registry = WorkerRegistry::new();
+        registry.remember_model("m");
+
+        let response = WorkerSelector::new(&registry)
+            .select_worker(&SelectWorkerRequest {
+                model_id: "m",
+                ..Default::default()
+            })
+            .await
+            .expect_err("known model with no workers must be rejected");
+
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //! The gate below is the gateway's half of the fix — never post more rooms to
 //! a pair than its decode can take. A request that arrives with the window
 //! full waits for a room rather than joining the engine's queue, and sheds if
-//! none frees in time, with the same 503 selection already answers when every
+//! none frees in time, with the same 429 selection already answers when every
 //! worker is vetoed.
 //!
 //! Admission is a *claim*, not a look: it reserves its rooms on the worker
@@ -342,7 +342,7 @@ mod tests {
         let response = admit_decode(&decode, "m", 5).await.expect_err("shed");
 
         assert_eq!(started.elapsed(), Duration::ZERO);
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(decode.pd_admitted(), 0, "a shed claims nothing");
     }
 
@@ -387,10 +387,10 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
-    /// The shed is the overload guard's 503, terminal for the retry layer and
+    /// The shed is the overload guard's 429, terminal for the retry layer and
     /// carrying the client's pacing hint.
     #[tokio::test(start_paused = true)]
-    async fn the_shed_is_the_overload_503_with_retry_after() {
+    async fn the_shed_is_the_overload_429_with_retry_after() {
         set_pd_admission_wait_secs(1);
         let decode = decode_worker("grpc://127.0.0.1:9906", Some(2));
         assert!(decode.try_admit_pd(2, 2), "fill the window");
@@ -398,7 +398,7 @@ mod tests {
         let response = admit_decode(&decode, "m", 1)
             .await
             .expect_err("a full window sheds");
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             extract_error_code_from_response(&response),
             "worker_overload_protection_shed"

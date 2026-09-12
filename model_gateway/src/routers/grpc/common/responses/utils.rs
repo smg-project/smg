@@ -18,7 +18,7 @@ use tracing::{debug, error, warn};
 use crate::{
     routers::{
         common::{
-            mcp_utils::ensure_request_mcp_client, openai_bridge,
+            mcp_utils::ensure_request_mcp_client, openai_bridge, overload,
             persistence_utils::persist_conversation_items,
         },
         error,
@@ -109,7 +109,14 @@ pub(crate) fn validate_worker_availability(
     model: &str,
 ) -> Option<Response> {
     if !worker_registry.contains_model(model) {
-        return Some(error::model_not_found(model));
+        if model == crate::worker::UNKNOWN_MODEL_ID {
+            return Some(error::model_not_found(model));
+        }
+        return Some(overload::unavailable_or_not_found(
+            worker_registry,
+            model,
+            format!("No workers are currently available for model '{model}'"),
+        ));
     }
 
     None
@@ -277,7 +284,15 @@ mod tests {
 
         let response = validate_worker_availability(&registry, "model-alias")
             .expect("alias must stop resolving with no workers behind it");
-        assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            response
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|seconds| seconds >= 1)
+        );
     }
     #[test]
     fn namespace_function_identity_roundtrips_and_preserves_literal_names() {

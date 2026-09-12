@@ -567,7 +567,7 @@ struct CliArgs {
 
     /// Seconds a prefill/decode dispatch waits for a free slot in the decode
     /// engine's running window (--max-num-seqs / --max-running-requests)
-    /// before shedding with 503 worker_overload_protection_shed. Keep it well
+    /// before shedding with 429 worker_overload_protection_shed. Keep it well
     /// under the engine's bootstrap deadline (120s on TokenSpeed) so a
     /// request that waits still dispatches with the deadline ahead of it. 0
     /// sheds immediately. Engines that report no running window are never

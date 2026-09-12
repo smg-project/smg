@@ -14,7 +14,10 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
-        common::placement::{self, PairFailure, PlacementFailure, PlacementInputs},
+        common::{
+            overload,
+            placement::{self, PairFailure, PlacementFailure, PlacementInputs},
+        },
         error,
         grpc::{
             context::{
@@ -318,7 +321,7 @@ fn selection_runtime(workers: &WorkerSelection) -> RuntimeType {
 }
 
 impl WorkerSelectionStage {
-    /// Response for a selection that produced nothing: a 503 shed when a leg's
+    /// Response for a selection that produced nothing: a 429 shed when a leg's
     /// whole candidate pool is vetoed, the existing 404 otherwise.
     ///
     /// `legs` must be exactly the legs this selection demanded — the verdict is
@@ -375,11 +378,15 @@ impl WorkerSelectionStage {
             model_id = %model_id,
             "No worker serves model"
         );
-        error::model_not_found(model_id)
+        overload::unavailable_or_not_found(
+            &self.worker_registry,
+            model_id,
+            format!("No workers are currently available for model '{model_id}'"),
+        )
     }
 
     /// Workers serve the model but none can take the request right now
-    /// (unhealthy, circuit breaker open, or the policy declined). A 503 with
+    /// (unhealthy, circuit breaker open, or the policy declined). A 429 with
     /// the same code the HTTP router uses: the model exists, the client should
     /// retry, and nothing about its request is wrong. Answering 404 here told
     /// clients the model was gone while its workers restarted.
@@ -390,16 +397,15 @@ impl WorkerSelectionStage {
             model_id = %model_id,
             "No available workers for model"
         );
-        error::service_unavailable(
-            "no_available_workers",
+        overload::no_available_workers(
             format!("All workers for model '{model_id}' are unavailable (unhealthy or circuit breaker open)"),
         )
     }
 
     /// The response for a failed pair placement. The verdict was judged from
     /// the leg's own candidates inside the placement, so a shed is answered
-    /// as it was built and counted once; a leg nobody serves is a 404, and a
-    /// leg whose workers are all unavailable is the 503 the HTTP router gives.
+    /// as it was built and counted once; a never-known model is a 404, and a
+    /// known model without a usable leg is the 429 the HTTP router gives.
     fn pair_failure(&self, model_id: &str, failure: PairFailure) -> Response {
         match failure.verdict {
             PlacementFailure::AllOverloaded(shed) => shed,
@@ -437,7 +443,11 @@ impl WorkerSelectionStage {
                     leg = ?failure.leg,
                     "No worker serves model"
                 );
-                error::model_not_found(model_id)
+                overload::unavailable_or_not_found(
+                    &self.worker_registry,
+                    model_id,
+                    format!("No workers are currently available for model '{model_id}'"),
+                )
             }
         }
     }
@@ -936,7 +946,7 @@ mod tests {
         );
         let response =
             stage.selection_failure(model_id, &[WorkerType::Prefill, WorkerType::Decode], None);
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             error::extract_error_code_from_response(&response),
             "worker_overload_protection_shed"
@@ -948,8 +958,8 @@ mod tests {
     }
 
     /// An undemanded leg cannot shed: a text-only EPD request that fails for a
-    /// non-overload reason must not 503 just because the (unused) encode pool
-    /// is saturated.
+    /// non-overload reason gets the generic capacity 429, not an overload shed
+    /// just because the (unused) encode pool is saturated.
     #[test]
     fn an_undemanded_encode_leg_cannot_shed() {
         let model_id = "test-model-encode-veto";
@@ -972,10 +982,14 @@ mod tests {
         );
 
         // No prefill/decode workers registered: with encode undemanded this is
-        // model absence (404), not pressure.
+        // a known model with no usable requested leg, not an overload shed.
         let text_only =
             stage.selection_failure(model_id, &[WorkerType::Prefill, WorkerType::Decode], None);
-        assert_eq!(text_only.status(), StatusCode::NOT_FOUND);
+        assert_eq!(text_only.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            error::extract_error_code_from_response(&text_only),
+            "no_available_workers"
+        );
 
         // With encode demanded, the saturated encode pool is a shed.
         let with_encode = stage.selection_failure(
@@ -983,7 +997,7 @@ mod tests {
             &[WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode],
             None,
         );
-        assert_eq!(with_encode.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(with_encode.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     /// A model nobody serves is still a 404 — the shed must not swallow real
@@ -1179,11 +1193,11 @@ mod tests {
     }
 
     /// The gRPC transport must shed an all-overloaded model with the same
-    /// distinct overload 503 the HTTP router uses. Its usual empty-pool answer
+    /// distinct overload 429 the HTTP router uses. Its usual empty-pool answer
     /// is a 404, which would both misreport pressure as model absence and skip
     /// the retry path (404 is not retryable).
     #[test]
-    fn grpc_all_overloaded_sheds_503_instead_of_404() {
+    fn grpc_all_overloaded_sheds_429_instead_of_404() {
         use crate::routers::error::extract_error_code_from_response;
 
         let model_id = "test-model-overload-shed";
@@ -1229,7 +1243,7 @@ mod tests {
         );
 
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None);
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             extract_error_code_from_response(&response),
             "worker_overload_protection_shed"
@@ -1249,11 +1263,11 @@ mod tests {
         );
     }
 
-    /// Workers serve the model but none is available: a 503 with the HTTP
+    /// Workers serve the model but none is available: a 429 with the HTTP
     /// router's code, not the 404 that told clients the model was gone while
     /// its workers restarted.
     #[test]
-    fn an_unavailable_regular_worker_answers_503_not_404() {
+    fn an_unavailable_regular_worker_answers_429_not_404() {
         use openai_protocol::worker::WorkerStatus;
 
         use crate::routers::error::extract_error_code_from_response;
@@ -1281,7 +1295,7 @@ mod tests {
 
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None);
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             extract_error_code_from_response(&response),
             "no_available_workers"
@@ -1295,10 +1309,10 @@ mod tests {
         );
     }
 
-    /// A disaggregated leg whose only worker is down is the same 503, both
+    /// A disaggregated leg whose only worker is down is the same 429, both
     /// through the per-leg fallback and through the pair verdict.
     #[test]
-    fn an_unavailable_decode_leg_answers_503_not_404() {
+    fn an_unavailable_decode_leg_answers_429_not_404() {
         use openai_protocol::worker::WorkerStatus;
 
         use crate::{policies::WorkerLeg, routers::error::extract_error_code_from_response};
@@ -1328,20 +1342,31 @@ mod tests {
         );
 
         for response in [fallback, pair] {
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
             assert_eq!(
                 extract_error_code_from_response(&response),
                 "no_available_workers"
             );
         }
-        let absent = stage.pair_failure(
+        let known_but_leg_absent = stage.pair_failure(
             model_id,
             PairFailure {
                 leg: WorkerLeg::Decode,
                 verdict: PlacementFailure::NoCandidates,
             },
         );
-        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            known_but_leg_absent.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let unknown = stage.pair_failure(
+            "no-such-model",
+            PairFailure {
+                leg: WorkerLeg::Decode,
+                verdict: PlacementFailure::NoCandidates,
+            },
+        );
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     }
 
     fn dispatch_ctx(model_id: &str, wire: WireConstraint) -> DispatchContext {
@@ -1502,7 +1527,7 @@ mod tests {
         }
     }
 
-    /// A drained pinned pool must shed (503), not answer 404 just because
+    /// A drained pinned pool must shed (429), not answer 404 just because
     /// another runtime still serves the model: 404 is non-retryable and would
     /// end the retry loop on a lie.
     #[test]
@@ -1548,7 +1573,7 @@ mod tests {
             .expect_err("the pinned pool is fully vetoed");
         assert_eq!(
             response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::TOO_MANY_REQUESTS,
             "verdict must reflect the pinned pool, not every runtime"
         );
     }

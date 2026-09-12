@@ -4,7 +4,7 @@ use axum::response::Response;
 use http::StatusCode;
 use tonic::Code;
 
-use crate::routers::error;
+use crate::routers::{common::overload, error};
 
 /// Extension methods for `tonic::Status`.
 pub(crate) trait TonicStatusExt {
@@ -37,7 +37,9 @@ impl TonicStatusExt for tonic::Status {
     }
 
     fn to_http_error(&self, code: &str, msg: String) -> Response {
-        error::create_error(self.http_status(), code, msg)
+        let mut response = error::create_error(self.http_status(), code, msg);
+        overload::apply_capacity_contract(&mut response);
+        response
     }
 }
 
@@ -52,5 +54,33 @@ impl<T> TonicResultExt for Result<T, tonic::Status> {
     fn cb_status_code(&self) -> u16 {
         self.as_ref()
             .map_or_else(|e| e.http_status().as_u16(), |_| 200)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http::header::RETRY_AFTER;
+
+    use super::*;
+    use crate::routers::common::retry::is_retryable_response;
+
+    #[test]
+    fn resource_exhausted_maps_to_terminal_429_with_retry_after() {
+        let status = tonic::Status::resource_exhausted("engine overloaded");
+        let response = status.to_http_error("engine_overloaded", status.message().to_string());
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(RETRY_AFTER));
+        assert!(!is_retryable_response(&response));
+    }
+
+    #[test]
+    fn unrelated_grpc_error_keeps_its_existing_mapping() {
+        let status = tonic::Status::unavailable("offline");
+        let response = status.to_http_error("offline", status.message().to_string());
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.headers().contains_key(RETRY_AFTER));
+        assert!(is_retryable_response(&response));
     }
 }

@@ -497,8 +497,10 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Whether the absolute overload guard currently vetoes this worker.
     ///
-    /// Written only by the load monitor, once per ingested load report, and
-    /// always `false` while overload protection is unconfigured.
+    /// Written only by the load monitor, once per observed admission signal or
+    /// configured-threshold load report. An engine's explicit pre-scheduler
+    /// admission verdict is authoritative even when router-side overload
+    /// thresholds are unconfigured.
     fn is_overloaded(&self) -> bool {
         false
     }

@@ -513,12 +513,15 @@ impl Router {
                     RoutingPool::HttpRegular,
                     None,
                 ) {
-                    PlacementFailure::NoCandidates => error::model_not_found(model_id),
+                    PlacementFailure::NoCandidates => overload::unavailable_or_not_found(
+                        &self.worker_registry,
+                        model_id,
+                        format!("No workers are currently available for model '{model_id}'"),
+                    ),
                     PlacementFailure::AllOverloaded(shed) => shed,
                     PlacementFailure::Unavailable
                     | PlacementFailure::PolicyDeclined(_)
-                    | PlacementFailure::NoCompatiblePair { .. } => error::service_unavailable(
-                        "no_available_workers",
+                    | PlacementFailure::NoCompatiblePair { .. } => overload::no_available_workers(
                         "All workers are unavailable (circuit breaker open or unhealthy)",
                     ),
                 };
@@ -785,7 +788,11 @@ impl Router {
             .worker_registry
             .get_routing_pool(model_id, RoutingPool::HttpRegular);
         if all_workers.is_empty() {
-            let resp = error::model_not_found(model_id);
+            let resp = overload::unavailable_or_not_found(
+                &self.worker_registry,
+                model_id,
+                format!("No workers are currently available for model '{model_id}'"),
+            );
             record_pre_send_error(&resp);
             return resp;
         }
@@ -831,7 +838,7 @@ impl Router {
                     } else {
                         "All workers are unavailable (circuit breaker open or unhealthy)"
                     };
-                    error::service_unavailable("no_available_workers", message)
+                    overload::no_available_workers(message)
                 }
             };
             record_pre_send_error(&resp);
@@ -1192,7 +1199,7 @@ impl Router {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-        if is_stream {
+        let mut response = if is_stream {
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             header_utils::insert_routed_worker_id(&mut response_headers, worker_url);
@@ -1274,7 +1281,11 @@ impl Router {
 
             // load_guard dropped here automatically after response body is read
             response
-        }
+        };
+        // Engine-side admission is terminal at this router: preserve its hint
+        // (or add one) and avoid retry amplification while it sheds load.
+        overload::apply_capacity_contract(&mut response);
+        response
     }
 
     /// Forward a raw request body to `worker` as a chunked stream.
@@ -2344,7 +2355,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unavailable_workers_keep_generic_503_without_retry_after() {
+    async fn unavailable_workers_return_capacity_429_with_retry_after() {
         let router = create_test_regular_router();
         for worker in router.worker_registry.get_all() {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
@@ -2362,7 +2373,7 @@ mod tests {
             )
             .await;
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             response
                 .headers()
@@ -2370,7 +2381,46 @@ mod tests {
                 .expect("gateway error code header"),
             "no_available_workers"
         );
-        assert!(response.headers().get(RETRY_AFTER).is_none());
+        assert!(response.headers().get(RETRY_AFTER).is_some());
+    }
+
+    #[tokio::test]
+    async fn ordinary_http_preserves_upstream_429_body_and_retry_after() {
+        let router = create_test_regular_router();
+        let worker = router
+            .worker_registry
+            .get_all()
+            .into_iter()
+            .next()
+            .expect("test worker");
+        let worker_url = worker.url().to_string();
+        let upstream_body = r#"{"error":"engine overloaded"}"#;
+        let upstream = http::Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(RETRY_AFTER, "17")
+            .header(CONTENT_TYPE, "application/json")
+            .body(upstream_body)
+            .unwrap();
+
+        let response = router
+            .forward_worker_response(
+                reqwest::Response::from(upstream),
+                false,
+                &worker_url,
+                WorkerLoadGuard::new(worker, None),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "17");
+        assert!(
+            !crate::routers::common::retry::is_retryable_response(&response),
+            "engine admission 429 must not be retried inside the same router"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], upstream_body.as_bytes());
     }
 
     fn rerank_request() -> RerankRequest {
