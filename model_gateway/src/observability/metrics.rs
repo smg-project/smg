@@ -127,6 +127,12 @@ impl Default for PrometheusConfig {
 /// `PrometheusBuilder::upkeep_timeout()` in `start_prometheus`.
 pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 
+/// Histogram buckets for `smg_cache_aware_match_ratio`. The ratio is
+/// dimensionless (matched/input, 0..1), so it takes deciles instead of the
+/// duration buckets; `le="0"` isolates requests with no cached prefix at all.
+const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
+    &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+
 /// Marks jemalloc as the final artifact's Rust global allocator.
 ///
 /// Call this before [`start_prometheus`] only from a binary or extension that
@@ -331,6 +337,15 @@ pub(crate) fn init_metrics() {
         "smg_cache_placement_entries",
         "Cache-aware hash-index placement entries by model (keys with a live holder)"
     );
+    describe_counter!(
+        "smg_cache_aware_policy_branch_total",
+        "Cache-aware tree-mode selection branch (tree_match, spill, expected_wait_fallback, \
+         first_healthy_fallback)"
+    );
+    describe_histogram!(
+        "smg_cache_aware_match_ratio",
+        "Cache-aware tree-mode best prefix match ratio per request (matched/input, 0..1)"
+    );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
     describe_gauge!(
@@ -513,6 +528,11 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     let ttft_matcher = Matcher::Suffix(String::from("ttft_seconds"));
     let tpot_matcher = Matcher::Suffix(String::from("tpot_seconds"));
 
+    // The cache-aware match ratio is a dimensionless 0..1 value: no `_seconds`
+    // matcher applies, so it also needs its own buckets or it renders as a
+    // summary.
+    let match_ratio_matcher = Matcher::Full(String::from("smg_cache_aware_match_ratio"));
+
     PrometheusBuilder::new()
         .upkeep_timeout(Duration::from_secs(UPKEEP_INTERVAL_SECS))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
@@ -526,6 +546,8 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
             super::runtime_metrics::EVENT_LOOP_DELAY_BUCKETS,
         )
         .expect("failed to set event loop delay buckets")
+        .set_buckets_for_metric(match_ratio_matcher, CACHE_AWARE_MATCH_RATIO_BUCKETS)
+        .expect("failed to set cache-aware match ratio buckets")
         .install_recorder()
         .inspect(|_| {
             #[cfg(all(
@@ -1281,6 +1303,21 @@ impl Metrics {
         gauge!("smg_cache_placement_entries", "model" => model).set(count as f64);
     }
 
+    /// Record cache-aware policy execution branch for tree-mode routing decisions
+    pub fn record_worker_cache_aware_policy_branch(branch: &'static str) {
+        counter!(
+            "smg_cache_aware_policy_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
+    /// Record the best prefix match ratio (matched/input, 0..1) of a cache-aware
+    /// tree-mode routing decision
+    pub fn record_cache_aware_match_ratio(ratio: f64) {
+        histogram!("smg_cache_aware_match_ratio").record(ratio);
+    }
+
     /// Record consistent hashing policy execution branch for routing decisions
     pub fn record_worker_consistent_hashing_policy_branch(branch: &'static str) {
         counter!(
@@ -1824,6 +1861,61 @@ mod tests {
                 "smg_cache_tree_tenants {tree} series missing; rendered:\n{rendered}"
             );
         }
+    }
+
+    /// The match ratio must render as a real histogram (`_bucket{le=...}`
+    /// lines) once its buckets are registered the way `start_prometheus` does;
+    /// without them the recorder falls back to a summary.
+    #[test]
+    fn cache_aware_decision_metrics_render_counter_and_bucketed_histogram() {
+        let recorder = PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                Matcher::Full(String::from("smg_cache_aware_match_ratio")),
+                CACHE_AWARE_MATCH_RATIO_BUCKETS,
+            )
+            .expect("bucket override")
+            .build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::record_worker_cache_aware_policy_branch("tree_match");
+            Metrics::record_worker_cache_aware_policy_branch("tree_match");
+            Metrics::record_worker_cache_aware_policy_branch("spill");
+            Metrics::record_cache_aware_match_ratio(0.0);
+            Metrics::record_cache_aware_match_ratio(0.75);
+        });
+        let rendered = handle.render();
+
+        for (branch, value) in [("tree_match", "2"), ("spill", "1")] {
+            let series =
+                format!("smg_cache_aware_policy_branch_total{{branch=\"{branch}\"}} {value}");
+            assert!(
+                rendered.lines().any(|l| l == series),
+                "{series} missing; rendered:\n{rendered}"
+            );
+        }
+        for (le, count) in [
+            ("0", "1"),
+            ("0.7", "1"),
+            ("0.8", "2"),
+            ("1", "2"),
+            ("+Inf", "2"),
+        ] {
+            let series = format!("smg_cache_aware_match_ratio_bucket{{le=\"{le}\"}} {count}");
+            assert!(
+                rendered.lines().any(|l| l == series),
+                "{series} missing; rendered:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l == "smg_cache_aware_match_ratio_count 2"),
+            "histogram count missing; rendered:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("smg_cache_aware_match_ratio{quantile="),
+            "match ratio rendered as a summary; rendered:\n{rendered}"
+        );
     }
 
     #[test]

@@ -1620,8 +1620,9 @@ impl CacheAwarePolicy {
         candidates.last().map(|c| c.idx)
     }
 
-    /// One decision line per tree-routed request. `selected_url == None`
-    /// means the caller fell back to `fallback_url` (first healthy).
+    /// One decision per tree-routed request: the branch counter and match
+    /// ratio histogram always, the debug line when enabled. `selected_url ==
+    /// None` means the caller fell back to `fallback_url` (first healthy).
     fn log_tree_decision(
         &self,
         selected_url: Option<&str>,
@@ -1631,9 +1632,6 @@ impl CacheAwarePolicy {
         matched_tenants: &[TenantId],
         model_id: &str,
     ) {
-        if !tracing::enabled!(tracing::Level::DEBUG) {
-            return;
-        }
         let matched_ratio = if input_units == 0 {
             0.0
         } else {
@@ -1650,6 +1648,8 @@ impl CacheAwarePolicy {
                 }
             }
         };
+        Metrics::record_worker_cache_aware_policy_branch(branch);
+        Metrics::record_cache_aware_match_ratio(f64::from(matched_ratio));
         debug!(
             index = "tree",
             branch,
@@ -2107,6 +2107,7 @@ impl Default for CacheAwarePolicy {
 #[cfg(test)]
 mod tests {
     use kv_index::{compute_content_hash, SequenceHash, StoredBlock, WorkerBlockMap};
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::worker::{
         HealthCheckConfig, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus,
     };
@@ -3260,6 +3261,47 @@ mod tests {
             )
             .unwrap();
         assert!(logs_contain("expected_wait_fallback"));
+    }
+
+    /// The branch counter and match-ratio histogram are recorded on every
+    /// tree decision, independent of whether the debug line is enabled.
+    #[test]
+    fn token_tree_selection_records_branch_and_match_ratio_metrics() {
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let tokens: Vec<u32> = (0..32).collect();
+        seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
+        let novel: Vec<u32> = (1000..1064).collect();
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            for request in [&tokens, &novel] {
+                policy
+                    .select_worker(
+                        &workers,
+                        &SelectWorkerInfo {
+                            tokens: Some(request),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+        });
+        let rendered = handle.render();
+
+        // One full-prefix hit (ratio 1.0) and one novel prompt (ratio 0.0).
+        for series in [
+            "smg_cache_aware_policy_branch_total{branch=\"tree_match\"} 1",
+            "smg_cache_aware_policy_branch_total{branch=\"expected_wait_fallback\"} 1",
+            "smg_cache_aware_match_ratio_sum 1",
+            "smg_cache_aware_match_ratio_count 2",
+        ] {
+            assert!(
+                rendered.lines().any(|l| l == series),
+                "{series} missing; rendered:\n{rendered}"
+            );
+        }
     }
 
     #[test]
