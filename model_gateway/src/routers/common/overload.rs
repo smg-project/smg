@@ -12,7 +12,7 @@ use std::sync::{
 };
 
 use axum::{
-    http::{header::RETRY_AFTER, HeaderValue},
+    http::{header::RETRY_AFTER, HeaderValue, StatusCode},
     response::Response,
 };
 use tracing::debug;
@@ -122,7 +122,7 @@ pub(crate) fn shed_pd_admission(
 /// Apply the public capacity contract to an existing 429 without replacing
 /// an upstream response body or an upstream `Retry-After` value.
 pub(crate) fn apply_capacity_contract(response: &mut Response) {
-    if response.status() != axum::http::StatusCode::TOO_MANY_REQUESTS {
+    if response.status() != StatusCode::TOO_MANY_REQUESTS {
         return;
     }
     if !response.headers().contains_key(RETRY_AFTER) {

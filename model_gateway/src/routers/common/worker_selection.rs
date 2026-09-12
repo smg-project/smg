@@ -305,6 +305,7 @@ async fn refresh_worker_models(
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
     use openai_protocol::worker::{HealthCheckConfig, WorkerSpec};
     use smg_external_router::known;
 
@@ -444,7 +445,7 @@ mod tests {
             .await
             .expect_err("known model with no workers must be rejected");
 
-        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]

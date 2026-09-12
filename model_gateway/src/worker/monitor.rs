@@ -819,6 +819,7 @@ impl WorkerMonitor {
     ///
     /// `native_loads_memo` is the shared probe memo, or `None` for callers
     /// with no monitor to borrow it from (they simply always discover).
+    #[cfg(test)]
     pub(crate) async fn fetch_http_load(
         worker: &Arc<dyn Worker>,
         native_loads_memo: Option<&DashMap<String, NativeLoadsMemo>>,

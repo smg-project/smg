@@ -2414,12 +2414,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "17");
         assert!(
-            !crate::routers::common::retry::is_retryable_response(&response),
+            !is_retryable_response(&response),
             "engine admission 429 must not be retried inside the same router"
         );
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], upstream_body.as_bytes());
     }
 
