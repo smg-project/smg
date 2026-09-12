@@ -102,11 +102,10 @@ impl PipelineStage for WorkerSelectionStage {
             .policy_registry
             .derive_rid_key(ctx.input.request_type.rid())
             .map(str::to_string);
-        ctx.state.sticky_key = rid_key.clone().or_else(|| {
-            self.policy_registry
-                .sticky_header_key(headers)
-                .map(str::to_string)
-        });
+        ctx.state.sticky_key = self
+            .policy_registry
+            .sticky_load_key(rid_key.as_deref(), headers)
+            .map(str::to_string);
 
         // Selection inputs that survive the request drop: retry attempts
         // re-select from these. Text is copied only when a configured policy

@@ -80,6 +80,10 @@ pub struct PolicyRegistry {
     /// requests via [`PolicyRegistry::select_worker`].
     routing_key_sticky: Option<Arc<ManualPolicy>>,
 
+    /// When true, a valid configured routing-key header is authoritative over
+    /// body `rid`, which allows the request body to stay unread by the router.
+    routing_key_prefer_header: bool,
+
     /// Ordered routing-key header names, parsed once from
     /// `routing_key_override.headers`; the first header present with a valid
     /// value wins.
@@ -136,6 +140,7 @@ impl PolicyRegistry {
                 assignment_mode: routing_key_override.assignment_mode,
             }))
         });
+        let routing_key_prefer_header = routing_key_override.prefer_header;
         // ConfigValidator rejects invalid names at startup; skipping here
         // covers direct construction.
         let routing_key_headers = routing_key_override
@@ -162,6 +167,7 @@ impl PolicyRegistry {
             mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
             routing_key_sticky,
+            routing_key_prefer_header,
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
         }
@@ -223,28 +229,63 @@ impl PolicyRegistry {
         })
     }
 
-    /// Whether sticky routing may derive its preferred key from the request
-    /// body's `rid`, requiring automatic body-path selection to keep the body
-    /// readable.
-    pub(crate) fn routing_key_override_enabled(&self) -> bool {
+    /// Whether sticky routing still needs the body to resolve its preferred
+    /// key. In header-first mode a valid configured key header is sufficient;
+    /// missing or malformed headers keep the request on the buffered path.
+    pub(crate) fn routing_key_override_needs_body(
+        &self,
+        headers: Option<&HeaderMap>,
+    ) -> bool {
         self.routing_key_sticky.is_some()
+            && !(self.routing_key_prefer_header && self.resolve_routing_key(headers).is_some())
     }
 
-    /// Resolve the effective sticky key: the rid-derived key wins, the
-    /// configured routing-key headers are the fallback when no rid is
-    /// present. Header keys get the same lineage stripping as rid keys, so a
-    /// proxy forwarding `conv_t2` as a header pins the entry `conv`.
+    /// Resolve one request's sticky key with the same source precedence used
+    /// by selection. This is also the canonical key for in-flight accounting.
+    fn effective_sticky_key_parts<'a>(
+        &self,
+        rid_key: Option<&'a str>,
+        routing_key: Option<&'a str>,
+        headers: Option<&'a HeaderMap>,
+    ) -> Option<(&'a str, &'static str)> {
+        let header_key = routing_key.or_else(|| self.resolve_routing_key(headers));
+        let normalize_header = |raw| {
+            if self.routing_key_sticky.is_some() {
+                Self::strip_header_key(raw)
+            } else {
+                raw
+            }
+        };
+
+        if self.routing_key_sticky.is_some() && self.routing_key_prefer_header {
+            if let Some(raw) = header_key {
+                return Some((normalize_header(raw), "header"));
+            }
+        }
+        if let Some(key) = rid_key {
+            return Some((key, "rid"));
+        }
+        header_key.map(|raw| (normalize_header(raw), "header"))
+    }
+
+    /// Effective request key for per-worker in-flight accounting.
+    pub(crate) fn sticky_load_key<'a>(
+        &self,
+        rid_key: Option<&'a str>,
+        headers: Option<&'a HeaderMap>,
+    ) -> Option<&'a str> {
+        self.effective_sticky_key_parts(rid_key, None, headers)
+            .map(|(key, _source)| key)
+    }
+
+    /// Resolve the effective sticky key. Header-first mode makes a valid
+    /// configured header authoritative; otherwise the rid-derived key wins and
+    /// the header is the fallback. Both sources use the same lineage stripping.
     fn effective_sticky_key<'a>(
         &self,
         info: &SelectWorkerInfo<'a>,
     ) -> Option<(&'a str, &'static str)> {
-        if let Some(key) = info.rid_key {
-            return Some((key, "rid"));
-        }
-        let raw = info
-            .routing_key
-            .or_else(|| self.resolve_routing_key(info.headers))?;
-        Some((Self::strip_header_key(raw), "header"))
+        self.effective_sticky_key_parts(info.rid_key, info.routing_key, info.headers)
     }
 
     /// Select a worker, applying the sticky routing-key override when it is
@@ -1414,6 +1455,46 @@ mod tests {
             reg.select_worker(&policy, &workers, &header_info),
             Some(pinned)
         );
+    }
+
+    #[test]
+    fn header_first_override_is_consistent_with_streaming_selection() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                prefer_header: true,
+                ..Default::default()
+            },
+        );
+        let headers = headers_with_key("header_t2");
+        let info = SelectWorkerInfo {
+            rid_key: Some("body-rid"),
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        assert_eq!(
+            reg.effective_sticky_key(&info),
+            Some(("header", "header"))
+        );
+        assert_eq!(
+            reg.sticky_load_key(info.rid_key, info.headers),
+            Some("header")
+        );
+        assert!(!reg.routing_key_override_needs_body(Some(&headers)));
+        assert!(reg.routing_key_override_needs_body(None));
+
+        let default_precedence =
+            PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
+        assert_eq!(
+            default_precedence.effective_sticky_key(&info),
+            Some(("body-rid", "rid"))
+        );
+        assert_eq!(
+            default_precedence.sticky_load_key(info.rid_key, info.headers),
+            Some("body-rid")
+        );
+        assert!(default_precedence.routing_key_override_needs_body(Some(&headers)));
     }
 
     #[test]

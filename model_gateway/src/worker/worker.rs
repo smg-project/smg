@@ -1939,8 +1939,8 @@ impl WorkerLoadGuard {
         Self::with_key(worker, key.as_deref())
     }
 
-    /// Guard keyed by the caller-resolved effective sticky key (rid-derived
-    /// wins over the header), so keyed-load accounting matches selection.
+    /// Guard keyed by the caller-resolved effective sticky key, so keyed-load
+    /// accounting follows the configured source precedence used by selection.
     pub fn with_key(worker: Arc<dyn Worker>, routing_key: Option<&str>) -> Self {
         worker.increment_load();
 

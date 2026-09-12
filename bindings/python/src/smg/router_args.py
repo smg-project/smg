@@ -257,6 +257,7 @@ class RouterArgs:
     enable_rl: bool = False  # Mount the RL control plane under /v1/rl
     rl_control_timeout_secs: int = 600  # Timeout for one proxied engine control call
     rl_fanout_concurrency: int = 32  # Max concurrent engine calls in one fan-out
+    routing_key_override_prefer_header: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -774,6 +775,16 @@ class RouterArgs:
                 "Sticky sessions: route every request of a conversation to the"
                 " same worker, on any policy (keys derived from the request-id"
                 " lineage, falling back to the routing-key headers)"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}routing-key-override-prefer-header",
+            action="store_true",
+            help=(
+                "With sticky routing enabled, prefer a valid configured"
+                " routing-key header over body rid. This permits raw-body"
+                " forwarding for trusted ingress; headerless requests stay"
+                " buffered"
             ),
         )
         routing_group.add_argument(

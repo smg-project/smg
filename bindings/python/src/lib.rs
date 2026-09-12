@@ -382,6 +382,7 @@ struct Router {
     port: u16,
     health_check_port: Option<u16>,
     routing_key_override: bool,
+    routing_key_override_prefer_header: bool,
     worker_urls: Vec<String>,
     policy: PolicyType,
     worker_startup_timeout_secs: u64,
@@ -931,6 +932,7 @@ impl Router {
             .mm_per_request_image_limit(self.mm_per_request_image_limit)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
+                prefer_header: self.routing_key_override_prefer_header,
                 eviction_interval_secs: self.eviction_interval_secs,
                 max_idle_secs: self.max_idle_secs,
                 assignment_mode: self
@@ -1117,6 +1119,7 @@ impl Router {
         enable_rl = false,
         rl_control_timeout_secs = 600,
         rl_fanout_concurrency = 32,
+        routing_key_override_prefer_header = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1276,6 +1279,7 @@ impl Router {
         enable_rl: bool,
         rl_control_timeout_secs: u64,
         rl_fanout_concurrency: usize,
+        routing_key_override_prefer_header: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1302,6 +1306,7 @@ impl Router {
             port,
             health_check_port,
             routing_key_override,
+            routing_key_override_prefer_header,
             worker_urls,
             policy,
             worker_startup_timeout_secs,

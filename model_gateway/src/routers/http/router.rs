@@ -50,7 +50,7 @@ use crate::{
             attach_sized_body,
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
-                REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
+                REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION,
                 REASON_WORKER_MUTATES_BODY,
             },
             header_utils, overload,
@@ -540,13 +540,11 @@ impl Router {
             return shed;
         }
 
-        // Keyed-load accounting uses the same effective key as selection:
-        // rid-derived first, header fallback.
+        // Keyed-load accounting uses the exact source precedence as selection.
         let load_guard = lease.with_view(|view| {
             WorkerLoadGuard::with_key(
                 worker.clone(),
-                view.rid_key
-                    .or_else(|| self.policy_registry.sticky_header_key(headers)),
+                self.policy_registry.sticky_load_key(view.rid_key, headers),
             )
         });
 
@@ -1646,7 +1644,9 @@ impl Router {
             .worker_registry
             .get_routing_pool(crate::worker::UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
         decide_body_path(&BodyPathInputs {
-            routing_key_override: self.policy_registry.routing_key_override_enabled(),
+            routing_key_override: self
+                .policy_registry
+                .routing_key_override_needs_body(Some(headers)),
             policy_needs_text: self
                 .policy_registry
                 .any_policy_needs_request_text(Some(headers)),
@@ -1685,21 +1685,64 @@ impl Router {
         let model_id = crate::worker::UNKNOWN_MODEL_ID;
         // Buffered-path parity: a valid tokens hint is exactly what selection
         // would have received there (text is never extracted alongside it).
-        // Streamed requests have no readable body, hence no rid key and no
-        // cache namespace: selection keys unpartitioned here, so a request
-        // that needs partitioned affinity must take the buffered path.
-        // Routing-key override is excluded by the body-path gate above.
+        // Streamed requests have no readable body or rid key. Header-first
+        // sticky routing is safe here because the validated header is
+        // authoritative; other sticky requests stay on the buffered path.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
-        let Some(worker) = self.select_worker_for_model(
+        let worker = self.select_worker_for_model(
             model_id,
             None,
             hinted_tokens.as_deref(),
             Some(req.headers()),
             None,
             None,
-        ) else {
-            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
-            return Err(req);
+        );
+        let Some(worker) = worker else {
+            // The streamed-path decision proved that body contents cannot
+            // change placement. Return the same terminal verdict as the typed
+            // path without polling or retaining a potentially large body.
+            let response = match placement::single_failure(
+                &self.worker_registry,
+                model_id,
+                RoutingPool::HttpRegular,
+                None,
+            ) {
+                PlacementFailure::NoCandidates => overload::unavailable_or_not_found(
+                    &self.worker_registry,
+                    model_id,
+                    format!("No workers are currently available for model '{model_id}'"),
+                ),
+                PlacementFailure::AllOverloaded(shed) => shed,
+                PlacementFailure::Unavailable
+                | PlacementFailure::PolicyDeclined(_)
+                | PlacementFailure::NoCompatiblePair { .. } => overload::no_available_workers(
+                    "All workers are unavailable (circuit breaker open or unhealthy)",
+                ),
+            };
+            let endpoint = route_to_endpoint(route);
+            Metrics::record_request_body_path(BODY_PATH_STREAMED, stream_reason);
+            Metrics::record_router_request(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                model_id,
+                endpoint,
+                "false",
+            );
+            Metrics::record_router_upstream_response(
+                metrics_labels::ROUTER_HTTP,
+                response.status().as_u16(),
+                extract_error_code_from_response(&response),
+            );
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                model_id,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
+            return Ok(response);
         };
         // Guard the registration races the decision left open: a mutating
         // worker that joined after the fleet check must not receive an
@@ -1750,7 +1793,8 @@ impl Router {
 
         let load_guard = WorkerLoadGuard::with_key(
             worker.clone(),
-            self.policy_registry.sticky_header_key(Some(req.headers())),
+            self.policy_registry
+                .sticky_load_key(None, Some(req.headers())),
         );
         events::RequestSentEvent { url: worker.url() }.emit();
 
@@ -2188,7 +2232,8 @@ mod tests {
         routers::common::{
             body_policy::{
                 REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT, REASON_RETRYABLE,
-                REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE, REASON_WASM_REQUEST_HOOK,
+                REASON_PURE_FORWARD, REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE,
+                REASON_WASM_REQUEST_HOOK,
             },
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
         },
@@ -2646,6 +2691,25 @@ mod tests {
         )
     }
 
+    fn streaming_router_with_header_first_key_override(
+        policy: PolicyConfig,
+        max_payload_size: usize,
+        workers: Vec<crate::worker::BasicWorker>,
+    ) -> Router {
+        streaming_router_with_registry(
+            Arc::new(PolicyRegistry::with_override(
+                policy,
+                RoutingKeyOverrideConfig {
+                    enabled: true,
+                    prefer_header: true,
+                    ..Default::default()
+                },
+            )),
+            max_payload_size,
+            workers,
+        )
+    }
+
     fn streaming_router_with_key_override(
         policy: PolicyConfig,
         max_payload_size: usize,
@@ -2973,6 +3037,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn header_first_overload_returns_429_without_polling_body() {
+        let worker = plain_worker("http://worker1:8080");
+        worker.set_overloaded(true);
+        let router = streaming_router_with_header_first_key_override(
+            cache_aware_policy(),
+            1024 * 1024,
+            vec![worker],
+        );
+        let body = Body::from_stream(stream::once(async {
+            panic!("an already-overloaded request body must never be polled");
+            #[allow(unreachable_code)]
+            Ok::<Bytes, std::io::Error>(Bytes::new())
+        }));
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/generate")
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .header(CONTENT_LENGTH, 1024)
+            .header("x-smg-routing-key", "conversation_t2")
+            .body(body)
+            .unwrap();
+
+        let response = router
+            .route_streaming_request(req, "/generate", false)
+            .await
+            .expect("overload must be returned directly from the streamed path");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "worker_overload_protection_shed"
+        );
+        assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "10");
+    }
+
+    #[tokio::test]
     async fn streamed_sse_response_relays_as_event_stream() {
         let (url, _captured) = spawn_capture_stub("text/event-stream", "data: hi\n\n").await;
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
@@ -3245,6 +3345,38 @@ mod tests {
         );
         assert_eq!(
             text_free.request_body_path(&no_hint, false),
+            BodyPath::Buffer(REASON_ROUTING_KEY_OVERRIDE)
+        );
+    }
+
+    #[test]
+    fn header_first_routing_key_override_streams_only_with_valid_header() {
+        let mut router = streaming_router_with_header_first_key_override(
+            cache_aware_policy(),
+            1024 * 1024,
+            vec![plain_worker("http://worker1:8080")],
+        );
+        router.retry_config = RetryConfig {
+            max_retries: 1,
+            ..Default::default()
+        };
+        let no_hint = headers_with_content_length(Some("64"));
+        assert_eq!(
+            router.request_body_path(&no_hint, false),
+            BodyPath::Buffer(REASON_ROUTING_KEY_OVERRIDE)
+        );
+
+        let mut valid = no_hint.clone();
+        valid.insert("x-smg-routing-key", "conversation_t2".parse().unwrap());
+        assert_eq!(
+            router.request_body_path(&valid, false),
+            BodyPath::Stream(REASON_PURE_FORWARD)
+        );
+
+        let mut invalid = no_hint.clone();
+        invalid.insert("x-smg-routing-key", "".parse().unwrap());
+        assert_eq!(
+            router.request_body_path(&invalid, false),
             BodyPath::Buffer(REASON_ROUTING_KEY_OVERRIDE)
         );
     }

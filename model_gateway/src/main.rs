@@ -441,6 +441,17 @@ struct CliArgs {
     )]
     routing_key_override: bool,
 
+    /// With sticky routing enabled, prefer a valid configured routing-key
+    /// header over body `rid`. This permits raw-body forwarding for trusted
+    /// ingress that lifts the affinity key into a header; requests without a
+    /// valid key header remain buffered.
+    #[arg(
+        long,
+        default_value_t = false,
+        help_heading = "Routing Policy"
+    )]
+    routing_key_override_prefer_header: bool,
+
     /// How strictly PD placement pairs a prefill with a decode on their KV
     /// transfer protocol. `lenient` refuses only a known difference in
     /// runtime, transport or KV layout (unknown components and engine
@@ -1940,6 +1951,7 @@ impl CliArgs {
             .pd_pairing_mode(PdPairingMode::parse(&self.pd_pairing_mode).unwrap_or_default())
             .routing_key_override(RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
+                prefer_header: self.routing_key_override_prefer_header,
                 eviction_interval_secs: self.eviction_interval,
                 max_idle_secs: self.max_idle_secs,
                 assignment_mode: Self::parse_assignment_mode(
@@ -2348,6 +2360,7 @@ mod tests {
         let config = cli.to_router_config(vec![], vec![]).unwrap();
         let override_cfg = &config.routing_key_override;
         assert!(override_cfg.enabled);
+        assert!(!override_cfg.prefer_header);
         assert_eq!(override_cfg.assignment_mode, ManualAssignmentMode::Delegate);
 
         // An explicit --assignment-mode overrides the sticky-map default.
@@ -2365,6 +2378,15 @@ mod tests {
             defaults.routing_key_override.headers,
             vec!["x-smg-routing-key".to_string()]
         );
+
+        let header_first = cli_args_from(&[
+            "--routing-key-override",
+            "--routing-key-override-prefer-header",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        assert!(header_first.routing_key_override.enabled);
+        assert!(header_first.routing_key_override.prefer_header);
     }
 
     #[test]

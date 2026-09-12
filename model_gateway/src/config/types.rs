@@ -588,17 +588,20 @@ impl PdPairingMode {
 /// policy knobs for the sticky map; eviction defaults match the manual policy so
 /// config-file users with only `enabled: true` still get TTL eviction (no leak).
 ///
-/// Key priority is fixed: a key derived from the typed body's `rid` (per-turn
-/// `_t<n>` and per-retry `_r<n>` suffixes stripped, so every turn of a
-/// conversation shares one key) wins over the routing-key headers; the first
-/// configured header carrying a valid value is the fallback when no rid is
-/// present. An enabled override keeps automatic body forwarding buffered so
-/// body `rid` precedence is preserved.
+/// By default a key derived from the typed body's `rid` wins over routing-key
+/// headers, so automatic body forwarding stays buffered. Operators whose
+/// trusted ingress already lifts the same affinity key into a header can set
+/// `prefer_header` to make that validated header authoritative and permit raw
+/// body streaming; headerless requests remain buffered for `rid` extraction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingKeyOverrideConfig {
     /// When false, policies are used unchanged.
     #[serde(default)]
     pub enabled: bool,
+    /// Prefer a valid configured header over body `rid`, allowing raw-body
+    /// forwarding without losing sticky routing.
+    #[serde(default)]
+    pub prefer_header: bool,
     #[serde(default = "default_manual_eviction_interval_secs")]
     pub eviction_interval_secs: u64,
     #[serde(
@@ -630,6 +633,7 @@ impl Default for RoutingKeyOverrideConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            prefer_header: false,
             eviction_interval_secs: default_manual_eviction_interval_secs(),
             max_idle_secs: default_manual_max_idle_secs(),
             assignment_mode: default_override_assignment_mode(),
@@ -1558,11 +1562,13 @@ mod tests {
         let json: serde_json::Value = serde_json::json!({ "enabled": true });
         let cfg: RoutingKeyOverrideConfig = serde_json::from_value(json).unwrap();
         assert!(cfg.enabled);
+        assert!(!cfg.prefer_header);
         assert_eq!(cfg.assignment_mode, ManualAssignmentMode::Delegate);
         assert_eq!(cfg.headers, vec!["x-smg-routing-key".to_string()]);
 
         let cfg = RoutingKeyOverrideConfig {
             enabled: true,
+            prefer_header: true,
             assignment_mode: ManualAssignmentMode::MinLoad,
             headers: vec!["x-routing-key".into(), "x-smg-routing-key".into()],
             ..Default::default()
@@ -1570,6 +1576,7 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let roundtripped: RoutingKeyOverrideConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtripped.assignment_mode, ManualAssignmentMode::MinLoad);
+        assert!(roundtripped.prefer_header);
         assert_eq!(
             roundtripped.headers,
             vec!["x-routing-key".to_string(), "x-smg-routing-key".to_string()]

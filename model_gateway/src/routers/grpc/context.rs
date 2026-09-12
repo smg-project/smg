@@ -199,8 +199,8 @@ pub(crate) struct ProcessingState {
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
 
-    /// Effective sticky key (rid-derived wins, header falls back), recorded by
-    /// worker selection so load guards account keyed load identically.
+    /// Effective sticky key under the configured source precedence, recorded
+    /// by worker selection so load guards account keyed load identically.
     pub sticky_key: Option<String>,
 
     /// Selection inputs that survive the request drop, captured by worker

@@ -526,12 +526,10 @@ impl PDRouter {
 
         let raw_body_len = header_utils::content_length(headers);
 
-        // Keyed-load accounting uses the same effective key as selection:
-        // rid-derived first, header fallback. Built before the lease releases.
+        // Keyed-load accounting uses the exact source precedence as selection.
+        // Built before the lease releases.
         let load_guards = lease.with_view(|view| {
-            let key = view
-                .rid_key
-                .or_else(|| self.policy_registry.sticky_header_key(headers));
+            let key = self.policy_registry.sticky_load_key(view.rid_key, headers);
             vec![
                 WorkerLoadGuard::with_key(prefill.clone(), key),
                 WorkerLoadGuard::with_key(decode.clone(), key),

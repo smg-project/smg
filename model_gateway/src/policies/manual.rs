@@ -286,7 +286,12 @@ impl ManualPolicy {
             return (None, ExecutionBranch::NoHealthyWorkers);
         }
 
-        if let Some(routing_id) = extract_routing_key(info.headers) {
+        // Registry callers supply the first valid configured routing header;
+        // the legacy extractor preserves direct-policy compatibility.
+        if let Some(routing_id) = info
+            .routing_key
+            .or_else(|| extract_routing_key(info.headers))
+        {
             // Single is the common leg; route on the bare key to skip the
             // per-request allocation. PD legs namespace so prefill and decode
             // stick independently.
@@ -475,6 +480,29 @@ mod tests {
             );
             assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
+    }
+
+    #[test]
+    fn test_manual_prefers_registry_validated_routing_key() {
+        let policy = ManualPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let headers = headers_with_routing_key("legacy-key");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            routing_key: Some("configured-key"),
+            ..Default::default()
+        };
+
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+
+        assert!(result.is_some());
+        assert_eq!(branch, ExecutionBranch::Vacant);
+        assert!(
+            policy
+                .routing_map
+                .contains_key(&RoutingId::new("configured-key"))
+        );
+        assert!(!policy.routing_map.contains_key(&RoutingId::new("legacy-key")));
     }
 
     #[test]

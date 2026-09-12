@@ -28,7 +28,6 @@ pub(crate) const REASON_MODEL_AMBIGUOUS: &str = "model_ambiguous";
 pub(crate) const REASON_WORKER_MUTATES_BODY: &str = "worker_mutates_body";
 pub(crate) const REASON_WASM_REQUEST_HOOK: &str = "wasm_request_hook";
 pub(crate) const REASON_NO_CONTENT_LENGTH: &str = "no_content_length";
-pub(crate) const REASON_NO_AVAILABLE_WORKER: &str = "no_available_worker";
 pub(crate) const REASON_MODEL_SELECTION: &str = "model_selection";
 pub(crate) const REASON_RETRYABLE: &str = "retryable";
 pub(crate) const REASON_RETRY_FORFEITED: &str = "retry_forfeited";
@@ -47,9 +46,10 @@ pub(crate) struct BodyPathInputs {
 }
 
 /// Decide the request body path before the body arrives. Buffer when
-/// something must read the body here: routing-key override (body `rid` wins
-/// over any header key), a text-routing policy without a valid hint-header
-/// waiver, a registry serving more than one model (content-blind selection
+/// something must read the body here: a routing-key override that still needs
+/// body `rid` under its configured source precedence, a text-routing policy
+/// without a valid hint-header waiver, a registry serving more than one model
+/// (content-blind selection
 /// could land the request on the wrong model's worker), a body-mutating
 /// worker, a WASM request hook, or a missing/invalid Content-Length.
 /// Otherwise, with router retries enabled, buffer up to

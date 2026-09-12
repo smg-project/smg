@@ -50,6 +50,7 @@ class TestRouterArgs:
         assert args.enable_rl is False
         assert args.rl_control_timeout_secs == 600
         assert args.rl_fanout_concurrency == 32
+        assert args.routing_key_override_prefer_header is False
 
     def test_rl_flags_parse(self):
         """RL control-plane flags land on the dataclass."""
@@ -1247,6 +1248,7 @@ class TestFlagAliases:
         namespace = parser.parse_args(
             [
                 "--sticky-sessions",
+                "--routing-key-override-prefer-header",
                 "--worker-auto-recovery",
                 "--cache-match-threshold",
                 "0.6",
@@ -1260,6 +1262,7 @@ class TestFlagAliases:
         )
         router_args = RouterArgs.from_cli_args(namespace)
         assert router_args.routing_key_override is True
+        assert router_args.routing_key_override_prefer_header is True
         assert router_args.remove_unhealthy_workers is True
         assert router_args.cache_threshold == 0.6
         assert router_args.balance_abs_threshold == 8
@@ -1468,6 +1471,7 @@ class TestRouterArgsFieldOrder:
         "enable_rl",
         "rl_control_timeout_secs",
         "rl_fanout_concurrency",
+        "routing_key_override_prefer_header",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1506,6 +1510,7 @@ class TestRouterArgsFieldOrder:
             "enable_rl",
             "rl_control_timeout_secs",
             "rl_fanout_concurrency",
+            "routing_key_override_prefer_header",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "
