@@ -130,7 +130,7 @@ pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 /// Histogram buckets for `smg_cache_aware_match_ratio`. The ratio is
 /// dimensionless (matched/input, 0..1), so it takes deciles instead of the
 /// duration buckets; `le="0"` isolates requests with no cached prefix at all.
-const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
+pub(crate) const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
     &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
 /// Marks jemalloc as the final artifact's Rust global allocator.
