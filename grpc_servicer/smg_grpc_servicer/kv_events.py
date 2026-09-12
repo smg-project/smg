@@ -53,11 +53,20 @@ def endpoint_for_rank(endpoint: str, dp_rank: int) -> str:
 
 
 def convert_event(event: object, event_id: int) -> common_pb2.KvCacheEvent | None:
-    """Convert one decoded engine event to a proto KvCacheEvent (or None if unknown)."""
+    """Convert a decoded event, skipping unknown types or unaligned block stores."""
     name = type(event).__name__
 
     if name == "BlockStored":
         block_size = int(event.block_size)
+        # Ordinal slicing is valid only for a dense sequence of complete blocks.
+        if block_size <= 0 or len(event.block_hashes) * block_size != len(event.token_ids):
+            logger.warning(
+                "Skipping BlockStored: %d hashes of block size %d cannot map to %d tokens",
+                len(event.block_hashes),
+                block_size,
+                len(event.token_ids),
+            )
+            return None
         blocks = []
         for i, block_hash in enumerate(event.block_hashes):
             start = i * block_size

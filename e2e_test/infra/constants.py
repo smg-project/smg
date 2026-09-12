@@ -174,11 +174,22 @@ def get_zmq_engine_count() -> int:
 
 
 ENV_VLLM_KV_BACKEND = "E2E_VLLM_KV_BACKEND"
+# One KV transfer backend for every PD worker in the lane, whatever the
+# engine; the per-engine variables below are the fallbacks.
+ENV_KV_BACKEND = "E2E_KV_BACKEND"
+ENV_SGLANG_TRANSFER_BACKEND = "E2E_SGLANG_TRANSFER_BACKEND"
 
 
 def vllm_kv_backend() -> str:
     """KV transfer backend for vLLM PD workers: "nixl" (default) or "mooncake"."""
-    return os.environ.get(ENV_VLLM_KV_BACKEND, "nixl").lower()
+    lane = os.environ.get(ENV_KV_BACKEND, "").strip().lower()
+    return lane or os.environ.get(ENV_VLLM_KV_BACKEND, "nixl").lower()
+
+
+def sglang_transfer_backend() -> str:
+    """Disaggregation transfer backend for SGLang PD workers: "mooncake" (default) or "nixl"."""
+    lane = os.environ.get(ENV_KV_BACKEND, "").strip().lower()
+    return lane or os.environ.get(ENV_SGLANG_TRANSFER_BACKEND, "mooncake").lower()
 
 
 # Runtime display labels

@@ -33,6 +33,7 @@ if [ ! -x "${CUDA_HOME}/bin/nvcc" ] || ! "${CUDA_HOME}/bin/nvcc" --version | gre
         https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
     sudo dpkg -i /tmp/cuda-keyring.deb
     rm /tmp/cuda-keyring.deb
+    bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
     $RETRY 3 10 sudo apt-get update -qq
     $RETRY 3 10 sudo apt-get install -y --no-install-recommends cuda-nvcc-13-0 cuda-cudart-dev-13-0
     # Ensure CUDA_HOME points to the installed toolkit
@@ -79,9 +80,28 @@ fi
 # (cuda13 wheel variant + nvrtc, since torch 2.13 defaults to CUDA 13):
 # https://github.com/sgl-project/sglang/blob/v0.5.18/scripts/ci/cuda/ci_install_dependency.sh
 echo "Installing mooncake system dependencies..."
+bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
+$RETRY 3 10 sudo apt-get update -qq
 $RETRY 3 10 sudo apt-get install -y --no-install-recommends libnuma-dev libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
 echo "Installing mooncake..."
 $RETRY 3 10 uv pip install mooncake-transfer-engine-cuda13==0.3.12.post1 nvidia-cuda-nvrtc
+
+# NIXL for SGLang PD disaggregation over NIXL (--disaggregation-transfer-backend
+# nixl), only on lanes that ask for it: Mooncake stays the default. Package,
+# pin and install shape track upstream sglang v0.5.18 CI (nixl and the backend
+# matching torch's CUDA, both --no-deps):
+# https://github.com/sgl-project/sglang/blob/v0.5.18/scripts/ci/cuda/ci_install_dependency.sh
+if [ "${E2E_KV_BACKEND:-}" = "nixl" ] || [ "${E2E_SGLANG_TRANSFER_BACKEND:-}" = "nixl" ]; then
+    NIXL_VERSION="1.3.0"
+    CUDA_MAJOR=$(python3 -c "import torch; print(torch.version.cuda.split('.')[0])")
+    echo "Installing nixl==${NIXL_VERSION} (cu${CUDA_MAJOR}) for SGLang PD over NIXL..."
+    $RETRY 3 10 uv pip install --no-deps "nixl==${NIXL_VERSION}" "nixl-cu${CUDA_MAJOR}==${NIXL_VERSION}"
+    # Import canary: fail here (not mid-e2e) if the install is broken. The
+    # bindings SGLang's NixlTransferEngine imports are checked, torch first so
+    # its bundled CUDA libraries are loaded.
+    python3 -c "import torch; from nixl._api import nixl_agent; from nixl._bindings import nixlRemoteDisconnectError"
+    echo "nixl import canary OK"
+fi
 
 # Install gRPC packages from source (not PyPI) so PR changes are always tested
 echo "Installing smg-grpc-proto and smg-grpc-servicer from source..."

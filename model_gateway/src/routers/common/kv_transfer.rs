@@ -100,7 +100,7 @@ pub(crate) fn connector_mode_for_worker(worker: &dyn Worker) -> KvConnectorMode 
         None
     } else {
         let dp_size = worker.dp_size().or(label_dp);
-        effective_kv_engine_id(meta.spec.kv_engine_id.as_deref(), dp_size, worker.dp_rank())
+        effective_kv_engine_id(worker.kv_engine_id().as_deref(), dp_size, worker.dp_rank())
     };
     kv_connector_mode(
         meta.spec.kv_connector.as_deref(),
@@ -255,5 +255,29 @@ mod tests {
         );
         assert_eq!(effective_kv_engine_id(Some(""), None, None), None);
         assert_eq!(effective_kv_engine_id(None, Some(2), Some(0)), None);
+    }
+
+    #[test]
+    fn a_refreshed_engine_id_is_what_the_handoff_is_minted_for() {
+        use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType};
+
+        let worker = BasicWorkerBuilder::new("grpc://p:1")
+            .worker_type(WorkerType::Prefill)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::Vllm)
+            .kv_connector("MooncakeConnector")
+            .kv_engine_id("eng-old")
+            .bootstrap_port(Some(8998))
+            .build();
+        assert!(matches!(
+            connector_mode_for_worker(&worker),
+            KvConnectorMode::Mooncake { engine_id: Some(ref id), .. } if id == "eng-old"
+        ));
+        assert!(worker.refresh_kv_engine_id(Some("eng-new".to_string())));
+        assert!(!worker.refresh_kv_engine_id(Some("eng-new".to_string())));
+        assert!(matches!(
+            connector_mode_for_worker(&worker),
+            KvConnectorMode::Mooncake { engine_id: Some(ref id), .. } if id == "eng-new"
+        ));
     }
 }

@@ -21,7 +21,9 @@ use crate::{
     policies::PolicyRegistry,
     rate_limit::RateLimitManager,
     routers::{
-        common::{openai_bridge::FormatRegistry, overload, realtime::RealtimeRegistry},
+        common::{
+            openai_bridge::FormatRegistry, overload, pd_admission, realtime::RealtimeRegistry,
+        },
         gateway::Gateway,
         grpc::multimodal::MultimodalConfigRegistry,
     },
@@ -83,6 +85,8 @@ pub struct AppContext {
     pub worker_client_cache: Arc<WorkerHttpClientCache>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    /// RL control plane state; `None` unless `router_config.rl.enabled`.
+    pub rl: Option<Arc<smg_rl::RlState>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
     /// Bind address for WebRTC UDP sockets (`None` = `0.0.0.0`, auto-detect).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -369,6 +373,8 @@ impl AppContextBuilder {
             &router_config.tenant_api_keys,
         );
 
+        let rl = crate::rl_adapter::build_rl_state(&worker_registry, &router_config);
+
         Ok(AppContext {
             gateway_auth,
             client: self
@@ -413,6 +419,7 @@ impl AppContextBuilder {
             worker_client_cache,
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
+            rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
             webrtc_stun_server: self.webrtc_stun_server,
@@ -567,10 +574,13 @@ impl AppContextBuilder {
 
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(PolicyRegistry::with_override(
-            config.policy.clone(),
-            config.routing_key_override.clone(),
-        )));
+        self.policy_registry = Some(Arc::new(
+            PolicyRegistry::with_override(
+                config.policy.clone(),
+                config.routing_key_override.clone(),
+            )
+            .with_pd_pairing_mode(config.pd_pairing_mode),
+        ));
         self
     }
 
@@ -631,6 +641,9 @@ impl AppContextBuilder {
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
+        // PD dispatch waits here, not in the decode engine's queue, when the
+        // pair's running window is full.
+        pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
         // Wire the backend load-snapshot feed into every policy that consumes
         // it; the monitor polls every group by default, conditionally under
         // `--disable-load-monitoring`.

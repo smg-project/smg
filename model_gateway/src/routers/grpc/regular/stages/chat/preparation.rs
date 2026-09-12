@@ -65,6 +65,8 @@ pub(crate) async fn prepare_chat_like(
     ctx: &mut RequestContext,
     request: &ChatCompletionRequest,
 ) -> Result<(Vec<u32>, ProcessedMessages, Option<(String, String)>), Response> {
+    utils::validate_chat_content_parts(&request.messages)
+        .map_err(|e| error::bad_request("unsupported_content_part", e))?;
     {
         // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
         let tokenizer =

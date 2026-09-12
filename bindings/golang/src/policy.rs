@@ -32,7 +32,7 @@ use smg::{
         circuit_breaker::{CircuitBreaker, CircuitState},
         resilience::ResolvedResilience,
         worker::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
-        ConnectionMode, OverloadThresholds, Worker, WorkerResult, WorkerType,
+        ConnectionMode, OverloadThresholds, PdPairing, Worker, WorkerResult, WorkerType,
     },
 };
 use smg_grpc_client::sglang_scheduler::{SglangGenerateRequestOptions, SglangSchedulerClient};
@@ -71,6 +71,7 @@ impl GrpcWorker {
         spec.runtime_type = RuntimeType::Sglang;
 
         let metadata = WorkerMetadata {
+            pd_pairing: PdPairing::derive(&spec),
             spec: Arc::new(spec),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),

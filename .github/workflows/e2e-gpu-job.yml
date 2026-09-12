@@ -54,6 +54,16 @@ on:
         type: string
         default: "nixl"
         description: "KV transfer backend for vLLM PD workers: nixl or mooncake"
+      kv_backend:
+        required: false
+        type: string
+        default: ""
+        description: "KV transfer backend for every PD worker, whatever the engine (nixl or mooncake); empty keeps each engine's default"
+      vllm_extra_kv_backends:
+        required: false
+        type: string
+        default: ""
+        description: "Additional vLLM KV transfer backends to install beside the lane's own (e.g. mooncake), for fleets that mix transports"
       connection_mode:
         required: false
         type: string
@@ -87,6 +97,8 @@ jobs:
       E2E_RUNTIME: ${{ inputs.engine }}
       E2E_GPU_TIER: ${{ inputs.gpu_tier }}
       E2E_VLLM_KV_BACKEND: ${{ inputs.vllm_kv_backend }}
+      E2E_KV_BACKEND: ${{ inputs.kv_backend }}
+      E2E_VLLM_EXTRA_KV_BACKENDS: ${{ inputs.vllm_extra_kv_backends }}
       E2E_CONNECTION_MODE: ${{ inputs.connection_mode }}
       E2E_ZMQ_ENGINE_COUNT: ${{ inputs.zmq_engine_count }}
       TOKENSPEED_PREBUILT_IMAGE: ${{ inputs.tokenspeed_prebuilt_image }}
@@ -200,7 +212,9 @@ jobs:
           LABEL=$(echo '${{ inputs.test_dirs }}' | tr '/' '-')
           # vLLM legs can differ only by KV backend; disambiguate the artifact
           SUFFIX=""
-          if [ "${{ inputs.engine }}" = "vllm" ]; then
+          if [ -n "${{ inputs.kv_backend }}" ]; then
+            SUFFIX="-${{ inputs.kv_backend }}"
+          elif [ "${{ inputs.engine }}" = "vllm" ]; then
             SUFFIX="-${{ inputs.vllm_kv_backend }}"
           fi
           # gRPC and ZMQ chat legs share engine/GPU/test-dir and differ only by

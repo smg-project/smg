@@ -22,8 +22,8 @@ use crate::{
     routers::{common::retry::mark_non_retryable, error},
     worker::{
         overload::{
-            BRANCH_ALL_OVERLOADED_SHED, BRANCH_OVERLOADED_AT_DISPATCH, STAGE_DISPATCH,
-            STAGE_SELECTION,
+            BRANCH_ALL_OVERLOADED_SHED, BRANCH_OVERLOADED_AT_DISPATCH, BRANCH_PD_ADMISSION_SHED,
+            STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION,
         },
         Worker,
     },
@@ -87,6 +87,33 @@ pub fn shed_if_worker_overloaded(worker: &dyn Worker, model_id: &str) -> Option<
         url,
         format!("Worker '{url}' for model '{model_id}' became overloaded before dispatch"),
     ))
+}
+
+/// Shed a disaggregated dispatch the decode leg cannot admit: the `rooms`
+/// bootstrap rooms it needs do not fit in the engine's running `window`, and
+/// none freed inside the admission wait.
+///
+/// Same client-visible answer as the two vetoes above — the request was never
+/// sent, and the wait already outlived any backoff a retry would add — under
+/// its own decision branch, because here the *pair* is full rather than a
+/// threshold being crossed. The counts are in the message because the two
+/// causes need different operator responses: a transient full window versus a
+/// batched request that is permanently wider than the pair.
+pub(crate) fn shed_pd_admission(
+    worker: &str,
+    model_id: &str,
+    window: usize,
+    rooms: usize,
+) -> Response {
+    shed(
+        BRANCH_PD_ADMISSION_SHED,
+        STAGE_PD_ADMISSION,
+        worker,
+        format!(
+            "Decode worker '{worker}' for model '{model_id}' could not admit {rooms} \
+             request(s) within its running window of {window}"
+        ),
+    )
 }
 
 /// One decision line, one counter, one response — marked non-retryable: the

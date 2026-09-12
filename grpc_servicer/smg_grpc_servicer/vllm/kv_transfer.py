@@ -11,6 +11,36 @@ _MULTI_CONNECTOR = "MultiConnector"
 _SUPPORTED_PD_CONNECTORS = frozenset({"MooncakeConnector", "NixlConnector"})
 
 
+def pairing_fields(vllm_config: object) -> dict:
+    """The KV-layout facts a PD peer must share, read off the engine config.
+
+    Model dtype, KV cache dtype and block size are the config-level factors
+    vLLM folds into its NIXL compatibility hash. The attention backend is the
+    *requested* one (`--attention-backend`): the resolved backend is picked
+    inside the worker process, so on the common auto path this field is
+    absent and the router treats it as unknown rather than as a match. Every
+    field degrades to its proto default when the config does not carry it.
+    """
+    fields: dict = {}
+    cache = getattr(vllm_config, "cache_config", None)
+    if cache is not None:
+        dtype = getattr(cache, "cache_dtype", None)
+        if dtype:
+            fields["kv_cache_dtype"] = str(dtype)
+        block_size = getattr(cache, "block_size", None)
+        if isinstance(block_size, int) and block_size > 0:
+            fields["block_size"] = block_size
+    attention = getattr(vllm_config, "attention_config", None)
+    backend = getattr(attention, "backend", None) if attention is not None else None
+    if backend is not None:
+        fields["attention_backend"] = str(getattr(backend, "name", backend))
+    model = getattr(vllm_config, "model_config", None)
+    dtype = getattr(model, "dtype", None) if model is not None else None
+    if dtype is not None:
+        fields["model_dtype"] = str(dtype)
+    return fields
+
+
 def resolve_pd_connector(config: object) -> tuple[str, str]:
     """Resolve the connector and engine id that SMG should report for PD.
 

@@ -17,7 +17,10 @@ use super::{
         WorkerType,
     },
 };
-use crate::{observability::metrics::Metrics, routers::grpc::backend_client::BackendClient};
+use crate::{
+    observability::metrics::Metrics, routers::grpc::backend_client::BackendClient,
+    worker::pd_pairing::PdPairing,
+};
 
 /// Builder for creating BasicWorker instances with fluent API.
 ///
@@ -319,6 +322,7 @@ impl BasicWorkerBuilder {
 
         let metadata = WorkerMetadata {
             overload: OverloadThresholds::resolve(&self.spec.overload, self.overload_defaults),
+            pd_pairing: PdPairing::derive(&self.spec),
             spec: Arc::new(self.spec),
             health_config,
             health_endpoint: self.health_endpoint,
@@ -359,6 +363,8 @@ impl BasicWorkerBuilder {
         let resilience = self.resilience.unwrap_or_default();
 
         BasicWorker {
+            kv_engine_id: ArcSwapOption::new(metadata.spec.kv_engine_id.clone().map(Arc::new)),
+            kv_engine_id_unconfirmed: AtomicBool::new(false),
             runtime: ArcSwap::from_pointee(WorkerRuntime::new(&metadata.spec.url, initial_status)),
             circuit_breaker: ArcSwap::from_pointee(CircuitBreaker::with_config_and_label(
                 self.circuit_breaker_config,

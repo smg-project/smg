@@ -32,6 +32,7 @@ fi
 
 tooling_hash="$(cat \
     docker/ci-tokenspeed.Dockerfile \
+    scripts/ci_apt_mirror.sh \
     scripts/ci_install_tokenspeed.sh \
     scripts/ci_retry.sh \
     scripts/ci_setup_python_venv.sh \

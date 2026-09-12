@@ -42,7 +42,7 @@ use crate::{
                 KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
             },
             overload,
-            placement::{self, PairCandidates, PairFailure, PlacementFailure, PlacementInputs},
+            placement::{self, PairFailure, PlacementFailure, PlacementInputs},
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, RetryExecutor},
             serialize_json_sized,
@@ -54,7 +54,10 @@ use crate::{
         http::router::send_with_stale_conn_retry,
         RouterTrait,
     },
-    worker::{RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID},
+    worker::{
+        PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
+        UNKNOWN_MODEL_ID,
+    },
 };
 
 /// Why PD pair selection produced nothing.
@@ -71,6 +74,9 @@ enum PdSelectionFailure {
     /// The pre-existing string: no workers configured, all unhealthy or
     /// circuit-broken, or the policy declined.
     Unavailable(String),
+    /// Both legs are up, but no prefill shares a KV transfer protocol with
+    /// any decode (#2483).
+    Incompatible(String),
 }
 
 #[derive(Debug)]
@@ -207,10 +213,18 @@ impl PDRouter {
             // counter; re-describing it as a circuit-breaker/health failure is
             // exactly the misdiagnosis this path used to hand operators.
             PdSelectionFailure::Shed(shed) => shed,
+            PdSelectionFailure::Incompatible(error) => {
+                error!("Failed to select PD pair error={}", error);
+                error::service_unavailable("no_compatible_pd_pair", error)
+            }
             PdSelectionFailure::Unavailable(error) => {
                 error!("Failed to select PD pair error={}", error);
+                // Same code the regular HTTP router and the gRPC routers use
+                // for a leg that is merely down, so a client can key its
+                // retry on one code whatever the transport; the message
+                // still names the leg.
                 error::service_unavailable(
-                    "server_selection_failed",
+                    "no_available_workers",
                     format!("No available servers: {error}"),
                 )
             }
@@ -1302,48 +1316,35 @@ impl PDRouter {
 
         // Shared HTTP-transport projections: this router proxies plain HTTP
         // to the selected worker's URL, so a gRPC or ZMQ worker must never
-        // be selectable. Both legs derive from ONE model snapshot (and, for
-        // the wildcard fallback, ONE global snapshot) — separate lookups
-        // could straddle a concurrent membership change and pair workers
-        // that never coexisted. The fallback stays conditional, matching the
-        // old code: untagged workers index under the literal "unknown" entry
-        // and win when present; only an empty entry widens to every HTTP
-        // prefill/decode worker ("auto" means pick any).
+        // be selectable. Both legs derive from ONE snapshot's pair index:
+        // separate lookups could straddle a concurrent membership change and
+        // pair workers that never coexisted.
         let is_unknown_model = model_id == UNKNOWN_MODEL_ID;
-        let model_snapshot = self.worker_registry.model_routing_snapshot(model_id);
-        let global_snapshot =
-            is_unknown_model.then(|| self.worker_registry.get_routing_snapshot(UNKNOWN_MODEL_ID));
-
-        let prefill_workers = {
-            let by_model = match &model_snapshot {
-                Some(snapshot) => snapshot.pool(RoutingPool::HttpPrefill),
-                None => WorkerRegistry::empty_pool(),
-            };
-            match &global_snapshot {
-                Some(global) if by_model.is_empty() => global.pool(RoutingPool::HttpPrefill),
-                _ => by_model,
-            }
-        };
-
-        let decode_workers = {
-            let by_model = match &model_snapshot {
-                Some(snapshot) => snapshot.pool(RoutingPool::HttpDecode),
-                None => WorkerRegistry::empty_pool(),
-            };
-            match &global_snapshot {
-                Some(global) if by_model.is_empty() => global.pool(RoutingPool::HttpDecode),
-                _ => by_model,
-            }
+        let mode = self.policy_registry.pd_pairing_mode();
+        let by_model = self
+            .worker_registry
+            .model_routing_snapshot(model_id)
+            .map(|snapshot| snapshot.pd_pairs(PdWire::Http, mode));
+        let pairs = match by_model {
+            // A named model routes within its own entry. The wildcard's
+            // literal "unknown" entry wins while it can pair at all; when it
+            // cannot (a leg empty, or no compatible pair) both legs widen
+            // together to the global snapshot, a superset of the entry. This
+            // widening is all-or-nothing per index, unlike the old per-leg
+            // widening, so the two legs always come from one snapshot.
+            Some(index) if !is_unknown_model || index.can_pair() => index,
+            _ if is_unknown_model => self
+                .worker_registry
+                .get_routing_snapshot(UNKNOWN_MODEL_ID)
+                .pd_pairs(PdWire::Http, mode),
+            _ => Arc::new(PdPairIndex::empty()),
         };
 
         let pair = placement::select_pair(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
-            PairCandidates {
-                prefill: &prefill_workers,
-                decode: &decode_workers,
-            },
+            &pairs,
             None,
             false,
             PlacementInputs {
@@ -1378,6 +1379,14 @@ impl PDRouter {
             PlacementFailure::PolicyDeclined(policy) => PdSelectionFailure::Unavailable(
                 format!("Policy {policy} failed to select a {leg} worker"),
             ),
+            PlacementFailure::NoCompatiblePair {
+                prefill,
+                decode,
+                mismatches,
+            } => PdSelectionFailure::Incompatible(format!(
+                "No prefill/decode pair shares a KV transfer protocol (mismatch on \
+                 {mismatches:?}; prefill: {prefill:?}, decode: {decode:?})"
+            )),
         }
     }
 
@@ -1772,6 +1781,9 @@ impl RouterTrait for PDRouter {
                 // broken one already did.
                 Err(failure) => match *failure {
                     PdSelectionFailure::Shed(shed) => return shed,
+                    PdSelectionFailure::Incompatible(e) => {
+                        return error::service_unavailable("no_compatible_pd_pair", e);
+                    }
                     PdSelectionFailure::Unavailable(e) => {
                         return error::service_unavailable(
                             "no_healthy_worker_pair",
@@ -2360,6 +2372,9 @@ mod tests {
                 assert!(error.contains("No prefill workers available"));
             }
             PdSelectionFailure::Shed(_) => panic!("an empty fleet is not an overload shed"),
+            PdSelectionFailure::Incompatible(_) => {
+                panic!("an empty fleet has no pairing to be incompatible about")
+            }
         }
     }
 

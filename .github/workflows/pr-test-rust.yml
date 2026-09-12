@@ -529,6 +529,7 @@ jobs:
               - '.github/workflows/e2e-gpu-job.yml'
               - 'scripts/ci_setup_python_venv.sh'
               - 'scripts/ci_retry.sh'
+              - 'scripts/ci_apt_mirror.sh'
               - 'scripts/ci_install_sglang.sh'
               - 'scripts/ci_install_vllm.sh'
               - 'scripts/ci_install_tokenspeed.sh'
@@ -544,6 +545,7 @@ jobs:
               - 'crates/kv_index/**'
               - 'crates/mesh/**'
               - 'crates/mm_rdma/**'
+              - 'crates/rl/**'
               - 'crates/wasm/**'
               - 'crates/workflow/**'
             chat-completions:
@@ -559,6 +561,7 @@ jobs:
               - 'e2e_test/router/**'
               - 'scripts/ci_install_vllm.sh'
               - 'scripts/ci_install_trtllm.sh'
+              - 'scripts/ci_apt_mirror.sh'
               - 'scripts/ci_install_tokenspeed.sh'
               - 'scripts/ci_tokenspeed_image_tag.sh'
               - 'scripts/ci_fetch_tokenspeed_prebuilt.sh'
@@ -569,6 +572,7 @@ jobs:
               - 'e2e_test/responses/**'
               - 'e2e_test/messages/**'
               - 'scripts/ci_agentic_svc_deps.sh'
+              - 'scripts/ci_apt_mirror.sh'
               - 'scripts/oracle_flyway/**'
             completions:
               - 'crates/grpc_client/**'
@@ -598,6 +602,7 @@ jobs:
               - '.cargo/**'
               - '.github/actions/setup-rust/**'
               - 'scripts/ci_install_rust.sh'
+              - 'scripts/ci_apt_mirror.sh'
               - '.github/workflows/pr-test-rust.yml'
               - 'examples/wasm/wasm-guest-storage-hook/**'
               - 'examples/wasm/wasm-guest-storage-hook-passthrough/**'
@@ -627,9 +632,12 @@ jobs:
             timeout: 36
             test_timeout: 28
             min_selected: 204 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+          # 21 min end to end on a quiet host (setup ~6 min, tests ~15 min);
+          # under runner contention setup alone reached 9 min and the 24 min
+          # budget cut the run short. Keep ~30% headroom like the other rows.
           - engine: vllm
-            timeout: 24
-            test_timeout: 18
+            timeout: 32
+            test_timeout: 24
             min_selected: 202 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: trtllm
             timeout: 36
@@ -848,11 +856,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The router suite grew (load reports, overload, restart); the sglang
+          # lane also switches models between classes, which restarts a worker.
           - engine: sglang
-            timeout: 20
+            timeout: 30
             min_selected: 23 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
-            timeout: 20
+            timeout: 30
             min_selected: 3 # vllm gateway lane selects only 3 tests; floor covers all of them (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
@@ -1000,6 +1010,77 @@ jobs:
       tokenspeed_prebuilt_image: ${{ needs.detect-changes.outputs.tokenspeed-image }}
     secrets: inherit
 
+  # PD disaggregation under one 4-GPU topology (2 prefill + 2 decode) plus a
+  # fleet assembled at runtime through the worker API, per engine. The full
+  # topology sweep (1p1d .. 3p1d) runs in nightly-pd.yml; this lane guards
+  # every PR with the topology that exercises both legs' load balancing.
+  e2e-4gpu-pd:
+    name: e2e-4gpu-pd (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
+    needs: [e2e-1gpu-gateway, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.e2e-1gpu-gateway.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && (needs.detect-changes.outputs.common == 'true'
+                  || needs.detect-changes.outputs.chat-completions == 'true')))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: sglang
+            timeout: 50
+            test_timeout: 42
+          - engine: vllm
+            timeout: 50
+            test_timeout: 42
+          # Qwen3.5-9B loads slower and the prebuilt image is extracted first;
+          # a cold path builds the engine from source.
+          - engine: tokenspeed
+            timeout: 85
+            test_timeout: 60
+          # The other KV transport of each engine (TokenSpeed only has
+          # Mooncake): the same slice on vLLM over Mooncake, and a 1p1d
+          # smoke of SGLang over NIXL (its venv gets NIXL only on this row,
+          # #2498). The peer-restart test stays out of the NIXL smoke: the
+          # SGLang prefill segfaults when its decode comes back on the same
+          # address (#2503). The full sweeps run in nightly-pd.
+          - engine: vllm
+            kv_backend: mooncake
+            timeout: 50
+            test_timeout: 42
+          - engine: sglang
+            kv_backend: nixl
+            timeout: 60
+            test_timeout: 50
+            test_filter: -k "1p1d and not http and not sole_leg_outage"
+            min_selected: 11
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: ${{ matrix.engine }}
+      gpu_tier: "4"
+      runner: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
+      timeout: ${{ matrix.timeout }}
+      test_timeout: ${{ matrix.test_timeout }}
+      test_dirs: e2e_test/router/test_pd_topologies.py
+      # The 2p2d slice (which carries the mixed-transport fleet on vLLM), the
+      # runtime-assembled fleet, the over-window burst, and the two fleets
+      # placement must refuse (mismatched transports, mismatched explicit
+      # protocols); the full sweep runs in nightly-pd.
+      # Run 34440725835: 9-16 min of tests per row against the 42/60 budgets.
+      test_filter: ${{ matrix.test_filter || '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport or MismatchedProtocol"' }}
+      extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
+      # floor ≈ 93% of the slice: 15 cases on sglang/tokenspeed, 17 on vllm
+      # (its two transport classes); the 1p1d smoke selects 13, floor 11
+      min_selected: ${{ matrix.min_selected || 14 }}
+      kv_backend: ${{ matrix.kv_backend || '' }}
+      vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
+      # The mixed-transport fleet needs both vLLM backends installed whatever the lane's own
+      vllm_extra_kv_backends: ${{ matrix.engine == 'vllm' && 'mooncake' || '' }}
+      tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+    secrets: inherit
+
   # --- Vendor E2E: CPU-only cloud backend tests ---
 
   e2e-vendor:
@@ -1144,6 +1225,7 @@ jobs:
 
       - name: Install build tools
         run: |
+          bash scripts/ci_apt_mirror.sh
           sudo apt-get update
           sudo apt-get install -y build-essential
 
@@ -1177,7 +1259,10 @@ jobs:
                   || needs.detect-changes.outputs.go-bindings == 'true')))
     runs-on: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
-    timeout-minutes: 20
+    # 19 min on a quiet host (SGLang setup ~6.5 min, Go ~4 min, tests ~6.5
+    # min); under runner contention the setup step reached 10 min and the
+    # job was cancelled as the last test passed. Keep ~35% headroom.
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -1309,7 +1394,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -1378,6 +1463,7 @@ jobs:
                 "${{ needs.e2e-4gpu-chat.result }}" == "failure" || \
                 "${{ needs.e2e-4gpu-gateway.result }}" == "failure" || \
                 "${{ needs.e2e-4gpu-epd.result }}" == "failure" || \
+                "${{ needs.e2e-4gpu-pd.result }}" == "failure" || \
                 "${{ needs.e2e-vendor.result }}" == "failure" || \
                 "${{ needs.go-unit-tests.result }}" == "failure" || \
                 "${{ needs.go-bindings-e2e.result }}" == "failure" ]]; then

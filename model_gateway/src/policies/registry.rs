@@ -21,7 +21,7 @@ use super::{
     ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
 };
 use crate::{
-    config::types::{ManualAssignmentMode, PolicyConfig, RoutingKeyOverrideConfig},
+    config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
     mesh::adapters::TreeSyncAdapter,
     observability::metrics::Metrics,
     policies::cache_aware::LoadReceiver,
@@ -84,6 +84,8 @@ pub struct PolicyRegistry {
     /// `routing_key_override.headers`; the first header present with a valid
     /// value wins.
     routing_key_headers: Arc<Vec<HeaderName>>,
+    /// How strictly PD placement pairs prefill and decode descriptors.
+    pd_pairing_mode: PdPairingMode,
 }
 
 /// A sticky key with this many of its own requests already in flight on its
@@ -161,7 +163,20 @@ impl PolicyRegistry {
             dp_rank_policy: Arc::new(OnceLock::new()),
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
+            pd_pairing_mode: PdPairingMode::default(),
         }
+    }
+
+    /// Set how strictly PD placement pairs prefill and decode descriptors.
+    #[must_use]
+    pub fn with_pd_pairing_mode(mut self, mode: PdPairingMode) -> Self {
+        self.pd_pairing_mode = mode;
+        self
+    }
+
+    /// How strictly PD placement pairs prefill and decode descriptors.
+    pub fn pd_pairing_mode(&self) -> PdPairingMode {
+        self.pd_pairing_mode
     }
 
     /// Derive the session key from a request id: trailing `_r<n>` retry and

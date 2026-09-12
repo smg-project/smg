@@ -378,6 +378,31 @@ mod tests {
     }
 
     #[test]
+    fn chat_completion_body_preserves_unknown_content_parts() {
+        let content = json!([
+            {"type": "text", "text": "Describe this attachment"},
+            {"type": "vendor_special", "payload": {"items": [1, null, true]}, "option": "keep"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+        ]);
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "alias-model",
+            "messages": [{"role": "user", "content": content}]
+        }))
+        .unwrap();
+
+        // Exercise both direct serialization and the worker's Value-based
+        // prepare_request path, with and without a model rewrite.
+        for worker in [worker(), dp_worker()] {
+            for canonical_model in [None, Some("canonical-model")] {
+                let body = serialize_request_body(&req, canonical_model, &worker, None).unwrap();
+                let parsed: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(parsed["messages"][0]["content"], content);
+                assert_eq!(parsed["model"], canonical_model.unwrap_or("alias-model"));
+            }
+        }
+    }
+
+    #[test]
     fn default_completion_body_reuses_the_direct_serialization() {
         let worker = worker();
         let req: openai_protocol::completion::CompletionRequest = serde_json::from_value(json!({

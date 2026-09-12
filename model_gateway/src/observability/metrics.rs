@@ -474,6 +474,9 @@ pub(crate) fn init_metrics() {
     // Initialize mesh metrics
     smg_mesh::init_mesh_metrics();
 
+    // RL control plane metrics (emit only when the plane is enabled).
+    smg_rl::init_rl_metrics();
+
     // Priority scheduler metrics (no-op at scrape time unless the scheduler
     // is enabled and recording).
     use crate::middleware::scheduler::metrics as scheduler_metrics;
@@ -1124,6 +1127,16 @@ impl Metrics {
     /// Record a PD KV-transfer failure (missing connector params at handoff).
     pub fn record_pd_kv_transfer_failure() {
         counter!("smg_pd_kv_transfer_failures_total").increment(1);
+    }
+
+    /// Record a PD dispatch that had to wait for a decode admission slot.
+    pub fn record_pd_admission_wait() {
+        counter!("smg_pd_admission_waits_total").increment(1);
+    }
+
+    /// Record a PD dispatch shed because no decode slot freed in time.
+    pub fn record_pd_admission_shed() {
+        counter!("smg_pd_admission_sheds_total").increment(1);
     }
 
     // ========================================================================

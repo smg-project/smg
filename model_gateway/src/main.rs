@@ -14,9 +14,10 @@ use smg::{
     config::{
         resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
-        RoutingMode, SchemaConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PdPairingMode,
+        PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
+        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
+        TokenizerCacheConfig, TraceConfig,
     },
     observability::{
         metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
@@ -440,6 +441,19 @@ struct CliArgs {
     )]
     routing_key_override: bool,
 
+    /// How strictly PD placement pairs a prefill with a decode on their KV
+    /// transfer protocol. `lenient` refuses only a known difference in
+    /// runtime, transport or KV layout (unknown components and engine
+    /// versions pair with anything); `strict` also refuses unknown
+    /// components and version differences; `off` pairs on nothing.
+    #[arg(
+        long,
+        value_parser = ["off", "lenient", "strict"],
+        default_value = "lenient",
+        help_heading = "Routing Policy"
+    )]
+    pd_pairing_mode: String,
+
     /// Ordered header names checked for the routing key; the first header
     /// present with a valid value wins. Header keys get the same
     /// per-turn/per-retry suffix stripping as rid-derived keys when the
@@ -454,6 +468,22 @@ struct CliArgs {
     /// Enable minimum tokens scheduler for data parallel group
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
+
+    // ==================== RL Control Plane ====================
+    /// Mount the RL control plane under /v1/rl (worker discovery,
+    /// engine-route passthrough, fan-out). Off by default; when off, no RL
+    /// code path is reachable.
+    #[arg(long, default_value_t = false, help_heading = "RL Control Plane")]
+    enable_rl: bool,
+
+    /// Total timeout for one proxied engine control call (weight refits can
+    /// take minutes)
+    #[arg(long, default_value_t = 600, help_heading = "RL Control Plane")]
+    rl_control_timeout_secs: u64,
+
+    /// Maximum concurrent engine calls in one fan-out
+    #[arg(long, default_value_t = 32, help_heading = "RL Control Plane")]
+    rl_fanout_concurrency: usize,
 
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
@@ -534,6 +564,16 @@ struct CliArgs {
     /// a load-aware routing policy. Routing-owned polls are always re-exported.
     #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
     engine_metrics: bool,
+
+    /// Seconds a prefill/decode dispatch waits for a free slot in the decode
+    /// engine's running window (--max-num-seqs / --max-running-requests)
+    /// before shedding with 503 worker_overload_protection_shed. Keep it well
+    /// under the engine's bootstrap deadline (120s on TokenSpeed) so a
+    /// request that waits still dispatches with the deadline ahead of it. 0
+    /// sheds immediately. Engines that report no running window are never
+    /// gated
+    #[arg(long, default_value_t = 30, help_heading = "Load Monitoring")]
+    pd_admission_wait_secs: u64,
 
     /// TTL in seconds for event-driven cache-aware indexer entries: entries
     /// neither stored nor read by a query within this window are pruned.
@@ -845,16 +885,16 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Health Checks")]
     disable_health_check: bool,
 
-    /// Let workers recover after prolonged failure: a worker that stays
-    /// unhealthy long enough is removed from the registry so service
-    /// discovery re-registers and re-probes it once its engine returns
-    /// (without this, a worker unreachable for ~12 minutes reaches a
-    /// terminal Failed state and is never probed again). Defaults to the
-    /// --service-discovery setting: recovery works by removal plus
-    /// discovery re-registration, so discovery-managed fleets get it for
-    /// free, while without discovery nothing would re-add the worker and
-    /// removal would permanently shrink a static fleet. Pass =false to
-    /// keep it off under discovery.
+    /// Recover failed workers by removal: a worker that stays unhealthy
+    /// long enough (Failed, ~12 minutes at the default thresholds) is
+    /// removed from the registry so service discovery re-registers and
+    /// re-probes it once its engine returns. Without this a Failed worker
+    /// stays registered, out of rotation, and keeps being probed, so it
+    /// rejoins in place as soon as it answers again. Defaults to the
+    /// --service-discovery setting: discovery-managed fleets recover by
+    /// removal plus re-registration, while a static fleet has nothing to
+    /// re-add a removed worker and recovers in place instead. Pass =false
+    /// to keep it off under discovery.
     #[arg(
         long,
         visible_alias = "worker-auto-recovery",
@@ -1814,6 +1854,7 @@ impl CliArgs {
             .job_queue_capacity(self.job_queue_capacity)
             .job_queue_concurrency(self.job_queue_concurrency)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .disable_load_monitoring(self.disable_load_monitoring)
             .worker_overload_protection(self.worker_overload_protection)
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
@@ -1896,6 +1937,7 @@ impl CliArgs {
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
+            .pd_pairing_mode(PdPairingMode::parse(&self.pd_pairing_mode).unwrap_or_default())
             .routing_key_override(RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval,
@@ -1912,6 +1954,11 @@ impl CliArgs {
             .enable_wasm(self.enable_wasm)
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .igw(self.enable_igw)
+            .rl(smg_rl::RlConfig {
+                enabled: self.enable_rl,
+                control_timeout_secs: self.rl_control_timeout_secs,
+                fanout_concurrency: self.rl_fanout_concurrency,
+            })
             .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
             .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
 
@@ -2265,6 +2312,20 @@ mod tests {
                 "{flag} {bad} should be rejected"
             );
         }
+    }
+
+    /// The PD admission wait is a router-only setting and must flow into
+    /// `RouterConfig`, where the dispatch path latches it at startup.
+    #[test]
+    fn pd_admission_wait_flag_flows_into_router_config() {
+        let cli = cli_args_from(&["--pd-admission-wait-secs", "5"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.pd_admission_wait_secs, 5);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.pd_admission_wait_secs, 5);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.pd_admission_wait_secs, 30);
     }
 
     /// The streamed-body stall timeout is a router-only setting and must

@@ -528,6 +528,12 @@ struct Router {
     kv_connector_annotation: String,
     kv_engine_id_annotation: String,
     mm_per_request_image_limit: Option<usize>,
+    pd_admission_wait_secs: u64,
+    /// New parameters MUST be appended here (not inserted mid-list) to avoid
+    /// breaking external Python callers that pass `_Router(...)` positionally.
+    enable_rl: bool,
+    rl_control_timeout_secs: u64,
+    rl_fanout_concurrency: usize,
 }
 
 impl Router {
@@ -848,6 +854,7 @@ impl Router {
             .worker_overload_protection(self.worker_overload_protection)
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -933,6 +940,11 @@ impl Router {
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .igw(self.enable_igw)
+            .rl(smg_rl::RlConfig {
+                enabled: self.enable_rl,
+                control_timeout_secs: self.rl_control_timeout_secs,
+                fanout_concurrency: self.rl_fanout_concurrency,
+            })
             .maybe_client_cert_and_key(
                 self.client_cert_path.as_ref(),
                 self.client_key_path.as_ref(),
@@ -1098,6 +1110,13 @@ impl Router {
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
         mm_per_request_image_limit = None,
+        pd_admission_wait_secs = 30,
+        // Appended last (not inserted mid-list) so every pre-existing
+        // positional argument keeps its index for callers that construct
+        // `_Router(...)` positionally. See the struct-field note above.
+        enable_rl = false,
+        rl_control_timeout_secs = 600,
+        rl_fanout_concurrency = 32,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1251,6 +1270,12 @@ impl Router {
         kv_connector_annotation: String,
         kv_engine_id_annotation: String,
         mm_per_request_image_limit: Option<usize>,
+        pd_admission_wait_secs: u64,
+        // Appended last to match the `#[pyo3(signature)]` order above and
+        // preserve positional-argument compatibility.
+        enable_rl: bool,
+        rl_control_timeout_secs: u64,
+        rl_fanout_concurrency: usize,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1418,6 +1443,10 @@ impl Router {
             kv_connector_annotation,
             kv_engine_id_annotation,
             mm_per_request_image_limit,
+            pd_admission_wait_secs,
+            enable_rl,
+            rl_control_timeout_secs,
+            rl_fanout_concurrency,
         })
     }
 

@@ -41,7 +41,7 @@ use super::{
 use crate::{
     middleware::TenantRequestMeta,
     policies::CacheNamespace,
-    routers::error::internal_error,
+    routers::{common::pd_admission::PdAdmissionGuard, error::internal_error},
     worker::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
 };
 
@@ -626,6 +626,14 @@ pub(crate) enum LoadGuards {
     Batch {
         _guards: Vec<LoadGuards>,
     },
+    /// A disaggregated dispatch whose bootstrap rooms the PD admission gate
+    /// claimed before it was allowed to send. The claim rides with the guards
+    /// so it is released on every path the dispatch can end on — an early
+    /// error, a failed leg, a client disconnect, a retry, or completion.
+    Admitted {
+        _admission: PdAdmissionGuard,
+        _guards: Box<LoadGuards>,
+    },
 }
 
 impl LoadGuards {
@@ -640,6 +648,19 @@ impl LoadGuards {
                 _prefill: WorkerLoadGuard::with_key(prefill.clone(), routing_key),
                 _decode: WorkerLoadGuard::with_key(decode.clone(), routing_key),
             },
+        }
+    }
+
+    /// Bind an admission claim to the dispatch's guards, so the rooms it
+    /// reserved outlive nothing else. `None` (the engine reports no window)
+    /// returns the guards untouched.
+    pub fn admitted(admission: Option<PdAdmissionGuard>, guards: Self) -> Self {
+        match admission {
+            Some(admission) => Self::Admitted {
+                _admission: admission,
+                _guards: Box::new(guards),
+            },
+            None => guards,
         }
     }
 
