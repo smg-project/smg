@@ -1264,41 +1264,39 @@ impl Router {
                 loop {
                     tokio::select! {
                         chunk = stream.next() => {
-                            idle.as_mut().reset(tokio::time::Instant::now() + RECHUNK_IDLE_FLUSH);
+                            if rechunker.is_some() {
+                                idle.as_mut().reset(tokio::time::Instant::now() + RECHUNK_IDLE_FLUSH);
+                            }
                             match chunk {
-                            // Same as the regular relay: an empty upstream chunk must
-                            // not become an empty h2 DATA frame toward the client.
-                            Some(Ok(bytes)) if bytes.is_empty() => {}
-                            Some(Ok(bytes)) => {
-                                let bytes = match rechunker.as_mut() {
-                                    Some(r) => r.feed(&bytes),
-                                    None => bytes,
-                                };
-                                if !bytes.is_empty() && tx.send(Ok(bytes)).await.is_err() {
+                                // Same as the regular relay: an empty upstream chunk must
+                                // not become an empty h2 DATA frame toward the client.
+                                Some(Ok(bytes)) if bytes.is_empty() => {}
+                                Some(Ok(bytes)) => {
+                                    let bytes = match rechunker.as_mut() {
+                                        Some(r) => r.feed(&bytes),
+                                        None => bytes,
+                                    };
+                                    if !bytes.is_empty() && tx.send(Ok(bytes)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    if let Some(tail) = rechunker.as_mut().map(SseRechunker::finish) {
+                                        if !tail.is_empty() {
+                                            let _ = tx.send(Ok(tail)).await;
+                                        }
+                                    }
+                                    let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                                     break;
                                 }
-                            }
-                            Some(Err(e)) => {
-                                if let Some(tail) =
-                                    rechunker.as_mut().map(SseRechunker::finish)
-                                {
-                                    if !tail.is_empty() {
-                                        let _ = tx.send(Ok(tail)).await;
+                                None => {
+                                    if let Some(tail) = rechunker.as_mut().map(SseRechunker::finish) {
+                                        if !tail.is_empty() {
+                                            let _ = tx.send(Ok(tail)).await;
+                                        }
                                     }
+                                    break;
                                 }
-                                let _ = tx.send(Err(format!("Stream error: {e}"))).await;
-                                break;
-                            }
-                            None => {
-                                if let Some(tail) =
-                                    rechunker.as_mut().map(SseRechunker::finish)
-                                {
-                                    if !tail.is_empty() {
-                                        let _ = tx.send(Ok(tail)).await;
-                                    }
-                                }
-                                break;
-                            }
                             }
                         },
                         () = &mut idle, if rechunker.as_ref().is_some_and(SseRechunker::has_pending) => {
