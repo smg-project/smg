@@ -715,3 +715,113 @@ fn kimi_and_openai_tolerate_loose_tool_history() {
         );
     }
 }
+
+#[test]
+fn minimax_normalizes_root_to_leading_system() {
+    let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "MiniMax-M3",
+        "messages": [
+            {"role": "root", "content": "top priority"},
+            {"role": "user", "content": "hi"}
+        ]
+    }))
+    .expect("root role deserializes");
+    req.normalize();
+    assert!(req.validate().is_ok());
+
+    let out = serde_json::to_value(&req).expect("serializes");
+    assert_eq!(out["messages"][0]["role"], json!("system"));
+    assert_eq!(out["messages"][0]["content"], json!("top priority"));
+}
+
+#[test]
+fn minimax_hoists_a_non_leading_root_above_system() {
+    let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "MiniMax-M3",
+        "messages": [
+            {"role": "system", "content": "Always answer in English"},
+            {"role": "root", "content": "Always answer in French", "name": "boss"},
+            {"role": "user", "content": "hi"}
+        ]
+    }))
+    .expect("root role deserializes");
+    req.normalize();
+    assert!(req.validate().is_ok());
+
+    let out = serde_json::to_value(&req).expect("serializes");
+    let roles: Vec<&Value> = out["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|m| &m["role"])
+        .collect();
+    assert_eq!(
+        roles,
+        vec![&json!("system"), &json!("system"), &json!("user")]
+    );
+    assert_eq!(
+        out["messages"][0]["content"],
+        json!("Always answer in French")
+    );
+    assert_eq!(out["messages"][0]["name"], json!("boss"));
+    assert_eq!(
+        out["messages"][1]["content"],
+        json!("Always answer in English")
+    );
+}
+
+#[test]
+fn root_requires_content() {
+    let result = serde_json::from_value::<ChatCompletionRequest>(json!({
+        "model": "MiniMax-M3",
+        "messages": [{"role": "root"}, {"role": "user", "content": "hi"}]
+    }));
+    let err = result.expect_err("a root message without content is meaningless");
+    assert!(
+        err.to_string().contains("missing field `content`"),
+        "root must fail on the missing content field, got: {err}"
+    );
+}
+
+#[test]
+fn minimax_hoists_every_root_in_order() {
+    let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "MiniMax-M3",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "root", "content": "Answer in French"},
+            {"role": "root", "content": "Answer in German"}
+        ]
+    }))
+    .expect("root roles deserialize");
+    req.normalize();
+    let out = serde_json::to_value(&req).expect("serializes");
+    let messages = out["messages"].as_array().expect("messages");
+    let roles: Vec<&Value> = messages.iter().map(|m| &m["role"]).collect();
+    assert_eq!(
+        roles,
+        vec![&json!("system"), &json!("system"), &json!("user")]
+    );
+    assert_eq!(messages[0]["content"], json!("Answer in French"));
+    assert_eq!(messages[1]["content"], json!("Answer in German"));
+}
+
+#[test]
+fn kimi_and_openai_reject_root_role() {
+    for model in ["kimi-k3", "gpt-4o-mini"] {
+        let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": model,
+            "messages": [
+                {"role": "root", "content": "x"},
+                {"role": "user", "content": "hi"}
+            ]
+        }))
+        .expect("root role deserializes");
+        req.normalize();
+        assert!(
+            has_code(&req, "invalid_role"),
+            "{model} must reject role root, got {:?}",
+            error_codes(&req)
+        );
+    }
+}

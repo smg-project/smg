@@ -24,7 +24,8 @@ fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
             ChatMessage::System { content, .. } => Some(content),
             ChatMessage::Developer { content, .. } => Some(content),
             ChatMessage::Tool { content, .. } => Some(content),
-            _ => None,
+            ChatMessage::Root { content, .. } => Some(content),
+            ChatMessage::Assistant { .. } | ChatMessage::Function { .. } => None,
         };
 
         if let Some(MessageContent::Parts(message_parts)) = content {

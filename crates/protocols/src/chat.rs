@@ -70,6 +70,13 @@ pub enum ChatMessage {
         #[serde(flatten)]
         ext: KimiDeveloperExt,
     },
+    /// MiniMax extension: top-priority instruction message, above system.
+    /// Normalized to a system message for dispatch; rejected by other profiles.
+    #[serde(rename = "root")]
+    Root {
+        content: MessageContent,
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
@@ -614,9 +621,10 @@ fn validate_chat_cross_parameters(
 
 impl Normalizable for ChatCompletionRequest {
     /// Normalize the request:
-    /// 1. Drop message extensions that belong to another provider's profile
-    ///    (the one place in the request lifecycle where caller data is removed;
-    ///    see [`ProviderProfile::normalize_chat`])
+    /// 1. Apply the profile's rewrites to the request as the client sent it,
+    ///    before any migration: drop message extensions that belong to another
+    ///    provider's profile and fold MiniMax `root` into the leading system
+    ///    message (see [`ProviderProfile::normalize_chat`])
     /// 2. Migrate deprecated fields to their replacements
     /// 3. Clear deprecated fields and log warnings
     /// 4. Apply OpenAI defaults for tool_choice
@@ -714,7 +722,8 @@ impl GenerationRequest for ChatCompletionRequest {
                 ChatMessage::System { content, .. }
                 | ChatMessage::User { content, .. }
                 | ChatMessage::Tool { content, .. }
-                | ChatMessage::Developer { content, .. } => {
+                | ChatMessage::Developer { content, .. }
+                | ChatMessage::Root { content, .. } => {
                     if has_content && content.has_text() {
                         buffer.push(' ');
                     }
