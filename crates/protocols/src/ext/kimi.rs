@@ -4,13 +4,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::{common::Tool, ext::ProviderExt, profile::ProviderProfile};
 
+/// A declared tool list, kept raw when it does not parse so the Kimi profile
+/// can reject it and every other profile can drop it without failing parsing.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum DeclaredTools {
+    Tools(Vec<Tool>),
+    Malformed(serde_json::Value),
+}
+
+impl DeclaredTools {
+    /// The declared tools, when the declaration parsed.
+    pub fn typed(&self) -> Option<&[Tool]> {
+        match self {
+            Self::Tools(tools) => Some(tools),
+            Self::Malformed(_) => None,
+        }
+    }
+}
+
 /// Dynamic-tool declaration on system messages (K3): tools may be declared on
 /// a system message with empty content, at any position in the conversation,
 /// with the same status as request-level tools.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct KimiSystemExt {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<Tool>>,
+    pub tools: Option<DeclaredTools>,
 }
 
 /// Captured so the Kimi profile can reject tools on non-system roles with a
@@ -37,7 +56,7 @@ pub struct KimiAssistantExt {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct KimiDeveloperExt {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<Tool>>,
+    pub tools: Option<DeclaredTools>,
 }
 
 impl ProviderExt for KimiSystemExt {

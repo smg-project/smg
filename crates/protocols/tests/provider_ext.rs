@@ -109,6 +109,7 @@ fn parsed_system_message_exposes_dynamic_tools() {
     match msg {
         ChatMessage::System { ext, .. } => {
             let tools = ext.tools.expect("tools parsed");
+            let tools = tools.typed().expect("declaration parsed as tools");
             assert_eq!(tools.len(), 1);
             assert_eq!(tools[0].function.name, "get_time");
         }
@@ -234,8 +235,8 @@ fn non_kimi_models_ignore_message_tools_of_any_shape() {
     // The capture is raw JSON, so a malformed value on a role that only the
     // Kimi profile inspects is dropped as before rather than failing parsing.
     for model in ["gpt-4o-mini", "MiniMax-M3"] {
-        for role in ["user", "assistant"] {
-            for tools in [json!({"name": "x"}), json!([{}]), json!("x")] {
+        for role in ["user", "assistant", "system", "developer"] {
+            for tools in [json!({"name": "x"}), json!([{}]), json!("x"), json!(null)] {
                 let mut req: ChatCompletionRequest = serde_json::from_value(json!({
                     "model": model,
                     "messages": [{"role": role, "content": "hi", "tools": tools}]
@@ -249,6 +250,38 @@ fn non_kimi_models_ignore_message_tools_of_any_shape() {
                     "{model}/{role}/{tools}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn kimi_profile_treats_null_tools_as_absent() {
+    for role in ["user", "assistant", "system", "developer"] {
+        let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "kimi-k3",
+            "messages": [{"role": role, "content": "hi", "tools": null}]
+        }))
+        .expect("request deserializes");
+        req.normalize();
+        assert!(req.validate().is_ok(), "{role}: {:?}", error_codes(&req));
+    }
+}
+
+#[test]
+fn kimi_profile_rejects_malformed_tools_on_system_and_developer() {
+    for role in ["system", "developer"] {
+        for tools in [json!({"name": "x"}), json!([{}]), json!("x")] {
+            let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "kimi-k3",
+                "messages": [{"role": role, "content": "", "tools": tools}]
+            }))
+            .expect("request deserializes");
+            req.normalize();
+            assert!(
+                error_codes(&req).contains(&"tools_malformed".to_string()),
+                "{role}/{tools}: {:?}",
+                error_codes(&req)
+            );
         }
     }
 }
