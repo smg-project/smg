@@ -1699,6 +1699,28 @@ impl Router {
             "false",
         );
 
+        // Match the typed and multipart paths: close the selection-to-dispatch
+        // race where a fresh load report can veto the chosen worker after the
+        // policy selected it but before any request body reaches the engine.
+        if let Some(response) =
+            overload::shed_if_worker_overloaded(worker.as_ref(), model_id)
+        {
+            Metrics::record_router_upstream_response(
+                metrics_labels::ROUTER_HTTP,
+                response.status().as_u16(),
+                extract_error_code_from_response(&response),
+            );
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                model_id,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
+            return Ok(response);
+        }
+
         let load_guard = WorkerLoadGuard::with_key(
             worker.clone(),
             self.policy_registry.sticky_header_key(Some(req.headers())),
@@ -2135,7 +2157,7 @@ mod tests {
     use super::*;
     use crate::{
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
-        policies::CacheAwarePolicy,
+        policies::{CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
         routers::common::{
             body_policy::{
                 REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT, REASON_RETRYABLE,
@@ -2622,6 +2644,29 @@ mod tests {
             .build()
     }
 
+    #[derive(Debug)]
+    struct OverloadDuringSelectionPolicy;
+
+    impl LoadBalancingPolicy for OverloadDuringSelectionPolicy {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            _info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            let selected = workers.first()?;
+            selected.set_overloaded(true);
+            Some(0)
+        }
+
+        fn name(&self) -> &'static str {
+            "overload_during_selection"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
     type CapturedUpstreamRequest = Arc<tokio::sync::Mutex<Option<(HeaderMap, Bytes)>>>;
 
     /// Loopback engine stub: captures the forwarded `/generate` request and
@@ -2840,6 +2885,39 @@ mod tests {
         assert_eq!(
             headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
             Some("application/json")
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_dispatch_rechecks_overload_after_selection() {
+        let (url, captured) = spawn_capture_stub("application/json", "{}").await;
+        let mut policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        policies.replace_default_policy_for_test(Arc::new(OverloadDuringSelectionPolicy));
+        let router = streaming_router_with_registry(
+            Arc::new(policies),
+            1024 * 1024,
+            vec![plain_worker(&url)],
+        );
+
+        let response = router
+            .route_streaming_request(
+                streamed_request(&[b"{\"text\":\"hello\"}"]),
+                "/generate",
+                false,
+            )
+            .await
+            .expect("the streamed path should return its overload response directly");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "worker_overload_protection_shed"
+        );
+        assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "10");
+        assert!(!is_retryable_response(&response));
+        assert!(
+            captured.lock().await.is_none(),
+            "the request body must not reach a worker vetoed after selection"
         );
     }
 

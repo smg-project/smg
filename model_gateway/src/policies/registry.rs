@@ -564,6 +564,14 @@ impl PolicyRegistry {
         Arc::clone(&self.default_policy)
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_default_policy_for_test(
+        &mut self,
+        policy: Arc<dyn LoadBalancingPolicy>,
+    ) {
+        self.default_policy = policy;
+    }
+
     /// Get policy for a model, or default if not found
     pub fn get_policy_or_default(&self, model_id: &str) -> Arc<dyn LoadBalancingPolicy> {
         self.get_policy(model_id)
