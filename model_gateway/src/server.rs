@@ -49,6 +49,7 @@ use crate::{
     config::RouterConfig,
     endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
     mesh::MeshAdapters,
+    mesh_discovery::{start_mesh_discovery, MeshDiscoveryConfig},
     middleware::{self, AdmissionQueue, AuthConfig},
     observability::{
         logging::{self, LoggingConfig},
@@ -737,6 +738,9 @@ pub struct ServerConfig {
     pub log_level: Option<String>,
     pub log_json: bool,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
+    /// Kubernetes discovery of SMG mesh router peers. Independent of the
+    /// worker discovery provider: either may run without the other.
+    pub mesh_discovery_config: Option<MeshDiscoveryConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
@@ -1037,6 +1041,28 @@ pub fn build_app(
         .layer(create_cors_layer(cors_allowed_origins))
         .fallback(sink_handler)
         .with_state(app_state))
+}
+
+/// Keep a discovery task's abort handle for shutdown while a supervisor logs if
+/// the task ever stops on its own. A watcher that panics or whose stream ends
+/// permanently disables that discovery, so it must not fail silently.
+fn supervise_discovery(
+    name: &'static str,
+    handle: tokio::task::JoinHandle<()>,
+) -> tokio::task::AbortHandle {
+    let abort = handle.abort_handle();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "supervisor outlives the task it watches; it ends when that task ends"
+    )]
+    spawn(async move {
+        match handle.await {
+            Ok(()) => error!("{name} task exited; it no longer receives updates"),
+            Err(e) if e.is_cancelled() => debug!("{name} task cancelled at shutdown"),
+            Err(e) => error!("{name} task panicked and is no longer running: {e}"),
+        }
+    });
+    abort
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -1385,35 +1411,50 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         mesh_adapters,
         probe_state,
     });
+    // Worker discovery and mesh-router discovery are independent lifetimes:
+    // either may run without the other. Each is supervised for unexpected exit
+    // and its abort handle held so shutdown cancels it.
+    let mut discovery_tasks: Vec<tokio::task::AbortHandle> = Vec::new();
+
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {
             let app_context_arc = Arc::clone(&app_state.context);
-
-            match start_service_discovery(
-                service_discovery_config,
-                app_context_arc,
-                mesh_cluster_state,
-                mesh_port,
-            )
-            .await
-            {
+            match start_service_discovery(service_discovery_config, app_context_arc).await {
                 Ok(handle) => {
                     info!("Service discovery started");
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "service discovery runs for the lifetime of the server"
-                    )]
-                    spawn(async move {
-                        if let Err(e) = handle.await {
-                            error!("Service discovery task failed: {:?}", e);
-                        }
-                    });
+                    discovery_tasks.push(supervise_discovery("Worker discovery", handle));
                 }
                 Err(e) => {
                     error!("Failed to start service discovery: {e}");
                     warn!("Continuing without service discovery");
                 }
             }
+        }
+    }
+
+    if let Some(mesh_discovery_config) = config.mesh_discovery_config {
+        match (
+            mesh_discovery_config.is_enabled(),
+            mesh_cluster_state,
+            mesh_port,
+        ) {
+            (true, Some(cluster_state), Some(port)) => {
+                match start_mesh_discovery(mesh_discovery_config, cluster_state, port).await {
+                    Ok(handle) => {
+                        info!("Mesh router discovery started");
+                        discovery_tasks.push(supervise_discovery("Mesh router discovery", handle));
+                    }
+                    Err(e) => {
+                        error!("Failed to start mesh router discovery: {e}");
+                        warn!("Continuing without mesh router discovery");
+                    }
+                }
+            }
+            (true, _, _) => warn!(
+                "Router selector configured but mesh is not enabled (mesh cluster state or \
+                 mesh port not provided). Skipping router discovery."
+            ),
+            (false, _, _) => {}
         }
     }
 
@@ -1546,6 +1587,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     info!("HTTP server stopped. Starting component cleanup...");
 
+    for task in discovery_tasks {
+        task.abort();
+    }
+
     // This triggers background task cancellation, waits for tools, and denies approvals
     if let Some(orchestrator) = app_context.mcp_orchestrator.get() {
         orchestrator.shutdown().await;
@@ -1637,6 +1682,7 @@ mod tests {
             log_level: None,
             log_json: false,
             service_discovery_config: None,
+            mesh_discovery_config: None,
             prometheus_config: None,
             request_timeout_secs: 60,
             request_id_headers: None,

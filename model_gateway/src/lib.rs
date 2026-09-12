@@ -3,6 +3,7 @@ pub mod config;
 pub mod endpoints;
 pub mod health;
 pub mod mesh;
+pub mod mesh_discovery;
 pub mod middleware;
 pub mod observability;
 pub mod policies;

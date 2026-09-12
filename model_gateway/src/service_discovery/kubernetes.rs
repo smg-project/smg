@@ -10,25 +10,20 @@ use kube::{
     api::Api,
     runtime::{
         reflector::{self, Store},
-        watcher::{watcher, Config, Event},
+        watcher::{watcher, Config},
         WatchStreamExt,
     },
     Client,
 };
-use openai_protocol::worker::{WorkerSpec, WorkerType};
+use openai_protocol::worker::WorkerType;
 use rustls::crypto::ring;
-use smg_mesh::{
-    gossip::{NodeState, NodeStatus},
-    ClusterState,
-};
 use tokio::{sync::Notify, task, time};
 use tracing::{debug, error, info, warn};
 
+use super::reconciler::{self, DesiredState, DesiredWorker};
 use crate::{
     app_context::AppContext,
-    observability::metrics::{metrics_labels, Metrics},
-    worker::{WorkerOrigin, MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
-    workflow::{Job, WorkerRegistrationMode},
+    worker::{MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
 };
 
 /// Source for per-worker model_id override during Kubernetes service discovery.
@@ -104,9 +99,6 @@ pub struct ServiceDiscoveryConfig {
     /// KV metadata is captured at worker registration; replace a Pod after changing it.
     pub kv_connector_annotation: String,
     pub kv_engine_id_annotation: String,
-    // Router node discovery for mesh
-    pub router_selector: HashMap<String, String>,
-    pub router_mesh_port_annotation: String,
     /// Per-worker model_id override source from pod metadata.
     pub model_id_source: Option<ModelIdSource>,
 }
@@ -154,28 +146,16 @@ impl ServiceDiscoveryConfig {
         .filter(|selector| !selector.is_empty())
         .collect()
     }
-
-    /// Build a label selector string for router pod K8s list/watch calls.
-    /// Returns an empty string when the router selector is unset, in which
-    /// case the watcher should fall back to listing without server-side
-    /// label filtering.
-    fn router_label_selector(&self) -> String {
-        self.router_selector
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    }
 }
 
 /// Build a kube watcher Config that pushes the given label selector down to
 /// the API server, logging watcher startup at INFO. An empty selector falls
 /// back to `Config::default()` (no server-side label filtering) so the
 /// watcher still functions when no selector is set.
-fn build_watcher_config(watcher_kind: &str, label_selector: &str) -> Config {
+fn build_watcher_config(label_selector: &str) -> Config {
     info!(
-        "Starting K8s {} watcher | selector: '{}'",
-        watcher_kind, label_selector
+        "Starting K8s worker watcher | selector: '{}'",
+        label_selector
     );
     if label_selector.is_empty() {
         Config::default()
@@ -200,8 +180,6 @@ impl Default for ServiceDiscoveryConfig {
             worker_ports_annotation: "smg.ai/worker-ports".to_string(),
             kv_connector_annotation: "smg.ai/kv-connector".to_string(),
             kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
-            router_selector: HashMap::new(),
-            router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
         }
     }
@@ -214,11 +192,6 @@ pub enum PodType {
     Decode,
     Regular,
 }
-
-/// Labels stamped on every discovery-created worker; workers carrying
-/// [`POD_UID_LABEL`] are owned (added/removed) by the K8s reconciler.
-pub const POD_NAME_LABEL: &str = "smg.ai/pod-name";
-pub const POD_UID_LABEL: &str = "smg.ai/pod-uid";
 
 #[derive(Debug, Clone)]
 pub struct PodInfo {
@@ -235,8 +208,6 @@ pub struct PodInfo {
     pub bootstrap_ports: Vec<Option<u16>>,
     pub kv_connector: Option<String>,
     pub kv_engine_ids: Vec<Option<String>>,
-    pub is_router: bool,
-    pub mesh_port: Option<u16>,
     pub model_id_override: Option<String>,
 }
 
@@ -340,29 +311,6 @@ impl PodInfo {
             .map(|config| resolve_kv_engine_ids(&name, pod, config, ports.len()))
             .unwrap_or_else(|| vec![None; ports.len()]);
 
-        // Check if this is a router pod
-        let is_router = if let Some(config) = config {
-            !config.router_selector.is_empty()
-                && Self::matches_selector(pod, &config.router_selector)
-        } else {
-            false
-        };
-
-        // Extract mesh port from annotation if this is a router pod
-        let mesh_port = if is_router {
-            if let Some(config) = config {
-                pod.metadata
-                    .annotations
-                    .as_ref()
-                    .and_then(|annotations| annotations.get(&config.router_mesh_port_annotation))
-                    .and_then(|port_str| port_str.parse::<u16>().ok())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
         // Extract model_id override from pod metadata if source is configured
         let model_id_override = config
             .and_then(|c| c.model_id_source.as_ref())
@@ -379,8 +327,6 @@ impl PodInfo {
             bootstrap_ports,
             kv_connector,
             kv_engine_ids,
-            is_router,
-            mesh_port,
             model_id_override,
         })
     }
@@ -498,8 +444,6 @@ fn resolve_bootstrap_ports(
 pub async fn start_service_discovery(
     config: ServiceDiscoveryConfig,
     app_context: Arc<AppContext>,
-    mesh_cluster_state: Option<ClusterState>,
-    mesh_port: Option<u16>,
 ) -> Result<task::JoinHandle<()>, kube::Error> {
     if !config.enabled {
         return Err(kube::Error::Api(
@@ -513,13 +457,7 @@ pub async fn start_service_discovery(
 
     let client = Client::try_default().await?;
 
-    Ok(run_service_discovery(
-        client,
-        config,
-        app_context,
-        mesh_cluster_state,
-        mesh_port,
-    ))
+    Ok(run_service_discovery(client, config, app_context))
 }
 
 /// Run discovery against an injected client. Compiled only for this crate's
@@ -529,19 +467,15 @@ pub fn start_service_discovery_with_client(
     client: Client,
     config: ServiceDiscoveryConfig,
     app_context: Arc<AppContext>,
-    mesh_cluster_state: Option<ClusterState>,
-    mesh_port: Option<u16>,
 ) -> task::JoinHandle<()> {
     let _ = ring::default_provider().install_default();
-    run_service_discovery(client, config, app_context, mesh_cluster_state, mesh_port)
+    run_service_discovery(client, config, app_context)
 }
 
 fn run_service_discovery(
     client: Client,
     config: ServiceDiscoveryConfig,
     app_context: Arc<AppContext>,
-    mesh_cluster_state: Option<ClusterState>,
-    mesh_port: Option<u16>,
 ) -> task::JoinHandle<()> {
     // Log the appropriate selectors based on mode
     if config.disaggregated_mode {
@@ -584,23 +518,9 @@ fn run_service_discovery(
         );
     }
 
-    // Log router discovery if enabled
-    if !config.router_selector.is_empty() {
-        let router_selector = config
-            .router_selector
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        info!(
-            "Router node discovery enabled | selector: '{}' | mesh port annotation: '{}'",
-            router_selector, config.router_mesh_port_annotation
-        );
-    }
-
     #[expect(
         clippy::disallowed_methods,
-        reason = "service discovery runs for the lifetime of the server; shutdown is handled by dropping the handle"
+        reason = "worker discovery runs for the lifetime of the server; shutdown aborts the handle"
     )]
     let handle = task::spawn(async move {
         let pods: Api<Pod> = if let Some(namespace) = &config.namespace {
@@ -613,43 +533,6 @@ fn run_service_discovery(
 
         let config_arc = Arc::new(config);
 
-        // Spawn router discovery task if enabled and mesh is available
-        // Router discovery requires mesh to be enabled to update cluster state
-        // If mesh is not enabled, router discovery is skipped and service discovery works independently
-        if !config_arc.router_selector.is_empty() {
-            if let (Some(cluster_state), Some(mesh_port)) = (mesh_cluster_state.clone(), mesh_port)
-            {
-                let router_config = config_arc.clone();
-                let router_pods = pods.clone();
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "router discovery runs for the lifetime of the server alongside worker discovery"
-                )]
-                let router_handle = tokio::spawn(async move {
-                    start_router_discovery(router_config, router_pods, cluster_state, mesh_port)
-                        .await;
-                });
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "monitor task runs for the lifetime of the server"
-                )]
-                tokio::spawn(async move {
-                    if let Err(e) = router_handle.await {
-                        error!(
-                            "Router discovery task panicked and is no longer running: {}",
-                            e
-                        );
-                    }
-                });
-                info!("Router discovery enabled (requires mesh to be enabled)");
-            } else {
-                warn!(
-                    "Router selector configured but mesh is not enabled (mesh cluster state or mesh port not provided). \
-                    Router discovery requires mesh to be enabled. Skipping router discovery."
-                );
-            }
-        }
-
         // Level-triggered reconcile: the reflector keeps `store` consistent
         // with the API server (initial LIST → watch, re-LIST on desync,
         // reconnect with internal backoff). Every watch event and a periodic
@@ -657,7 +540,7 @@ fn run_service_discovery(
         let (store, writer) = reflector::store::<Pod>();
         let notify = Arc::new(Notify::new());
 
-        let watcher_config = build_watcher_config("worker", &config_arc.list_label_selector());
+        let watcher_config = build_watcher_config(&config_arc.list_label_selector());
         // managed_fields dominate pod object size and nothing here reads them;
         // pruning keeps the long-lived Store lean.
         let mut stream = watcher(pods, watcher_config)
@@ -700,7 +583,7 @@ fn run_service_discovery(
                     }
                     _ = interval.tick() => {}
                 }
-                reconcile_workers(&store, &config_arc, &app_context).await;
+                reconcile_once(&store, &config_arc, &app_context).await;
             }
         };
 
@@ -708,32 +591,6 @@ fn run_service_discovery(
     });
 
     handle
-}
-
-/// One worker the reconciler wants registered: a single engine server
-/// (pod IP + data port) plus the metadata needed to build its spec.
-#[derive(Debug, Clone)]
-struct DesiredWorker {
-    /// Bare host:port so DetectConnectionModeStep dual-probes HTTP and gRPC.
-    url: String,
-    worker_type: WorkerType,
-    bootstrap_port: Option<u16>,
-    pod_name: String,
-    pod_uid: String,
-    model_id_override: Option<String>,
-    kv_connector: Option<String>,
-    kv_engine_id: Option<String>,
-}
-
-/// Desired view of the cluster derived from the store snapshot.
-#[derive(Debug, Default)]
-struct DesiredState {
-    /// Owning pod uid per worker URL for Ready, non-terminating Pods.
-    /// Registered workers whose URL is absent — or owned by a different Pod
-    /// uid — enter the existing drain/remove workflow.
-    uid_by_url: HashMap<String, String>,
-    /// Workers on Running, Ready Pods — registration candidates.
-    addable: Vec<DesiredWorker>,
 }
 
 fn worker_type_for(pod_type: Option<&PodType>, disaggregated_mode: bool) -> WorkerType {
@@ -793,310 +650,16 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
     state
 }
 
-/// A registry worker owned by K8s discovery (stamped with [`POD_UID_LABEL`]).
-#[derive(Debug, Clone)]
-struct OwnedWorker {
-    /// Scheme- and DP-rank-stripped `host:port`.
-    url: String,
-    pod_uid: String,
-    /// Revision guard for removal: a concurrently replaced worker is skipped
-    /// and re-evaluated on the next pass instead of removed blindly.
-    revision: u64,
-}
-
-/// `http://10.0.0.1:8080@2` → `10.0.0.1:8080`.
-fn canonical_host_port(url: &str) -> &str {
-    let stripped = ["http://", "https://", "grpc://", "grpcs://", "ipc://"]
-        .iter()
-        .find_map(|scheme| url.strip_prefix(scheme))
-        .unwrap_or(url);
-    stripped.split('@').next().unwrap_or(stripped)
-}
-
-/// Snapshot the registry workers this reconciler owns: locally registered
-/// (never mesh-imported) and stamped with the pod-uid label. Manually added
-/// workers lack the label and are never touched.
-fn k8s_owned_workers(app_context: &AppContext) -> Vec<OwnedWorker> {
-    app_context
-        .worker_registry
-        .get_all_with_ids()
-        .into_iter()
-        .filter_map(|(id, worker)| {
-            if app_context.worker_registry.origin_of(&id) != Some(WorkerOrigin::Local) {
-                return None;
-            }
-            let pod_uid = worker.metadata().spec.labels.get(POD_UID_LABEL)?.clone();
-            Some(OwnedWorker {
-                url: canonical_host_port(worker.url()).to_string(),
-                pod_uid,
-                revision: worker.revision(),
-            })
-        })
-        .collect()
-}
-
-#[derive(Debug, Default)]
-struct ReconcileActions {
-    /// Workers to register: new URLs, plus same-URL pods whose uid changed
-    /// (restart with a stable IP).
-    add: Vec<DesiredWorker>,
-    /// Workers to remove: URL gone from the desired set, or owned by a pod
-    /// uid that no longer holds the URL (covers a stale-scheme sibling the
-    /// same-URL Upsert cannot replace).
-    remove: Vec<OwnedWorker>,
-}
-
-fn compute_actions(desired: &DesiredState, registered: &[OwnedWorker]) -> ReconcileActions {
-    let mut actions = ReconcileActions::default();
-
-    let mut registered_uid: HashMap<&str, &str> = HashMap::new();
-    for worker in registered {
-        registered_uid.insert(worker.url.as_str(), worker.pod_uid.as_str());
-        match desired.uid_by_url.get(worker.url.as_str()) {
-            Some(uid) if *uid == worker.pod_uid => {}
-            _ => actions.remove.push(worker.clone()),
-        }
-    }
-    // DP-rank expansions share one canonical URL; remove it once.
-    actions.remove.sort_unstable_by(|a, b| a.url.cmp(&b.url));
-    actions.remove.dedup_by(|a, b| a.url == b.url);
-
-    for worker in &desired.addable {
-        match registered_uid.get(worker.url.as_str()) {
-            Some(uid) if *uid == worker.pod_uid => {}
-            _ => actions.add.push(worker.clone()),
-        }
-    }
-    actions
-}
-
-fn build_worker_spec(desired: &DesiredWorker, app_context: &AppContext) -> WorkerSpec {
-    let mut spec = WorkerSpec::new(desired.url.clone());
-    spec.worker_type = desired.worker_type;
-    spec.bootstrap_port = desired.bootstrap_port;
-    spec.labels
-        .insert(POD_NAME_LABEL.to_string(), desired.pod_name.clone());
-    spec.labels
-        .insert(POD_UID_LABEL.to_string(), desired.pod_uid.clone());
-    // served_model_name is priority #2 in create_worker's model_id chain.
-    if let Some(ref model_id) = desired.model_id_override {
-        spec.labels
-            .insert("served_model_name".to_string(), model_id.clone());
-    }
-    spec.kv_connector.clone_from(&desired.kv_connector);
-    spec.kv_engine_id.clone_from(&desired.kv_engine_id);
-    spec.api_key.clone_from(&app_context.router_config.api_key);
-    spec.max_connection_attempts = app_context
-        .router_config
-        .health_check
-        .success_threshold
-        .max(1)
-        * 20;
-    spec
-}
-
-/// One reconcile pass: diff desired workers (store snapshot) against the
-/// K8s-owned registry entries and submit Add/Remove jobs for the gap.
-/// Failed or missed work is retried on the next pass by construction.
-async fn reconcile_workers(
+/// Convert the current reflector store snapshot into desired workers and hand
+/// it to the shared reconciler. Kubernetes-specific conversion stops here.
+async fn reconcile_once(
     store: &Store<Pod>,
     config: &ServiceDiscoveryConfig,
     app_context: &Arc<AppContext>,
 ) {
-    let start = time::Instant::now();
-    let snapshot = store.state();
-    let desired = compute_desired_state(&snapshot, config);
-    let registered = k8s_owned_workers(app_context);
-    let actions = compute_actions(&desired, &registered);
-
-    let desired_count = desired.uid_by_url.len();
-    if actions.add.is_empty() && actions.remove.is_empty() {
-        Metrics::set_discovery_workers_discovered(
-            metrics_labels::DISCOVERY_KUBERNETES,
-            desired_count,
-        );
-        return;
-    }
-
-    let Some(job_queue) = app_context.worker_job_queue.get() else {
-        warn!(
-            "JobQueue not initialized; deferring {} addition(s), {} removal(s)",
-            actions.add.len(),
-            actions.remove.len()
-        );
-        return;
-    };
-
-    // One in-flight job per URL: a pending/processing job owns that worker's
-    // transition (a duplicate removal would find it already Draining, skip
-    // the settle sleep, and collapse the drain window). Completed/failed
-    // statuses do not block, so failures retry on the next pass.
-    let in_flight = |url: &str| {
-        job_queue
-            .get_status(url)
-            .is_some_and(|status| status.status == "pending" || status.status == "processing")
-    };
-    let removals: Vec<&OwnedWorker> = actions
-        .remove
-        .iter()
-        .filter(|worker| !in_flight(&worker.url))
-        .collect();
-    let additions: Vec<&DesiredWorker> = actions
-        .add
-        .iter()
-        .filter(|worker| !in_flight(&worker.url))
-        .collect();
-
-    if removals.is_empty() && additions.is_empty() {
-        Metrics::set_discovery_workers_discovered(
-            metrics_labels::DISCOVERY_KUBERNETES,
-            desired_count,
-        );
-        return;
-    }
-
-    info!(
-        "Reconciling workers: {} to add, {} to remove ({} desired)",
-        additions.len(),
-        removals.len(),
-        desired_count
-    );
-
-    for worker in removals {
-        info!(
-            "Removing worker {}: pod unready, gone, terminating, or replaced",
-            worker.url
-        );
-        let job = Job::RemoveWorker {
-            url: worker.url.clone(),
-            expected_revision: Some(worker.revision),
-        };
-        match job_queue.submit(job).await {
-            Ok(()) => Metrics::record_discovery_deregistration(
-                metrics_labels::DISCOVERY_KUBERNETES,
-                metrics_labels::DEREGISTRATION_RECONCILED,
-            ),
-            Err(e) => error!("Failed to submit worker removal for {}: {}", worker.url, e),
-        }
-    }
-
-    for worker in additions {
-        info!(
-            "Registering worker {} ({:?}) for pod {}",
-            worker.url, worker.worker_type, worker.pod_name
-        );
-        let job = Job::AddWorker {
-            config: Box::new(build_worker_spec(worker, app_context)),
-            registration_mode: WorkerRegistrationMode::Upsert,
-        };
-        match job_queue.submit(job).await {
-            Ok(()) => Metrics::record_discovery_registration(
-                metrics_labels::DISCOVERY_KUBERNETES,
-                metrics_labels::REGISTRATION_SUCCESS,
-            ),
-            Err(e) => {
-                error!("Failed to submit worker addition for {}: {}", worker.url, e);
-                Metrics::record_discovery_registration(
-                    metrics_labels::DISCOVERY_KUBERNETES,
-                    metrics_labels::REGISTRATION_FAILED,
-                );
-            }
-        }
-    }
-
-    Metrics::set_discovery_workers_discovered(metrics_labels::DISCOVERY_KUBERNETES, desired_count);
-    Metrics::record_discovery_sync_duration(metrics_labels::DISCOVERY_KUBERNETES, start.elapsed());
-}
-
-/// Apply one router-watcher event to the mesh cluster state. A hard delete
-/// or a set deletion timestamp marks the node Down; the mesh SWIM/CRDT layer
-/// owns convergence, so no store snapshot is needed here.
-fn apply_router_event(
-    event: &Event<Pod>,
-    config: &ServiceDiscoveryConfig,
-    cluster_state: &ClusterState,
-    default_mesh_port: u16,
-) {
-    let (pod, is_delete) = match event {
-        Event::Apply(pod) | Event::InitApply(pod) => (pod, false),
-        Event::Delete(pod) => (pod, true),
-        Event::Init | Event::InitDone => return,
-    };
-
-    if !PodInfo::matches_selector(pod, &config.router_selector) {
-        return;
-    }
-    let Some(pod_info) = PodInfo::from_pod(pod, Some(config)) else {
-        return;
-    };
-    if !pod_info.is_router {
-        return;
-    }
-
-    if is_delete || pod.metadata.deletion_timestamp.is_some() {
-        let mut state = cluster_state.write();
-        if let Some(node) = state.get_mut(&pod_info.name) {
-            node.status = NodeStatus::Down as i32;
-            node.version += 1;
-            info!("Router node {} marked as Down (pod deleted)", pod_info.name);
-        } else {
-            debug!(
-                "Router node {} not found in cluster state (already removed)",
-                pod_info.name
-            );
-        }
-    } else if pod_info.is_healthy() {
-        let mesh_port = pod_info.mesh_port.unwrap_or(default_mesh_port);
-        let node_address = format!("{}:{}", pod_info.ip, mesh_port);
-        let mut state = cluster_state.write();
-        let existing_version = state.get(&pod_info.name).map(|n| n.version).unwrap_or(0);
-
-        let node_state = NodeState {
-            name: pod_info.name.clone(),
-            address: node_address,
-            status: NodeStatus::Alive as i32,
-            version: existing_version + 1,
-            metadata: HashMap::new(),
-        };
-
-        state.insert(pod_info.name.clone(), node_state.clone());
-        info!(
-            "Router node {} added/updated in mesh cluster (address: {})",
-            pod_info.name, node_state.address
-        );
-    } else {
-        let mut state = cluster_state.write();
-        if let Some(node) = state.get_mut(&pod_info.name) {
-            if node.status != NodeStatus::Down as i32 {
-                node.status = NodeStatus::Suspected as i32;
-                node.version += 1;
-                debug!(
-                    "Router node {} marked as Suspected (pod not healthy)",
-                    pod_info.name
-                );
-            }
-        }
-    }
-}
-
-/// Start router node discovery for mesh cluster
-async fn start_router_discovery(
-    config: Arc<ServiceDiscoveryConfig>,
-    pods: Api<Pod>,
-    cluster_state: ClusterState,
-    default_mesh_port: u16,
-) {
-    let watcher_config = build_watcher_config("router", &config.router_label_selector());
-    let mut stream = watcher(pods, watcher_config).default_backoff().boxed();
-
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(event) => apply_router_event(&event, &config, &cluster_state, default_mesh_port),
-            Err(e) => error!("Router watcher error (auto-retrying with backoff): {e}"),
-        }
-    }
-
-    error!("K8s router watcher stream ended; router discovery no longer receives updates");
+    let started_at = time::Instant::now();
+    let desired = compute_desired_state(&store.state(), config);
+    reconciler::reconcile(&desired, app_context, started_at).await;
 }
 
 #[cfg(test)]
@@ -1105,13 +668,10 @@ mod tests {
         api::core::v1::{Pod, PodCondition, PodSpec, PodStatus},
         apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time},
     };
+    use kube::runtime::watcher::Event;
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::{
-        middleware::AuthConfig,
-        routers::{common::openai_bridge, grpc::multimodal::MultimodalConfigRegistry},
-    };
 
     fn create_k8s_pod(
         name: Option<&str>,
@@ -1192,68 +752,6 @@ mod tests {
         }
     }
 
-    fn create_test_app_context() -> Arc<AppContext> {
-        use crate::{
-            config::RouterConfig, middleware::TokenBucket,
-            observability::inflight_tracker::InFlightRequestTracker,
-            routers::common::realtime::RealtimeRegistry, worker::WorkerService,
-        };
-
-        let router_config = RouterConfig::builder()
-            .worker_startup_timeout_secs(1)
-            .build_unchecked();
-
-        let worker_registry = Arc::new(crate::worker::WorkerRegistry::new());
-        let worker_job_queue = Arc::new(std::sync::OnceLock::new());
-
-        // Note: Using uninitialized queue for tests to avoid spawning background workers
-        // Jobs submitted during tests will queue but not be processed
-        Arc::new(AppContext {
-            gateway_auth: AuthConfig::new(None),
-            client: reqwest::Client::new(),
-            router_config: router_config.clone(),
-            rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
-            rate_limit_manager: None,
-            worker_registry: worker_registry.clone(),
-            policy_registry: Arc::new(crate::policies::PolicyRegistry::with_override(
-                router_config.policy.clone(),
-                router_config.routing_key_override.clone(),
-            )),
-            reasoning_parser_factory: None,
-            tool_parser_factory: None,
-            gateway: None,
-            response_storage: Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-            conversation_storage: Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-            conversation_item_storage: Arc::new(
-                smg_data_connector::MemoryConversationItemStorage::new(),
-            ),
-            worker_monitor: None,
-            configured_reasoning_parser: None,
-            configured_tool_parser: None,
-            worker_job_queue: worker_job_queue.clone(),
-            workflow_engines: Arc::new(std::sync::OnceLock::new()),
-            mcp_orchestrator: Arc::new(std::sync::OnceLock::new()),
-            mcp_format_registry: openai_bridge::FormatRegistry::new(),
-            tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
-            multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
-            wasm_manager: None,
-            worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
-                &router_config,
-            )),
-            worker_service: Arc::new(WorkerService::new(
-                worker_registry,
-                worker_job_queue,
-                router_config,
-            )),
-            inflight_tracker: InFlightRequestTracker::new(),
-            kv_event_monitor: None,
-            rl: None,
-            realtime_registry: Arc::new(RealtimeRegistry::new()),
-            webrtc_bind_addr: None,
-            webrtc_stun_server: None,
-        })
-    }
-
     fn create_pd_config() -> ServiceDiscoveryConfig {
         let mut prefill_selector = HashMap::new();
         prefill_selector.insert("app".to_string(), "sglang".to_string());
@@ -1277,8 +775,6 @@ mod tests {
             worker_ports_annotation: "smg.ai/worker-ports".to_string(),
             kv_connector_annotation: "smg.ai/kv-connector".to_string(),
             kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
-            router_selector: HashMap::new(),
-            router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
         }
     }
@@ -1533,8 +1029,6 @@ mod tests {
             bootstrap_ports: vec![],
             kv_connector: None,
             kv_engine_ids: vec![],
-            is_router: false,
-            mesh_port: None,
             model_id_override: None,
         };
         assert!(healthy_pod.is_healthy());
@@ -1550,8 +1044,6 @@ mod tests {
             bootstrap_ports: vec![],
             kv_connector: None,
             kv_engine_ids: vec![],
-            is_router: false,
-            mesh_port: None,
             model_id_override: None,
         };
         assert!(!not_ready_pod.is_healthy());
@@ -1567,8 +1059,6 @@ mod tests {
             bootstrap_ports: vec![],
             kv_connector: None,
             kv_engine_ids: vec![],
-            is_router: false,
-            mesh_port: None,
             model_id_override: None,
         };
         assert!(!not_running_pod.is_healthy());
@@ -1715,6 +1205,41 @@ mod tests {
         pods.into_iter().map(Arc::new).collect()
     }
 
+    fn owned(url: &str, uid: &str) -> reconciler::OwnedWorker {
+        reconciler::OwnedWorker {
+            url: url.to_string(),
+            pod_uid: uid.to_string(),
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn test_compute_actions_unready_pod_removes_registered_workers() {
+        let config = make_regular_config();
+        let mut pod = pod_with_annotations("w", &[("smg.ai/worker-ports", "8080,8081")]);
+        if let Some(status) = pod.status.as_mut() {
+            status.conditions = Some(vec![PodCondition {
+                type_: "Ready".to_string(),
+                status: "False".to_string(),
+                last_probe_time: None,
+                last_transition_time: None,
+                message: None,
+                reason: None,
+                observed_generation: None,
+            }]);
+        }
+        let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
+        let registered = [
+            owned("10.0.0.1:8080", "uid-w"),
+            owned("10.0.0.1:8081", "uid-w"),
+        ];
+        let actions = reconciler::compute_actions(&desired, &registered);
+        assert!(actions.add.is_empty());
+        assert_eq!(actions.remove.len(), 2);
+        assert_eq!(actions.remove[0].pod_uid, "uid-w");
+        assert_eq!(actions.remove[1].pod_uid, "uid-w");
+    }
+
     #[test]
     fn test_compute_desired_state_multi_port_pod() {
         let config = make_regular_config();
@@ -1843,314 +1368,6 @@ mod tests {
         let config = make_regular_config();
         let desired = compute_desired_state(&store.state(), &config);
         assert_eq!(desired.uid_by_url.len(), 2);
-    }
-
-    // ========== Registry diff ==========
-
-    #[test]
-    fn test_canonical_host_port() {
-        assert_eq!(canonical_host_port("10.0.0.1:8080"), "10.0.0.1:8080");
-        assert_eq!(canonical_host_port("http://10.0.0.1:8080"), "10.0.0.1:8080");
-        assert_eq!(
-            canonical_host_port("grpc://10.0.0.1:8080@2"),
-            "10.0.0.1:8080"
-        );
-        assert_eq!(canonical_host_port("10.0.0.1:8080@0"), "10.0.0.1:8080");
-    }
-
-    fn desired_worker(url: &str, uid: &str) -> DesiredWorker {
-        DesiredWorker {
-            url: url.to_string(),
-            worker_type: WorkerType::Regular,
-            bootstrap_port: None,
-            pod_name: "w".to_string(),
-            pod_uid: uid.to_string(),
-            model_id_override: None,
-            kv_connector: None,
-            kv_engine_id: None,
-        }
-    }
-
-    fn desired_state_of(workers: &[DesiredWorker]) -> DesiredState {
-        let mut state = DesiredState::default();
-        for worker in workers {
-            state
-                .uid_by_url
-                .insert(worker.url.clone(), worker.pod_uid.clone());
-            state.addable.push(worker.clone());
-        }
-        state
-    }
-
-    fn owned(url: &str, uid: &str) -> OwnedWorker {
-        OwnedWorker {
-            url: url.to_string(),
-            pod_uid: uid.to_string(),
-            revision: 1,
-        }
-    }
-
-    #[test]
-    fn test_compute_actions_adds_missing_workers() {
-        let desired = desired_state_of(&[
-            desired_worker("10.0.0.1:8080", "u1"),
-            desired_worker("10.0.0.1:8081", "u1"),
-        ]);
-        let actions = compute_actions(&desired, &[]);
-        assert_eq!(actions.add.len(), 2);
-        assert!(actions.remove.is_empty());
-    }
-
-    #[test]
-    fn test_compute_actions_same_uid_metadata_change_is_noop() {
-        let mut worker = desired_worker("10.0.0.1:8080", "u1");
-        worker.kv_connector = Some("NixlConnector".to_string());
-        let desired = desired_state_of(&[worker]);
-        let registered = [owned("10.0.0.1:8080", "u1")];
-        let actions = compute_actions(&desired, &registered);
-        assert!(actions.add.is_empty());
-        assert!(actions.remove.is_empty());
-    }
-
-    #[test]
-    fn test_compute_actions_removes_workers_for_gone_pods() {
-        let desired = desired_state_of(&[desired_worker("10.0.0.1:8080", "u1")]);
-        let registered = [owned("10.0.0.1:8080", "u1"), owned("10.0.0.2:8080", "u2")];
-        let actions = compute_actions(&desired, &registered);
-        assert!(actions.add.is_empty());
-        assert_eq!(actions.remove.len(), 1);
-        assert_eq!(actions.remove[0].url, "10.0.0.2:8080");
-    }
-
-    #[test]
-    fn test_compute_actions_uid_change_removes_and_reregisters_same_url() {
-        // Same-IP pod restart (hostNetwork / stable IP): URL unchanged but
-        // uid differs → the stale worker is removed (covers a scheme-flipped
-        // sibling the Upsert cannot replace) and the new one registered.
-        let desired = desired_state_of(&[desired_worker("10.0.0.1:8080", "uid-new")]);
-        let registered = [owned("10.0.0.1:8080", "uid-old")];
-        let actions = compute_actions(&desired, &registered);
-        assert_eq!(actions.add.len(), 1);
-        assert_eq!(actions.add[0].pod_uid, "uid-new");
-        assert_eq!(actions.remove.len(), 1);
-        assert_eq!(actions.remove[0].pod_uid, "uid-old");
-    }
-
-    #[test]
-    fn test_compute_actions_unready_pod_removes_registered_workers() {
-        let config = make_regular_config();
-        let mut pod = pod_with_annotations("w", &[("smg.ai/worker-ports", "8080,8081")]);
-        if let Some(status) = pod.status.as_mut() {
-            status.conditions = Some(vec![PodCondition {
-                type_: "Ready".to_string(),
-                status: "False".to_string(),
-                last_probe_time: None,
-                last_transition_time: None,
-                message: None,
-                reason: None,
-                observed_generation: None,
-            }]);
-        }
-        let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
-        let registered = [
-            owned("10.0.0.1:8080", "uid-w"),
-            owned("10.0.0.1:8081", "uid-w"),
-        ];
-        let actions = compute_actions(&desired, &registered);
-        assert!(actions.add.is_empty());
-        assert_eq!(actions.remove.len(), 2);
-        assert_eq!(actions.remove[0].pod_uid, "uid-w");
-        assert_eq!(actions.remove[1].pod_uid, "uid-w");
-    }
-
-    #[test]
-    fn test_compute_actions_dp_ranks_removed_once() {
-        let registered = [owned("10.0.0.1:8080", "u1"), owned("10.0.0.1:8080", "u1")];
-        let actions = compute_actions(&DesiredState::default(), &registered);
-        assert_eq!(actions.remove.len(), 1);
-        assert_eq!(actions.remove[0].url, "10.0.0.1:8080");
-        assert_eq!(actions.remove[0].revision, 1);
-        assert!(actions.add.is_empty());
-    }
-
-    #[test]
-    fn test_k8s_owned_workers_scoped_by_label_and_origin() {
-        use openai_protocol::model_card::ModelCard;
-
-        use crate::worker::BasicWorkerBuilder;
-
-        let app_context = create_test_app_context();
-
-        let mut labels = HashMap::new();
-        labels.insert(POD_UID_LABEL.to_string(), "uid-1".to_string());
-        let discovered = Arc::new(
-            BasicWorkerBuilder::new("http://10.0.0.1:8080")
-                .model(ModelCard::new("m"))
-                .labels(labels)
-                .build(),
-        );
-        let manual = Arc::new(
-            BasicWorkerBuilder::new("http://10.0.0.2:8080")
-                .model(ModelCard::new("m"))
-                .build(),
-        );
-        app_context.worker_registry.register(discovered).unwrap();
-        app_context.worker_registry.register(manual).unwrap();
-
-        let owned = k8s_owned_workers(&app_context);
-        assert_eq!(owned.len(), 1);
-        assert_eq!(owned[0].url, "10.0.0.1:8080");
-        assert_eq!(owned[0].pod_uid, "uid-1");
-    }
-
-    #[test]
-    fn test_k8s_owned_workers_excludes_mesh_imported_workers() {
-        // A peer's discovered worker arrives via mesh sync carrying the
-        // pod-uid label; its pod is absent from this node's store, so without
-        // the Local-origin filter the reconciler would remove it every pass.
-        let app_context = create_test_app_context();
-
-        let mut spec = WorkerSpec::new("http://10.0.0.3:8080");
-        spec.labels
-            .insert(POD_UID_LABEL.to_string(), "uid-mesh".to_string());
-        let state = smg_mesh::WorkerState {
-            worker_id: "peer-w1".to_string(),
-            model_id: "m".to_string(),
-            url: "http://10.0.0.3:8080".to_string(),
-            health: true,
-            load: 0.0,
-            version: 0,
-            spec: serde_json::to_vec(&spec).unwrap(),
-        };
-        app_context.worker_registry.on_remote_worker_state(&state);
-        assert!(app_context
-            .worker_registry
-            .get_by_url("http://10.0.0.3:8080")
-            .is_some());
-
-        assert!(k8s_owned_workers(&app_context).is_empty());
-    }
-
-    #[test]
-    fn test_build_worker_spec_stamps_ownership_labels() {
-        let app_context = create_test_app_context();
-        let desired = DesiredWorker {
-            url: "10.0.0.1:8081".to_string(),
-            worker_type: WorkerType::Prefill,
-            bootstrap_port: Some(9080),
-            pod_name: "prefill-0".to_string(),
-            pod_uid: "uid-1".to_string(),
-            model_id_override: Some("llama".to_string()),
-            kv_connector: Some("MooncakeConnector".to_string()),
-            kv_engine_id: Some("engine-1".to_string()),
-        };
-        let spec = build_worker_spec(&desired, &app_context);
-        assert_eq!(spec.url, "10.0.0.1:8081");
-        assert_eq!(spec.worker_type, WorkerType::Prefill);
-        assert_eq!(spec.bootstrap_port, Some(9080));
-        assert_eq!(spec.kv_connector.as_deref(), Some("MooncakeConnector"));
-        assert_eq!(spec.kv_engine_id.as_deref(), Some("engine-1"));
-        assert_eq!(
-            spec.labels.get(POD_NAME_LABEL),
-            Some(&"prefill-0".to_string())
-        );
-        assert_eq!(spec.labels.get(POD_UID_LABEL), Some(&"uid-1".to_string()));
-        assert_eq!(
-            spec.labels.get("served_model_name"),
-            Some(&"llama".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn test_reconcile_workers_without_job_queue_is_safe() {
-        let app_context = create_test_app_context();
-        let (store, mut writer) = reflector::store::<Pod>();
-        writer.apply_watcher_event(&Event::Init);
-        writer.apply_watcher_event(&Event::InitApply(make_labeled_pod(
-            "w",
-            "10.0.0.1",
-            &[("app", "sglang")],
-        )));
-        writer.apply_watcher_event(&Event::InitDone);
-        let config = make_regular_config();
-        reconcile_workers(&store, &config, &app_context).await;
-    }
-
-    // ========== Router events ==========
-
-    fn router_config_and_pod() -> (ServiceDiscoveryConfig, Pod) {
-        let mut router_selector = HashMap::new();
-        router_selector.insert("role".to_string(), "router".to_string());
-        let config = ServiceDiscoveryConfig {
-            enabled: true,
-            router_selector,
-            ..Default::default()
-        };
-        let mut pod = make_labeled_pod("r1", "10.1.0.1", &[("role", "router")]);
-        pod.metadata.annotations = Some(
-            [("sglang.ai/mesh-port".to_string(), "7100".to_string())]
-                .into_iter()
-                .collect(),
-        );
-        (config, pod)
-    }
-
-    #[test]
-    fn test_apply_router_event_apply_then_delete() {
-        let (config, pod) = router_config_and_pod();
-        let cluster_state: ClusterState = Arc::default();
-
-        apply_router_event(&Event::Apply(pod.clone()), &config, &cluster_state, 7000);
-        {
-            let state = cluster_state.read();
-            let node = state.get("r1").unwrap();
-            assert_eq!(node.status, NodeStatus::Alive as i32);
-            assert_eq!(node.address, "10.1.0.1:7100");
-        }
-
-        apply_router_event(&Event::Delete(pod), &config, &cluster_state, 7000);
-        assert_eq!(
-            cluster_state.read().get("r1").unwrap().status,
-            NodeStatus::Down as i32
-        );
-    }
-
-    #[test]
-    fn test_apply_router_event_terminating_marks_down() {
-        let (config, mut pod) = router_config_and_pod();
-        let cluster_state: ClusterState = Arc::default();
-
-        apply_router_event(&Event::Apply(pod.clone()), &config, &cluster_state, 7000);
-        pod.metadata.deletion_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::now()));
-        apply_router_event(&Event::Apply(pod), &config, &cluster_state, 7000);
-        assert_eq!(
-            cluster_state.read().get("r1").unwrap().status,
-            NodeStatus::Down as i32
-        );
-    }
-
-    #[test]
-    fn test_apply_router_event_unready_marks_suspected() {
-        let (config, mut pod) = router_config_and_pod();
-        let cluster_state: ClusterState = Arc::default();
-
-        apply_router_event(&Event::Apply(pod.clone()), &config, &cluster_state, 7000);
-        if let Some(status) = pod.status.as_mut() {
-            status.conditions = Some(vec![PodCondition {
-                type_: "Ready".to_string(),
-                status: "False".to_string(),
-                last_probe_time: None,
-                last_transition_time: None,
-                message: None,
-                reason: None,
-                observed_generation: None,
-            }]);
-        }
-        apply_router_event(&Event::Apply(pod), &config, &cluster_state, 7000);
-        assert_eq!(
-            cluster_state.read().get("r1").unwrap().status,
-            NodeStatus::Suspected as i32
-        );
     }
 
     // ========== ModelIdSource tests ==========
@@ -2428,20 +1645,14 @@ mod tests {
     }
 
     #[test]
-    fn test_deregistration_reconciled_metric_label() {
-        // Verify the metric label constant exists and has expected value
-        assert_eq!(metrics_labels::DEREGISTRATION_RECONCILED, "reconciled");
-    }
-
-    #[test]
     fn test_build_watcher_config_with_selector_pushes_label_selector() {
-        let cfg = build_watcher_config("worker", "app=sglang");
+        let cfg = build_watcher_config("app=sglang");
         assert_eq!(cfg.label_selector.as_deref(), Some("app=sglang"));
     }
 
     #[test]
     fn test_build_watcher_config_empty_selector_falls_back_to_default() {
-        let cfg = build_watcher_config("worker", "");
+        let cfg = build_watcher_config("");
         assert!(cfg.label_selector.is_none());
     }
 
@@ -2454,7 +1665,7 @@ mod tests {
             disaggregated_mode: false,
             ..Default::default()
         };
-        let watcher_config = build_watcher_config("worker", &config.list_label_selector());
+        let watcher_config = build_watcher_config(&config.list_label_selector());
         assert_eq!(watcher_config.label_selector.as_deref(), Some("app=sglang"));
     }
 
@@ -2472,7 +1683,7 @@ mod tests {
             decode_selector: decode,
             ..Default::default()
         };
-        let watcher_config = build_watcher_config("worker", &config.list_label_selector());
+        let watcher_config = build_watcher_config(&config.list_label_selector());
         assert_eq!(watcher_config.label_selector.as_deref(), Some("app=sglang"));
     }
 
@@ -2480,7 +1691,7 @@ mod tests {
     fn test_build_watcher_config_for_epd_mode_pushes_intersection() {
         let config = create_epd_config();
 
-        let watcher_config = build_watcher_config("worker", &config.list_label_selector());
+        let watcher_config = build_watcher_config(&config.list_label_selector());
         assert_eq!(watcher_config.label_selector.as_deref(), Some("app=sglang"));
     }
 
@@ -2496,52 +1707,15 @@ mod tests {
             decode_selector: decode,
             ..Default::default()
         };
-        let watcher_config = build_watcher_config("worker", &config.list_label_selector());
+        let watcher_config = build_watcher_config(&config.list_label_selector());
         assert!(watcher_config.label_selector.is_none());
-    }
-
-    #[test]
-    fn test_router_label_selector_serializes_router_selector() {
-        let mut router = HashMap::new();
-        router.insert("app".to_string(), "smg".to_string());
-        let config = ServiceDiscoveryConfig {
-            router_selector: router,
-            ..Default::default()
-        };
-        assert_eq!(config.router_label_selector(), "app=smg");
-    }
-
-    #[test]
-    fn test_router_label_selector_empty_when_unset() {
-        let config = ServiceDiscoveryConfig::default();
-        assert!(config.router_label_selector().is_empty());
-    }
-
-    #[test]
-    fn test_build_watcher_config_for_router_pushes_router_selector() {
-        let mut router = HashMap::new();
-        router.insert("app".to_string(), "smg".to_string());
-        let config = ServiceDiscoveryConfig {
-            router_selector: router,
-            ..Default::default()
-        };
-        let watcher_config = build_watcher_config("router", &config.router_label_selector());
-        assert_eq!(watcher_config.label_selector.as_deref(), Some("app=smg"));
     }
 
     #[traced_test]
     #[test]
     fn test_build_watcher_config_logs_selector_at_info_level() {
-        let _ = build_watcher_config("worker", "app=sglang");
+        let _ = build_watcher_config("app=sglang");
         assert!(logs_contain("Starting K8s worker watcher"));
         assert!(logs_contain("app=sglang"));
-    }
-
-    #[traced_test]
-    #[test]
-    fn test_build_watcher_config_logs_router_kind_with_empty_selector() {
-        let _ = build_watcher_config("router", "");
-        assert!(logs_contain("Starting K8s router watcher"));
-        assert!(logs_contain("selector: ''"));
     }
 }
