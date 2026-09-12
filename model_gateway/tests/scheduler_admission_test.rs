@@ -287,6 +287,14 @@ async fn join(
         .expect("spawned request task panicked")
 }
 
+fn cancel_request(response_id: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/v1/responses/{response_id}/cancel"))
+        .body(Body::empty())
+        .expect("valid cancel request")
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 /// Queue full → 429. Capacity 1, occupied by a held request; the Default
@@ -336,6 +344,50 @@ async fn queue_full_returns_429() {
     assert_eq!(body["error"]["code"], "scheduler_queue_full");
 
     // Release the held request and confirm it then succeeds.
+    gate.release();
+    let held_resp = join(held).await;
+    assert_eq!(held_resp.status(), StatusCode::OK);
+    let _ = body_json(held_resp).await;
+
+    ctx.shutdown().await;
+}
+
+/// Cancellation releases existing engine work, so it must remain reachable
+/// even while priority admission has no free generation slot.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test infra: holds a request open in a spawned task"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn response_cancel_bypasses_saturated_priority_admission() {
+    let mut yaml = SchedulerYaml::base();
+    yaml.default.queue_size = 0;
+    let yaml_file = write_scheduler_yaml(&yaml);
+    let config = scheduler_config(3607, "default", yaml_file.path().to_str().unwrap());
+
+    let gate = HoldGate::new();
+    let ctx =
+        AppTestContext::new_with_config(config, vec![scheduler_worker(1, Some(&gate))]).await;
+    let app = ctx.create_app();
+
+    let held_app = app.clone();
+    let held = tokio::spawn(async move {
+        held_app
+            .oneshot(generate_request("held", None))
+            .await
+            .unwrap()
+    });
+    wait_arrivals(&gate, 1).await;
+
+    let cancel = send(&app, cancel_request("not-running")).await;
+    assert_eq!(
+        cancel.status(),
+        StatusCode::NOT_FOUND,
+        "cancel must reach the worker instead of being rejected by admission"
+    );
+    assert_ne!(error_code(&cancel).as_deref(), Some("scheduler_queue_full"));
+
     gate.release();
     let held_resp = join(held).await;
     assert_eq!(held_resp.status(), StatusCode::OK);

@@ -113,7 +113,13 @@ impl PDRouter {
             .cloned();
 
         if let Some(worker) = first_worker {
-            Self::proxy_to_worker(&worker, endpoint, headers).await
+            Self::proxy_to_worker(
+                &worker,
+                endpoint,
+                headers,
+                self.retry_config.max_retries > 1,
+            )
+            .await
         } else {
             error::service_unavailable("no_prefill_servers", "No prefill servers available")
         }
@@ -123,6 +129,7 @@ impl PDRouter {
         worker: &Arc<dyn Worker>,
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
+        retry_enabled: bool,
     ) -> Response {
         let url = format!("{}/{endpoint}", worker.url());
         let mut request_builder = worker.http_client().get(&url);
@@ -133,7 +140,7 @@ impl PDRouter {
             }
         }
 
-        match send_with_stale_conn_retry(request_builder).await {
+        match send_with_stale_conn_retry(request_builder, retry_enabled).await {
             Ok(res) if res.status().is_success() => {
                 let response_headers = header_utils::preserve_response_headers(res.headers());
 
@@ -883,11 +890,11 @@ impl PDRouter {
         let runtime = prefill.metadata().spec.runtime_type.as_str();
         let dispatch_start = Instant::now();
         let prefill_fut = async {
-            let resp = send_with_stale_conn_retry(prefill_request).await?;
+            let resp = send_with_stale_conn_retry(prefill_request, false).await?;
             Ok::<_, reqwest::Error>((dispatch_start.elapsed(), resp))
         };
         let decode_fut = async {
-            let resp = send_with_stale_conn_retry(decode_request).await?;
+            let resp = send_with_stale_conn_retry(decode_request, false).await?;
             Ok::<_, reqwest::Error>((dispatch_start.elapsed(), resp))
         };
         tokio::pin!(prefill_fut);
@@ -1093,7 +1100,7 @@ impl PDRouter {
                 headers,
                 false,
             );
-            let prefill_response = match send_with_stale_conn_retry(prefill_request).await {
+            let prefill_response = match send_with_stale_conn_retry(prefill_request, false).await {
                 Ok(response) => response,
                 Err(e) => {
                     error!("PD prefill transport error: {e}");
@@ -1216,7 +1223,7 @@ impl PDRouter {
             headers,
             false,
         );
-        let decode_response = match send_with_stale_conn_retry(decode_request).await {
+        let decode_response = match send_with_stale_conn_retry(decode_request, false).await {
             Ok(response) => response,
             Err(e) => {
                 error!("PD decode transport error: {e}");

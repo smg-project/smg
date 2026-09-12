@@ -51,7 +51,7 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     sync::{Arc, Weak},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
@@ -238,6 +238,20 @@ struct IngressSaturationState {
     source: Weak<dyn Worker>,
     saturated: bool,
 }
+
+/// Last positive scheduler-threshold verdict for one worker incarnation.
+///
+/// A single failed load poll must not immediately make an overloaded engine
+/// routable again. Unlike the engine-owned ingress latch, this fallback is
+/// deliberately bounded so a dead load feed cannot strand a healthy worker.
+struct ThresholdSaturationState {
+    source: Weak<dyn Worker>,
+    observed_at: Instant,
+}
+
+/// Preserve a positive scheduler-threshold verdict for this many polling
+/// intervals without a fresh scheduler sample.
+const THRESHOLD_STALE_INTERVALS: u32 = 2;
 
 /// DP rank load cache used by load-aware routing policies.
 ///
@@ -435,6 +449,8 @@ pub struct WorkerMonitor {
     /// each URL. Scheduler-threshold polling and ingress admission therefore
     /// remain independent inputs to the combined overload flag.
     ingress_saturation: DashMap<String, IngressSaturationState>,
+    /// Bounded last-positive scheduler-threshold verdict per worker incarnation.
+    threshold_saturation: DashMap<String, ThresholdSaturationState>,
     group_handles: Mutex<HashMap<WorkerGroupKey, GroupState>>,
     event_task: Mutex<Option<JoinHandle<()>>>,
     eviction_flush_task: Mutex<Option<JoinHandle<()>>>,
@@ -478,6 +494,7 @@ impl WorkerMonitor {
             load_state,
             native_loads_memo: Arc::new(DashMap::new()),
             ingress_saturation: DashMap::new(),
+            threshold_saturation: DashMap::new(),
             group_handles: Mutex::new(HashMap::new()),
             event_task: Mutex::new(None),
             eviction_flush_task: Mutex::new(None),
@@ -587,6 +604,7 @@ impl WorkerMonitor {
         self.worker_load_manager.clear();
         self.native_loads_memo.clear();
         self.ingress_saturation.clear();
+        self.threshold_saturation.clear();
         // The feed that would clear the vetoes is being torn down: fail open,
         // but say so — a wiped gauge is otherwise indistinguishable from a
         // genuine recovery. With no thresholds anywhere no flag was ever
@@ -712,6 +730,9 @@ impl WorkerMonitor {
                 .upgrade()
                 .is_some_and(|source| Arc::ptr_eq(&source, worker))
         });
+        self.threshold_saturation.remove_if(url, |_, state| {
+            state.source.upgrade().is_some_and(|source| Arc::ptr_eq(&source, worker))
+        });
         self.load_state.enqueue_eviction(Arc::clone(worker));
     }
 
@@ -761,6 +782,88 @@ impl WorkerMonitor {
             .upgrade()
             .filter(|source| Arc::ptr_eq(source, worker))
             .map(|_| cached.saturated)
+    }
+
+    /// Resolve a scheduler-threshold verdict while retaining a positive
+    /// result across a short load-feed outage. A successful under-threshold
+    /// sample clears immediately; an absent sample holds for two configured
+    /// polling intervals and then fails open. Every mutation is fenced to the
+    /// worker object currently registered at this URL.
+    fn resolve_threshold_saturation(
+        &self,
+        worker: &Arc<dyn Worker>,
+        observed: Option<bool>,
+        interval: Duration,
+    ) -> Option<bool> {
+        self.resolve_threshold_saturation_at(worker, observed, interval, Instant::now())
+    }
+
+    fn resolve_threshold_saturation_at(
+        &self,
+        worker: &Arc<dyn Worker>,
+        observed: Option<bool>,
+        interval: Duration,
+        now: Instant,
+    ) -> Option<bool> {
+        let is_current = self
+            .worker_registry
+            .get_by_url(worker.url())
+            .is_some_and(|current| Arc::ptr_eq(&current, worker));
+        if !is_current {
+            return None;
+        }
+
+        if let Some(saturated) = observed {
+            let entry = self.threshold_saturation.entry(worker.url().to_string());
+            if saturated {
+                let state = ThresholdSaturationState {
+                    source: Arc::downgrade(worker),
+                    observed_at: now,
+                };
+                match entry {
+                    Entry::Occupied(mut occupied) => {
+                        occupied.insert(state);
+                    }
+                    Entry::Vacant(vacant) => {
+                        vacant.insert(state);
+                    }
+                }
+            } else if let Entry::Occupied(occupied) = entry {
+                let owned_by_worker = occupied
+                    .get()
+                    .source
+                    .upgrade()
+                    .is_some_and(|source| Arc::ptr_eq(&source, worker));
+                if owned_by_worker {
+                    occupied.remove();
+                }
+            }
+            return Some(saturated);
+        }
+
+        let stale_for = interval.saturating_mul(THRESHOLD_STALE_INTERVALS);
+        let Some(cached) = self.threshold_saturation.get(worker.url()) else {
+            return Some(false);
+        };
+        let source_matches = cached
+            .source
+            .upgrade()
+            .is_some_and(|source| Arc::ptr_eq(&source, worker));
+        let observed_at = cached.observed_at;
+        let retained = source_matches && now.saturating_duration_since(observed_at) <= stale_for;
+        drop(cached);
+
+        if !retained {
+            // Do not remove a fresh verdict published after the read above.
+            self.threshold_saturation.remove_if(worker.url(), |_, state| {
+                state.observed_at == observed_at
+                    && state
+                        .source
+                        .upgrade()
+                        .is_some_and(|source| Arc::ptr_eq(&source, worker))
+            });
+        }
+        Some(retained)
     }
 
     /// Apply every queued eviction in one snapshot rebuild, and sentinel the
@@ -1290,15 +1393,19 @@ async fn group_monitor_loop(
                 .as_ref()
                 .and_then(|observation| observation.ingress_saturated);
             let ingress_verdict = monitor.resolve_ingress_saturation(&worker, observed_ingress);
-            if overload.is_enabled() || ingress_verdict.is_some() {
-                let threshold_verdict = overload.is_enabled()
-                    && response
-                        .as_ref()
-                        .and_then(|observation| observation.load.as_ref())
-                        .is_some_and(|load| overload.is_overloaded(load));
+            let threshold_verdict = if overload.is_enabled() {
+                let observed_threshold = response
+                    .as_ref()
+                    .and_then(|observation| observation.load.as_ref())
+                    .map(|load| overload.is_overloaded(load));
+                monitor.resolve_threshold_saturation(&worker, observed_threshold, interval)
+            } else {
+                None
+            };
+            if threshold_verdict.is_some() || ingress_verdict.is_some() {
                 monitor.worker_registry.set_worker_overloaded(
                     &worker,
-                    ingress_verdict.unwrap_or(false) || threshold_verdict,
+                    ingress_verdict.unwrap_or(false) || threshold_verdict.unwrap_or(false),
                 );
             }
 
@@ -1646,18 +1753,140 @@ mod worker_monitor_tests {
         );
     }
 
+    #[test]
+    fn threshold_veto_survives_two_intervals_then_expires() {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:8080", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let interval = Duration::from_secs(10);
+        let observed_at = Instant::now();
+
+        assert_eq!(
+            monitor.resolve_threshold_saturation_at(
+                &worker,
+                Some(true),
+                interval,
+                observed_at,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            monitor.resolve_threshold_saturation_at(
+                &worker,
+                None,
+                interval,
+                observed_at + interval,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            monitor.resolve_threshold_saturation_at(
+                &worker,
+                None,
+                interval,
+                observed_at + interval.saturating_mul(2),
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            monitor.resolve_threshold_saturation_at(
+                &worker,
+                None,
+                interval,
+                observed_at + interval.saturating_mul(2) + Duration::from_nanos(1),
+            ),
+            Some(false)
+        );
+        assert!(monitor.threshold_saturation.is_empty());
+    }
+
+    #[test]
+    fn threshold_veto_is_fenced_to_worker_incarnation() {
+        let (registry, monitor) = build_monitor();
+        let url = "http://w:8080";
+        let old = ready_worker(url, "llama-3");
+        let id = registry.register(Arc::clone(&old)).unwrap();
+        let now = Instant::now();
+        let interval = Duration::from_secs(10);
+        assert_eq!(
+            monitor.resolve_threshold_saturation_at(&old, Some(true), interval, now),
+            Some(true)
+        );
+
+        let replacement = ready_worker(url, "llama-3");
+        assert!(registry.replace(&id, Arc::clone(&replacement)));
+        assert_eq!(
+            monitor.resolve_threshold_saturation_at(&old, Some(false), interval, now),
+            None,
+            "a detached worker cannot overwrite the replacement's state"
+        );
+        assert_eq!(
+            monitor.resolve_threshold_saturation_at(&replacement, None, interval, now),
+            Some(false),
+            "a replacement cannot inherit the old worker's retained veto"
+        );
+
+        assert_eq!(
+            monitor.resolve_threshold_saturation_at(
+                &replacement,
+                Some(true),
+                interval,
+                now,
+            ),
+            Some(true)
+        );
+        monitor.evict_worker_loads(&old);
+        assert_eq!(
+            monitor.resolve_threshold_saturation_at(&replacement, None, interval, now),
+            Some(true),
+            "delayed eviction of the old worker must preserve replacement state"
+        );
+    }
+
+    #[test]
+    fn explicit_under_threshold_sample_clears_retained_veto() {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:8080", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let now = Instant::now();
+
+        assert_eq!(
+            monitor.resolve_threshold_saturation_at(
+                &worker,
+                Some(true),
+                Duration::from_secs(10),
+                now,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            monitor.resolve_threshold_saturation_at(
+                &worker,
+                Some(false),
+                Duration::from_secs(10),
+                now,
+            ),
+            Some(false)
+        );
+        assert!(monitor.threshold_saturation.is_empty());
+    }
+
     #[tokio::test]
     async fn stop_all_groups_clears_native_probe_memo() {
         // A worker removed during a `RecvError::Lagged` window never
         // fires an eviction, so the reset path must drop the memo too.
-        let (_registry, monitor) = build_monitor();
+        let (registry, monitor) = build_monitor();
         monitor
             .native_loads_memo
             .insert("http://w1:8080".to_string(), NativeLoadsMemo::default());
+        let worker = ready_worker("http://w1:8080", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.resolve_threshold_saturation(&worker, Some(true), Duration::from_secs(5));
 
         monitor.stop_all_groups();
 
         assert!(monitor.native_loads_memo.is_empty());
+        assert!(monitor.threshold_saturation.is_empty());
     }
 
     #[tokio::test]

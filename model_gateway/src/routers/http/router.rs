@@ -204,7 +204,12 @@ impl Router {
                     }
                 }
 
-                match send_with_stale_conn_retry(request_builder).await {
+                match send_with_stale_conn_retry(
+                    request_builder,
+                    self.retry_config.max_retries > 1,
+                )
+                .await
+                {
                     Ok(res) => {
                         let status = StatusCode::from_u16(res.status().as_u16())
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -625,6 +630,8 @@ impl Router {
             })
             .unwrap_or_default();
 
+        let stale_retry_enabled = self.retry_config.max_retries > 1 && method == Method::GET;
+
         let futures: Vec<_> = workers
             .into_iter()
             .map(|worker| {
@@ -635,6 +642,7 @@ impl Router {
                 let headers = filtered_headers.clone();
                 let client_auth = client_auth.clone();
                 let api_key = worker.api_key().cloned();
+                let stale_retry_enabled = stale_retry_enabled;
 
                 async move {
                     let mut request_builder = match method {
@@ -660,7 +668,7 @@ impl Router {
                         request_builder = request_builder.header(name.clone(), value.clone());
                     }
 
-                    send_with_stale_conn_retry(request_builder)
+                    send_with_stale_conn_retry(request_builder, stale_retry_enabled)
                         .await
                         .map_err(convert_reqwest_error)
                 }
@@ -886,7 +894,7 @@ impl Router {
             worker.api_key(),
         );
 
-        let res = match send_with_stale_conn_retry(request_builder).await {
+        let res = match send_with_stale_conn_retry(request_builder, false).await {
             Ok(res) => res,
             Err(e) => {
                 error!(
@@ -1139,9 +1147,9 @@ impl Router {
         Ok(body.freeze())
     }
 
-    // Send an already-serialized request body. The stale-connection resend
-    // guard inside `send_with_stale_conn_retry` shares the body allocation by
-    // refcount, so the bytes live exactly until the response head arrives.
+    // Send an already-serialized request body. Explicit request retries are
+    // owned by `RetryExecutor`; this inner send must never silently duplicate
+    // accepted generation work after an ambiguous transport failure.
     async fn send_serialized_request(
         &self,
         headers: Option<&HeaderMap>,
@@ -1168,7 +1176,7 @@ impl Router {
             api_key.as_ref(),
         );
 
-        let res = match send_with_stale_conn_retry(request_builder).await {
+        let res = match send_with_stale_conn_retry(request_builder, false).await {
             Ok(res) => res,
             Err(e) => {
                 error!(
@@ -1326,7 +1334,7 @@ impl Router {
             api_key.as_ref(),
         );
 
-        let send = send_with_stale_conn_retry(request_builder);
+        let send = send_with_stale_conn_retry(request_builder, false);
         tokio::pin!(send);
         let sent = tokio::select! {
             sent = &mut send => sent,
@@ -1527,9 +1535,9 @@ fn build_transcription_form(
 
 /// True for transport failures surfaced without any response: no upstream
 /// status, not a timeout, and not a response-phase (body/decode) or local
-/// (builder/redirect) error. The dominant producer is a pooled connection
-/// the backend closed while idle; the backend never processed the request,
-/// so one resend is safe for any route.
+/// (builder/redirect) error. A pooled connection closed while idle is the
+/// common producer, but the classification cannot prove that the backend did
+/// not accept work before the connection failed.
 fn is_pre_response_transport_error(e: &reqwest::Error) -> bool {
     e.status().is_none()
         && !e.is_timeout()
@@ -1539,12 +1547,31 @@ fn is_pre_response_transport_error(e: &reqwest::Error) -> bool {
         && !e.is_redirect()
 }
 
-/// Send with a single retry on pre-response transport failures. Requests
-/// whose body cannot be cloned (multipart streams) fail through unchanged.
+/// Send with at most one retry on a pre-response transport failure.
+///
+/// The caller must explicitly authorize this for an idempotent request and
+/// only when its effective retry policy allows multiple attempts. Mutating
+/// engine dispatches pass `false`: a connection can reset after the engine
+/// accepted work but before response headers reached us, so replaying here
+/// could create duplicate work outside `RetryExecutor` and despite
+/// `--disable-retries`.
 pub(crate) async fn send_with_stale_conn_retry(
     builder: reqwest::RequestBuilder,
+    retry_enabled: bool,
 ) -> Result<reqwest::Response, reqwest::Error> {
-    let retry = builder.try_clone();
+    // Enforce idempotence here as well as at call sites. A future caller
+    // cannot accidentally opt a POST generation into an ambiguous resend.
+    let retry = retry_enabled
+        .then(|| builder.try_clone())
+        .flatten()
+        .and_then(|retry| {
+            let method = retry.try_clone()?.build().ok()?.method().clone();
+            if method == Method::GET || method == Method::HEAD {
+                Some(retry)
+            } else {
+                None
+            }
+        });
     match builder.send().await {
         Err(e) if is_pre_response_transport_error(&e) => match retry {
             Some(retry) => {
@@ -2206,9 +2233,9 @@ mod tests {
     async fn stale_conn_retry_recovers_on_second_connection() {
         let (addr, accepted) = flaky_upstream(1).await;
         let client = reqwest::Client::new();
-        let builder = client.post(format!("http://{addr}/generate")).body("{}");
+        let builder = client.get(format!("http://{addr}/health"));
 
-        let res = send_with_stale_conn_retry(builder).await.unwrap();
+        let res = send_with_stale_conn_retry(builder, true).await.unwrap();
         assert_eq!(res.status().as_u16(), 200);
         assert_eq!(accepted.load(AtomicOrdering::SeqCst), 2);
     }
@@ -2217,11 +2244,35 @@ mod tests {
     async fn stale_conn_retry_is_bounded_to_one() {
         let (addr, accepted) = flaky_upstream(usize::MAX).await;
         let client = reqwest::Client::new();
-        let builder = client.post(format!("http://{addr}/generate")).body("{}");
+        let builder = client.get(format!("http://{addr}/health"));
 
-        let err = send_with_stale_conn_retry(builder).await.unwrap_err();
+        let err = send_with_stale_conn_retry(builder, true).await.unwrap_err();
         assert!(is_pre_response_transport_error(&err));
         assert_eq!(accepted.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_conn_retry_disabled_sends_once() {
+        let (addr, accepted) = flaky_upstream(usize::MAX).await;
+        let client = reqwest::Client::new();
+        let builder = client.get(format!("http://{addr}/health"));
+
+        let err = send_with_stale_conn_retry(builder, false)
+            .await
+            .unwrap_err();
+        assert!(is_pre_response_transport_error(&err));
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_conn_retry_never_replays_post_even_when_enabled() {
+        let (addr, accepted) = flaky_upstream(usize::MAX).await;
+        let client = reqwest::Client::new();
+        let builder = client.post(format!("http://{addr}/generate")).body("{}");
+
+        let err = send_with_stale_conn_retry(builder, true).await.unwrap_err();
+        assert!(is_pre_response_transport_error(&err));
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2232,10 +2283,10 @@ mod tests {
             Ok::<_, std::io::Error>(Bytes::from_static(b"{}"))
         }));
         let builder = client
-            .post(format!("http://{addr}/generate"))
+            .get(format!("http://{addr}/health"))
             .body(stream_body);
 
-        send_with_stale_conn_retry(builder).await.unwrap_err();
+        send_with_stale_conn_retry(builder, true).await.unwrap_err();
         assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
     }
 

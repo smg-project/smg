@@ -29,7 +29,7 @@ use super::{
     SchedulerError, SchedulerGuardBody, HEADER_X_SMG_PREEMPTED, PRIORITY_HEADER,
 };
 use crate::{
-    middleware::RouteRequestMeta,
+    middleware::{concurrency::is_capacity_release_request, RouteRequestMeta},
     observability::metrics::{metrics_labels, Metrics},
     tenant::TenantKey,
 };
@@ -97,6 +97,10 @@ pub async fn priority_admission_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
+    if is_capacity_release_request(&req) {
+        return next.run(req).await;
+    }
+
     let tenant = req
         .extensions()
         .get::<RouteRequestMeta>()

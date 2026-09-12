@@ -17,7 +17,7 @@ use std::{
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{header::RETRY_AFTER, HeaderValue, StatusCode},
+    http::{header::RETRY_AFTER, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -40,6 +40,25 @@ fn shed_response(status: StatusCode, code: &'static str, message: &'static str) 
         .headers_mut()
         .insert(RETRY_AFTER, HeaderValue::from(SHED_RETRY_AFTER_SECS));
     response
+}
+
+/// Whether this request must bypass generation admission so it can release
+/// work that is already consuming engine capacity.
+///
+/// Keep this deliberately narrower than the Responses control surface: only
+/// POST to the exact cancel route can stop active generation. Retrieval,
+/// deletion, and malformed lookalike paths remain subject to normal admission.
+pub(crate) fn is_capacity_release_request(request: &Request<Body>) -> bool {
+    if request.method() != Method::POST {
+        return false;
+    }
+    let Some(tail) = request.uri().path().strip_prefix("/v1/responses/") else {
+        return false;
+    };
+    let Some(response_id) = tail.strip_suffix("/cancel") else {
+        return false;
+    };
+    !response_id.is_empty() && !response_id.contains('/')
 }
 
 /// Returns an acquired token when the request is cancelled or the response body is dropped.
@@ -169,6 +188,10 @@ pub async fn concurrency_limit_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    if is_capacity_release_request(&request) {
+        return next.run(request).await;
+    }
+
     // Cluster-wide rate limiting was previously enforced via the
     // v1 `MeshSyncManager::check_global_rate_limit` path. That hook
     // is removed in this PR. Local per-node token-bucket rate
@@ -301,6 +324,10 @@ mod tests {
     fn echo_app(app_state: Arc<AppState>) -> Router {
         Router::new()
             .route("/echo", post(|body: Bytes| async move { body }))
+            .route(
+                "/v1/responses/{response_id}/cancel",
+                post(|| async { "cancelled" }),
+            )
             .layer(axum::middleware::from_fn_with_state(
                 app_state,
                 concurrency_limit_middleware,
@@ -505,6 +532,62 @@ mod tests {
 
         let admitted = app.oneshot(echo_request(Body::from("x"))).await.unwrap();
         assert_eq!(admitted.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn only_exact_response_cancel_posts_are_capacity_release_requests() {
+        let request = |method: Method, path: &str| {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        assert!(is_capacity_release_request(&request(
+            Method::POST,
+            "/v1/responses/resp_123/cancel",
+        )));
+        assert!(!is_capacity_release_request(&request(
+            Method::GET,
+            "/v1/responses/resp_123/cancel",
+        )));
+        assert!(!is_capacity_release_request(&request(
+            Method::POST,
+            "/v1/responses//cancel",
+        )));
+        assert!(!is_capacity_release_request(&request(
+            Method::POST,
+            "/v1/responses/resp_123/cancel/extra",
+        )));
+        assert!(!is_capacity_release_request(&request(
+            Method::POST,
+            "/v1/responses/resp_123",
+        )));
+    }
+
+    #[tokio::test]
+    async fn response_cancel_bypasses_saturated_legacy_admission() {
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+        let app = echo_app(test_app_state(bucket.clone(), None));
+        let held = TokenPermit::try_acquire(bucket.clone(), 1.0).unwrap();
+
+        let cancel = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/responses/resp_123/cancel")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(cancel).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"cancelled");
+        assert_eq!(bucket.available_tokens(), 0.0);
+
+        let shed = app.oneshot(echo_request(Body::empty())).await.unwrap();
+        assert_eq!(shed.status(), StatusCode::TOO_MANY_REQUESTS);
+        drop(held);
     }
 
     #[tokio::test]
