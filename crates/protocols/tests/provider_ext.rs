@@ -631,8 +631,9 @@ fn minimax_profile_rejects_unanswered_tool_calls() {
 
 #[test]
 fn long_tool_histories_validate_in_linear_time() {
-    // 100k calls answered in reverse order: quadratic bookkeeping took
-    // seconds here, linear bookkeeping takes milliseconds.
+    // 100k calls answered in reverse order. The 2 s bound is a generous
+    // tripwire (the quadratic version took seconds at this size), not a
+    // measured budget; a breach on a loaded runner is noise.
     let n = 100_000;
     let calls: Vec<Value> = (0..n).map(|i| tool_call(&format!("call_{i}"))).collect();
     let mut messages = vec![
@@ -649,7 +650,7 @@ fn long_tool_histories_validate_in_linear_time() {
     assert!(req.validate().is_ok(), "{:?}", error_codes(&req));
     assert!(
         start.elapsed() < std::time::Duration::from_secs(2),
-        "took {:?}",
+        "linear bookkeeping should finish well under 2s; took {:?} (noise if the runner is loaded)",
         start.elapsed()
     );
 }

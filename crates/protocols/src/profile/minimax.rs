@@ -42,11 +42,14 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
                     }
                 }
             }
-            ChatMessage::Tool { tool_call_id, .. } if !pending.remove(tool_call_id.as_str()) => {
-                return Err(error(
-                    "tool_call_id_mismatch",
-                    format!("no pending tool_call with id '{tool_call_id}'"),
-                ));
+            ChatMessage::Tool { tool_call_id, .. } => {
+                let answered = pending.remove(tool_call_id.as_str());
+                if !answered {
+                    return Err(error(
+                        "tool_call_id_mismatch",
+                        format!("no pending tool_call with id '{tool_call_id}'"),
+                    ));
+                }
             }
             _ => {}
         }
