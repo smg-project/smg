@@ -1650,6 +1650,7 @@ pub enum MessagePhase {
 pub enum ResponseInputOutputItem {
     #[serde(rename = "message")]
     Message {
+        #[serde(default)]
         id: String,
         role: String,
         content: Vec<ResponseContentPart>,
@@ -1663,6 +1664,7 @@ pub enum ResponseInputOutputItem {
     #[serde(rename = "reasoning")]
     #[non_exhaustive]
     Reasoning {
+        #[serde(default)]
         id: String,
         #[serde(default)]
         summary: Vec<SummaryTextContent>,
