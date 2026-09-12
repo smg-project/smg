@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     builders::{ChatCompletionResponseBuilder, ChatCompletionStreamResponseBuilder},
-    ext::kimi::{KimiAssistantExt, KimiDeveloperExt, KimiSystemExt, KimiUserExt},
+    ext::kimi::{DeclaredTools, KimiAssistantExt, KimiDeveloperExt, KimiSystemExt, KimiUserExt},
     profile::ProviderProfile,
     validated::Normalizable,
 };
@@ -494,8 +494,16 @@ fn validate_chat_cross_parameters(
         // it, so a name is resolved against everything the model will see.
         let dynamic_tools = || {
             req.messages.iter().flat_map(|m| match m {
-                ChatMessage::System { ext, .. } => ext.tools.as_deref().unwrap_or_default(),
-                ChatMessage::Developer { ext, .. } => ext.tools.as_deref().unwrap_or_default(),
+                ChatMessage::System { ext, .. } => ext
+                    .tools
+                    .as_ref()
+                    .and_then(DeclaredTools::typed)
+                    .unwrap_or_default(),
+                ChatMessage::Developer { ext, .. } => ext
+                    .tools
+                    .as_ref()
+                    .and_then(DeclaredTools::typed)
+                    .unwrap_or_default(),
                 _ => &[],
             })
         };
