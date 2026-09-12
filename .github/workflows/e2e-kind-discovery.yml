@@ -6,7 +6,8 @@ name: E2E Kind Discovery
 on:
   pull_request:
     paths:
-      - model_gateway/src/service_discovery.rs
+      - model_gateway/src/service_discovery/**
+      - model_gateway/src/mesh_discovery/**
       - model_gateway/tests/k8s_discovery_test.rs
       - e2e_test/kind_discovery/**
       - .github/workflows/e2e-kind-discovery.yml
