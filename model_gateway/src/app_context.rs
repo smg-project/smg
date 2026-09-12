@@ -28,7 +28,10 @@ use crate::{
         grpc::multimodal::MultimodalConfigRegistry,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    worker::{KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService},
+    worker::{
+        KvEventMonitor, OverloadThresholds, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry,
+        WorkerService,
+    },
     workflow::{JobQueue, WorkflowEngines},
 };
 
@@ -356,6 +359,9 @@ impl AppContextBuilder {
         let worker_registry = self
             .worker_registry
             .ok_or(AppContextBuildError::MissingField("worker_registry"))?;
+        worker_registry.set_overload_defaults(OverloadThresholds::from_gateway_config(
+            &router_config,
+        ));
         let worker_job_queue = self
             .worker_job_queue
             .ok_or(AppContextBuildError::MissingField("worker_job_queue"))?;

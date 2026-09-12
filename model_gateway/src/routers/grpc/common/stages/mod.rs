@@ -63,7 +63,7 @@ mod request_execution;
 mod worker_selection;
 
 // Export stage implementations
-pub(crate) use client_acquisition::acquire_clients;
+pub(crate) use client_acquisition::{acquire_clients, ClientAcquisitionError};
 pub(crate) use dispatch_metadata::prepare_dispatch_metadata;
 pub(crate) use encode::EncodeStage;
 pub(crate) use rate_limit::{RateLimitCell, RateLimitOutcome, RateLimitReserveStage};

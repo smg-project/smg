@@ -37,8 +37,8 @@ static SHED_RETRY_AFTER_SECS: AtomicU64 = AtomicU64::new(10);
 
 /// Client-visible, gateway-owned code for a worker-overload-protection shed.
 ///
-/// This deliberately covers both an all-overloaded candidate pool and the
-/// selection-to-dispatch re-check, where another worker may still be eligible.
+/// This deliberately covers both an all-overloaded candidate pool and a
+/// selection-to-dispatch re-check after compatible alternatives are exhausted.
 pub(crate) const WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE: &str =
     "worker_overload_protection_shed";
 
@@ -75,21 +75,27 @@ pub fn shed_if_all_overloaded(candidates: &[Arc<dyn Worker>], model_id: &str) ->
     ))
 }
 
-/// Dispatch-time re-check: one atomic read on the already-chosen worker,
-/// covering the selection→dispatch window. Deliberately sheds rather than
-/// re-selecting — the flag moves at the poll interval, so the window is rare —
-/// and reports only what it knows: this worker went over, not the fleet.
+/// Dispatch-time re-check: one atomic read on the already-chosen worker.
+/// Callers that still own an unsent request should attempt compatible
+/// reselection before returning this response.
 pub fn shed_if_worker_overloaded(worker: &dyn Worker, model_id: &str) -> Option<Response> {
     if !worker.is_overloaded() {
         return None;
     }
+    Some(shed_worker_overloaded(worker, model_id))
+}
+
+/// Build the dispatch-time overload response for a worker already observed
+/// overloaded. Keeping response construction separate from the atomic read
+/// lets reselection paths avoid counting a shed unless no alternative exists.
+pub(crate) fn shed_worker_overloaded(worker: &dyn Worker, model_id: &str) -> Response {
     let url = worker.url();
-    Some(shed(
+    shed(
         BRANCH_OVERLOADED_AT_DISPATCH,
         STAGE_DISPATCH,
         url,
         format!("Worker '{url}' for model '{model_id}' became overloaded before dispatch"),
-    ))
+    )
 }
 
 /// Shed a disaggregated dispatch the decode leg cannot admit: the `rooms`

@@ -34,6 +34,7 @@ use crate::{
         circuit_breaker::CircuitState,
         event::{WorkerConnected, WorkerEvent},
         hash_ring::HashRing,
+        overload::OverloadThresholds,
         pd_pair_index::{PdPairIndex, PdWire},
         pd_pairing::PdPairingMode,
         worker::{RuntimeType, WorkerType},
@@ -334,6 +335,12 @@ pub struct WorkerRegistry {
     /// never taken on a request path.
     overload_transitions: Arc<parking_lot::Mutex<()>>,
 
+    /// Gateway-level overload defaults applied to workers reconstructed from
+    /// mesh state. Local workers receive the same defaults in their creation
+    /// workflow; keeping a copy here prevents remote workers whose spec only
+    /// carries per-worker overrides from silently disabling admission.
+    overload_defaults: parking_lot::RwLock<OverloadThresholds>,
+
     /// Per-model retry config (last write wins).
     /// Updated when a worker with non-empty retry overrides registers.
     /// Cleaned up when the last worker for a model is removed.
@@ -393,6 +400,7 @@ impl WorkerRegistry {
             worker_mutation_locks: Arc::new(DashMap::new()),
             model_overloaded: Arc::new(DashMap::new()),
             overload_transitions: Arc::new(parking_lot::Mutex::new(())),
+            overload_defaults: parking_lot::RwLock::new(OverloadThresholds::default()),
             model_retry_configs: Arc::new(DashMap::new()),
             worker_origins: Arc::new(DashMap::new()),
             // Sized for fleet-scale bursts (startup registration, probe
@@ -427,6 +435,13 @@ impl WorkerRegistry {
     /// connection completes. See [`WorkerConnected`]. Holds no locks.
     pub fn connect_signal_sender(&self) -> mpsc::UnboundedSender<WorkerConnected> {
         self.connect_signal_tx.clone()
+    }
+
+    /// Install the gateway overload defaults used for future mesh imports.
+    /// Startup config is resolved before mesh gossip begins, so this is a
+    /// cold-path write and imports only need a short read lock.
+    pub fn set_overload_defaults(&self, defaults: OverloadThresholds) {
+        *self.overload_defaults.write() = defaults;
     }
 
     /// Take the connect-signal receiver. Returns `Some` exactly once (the
@@ -2467,10 +2482,14 @@ impl WorkerRegistry {
         // New worker — build from the full WorkerSpec if it decoded,
         // otherwise fall back to the minimal builder.
         let spec_applied = spec.is_some();
+        let overload_defaults = *self.overload_defaults.read();
         let worker = match spec {
-            Some(spec) => super::builder::BasicWorkerBuilder::from_spec(spec).build(),
+            Some(spec) => super::builder::BasicWorkerBuilder::from_spec(spec)
+                .overload_defaults(overload_defaults)
+                .build(),
             None => super::builder::BasicWorkerBuilder::new(&state.url)
                 .model(ModelCard::new(&state.model_id))
+                .overload_defaults(overload_defaults)
                 .build(),
         };
 
@@ -2816,6 +2835,36 @@ mod tests {
             registry.get_id_by_url("http://remote:8080"),
             Some(WorkerId::from_string("peer-w1".to_string())),
             "import keys under the publisher's id so its tombstone resolves"
+        );
+    }
+
+    #[test]
+    fn mesh_import_resolves_overload_against_gateway_defaults() {
+        let registry = WorkerRegistry::new();
+        registry.set_overload_defaults(OverloadThresholds {
+            waiting_requests: Some(4),
+            token_usage: Some(0.7),
+        });
+        let mut spec = openai_protocol::worker::WorkerSpec::new("http://remote:8080");
+        spec.overload.waiting_requests = Some(2);
+
+        registry.on_remote_worker_state(&remote_state(
+            "peer-w1",
+            "http://remote:8080",
+            true,
+            serde_json::to_vec(&spec).unwrap(),
+        ));
+
+        let worker = registry
+            .get_by_url("http://remote:8080")
+            .expect("mesh worker imported");
+        assert_eq!(
+            worker.metadata().overload,
+            OverloadThresholds {
+                waiting_requests: Some(2),
+                token_usage: Some(0.7),
+            },
+            "mesh imports must inherit each missing signal from gateway defaults"
         );
     }
 

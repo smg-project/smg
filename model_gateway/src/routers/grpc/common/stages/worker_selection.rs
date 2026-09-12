@@ -308,6 +308,13 @@ impl WorkerSelectionStage {
         ctx.workers = Some(workers);
         Ok(())
     }
+
+    /// Upper bound for pre-dispatch reselection while overload flags change.
+    /// Each persistent veto removes at least one worker from subsequent
+    /// placement; the fleet size therefore bounds useful retries.
+    pub(crate) fn dispatch_reselect_budget(&self) -> usize {
+        self.worker_registry.len().max(1)
+    }
 }
 
 /// Runtime of the leg that builds the generate request: the sole worker in

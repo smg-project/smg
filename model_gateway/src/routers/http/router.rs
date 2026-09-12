@@ -533,12 +533,36 @@ impl Router {
             }
         };
 
-        // Dispatch-time re-check of the one chosen worker: O(1), and the only
-        // thing that closes the window between selection and dispatch in which
-        // a load report can flip the veto.
-        if let Some(shed) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
-            return shed;
-        }
+        // Close the selection-to-dispatch race. If the chosen worker crossed
+        // its overload ceiling, respill to another compatible HTTP worker;
+        // shed only after that pool has no usable alternative. This is still
+        // before serialization or any upstream bytes, so no request is
+        // replayed.
+        let candidates = placement::candidates(
+            &self.worker_registry,
+            model_id,
+            RoutingPool::HttpRegular,
+            None,
+        );
+        let worker = match lease.with_view(|view| {
+            placement::reselect_single_before_dispatch(
+                &self.worker_registry,
+                &self.policy_registry,
+                model_id,
+                candidates.as_slice(),
+                PlacementInputs {
+                    text: view.text,
+                    tokens: view.tokens,
+                    headers,
+                    rid_key: view.rid_key,
+                    cache_namespace: view.cache_namespace,
+                },
+                worker,
+            )
+        }) {
+            Ok(worker) => worker,
+            Err(shed) => return shed,
+        };
 
         // Keyed-load accounting uses the exact source precedence as selection.
         let load_guard = lease.with_view(|view| {
@@ -851,14 +875,30 @@ impl Router {
             return resp;
         };
 
-        // Same dispatch-time re-check the regular path takes. A transcription
+        // Same dispatch-time respill the regular path takes. A transcription
         // occupies its worker for far longer than a chat completion, so a
-        // report landing in the selection→dispatch window is the one case where
-        // dispatching anyway is measurably worse.
-        if let Some(resp) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
-            record_pre_send_error(&resp);
-            return resp;
-        }
+        // report landing in the selection→dispatch window must prefer another
+        // compatible non-DP worker before shedding.
+        let worker = match placement::reselect_single_before_dispatch(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            &non_dp_workers,
+            PlacementInputs {
+                text: text.as_deref(),
+                tokens: hinted_tokens.as_deref(),
+                headers,
+                rid_key: None,
+                cache_namespace: None,
+            },
+            worker,
+        ) {
+            Ok(worker) => worker,
+            Err(resp) => {
+                record_pre_send_error(&resp);
+                return resp;
+            }
+        };
 
         // Streamed requests have no rid; the header is the whole sticky key.
         let load_guard = WorkerLoadGuard::with_key(
@@ -1769,27 +1809,47 @@ impl Router {
             "false",
         );
 
-        // Match the typed and multipart paths: close the selection-to-dispatch
-        // race where a fresh load report can veto the chosen worker after the
-        // policy selected it but before any request body reaches the engine.
-        if let Some(response) =
-            overload::shed_if_worker_overloaded(worker.as_ref(), model_id)
-        {
-            Metrics::record_router_upstream_response(
-                metrics_labels::ROUTER_HTTP,
-                response.status().as_u16(),
-                extract_error_code_from_response(&response),
-            );
-            Metrics::record_router_error(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_REGULAR,
-                metrics_labels::CONNECTION_HTTP,
-                model_id,
-                endpoint,
-                error_type_from_status(response.status()),
-            );
-            return Ok(response);
-        }
+        // Match the typed and multipart paths: respill when the selected
+        // worker is vetoed before the first body chunk is polled. Once the
+        // body is handed to reqwest below, this path never replays it.
+        let candidates = placement::candidates(
+            &self.worker_registry,
+            model_id,
+            RoutingPool::HttpRegular,
+            None,
+        );
+        let worker = match placement::reselect_single_before_dispatch(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            candidates.as_slice(),
+            PlacementInputs {
+                text: None,
+                tokens: hinted_tokens.as_deref(),
+                headers: Some(req.headers()),
+                rid_key: None,
+                cache_namespace: None,
+            },
+            worker,
+        ) {
+            Ok(worker) => worker,
+            Err(response) => {
+                Metrics::record_router_upstream_response(
+                    metrics_labels::ROUTER_HTTP,
+                    response.status().as_u16(),
+                    extract_error_code_from_response(&response),
+                );
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_HTTP,
+                    metrics_labels::BACKEND_REGULAR,
+                    metrics_labels::CONNECTION_HTTP,
+                    model_id,
+                    endpoint,
+                    error_type_from_status(response.status()),
+                );
+                return Ok(response);
+            }
+        };
 
         let load_guard = WorkerLoadGuard::with_key(
             worker.clone(),
@@ -2782,6 +2842,33 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct OverloadFirstSelectionPolicy {
+        selections: AtomicUsize,
+    }
+
+    impl LoadBalancingPolicy for OverloadFirstSelectionPolicy {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            _info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            let selected = workers.first()?;
+            if self.selections.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                selected.set_overloaded(true);
+            }
+            Some(0)
+        }
+
+        fn name(&self) -> &'static str {
+            "overload_first_selection"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
     type CapturedUpstreamRequest = Arc<tokio::sync::Mutex<Option<(HeaderMap, Bytes)>>>;
 
     /// Loopback engine stub: captures the forwarded `/generate` request and
@@ -3033,6 +3120,48 @@ mod tests {
         assert!(
             captured.lock().await.is_none(),
             "the request body must not reach a worker vetoed after selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_dispatch_respills_before_polling_body() {
+        let (url_a, captured_a) = spawn_capture_stub("application/json", "{}").await;
+        let (url_b, captured_b) = spawn_capture_stub("application/json", "{}").await;
+        let mut policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        policies.replace_default_policy_for_test(Arc::new(
+            OverloadFirstSelectionPolicy::default(),
+        ));
+        let router = streaming_router_with_registry(
+            Arc::new(policies),
+            1024 * 1024,
+            vec![plain_worker(&url_a), plain_worker(&url_b)],
+        );
+
+        let response = router
+            .route_streaming_request(
+                streamed_request(&[b"{\"text\":\"hello\"}"]),
+                "/generate",
+                false,
+            )
+            .await
+            .expect("streaming remains eligible");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let overloaded_url = router
+            .worker_registry
+            .get_all()
+            .into_iter()
+            .find(|worker| worker.is_overloaded())
+            .expect("the first selection was vetoed")
+            .url()
+            .to_string();
+        let a_received = captured_a.lock().await.is_some();
+        let b_received = captured_b.lock().await.is_some();
+        assert_ne!(a_received, b_received, "exactly one worker receives the body");
+        assert!(
+            (overloaded_url == url_a && !a_received && b_received)
+                || (overloaded_url == url_b && !b_received && a_received),
+            "the overload-vetoed worker must receive no request bytes"
         );
     }
 
@@ -3410,6 +3539,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn buffered_generate_respills_before_serializing_to_upstream() {
+        let (url_a, captured_a) = spawn_capture_stub("application/json", "{}").await;
+        let (url_b, captured_b) = spawn_capture_stub("application/json", "{}").await;
+        let mut policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        policies.replace_default_policy_for_test(Arc::new(
+            OverloadFirstSelectionPolicy::default(),
+        ));
+        let router = streaming_router_with_registry(
+            Arc::new(policies),
+            1024 * 1024,
+            vec![plain_worker(&url_a), plain_worker(&url_b)],
+        );
+
+        let response = router
+            .route_typed_request(
+                None,
+                DropProbeRequest {
+                    text: "respill me".to_string(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let overloaded_url = router
+            .worker_registry
+            .get_all()
+            .into_iter()
+            .find(|worker| worker.is_overloaded())
+            .expect("the first selection was vetoed")
+            .url()
+            .to_string();
+        let a_received = captured_a.lock().await.is_some();
+        let b_received = captured_b.lock().await.is_some();
+        assert_ne!(a_received, b_received, "exactly one worker receives the body");
+        assert!(
+            (overloaded_url == url_a && !a_received && b_received)
+                || (overloaded_url == url_b && !b_received && a_received),
+            "the overload-vetoed worker must receive no request bytes"
+        );
+    }
+
     /// With retries enabled the request must survive for replay: a 503 on the
     /// first attempt is retried with an identical body.
     #[tokio::test]
@@ -3483,8 +3657,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_worker_falls_back_to_buffered() {
+    async fn missing_worker_returns_404_without_polling_body() {
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
-        assert_falls_back_with_body_intact(&router).await;
+        let body = Body::from_stream(stream::once(async {
+            panic!("worker absence is known before the request body is read");
+            #[allow(unreachable_code)]
+            Ok::<Bytes, std::io::Error>(Bytes::new())
+        }));
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/generate")
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .header(CONTENT_LENGTH, 1024)
+            .body(body)
+            .unwrap();
+
+        let response = router
+            .route_streaming_request(req, "/generate", false)
+            .await
+            .expect("known pre-send failure is returned directly");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(extract_error_code_from_response(&response), "model_not_found");
     }
 }

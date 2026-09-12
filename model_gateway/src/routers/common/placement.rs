@@ -211,6 +211,58 @@ pub(crate) fn select_from(
     Some(selected)
 }
 
+/// Close the selection-to-dispatch overload race without needlessly shedding
+/// a request that another compatible worker can still serve.
+///
+/// `candidates` must be the exact compatibility pool used for the original
+/// selection. Each worker observed overloaded at this final check is excluded
+/// from subsequent choices for this request, so even a stateful or sticky
+/// policy cannot bounce back to it if its flag changes concurrently. No
+/// upstream I/O has happened at this point; callers must never use this helper
+/// to replay a request after dispatch begins.
+pub(crate) fn reselect_single_before_dispatch(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    candidates: &[Arc<dyn Worker>],
+    inputs: PlacementInputs<'_>,
+    mut selected: Arc<dyn Worker>,
+) -> Result<Arc<dyn Worker>, Response> {
+    let mut rejected: Vec<Arc<dyn Worker>> = Vec::new();
+
+    loop {
+        if !selected.is_overloaded() {
+            return Ok(selected);
+        }
+
+        // Keep the worker that caused the dispatch veto so the terminal
+        // answer can name it, but do not build/count that answer unless
+        // reselection proves there is no compatible available alternative.
+        let rejected_worker = Arc::clone(&selected);
+        rejected.push(selected);
+
+        let remaining: Vec<Arc<dyn Worker>> = candidates
+            .iter()
+            .filter(|candidate| {
+                !rejected
+                    .iter()
+                    .any(|rejected| Arc::ptr_eq(candidate, rejected))
+            })
+            .cloned()
+            .collect();
+
+        match select_from(registry, policies, model_id, &remaining, inputs) {
+            Some(next) => selected = next,
+            None => {
+                return Err(overload::shed_worker_overloaded(
+                    rejected_worker.as_ref(),
+                    model_id,
+                ))
+            }
+        }
+    }
+}
+
 /// Classify a failed single-worker placement from the same pool it drew from.
 pub(crate) fn single_failure(
     registry: &WorkerRegistry,
@@ -435,6 +487,7 @@ pub(crate) fn select_pair(
 mod tests {
     use std::collections::BTreeMap;
 
+    use axum::http::StatusCode;
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
 
     use super::*;
@@ -836,6 +889,68 @@ mod tests {
                 wire
             )),
             ["grpc://g:2"]
+        );
+    }
+
+    #[test]
+    fn dispatch_recheck_respills_away_from_newly_overloaded_worker() {
+        let registry = registry_with(&[
+            ("http://h:1", ConnectionMode::Http, RuntimeType::Sglang),
+            ("http://h:2", ConnectionMode::Http, RuntimeType::Sglang),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let candidates = candidates(&registry, MODEL, RoutingPool::HttpRegular, None);
+        let selected = select_from(
+            &registry,
+            &policies,
+            MODEL,
+            candidates.as_slice(),
+            PlacementInputs::default(),
+        )
+        .expect("initial worker");
+        let rejected_url = selected.url().to_string();
+        selected.set_overloaded(true);
+
+        let replacement = reselect_single_before_dispatch(
+            &registry,
+            &policies,
+            MODEL,
+            candidates.as_slice(),
+            PlacementInputs::default(),
+            selected,
+        )
+        .expect("another compatible worker remains");
+
+        assert_ne!(replacement.url(), rejected_url);
+        assert!(!replacement.is_overloaded());
+    }
+
+    #[test]
+    fn dispatch_recheck_sheds_only_after_compatible_pool_is_exhausted() {
+        let registry = registry_with(&[
+            ("http://h:1", ConnectionMode::Http, RuntimeType::Sglang),
+            ("http://h:2", ConnectionMode::Http, RuntimeType::Sglang),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let candidates = candidates(&registry, MODEL, RoutingPool::HttpRegular, None);
+        for worker in candidates.as_slice() {
+            worker.set_overloaded(true);
+        }
+
+        let response = reselect_single_before_dispatch(
+            &registry,
+            &policies,
+            MODEL,
+            candidates.as_slice(),
+            PlacementInputs::default(),
+            Arc::clone(&candidates.as_slice()[0]),
+        )
+        .expect_err("no compatible worker remains");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            crate::routers::error::extract_error_code_from_response(&response),
+            overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE
         );
     }
 

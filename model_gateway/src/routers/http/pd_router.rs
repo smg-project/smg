@@ -502,12 +502,54 @@ impl PDRouter {
                 context.headers.as_ref(),
             )
         });
-        let (prefill, decode) = match selected {
+        let (mut prefill, mut decode) = match selected {
             Ok(pair) => pair,
             Err(e) => {
                 return self.handle_server_selection_error(*e, context.model_id);
             }
         };
+
+        // Re-select the whole compatible pair if either leg crossed its
+        // overload threshold after selection. This runs before either leg is
+        // serialized or sent, so it is a respill, never a replay. The bound
+        // protects against pathological policies while persistent overload
+        // flags naturally remove each rejected leg from the next placement.
+        let reselect_budget = self.worker_registry.len().max(1);
+        for reselect_attempt in 0..=reselect_budget {
+            let overloaded = if prefill.is_overloaded() {
+                Some(Arc::clone(&prefill))
+            } else if decode.is_overloaded() {
+                Some(Arc::clone(&decode))
+            } else {
+                None
+            };
+            let Some(overloaded) = overloaded else {
+                break;
+            };
+            if reselect_attempt == reselect_budget {
+                return overload::shed_worker_overloaded(overloaded.as_ref(), context.model_id);
+            }
+
+            let replacement = lease.with_view(|view| {
+                self.select_pd_pair(
+                    view.text,
+                    view.tokens,
+                    view.rid_key,
+                    view.cache_namespace,
+                    context.model_id,
+                    context.headers.as_ref(),
+                )
+            });
+            match replacement {
+                Ok(pair) => (prefill, decode) = pair,
+                Err(_) => {
+                    return overload::shed_worker_overloaded(
+                        overloaded.as_ref(),
+                        context.model_id,
+                    )
+                }
+            }
+        }
 
         debug!(
             "PD retry attempt {} using prefill={} decode={}",
@@ -515,14 +557,6 @@ impl PDRouter {
             prefill.url(),
             decode.url()
         );
-
-        // Dispatch-time re-check of both legs, the same one the regular HTTP
-        // and gRPC paths take just before their load guards.
-        if let Some(shed) = overload::shed_if_worker_overloaded(prefill.as_ref(), context.model_id)
-            .or_else(|| overload::shed_if_worker_overloaded(decode.as_ref(), context.model_id))
-        {
-            return shed;
-        }
 
         let raw_body_len = header_utils::content_length(headers);
 

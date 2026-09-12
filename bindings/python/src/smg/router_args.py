@@ -744,7 +744,7 @@ class RouterArgs:
             default=RouterArgs.pd_admission_wait_secs,
             help=(
                 "Seconds a prefill/decode dispatch waits for a free slot in"
-                " the decode engine's running window before shedding with 503"
+                " the decode engine's running window before shedding with 429"
                 " worker_overload_protection_shed. Keep it well under the"
                 " engine's bootstrap deadline. 0 sheds immediately; engines"
                 " that report no running window are never gated"

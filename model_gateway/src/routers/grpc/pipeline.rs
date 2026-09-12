@@ -64,7 +64,10 @@ use crate::{
     policies::PolicyRegistry,
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
-        common::retry::{is_retryable_response, BackoffCalculator},
+        common::{
+            overload,
+            retry::{is_retryable_response, BackoffCalculator},
+        },
         error,
     },
     worker::WorkerRegistry,
@@ -418,17 +421,51 @@ impl RequestPipeline {
             stages.worker_selection.name(),
             stages.worker_selection.execute(ctx).await
         )?;
-        let workers = ctx.state.workers.as_ref().ok_or_else(|| {
-            error!(function = "run_ingress", "Worker selection not completed");
-            error::internal_error(
-                "worker_selection_not_completed",
-                "Worker selection not completed",
-            )
-        })?;
-        ctx.state.clients = Some(step!(
-            "ClientAcquisition",
-            acquire_clients(workers, &ctx.input.model_id).await
-        )?);
+        // Client acquisition is the last pre-build point at which no backend
+        // bytes can have been sent. If a selected worker crossed its overload
+        // threshold, run selection again so another compatible worker can
+        // accept the request. A bounded loop prevents a pathological policy
+        // from spinning while workers flap.
+        let reselect_budget = ctx.components.worker_registry.len().max(1);
+        let mut reselects = 0usize;
+        loop {
+            let acquisition = {
+                let workers = ctx.state.workers.as_ref().ok_or_else(|| {
+                    error!(function = "run_ingress", "Worker selection not completed");
+                    error::internal_error(
+                        "worker_selection_not_completed",
+                        "Worker selection not completed",
+                    )
+                })?;
+                acquire_clients(workers).await
+            };
+            match acquisition {
+                Ok(clients) => {
+                    ctx.state.clients = Some(clients);
+                    break;
+                }
+                Err(ClientAcquisitionError::Response(response)) => {
+                    error!(
+                        "Stage ClientAcquisition failed with status {}",
+                        response.status()
+                    );
+                    return Err(response);
+                }
+                Err(ClientAcquisitionError::Overloaded(worker)) => {
+                    if reselects >= reselect_budget {
+                        return Err(overload::shed_worker_overloaded(
+                            worker.as_ref(),
+                            &ctx.input.model_id,
+                        ));
+                    }
+                    reselects += 1;
+                    step!(
+                        stages.worker_selection.name(),
+                        stages.worker_selection.execute(ctx).await
+                    )?;
+                }
+            }
+        }
         if let Some(encode) = &stages.encode {
             step!(encode.name(), encode.execute(ctx).await)?;
         }
@@ -455,6 +492,46 @@ impl RequestPipeline {
             // new workers. Buffered decode state from the failed attempt is
             // reset.
             self.stages.worker_selection.reselect(dctx)?;
+            let reselect_budget = self.stages.worker_selection.dispatch_reselect_budget();
+            let mut reselects = 0usize;
+            loop {
+                let acquisition = {
+                    let workers = dctx.workers.as_ref().ok_or_else(|| {
+                        error!(
+                            function = "run_attempt",
+                            "Worker re-selection not completed"
+                        );
+                        error::internal_error(
+                            "worker_selection_not_completed",
+                            "Worker selection not completed",
+                        )
+                    })?;
+                    acquire_clients(workers).await
+                };
+                match acquisition {
+                    Ok(clients) => {
+                        dctx.clients = Some(clients);
+                        break;
+                    }
+                    Err(ClientAcquisitionError::Response(response)) => {
+                        error!(
+                            "Stage ClientAcquisition failed with status {}",
+                            response.status()
+                        );
+                        return Err(response);
+                    }
+                    Err(ClientAcquisitionError::Overloaded(worker)) => {
+                        if reselects >= reselect_budget {
+                            return Err(overload::shed_worker_overloaded(
+                                worker.as_ref(),
+                                &dctx.model_id,
+                            ));
+                        }
+                        reselects += 1;
+                        self.stages.worker_selection.reselect(dctx)?;
+                    }
+                }
+            }
             let workers = dctx.workers.as_ref().ok_or_else(|| {
                 error!(
                     function = "run_attempt",
@@ -465,7 +542,6 @@ impl RequestPipeline {
                     "Worker selection not completed",
                 )
             })?;
-            dctx.clients = Some(acquire_clients(workers, &dctx.model_id).await?);
             let retained = plan.as_mut().ok_or_else(|| {
                 error!(function = "run_attempt", "Execution plan already consumed");
                 error::internal_error("execution_plan_consumed", "Execution plan already consumed")
@@ -1430,10 +1506,38 @@ mod request_release_tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+        policies::{LoadBalancingPolicy, SelectWorkerInfo},
+        worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
     };
 
     const MODEL: &str = "request-release-test-model";
+
+    #[derive(Debug, Default)]
+    struct OverloadFirstSelectionPolicy {
+        selections: AtomicUsize,
+    }
+
+    impl LoadBalancingPolicy for OverloadFirstSelectionPolicy {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            _info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            let selected = workers.first()?;
+            if self.selections.fetch_add(1, Ordering::SeqCst) == 0 {
+                selected.set_overloaded(true);
+            }
+            Some(0)
+        }
+
+        fn name(&self) -> &'static str {
+            "overload_first_selection"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
 
     type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
     type KvEventStream = Pin<Box<dyn Stream<Item = Result<common::KvEventBatch, Status>> + Send>>;
@@ -1871,6 +1975,74 @@ mod request_release_tests {
             released.load(Ordering::SeqCst),
             "the parsed request must be freed before the upstream answers"
         );
+    }
+
+    #[tokio::test]
+    async fn grpc_ingress_respills_when_selected_worker_becomes_overloaded() {
+        let requests_a = Arc::new(Mutex::new(Vec::new()));
+        let requests_b = Arc::new(Mutex::new(Vec::new()));
+        let port_a = spawn_stub(GatedScheduler {
+            seen_request_ids: Arc::clone(&requests_a),
+            ..Default::default()
+        })
+        .await;
+        let port_b = spawn_stub(GatedScheduler {
+            seen_request_ids: Arc::clone(&requests_b),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, port_a, WorkerType::Regular);
+        register_worker(&worker_registry, port_b, WorkerType::Regular);
+        let mut policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        policies.replace_default_policy_for_test(Arc::new(
+            OverloadFirstSelectionPolicy::default(),
+        ));
+        let deps = PipelineDeps::pair(
+            Arc::clone(&worker_registry),
+            Arc::new(policies),
+            None,
+        );
+        let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+            .expect("completion pipeline");
+        let components = components(Arc::clone(&worker_registry)).await;
+
+        let response = pipeline
+            .execute_completion(
+                completion_request(false),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let overloaded_url = worker_registry
+            .get_all()
+            .into_iter()
+            .find(|worker| worker.is_overloaded())
+            .expect("first selection was vetoed")
+            .url()
+            .to_string();
+        let calls_a = requests_a
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        let calls_b = requests_b
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        let (rejected_calls, replacement_calls) = if overloaded_url.ends_with(&port_a.to_string()) {
+            (calls_a, calls_b)
+        } else {
+            (calls_b, calls_a)
+        };
+        assert_eq!(rejected_calls, 0, "no RPC reaches the overloaded worker");
+        assert_eq!(replacement_calls, 1, "the compatible worker serves once");
     }
 
     /// grpc_pd twin of the dispatch-release probe: the gated decode leg

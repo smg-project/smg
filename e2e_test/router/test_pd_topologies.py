@@ -725,11 +725,11 @@ class TestPDTopology:
                 "sole %s down: status=%s code=%s after %.1fs", role, resp.status_code, code, elapsed
             )
             assert elapsed < 20.0, f"request hung for {elapsed:.1f}s while the only {role} was down"
-            # The model exists and its leg is merely down: a 503 the client can
-            # retry, never a 404 that says the model is gone (#2465). Every
+            # The model exists and its leg is merely down: a capacity 429 the
+            # client can retry, never a 404 that says the model is gone (#2465). Every
             # router answers no_available_workers (#2479); the HTTP PD router
             # may name the leg instead.
-            assert resp.status_code == 503, (
+            assert resp.status_code == 429, (
                 f"unexpected outage answer: {resp.status_code} {resp.text[:200]}"
             )
             assert code in (
@@ -978,12 +978,12 @@ class TestPDSmallWindow:
             dict(statuses),
             elapsed,
         )
-        assert set(statuses) <= {200, 503}, (
+        assert set(statuses) <= {200, 429}, (
             f"a burst must be served or shed, never errored: {dict(statuses)}"
         )
         assert statuses[200] >= _WINDOW, f"too few requests served: {dict(statuses)}"
         for resp in results:
-            if resp.status_code == 503:
+            if resp.status_code == 429:
                 assert _error_code(resp) == "worker_overload_protection_shed", resp.text[:200]
                 assert resp.headers.get("retry-after"), "a shed must say when to retry"
         assert elapsed < 90.0, f"the burst took {elapsed:.0f}s; queued rooms are timing out"

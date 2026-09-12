@@ -10,7 +10,6 @@ use tracing::error;
 
 use crate::{
     routers::{
-        common::overload,
         error,
         grpc::{
             backend_client::BackendClient,
@@ -20,44 +19,76 @@ use crate::{
     worker::Worker,
 };
 
-/// Acquire backend clients for the selected workers, with a dispatch-time
-/// overload re-check: one relaxed atomic read per already-chosen worker,
-/// closing the window between selection and dispatch in which a load report
-/// can flip the veto.
-pub(crate) async fn acquire_clients(
-    workers: &WorkerSelection,
-    model_id: &str,
-) -> Result<ClientSelection, Response> {
+/// Client acquisition distinguishes a pre-dispatch overload observation from
+/// transport/configuration failures. The pipeline may safely reselect for the
+/// former because no backend RPC has started; it must return the latter.
+pub(crate) enum ClientAcquisitionError {
+    Overloaded(Arc<dyn Worker>),
+    Response(Response),
+}
+
+fn first_overloaded_worker(workers: &WorkerSelection) -> Option<Arc<dyn Worker>> {
     match workers {
         WorkerSelection::Single { worker } => {
-            if let Some(shed) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
-                return Err(shed);
-            }
-            let client = get_backend_client_from_worker(worker).await?;
-            Ok(ClientSelection::Single { client })
+            worker.is_overloaded().then(|| Arc::clone(worker))
         }
         WorkerSelection::Disaggregated {
             encode_assignments,
             prefill,
             decode,
             ..
-        } => {
-            // Every assigned leg, encode included: an encode worker is
-            // vetoed at selection through the same filter, so leaving it out
-            // of the re-check would be the one dispatch path that can send
-            // to a worker known to be over the ceiling.
-            if let Some(shed) = overload::shed_if_worker_overloaded(prefill.as_ref(), model_id)
-                .or_else(|| overload::shed_if_worker_overloaded(decode.as_ref(), model_id))
-                .or_else(|| {
-                    encode_assignments.iter().flatten().find_map(|assignment| {
-                        overload::shed_if_worker_overloaded(assignment.worker.as_ref(), model_id)
-                    })
+        } => [prefill, decode]
+            .into_iter()
+            .find(|worker| worker.is_overloaded())
+            .cloned()
+            .or_else(|| {
+                encode_assignments.iter().flatten().find_map(|assignment| {
+                    assignment
+                        .worker
+                        .is_overloaded()
+                        .then(|| Arc::clone(&assignment.worker))
                 })
-            {
-                return Err(shed);
+            }),
+    }
+}
+
+/// Acquire backend clients for the selected workers, bracketing any lazy
+/// connection awaits with overload checks. This closes the selection-to-build
+/// window without sending an inference request to a newly vetoed worker.
+pub(crate) async fn acquire_clients(
+    workers: &WorkerSelection,
+) -> Result<ClientSelection, ClientAcquisitionError> {
+    if let Some(worker) = first_overloaded_worker(workers) {
+        return Err(ClientAcquisitionError::Overloaded(worker));
+    }
+
+    match workers {
+        WorkerSelection::Single { worker } => {
+            let client = get_backend_client_from_worker(worker)
+                .await
+                .map_err(ClientAcquisitionError::Response)?;
+            if let Some(worker) = first_overloaded_worker(workers) {
+                return Err(ClientAcquisitionError::Overloaded(worker));
             }
-            let prefill_client = get_backend_client_from_worker(prefill).await?;
-            let decode_client = get_backend_client_from_worker(decode).await?;
+            Ok(ClientSelection::Single { client })
+        }
+        WorkerSelection::Disaggregated {
+            prefill,
+            decode,
+            ..
+        } => {
+            let prefill_client = get_backend_client_from_worker(prefill)
+                .await
+                .map_err(ClientAcquisitionError::Response)?;
+            let decode_client = get_backend_client_from_worker(decode)
+                .await
+                .map_err(ClientAcquisitionError::Response)?;
+            // Re-check after any lazy connection awaits. Every assigned leg,
+            // encode included, must still be open immediately before request
+            // construction begins.
+            if let Some(worker) = first_overloaded_worker(workers) {
+                return Err(ClientAcquisitionError::Overloaded(worker));
+            }
 
             Ok(ClientSelection::Disaggregated {
                 prefill: prefill_client,
@@ -97,4 +128,39 @@ async fn get_backend_client_from_worker(
         })?;
 
     Ok((*client_arc).clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::worker::HealthCheckConfig;
+
+    use super::*;
+    use crate::worker::{BasicWorkerBuilder, ConnectionMode, WorkerType};
+
+    #[tokio::test]
+    async fn overload_is_reported_as_reselectable_before_client_creation() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:9999")
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        worker.set_overloaded(true);
+
+        let result = acquire_clients(&WorkerSelection::Single {
+            worker: Arc::clone(&worker),
+        })
+        .await;
+
+        match result {
+            Err(ClientAcquisitionError::Overloaded(observed)) => {
+                assert!(Arc::ptr_eq(&observed, &worker));
+            }
+            _ => panic!("overload must be distinguished from a client acquisition error"),
+        }
+    }
 }
