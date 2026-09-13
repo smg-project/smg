@@ -386,6 +386,60 @@ jobs:
   # not a merge blocker: it shows up as a warning annotation and in the step
   # summary (BENCH_ENFORCE_THRESHOLDS=1 makes it fail). Results are still
   # uploaded and summarized.
+  # Public-API guard for the published protocol crate: `cargo semver-checks`
+  # diffs openai-protocol against the newest version on crates.io. Versions
+  # are bumped at release time, so mid-cycle the manifest usually still says
+  # the published version; then only breaking changes fail (release type
+  # "minor"), and the fix is to bump the major in the PR that breaks the API.
+  # Once the manifest is bumped, the allowed change is derived from the two
+  # version numbers instead. Background: #2505, where a removal shipped as a
+  # plain feat: and the release script proposed a minor bump.
+  protocols-semver:
+    needs: [detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.detect-changes.result == 'success'
+      && (
+        github.event_name != 'pull_request'
+        || needs.detect-changes.outputs.protocols == 'true'
+      )
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Decide the release type
+        id: release-type
+        run: |
+          local_version=$(grep -E '^version = ' crates/protocols/Cargo.toml | head -1 | cut -d'"' -f2)
+          published=$(curl -sf -A "smg-ci (${{ github.repository }})" https://crates.io/api/v1/crates/openai-protocol \
+            | grep -o '"max_version":"[^"]*"' | cut -d'"' -f4)
+          if [ -z "$published" ]; then
+            echo "could not read openai-protocol's published version from crates.io" >&2
+            exit 1
+          fi
+          echo "openai-protocol: manifest ${local_version}, crates.io ${published}"
+          if [ "$local_version" = "$published" ]; then
+            echo "Unbumped since the last publish: only breaking changes fail; bump the major in this PR to allow them"
+            echo "release-type=minor" >> "$GITHUB_OUTPUT"
+          else
+            echo "Manifest already bumped: the allowed change is derived from ${published} -> ${local_version}"
+            echo "release-type=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: cargo semver-checks openai-protocol
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: openai-protocol
+          feature-group: all-features
+          rust-toolchain: manual
+          release-type: ${{ steps.release-type.outputs.release-type }}
+
   benchmarks:
     needs: build-wheel
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
@@ -477,6 +531,7 @@ jobs:
       realtime: ${{ steps.filter.outputs.realtime }}
       go-bindings: ${{ steps.filter.outputs.go-bindings }}
       rust-ci: ${{ steps.filter.outputs.rust-ci }}
+      protocols: ${{ steps.filter.outputs.protocols }}
       tokenspeed-image: ${{ steps.tokenspeed-image.outputs.image }}
     steps:
       - uses: actions/checkout@v7
@@ -584,6 +639,11 @@ jobs:
               - 'e2e_test/realtime/**'
             go-bindings:
               - 'e2e_test/bindings_go/**'
+            protocols:
+              - 'crates/protocols/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/pr-test-rust.yml'
             rust-ci:
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -1394,7 +1454,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, protocols-semver, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -1451,6 +1511,7 @@ jobs:
                 "${{ needs.build-wheel.result }}" == "failure" || \
                 "${{ needs.python-unit-tests.result }}" == "failure" || \
                 "${{ needs.unit-tests.result }}" == "failure" || \
+                "${{ needs.protocols-semver.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat-zmq.result }}" == "failure" || \
                 "${{ needs.e2e-2gpu-chat-zmq-dp.result }}" == "failure" || \
