@@ -250,8 +250,9 @@ impl PolicyRegistry {
     /// Select a worker, applying the sticky routing-key override when it is
     /// enabled, the request carries a key from the configured source, and the
     /// configured policy does not already honor the key (`manual` /
-    /// `consistent_hashing`). Otherwise delegates to `policy`. `policy.name()`
-    /// stays the real policy (for metrics).
+    /// `consistent_hashing`, which read `rid_key` and the header themselves
+    /// with the same rid-first precedence). Otherwise delegates to `policy`.
+    /// `policy.name()` stays the real policy (for metrics).
     pub fn select_worker(
         &self,
         policy: &Arc<dyn LoadBalancingPolicy>,
@@ -355,7 +356,8 @@ impl PolicyRegistry {
         finish(Some(idx), branch)
     }
 
-    /// Policies that already honor the routing key keep their own handling; all
+    /// Policies that already honor the routing key keep their own handling
+    /// (they consult `rid_key` before the header, like the override does); all
     /// others (cache_aware, least_load, prefix_hash, ...) get the sticky override.
     fn routing_key_override_applies(name: &str) -> bool {
         !matches!(name, "manual" | "consistent_hashing")
@@ -985,7 +987,7 @@ mod tests {
     use super::*;
     use crate::{
         policies::{CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
-        worker::{BasicWorkerBuilder, Worker, WorkerLoadGuard, WorkerType},
+        worker::{BasicWorkerBuilder, HashRing, Worker, WorkerLoadGuard, WorkerType},
     };
 
     fn no_health_check() -> HealthCheckConfig {
@@ -1053,6 +1055,72 @@ mod tests {
         let first = reg.select_worker(&policy, &workers, &info).unwrap();
         for _ in 0..5 {
             assert_eq!(reg.select_worker(&policy, &workers, &info), Some(first));
+        }
+    }
+
+    /// `--routing-key-override` means the same thing under every policy:
+    /// the body rid outranks the routing-key header. Key-native policies
+    /// skip the sticky override, so they must honor `rid_key` themselves.
+    #[test]
+    fn rid_key_outranks_header_under_key_native_policies() {
+        for config in [
+            PolicyConfig::Manual {
+                eviction_interval_secs: 60,
+                max_idle_secs: 3600,
+                assignment_mode: ManualAssignmentMode::Random,
+            },
+            PolicyConfig::ConsistentHashing,
+        ] {
+            let reg = PolicyRegistry::with_override(
+                config,
+                RoutingKeyOverrideConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+            let policy = reg.get_default_policy();
+            let name = policy.name();
+            assert!(!PolicyRegistry::routing_key_override_applies(name));
+            let workers = vec![
+                worker("http://w1", WorkerType::Regular),
+                worker("http://w2", WorkerType::Regular),
+                worker("http://w3", WorkerType::Regular),
+                worker("http://w4", WorkerType::Regular),
+            ];
+            let hash_ring = Some(Arc::new(HashRing::new(workers.iter().map(|w| w.url()))));
+
+            let rid_key = reg.derive_rid_key(Some("conv_t1"));
+            assert_eq!(rid_key, Some("conv"));
+            let pinned = reg
+                .select_worker(
+                    &policy,
+                    &workers,
+                    &SelectWorkerInfo {
+                        rid_key,
+                        hash_ring: hash_ring.clone(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+            // Later turns of the conversation with rotating header keys stay
+            // on the rid's worker, whatever the header would have picked.
+            for (turn, key) in (2..).zip(["key_a", "key_b", "key_c", "key_d"]) {
+                let headers = headers_with_key(key);
+                let rid = format!("conv_t{turn}");
+                let info = SelectWorkerInfo {
+                    headers: Some(&headers),
+                    routing_key: reg.resolve_routing_key(Some(&headers)),
+                    rid_key: reg.derive_rid_key(Some(&rid)),
+                    hash_ring: hash_ring.clone(),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    reg.select_worker(&policy, &workers, &info),
+                    Some(pinned),
+                    "{name}: body rid must outrank header {key}"
+                );
+            }
         }
     }
 
