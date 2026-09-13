@@ -287,6 +287,10 @@ async fn join(
         .expect("spawned request task panicked")
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
 fn cancel_request(response_id: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
