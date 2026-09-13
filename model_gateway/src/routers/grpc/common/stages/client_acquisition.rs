@@ -22,9 +22,12 @@ use crate::{
 /// Client acquisition distinguishes a pre-dispatch overload observation from
 /// transport/configuration failures. The pipeline may safely reselect for the
 /// former because no backend RPC has started; it must return the latter.
+///
+/// The rendered response is boxed so the overload path — the common one — does
+/// not carry a response-sized payload through every `Result` in the pipeline.
 pub(crate) enum ClientAcquisitionError {
     Overloaded(Arc<dyn Worker>),
-    Response(Response),
+    Response(Box<Response>),
 }
 
 fn first_overloaded_worker(workers: &WorkerSelection) -> Option<Arc<dyn Worker>> {
@@ -66,7 +69,7 @@ pub(crate) async fn acquire_clients(
         WorkerSelection::Single { worker } => {
             let client = get_backend_client_from_worker(worker)
                 .await
-                .map_err(ClientAcquisitionError::Response)?;
+                .map_err(|response| ClientAcquisitionError::Response(Box::new(response)))?;
             if let Some(worker) = first_overloaded_worker(workers) {
                 return Err(ClientAcquisitionError::Overloaded(worker));
             }
@@ -79,10 +82,10 @@ pub(crate) async fn acquire_clients(
         } => {
             let prefill_client = get_backend_client_from_worker(prefill)
                 .await
-                .map_err(ClientAcquisitionError::Response)?;
+                .map_err(|response| ClientAcquisitionError::Response(Box::new(response)))?;
             let decode_client = get_backend_client_from_worker(decode)
                 .await
-                .map_err(ClientAcquisitionError::Response)?;
+                .map_err(|response| ClientAcquisitionError::Response(Box::new(response)))?;
             // Re-check after any lazy connection awaits. Every assigned leg,
             // encode included, must still be open immediately before request
             // construction begins.

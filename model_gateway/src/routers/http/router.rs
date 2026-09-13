@@ -664,7 +664,6 @@ impl Router {
                 let headers = filtered_headers.clone();
                 let client_auth = client_auth.clone();
                 let api_key = worker.api_key().cloned();
-                let stale_retry_enabled = stale_retry_enabled;
 
                 async move {
                     let mut request_builder = match method {

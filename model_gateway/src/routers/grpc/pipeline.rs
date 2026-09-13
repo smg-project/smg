@@ -449,7 +449,7 @@ impl RequestPipeline {
                         "Stage ClientAcquisition failed with status {}",
                         response.status()
                     );
-                    return Err(response);
+                    return Err(*response);
                 }
                 Err(ClientAcquisitionError::Overloaded(worker)) => {
                     if reselects >= reselect_budget {
@@ -518,7 +518,7 @@ impl RequestPipeline {
                             "Stage ClientAcquisition failed with status {}",
                             response.status()
                         );
-                        return Err(response);
+                        return Err(*response);
                     }
                     Err(ClientAcquisitionError::Overloaded(worker)) => {
                         if reselects >= reselect_budget {
