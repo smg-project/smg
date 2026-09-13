@@ -2527,8 +2527,11 @@ mod tests {
             .is_none());
     }
 
+    /// A NotReady pool is unavailability, not capacity pressure: the answer
+    /// stays the retryable 503 and advertises no pacing interval, so clients
+    /// and proxies read it as a server fault rather than a rate limit.
     #[tokio::test]
-    async fn unavailable_workers_return_capacity_429_with_retry_after() {
+    async fn unavailable_workers_return_retryable_503_without_retry_after() {
         let router = create_test_regular_router();
         for worker in router.worker_registry.get_all() {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
@@ -2546,7 +2549,7 @@ mod tests {
             )
             .await;
 
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             response
                 .headers()
@@ -2554,7 +2557,7 @@ mod tests {
                 .expect("gateway error code header"),
             "no_available_workers"
         );
-        assert!(response.headers().get(RETRY_AFTER).is_some());
+        assert!(response.headers().get(RETRY_AFTER).is_none());
     }
 
     #[tokio::test]

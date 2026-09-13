@@ -392,7 +392,7 @@ impl WorkerSelectionStage {
     }
 
     /// Workers serve the model but none can take the request right now
-    /// (unhealthy, circuit breaker open, or the policy declined). A 429 with
+    /// (unhealthy, circuit breaker open, or the policy declined). A 503 with
     /// the same code the HTTP router uses: the model exists, the client should
     /// retry, and nothing about its request is wrong. Answering 404 here told
     /// clients the model was gone while its workers restarted.
@@ -411,7 +411,7 @@ impl WorkerSelectionStage {
     /// The response for a failed pair placement. The verdict was judged from
     /// the leg's own candidates inside the placement, so a shed is answered
     /// as it was built and counted once; a never-known model is a 404, and a
-    /// known model without a usable leg is the 429 the HTTP router gives.
+    /// known model without a usable leg is the 503 the HTTP router gives.
     fn pair_failure(&self, model_id: &str, failure: PairFailure) -> Response {
         match failure.verdict {
             PlacementFailure::AllOverloaded(shed) => shed,
@@ -964,7 +964,7 @@ mod tests {
     }
 
     /// An undemanded leg cannot shed: a text-only EPD request that fails for a
-    /// non-overload reason gets the generic capacity 429, not an overload shed
+    /// non-overload reason gets the unavailability 503, not an overload shed
     /// just because the (unused) encode pool is saturated.
     #[test]
     fn an_undemanded_encode_leg_cannot_shed() {
@@ -991,7 +991,7 @@ mod tests {
         // a known model with no usable requested leg, not an overload shed.
         let text_only =
             stage.selection_failure(model_id, &[WorkerType::Prefill, WorkerType::Decode], None);
-        assert_eq!(text_only.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(text_only.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             error::extract_error_code_from_response(&text_only),
             "no_available_workers"
@@ -1269,11 +1269,11 @@ mod tests {
         );
     }
 
-    /// Workers serve the model but none is available: a 429 with the HTTP
+    /// Workers serve the model but none is available: a 503 with the HTTP
     /// router's code, not the 404 that told clients the model was gone while
     /// its workers restarted.
     #[test]
-    fn an_unavailable_regular_worker_answers_429_not_404() {
+    fn an_unavailable_regular_worker_answers_503_not_404() {
         use openai_protocol::worker::WorkerStatus;
 
         use crate::routers::error::extract_error_code_from_response;
@@ -1301,7 +1301,7 @@ mod tests {
 
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None);
 
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             extract_error_code_from_response(&response),
             "no_available_workers"
@@ -1315,10 +1315,10 @@ mod tests {
         );
     }
 
-    /// A disaggregated leg whose only worker is down is the same 429, both
+    /// A disaggregated leg whose only worker is down is the same 503, both
     /// through the per-leg fallback and through the pair verdict.
     #[test]
-    fn an_unavailable_decode_leg_answers_429_not_404() {
+    fn an_unavailable_decode_leg_answers_503_not_404() {
         use openai_protocol::worker::WorkerStatus;
 
         use crate::{policies::WorkerLeg, routers::error::extract_error_code_from_response};
@@ -1348,7 +1348,7 @@ mod tests {
         );
 
         for response in [fallback, pair] {
-            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(
                 extract_error_code_from_response(&response),
                 "no_available_workers"
@@ -1361,7 +1361,7 @@ mod tests {
                 verdict: PlacementFailure::NoCandidates,
             },
         );
-        assert_eq!(known_but_leg_absent.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(known_but_leg_absent.status(), StatusCode::SERVICE_UNAVAILABLE);
         let unknown = stage.pair_failure(
             "no-such-model",
             PairFailure {

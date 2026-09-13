@@ -140,7 +140,7 @@ pub(crate) fn apply_capacity_contract(response: &mut Response) {
     mark_non_retryable(response);
 }
 
-/// Return capacity pressure for a known model while preserving 404 for an
+/// Report a known model whose workers cannot serve while preserving 404 for an
 /// identity this router has never observed.
 pub(crate) fn unavailable_or_not_found(
     registry: &WorkerRegistry,
@@ -154,10 +154,16 @@ pub(crate) fn unavailable_or_not_found(
     }
 }
 
-/// Stable response for a known model whose workers cannot currently accept
-/// work.
+/// Stable response for a known model with no worker able to take the request:
+/// unhealthy, circuit-open, or no leg the request is compatible with.
+///
+/// This is server-side unavailability, not capacity pressure, so it stays the
+/// retryable 503 and carries neither Retry-After nor the non-retryable mark.
+/// A worker over its load threshold is the [`shed`] path and its 429 instead:
+/// 429 asks the client to slow down, which is the wrong instruction when the
+/// backend is simply broken.
 pub(crate) fn no_available_workers(message: impl Into<String>) -> Response {
-    capacity_response(NO_AVAILABLE_WORKERS_ERROR_CODE, message)
+    error::service_unavailable(NO_AVAILABLE_WORKERS_ERROR_CODE, message)
 }
 
 fn capacity_response(code: &'static str, message: impl Into<String>) -> Response {
@@ -308,8 +314,11 @@ mod tests {
         );
     }
 
+    /// An unservable known model is unavailability, not capacity pressure: it
+    /// keeps the retryable 503 so the retry layer and clients treat a
+    /// circuit-open backend as a server fault rather than a rate limit.
     #[test]
-    fn known_model_without_workers_is_capacity_but_unknown_model_is_not_found() {
+    fn known_model_without_workers_is_unavailable_but_unknown_model_is_not_found() {
         let registry = WorkerRegistry::new();
 
         let unknown = unavailable_or_not_found(&registry, "unknown", "no worker");
@@ -317,13 +326,19 @@ mod tests {
 
         registry.remember_model("known");
         let known = unavailable_or_not_found(&registry, "known", "no worker");
-        assert_eq!(known.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(known.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             extract_error_code_from_response(&known),
             NO_AVAILABLE_WORKERS_ERROR_CODE
         );
-        assert!(known.headers().contains_key(RETRY_AFTER));
-        assert!(!is_retryable_response(&known));
+        assert!(
+            !known.headers().contains_key(RETRY_AFTER),
+            "unavailability advertises no pacing interval; only a capacity shed does"
+        );
+        assert!(
+            is_retryable_response(&known),
+            "an unhealthy pool must stay retryable, unlike a terminal shed"
+        );
     }
 
     #[test]

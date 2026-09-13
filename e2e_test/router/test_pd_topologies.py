@@ -725,11 +725,11 @@ class TestPDTopology:
                 "sole %s down: status=%s code=%s after %.1fs", role, resp.status_code, code, elapsed
             )
             assert elapsed < 20.0, f"request hung for {elapsed:.1f}s while the only {role} was down"
-            # The model exists and its leg is merely down: a capacity 429 the
-            # client can retry, never a 404 that says the model is gone (#2465). Every
+            # The model exists and its leg is merely down: a 503 the client can
+            # retry, never a 404 that says the model is gone (#2465). Every
             # router answers no_available_workers (#2479); the HTTP PD router
             # may name the leg instead.
-            assert resp.status_code == 429, (
+            assert resp.status_code == 503, (
                 f"unexpected outage answer: {resp.status_code} {resp.text[:200]}"
             )
             assert code in (
