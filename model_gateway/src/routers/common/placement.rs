@@ -494,6 +494,7 @@ mod tests {
     use crate::{
         config::types::{PdPairingMode, PolicyConfig},
         policies::RoundRobinPolicy,
+        routers::error::extract_error_code_from_response,
         worker::{BasicWorkerBuilder, ModelCard, PdWire, WorkerType},
     };
 
@@ -949,7 +950,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
-            crate::routers::error::extract_error_code_from_response(&response),
+            extract_error_code_from_response(&response),
             overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE
         );
     }

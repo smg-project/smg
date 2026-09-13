@@ -3175,7 +3175,7 @@ mod tests {
         );
         let body = Body::from_stream(stream::once(async {
             panic!("an already-overloaded request body must never be polled");
-            #[allow(unreachable_code)]
+            #[expect(unreachable_code)]
             Ok::<Bytes, std::io::Error>(Bytes::new())
         }));
         let req = Request::builder()
@@ -3660,7 +3660,7 @@ mod tests {
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
         let body = Body::from_stream(stream::once(async {
             panic!("worker absence is known before the request body is read");
-            #[allow(unreachable_code)]
+            #[expect(unreachable_code)]
             Ok::<Bytes, std::io::Error>(Bytes::new())
         }));
         let req = Request::builder()
