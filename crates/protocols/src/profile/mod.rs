@@ -63,7 +63,8 @@ impl ProviderProfile {
     /// field never reaches a backend or a chat template. Runs before
     /// validation and template rendering on every entry point. Only
     /// message-level extension structs are covered; see the module docs.
-    /// Dropped extensions are logged once per request.
+    /// Dropped extensions are logged once per request. The profile then
+    /// applies its contract defaults to fields the client omitted.
     pub fn normalize_chat(self, req: &mut ChatCompletionRequest) {
         let mut dropped: Vec<&'static str> = Vec::new();
         for message in &mut req.messages {
@@ -91,6 +92,10 @@ impl ProviderProfile {
                 roles = %dropped.join(","),
                 "dropped message extensions that belong to another provider's profile"
             );
+        }
+        match self {
+            ProviderProfile::Kimi => kimi::normalize_chat(req),
+            ProviderProfile::OpenAi | ProviderProfile::Minimax => {}
         }
     }
 
