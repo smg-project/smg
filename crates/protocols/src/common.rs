@@ -650,18 +650,26 @@ impl Usage {
     /// Add reasoning token details to this Usage
     pub fn with_reasoning_tokens(mut self, reasoning_tokens: u32) -> Self {
         if reasoning_tokens > 0 {
-            self.completion_tokens_details = Some(CompletionTokensDetails {
-                reasoning_tokens: Some(reasoning_tokens),
-                accepted_prediction_tokens: None,
-                rejected_prediction_tokens: None,
-            });
+            self.completion_tokens_details
+                .get_or_insert_default()
+                .reasoning_tokens = Some(reasoning_tokens);
+        }
+        self
+    }
+
+    /// Add speculative decoding details to this Usage.
+    pub fn with_speculative_tokens(mut self, accepted: u32, drafted: u32) -> Self {
+        if drafted > 0 {
+            let details = self.completion_tokens_details.get_or_insert_default();
+            details.accepted_prediction_tokens = Some(accepted);
+            details.rejected_prediction_tokens = Some(drafted.saturating_sub(accepted));
         }
         self
     }
 }
 
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompletionTokensDetails {
     pub reasoning_tokens: Option<u32>,
     pub accepted_prediction_tokens: Option<u32>,
@@ -1223,5 +1231,35 @@ mod tests {
         let value = json!({"name": "web_search", "description": ""});
         let function: Function = serde_json::from_value(value).expect("parameterless function");
         assert_eq!(function.parameters, json!({}));
+    }
+
+    #[test]
+    fn reasoning_tokens_do_not_clear_speculative_tokens() {
+        let details = Usage::from_counts(10, 20)
+            .with_speculative_tokens(12, 16)
+            .with_reasoning_tokens(5)
+            .completion_tokens_details
+            .expect("details");
+        assert_eq!(details.reasoning_tokens, Some(5));
+        assert_eq!(details.accepted_prediction_tokens, Some(12));
+        assert_eq!(details.rejected_prediction_tokens, Some(4));
+    }
+
+    #[test]
+    fn speculative_tokens_do_not_clear_reasoning_tokens() {
+        let details = Usage::from_counts(10, 20)
+            .with_reasoning_tokens(5)
+            .with_speculative_tokens(12, 16)
+            .completion_tokens_details
+            .expect("details");
+        assert_eq!(details.reasoning_tokens, Some(5));
+        assert_eq!(details.accepted_prediction_tokens, Some(12));
+        assert_eq!(details.rejected_prediction_tokens, Some(4));
+    }
+
+    #[test]
+    fn zero_speculative_counts_leave_usage_untouched() {
+        let usage = Usage::from_counts(10, 20).with_speculative_tokens(0, 0);
+        assert!(usage.completion_tokens_details.is_none());
     }
 }

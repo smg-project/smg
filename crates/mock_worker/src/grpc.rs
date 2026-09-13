@@ -138,6 +138,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 output_logprobs: None,
                 matched_stop: None,
                 index: 0,
+                ..Default::default()
             })),
         }));
 
@@ -339,6 +340,7 @@ fn generate_stream(
                                 output_logprobs: None,
                                 matched_stop: None,
                                 index: 0,
+                                ..Default::default()
                             })),
                         };
                         return Some((Ok(resp), (rx, output_ids, stream_chunks, request_id)));

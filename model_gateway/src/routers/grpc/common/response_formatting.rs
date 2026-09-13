@@ -34,10 +34,13 @@ pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
         .max()
         .unwrap_or(0);
     let total_reasoning_tokens: u32 = responses.iter().map(|r| r.reasoning_tokens()).sum();
+    let total_spec_accepted: u32 = responses.iter().map(|r| r.spec_accepted_tokens()).sum();
+    let total_spec_drafted: u32 = responses.iter().map(|r| r.spec_draft_tokens()).sum();
 
     Usage::from_counts(total_prompt_tokens, total_completion_tokens)
         .with_cached_tokens(total_cached_tokens)
         .with_reasoning_tokens(total_reasoning_tokens)
+        .with_speculative_tokens(total_spec_accepted, total_spec_drafted)
 }
 
 /// Tracks per-index completion token counts across streaming chunks.

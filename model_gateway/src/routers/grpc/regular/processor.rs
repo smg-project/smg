@@ -826,6 +826,8 @@ impl ResponseProcessor {
 
         let mut total_prompt = 0u32;
         let mut total_completion = 0u32;
+        let mut total_spec_accepted = 0u32;
+        let mut total_spec_drafted = 0u32;
         let mut choices = Vec::new();
 
         for (prompt_index, all_responses) in collected.into_iter().enumerate() {
@@ -876,6 +878,8 @@ impl ResponseProcessor {
 
                 prompt_tokens = prompt_tokens.max(complete.prompt_tokens());
                 total_completion += complete.completion_tokens();
+                total_spec_accepted += complete.spec_accepted_tokens();
+                total_spec_drafted += complete.spec_draft_tokens();
 
                 // A local stop-decoder match takes precedence over the engine's
                 // reason (which is "length" when stop strings are enforced
@@ -940,7 +944,10 @@ impl ResponseProcessor {
             created: dispatch.created,
             model: dispatch.model.clone(),
             choices,
-            usage: Some(Usage::from_counts(total_prompt, total_completion)),
+            usage: Some(
+                Usage::from_counts(total_prompt, total_completion)
+                    .with_speculative_tokens(total_spec_accepted, total_spec_drafted),
+            ),
             system_fingerprint: dispatch.weight_version.clone(),
         })
     }

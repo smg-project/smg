@@ -67,6 +67,8 @@ struct CompletionStreamOutcome {
     prompt_tokens: u32,
     cached_tokens: u32,
     reasoning_tokens: u32,
+    spec_accepted_tokens: u32,
+    spec_draft_tokens: u32,
     completion_tokens: u32,
     first_token_time: Option<Instant>,
     /// Whether *every* expected `n>1` choice in this unit received a
@@ -296,6 +298,8 @@ impl StreamingProcessor {
         let mut completion_tokens = CompletionTokenTracker::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
         let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut spec_accepted: HashMap<u32, u32> = HashMap::new();
+        let mut spec_drafted: HashMap<u32, u32> = HashMap::new();
 
         // Parser state (lazy initialization per index)
         type PooledReasoningParser = Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>;
@@ -494,6 +498,8 @@ impl StreamingProcessor {
 
                     cached_tokens.insert(index, complete.cached_tokens());
                     reasoning_tokens.insert(index, complete.reasoning_tokens());
+                    spec_accepted.insert(index, complete.spec_accepted_tokens());
+                    spec_drafted.insert(index, complete.spec_draft_tokens());
 
                     // A local stop-decoder match already pinned "stop" for this
                     // index; don't let the engine's finish reason overwrite it.
@@ -721,13 +727,16 @@ impl StreamingProcessor {
                 let total_completion: u32 = completion_tokens.total();
                 let total_cached: u32 = cached_tokens.values().copied().max().unwrap_or(0);
                 let total_reasoning: u32 = reasoning_tokens.values().sum();
+                let total_spec_accepted: u32 = spec_accepted.values().sum();
+                let total_spec_drafted: u32 = spec_drafted.values().sum();
 
                 let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                     .created(created)
                     .usage(
                         Usage::from_counts(total_prompt, total_completion)
                             .with_cached_tokens(total_cached)
-                            .with_reasoning_tokens(total_reasoning),
+                            .with_reasoning_tokens(total_reasoning)
+                            .with_speculative_tokens(total_spec_accepted, total_spec_drafted),
                     )
                     .maybe_system_fingerprint(system_fingerprint)
                     .build();
@@ -2725,6 +2734,8 @@ impl StreamingProcessor {
                     let mut total_prompt = 0u32;
                     let mut total_cached = 0u32;
                     let mut total_reasoning = 0u32;
+                    let mut total_spec_accepted = 0u32;
+                    let mut total_spec_drafted = 0u32;
                     let mut total_completion = 0u32;
                     let mut first_token_time: Option<Instant> = None;
                     let mut all_saw_complete = true;
@@ -2732,6 +2743,8 @@ impl StreamingProcessor {
                         total_prompt += outcome.prompt_tokens;
                         total_cached += outcome.cached_tokens;
                         total_reasoning += outcome.reasoning_tokens;
+                        total_spec_accepted += outcome.spec_accepted_tokens;
+                        total_spec_drafted += outcome.spec_draft_tokens;
                         total_completion += outcome.completion_tokens;
                         all_saw_complete &= outcome.saw_complete;
                         first_token_time = match (first_token_time, outcome.first_token_time) {
@@ -2772,6 +2785,8 @@ impl StreamingProcessor {
                                 total_completion,
                                 total_cached,
                                 total_reasoning,
+                                total_spec_accepted,
+                                total_spec_drafted,
                             )),
                         };
                         let mut sse_buffer = Vec::with_capacity(256);
@@ -2871,6 +2886,8 @@ impl StreamingProcessor {
         let mut total_prompt = 0u32;
         let mut total_cached = 0u32;
         let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut spec_accepted: HashMap<u32, u32> = HashMap::new();
+        let mut spec_drafted: HashMap<u32, u32> = HashMap::new();
         let mut total_completion = CompletionTokenTracker::new();
         // Indices that received a `Complete` message -- tracked separately
         // from `reasoning_tokens` (which exists for a different purpose and
@@ -3002,6 +3019,8 @@ impl StreamingProcessor {
                     total_prompt = total_prompt.max(complete.prompt_tokens());
                     total_cached = total_cached.max(complete.cached_tokens());
                     reasoning_tokens.insert(index, complete.reasoning_tokens());
+                    spec_accepted.insert(index, complete.spec_accepted_tokens());
+                    spec_drafted.insert(index, complete.spec_draft_tokens());
                     total_completion.record_complete(&complete);
 
                     if stopped_indices.contains(&index) {
@@ -3142,6 +3161,8 @@ impl StreamingProcessor {
             prompt_tokens: total_prompt,
             cached_tokens: total_cached,
             reasoning_tokens: reasoning_tokens.values().sum(),
+            spec_accepted_tokens: spec_accepted.values().sum(),
+            spec_draft_tokens: spec_drafted.values().sum(),
             completion_tokens: total_completion.total(),
             first_token_time,
             saw_complete,
@@ -3221,10 +3242,13 @@ impl StreamingProcessor {
         total_completion: u32,
         total_cached: u32,
         total_reasoning: u32,
+        total_spec_accepted: u32,
+        total_spec_drafted: u32,
     ) -> Usage {
         Usage::from_counts(total_prompt, total_completion)
             .with_cached_tokens(total_cached)
             .with_reasoning_tokens(total_reasoning)
+            .with_speculative_tokens(total_spec_accepted, total_spec_drafted)
     }
 
     /// Skeleton usage for the `message_start` event. Cache counters are
@@ -3267,7 +3291,7 @@ mod tests {
 
     #[test]
     fn completion_streaming_usage_includes_reasoning_tokens() {
-        let usage = StreamingProcessor::build_completion_streaming_usage(10, 5, 4, 3);
+        let usage = StreamingProcessor::build_completion_streaming_usage(10, 5, 4, 3, 0, 0);
 
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 5);

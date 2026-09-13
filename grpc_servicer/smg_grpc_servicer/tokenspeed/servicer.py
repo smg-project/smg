@@ -1587,6 +1587,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 prompt_tokens=int(meta.get("prompt_tokens", 0)),
                 completion_tokens=int(meta.get("completion_tokens", len(token_ids))),
                 cached_tokens=int(meta.get("cached_tokens", 0)),
+                spec_accepted_tokens=int(meta.get("spec_accepted_tokens", 0)),
+                spec_draft_tokens=int(meta.get("spec_draft_tokens", 0)),
                 output_logprobs=self._convert_output_logprobs_to_proto(output, len(token_ids)),
                 index=choice_index,
                 **matched_kwargs,

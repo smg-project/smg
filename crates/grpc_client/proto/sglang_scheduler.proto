@@ -278,6 +278,9 @@ message GenerateComplete {
 
   // Index for ordering when n>1 (for parallel request multiplexing)
   uint32 index = 11;
+
+  uint32 spec_accepted_tokens = 13;
+  uint32 spec_draft_tokens = 14;
 }
 
 // Output logprobs - all values are present (no None)

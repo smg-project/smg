@@ -282,6 +282,9 @@ message GenerateComplete {
   // Connector KV-transfer params returned by the engine, as a JSON object
   // (e.g. NIXL's handoff for the decode worker). Forwarded verbatim by the router.
   optional string kv_transfer_params_json = 12;
+
+  uint32 spec_accepted_tokens = 13;
+  uint32 spec_draft_tokens = 14;
 }
 
 // =====================

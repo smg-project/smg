@@ -418,6 +418,9 @@ message GenerateComplete {
 
   // Generation logits (if requested) - serialized float tensor
   optional bytes generation_logits = 12;
+
+  uint32 spec_accepted_tokens = 14;
+  uint32 spec_draft_tokens = 15;
 }
 
 // Token log probability information

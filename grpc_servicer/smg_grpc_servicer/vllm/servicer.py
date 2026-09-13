@@ -1054,6 +1054,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             else:
                 stop_kwargs["matched_stop_str"] = str(completion.stop_reason)
 
+        # Per-request speculative counts; needs vLLM's --per-request-spec-decode-metrics.
+        spec = getattr(completion, "spec_decode_metrics", None)
+        spec_accepted = sum(j * n for j, n in enumerate(spec.histogram)) if spec else 0
+
         # Build complete response
         # When streaming (DELTA mode): completion.token_ids will be empty/last delta
         # When non-streaming (FINAL_ONLY mode): completion.token_ids has all tokens
@@ -1062,6 +1066,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             complete=vllm_engine_pb2.GenerateComplete(
                 output_ids=completion.token_ids,
                 finish_reason=completion.finish_reason or "stop",
+                spec_accepted_tokens=spec_accepted,
+                spec_draft_tokens=spec.num_draft_tokens if spec else 0,
                 prompt_tokens=len(output.prompt_token_ids) if output.prompt_token_ids else 0,
                 completion_tokens=len(completion.token_ids),
                 cached_tokens=output.num_cached_tokens,

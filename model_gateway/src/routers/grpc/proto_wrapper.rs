@@ -2161,6 +2161,28 @@ impl ProtoGenerateComplete {
         }
     }
 
+    /// Get accepted speculative draft tokens.
+    pub fn spec_accepted_tokens(&self) -> u32 {
+        match self {
+            Self::Sglang(c) => c.spec_accepted_tokens,
+            Self::Vllm(c) => c.spec_accepted_tokens,
+            Self::Trtllm(c) => c.spec_accepted_tokens,
+            Self::TokenSpeed(c) => c.spec_accepted_tokens,
+            Self::Mlx(_) => 0,
+        }
+    }
+
+    /// Get proposed speculative draft tokens.
+    pub fn spec_draft_tokens(&self) -> u32 {
+        match self {
+            Self::Sglang(c) => c.spec_draft_tokens,
+            Self::Vllm(c) => c.spec_draft_tokens,
+            Self::Trtllm(c) => c.spec_draft_tokens,
+            Self::TokenSpeed(c) => c.spec_draft_tokens,
+            Self::Mlx(_) => 0,
+        }
+    }
+
     /// Get input/prompt logprobs (SGLang, vLLM, and TensorRT-LLM)
     pub fn input_logprobs(&self) -> Option<ProtoInputLogProbs> {
         match self {
