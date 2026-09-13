@@ -10,6 +10,7 @@ pub use smg_data_connector::{
 
 use super::{validation::ConfigValidator, ConfigResult};
 use crate::{
+    routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
     worker::{ConnectionMode, RuntimeType},
 };
@@ -42,6 +43,10 @@ pub struct RouterConfig {
     /// Per-request sticky-session routing (rid-lineage keys, header fallback).
     #[serde(default, alias = "sticky_sessions")]
     pub routing_key_override: RoutingKeyOverrideConfig,
+    /// How strictly PD placement pairs a prefill with a decode on their KV
+    /// transfer protocol; see [`PdPairingMode`].
+    #[serde(default)]
+    pub pd_pairing_mode: PdPairingMode,
     pub host: String,
     pub port: u16,
     /// Dedicated port for the isolated Kubernetes liveness/readiness/health
@@ -91,6 +96,14 @@ pub struct RouterConfig {
     pub job_queue_concurrency: usize,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// How long a disaggregated (PD) dispatch waits for a slot in the decode
+    /// engine's running window before shedding. Must stay well under the
+    /// engine's bootstrap deadline (120s on TokenSpeed): a request that waits
+    /// out this budget and then dispatches still has the whole deadline ahead
+    /// of it. `0` sheds immediately instead of waiting. Ignored for engines
+    /// that report no running window.
+    #[serde(default = "default_pd_admission_wait_secs")]
+    pub pd_admission_wait_secs: u64,
     /// Restore the conditional load-monitor poll gate: only poll worker groups
     /// when a load-aware routing policy, `engine_metrics`, or overload
     /// protection needs the data. Default `false` — the monitor polls every
@@ -147,6 +160,10 @@ pub struct RouterConfig {
     /// to `SMG_MM_SHM_MIN_BYTES`, then 64 KiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_shm_min_bytes: Option<usize>,
+    /// Per-request image-count limit applied to every model, replacing each
+    /// spec's built-in limit; beats `SMG_IMAGE_MAX_COUNT`. Unset keeps spec limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_per_request_image_limit: Option<usize>,
     pub dp_aware: bool,
     #[serde(default)]
     pub dp_minimum_tokens_scheduler: bool,
@@ -220,6 +237,9 @@ pub struct RouterConfig {
     pub health_check: HealthCheckConfig,
     #[serde(default)]
     pub enable_igw: bool,
+    /// RL control plane (`/v1/rl/*`); inert unless `rl.enabled`.
+    #[serde(default)]
+    pub rl: smg_rl::RlConfig,
     /// Can be a HuggingFace model ID or local path
     pub model_path: Option<String>,
     /// Overrides model_path tokenizer if provided
@@ -268,8 +288,9 @@ pub struct RouterConfig {
     /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext) on all
     /// engine-directed connections — request dispatch and health/probe traffic
     /// alike — multiplexing every request to a worker over one connection
-    /// instead of one TCP connection per in-flight request. Requires every
-    /// HTTP worker to serve HTTP/2 without an upgrade handshake.
+    /// instead of one TCP connection per in-flight request. Negotiated per
+    /// worker at registration: a worker that does not answer HTTP/2 stays on
+    /// HTTP/1.1. `http_pool.http2` on a worker spec pins the version instead.
     #[serde(default)]
     pub upstream_http2: bool,
     /// Loaded from mcp_config_path during config creation
@@ -334,6 +355,10 @@ pub struct TokenizerCacheConfig {
 
 fn default_load_monitor_interval_secs() -> u64 {
     10
+}
+
+fn default_pd_admission_wait_secs() -> u64 {
+    DEFAULT_PD_ADMISSION_WAIT_SECS
 }
 
 fn default_job_queue_capacity() -> usize {
@@ -516,6 +541,56 @@ pub enum ManualAssignmentMode {
     Delegate,
 }
 
+/// How strictly PD placement pairs a prefill with a decode on their KV
+/// transfer protocol (#2483). A descriptor component an engine does not report
+/// is "unknown".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PdPairingMode {
+    /// Pair on nothing: placement behaves as if no descriptor existed.
+    Off,
+    /// A known difference in runtime, transport or KV layout refuses the
+    /// pair; unknown components and engine versions pair with anything.
+    #[default]
+    Lenient,
+    /// Runtime, transport and KV layout must be known on both sides and
+    /// agree, and reported engine versions must match.
+    Strict,
+}
+
+impl PdPairingMode {
+    /// Number of modes, for per-mode caches.
+    pub const COUNT: usize = 3;
+
+    /// A dense index for per-mode caches.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Off => 0,
+            Self::Lenient => 1,
+            Self::Strict => 2,
+        }
+    }
+
+    /// Parse the CLI spelling (`off` / `lenient` / `strict`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "lenient" => Some(Self::Lenient),
+            "strict" => Some(Self::Strict),
+            _ => None,
+        }
+    }
+
+    /// The CLI spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Lenient => "lenient",
+            Self::Strict => "strict",
+        }
+    }
+}
+
 /// Per-request sticky-routing override: when a sticky key is present, any
 /// eligible policy routes via manual sticky-map semantics. Reuses the manual
 /// policy knobs for the sticky map; eviction defaults match the manual policy so
@@ -525,8 +600,8 @@ pub enum ManualAssignmentMode {
 /// `_t<n>` and per-retry `_r<n>` suffixes stripped, so every turn of a
 /// conversation shares one key) wins over the routing-key headers; the first
 /// configured header carrying a valid value is the fallback when no rid is
-/// present. Raw-streamed requests have no readable body and therefore derive
-/// keys from the headers only.
+/// present. An enabled override keeps automatic body forwarding buffered so
+/// body `rid` precedence is preserved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingKeyOverrideConfig {
     /// When false, policies are used unchanged.
@@ -870,6 +945,10 @@ pub struct DiscoveryConfig {
     /// Absent on a pod = single worker at `port`.
     #[serde(default = "default_worker_ports_annotation")]
     pub worker_ports_annotation: String,
+    #[serde(default = "default_kv_connector_annotation")]
+    pub kv_connector_annotation: String,
+    #[serde(default = "default_kv_engine_id_annotation")]
+    pub kv_engine_id_annotation: String,
     /// Router node discovery for HA (Kubernetes label selector)
     #[serde(default)]
     pub router_selector: HashMap<String, String>,
@@ -889,6 +968,14 @@ fn default_worker_ports_annotation() -> String {
     "smg.ai/worker-ports".to_string()
 }
 
+fn default_kv_connector_annotation() -> String {
+    "smg.ai/kv-connector".to_string()
+}
+
+fn default_kv_engine_id_annotation() -> String {
+    "smg.ai/kv-engine-id".to_string()
+}
+
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
@@ -902,6 +989,8 @@ impl Default for DiscoveryConfig {
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
             worker_ports_annotation: default_worker_ports_annotation(),
+            kv_connector_annotation: default_kv_connector_annotation(),
+            kv_engine_id_annotation: default_kv_engine_id_annotation(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: default_router_mesh_port_annotation(),
             model_id_source: None,
@@ -909,33 +998,7 @@ impl Default for DiscoveryConfig {
     }
 }
 
-/// Retry configuration for request handling
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryConfig {
-    pub max_retries: u32,
-    pub initial_backoff_ms: u64,
-    pub max_backoff_ms: u64,
-    pub backoff_multiplier: f32,
-    /// D' = D * (1 + U[-j, +j]) where j is jitter factor
-    #[serde(default = "default_retry_jitter_factor")]
-    pub jitter_factor: f32,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 5,
-            initial_backoff_ms: 50,
-            max_backoff_ms: 30000,
-            backoff_multiplier: 1.5,
-            jitter_factor: 0.2,
-        }
-    }
-}
-
-fn default_retry_jitter_factor() -> f32 {
-    0.2
-}
+pub use smg_external_router::RetryConfig;
 
 /// Health check configuration for worker monitoring
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -946,8 +1009,9 @@ pub struct HealthCheckConfig {
     pub check_interval_secs: u64,
     pub endpoint: String,
     pub disable_health_check: bool,
-    /// Let workers recover after prolonged failure: removal re-enters them
-    /// through service discovery once their engine returns.
+    /// Recover failed workers by removal: they re-enter through service
+    /// discovery once their engine returns. Off, a Failed worker stays
+    /// registered and probed, and rejoins in place when it answers again.
     #[serde(default, alias = "worker_auto_recovery")]
     pub remove_unhealthy_workers: bool,
     /// Seconds to keep a Ready worker in `Draining` after `RemoveWorker`
@@ -960,6 +1024,19 @@ pub struct HealthCheckConfig {
 
 fn default_drain_settle_secs() -> u64 {
     5
+}
+
+/// Resolve `--worker-auto-recovery`'s conditional default: an explicit
+/// setting always wins; otherwise it follows service discovery.
+///
+/// The recovery mechanism is removal — a terminally failed worker is dropped
+/// from the registry so discovery re-registers and re-probes it once its
+/// engine returns. With discovery on, that loop completes and recovery is
+/// pure upside; with discovery off, nothing re-adds the worker, so removal
+/// would silently and permanently shrink a static fleet and must stay
+/// opt-in.
+pub fn resolve_worker_auto_recovery(explicit: Option<bool>, service_discovery: bool) -> bool {
+    explicit.unwrap_or(service_discovery)
 }
 
 impl Default for HealthCheckConfig {
@@ -1051,6 +1128,7 @@ impl Default for RouterConfig {
             policy: PolicyConfig::Random,
             cache_boundaries: Vec::new(),
             routing_key_override: RoutingKeyOverrideConfig::default(),
+            pd_pairing_mode: PdPairingMode::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
             health_check_port: None,
@@ -1066,6 +1144,7 @@ impl Default for RouterConfig {
             job_queue_capacity: default_job_queue_capacity(),
             job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
+            pd_admission_wait_secs: default_pd_admission_wait_secs(),
             disable_load_monitoring: false,
             worker_overload_protection: false,
             worker_overload_waiting_requests: None,
@@ -1075,6 +1154,7 @@ impl Default for RouterConfig {
             engine_metrics: false,
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,
+            mm_per_request_image_limit: None,
             dp_aware: false,
             dp_minimum_tokens_scheduler: false,
             api_key: None,
@@ -1105,6 +1185,7 @@ impl Default for RouterConfig {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            rl: smg_rl::RlConfig::default(),
             connection_mode: ConnectionMode::Http,
             startup_worker_runtime_type: None,
             zmq_engine_count: None,
@@ -1386,6 +1467,27 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.stream_body_stall_timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_pd_admission_wait_serde_default_and_roundtrip() {
+        // Config files predating the field deserialize to the 30s default.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("pd_admission_wait_secs")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.pd_admission_wait_secs, 30);
+
+        // The shed-immediately zero round-trips instead of reverting.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .pd_admission_wait_secs(0)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.pd_admission_wait_secs, 0);
     }
 
     #[test]
@@ -1838,6 +1940,8 @@ mod tests {
         assert!(config.prefill_selector.is_empty());
         assert!(config.decode_selector.is_empty());
         assert_eq!(config.bootstrap_port_annotation, "sglang.ai/bootstrap-port");
+        assert_eq!(config.kv_connector_annotation, "smg.ai/kv-connector");
+        assert_eq!(config.kv_engine_id_annotation, "smg.ai/kv-engine-id");
     }
 
     #[test]
@@ -1857,6 +1961,8 @@ mod tests {
             decode_selector: selector.clone(),
             bootstrap_port_annotation: "custom.io/port".to_string(),
             worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+            kv_connector_annotation: "custom.io/kv-connector".to_string(),
+            kv_engine_id_annotation: "custom.io/kv-engine-id".to_string(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
@@ -2138,6 +2244,8 @@ mod tests {
                 decode_selector: selectors,
                 bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
                 worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+                kv_connector_annotation: "smg.ai/kv-connector".to_string(),
+                kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
                 router_selector: HashMap::new(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source: None,

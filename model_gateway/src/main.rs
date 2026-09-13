@@ -12,9 +12,10 @@ use openai_protocol::worker::TransportMode;
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        validate_mesh_server_name, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
-        DiscoveryConfig, HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig,
-        OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
+        resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
+        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
+        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PdPairingMode,
+        PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
         RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
         TokenizerCacheConfig, TraceConfig,
     },
@@ -428,8 +429,9 @@ struct CliArgs {
     /// Sticky sessions: route every request of a conversation to the same
     /// worker, on any policy. The key is derived from the request body's rid
     /// with per-turn/per-retry suffixes stripped (conv_t2_r1 -> conv),
-    /// falling back to the routing-key headers when no rid is present;
-    /// raw-streamed requests carry no readable rid and use the headers only.
+    /// falling back to the routing-key headers when no rid is present.
+    /// Enabling this keeps automatic body forwarding buffered so body rid
+    /// precedence is preserved.
     /// Reuses the manual eviction/idle/assignment knobs for the sticky map
     #[arg(
         long,
@@ -438,6 +440,19 @@ struct CliArgs {
         help_heading = "Routing Policy"
     )]
     routing_key_override: bool,
+
+    /// How strictly PD placement pairs a prefill with a decode on their KV
+    /// transfer protocol. `lenient` refuses only a known difference in
+    /// runtime, transport or KV layout (unknown components and engine
+    /// versions pair with anything); `strict` also refuses unknown
+    /// components and version differences; `off` pairs on nothing.
+    #[arg(
+        long,
+        value_parser = ["off", "lenient", "strict"],
+        default_value = "lenient",
+        help_heading = "Routing Policy"
+    )]
+    pd_pairing_mode: String,
 
     /// Ordered header names checked for the routing key; the first header
     /// present with a valid value wins. Header keys get the same
@@ -453,6 +468,22 @@ struct CliArgs {
     /// Enable minimum tokens scheduler for data parallel group
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
+
+    // ==================== RL Control Plane ====================
+    /// Mount the RL control plane under /v1/rl (worker discovery,
+    /// engine-route passthrough, fan-out). Off by default; when off, no RL
+    /// code path is reachable.
+    #[arg(long, default_value_t = false, help_heading = "RL Control Plane")]
+    enable_rl: bool,
+
+    /// Total timeout for one proxied engine control call (weight refits can
+    /// take minutes)
+    #[arg(long, default_value_t = 600, help_heading = "RL Control Plane")]
+    rl_control_timeout_secs: u64,
+
+    /// Maximum concurrent engine calls in one fan-out
+    #[arg(long, default_value_t = 32, help_heading = "RL Control Plane")]
+    rl_fanout_concurrency: usize,
 
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
@@ -511,7 +542,9 @@ struct CliArgs {
     /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext) on all
     /// engine-directed connections — request dispatch and health/probe traffic
     /// alike — multiplexing every request to a worker over one connection.
-    /// Requires every HTTP worker to serve HTTP/2 without an upgrade handshake.
+    /// Negotiated per worker at registration: a worker that does not answer
+    /// HTTP/2 stays on HTTP/1.1, so mixed fleets roll out in any order.
+    /// `http_pool.http2` on a worker spec pins the version instead.
     #[arg(long, default_value_t = false, help_heading = "Worker Configuration")]
     upstream_http2: bool,
 
@@ -531,6 +564,16 @@ struct CliArgs {
     /// a load-aware routing policy. Routing-owned polls are always re-exported.
     #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
     engine_metrics: bool,
+
+    /// Seconds a prefill/decode dispatch waits for a free slot in the decode
+    /// engine's running window (--max-num-seqs / --max-running-requests)
+    /// before shedding with 503 worker_overload_protection_shed. Keep it well
+    /// under the engine's bootstrap deadline (120s on TokenSpeed) so a
+    /// request that waits still dispatches with the deadline ahead of it. 0
+    /// sheds immediately. Engines that report no running window are never
+    /// gated
+    #[arg(long, default_value_t = 30, help_heading = "Load Monitoring")]
+    pd_admission_wait_secs: u64,
 
     /// TTL in seconds for event-driven cache-aware indexer entries: entries
     /// neither stored nor read by a query within this window are pruned.
@@ -555,6 +598,11 @@ struct CliArgs {
     /// Overridable per worker via `WorkerSpec.multimodal_shm_min_bytes`.
     #[arg(long, help_heading = "Multimodal")]
     multimodal_shm_min_bytes: Option<usize>,
+
+    /// Per-request image-count limit applied to every model, replacing each
+    /// spec's built-in limit (e.g. to match the engine's `--limit-mm-per-prompt`).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Multimodal")]
+    mm_per_request_image_limit: Option<u64>,
 
     // ==================== Service Discovery (Kubernetes) ====================
     /// Enable Kubernetes service discovery
@@ -581,6 +629,22 @@ struct CliArgs {
     /// Kubernetes namespace to watch for pods
     #[arg(long, help_heading = "Service Discovery (Kubernetes)")]
     service_discovery_namespace: Option<String>,
+
+    /// Pod annotation containing the vLLM KV connector name
+    #[arg(
+        long,
+        default_value = "smg.ai/kv-connector",
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    kv_connector_annotation: String,
+
+    /// Pod annotation containing per-worker KV engine IDs
+    #[arg(
+        long,
+        default_value = "smg.ai/kv-engine-id",
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    kv_engine_id_annotation: String,
 
     /// Label selector for encode server pods in EPD mode
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
@@ -821,18 +885,24 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Health Checks")]
     disable_health_check: bool,
 
-    /// Let workers recover after prolonged failure: a worker that stays
-    /// unhealthy long enough is removed from the registry so service
-    /// discovery re-registers and re-probes it once its engine returns
-    /// (without this, a worker unreachable for ~12 minutes reaches a
-    /// terminal Failed state and is never probed again)
+    /// Recover failed workers by removal: a worker that stays unhealthy
+    /// long enough (Failed, ~12 minutes at the default thresholds) is
+    /// removed from the registry so service discovery re-registers and
+    /// re-probes it once its engine returns. Without this a Failed worker
+    /// stays registered, out of rotation, and keeps being probed, so it
+    /// rejoins in place as soon as it answers again. Defaults to the
+    /// --service-discovery setting: discovery-managed fleets recover by
+    /// removal plus re-registration, while a static fleet has nothing to
+    /// re-add a removed worker and recovers in place instead. Pass =false
+    /// to keep it off under discovery.
     #[arg(
         long,
         visible_alias = "worker-auto-recovery",
-        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
         help_heading = "Health Checks"
     )]
-    remove_unhealthy_workers: bool,
+    remove_unhealthy_workers: Option<bool>,
 
     /// Seconds to keep a Ready worker in `Draining` before removing it from
     /// the registry. Applies to all RemoveWorker submissions (K8s deletion,
@@ -1644,6 +1714,8 @@ impl CliArgs {
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                 worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+                kv_connector_annotation: self.kv_connector_annotation.clone(),
+                kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
                 router_selector: Self::parse_selector(&self.router_selector),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source: self.model_id_from.clone(),
@@ -1782,6 +1854,7 @@ impl CliArgs {
             .job_queue_capacity(self.job_queue_capacity)
             .job_queue_concurrency(self.job_queue_concurrency)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .disable_load_monitoring(self.disable_load_monitoring)
             .worker_overload_protection(self.worker_overload_protection)
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
@@ -1791,6 +1864,7 @@ impl CliArgs {
             .engine_metrics(self.engine_metrics)
             .multimodal_tensor_transport(self.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
+            .mm_per_request_image_limit(self.mm_per_request_image_limit.map(|v| v as usize))
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -1821,7 +1895,10 @@ impl CliArgs {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
                 disable_health_check: self.disable_health_check,
-                remove_unhealthy_workers: self.remove_unhealthy_workers,
+                remove_unhealthy_workers: resolve_worker_auto_recovery(
+                    self.remove_unhealthy_workers,
+                    self.service_discovery,
+                ),
                 drain_settle_secs: self.drain_settle_secs,
             })
             .tokenizer_cache(TokenizerCacheConfig {
@@ -1860,6 +1937,7 @@ impl CliArgs {
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
+            .pd_pairing_mode(PdPairingMode::parse(&self.pd_pairing_mode).unwrap_or_default())
             .routing_key_override(RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval,
@@ -1876,6 +1954,11 @@ impl CliArgs {
             .enable_wasm(self.enable_wasm)
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .igw(self.enable_igw)
+            .rl(smg_rl::RlConfig {
+                enabled: self.enable_rl,
+                control_timeout_secs: self.rl_control_timeout_secs,
+                fanout_concurrency: self.rl_fanout_concurrency,
+            })
             .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
             .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
 
@@ -1885,16 +1968,30 @@ impl CliArgs {
     fn to_server_config(&self, router_config: RouterConfig) -> ConfigResult<ServerConfig> {
         let service_discovery_config = if self.service_discovery {
             // Get router discovery config from router_config.discovery if available
-            let (router_selector, router_mesh_port_annotation) = router_config
+            let (
+                router_selector,
+                router_mesh_port_annotation,
+                kv_connector_annotation,
+                kv_engine_id_annotation,
+            ) = router_config
                 .discovery
                 .as_ref()
                 .map(|d| {
                     (
                         d.router_selector.clone(),
                         d.router_mesh_port_annotation.clone(),
+                        d.kv_connector_annotation.clone(),
+                        d.kv_engine_id_annotation.clone(),
                     )
                 })
-                .unwrap_or_else(|| (HashMap::new(), "sglang.ai/mesh-port".to_string()));
+                .unwrap_or_else(|| {
+                    (
+                        HashMap::new(),
+                        "sglang.ai/mesh-port".to_string(),
+                        self.kv_connector_annotation.clone(),
+                        self.kv_engine_id_annotation.clone(),
+                    )
+                });
 
             let model_id_source = self
                 .model_id_from
@@ -1926,6 +2023,8 @@ impl CliArgs {
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                 worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+                kv_connector_annotation,
+                kv_engine_id_annotation,
                 router_selector,
                 router_mesh_port_annotation,
                 model_id_source,
@@ -2215,6 +2314,20 @@ mod tests {
         }
     }
 
+    /// The PD admission wait is a router-only setting and must flow into
+    /// `RouterConfig`, where the dispatch path latches it at startup.
+    #[test]
+    fn pd_admission_wait_flag_flows_into_router_config() {
+        let cli = cli_args_from(&["--pd-admission-wait-secs", "5"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.pd_admission_wait_secs, 5);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.pd_admission_wait_secs, 5);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.pd_admission_wait_secs, 30);
+    }
+
     /// The streamed-body stall timeout is a router-only setting and must
     /// flow into `RouterConfig`.
     #[test]
@@ -2332,6 +2445,66 @@ mod tests {
         .to_router_config(vec![], vec![])
         .unwrap();
         assert_eq!(format!("{canonical:?}"), format!("{aliased:?}"));
+    }
+
+    #[test]
+    fn kv_annotation_flags_flow_into_both_configs() {
+        let cli = cli_args_from(&[
+            "--service-discovery",
+            "--selector",
+            "app=worker",
+            "--kv-connector-annotation",
+            "example.com/connector",
+            "--kv-engine-id-annotation",
+            "example.com/engine-id",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let discovery = router.discovery.as_ref().unwrap();
+        assert_eq!(discovery.kv_connector_annotation, "example.com/connector");
+        assert_eq!(discovery.kv_engine_id_annotation, "example.com/engine-id");
+
+        let server = cli.to_server_config(router).unwrap();
+        let discovery = server.service_discovery_config.as_ref().unwrap();
+        assert_eq!(discovery.kv_connector_annotation, "example.com/connector");
+        assert_eq!(discovery.kv_engine_id_annotation, "example.com/engine-id");
+
+        let defaults = cli_args_from(&["--service-discovery", "--selector", "app=worker"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        let defaults = defaults.discovery.as_ref().unwrap();
+        assert_eq!(defaults.kv_connector_annotation, "smg.ai/kv-connector");
+        assert_eq!(defaults.kv_engine_id_annotation, "smg.ai/kv-engine-id");
+    }
+
+    /// `--worker-auto-recovery` defaults to the `--service-discovery`
+    /// setting: recovery works by removal plus discovery re-registration, so
+    /// it is on exactly when discovery can complete that loop, and off when
+    /// removal would permanently shrink a static fleet. Explicit values win
+    /// in both directions.
+    #[test]
+    fn worker_auto_recovery_follows_service_discovery_by_default() {
+        let derived_on = cli_args_from(&["--service-discovery", "--selector", "app=w"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert!(derived_on.health_check.remove_unhealthy_workers);
+
+        let derived_off = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(!derived_off.health_check.remove_unhealthy_workers);
+
+        let forced_off = cli_args_from(&[
+            "--service-discovery",
+            "--selector",
+            "app=w",
+            "--remove-unhealthy-workers=false",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        assert!(!forced_off.health_check.remove_unhealthy_workers);
+
+        let forced_on = cli_args_from(&["--remove-unhealthy-workers"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert!(forced_on.health_check.remove_unhealthy_workers);
     }
 
     /// `--health-check-port` must flow into BOTH conversion paths
@@ -2585,6 +2758,8 @@ mod tests {
             "shm",
             "--multimodal-shm-min-bytes",
             "1024",
+            "--mm-per-request-image-limit",
+            "128",
         ]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
@@ -2594,6 +2769,7 @@ mod tests {
             "transport mode must reach RouterConfig via to_router_config"
         );
         assert_eq!(router_config.multimodal_shm_min_bytes, Some(1024));
+        assert_eq!(router_config.mm_per_request_image_limit, Some(128));
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(
@@ -2605,6 +2781,13 @@ mod tests {
             server_config.router_config.multimodal_shm_min_bytes,
             Some(1024)
         );
+        assert_eq!(
+            server_config.router_config.mm_per_request_image_limit,
+            Some(128)
+        );
+
+        // clap rejects a zero limit outright.
+        assert!(Cli::try_parse_from(["smg", "--mm-per-request-image-limit", "0"]).is_err());
     }
 
     /// Default is off: the flag stays false through both conversions so

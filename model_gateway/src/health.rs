@@ -82,9 +82,8 @@ const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 /// values the `/readiness` handler used to compute inline per probe.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReadinessSnapshot {
-    /// Per-mode worker presence: any healthy worker (IGW or single-pool
-    /// modes), or at least one healthy prefill AND one healthy decode
-    /// worker in PrefillDecode mode.
+    /// Per-mode worker presence: any healthy worker in a single-pool mode,
+    /// or at least one healthy worker for every required disaggregated role.
     pub workers_ready: bool,
     /// Tokenizer-autoload gate: every healthy gRPC/ZMQ worker's tokenizer is
     /// registered (`true` when autoload is disabled — the gateway does not
@@ -157,7 +156,11 @@ impl ProbeState {
         let workers = worker_registry.get_all();
         let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
 
-        let workers_ready = if router_config.enable_igw {
+        let workers_ready = if router_config.enable_igw
+            && !matches!(
+                &router_config.mode,
+                RoutingMode::PrefillDecode { .. } | RoutingMode::EncodePrefillDecode { .. }
+            ) {
             !healthy_workers.is_empty()
         } else {
             match &router_config.mode {
@@ -585,15 +588,18 @@ mod tests {
     }
 
     #[test]
-    fn pd_mode_requires_healthy_prefill_and_decode() {
+    fn pd_mode_requires_healthy_prefill_and_decode_with_igw() {
         let state = probe_state();
         let registry = WorkerRegistry::new();
-        let router_config = config(RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: None,
-        });
+        let router_config = RouterConfig {
+            enable_igw: true,
+            ..config(RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            })
+        };
 
         let prefill_id = registry
             .register(worker(
@@ -622,36 +628,32 @@ mod tests {
         recompute(&state, &registry, &router_config);
         assert!(state.readiness().workers_ready);
 
-        // Losing the prefill side flips readiness back off.
         registry.transition_status(&prefill_id, WorkerStatus::NotReady);
         recompute(&state, &registry, &router_config);
         assert!(!state.readiness().workers_ready);
     }
 
     #[test]
-    fn igw_mode_needs_any_healthy_worker_regardless_of_mode() {
+    fn igw_epd_does_not_accept_an_untyped_healthy_worker() {
         let state = probe_state();
         let registry = WorkerRegistry::new();
-        // PD mode would demand prefill+decode, but enable_igw short-circuits
-        // to "any healthy worker".
         let router_config = RouterConfig {
             enable_igw: true,
-            ..config(RoutingMode::PrefillDecode {
+            ..config(RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![],
                 prefill_urls: vec![],
                 decode_urls: vec![],
+                encode_policy: None,
                 prefill_policy: None,
                 decode_policy: None,
             })
         };
 
-        recompute(&state, &registry, &router_config);
-        assert!(!state.readiness().workers_ready);
-
         registry
             .register(http_worker("http://w1:8080", WorkerStatus::Ready))
             .unwrap();
         recompute(&state, &registry, &router_config);
-        assert!(state.readiness().workers_ready);
+        assert!(!state.readiness().workers_ready);
     }
 
     #[test]

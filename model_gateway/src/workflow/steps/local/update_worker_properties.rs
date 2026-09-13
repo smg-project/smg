@@ -90,6 +90,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             let mut builder = BasicWorkerBuilder::new(worker.base_url())
                 .worker_type(*worker.worker_type())
                 .connection_mode(*worker.connection_mode())
+                .http2(worker.http2())
                 .runtime_type(worker.metadata().spec.runtime_type)
                 .labels(updated_labels)
                 .health_config(updated_health_config.clone())
@@ -201,6 +202,7 @@ mod tests {
     use super::*;
     use crate::{
         app_context::AppContext,
+        middleware::AuthConfig,
         routers::grpc::{
             backend_client::BackendClient,
             zmq_client::{EosTokenIds, ZmqEngineClient},
@@ -230,6 +232,7 @@ mod tests {
         let job_queue = Arc::new(std::sync::OnceLock::new());
 
         Arc::new(AppContext {
+            gateway_auth: AuthConfig::new(None),
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
@@ -240,7 +243,7 @@ mod tests {
             )),
             reasoning_parser_factory: None,
             tool_parser_factory: None,
-            router_manager: None,
+            gateway: None,
             response_storage: Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             conversation_storage: Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             conversation_item_storage: Arc::new(
@@ -262,6 +265,7 @@ mod tests {
             worker_service: Arc::new(WorkerService::new(registry, job_queue, router_config)),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
+            rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
@@ -417,5 +421,25 @@ mod tests {
             .http_client_handle_if_initialized()
             .expect("materialized client is adopted");
         assert!(Arc::ptr_eq(&adopted, &client));
+    }
+
+    /// The adopted client speaks one HTTP version; the replacement must keep
+    /// describing it correctly.
+    #[tokio::test]
+    async fn http_update_preserves_http2() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w:8080")
+                .http_client(Arc::new(reqwest::Client::new()))
+                .http2(true)
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+        let mut ctx = make_context(app_ctx, Arc::clone(&worker), HashMap::new());
+
+        UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap();
+
+        let updated = &ctx.data.updated_workers.as_ref().expect("updated workers")[0];
+        assert!(updated.http2());
     }
 }

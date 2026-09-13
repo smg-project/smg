@@ -16,20 +16,19 @@ use tracing::debug;
 
 use crate::{
     config::RouterConfig,
-    middleware::TokenBucket,
+    middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     rate_limit::RateLimitManager,
     routers::{
-        common::{openai_bridge::FormatRegistry, overload, realtime::RealtimeRegistry},
+        common::{
+            openai_bridge::FormatRegistry, overload, pd_admission, realtime::RealtimeRegistry,
+        },
+        gateway::Gateway,
         grpc::multimodal::MultimodalConfigRegistry,
-        router_manager::RouterManager,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    worker::{
-        http_client::apply_upstream_http2, KvEventMonitor, WorkerHttpClientCache, WorkerMonitor,
-        WorkerRegistry, WorkerService,
-    },
+    worker::{KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService},
     workflow::{JobQueue, WorkflowEngines},
 };
 
@@ -55,6 +54,11 @@ impl std::error::Error for AppContextBuildError {}
 pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
+    /// Every credential that authenticates as this gateway: the shared
+    /// `api_key` plus any per-tenant keys, derived once from `router_config`.
+    /// The serving auth layer and the `/v1/models` BYOK short-circuit both
+    /// read this set, so they cannot drift apart.
+    pub gateway_auth: AuthConfig,
     pub rate_limiter: Option<Arc<TokenBucket>>,
     pub rate_limit_manager: Option<Arc<RateLimitManager>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
@@ -63,7 +67,7 @@ pub struct AppContext {
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
-    pub router_manager: Option<Arc<RouterManager>>,
+    pub gateway: Option<Arc<Gateway>>,
     pub response_storage: Arc<dyn ResponseStorage>,
     pub conversation_storage: Arc<dyn ConversationStorage>,
     pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
@@ -81,6 +85,8 @@ pub struct AppContext {
     pub worker_client_cache: Arc<WorkerHttpClientCache>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    /// RL control plane state; `None` unless `router_config.rl.enabled`.
+    pub rl: Option<Arc<smg_rl::RlState>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
     /// Bind address for WebRTC UDP sockets (`None` = `0.0.0.0`, auto-detect).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -106,7 +112,7 @@ pub struct AppContextBuilder {
     tool_parser_factory: Option<ToolParserFactory>,
     worker_registry: Option<Arc<WorkerRegistry>>,
     policy_registry: Option<Arc<PolicyRegistry>>,
-    router_manager: Option<Arc<RouterManager>>,
+    gateway: Option<Arc<Gateway>>,
     response_storage: Option<Arc<dyn ResponseStorage>>,
     conversation_storage: Option<Arc<dyn ConversationStorage>>,
     conversation_item_storage: Option<Arc<dyn ConversationItemStorage>>,
@@ -160,7 +166,7 @@ impl AppContextBuilder {
             tool_parser_factory: None,
             worker_registry: None,
             policy_registry: None,
-            router_manager: None,
+            gateway: None,
             response_storage: None,
             conversation_storage: None,
             conversation_item_storage: None,
@@ -238,8 +244,8 @@ impl AppContextBuilder {
         self
     }
 
-    pub fn router_manager(mut self, router_manager: Option<Arc<RouterManager>>) -> Self {
-        self.router_manager = router_manager;
+    pub fn gateway(mut self, gateway: Option<Arc<Gateway>>) -> Self {
+        self.gateway = gateway;
         self
     }
 
@@ -362,8 +368,15 @@ impl AppContextBuilder {
         ));
 
         let worker_client_cache = Arc::new(WorkerHttpClientCache::new(&router_config));
+        let gateway_auth = AuthConfig::with_tenant_keys(
+            router_config.api_key.clone(),
+            &router_config.tenant_api_keys,
+        );
+
+        let rl = crate::rl_adapter::build_rl_state(&worker_registry, &router_config);
 
         Ok(AppContext {
+            gateway_auth,
             client: self
                 .client
                 .ok_or(AppContextBuildError::MissingField("client"))?,
@@ -380,7 +393,7 @@ impl AppContextBuilder {
             policy_registry: self
                 .policy_registry
                 .ok_or(AppContextBuildError::MissingField("policy_registry"))?,
-            router_manager: self.router_manager,
+            gateway: self.gateway,
             response_storage: self
                 .response_storage
                 .ok_or(AppContextBuildError::MissingField("response_storage"))?,
@@ -406,6 +419,7 @@ impl AppContextBuilder {
             worker_client_cache,
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
+            rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
             webrtc_stun_server: self.webrtc_stun_server,
@@ -445,24 +459,14 @@ impl AppContextBuilder {
             .router_config(router_config))
     }
 
-    /// Create HTTP client with TLS/mTLS configuration
+    /// Create the shared HTTP client for upstream calls not addressed to a
+    /// registered worker (external providers, IGW model discovery, worker
+    /// classification). Worker-directed traffic uses each worker's own client
+    /// from [`WorkerHttpClientCache`].
+    ///
+    /// Uses the rustls TLS backend when TLS/mTLS is configured (client cert or
+    /// CA certs provided) for PKCS#8 key support; plain HTTP skips TLS setup.
     fn with_client(mut self, config: &RouterConfig, timeout_secs: u64) -> Result<Self, String> {
-        // FIXME: Current implementation creates a single HTTP client for all workers.
-        // This works well for single security domain deployments where all workers share
-        // the same CA and can accept the same client certificate.
-        //
-        // For multi-domain deployments (e.g., different model families with different CAs),
-        // this architecture needs significant refactoring:
-        // 1. Move client creation into worker registration workflow (per-worker clients)
-        // 2. Store client per worker in WorkerRegistry
-        // 3. Update PDRouter and other routers to fetch client from worker
-        // 4. Add per-worker TLS spec in WorkerConfigRequest
-        //
-        // Current single-domain approach is sufficient for most deployments.
-        //
-        // Use rustls TLS backend when TLS/mTLS is configured (client cert or CA certs provided).
-        // This ensures proper PKCS#8 key format support. For plain HTTP workers, use default
-        // backend to avoid unnecessary TLS initialization overhead.
         let has_tls_config = config.client_identity.is_some() || !config.ca_certificates.is_empty();
 
         // Idle pooled connections must expire before the backend server's
@@ -479,10 +483,6 @@ impl AppContextBuilder {
             .connect_timeout(Duration::from_secs(10))
             .tcp_nodelay(true)
             .tcp_keepalive(Some(Duration::from_secs(30)));
-
-        if config.upstream_http2 {
-            client_builder = apply_upstream_http2(client_builder);
-        }
 
         // Force rustls backend when TLS is configured
         if has_tls_config {
@@ -574,10 +574,13 @@ impl AppContextBuilder {
 
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(PolicyRegistry::with_override(
-            config.policy.clone(),
-            config.routing_key_override.clone(),
-        )));
+        self.policy_registry = Some(Arc::new(
+            PolicyRegistry::with_override(
+                config.policy.clone(),
+                config.routing_key_override.clone(),
+            )
+            .with_pd_pairing_mode(config.pd_pairing_mode),
+        ));
         self
     }
 
@@ -620,10 +623,6 @@ impl AppContextBuilder {
 
     /// Create load monitor
     fn with_worker_monitor(mut self, config: &RouterConfig) -> Result<Self, String> {
-        let client = self
-            .client
-            .as_ref()
-            .ok_or_else(|| "client must be set before load monitor".to_string())?;
         let policy_registry = self
             .policy_registry
             .as_ref()
@@ -635,7 +634,6 @@ impl AppContextBuilder {
                 .ok_or_else(|| "worker_registry must be set before load monitor".to_string())?
                 .clone(),
             Arc::clone(&policy_registry),
-            client.clone(),
             config.load_monitor_interval_secs,
             config.engine_metrics,
             config.disable_load_monitoring,
@@ -643,6 +641,9 @@ impl AppContextBuilder {
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
+        // PD dispatch waits here, not in the decode engine's queue, when the
+        // pair's running window is full.
+        pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
         // Wire the backend load-snapshot feed into every policy that consumes
         // it; the monitor polls every group by default, conditionally under
         // `--disable-load-monitoring`.
@@ -811,15 +812,17 @@ mod tests {
             .expect("client set")
     }
 
+    /// `--upstream-http2` is a worker-client concern; the shared client keeps
+    /// negotiating normally (HTTP/1.1 on cleartext, ALPN on TLS).
     #[tokio::test]
-    async fn upstream_http2_client_speaks_h2c_prior_knowledge() {
+    async fn shared_client_ignores_upstream_http2() {
         let url = spawn_echo_server().await;
         let resp = built_client(true)
             .get(&url)
             .send()
             .await
-            .expect("h2c request");
-        assert_eq!(resp.version(), http::Version::HTTP_2);
+            .expect("h1 request");
+        assert_eq!(resp.version(), http::Version::HTTP_11);
         assert_eq!(resp.text().await.expect("body"), "ok");
     }
 

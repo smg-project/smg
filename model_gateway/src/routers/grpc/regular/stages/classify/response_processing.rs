@@ -20,8 +20,9 @@ use tracing::error;
 use crate::routers::{
     error,
     grpc::{
-        common::stages::PipelineStage,
-        context::{ExecutionResult, FinalResponse, RequestContext, WorkerSelection},
+        common::stages::ProcessStage,
+        context::{DispatchContext, ExecutionResult, FinalResponse, WorkerSelection},
+        spec::ResponseSpec,
     },
 };
 
@@ -88,9 +89,9 @@ impl ClassifyResponseProcessingStage {
     }
 
     /// Extract id2label mapping from the selected worker's model card.
-    fn get_id2label_from_context(ctx: &RequestContext) -> HashMap<u32, String> {
+    fn get_id2label_from_context(ctx: &DispatchContext) -> HashMap<u32, String> {
         // Get the selected worker
-        let worker = match ctx.state.workers.as_ref() {
+        let worker = match ctx.workers.as_ref() {
             Some(WorkerSelection::Single { worker }) => worker,
             Some(WorkerSelection::Disaggregated { prefill, .. }) => prefill, // Use prefill worker for model info
             None => return HashMap::new(),
@@ -114,12 +115,27 @@ impl Default for ClassifyResponseProcessingStage {
 }
 
 #[async_trait]
-impl PipelineStage for ClassifyResponseProcessingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        // Extract execution result
-        let execution_result = ctx.state.response.execution_result.take().ok_or_else(|| {
+impl ProcessStage for ClassifyResponseProcessingStage {
+    async fn process(
+        &self,
+        ctx: &mut DispatchContext,
+        spec: ResponseSpec,
+    ) -> Result<Option<Response>, Response> {
+        if !matches!(spec, ResponseSpec::Classify) {
             error!(
-                function = "ClassifyResponseProcessingStage::execute",
+                function = "ClassifyResponseProcessingStage::process",
+                "Wrong response spec"
+            );
+            return Err(error::internal_error(
+                "wrong_response_spec",
+                "Wrong response spec",
+            ));
+        }
+
+        // Extract execution result
+        let execution_result = ctx.response.execution_result.take().ok_or_else(|| {
+            error!(
+                function = "ClassifyResponseProcessingStage::process",
                 "Execution result missing"
             );
             error::internal_error("execution_result_missing", "Execution result missing")
@@ -130,7 +146,7 @@ impl PipelineStage for ClassifyResponseProcessingStage {
             response
         } else {
             error!(
-                function = "ClassifyResponseProcessingStage::execute",
+                function = "ClassifyResponseProcessingStage::process",
                 "Invalid execution result: expected Embedding"
             );
             return Err(error::internal_error(
@@ -144,7 +160,7 @@ impl PipelineStage for ClassifyResponseProcessingStage {
 
         if logits.is_empty() {
             error!(
-                function = "ClassifyResponseProcessingStage::execute",
+                function = "ClassifyResponseProcessingStage::process",
                 "Empty logits received from scheduler"
             );
             return Err(error::internal_error(
@@ -174,9 +190,9 @@ impl PipelineStage for ClassifyResponseProcessingStage {
         };
 
         // Get dispatch metadata
-        let dispatch = ctx.state.dispatch.as_ref().ok_or_else(|| {
+        let dispatch = ctx.dispatch.as_ref().ok_or_else(|| {
             error!(
-                function = "ClassifyResponseProcessingStage::execute",
+                function = "ClassifyResponseProcessingStage::process",
                 "Dispatch metadata missing"
             );
             error::internal_error("dispatch_missing", "Dispatch metadata missing")
@@ -202,7 +218,7 @@ impl PipelineStage for ClassifyResponseProcessingStage {
         );
 
         // Store in context for pipeline to extract
-        ctx.state.response.final_response = Some(FinalResponse::Classify(response));
+        ctx.response.final_response = Some(FinalResponse::Classify(response));
 
         Ok(None)
     }

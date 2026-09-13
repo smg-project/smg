@@ -28,19 +28,14 @@ use openai_protocol::{
 
 use crate::middleware::TenantRequestMeta;
 
-pub mod anthropic;
 pub mod common;
-pub mod conversations;
-pub mod error;
+pub use smg_external_router::error;
+pub mod external;
 pub mod factory;
-pub mod gemini;
+pub mod gateway;
 pub mod grpc;
 pub mod http;
-pub mod openai;
-pub mod parse;
-pub mod responses;
-pub mod router_manager;
-pub mod tokenize;
+pub(crate) mod provider_support;
 
 pub use common::body_policy::BodyPolicy;
 pub use factory::RouterFactory;
@@ -74,11 +69,6 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Get server information
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Server info not implemented").into_response()
-    }
-
-    /// Get available models
-    async fn get_models(&self, _req: Request<Body>) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Get models not implemented").into_response()
     }
 
     /// Get model information

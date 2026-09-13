@@ -1,0 +1,44 @@
+name: radix-tree fuzz campaign
+
+# The always-on `fuzz_quick` in the unit-test lane is a triage gate (8+3
+# seeds, debug build). The differential campaign — seeded runs against
+# the reference model, every 4th at the wide H<=64 sharing width, plus
+# the out-of-contract chaos runs — is release-only and runs here nightly
+# so the data structure's correctness gate does not depend on someone
+# remembering to run it by hand. Budget: 1000 seeds took 52 min in
+# release on an M-series laptop; 600 fits a 2x slower hosted runner
+# inside the 120-minute job limit with headroom. Dispatch for more.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "RADIX_FUZZ_SEEDS"
+        default: "600"
+      start:
+        description: "RADIX_FUZZ_START"
+        default: "1000"
+
+concurrency:
+  group: radix-tree-fuzz
+  cancel-in-progress: true
+
+jobs:
+  campaign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: radix-tree-fuzz
+      - name: Run the differential campaign (release)
+        env:
+          RADIX_FUZZ_SEEDS: ${{ github.event.inputs.seeds || '600' }}
+          RADIX_FUZZ_START: ${{ github.event.inputs.start || '1000' }}
+        run: |
+          cargo test -p smg-radix-tree --release --test fuzz_differential \
+            -- --ignored --nocapture fuzz_campaign

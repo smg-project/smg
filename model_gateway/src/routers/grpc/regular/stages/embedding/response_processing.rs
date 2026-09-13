@@ -8,9 +8,10 @@ use tracing::error;
 use crate::routers::{
     error,
     grpc::{
-        common::stages::PipelineStage,
-        context::{ExecutionResult, FinalResponse, RequestContext},
+        common::stages::ProcessStage,
+        context::{DispatchContext, ExecutionResult, FinalResponse},
         proto_wrapper::ProtoEmbedComplete,
+        spec::ResponseSpec,
     },
 };
 
@@ -30,12 +31,27 @@ impl Default for EmbeddingResponseProcessingStage {
 }
 
 #[async_trait]
-impl PipelineStage for EmbeddingResponseProcessingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        // Extract execution result
-        let execution_result = ctx.state.response.execution_result.take().ok_or_else(|| {
+impl ProcessStage for EmbeddingResponseProcessingStage {
+    async fn process(
+        &self,
+        ctx: &mut DispatchContext,
+        spec: ResponseSpec,
+    ) -> Result<Option<Response>, Response> {
+        if !matches!(spec, ResponseSpec::Embedding) {
             error!(
-                function = "EmbeddingResponseProcessingStage::execute",
+                function = "EmbeddingResponseProcessingStage::process",
+                "Wrong response spec"
+            );
+            return Err(error::internal_error(
+                "wrong_response_spec",
+                "Wrong response spec",
+            ));
+        }
+
+        // Extract execution result
+        let execution_result = ctx.response.execution_result.take().ok_or_else(|| {
+            error!(
+                function = "EmbeddingResponseProcessingStage::process",
                 "Execution result missing"
             );
             error::internal_error("execution_result_missing", "Execution result missing")
@@ -46,7 +62,7 @@ impl PipelineStage for EmbeddingResponseProcessingStage {
             response
         } else {
             error!(
-                function = "EmbeddingResponseProcessingStage::execute",
+                function = "EmbeddingResponseProcessingStage::process",
                 "Invalid execution result: expected Embedding"
             );
             return Err(error::internal_error(
@@ -61,7 +77,7 @@ impl PipelineStage for EmbeddingResponseProcessingStage {
             .map_err(|boxed_err| *boxed_err)?;
 
         // Store in context for pipeline to extract
-        ctx.state.response.final_response = Some(FinalResponse::Embedding(embedding_response));
+        ctx.response.final_response = Some(FinalResponse::Embedding(embedding_response));
 
         Ok(None)
     }
@@ -78,10 +94,10 @@ impl EmbeddingResponseProcessingStage {
     )]
     fn convert_response(
         &self,
-        ctx: &RequestContext,
+        ctx: &DispatchContext,
         proto: ProtoEmbedComplete,
     ) -> Result<EmbeddingResponse, Box<Response>> {
-        let dispatch = ctx.state.dispatch.as_ref().ok_or_else(|| {
+        let dispatch = ctx.dispatch.as_ref().ok_or_else(|| {
             error!(
                 function = "EmbeddingResponseProcessingStage::convert_response",
                 "Dispatch metadata missing in context"

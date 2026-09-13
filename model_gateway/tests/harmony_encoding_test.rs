@@ -42,6 +42,8 @@ fn context(
             registration_mode: WorkerRegistrationMode::Upsert,
             worker_kind: Some(kind),
             connection_mode: Some(connection),
+            http2: None,
+            http_client_handle: None,
             detected_runtime_type: None,
             discovered_labels: Default::default(),
             dp_info: None,

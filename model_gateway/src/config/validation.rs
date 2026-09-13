@@ -99,6 +99,7 @@ impl ConfigValidator {
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
         Self::validate_model_aliases(config)?;
+        Self::validate_rl(config)?;
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
         }
@@ -732,6 +733,14 @@ impl ConfigValidator {
             });
         }
 
+        if config.mm_per_request_image_limit == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "mm_per_request_image_limit".to_string(),
+                value: "0".to_string(),
+                reason: "Must be at least 1".to_string(),
+            });
+        }
+
         // A zero-capacity job channel panics at construction and a
         // zero-permit dispatcher never dequeues; reject both here so a
         // config-file value fails as early as the CLI parsers do.
@@ -828,6 +837,20 @@ impl ConfigValidator {
         Ok(())
     }
 
+    fn validate_rl(config: &RouterConfig) -> ConfigResult<()> {
+        config
+            .rl
+            .validate()
+            .map_err(|reason| ConfigError::InvalidValue {
+                field: "rl".to_string(),
+                value: format!(
+                    "control_timeout_secs={} fanout_concurrency={}",
+                    config.rl.control_timeout_secs, config.rl.fanout_concurrency
+                ),
+                reason,
+            })
+    }
+
     fn validate_discovery(discovery: &DiscoveryConfig, mode: &RoutingMode) -> ConfigResult<()> {
         if !discovery.enabled {
             return Ok(());
@@ -847,6 +870,27 @@ impl ConfigValidator {
                 value: discovery.check_interval_secs.to_string(),
                 reason: "Must be > 0".to_string(),
             });
+        }
+
+        for (field, value) in [
+            (
+                "discovery.kv_connector_annotation",
+                &discovery.kv_connector_annotation,
+            ),
+            (
+                "discovery.kv_engine_id_annotation",
+                &discovery.kv_engine_id_annotation,
+            ),
+        ] {
+            let trimmed = value.trim();
+            if trimmed.is_empty() || trimmed != value {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: value.clone(),
+                    reason: "Annotation name must not be empty or padded with whitespace"
+                        .to_string(),
+                });
+            }
         }
 
         match mode {
@@ -1067,22 +1111,32 @@ impl ConfigValidator {
     }
 
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
+        let invalid_decode_policy = match &config.mode {
+            RoutingMode::PrefillDecode { decode_policy, .. } if !config.enable_igw => {
+                !has_service_discovery && matches!(decode_policy, Some(PolicyConfig::Bucket { .. }))
+            }
+            RoutingMode::PrefillDecode { .. } | RoutingMode::EncodePrefillDecode { .. } => {
+                matches!(
+                    config.mode.get_decode_policy(&config.policy),
+                    PolicyConfig::Bucket { .. }
+                )
+            }
+            _ => false,
+        };
+        if invalid_decode_policy {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "Decode policy should not be allowed to be bucket".to_string(),
+            });
+        }
+
+        // IGW may receive workers dynamically, so worker-count validation cannot
+        // reason about its eventual topology. Mode-level compatibility still applies.
         if config.enable_igw {
             return Ok(());
         }
 
         Self::validate_mtls(config)?;
-
-        let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
-
-        if let RoutingMode::EncodePrefillDecode { decode_policy, .. } = &config.mode {
-            let effective_decode_policy = decode_policy.as_ref().unwrap_or(&config.policy);
-            if matches!(effective_decode_policy, PolicyConfig::Bucket { .. }) {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "Decode policy should not be allowed to be bucket".to_string(),
-                });
-            }
-        }
 
         if !has_service_discovery {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
@@ -1117,13 +1171,6 @@ impl ConfigValidator {
                                     .to_string(),
                         });
                     }
-                }
-
-                // Check bucket for decode
-                if let Some(PolicyConfig::Bucket { .. }) = decode_policy {
-                    return Err(ConfigError::IncompatibleConfig {
-                        reason: "Decode policy should not be allowed to be bucket".to_string(),
-                    });
                 }
             }
 
@@ -1176,6 +1223,49 @@ mod tests {
     use crate::worker::ConnectionMode;
 
     #[test]
+    fn igw_disaggregated_modes_reject_bucket_decode_policy() {
+        let bucket = || PolicyConfig::Bucket {
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            bucket_adjust_interval_secs: 5,
+        };
+        let mut config = RouterConfig {
+            discovery: Some(DiscoveryConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: Some(bucket()),
+            },
+            ..Default::default()
+        };
+
+        assert!(ConfigValidator::validate_compatibility(&config).is_ok());
+        config.enable_igw = true;
+        assert!(ConfigValidator::validate_compatibility(&config).is_err());
+
+        if let RoutingMode::PrefillDecode { decode_policy, .. } = &mut config.mode {
+            *decode_policy = None;
+        }
+        config.policy = bucket();
+        assert!(ConfigValidator::validate_compatibility(&config).is_err());
+
+        config.policy = PolicyConfig::Random;
+        config.mode = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![],
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: Some(bucket()),
+        };
+        assert!(ConfigValidator::validate_compatibility(&config).is_err());
+    }
+
+    #[test]
     fn prefix_hash_policy_cache_boundaries_are_validated() {
         let config = RouterConfig {
             policy: PolicyConfig::PrefixHash {
@@ -1190,6 +1280,24 @@ mod tests {
             ConfigValidator::validate(&config),
             Err(ConfigError::InvalidValue { ref field, .. }) if field == "cache_boundaries"
         ));
+    }
+
+    #[test]
+    fn zero_mm_per_request_image_limit_is_rejected() {
+        let config = RouterConfig {
+            mm_per_request_image_limit: Some(0),
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "mm_per_request_image_limit"
+        ));
+
+        let config = RouterConfig {
+            mm_per_request_image_limit: Some(128),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]
@@ -1511,6 +1619,36 @@ mod tests {
 
         // Should pass validation since service discovery is enabled
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_invalid_kv_annotation_names() {
+        for (field, kv_connector_annotation, kv_engine_id_annotation) in [
+            (
+                "discovery.kv_connector_annotation",
+                " ",
+                "smg.ai/kv-engine-id",
+            ),
+            (
+                "discovery.kv_engine_id_annotation",
+                "smg.ai/kv-connector",
+                " smg.ai/kv-engine-id",
+            ),
+        ] {
+            let mut config = regular_mode_config();
+            config.discovery = Some(DiscoveryConfig {
+                enabled: true,
+                selector: [("app".to_string(), "worker".to_string())].into(),
+                kv_connector_annotation: kv_connector_annotation.to_string(),
+                kv_engine_id_annotation: kv_engine_id_annotation.to_string(),
+                ..Default::default()
+            });
+
+            assert!(matches!(
+                ConfigValidator::validate(&config),
+                Err(ConfigError::InvalidValue { field: ref actual, .. }) if actual == field
+            ));
+        }
     }
 
     #[test]
@@ -2134,5 +2272,39 @@ mod tests {
         }
         config.worker_overload_token_usage = Some(1.0);
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn rl_config_defaults_to_disabled_and_validates_when_enabled() {
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .round_robin_policy()
+            .build_unchecked();
+        assert!(!config.rl.enabled);
+        assert_eq!(config.rl.control_timeout_secs, 600);
+        assert_eq!(config.rl.fanout_concurrency, 32);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        let bad = RouterConfig::builder()
+            .regular_mode(vec![])
+            .round_robin_policy()
+            .rl(smg_rl::RlConfig {
+                enabled: true,
+                control_timeout_secs: 0,
+                fanout_concurrency: 32,
+            })
+            .build_unchecked();
+        let err = ConfigValidator::validate(&bad).unwrap_err().to_string();
+        assert!(err.contains("control_timeout_secs"), "{err}");
+
+        let ok = RouterConfig::builder()
+            .regular_mode(vec![])
+            .round_robin_policy()
+            .rl(smg_rl::RlConfig {
+                enabled: true,
+                ..smg_rl::RlConfig::default()
+            })
+            .build_unchecked();
+        assert!(ConfigValidator::validate(&ok).is_ok());
     }
 }

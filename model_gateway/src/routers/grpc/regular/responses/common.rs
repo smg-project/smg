@@ -26,7 +26,7 @@ use crate::{
     routers::{
         common::{openai_bridge, persistence_utils::split_stored_message_content},
         error,
-        grpc::common::responses::ResponsesContext,
+        grpc::common::responses::{utils::resolve_function_identity, ResponsesContext},
     },
 };
 
@@ -36,6 +36,7 @@ use crate::{
 
 /// State for tracking multi-turn tool calling loop
 pub(super) struct ToolLoopState {
+    tools: Option<Vec<responses::ResponseTool>>,
     pub iteration: usize,
     pub total_calls: usize,
     pub conversation_history: Vec<ResponseInputOutputItem>,
@@ -53,12 +54,13 @@ pub(super) struct ResponsesCallContext {
 }
 
 impl ToolLoopState {
-    pub fn new(original_input: ResponseInput) -> Self {
+    pub fn new(request: &ResponsesRequest) -> Self {
         Self {
+            tools: request.tools.clone(),
             iteration: 0,
             total_calls: 0,
             conversation_history: Vec::new(),
-            original_input,
+            original_input: request.input.clone(),
             mcp_call_items: Vec::new(),
         }
     }
@@ -74,11 +76,13 @@ impl ToolLoopState {
     ) {
         // Add function_tool_call item with both arguments and output
         let id = call_id.clone();
+        let (name, namespace) = resolve_function_identity(self.tools.as_deref(), &tool_name);
         self.conversation_history
             .push(ResponseInputOutputItem::FunctionToolCall {
                 id: Some(id),
                 call_id,
-                name: tool_name,
+                name,
+                namespace,
                 arguments: args_json_str,
                 output: Some(output_str),
                 status: Some("completed".to_string()),
@@ -424,5 +428,36 @@ pub(super) fn build_next_request(
         top_k: current_request.top_k,
         min_p: current_request.min_p,
         repetition_penalty: current_request.repetition_penalty,
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+    use crate::routers::grpc::common::responses::utils::namespace_test_request;
+    #[test]
+    fn namespace_replay_preserves_structured_identity() {
+        let request: ResponsesRequest = namespace_test_request();
+        let mut state = ToolLoopState::new(&request);
+        state.record_call(
+            "call_test".into(),
+            "weather.lookup".into(),
+            "{}".into(),
+            "sunny".into(),
+            ResponseOutputItem::new_function_tool_call(
+                "fc_test".into(),
+                "call_test".into(),
+                "weather.lookup".into(),
+                "{}".into(),
+                None,
+                "completed".into(),
+            ),
+            true,
+        );
+        let wire = serde_json::to_value(&state.conversation_history[0]).unwrap();
+
+        assert_eq!(wire["name"], "lookup");
+        assert_eq!(wire["namespace"], "weather");
+        assert_eq!(wire["call_id"], "call_test");
     }
 }

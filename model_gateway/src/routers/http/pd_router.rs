@@ -19,7 +19,6 @@ use openai_protocol::{
     rerank::RerankRequest,
     responses::ResponsesRequest,
 };
-use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -34,7 +33,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    policies::{CacheNamespace, PolicyRegistry, WorkerLeg},
     routers::{
         common::{
             attach_sized_body, header_utils,
@@ -43,6 +42,7 @@ use crate::{
                 KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
             },
             overload,
+            placement::{self, PairFailure, PlacementFailure, PlacementInputs},
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, RetryExecutor},
             serialize_json_sized,
@@ -55,7 +55,7 @@ use crate::{
         RouterTrait,
     },
     worker::{
-        HashRing, RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
+        PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
         UNKNOWN_MODEL_ID,
     },
 };
@@ -74,13 +74,15 @@ enum PdSelectionFailure {
     /// The pre-existing string: no workers configured, all unhealthy or
     /// circuit-broken, or the policy declined.
     Unavailable(String),
+    /// Both legs are up, but no prefill shares a KV transfer protocol with
+    /// any decode (#2483).
+    Incompatible(String),
 }
 
 #[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
-    pub client: Client,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
 }
@@ -101,30 +103,29 @@ impl PDRouter {
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
-        // Plain HTTP GET to the selected URL: only healthy HTTP-transport
+        // Plain HTTP GET to the selected worker: only healthy HTTP-transport
         // prefill workers are eligible (same rule as the PD legs).
-        let first_worker_url = self
+        let first_worker = self
             .worker_registry
             .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpPrefill)
             .iter()
             .find(|w| w.is_healthy())
-            .map(|w| w.url().to_string());
+            .cloned();
 
-        if let Some(worker_url) = first_worker_url {
-            self.proxy_to_worker(worker_url, endpoint, headers).await
+        if let Some(worker) = first_worker {
+            Self::proxy_to_worker(&worker, endpoint, headers).await
         } else {
             error::service_unavailable("no_prefill_servers", "No prefill servers available")
         }
     }
 
     async fn proxy_to_worker(
-        &self,
-        worker_url: String,
+        worker: &Arc<dyn Worker>,
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
-        let url = format!("{worker_url}/{endpoint}");
-        let mut request_builder = self.client.get(&url);
+        let url = format!("{}/{endpoint}", worker.url());
+        let mut request_builder = worker.http_client().get(&url);
 
         if let Some(headers) = headers {
             for (name, value) in headers {
@@ -201,7 +202,6 @@ impl PDRouter {
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
-            client: ctx.client.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
         })
@@ -213,28 +213,21 @@ impl PDRouter {
             // counter; re-describing it as a circuit-breaker/health failure is
             // exactly the misdiagnosis this path used to hand operators.
             PdSelectionFailure::Shed(shed) => shed,
+            PdSelectionFailure::Incompatible(error) => {
+                error!("Failed to select PD pair error={}", error);
+                error::service_unavailable("no_compatible_pd_pair", error)
+            }
             PdSelectionFailure::Unavailable(error) => {
                 error!("Failed to select PD pair error={}", error);
+                // Same code the regular HTTP router and the gRPC routers use
+                // for a leg that is merely down, so a client can key its
+                // retry on one code whatever the transport; the message
+                // still names the leg.
                 error::service_unavailable(
-                    "server_selection_failed",
+                    "no_available_workers",
                     format!("No available servers: {error}"),
                 )
             }
-        }
-    }
-
-    /// Classify one leg's selection miss. `candidates` is the leg pool before
-    /// the `is_available()` filter, so the verdict describes the pool that
-    /// actually emptied rather than the model's whole registry entry — a
-    /// saturated prefill leg leaves the decode workers unflagged.
-    fn leg_failure(
-        candidates: &[Arc<dyn Worker>],
-        model_id: &str,
-        error: String,
-    ) -> PdSelectionFailure {
-        match overload::shed_if_all_overloaded(candidates, model_id) {
-            Some(shed) => PdSelectionFailure::Shed(shed),
-            None => PdSelectionFailure::Unavailable(error),
         }
     }
 
@@ -470,6 +463,7 @@ impl PDRouter {
                 view.text,
                 view.tokens,
                 view.rid_key,
+                view.cache_namespace,
                 context.model_id,
                 context.headers.as_ref(),
             )
@@ -825,7 +819,6 @@ impl PDRouter {
 
         // Build both requests
         let prefill_request = self.build_post_with_headers(
-            &self.client,
             prefill.as_ref(),
             context.route,
             prefill_body,
@@ -833,7 +826,6 @@ impl PDRouter {
             false,
         );
         let decode_request = self.build_post_with_headers(
-            &self.client,
             decode.as_ref(),
             context.route,
             decode_body,
@@ -1024,7 +1016,6 @@ impl PDRouter {
             .emit();
 
             let prefill_request = self.build_post_with_headers(
-                &self.client,
                 prefill.as_ref(),
                 context.route,
                 prefill_body,
@@ -1148,7 +1139,6 @@ impl PDRouter {
         };
 
         let decode_request = self.build_post_with_headers(
-            &self.client,
             decode.as_ref(),
             context.route,
             decode_body,
@@ -1318,6 +1308,7 @@ impl PDRouter {
         request_text: Option<&str>,
         tokens: Option<&[u32]>,
         rid_key: Option<&str>,
+        cache_namespace: Option<CacheNamespace>,
         model_id: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<PdPair, Box<PdSelectionFailure>> {
@@ -1325,150 +1316,78 @@ impl PDRouter {
 
         // Shared HTTP-transport projections: this router proxies plain HTTP
         // to the selected worker's URL, so a gRPC or ZMQ worker must never
-        // be selectable. Both legs derive from ONE model snapshot (and, for
-        // the wildcard fallback, ONE global snapshot) — separate lookups
-        // could straddle a concurrent membership change and pair workers
-        // that never coexisted. The fallback stays conditional, matching the
-        // old code: untagged workers index under the literal "unknown" entry
-        // and win when present; only an empty entry widens to every HTTP
-        // prefill/decode worker ("auto" means pick any).
+        // be selectable. Both legs derive from ONE snapshot's pair index:
+        // separate lookups could straddle a concurrent membership change and
+        // pair workers that never coexisted.
         let is_unknown_model = model_id == UNKNOWN_MODEL_ID;
-        let model_snapshot = self.worker_registry.model_routing_snapshot(model_id);
-        let global_snapshot =
-            is_unknown_model.then(|| self.worker_registry.get_routing_snapshot(UNKNOWN_MODEL_ID));
-
-        let prefill_workers = {
-            let by_model = match &model_snapshot {
-                Some(snapshot) => snapshot.pool(RoutingPool::HttpPrefill),
-                None => WorkerRegistry::empty_pool(),
-            };
-            match &global_snapshot {
-                Some(global) if by_model.is_empty() => global.pool(RoutingPool::HttpPrefill),
-                _ => by_model,
-            }
+        let mode = self.policy_registry.pd_pairing_mode();
+        let by_model = self
+            .worker_registry
+            .model_routing_snapshot(model_id)
+            .map(|snapshot| snapshot.pd_pairs(PdWire::Http, mode));
+        let pairs = match by_model {
+            // A named model routes within its own entry. The wildcard's
+            // literal "unknown" entry wins while it can pair at all; when it
+            // cannot (a leg empty, or no compatible pair) both legs widen
+            // together to the global snapshot, a superset of the entry. This
+            // widening is all-or-nothing per index, unlike the old per-leg
+            // widening, so the two legs always come from one snapshot.
+            Some(index) if !is_unknown_model || index.can_pair() => index,
+            _ if is_unknown_model => self
+                .worker_registry
+                .get_routing_snapshot(UNKNOWN_MODEL_ID)
+                .pd_pairs(PdWire::Http, mode),
+            _ => Arc::new(PdPairIndex::empty()),
         };
 
-        let decode_workers = {
-            let by_model = match &model_snapshot {
-                Some(snapshot) => snapshot.pool(RoutingPool::HttpDecode),
-                None => WorkerRegistry::empty_pool(),
-            };
-            match &global_snapshot {
-                Some(global) if by_model.is_empty() => global.pool(RoutingPool::HttpDecode),
-                _ => by_model,
-            }
-        };
-
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-        let decode_policy = self.policy_registry.get_decode_policy();
-
-        // Get cached hash ring for consistent hashing
-        let hash_ring = self.worker_registry.get_hash_ring(model_id);
-
-        let prefill = self
-            .pick_worker_by_policy_arc(
-                &prefill_workers,
-                &prefill_policy,
-                request_text,
+        let pair = placement::select_pair(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            &pairs,
+            None,
+            false,
+            PlacementInputs {
+                text: request_text,
                 tokens,
-                rid_key,
                 headers,
-                hash_ring.clone(),
-                "prefill",
-                crate::policies::WorkerLeg::Prefill,
-            )
-            .map_err(|e| Box::new(Self::leg_failure(&prefill_workers, model_id, e)))?;
-
-        let decode = self
-            .pick_worker_by_policy_arc(
-                &decode_workers,
-                &decode_policy,
-                request_text,
-                tokens,
                 rid_key,
-                headers,
-                hash_ring,
-                "decode",
-                crate::policies::WorkerLeg::Decode,
-            )
-            .map_err(|e| Box::new(Self::leg_failure(&decode_workers, model_id, e)))?;
+                cache_namespace,
+            },
+        )
+        .map_err(|failure| Box::new(Self::pair_failure(*failure)))?;
 
-        // Record worker selection metrics (Layer 3)
-        let model = model_id;
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_PREFILL,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            prefill_policy.name(),
-        );
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_DECODE,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            decode_policy.name(),
-        );
-
-        Ok((prefill, decode))
+        Ok((pair.prefill, pair.decode))
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "HTTP PD worker pick threads policy + request context + leg"
-    )]
-    fn pick_worker_by_policy_arc(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        policy: &Arc<dyn LoadBalancingPolicy>,
-        request_text: Option<&str>,
-        tokens: Option<&[u32]>,
-        rid_key: Option<&str>,
-        headers: Option<&HeaderMap>,
-        hash_ring: Option<Arc<HashRing>>,
-        worker_type: &str,
-        leg: crate::policies::WorkerLeg,
-    ) -> Result<Arc<dyn Worker>, String> {
-        if workers.is_empty() {
-            return Err(format!(
-                "No {worker_type} workers available. Please check if {worker_type} servers are configured and healthy."
-            ));
+    /// Map a leg's placement verdict to this router's selection failure,
+    /// keeping the operator-facing messages the legs always produced.
+    fn pair_failure(failure: PairFailure) -> PdSelectionFailure {
+        let leg = match failure.leg {
+            WorkerLeg::Prefill => "prefill",
+            WorkerLeg::Decode => "decode",
+            WorkerLeg::Single => "worker",
+        };
+        match failure.verdict {
+            PlacementFailure::AllOverloaded(shed) => PdSelectionFailure::Shed(shed),
+            PlacementFailure::NoCandidates => PdSelectionFailure::Unavailable(format!(
+                "No {leg} workers available. Please check if {leg} servers are configured and healthy."
+            )),
+            PlacementFailure::Unavailable => PdSelectionFailure::Unavailable(format!(
+                "No available {leg} workers (all circuits open or unhealthy)"
+            )),
+            PlacementFailure::PolicyDeclined(policy) => PdSelectionFailure::Unavailable(
+                format!("Policy {policy} failed to select a {leg} worker"),
+            ),
+            PlacementFailure::NoCompatiblePair {
+                prefill,
+                decode,
+                mismatches,
+            } => PdSelectionFailure::Incompatible(format!(
+                "No prefill/decode pair shares a KV transfer protocol (mismatch on \
+                 {mismatches:?}; prefill: {prefill:?}, decode: {decode:?})"
+            )),
         }
-
-        let available_workers: Vec<Arc<dyn Worker>> = workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-
-        if available_workers.is_empty() {
-            return Err(format!(
-                "No available {worker_type} workers (all circuits open or unhealthy)"
-            ));
-        }
-
-        let selected_idx = self
-            .policy_registry
-            .select_worker(
-                policy,
-                &available_workers,
-                &SelectWorkerInfo {
-                    request_text,
-                    tokens,
-                    headers,
-                    routing_key: self.policy_registry.resolve_routing_key(headers),
-                    rid_key,
-                    hash_ring,
-                    leg,
-                },
-            )
-            .ok_or_else(|| {
-                format!(
-                    "Policy {} failed to select a {} worker",
-                    policy.name(),
-                    worker_type
-                )
-            })?;
-
-        Ok(available_workers[selected_idx].clone())
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1697,7 +1616,6 @@ impl PDRouter {
     )]
     fn build_post_with_headers(
         &self,
-        client: &Client,
         worker: &dyn Worker,
         route: &'static str,
         body: Bytes,
@@ -1706,7 +1624,8 @@ impl PDRouter {
     ) -> reqwest::RequestBuilder {
         let endpoint_url = worker.endpoint_url(route);
         let mut request = attach_sized_body(
-            client
+            worker
+                .http_client()
                 .post(endpoint_url)
                 .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
             body,
@@ -1854,27 +1773,31 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None)
-        {
-            Ok(pair) => pair,
-            // A deep probe that generates gets the same answer routing does:
-            // an all-vetoed fleet fails the probe, exactly as an all-circuit-
-            // broken one already did.
-            Err(failure) => match *failure {
-                PdSelectionFailure::Shed(shed) => return shed,
-                PdSelectionFailure::Unavailable(e) => {
-                    return error::service_unavailable(
-                        "no_healthy_worker_pair",
-                        format!("No healthy worker pair available: {e}"),
-                    );
-                }
-            },
-        };
+        let (prefill, decode) =
+            match self.select_pd_pair(None, None, None, None, UNKNOWN_MODEL_ID, None) {
+                Ok(pair) => pair,
+                // A deep probe that generates gets the same answer routing does:
+                // an all-vetoed fleet fails the probe, exactly as an all-circuit-
+                // broken one already did.
+                Err(failure) => match *failure {
+                    PdSelectionFailure::Shed(shed) => return shed,
+                    PdSelectionFailure::Incompatible(e) => {
+                        return error::service_unavailable("no_compatible_pd_pair", e);
+                    }
+                    PdSelectionFailure::Unavailable(e) => {
+                        return error::service_unavailable(
+                            "no_healthy_worker_pair",
+                            format!("No healthy worker pair available: {e}"),
+                        );
+                    }
+                },
+            };
 
         let prefill_url = format!("{}/health_generate", prefill.url());
         let (prefill_result, decode_result) = tokio::join!(
-            self.client.get(&prefill_url).send(),
-            self.client
+            prefill.http_client().get(&prefill_url).send(),
+            decode
+                .http_client()
                 .get(format!("{}/health_generate", decode.url()))
                 .send()
         );
@@ -1977,6 +1900,7 @@ impl RouterTrait for PDRouter {
                 .policy_registry
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
+            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
         };
         let context = PDRequestContext {
             route: "/generate",
@@ -2017,6 +1941,7 @@ impl RouterTrait for PDRouter {
                 .policy_registry
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
+            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
         };
         let context = PDRequestContext {
             route: "/v1/chat/completions",
@@ -2053,6 +1978,7 @@ impl RouterTrait for PDRouter {
                 .policy_registry
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
+            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
         };
         let context = PDRequestContext {
             route: "/v1/messages",
@@ -2089,6 +2015,7 @@ impl RouterTrait for PDRouter {
                 .policy_registry
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
+            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
         };
         let context = PDRequestContext {
             route: "/v1/responses",
@@ -2132,6 +2059,7 @@ impl RouterTrait for PDRouter {
                 .policy_registry
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
+            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
         };
         let context = PDRequestContext {
             route: "/v1/completions",
@@ -2167,6 +2095,7 @@ impl RouterTrait for PDRouter {
                 .policy_registry
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
+            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
         };
         let context = PDRequestContext {
             route: "/v1/rerank",
@@ -2204,7 +2133,6 @@ mod tests {
         PDRouter {
             worker_registry,
             policy_registry,
-            client: Client::new(),
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
         }
@@ -2357,7 +2285,6 @@ mod tests {
 
         let request = router
             .build_post_with_headers(
-                &router.client,
                 &worker,
                 "/generate",
                 Bytes::from(r#"{"text":"hello"}"#),
@@ -2396,7 +2323,7 @@ mod tests {
             .worker_registry
             .register_or_replace(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None);
+        let result = router.select_pd_pair(None, None, None, None, UNKNOWN_MODEL_ID, None);
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -2421,13 +2348,13 @@ mod tests {
         }
 
         let (prefill, decode) = router
-            .select_pd_pair(None, None, None, "GLM-5.2-Coding", None)
+            .select_pd_pair(None, None, None, None, "GLM-5.2-Coding", None)
             .expect("alias should select a PD pair");
         assert_eq!(prefill.url(), "http://prefill");
         assert_eq!(decode.url(), "http://decode");
 
         assert!(router
-            .select_pd_pair(None, None, None, "GLM-5.2-Unknown", None)
+            .select_pd_pair(None, None, None, None, "GLM-5.2-Unknown", None)
             .is_err());
     }
 
@@ -2435,7 +2362,7 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None);
+        let result = router.select_pd_pair(None, None, None, None, UNKNOWN_MODEL_ID, None);
 
         assert!(result.is_err());
         // No workers at all is the pre-existing unavailable string, not a shed:
@@ -2445,6 +2372,9 @@ mod tests {
                 assert!(error.contains("No prefill workers available"));
             }
             PdSelectionFailure::Shed(_) => panic!("an empty fleet is not an overload shed"),
+            PdSelectionFailure::Incompatible(_) => {
+                panic!("an empty fleet has no pairing to be incompatible about")
+            }
         }
     }
 

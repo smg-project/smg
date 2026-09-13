@@ -51,6 +51,15 @@ struct Operation {
     #[serde(rename = "requestBody")]
     request_body: Option<RequestBody>,
     responses: BTreeMap<String, Response>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    deprecated: bool,
+}
+
+impl Operation {
+    fn deprecated(mut self) -> Self {
+        self.deprecated = true;
+        self
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -227,6 +236,17 @@ fn path_param(name: &str) -> Parameter {
     }
 }
 
+fn optional_query_param(name: &str) -> Parameter {
+    Parameter {
+        name: name.to_string(),
+        location: "query".to_string(),
+        required: false,
+        schema: ParameterSchema {
+            schema_type: "string".to_string(),
+        },
+    }
+}
+
 fn operation(
     op_id: &str,
     summary: &str,
@@ -240,6 +260,7 @@ fn operation(
         parameters: params,
         request_body,
         responses,
+        deprecated: false,
     }
 }
 
@@ -575,6 +596,154 @@ fn main() -> anyhow::Result<()> {
                 None,
                 worker_accepted_response("Worker deletion accepted"),
             )),
+            ..PathItem::default()
+        },
+    );
+
+    // ---- Fleet load ----
+    let worker_load_name = collect_schema(schema_for!(WorkerLoadResponse), &mut schemas)?;
+    let loads_operation = |op_id: &str, summary: &str| {
+        operation(
+            op_id,
+            summary,
+            Some(vec![optional_query_param("model")]),
+            None,
+            json_response(&worker_load_name, summary),
+        )
+    };
+    paths.insert(
+        "/loads".to_string(),
+        PathItem {
+            get: Some(loads_operation(
+                "getLoads",
+                "Cached engine load for every worker, plus a fleet aggregate",
+            )),
+            ..PathItem::default()
+        },
+    );
+    paths.insert(
+        "/get_loads".to_string(),
+        PathItem {
+            get: Some(loads_operation("getLoadsLegacy", "Deprecated alias of /loads").deprecated()),
+            ..PathItem::default()
+        },
+    );
+
+    // ---- RL control plane ----
+    // Engine-native routes are proxied verbatim: `{path}` is the engine route
+    // (it may contain slashes) and the body is whatever that route takes, so
+    // both are free-form here. The per-worker proxy mirrors the engine's
+    // status, hence the `default` response.
+    use openai_protocol::rl::*;
+    let rl_workers_name = collect_schema(schema_for!(RlWorkersResponse), &mut schemas)?;
+    let rl_entry_name = collect_schema(schema_for!(RlWorkerEntry), &mut schemas)?;
+    let rl_outcome_name = collect_schema(schema_for!(RlCallOutcome), &mut schemas)?;
+    let rl_fanout_name = collect_schema(schema_for!(RlFanoutResponse), &mut schemas)?;
+    let json_content = |name: &str| -> BTreeMap<String, MediaType> {
+        let mut content = BTreeMap::new();
+        content.insert(
+            "application/json".to_string(),
+            MediaType {
+                schema: schema_ref(name),
+            },
+        );
+        content
+    };
+    let engine_body = || {
+        let mut content = BTreeMap::new();
+        content.insert(
+            "application/json".to_string(),
+            MediaType {
+                schema: serde_json::json!({
+                    "type": "object",
+                    "description": "Engine-defined request body, forwarded verbatim",
+                    "additionalProperties": true
+                }),
+            },
+        );
+        RequestBody {
+            required: false,
+            content,
+        }
+    };
+    paths.insert(
+        "/v1/rl/workers".to_string(),
+        get_endpoint(
+            "listRlWorkers",
+            "List workers for RL control: engine, topology, health, weight version, capabilities",
+            &rl_workers_name,
+        ),
+    );
+    paths.insert(
+        "/v1/rl/workers/{worker_id}".to_string(),
+        PathItem {
+            get: Some(operation(
+                "getRlWorker",
+                "Get one worker for RL control",
+                Some(vec![path_param("worker_id")]),
+                None,
+                json_response(&rl_entry_name, "Get one worker for RL control"),
+            )),
+            ..PathItem::default()
+        },
+    );
+    let rl_proxy = |op_id: &str, body: Option<RequestBody>| {
+        let mut responses =
+            json_response(&rl_outcome_name, "The engine's status and body, wrapped");
+        responses.insert(
+            "default".to_string(),
+            Response {
+                description: "The engine answered a non-2xx status, wrapped the same way"
+                    .to_string(),
+                content: Some(json_content(&rl_outcome_name)),
+            },
+        );
+        operation(
+            op_id,
+            "Proxy one engine-native route to one worker",
+            Some(vec![path_param("worker_id"), path_param("path")]),
+            body,
+            responses,
+        )
+    };
+    paths.insert(
+        "/v1/rl/workers/{worker_id}/engine/{path}".to_string(),
+        PathItem {
+            get: Some(rl_proxy("proxyRlEngineRouteGet", None)),
+            post: Some(rl_proxy("proxyRlEngineRoute", Some(engine_body()))),
+            ..PathItem::default()
+        },
+    );
+    let rl_fanout = |op_id: &str, body: Option<RequestBody>| {
+        let mut responses = json_response(&rl_fanout_name, "Every selected worker succeeded");
+        responses.insert(
+            "207".to_string(),
+            Response {
+                description: "At least one selected worker failed; see `failed`".to_string(),
+                content: Some(json_content(&rl_fanout_name)),
+            },
+        );
+        let selector = Parameter {
+            name: "selector".to_string(),
+            location: "query".to_string(),
+            required: true,
+            schema: ParameterSchema {
+                schema_type: "string".to_string(),
+            },
+        };
+        operation(
+            op_id,
+            "Fan one engine-native route out to every worker matching `selector`",
+            Some(vec![path_param("path"), selector]),
+            body,
+            responses,
+        )
+    };
+    paths.insert(
+        "/v1/rl/engine/{path}".to_string(),
+        PathItem {
+            get: Some(rl_fanout("fanoutRlEngineRouteGet", None)),
+            post: Some(rl_fanout("fanoutRlEngineRoute", Some(engine_body()))),
             ..PathItem::default()
         },
     );

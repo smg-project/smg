@@ -5,7 +5,10 @@ use serde_json::{Map, Value};
 use validator::Validate;
 
 use super::{
-    common::{default_true, deserialize_null_as_false, is_false, GenerationRequest, InputIds},
+    common::{
+        default_true, deserialize_null_as_false, is_false, CachePartition, GenerationRequest,
+        InputIds,
+    },
     sampling_params::SamplingParams,
 };
 use crate::validated::Normalizable;
@@ -211,6 +214,17 @@ impl GenerationRequest for GenerateRequest {
         self.stream
     }
 
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition {
+            // vLLM's `cache_salt` is a passthrough extension on this
+            // protocol; `extra_key` is SGLang's typed classification key.
+            cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
+            extra_key: self.extra_key.as_deref(),
+            // Either name identifies the adapter the engine namespaces by.
+            lora_path: self.lora_path.as_deref().or(self.lora_id.as_deref()),
+        }
+    }
+
     fn get_model(&self) -> Option<&str> {
         Some(self.model.as_str())
     }
@@ -400,5 +414,29 @@ mod tests {
 
         let r = req();
         assert_eq!(r.routing_tokens(), None);
+    }
+
+    #[test]
+    fn cache_partition_uses_the_typed_extra_key_and_falls_back_to_lora_id() {
+        let request: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "extra_key": "k",
+            "lora_id": "adapter-id",
+            "cache_salt": "tenant-a"
+        }))
+        .unwrap();
+        let partition = request.cache_partition();
+        assert_eq!(partition.cache_salt, Some("tenant-a"));
+        assert_eq!(partition.extra_key, Some("k"));
+        assert_eq!(partition.lora_path, Some("adapter-id"));
+
+        let typed_path: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "lora_path": "adapter-path",
+            "lora_id": "adapter-id"
+        }))
+        .unwrap();
+        assert_eq!(typed_path.cache_partition().lora_path, Some("adapter-path"));
+        assert!(typed_path.cache_partition().cache_salt.is_none());
     }
 }

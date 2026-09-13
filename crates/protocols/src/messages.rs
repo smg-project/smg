@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
-use crate::{common::GenerationRequest, validated::Normalizable};
+use crate::{
+    common::{CachePartition, GenerationRequest},
+    validated::Normalizable,
+};
 
 // ============================================================================
 // Request Types
@@ -114,6 +117,16 @@ impl CreateMessageRequest {
 }
 
 impl GenerationRequest for CreateMessageRequest {
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition {
+            // Engine extensions in the passthrough map, forwarded to the
+            // backend as-is.
+            cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
+            extra_key: self.other.get("extra_key").and_then(Value::as_str),
+            lora_path: self.other.get("lora_path").and_then(Value::as_str),
+        }
+    }
+
     fn rid(&self) -> Option<&str> {
         self.rid.as_deref()
     }
@@ -2462,5 +2475,22 @@ mod tests {
         assert_eq!(req.messages.len(), 2);
         assert_eq!(req.messages[0].role, Role::User);
         assert_eq!(req.messages[1].role, Role::System); // preserved in place
+    }
+
+    #[test]
+    fn cache_partition_reads_passthrough_fields() {
+        use crate::common::GenerationRequest;
+
+        let request: CreateMessageRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "cache_salt": "tenant-a"
+        }))
+        .unwrap();
+        let partition = request.cache_partition();
+        assert_eq!(partition.cache_salt, Some("tenant-a"));
+        assert!(partition.extra_key.is_none());
+        assert!(partition.lora_path.is_none());
     }
 }

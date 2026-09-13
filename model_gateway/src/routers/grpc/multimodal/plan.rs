@@ -120,10 +120,12 @@ pub(crate) async fn prepare_placeholder_tokens(
         .iter()
         .map(|&modality| (modality, plan.count(modality)))
         .collect::<Vec<_>>();
-    spec.validate_media_request(&metadata, &requested)
-        .map_err(|error| {
-            anyhow::anyhow!("invalid media request for model {}: {error}", spec.name())
-        })?;
+    spec.validate_media_request_with_limits(
+        &metadata,
+        &requested,
+        &components.modality_limit_overrides,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid media request for model {}: {error}", spec.name()))?;
     let mut placeholders = PlaceholderTokens::default();
     for &modality in plan.modalities() {
         let token = spec
@@ -229,6 +231,7 @@ mod tests {
                 url: "image".to_string(),
                 detail: None,
                 uuid: None,
+                max_long_side_pixel: None,
             },
             MediaContentPart::AudioUrl {
                 url: "audio-2".to_string(),
@@ -263,6 +266,7 @@ mod tests {
                 url: "image".to_string(),
                 detail: None,
                 uuid: None,
+                max_long_side_pixel: None,
             },
             MediaContentPart::AudioUrl {
                 url: "audio".to_string(),

@@ -47,6 +47,7 @@ use wfaas::LoggingSubscriber;
 use crate::{
     app_context::AppContext,
     config::RouterConfig,
+    endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
     mesh::MeshAdapters,
     middleware::{self, AdmissionQueue, AuthConfig},
     observability::{
@@ -56,11 +57,9 @@ use crate::{
     },
     routers::{
         common::realtime::ws::RealtimeQueryParams,
-        conversations,
+        gateway::Gateway,
         http::router::{stream_eligible_request_bodies, StreamBodyState},
-        parse, responses as response_handlers,
-        router_manager::RouterManager,
-        tokenize, RouterTrait,
+        RouterTrait,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
@@ -78,7 +77,7 @@ pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
     pub admission_queue: Option<Arc<AdmissionQueue>>,
-    pub router_manager: Option<Arc<RouterManager>>,
+    pub gateway: Option<Arc<Gateway>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
     pub mesh_adapters: Option<Arc<MeshAdapters>>,
     /// Cached O(1) readiness state shared with the optional dedicated
@@ -127,7 +126,7 @@ async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
-    WorkerManager::get_engine_metrics(&state.context.worker_registry, &state.context.client)
+    WorkerManager::get_engine_metrics(&state.context.worker_registry)
         .await
         .into_response()
 }
@@ -137,7 +136,7 @@ async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    state.router.get_models(req).await
+    models::list_models(&state.context, req.headers()).await
 }
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -564,17 +563,21 @@ async fn stop_profile(
         .into_response()
 }
 
-async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    WorkerManager::get_all_worker_loads(
+async fn get_loads(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListWorkersQuery>,
+) -> Response {
+    let snapshot = state
+        .context
+        .worker_monitor
+        .as_ref()
+        .map(|monitor| monitor.load_snapshot())
+        .unwrap_or_default();
+    Json(WorkerManager::fleet_loads(
         &state.context.worker_registry,
-        &state.context.client,
-        state
-            .context
-            .worker_monitor
-            .as_ref()
-            .map(|monitor| monitor.native_loads_absent()),
-    )
-    .await
+        &snapshot,
+        query.model.as_deref(),
+    ))
     .into_response()
 }
 
@@ -592,11 +595,17 @@ async fn list_workers_rest(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListWorkersQuery>,
 ) -> Response {
-    state
+    let mut result = state
         .context
         .worker_service
-        .list_workers(query.model.as_deref())
-        .into_response()
+        .list_workers(query.model.as_deref());
+    if let Some(monitor) = state.context.worker_monitor.as_ref() {
+        let snapshot = monitor.load_snapshot();
+        for info in &mut result.workers {
+            info.engine_load = snapshot.get(&info.spec.url).cloned();
+        }
+    }
+    result.into_response()
 }
 
 async fn get_worker(
@@ -604,7 +613,13 @@ async fn get_worker(
     Path(worker_id_raw): Path<String>,
 ) -> Response {
     match state.context.worker_service.get_worker(&worker_id_raw) {
-        Ok(result) => result.into_response(),
+        Ok(mut result) => {
+            if let Some(monitor) = state.context.worker_monitor.as_ref() {
+                let snapshot = monitor.load_snapshot();
+                result.0.engine_load = snapshot.get(&result.0.spec.url).cloned();
+            }
+            result.into_response()
+        }
         Err(err) => err.into_response(),
     }
 }
@@ -920,6 +935,7 @@ pub fn build_app(
         .route("/health", get(health))
         .route("/health_generate", get(health_generate))
         .route("/engine_metrics", get(engine_metrics))
+        .route("/loads", get(get_loads))
         .route("/v1/models", get(v1_models))
         .route("/get_model_info", get(get_model_info))
         .route("/get_server_info", get(get_server_info));
@@ -929,6 +945,7 @@ pub fn build_app(
         .route("/flush_cache", post(flush_cache))
         .route("/start_profile", post(start_profile))
         .route("/stop_profile", post(stop_profile))
+        // Deprecated alias of the public `/loads`.
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
@@ -984,19 +1001,30 @@ pub fn build_app(
     let admin_routes = apply_control_plane_auth(admin_routes);
     let worker_routes = apply_control_plane_auth(worker_routes);
 
+    // RL control plane: mounted only when the flag built an `RlState`, so
+    // with `--enable-rl` off nothing under /v1/rl exists and the sink 404s.
+    let rl_routes = app_state.context.rl.as_ref().map(|rl| {
+        apply_control_plane_auth(Router::new().nest("/v1/rl", smg_rl::router(Arc::clone(rl))))
+    });
+
     // `/ha/*` management routes (routers/mesh handlers) are removed
     // in this PR — they all read/write through the v1
     // `MeshSyncManager` and don't map cleanly onto the v2 adapters.
     // A v2-aware admin surface will return in a follow-up PR once
     // adapters are production-wired.
 
-    Ok(Router::new()
+    let mut app = Router::new()
         .merge(protected_routes)
         .merge(realtime_routes)
         .merge(multipart_upload_routes)
         .merge(public_routes)
         .merge(admin_routes)
-        .merge(worker_routes)
+        .merge(worker_routes);
+    if let Some(rl_routes) = rl_routes {
+        app = app.merge(rl_routes);
+    }
+
+    Ok(app
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
@@ -1263,8 +1291,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         worker_stats.total_workers, worker_stats.healthy_workers
     );
 
-    let router_manager = RouterManager::from_config(&config, &app_context).await?;
-    let router: Arc<dyn RouterTrait> = router_manager.clone();
+    let gateway = Gateway::from_config(&config, &app_context).await?;
+    let router: Arc<dyn RouterTrait> = gateway.clone();
 
     // WorkerManager owns the background health check loop. Its handle must
     // outlive the server to keep the task alive — bind it here so its Drop
@@ -1287,7 +1315,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // WorkerMonitor subscribes to registry events. Starting its event
     // loop here (after the synchronous worker population in
-    // RouterManager::from_config above) means the bootstrap reconcile
+    // Gateway::from_config above) means the bootstrap reconcile
     // captures every worker that exists at this point and the event
     // task picks up everything registered afterwards.
     if let Some(ref worker_monitor) = app_context.worker_monitor {
@@ -1352,7 +1380,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         router,
         context: app_context.clone(),
         admission_queue,
-        router_manager: Some(router_manager),
+        gateway: Some(gateway),
         mesh_handler,
         mesh_adapters,
         probe_state,
@@ -1409,10 +1437,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // keys when falling back to simple API-key auth (no control-plane auth
     // configured) — a tenant credential must not be able to reach
     // `/workers`, `/flush_cache`, etc. Only the shared gateway-wide key does.
-    let serving_auth_config = AuthConfig::with_tenant_keys(
-        config.router_config.api_key.clone(),
-        &config.router_config.tenant_api_keys,
-    );
+    let serving_auth_config = app_context.gateway_auth.clone();
     let admin_auth_config = AuthConfig::new(config.router_config.api_key.clone());
 
     // Initialize control plane authentication if configured

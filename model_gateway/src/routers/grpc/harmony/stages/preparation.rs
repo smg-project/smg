@@ -47,7 +47,7 @@ impl Default for HarmonyPreparationStage {
 
 #[async_trait]
 impl PipelineStage for HarmonyPreparationStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         // Clone Arc before match to avoid borrow checker issues
         // Arc clone is cheap (8 bytes) - avoids full request clone (15KB-200KB)
         let is_chat = matches!(&ctx.input.request_type, RequestType::Chat(_));
@@ -79,7 +79,7 @@ impl PipelineStage for HarmonyPreparationStage {
             ));
         }
 
-        Ok(None)
+        Ok(())
     }
 
     fn name(&self) -> &'static str {
@@ -93,7 +93,7 @@ impl HarmonyPreparationStage {
         &self,
         ctx: &mut RequestContext,
         request: &ChatCompletionRequest,
-    ) -> Result<Option<Response>, Response> {
+    ) -> Result<(), Response> {
         // Step 1: Filter tools if needed
         let mut body_ref = utils::filter_chat_request_by_tool_choice(request);
 
@@ -151,7 +151,7 @@ impl HarmonyPreparationStage {
             harmony_stop_ids: build_output.stop_token_ids,
         });
 
-        Ok(None)
+        Ok(())
     }
 
     /// Prepare a responses API request using Harmony encoding
@@ -162,7 +162,7 @@ impl HarmonyPreparationStage {
         &self,
         ctx: &mut RequestContext,
         request: &ResponsesRequest,
-    ) -> Result<Option<Response>, Response> {
+    ) -> Result<(), Response> {
         // Step 1: Extract function tools with schemas from ResponseTools
         let mut function_tools = extract_tools_from_response_tools(request.tools.as_deref());
 
@@ -226,7 +226,7 @@ impl HarmonyPreparationStage {
             harmony_stop_ids: build_output.stop_token_ids,
         });
 
-        Ok(None)
+        Ok(())
     }
 
     /// Generate Harmony structural tag for structured output (text field)

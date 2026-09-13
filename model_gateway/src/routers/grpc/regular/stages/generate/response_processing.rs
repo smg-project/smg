@@ -9,9 +9,10 @@ use tracing::error;
 use crate::routers::{
     error,
     grpc::{
-        common::stages::{helpers, PipelineStage, RateLimitCell},
-        context::{FinalResponse, RequestContext},
+        common::stages::{helpers, ProcessStage, RateLimitCell},
+        context::{DispatchContext, FinalResponse},
         regular::{processor, streaming},
+        spec::ResponseSpec,
     },
 };
 
@@ -36,28 +37,30 @@ impl GenerateResponseProcessingStage {
 }
 
 #[async_trait]
-impl PipelineStage for GenerateResponseProcessingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        self.process_generate_response(ctx).await
-    }
-
-    fn name(&self) -> &'static str {
-        "GenerateResponseProcessing"
-    }
-}
-
-impl GenerateResponseProcessingStage {
-    async fn process_generate_response(
+impl ProcessStage for GenerateResponseProcessingStage {
+    async fn process(
         &self,
-        ctx: &mut RequestContext,
+        ctx: &mut DispatchContext,
+        spec: ResponseSpec,
     ) -> Result<Option<Response>, Response> {
+        let ResponseSpec::Generate(generate_request) = spec else {
+            error!(
+                function = "GenerateResponseProcessingStage::process",
+                "Wrong response spec"
+            );
+            return Err(error::internal_error(
+                "wrong_response_spec",
+                "Wrong response spec",
+            ));
+        };
+
         let start_time = Instant::now();
-        let is_streaming = ctx.is_streaming();
+        let is_streaming = ctx.streaming;
 
         // Extract execution result
-        let execution_result = ctx.state.response.execution_result.take().ok_or_else(|| {
+        let execution_result = ctx.response.execution_result.take().ok_or_else(|| {
             error!(
-                function = "GenerateResponseProcessingStage::execute",
+                function = "GenerateResponseProcessingStage::process",
                 "No execution result"
             );
             error::internal_error("no_execution_result", "No execution result")
@@ -65,12 +68,11 @@ impl GenerateResponseProcessingStage {
 
         // Get dispatch metadata (needed by both streaming and non-streaming)
         let dispatch = ctx
-            .state
             .dispatch
             .as_ref()
             .ok_or_else(|| {
                 error!(
-                    function = "GenerateResponseProcessingStage::execute",
+                    function = "GenerateResponseProcessingStage::process",
                     "Dispatch metadata not set"
                 );
                 error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
@@ -80,7 +82,7 @@ impl GenerateResponseProcessingStage {
         // Get cached tokenizer (resolved once in preparation stage)
         let tokenizer = ctx.tokenizer_arc().ok_or_else(|| {
             error!(
-                function = "GenerateResponseProcessingStage::process_generate_response",
+                function = "GenerateResponseProcessingStage::process",
                 "Tokenizer not cached in context"
             );
             error::internal_error(
@@ -95,7 +97,6 @@ impl GenerateResponseProcessingStage {
             // via the attached ReservationAttachment's Drop below on early
             // disconnect/error.
             let reservation = ctx
-                .input
                 .rate_limit_cell
                 .as_deref()
                 .and_then(RateLimitCell::take_for_streaming_handoff);
@@ -106,7 +107,7 @@ impl GenerateResponseProcessingStage {
                 .clone()
                 .process_streaming_generate(
                     execution_result,
-                    ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
+                    generate_request,
                     dispatch,
                     tokenizer,
                     reservation.clone(),
@@ -115,22 +116,18 @@ impl GenerateResponseProcessingStage {
 
             // Attach load guards (and the reservation's disconnect/error
             // safety net) to the response body for proper RAII lifecycle.
-            let response = helpers::attach_response_guards(
-                response,
-                ctx.state.load_guards.take(),
-                reservation,
-            );
+            let response =
+                helpers::attach_response_guards(response, ctx.load_guards.take(), reservation);
 
             return Ok(Some(response));
         }
 
         // Non-streaming: Delegate to ResponseProcessor
-        let request_logprobs = ctx.generate_request().return_logprob.unwrap_or(false);
-        let generate_request = ctx.generate_request_arc();
+        let request_logprobs = generate_request.return_logprob;
 
-        let stop_decoder = ctx.state.response.stop_decoder.as_mut().ok_or_else(|| {
+        let stop_decoder = ctx.response.stop_decoder.as_mut().ok_or_else(|| {
             error!(
-                function = "GenerateResponseProcessingStage::execute",
+                function = "GenerateResponseProcessingStage::process",
                 "Stop decoder not initialized"
             );
             error::internal_error(
@@ -143,7 +140,6 @@ impl GenerateResponseProcessingStage {
             .processor
             .process_non_streaming_generate_response(
                 execution_result,
-                generate_request,
                 dispatch,
                 stop_decoder,
                 request_logprobs,
@@ -152,8 +148,12 @@ impl GenerateResponseProcessingStage {
             .await?;
 
         // Store the final response
-        ctx.state.response.final_response = Some(FinalResponse::Generate(result_array));
+        ctx.response.final_response = Some(FinalResponse::Generate(result_array));
 
         Ok(None)
+    }
+
+    fn name(&self) -> &'static str {
+        "GenerateResponseProcessing"
     }
 }

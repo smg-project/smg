@@ -46,6 +46,30 @@ class TestRouterArgs:
         assert args.disable_circuit_breaker is False
         assert args.mesh_advertise_host is None
 
+        # RL control plane defaults
+        assert args.enable_rl is False
+        assert args.rl_control_timeout_secs == 600
+        assert args.rl_fanout_concurrency == 32
+
+    def test_rl_flags_parse(self):
+        """RL control-plane flags land on the dataclass."""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        args = RouterArgs.from_cli_args(
+            parser.parse_args(
+                [
+                    "--enable-rl",
+                    "--rl-control-timeout-secs",
+                    "1200",
+                    "--rl-fanout-concurrency",
+                    "8",
+                ]
+            )
+        )
+        assert args.enable_rl is True
+        assert args.rl_control_timeout_secs == 1200
+        assert args.rl_fanout_concurrency == 8
+
     def test_parse_selector_valid(self):
         """Test parsing valid selector arguments."""
         # Test single key-value pair
@@ -539,6 +563,14 @@ class TestParseRouterArgs:
         assert router_args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert router_args.policy == "round_robin"
 
+    def test_parse_mm_per_request_image_limit(self):
+        """Deployment-wide image-count limit; unset keeps model spec limits."""
+        router_args = parse_router_args(["--mm-per-request-image-limit", "128"])
+        assert router_args.mm_per_request_image_limit == 128
+
+        defaults = parse_router_args([])
+        assert defaults.mm_per_request_image_limit is None
+
     def test_parse_routing_key_headers(self):
         """Ordered list flag; unset keeps the x-smg-routing-key default."""
         router_args = parse_router_args(
@@ -777,6 +809,10 @@ class TestParseRouterArgs:
             "8080",
             "--service-discovery-namespace",
             "default",
+            "--kv-connector-annotation",
+            "example.com/connector",
+            "--kv-engine-id-annotation",
+            "example.com/engine-id",
         ]
         args_b = [
             "--service-discovery",
@@ -787,6 +823,10 @@ class TestParseRouterArgs:
             "8080",
             "--service-discovery-namespace",
             "default",
+            "--kv-connector-annotation",
+            "example.com/connector",
+            "--kv-engine-id-annotation",
+            "example.com/engine-id",
         ]
 
         for args in [args_a, args_b]:
@@ -796,6 +836,14 @@ class TestParseRouterArgs:
             assert router_args.selector == {"app": "worker", "env": "prod"}
             assert router_args.service_discovery_port == 8080
             assert router_args.service_discovery_namespace == "default"
+            assert router_args.kv_connector_annotation == "example.com/connector"
+            assert router_args.kv_engine_id_annotation == "example.com/engine-id"
+
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        defaults = parser.parse_args([])
+        assert defaults.kv_connector_annotation == RouterArgs.kv_connector_annotation
+        assert defaults.kv_engine_id_annotation == RouterArgs.kv_engine_id_annotation
 
     def test_repeated_list_flags_accumulate(self):
         """Repeated occurrences of list flags append, matching the Rust CLI."""
@@ -1237,6 +1285,18 @@ class TestFlagAliases:
         assert router_args.routing_key_override is True
         assert router_args.remove_unhealthy_workers is True
 
+    def test_worker_auto_recovery_is_tri_state(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        # Absent: undecided — the Rust core derives the default from the
+        # service-discovery setting (recovery works by removal + discovery
+        # re-registration, so it is on exactly when discovery is).
+        absent = RouterArgs.from_cli_args(parser.parse_args([]))
+        assert absent.remove_unhealthy_workers is None
+        # The --no- form pins it off even under service discovery.
+        pinned_off = RouterArgs.from_cli_args(parser.parse_args(["--no-remove-unhealthy-workers"]))
+        assert pinned_off.remove_unhealthy_workers is False
+
 
 class TestRouterArgsFieldOrder:
     """RouterArgs generates a positional __init__, so field order is a public
@@ -1401,6 +1461,13 @@ class TestRouterArgsFieldOrder:
         "worker_overload_protection",
         "disable_load_monitoring",
         "max_buffered_request_bytes",
+        "kv_connector_annotation",
+        "kv_engine_id_annotation",
+        "mm_per_request_image_limit",
+        "pd_admission_wait_secs",
+        "enable_rl",
+        "rl_control_timeout_secs",
+        "rl_fanout_concurrency",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1433,6 +1500,12 @@ class TestRouterArgsFieldOrder:
             "worker_overload_protection",
             "disable_load_monitoring",
             "max_buffered_request_bytes",
+            "kv_connector_annotation",
+            "kv_engine_id_annotation",
+            "mm_per_request_image_limit",
+            "enable_rl",
+            "rl_control_timeout_secs",
+            "rl_fanout_concurrency",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

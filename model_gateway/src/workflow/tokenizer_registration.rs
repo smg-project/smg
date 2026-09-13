@@ -29,7 +29,7 @@ use crate::{
     app_context::AppContext,
     config::TokenizerCacheConfig,
     routers::grpc::multimodal::{
-        load_preprocessor_config_file, load_video_preprocessor_config, MultimodalModelConfig,
+        load_image_preprocessor_config, load_video_preprocessor_config, MultimodalModelConfig,
     },
     worker::ConnectionMode,
 };
@@ -245,8 +245,6 @@ fn load_tokenizer_from_bundle(
 /// processor supplies its own model-specific defaults.
 fn try_load_multimodal_config(tokenizer_dir: &std::path::Path) -> Option<MultimodalModelConfig> {
     let config_path = tokenizer_dir.join("config.json");
-    let pp_config_path = tokenizer_dir.join("preprocessor_config.json");
-
     if !config_path.exists() {
         debug!("Bundle has no config.json; skipping multimodal config preload");
         return None;
@@ -267,13 +265,10 @@ fn try_load_multimodal_config(tokenizer_dir: &std::path::Path) -> Option<Multimo
         }
     };
 
-    let preprocessor_config = if pp_config_path.exists() {
-        load_preprocessor_config_file(&pp_config_path, "preprocessor_config.json")
-            .unwrap_or_default()
-    } else {
-        debug!("No preprocessor_config.json in bundle; using PreProcessorConfig defaults");
+    let preprocessor_config = load_image_preprocessor_config(tokenizer_dir).unwrap_or_else(|| {
+        debug!("No image preprocessor config in bundle; using defaults");
         llm_multimodal::PreProcessorConfig::default()
-    };
+    });
     let video_preprocessor_config = load_video_preprocessor_config(tokenizer_dir);
 
     Some(MultimodalModelConfig {

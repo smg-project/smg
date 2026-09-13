@@ -389,6 +389,8 @@ class TestKindPDDisaggregation:
                 {
                     "smg.ai/worker-ports": "29600,29601",
                     "sglang.ai/bootstrap-port": "29700,29701",
+                    "smg.ai/kv-connector": "MooncakeConnector",
+                    "smg.ai/kv-engine-id": "prefill-0,prefill-1",
                 },
                 probe_port=29600,
                 extra_labels={"role": "prefill"},
@@ -407,7 +409,11 @@ class TestKindPDDisaggregation:
                     "--model",
                     "kind-e2e-model",
                 ],
-                {"smg.ai/worker-ports": "29610,29611"},
+                {
+                    "smg.ai/worker-ports": "29610,29611",
+                    "smg.ai/kv-connector": "NixlConnector",
+                    "smg.ai/kv-engine-id": "decode-0,decode-1",
+                },
                 probe_port=29610,
                 extra_labels={"role": "decode"},
             )
@@ -438,6 +444,12 @@ class TestKindPDDisaggregation:
         assert by_port["29600"].get("bootstrap_port") == 29700
         assert by_port["29601"].get("bootstrap_port") == 29701
         assert "bootstrap_port" not in by_port["29610"]
+        assert by_port["29600"]["kv_connector"] == "MooncakeConnector"
+        assert by_port["29600"]["kv_engine_id"] == "prefill-0"
+        assert by_port["29601"]["kv_engine_id"] == "prefill-1"
+        assert by_port["29610"]["kv_connector"] == "NixlConnector"
+        assert by_port["29610"]["kv_engine_id"] == "decode-0"
+        assert by_port["29611"]["kv_engine_id"] == "decode-1"
 
         kubectl("delete", "pod", "prefill-0", "decode-0", "--grace-period=0", "--force")
         gateway.wait_for_count(0, "PD fleet unwound")

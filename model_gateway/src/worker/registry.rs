@@ -34,6 +34,8 @@ use crate::{
         circuit_breaker::CircuitState,
         event::{WorkerConnected, WorkerEvent},
         hash_ring::HashRing,
+        pd_pair_index::{PdPairIndex, PdWire},
+        pd_pairing::PdPairingMode,
         worker::{RuntimeType, WorkerType},
         ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
     },
@@ -108,13 +110,15 @@ pub(crate) enum RoutingPool {
     HttpPrefill,
     /// HTTP-transport decode pool (same contract as [`Self::HttpPrefill`]).
     HttpDecode,
+    /// Workers that front a third-party provider, whatever their type.
+    External,
 }
 
 type WorkerSnapshot = Arc<[Arc<dyn Worker>]>;
 type LazyRoutingPool = OnceLock<WorkerSnapshot>;
 
 impl RoutingPool {
-    const COUNT: usize = 7;
+    const COUNT: usize = 8;
 
     const fn index(self) -> usize {
         match self {
@@ -125,6 +129,7 @@ impl RoutingPool {
             Self::GrpcEncode => 4,
             Self::HttpPrefill => 5,
             Self::HttpDecode => 6,
+            Self::External => 7,
         }
     }
 
@@ -158,6 +163,7 @@ impl RoutingPool {
                 *worker.worker_type() == WorkerType::Decode
                     && *worker.connection_mode() == ConnectionMode::Http
             }
+            Self::External => worker.metadata().spec.runtime_type == RuntimeType::External,
         }
     }
 }
@@ -173,6 +179,9 @@ impl RoutingPool {
 pub(crate) struct ModelWorkerSnapshot {
     all: WorkerSnapshot,
     pools: [LazyRoutingPool; RoutingPool::COUNT],
+    /// The compatible prefill/decode pairs per wire and pairing mode, built
+    /// once from the pools above (see [`PdPairIndex`]).
+    pd_pairs: [[OnceLock<Arc<PdPairIndex>>; PdPairingMode::COUNT]; PdWire::COUNT],
 }
 
 impl ModelWorkerSnapshot {
@@ -180,7 +189,24 @@ impl ModelWorkerSnapshot {
         Self {
             all,
             pools: std::array::from_fn(|_| OnceLock::new()),
+            pd_pairs: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
         }
+    }
+
+    /// The compatible prefill/decode pairs of `wire` under `mode`: descriptor
+    /// comparisons happen here, once per membership snapshot, never on the
+    /// request path.
+    pub(crate) fn pd_pairs(&self, wire: PdWire, mode: PdPairingMode) -> Arc<PdPairIndex> {
+        self.pd_pairs[wire.index()][mode.index()]
+            .get_or_init(|| {
+                let (prefill, decode) = wire.pools();
+                Arc::new(PdPairIndex::build(
+                    self.pool(prefill),
+                    self.pool(decode),
+                    mode,
+                ))
+            })
+            .clone()
     }
 
     pub(crate) fn pool(&self, pool: RoutingPool) -> WorkerSnapshot {
@@ -627,11 +653,6 @@ impl WorkerRegistry {
             .unwrap_or_else(Self::empty_routing_snapshot)
     }
 
-    /// Shared empty candidate slice.
-    pub(crate) fn empty_pool() -> Arc<[Arc<dyn Worker>]> {
-        Arc::from(Self::EMPTY_WORKERS)
-    }
-
     /// Shared empty snapshot for unknown models.
     fn empty_routing_snapshot() -> Arc<ModelWorkerSnapshot> {
         static EMPTY: OnceLock<Arc<ModelWorkerSnapshot>> = OnceLock::new();
@@ -777,13 +798,13 @@ impl WorkerRegistry {
     /// other is pinned — and substituting one for the other would silently run
     /// a model the client did not ask for.
     ///
-    /// External workers reach only the OpenAI, Anthropic and Gemini routers
-    /// ([`RouterManager::select_router_for_workers`] gives them priority, and
+    /// External workers reach only the provider routers
+    /// ([`Gateway::select_router_for_model`] gives them priority, and
     /// single-router mode picks by routing mode), none of which rewrite the
     /// outbound model. Keep it that way: canonicalize registry lookups there
     /// if needed, never the request body.
     ///
-    /// [`RouterManager::select_router_for_workers`]: crate::routers::RouterManager
+    /// [`Gateway::select_router_for_model`]: crate::routers::gateway::Gateway
     pub fn resolve_model_alias(&self, model_id: &str) -> Option<Arc<str>> {
         if model_id == UNKNOWN_MODEL_ID || self.model_index.contains_key(model_id) {
             return None;

@@ -1,41 +1,174 @@
-//! Request execution stage: execute gRPC requests from an execution plan.
+//! Request execution: dispatch one attempt of the retained execution plan.
 
-use std::time::Instant;
+use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
 
-use async_trait::async_trait;
 use axum::response::Response;
 use futures::future::{join_all, try_join_all};
 use tracing::{debug, error, info_span, Instrument};
 
 use super::{
+    helpers::{maybe_inject_pd_metadata, maybe_inject_pd_rendezvous},
     pd_protocol::{DpPlacement, PdDispatch, PdProtocol},
-    PipelineStage,
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
-        common::kv_transfer::{
-            connector_mode_for_worker, mooncake_decode_params, mooncake_prefill_params,
-            KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
+        common::{
+            kv_transfer::{
+                connector_mode_for_worker, mooncake_decode_params, mooncake_prefill_params,
+                KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
+            },
+            pd_admission,
         },
         error,
         grpc::{
             common::stages::encode::EncodeDispatchPlan,
             context::{
-                ClientSelection, ExecutionPlan, ExecutionPlanKind, ExecutionResult, LoadGuards,
-                PdTiming, RequestContext, WorkerSelection,
+                ClientSelection, DispatchContext, ExecutionPlan, ExecutionPlanKind,
+                ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
             },
             proto_wrapper::{
-                ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest, ProtoResponseVariant,
-                ProtoStream,
+                FanoutStream, ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest,
+                ProtoResponseVariant, ProtoStream,
             },
             utils::tonic_ext::{TonicResultExt, TonicStatusExt},
         },
     },
-    worker::ConnectionModeExt,
+    worker::{ConnectionModeExt, Worker},
 };
 
 type StreamResult = Result<ProtoStream, tonic::Status>;
+
+/// One leg's owned dispatch. Owned (rather than borrowed from the client
+/// selection) so the leg still in flight when its partner fails can be moved
+/// off the request path — see [`retire_pd_leg`].
+type PdLegDispatch = Pin<Box<dyn Future<Output = StreamResult> + Send>>;
+
+/// Which leg of a disaggregated dispatch a result belongs to. The error code
+/// and message are part of the client contract, so they live per leg here
+/// rather than being reconstructed at each call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdLeg {
+    Prefill,
+    Decode,
+}
+
+impl PdLeg {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Prefill => metrics_labels::WORKER_PREFILL,
+            Self::Decode => metrics_labels::WORKER_DECODE,
+        }
+    }
+
+    fn error_code(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill_worker_failed_to_start",
+            Self::Decode => "decode_worker_failed_to_start",
+        }
+    }
+
+    fn error_message(self) -> &'static str {
+        match self {
+            Self::Prefill => "Prefill worker failed to start",
+            Self::Decode => "Decode worker failed to start",
+        }
+    }
+
+    fn partner(self) -> Self {
+        match self {
+            Self::Prefill => Self::Decode,
+            Self::Decode => Self::Prefill,
+        }
+    }
+}
+
+/// How the two parallel legs resolved.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "consumed by its caller on the next line; boxing would add an allocation to the success path to save one stack move"
+)]
+enum PdDispatchOutcome {
+    /// Both legs answered; either or both may carry an error.
+    Both(StreamResult, StreamResult),
+    /// One leg failed while its partner was still dispatching. The partner is
+    /// handed back so the caller can retire it instead of waiting it out.
+    FailedFirst {
+        leg: PdLeg,
+        error: tonic::Status,
+        partner: PdLegDispatch,
+    },
+}
+
+/// Backend requests one plan dispatches — one per batched prompt, times the
+/// PD fan-out width where a parallel PD request asks for n>1 samples.
+///
+/// This is both the load-guard scale and the number of PD bootstrap rooms the
+/// plan will post, which is why admission and the guards read the same count.
+fn plan_sub_requests(plan: &ExecutionPlan, workers: Option<&WorkerSelection>) -> usize {
+    let protocol = workers
+        .and_then(WorkerSelection::disaggregated_runtime_type)
+        .and_then(|runtime| PdProtocol::for_runtime(*runtime));
+    let width = |request: &ProtoGenerateRequest| {
+        protocol
+            .and_then(|protocol| pd_fanout_width(request, protocol))
+            .map_or(1, |n| n as usize)
+    };
+    match plan {
+        ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::Single,
+            requests,
+            ..
+        } => requests.len(),
+        ExecutionPlan::Batch { requests, .. } => requests.iter().map(width).sum(),
+        ExecutionPlan::PrefillDecode(request) | ExecutionPlan::EncodePrefillDecode { request } => {
+            width(request)
+        }
+        ExecutionPlan::Single(_) => 1,
+    }
+}
+
+/// Fan-out width for a parallel PD dispatch: `n` when the request asks for
+/// more than one sample of a text-only prompt, else `None`.
+///
+/// A rendezvous room serves one sample. The engines that rendezvous on a
+/// room broadcast the request's single room to every sample of an n>1
+/// request: each of the decode's children then pre-allocates against the
+/// same room, and the prefill either rejects the repeats (TokenSpeed) or
+/// serves one child while the rest wait on KV that never comes. So each
+/// sample becomes its own single-sample PD dispatch with its own room, and
+/// the merged streams stamp every child's position as the choice index. A
+/// multimodal payload travels as one SHM segment that the prefill unlinks on
+/// read, so it cannot be handed to n prefills; those requests keep the
+/// single dispatch.
+fn pd_fanout_width(request: &ProtoGenerateRequest, protocol: PdProtocol) -> Option<u32> {
+    if protocol.dispatch != PdDispatch::Parallel || request.has_mm_inputs() {
+        return None;
+    }
+    let n = request.sampling_n();
+    (n > 1).then_some(n)
+}
+
+/// Split an n>1 request into `n` single-sample sub-requests. Sub `i` carries
+/// engine id `{id}-{i}`, `n = 1`, a seed offset of `i` when the request
+/// pinned a seed, and whatever rendezvous `remint` stamps on it.
+fn fan_out_pd_request(
+    request: &ProtoGenerateRequest,
+    n: u32,
+    mut remint: impl FnMut(&mut ProtoGenerateRequest),
+) -> Vec<ProtoGenerateRequest> {
+    let base_id = request.request_id().to_string();
+    (0..n)
+        .map(|i| {
+            let mut sub = request.clone();
+            sub.set_request_id(format!("{base_id}-{i}"));
+            sub.set_sampling_n(1);
+            sub.offset_sampling_seed(i);
+            remint(&mut sub);
+            sub
+        })
+        .collect()
+}
 
 /// Metric connection labels for the PD legs (a leg can be gRPC or ZMQ).
 fn pd_leg_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
@@ -53,467 +186,665 @@ fn pd_leg_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
     }
 }
 
-/// Request execution stage: execute the plan produced by request building.
-pub(crate) struct RequestExecutionStage;
+/// Dispatch one attempt of the retained plan: create the attempt's load
+/// guards, fan out encode jobs on the first EPD dispatch, and store the
+/// execution result on the context for response processing.
+pub(crate) async fn execute_plan(
+    ctx: &mut DispatchContext,
+    execution_plan: ExecutionPlan,
+) -> Result<(), Response> {
+    // One bootstrap room per backend request the plan will post: a batched
+    // completion fans out one PD dispatch per sub-request, so admission has
+    // to claim for all of them or the siblings walk past a gate that only
+    // ever asked about one.
+    let sub_requests = plan_sub_requests(&execution_plan, ctx.workers.as_ref());
 
-impl RequestExecutionStage {
-    pub fn new() -> Self {
-        Self
-    }
-}
+    // Admission runs before this attempt claims anything else. The decode
+    // leg's engine window is what clears the prefill's bootstrap deadline, so
+    // a request the decode cannot admit yet waits here rather than in the
+    // engine's queue — where it would burn the prefill's deadline and strand
+    // both rooms. Waiting ahead of the encode take below also keeps the
+    // encode jobs' SHM unclaimed for the duration: under the burst this gate
+    // targets, holding it would queue a second scarce resource behind the
+    // decode window and throw the finished encode work away on a shed. The
+    // gate abstains when the engine reports no window.
+    let admission = match ctx
+        .workers
+        .as_ref()
+        .and_then(WorkerSelection::decode_worker)
+    {
+        Some(decode) => pd_admission::admit_decode(decode, &ctx.model_id, sub_requests).await?,
+        None => None,
+    };
 
-#[async_trait]
-impl PipelineStage for RequestExecutionStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        let execution_plan = ctx.state.execution_plan.take().ok_or_else(|| {
-            error!(
-                function = "RequestExecutionStage::execute",
-                "Execution plan not built"
-            );
-            error::internal_error("execution_plan_not_built", "Execution plan not built")
-        })?;
+    // `None` for non-EPD, text-only EPD, or an EPD retry (the first dispatch
+    // consumed it). Taking it transfers the encode jobs' SHM Drop guards
+    // here: dispatch consumes them, while an early error before dispatch
+    // drops them and reclaims the SHM.
+    let encode_dispatch = ctx.encode_outputs.take().map(|o| o.dispatch);
 
-        // `None` for non-EPD or text-only EPD. Taking it transfers the encode
-        // jobs' SHM Drop guards here: dispatch consumes them, while an early
-        // error before dispatch drops them and reclaims the SHM.
-        let encode_dispatch = ctx.state.encode_outputs.take().map(|o| o.dispatch);
-
-        let clients = ctx.state.clients.as_mut().ok_or_else(|| {
-            error!(
-                function = "RequestExecutionStage::execute",
-                "Client acquisition not completed"
-            );
-            error::internal_error(
-                "client_acquisition_not_completed",
-                "Client acquisition not completed",
-            )
-        })?;
-
-        // Create load guards for worker load tracking (increment load when created)
-        // They will be automatically dropped (and decrement load) when RequestContext is dropped
-        let workers = ctx.state.workers.as_ref().ok_or_else(|| {
-            error!(
-                function = "RequestExecutionStage::execute",
-                "Worker selection not completed"
-            );
-            error::internal_error(
-                "worker_selection_not_completed",
-                "Worker selection not completed",
-            )
-        })?;
-
-        let sub_requests = match &execution_plan {
-            ExecutionPlan::Batch { requests, .. } => requests.len(),
-            _ => 1,
-        };
-        ctx.state.load_guards = Some(LoadGuards::scaled(
-            workers,
-            ctx.state.sticky_key.as_deref(),
-            sub_requests,
-        ));
-
-        // Extract dispatch metadata for tracing span
-        let dispatch = ctx.state.dispatch.as_ref();
-        let request_id = dispatch.map(|d| d.request_id.as_str()).unwrap_or("unknown");
-        let model = dispatch.map(|d| d.model.as_str()).unwrap_or("unknown");
-        let request_type = execution_plan.request_type();
-        let mode = execution_plan.mode_label();
-
-        // Create OTEL span for gRPC request execution
-        let span = info_span!(
-            target: "smg::otel-trace",
-            "grpc_execute",
-            request_type,
-            request_id = %request_id,
-            model = %model,
-            mode = %mode,
+    let clients = ctx.clients.as_mut().ok_or_else(|| {
+        error!(
+            function = "execute_plan",
+            "Client acquisition not completed"
         );
+        error::internal_error(
+            "client_acquisition_not_completed",
+            "Client acquisition not completed",
+        )
+    })?;
 
-        let result = async {
-            match execution_plan {
-                ExecutionPlan::Single(request) => match request {
-                    ProtoRequest::Generate(req) => self.execute_single(req, clients, workers).await,
-                    ProtoRequest::Embed(req) => {
-                        self.execute_single_embed(req, clients, workers).await
-                    }
-                },
-                ExecutionPlan::PrefillDecode(req) => {
-                    self.execute_pd_dispatch(req, clients, workers, model).await
-                }
-                ExecutionPlan::EncodePrefillDecode { request } => {
-                    // Bootstrap info was injected into the prefill request during
-                    // request building; dispatch the encode jobs with the
-                    // prefill+decode leg.
-                    self.execute_epd_dispatch(request, clients, workers, model, encode_dispatch)
-                        .await
-                }
-                ExecutionPlan::Batch { kind, requests, .. } => {
-                    self.execute_batch_dispatch(kind, requests, clients, workers, model)
-                        .await
-                }
+    // Create load guards for worker load tracking (increment load when created)
+    // They will be automatically dropped (and decrement load) when the
+    // dispatch context (or the streaming body they are attached to) drops.
+    let workers = ctx.workers.as_ref().ok_or_else(|| {
+        error!(function = "execute_plan", "Worker selection not completed");
+        error::internal_error(
+            "worker_selection_not_completed",
+            "Worker selection not completed",
+        )
+    })?;
+
+    ctx.load_guards = Some(LoadGuards::admitted(
+        admission,
+        LoadGuards::scaled(workers, ctx.sticky_key.as_deref(), sub_requests),
+    ));
+
+    // Extract dispatch metadata for the tracing span and PD metric labels.
+    let dispatch = ctx.dispatch.as_ref().ok_or_else(|| {
+        error!(function = "execute_plan", "Dispatch metadata not set");
+        error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
+    })?;
+    let request_id = dispatch.request_id.as_str();
+    let model = dispatch.model.as_str();
+    let request_type = execution_plan.request_type();
+    let mode = execution_plan.mode_label();
+
+    // Create OTEL span for gRPC request execution
+    let span = info_span!(
+        target: "smg::otel-trace",
+        "grpc_execute",
+        request_type,
+        request_id = %request_id,
+        model = %model,
+        mode = %mode,
+    );
+
+    let result = async {
+        match execution_plan {
+            ExecutionPlan::Single(request) => match request {
+                ProtoRequest::Generate(req) => execute_single(req, clients, workers).await,
+                ProtoRequest::Embed(req) => execute_single_embed(req, clients, workers).await,
+            },
+            ExecutionPlan::PrefillDecode(req) => {
+                execute_pd_dispatch(req, clients, workers, model).await
+            }
+            ExecutionPlan::EncodePrefillDecode { request } => {
+                // Bootstrap info was injected into the prefill request during
+                // request building; dispatch the encode jobs with the
+                // prefill+decode leg.
+                execute_epd_dispatch(request, clients, workers, model, encode_dispatch).await
+            }
+            ExecutionPlan::Batch { kind, requests, .. } => {
+                execute_batch_dispatch(kind, requests, clients, workers, model).await
             }
         }
-        .instrument(span)
-        .await?;
-
-        // Store result in context for ResponseProcessingStage
-        ctx.state.response.execution_result = Some(result);
-        Ok(None)
     }
+    .instrument(span)
+    .await?;
 
-    fn name(&self) -> &'static str {
-        "RequestExecution"
+    // Store result in context for response processing
+    ctx.response.execution_result = Some(result);
+    Ok(())
+}
+
+async fn execute_pd_dispatch(
+    proto_request: ProtoGenerateRequest,
+    clients: &mut ClientSelection,
+    workers: &WorkerSelection,
+    model: &str,
+) -> Result<ExecutionResult, Response> {
+    let Some(runtime_type) = workers.disaggregated_runtime_type() else {
+        error!(
+            function = "execute_pd_dispatch",
+            "PD mode requires disaggregated worker selection"
+        );
+        return Err(error::internal_error(
+            "pd_mode_requires_disaggregated_workers",
+            "PD mode requires disaggregated worker selection",
+        ));
+    };
+    let Some(protocol) = PdProtocol::for_runtime(*runtime_type) else {
+        error!(
+            function = "execute_pd_dispatch",
+            runtime_type = ?runtime_type,
+            "Runtime does not support PD disaggregated mode"
+        );
+        return Err(error::bad_request(
+            "runtime_pd_not_supported",
+            "This runtime does not support PD disaggregated mode",
+        ));
+    };
+    // Dispatch shape comes from the per-runtime PD protocol table (see
+    // `PdProtocol::for_runtime`): sequential legs relay the KV handoff
+    // through the router, parallel legs rendezvous on bootstrap info
+    // carried in the request.
+    match protocol.dispatch {
+        PdDispatch::Sequential => {
+            execute_sequential_pd(proto_request, clients, workers, model).await
+        }
+        PdDispatch::Parallel => match pd_fanout_width(&proto_request, protocol) {
+            Some(n) => execute_fanout_pd(proto_request, n, clients, workers, protocol).await,
+            None => execute_parallel_pd(proto_request, clients, workers, protocol).await,
+        },
     }
 }
 
-impl RequestExecutionStage {
-    async fn execute_pd_dispatch(
-        &self,
-        proto_request: ProtoGenerateRequest,
-        clients: &mut ClientSelection,
-        workers: &WorkerSelection,
-        model: &str,
-    ) -> Result<ExecutionResult, Response> {
-        let Some(runtime_type) = workers.disaggregated_runtime_type() else {
+/// Dispatch an n>1 request as `n` concurrent single-sample PD pairs, each
+/// with its own rendezvous room, and merge their legs into one PD result
+/// whose responses carry the sample index. Fail-fast: the first pair that
+/// fails to start fails the request, and dropping the others aborts them.
+async fn execute_fanout_pd(
+    proto_request: ProtoGenerateRequest,
+    n: u32,
+    clients: &mut ClientSelection,
+    workers: &WorkerSelection,
+    protocol: PdProtocol,
+) -> Result<ExecutionResult, Response> {
+    let subs = fan_out_pd_request(&proto_request, n, |sub| {
+        maybe_inject_pd_metadata(sub, workers);
+        maybe_inject_pd_rendezvous(sub, workers);
+    });
+    debug!(
+        request_id = proto_request.request_id(),
+        samples = n,
+        "PD fan-out: one single-sample pair per sample, each with its own room"
+    );
+    let dispatches = subs.into_iter().map(|sub| {
+        let mut clients = clients.clone();
+        async move { execute_parallel_pd(sub, &mut clients, workers, protocol).await }
+    });
+    let results = try_join_all(dispatches).await?;
+
+    let mut prefills = Vec::with_capacity(results.len());
+    let mut decodes = Vec::with_capacity(results.len());
+    let mut timing: Option<PdTiming> = None;
+    for result in results {
+        let ExecutionResult::PrefillDecode {
+            prefill,
+            decode,
+            pd_timing,
+        } = result
+        else {
             error!(
-                function = "RequestExecutionStage::execute",
-                "PD mode requires disaggregated worker selection"
+                function = "execute_fanout_pd",
+                "PD fan-out child returned a non-PD result"
             );
             return Err(error::internal_error(
-                "pd_mode_requires_disaggregated_workers",
-                "PD mode requires disaggregated worker selection",
+                "pd_fanout_unexpected_result",
+                "PD fan-out child returned a non-PD result",
             ));
         };
-        let Some(protocol) = PdProtocol::for_runtime(*runtime_type) else {
-            error!(
-                function = "RequestExecutionStage::execute",
-                runtime_type = ?runtime_type,
-                "Runtime does not support PD disaggregated mode"
-            );
-            return Err(error::bad_request(
-                "runtime_pd_not_supported",
-                "This runtime does not support PD disaggregated mode",
-            ));
-        };
-        // Dispatch shape comes from the per-runtime PD protocol table (see
-        // `PdProtocol::for_runtime`): sequential legs relay the KV handoff
-        // through the router, parallel legs rendezvous on bootstrap info
-        // carried in the request.
-        match protocol.dispatch {
-            PdDispatch::Sequential => {
-                self.execute_sequential_pd(proto_request, clients, workers, model)
-                    .await
-            }
-            PdDispatch::Parallel => {
-                self.execute_parallel_pd(proto_request, clients, workers, protocol)
-                    .await
-            }
-        }
-    }
-
-    async fn execute_epd_dispatch(
-        &self,
-        mut proto_request: ProtoGenerateRequest,
-        clients: &mut ClientSelection,
-        workers: &WorkerSelection,
-        model: &str,
-        encode_dispatch: Option<EncodeDispatchPlan>,
-    ) -> Result<ExecutionResult, Response> {
-        if let Some(encode_dispatch) = encode_dispatch {
-            Self::spawn_encode_dispatch(encode_dispatch);
-        }
-        proto_request.clear_mm_pixel_values();
-        self.execute_pd_dispatch(proto_request, clients, workers, model)
-            .await
-    }
-
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "EPD encode dispatch is intentionally supervised in the background while the prefill leg blocks on embedding receive."
-    )]
-    fn spawn_encode_dispatch(encode_dispatch: EncodeDispatchPlan) {
-        if encode_dispatch.is_empty() {
-            return;
-        }
-
-        let num_encode_items = encode_dispatch.len();
-        let sends: Vec<_> = encode_dispatch
-            .into_jobs()
-            .into_iter()
-            .map(|job| tokio::spawn(async move { job.dispatch().await }))
-            .collect();
-
-        debug!(
-            num_encode_items,
-            "EPD encode dispatch issued with prefill/decode"
-        );
-
-        tokio::spawn(async move {
-            for join_res in join_all(sends).await {
-                match join_res {
-                    Ok(Ok(())) => {}
-                    Ok(Err(message)) => {
-                        error!(
-                            function = "RequestExecutionStage::execute_epd_dispatch",
-                            error = %message,
-                            "Backend encode dispatch failed after EPD dispatch; embedding-receive timeout will abort the request"
-                        );
-                    }
-                    Err(join_err) => {
-                        error!(
-                            function = "RequestExecutionStage::execute_epd_dispatch",
-                            error = %join_err,
-                            "Encode dispatch task panicked after EPD dispatch"
-                        );
-                    }
-                }
-            }
+        prefills.push(prefill);
+        decodes.push(*decode);
+        // The earliest prefill start anchors the merged request's TTFT.
+        timing = Some(match timing {
+            Some(earliest) if earliest.prefill_start <= pd_timing.prefill_start => earliest,
+            _ => pd_timing,
         });
     }
+    let Some(pd_timing) = timing else {
+        return Err(error::internal_error(
+            "pd_fanout_empty",
+            "PD fan-out produced no dispatch",
+        ));
+    };
+    Ok(ExecutionResult::PrefillDecode {
+        prefill: ProtoStream::Fanout(FanoutStream::new(prefills)),
+        decode: Box::new(ProtoStream::Fanout(FanoutStream::new(decodes))),
+        pd_timing,
+    })
+}
 
-    /// Dispatch one backend request per batched prompt concurrently, preserving
-    /// prompt order. Fail-fast: the first failed dispatch fails the batch and
-    /// drops the remaining streams (abort-on-drop reclaims them backend-side).
-    async fn execute_batch_dispatch(
-        &self,
-        kind: ExecutionPlanKind,
-        requests: Vec<ProtoGenerateRequest>,
-        clients: &ClientSelection,
-        workers: &WorkerSelection,
-        model: &str,
-    ) -> Result<ExecutionResult, Response> {
-        let dispatches = requests.into_iter().map(|request| {
-            let mut clients = clients.clone();
-            async move {
-                match kind {
-                    ExecutionPlanKind::Single => {
-                        self.execute_single(request, &mut clients, workers).await
-                    }
-                    // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
-                    ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
-                        self.execute_pd_dispatch(request, &mut clients, workers, model)
-                            .await
-                    }
+async fn execute_epd_dispatch(
+    mut proto_request: ProtoGenerateRequest,
+    clients: &mut ClientSelection,
+    workers: &WorkerSelection,
+    model: &str,
+    encode_dispatch: Option<EncodeDispatchPlan>,
+) -> Result<ExecutionResult, Response> {
+    if let Some(encode_dispatch) = encode_dispatch {
+        spawn_encode_dispatch(encode_dispatch);
+    }
+    proto_request.clear_mm_pixel_values();
+    execute_pd_dispatch(proto_request, clients, workers, model).await
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "EPD encode dispatch is intentionally supervised in the background while the prefill leg blocks on embedding receive."
+)]
+fn spawn_encode_dispatch(encode_dispatch: EncodeDispatchPlan) {
+    if encode_dispatch.is_empty() {
+        return;
+    }
+
+    let num_encode_items = encode_dispatch.len();
+    let sends: Vec<_> = encode_dispatch
+        .into_jobs()
+        .into_iter()
+        .map(|job| tokio::spawn(async move { job.dispatch().await }))
+        .collect();
+
+    debug!(
+        num_encode_items,
+        "EPD encode dispatch issued with prefill/decode"
+    );
+
+    tokio::spawn(async move {
+        for join_res in join_all(sends).await {
+            match join_res {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => {
+                    error!(
+                        function = "execute_epd_dispatch",
+                        error = %message,
+                        "Backend encode dispatch failed after EPD dispatch; embedding-receive timeout will abort the request"
+                    );
+                }
+                Err(join_err) => {
+                    error!(
+                        function = "execute_epd_dispatch",
+                        error = %join_err,
+                        "Encode dispatch task panicked after EPD dispatch"
+                    );
                 }
             }
-        });
-
-        let results = try_join_all(dispatches).await?;
-        Ok(ExecutionResult::Batch { results })
-    }
-
-    async fn execute_single(
-        &self,
-        mut proto_request: ProtoGenerateRequest,
-        clients: &mut ClientSelection,
-        workers: &WorkerSelection,
-    ) -> Result<ExecutionResult, Response> {
-        let client = clients.single_mut().ok_or_else(|| {
-            error!(
-                function = "execute_single",
-                "Expected single client but got disaggregated"
-            );
-            error::internal_error(
-                "expected_single_client_got_disaggregated",
-                "Expected single client but got disaggregated",
-            )
-        })?;
-
-        if let Some(rank) = workers.single().and_then(|w| w.dp_rank()) {
-            proto_request.set_data_parallel_rank(rank as i32);
         }
+    });
+}
 
-        let result = client.generate(proto_request).await;
-        workers.record_outcome(result.cb_status_code());
-
-        let stream = result.map_err(|e| {
-            error!(function = "execute_single", error = %e, "Failed to start generation");
-            e.to_http_error(
-                "start_generation_failed",
-                format!("Failed to start generation: {}", e.message()),
-            )
-        })?;
-
-        Ok(ExecutionResult::Single { stream })
-    }
-
-    async fn execute_single_embed(
-        &self,
-        proto_request: ProtoEmbedRequest,
-        clients: &mut ClientSelection,
-        workers: &WorkerSelection,
-    ) -> Result<ExecutionResult, Response> {
-        let client = clients.single_mut().ok_or_else(|| {
-            error!(
-                function = "execute_single_embed",
-                "Expected single client but got disaggregated"
-            );
-            error::internal_error(
-                "expected_single_client_got_disaggregated",
-                "Expected single client but got disaggregated",
-            )
-        })?;
-
-        let result = client.embed(proto_request).await;
-        workers.record_outcome(result.cb_status_code());
-
-        let complete = result.map_err(|e| {
-            error!(function = "execute_single_embed", error = %e, "Failed to start embedding");
-            e.to_http_error(
-                "start_embedding_failed",
-                format!("Failed to start embedding: {}", e.message()),
-            )
-        })?;
-
-        Ok(ExecutionResult::Embedding { response: complete })
-    }
-
-    async fn execute_parallel_pd(
-        &self,
-        proto_request: ProtoGenerateRequest,
-        clients: &mut ClientSelection,
-        workers: &WorkerSelection,
-        protocol: PdProtocol,
-    ) -> Result<ExecutionResult, Response> {
-        let runtime = workers
-            .disaggregated_runtime_type()
-            .map(|r| r.as_str())
-            .unwrap_or("");
-        let (prefill_client, decode_client) = clients.disaggregated_mut().ok_or_else(|| {
-            error!(
-                function = "execute_parallel_pd",
-                "Expected disaggregated clients but got single"
-            );
-            error::internal_error(
-                "expected_disaggregated_clients_got_single",
-                "Expected disaggregated clients but got single",
-            )
-        })?;
-
-        // Decode consumes the KV handoff from prefill, but TokenSpeed still
-        // needs multimodal metadata to pad placeholders and compute MRoPE in
-        // the same way as prefill. Drop raw pixels and prefill-only encode
-        // rooms, but keep the per-item metadata. The pixel-free leg is the
-        // clone, so pixel tensors are never duplicated.
-        let mut prefill_request = proto_request;
-        let mut decode_request = prefill_request.clone_without_mm_pixels();
-        decode_request.clear_encode_bootstrap_info();
-        // Pin each leg's DP rank only when the engine reads placement from
-        // the request field; `RoomResidue` engines take it from the bootstrap
-        // room minted in maybe_inject_pd_rendezvous, ignore the pin, and spam
-        // conflict warnings on a mismatched decode-leg pin.
-        if protocol.dp_placement == DpPlacement::PinField {
-            if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
-                prefill_request.set_data_parallel_rank(rank as i32);
-            }
-            if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
-                decode_request.set_data_parallel_rank(rank as i32);
+/// Dispatch one backend request per batched prompt concurrently, preserving
+/// prompt order. Fail-fast: the first failed dispatch fails the batch and
+/// drops the remaining streams (abort-on-drop reclaims them backend-side).
+async fn execute_batch_dispatch(
+    kind: ExecutionPlanKind,
+    requests: Vec<ProtoGenerateRequest>,
+    clients: &ClientSelection,
+    workers: &WorkerSelection,
+    model: &str,
+) -> Result<ExecutionResult, Response> {
+    let dispatches = requests.into_iter().map(|request| {
+        let mut clients = clients.clone();
+        async move {
+            match kind {
+                ExecutionPlanKind::Single => execute_single(request, &mut clients, workers).await,
+                // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
+                ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
+                    execute_pd_dispatch(request, &mut clients, workers, model).await
+                }
             }
         }
+    });
 
-        // `generate` only establishes the prefill stream here (SMG does not drain
-        // it on this path), so prefill duration cannot be measured — only TTFT,
-        // recorded at the first decode token in streaming. prefill_start anchors it.
-        let prefill_start = Instant::now();
-        let (prefill_result, decode_result): (StreamResult, StreamResult) = tokio::join!(
-            prefill_client.generate(prefill_request),
-            decode_client.generate(decode_request)
+    let results = try_join_all(dispatches).await?;
+    Ok(ExecutionResult::Batch { results })
+}
+
+async fn execute_single(
+    mut proto_request: ProtoGenerateRequest,
+    clients: &mut ClientSelection,
+    workers: &WorkerSelection,
+) -> Result<ExecutionResult, Response> {
+    let client = clients.single_mut().ok_or_else(|| {
+        error!(
+            function = "execute_single",
+            "Expected single client but got disaggregated"
         );
+        error::internal_error(
+            "expected_single_client_got_disaggregated",
+            "Expected single client but got disaggregated",
+        )
+    })?;
 
-        // Record circuit breaker outcomes (client errors don't count as failures)
-        workers.record_prefill_decode_outcomes(
-            prefill_result.cb_status_code(),
-            decode_result.cb_status_code(),
+    if let Some(rank) = workers.single().and_then(|w| w.dp_rank()) {
+        proto_request.set_data_parallel_rank(rank as i32);
+    }
+
+    let result = client.generate(proto_request).await;
+    workers.record_outcome(result.cb_status_code());
+
+    let stream = result.map_err(|e| {
+        error!(function = "execute_single", error = %e, "Failed to start generation");
+        e.to_http_error(
+            "start_generation_failed",
+            format!("Failed to start generation: {}", e.message()),
+        )
+    })?;
+
+    Ok(ExecutionResult::Single { stream })
+}
+
+async fn execute_single_embed(
+    proto_request: ProtoEmbedRequest,
+    clients: &mut ClientSelection,
+    workers: &WorkerSelection,
+) -> Result<ExecutionResult, Response> {
+    let client = clients.single_mut().ok_or_else(|| {
+        error!(
+            function = "execute_single_embed",
+            "Expected single client but got disaggregated"
         );
+        error::internal_error(
+            "expected_single_client_got_disaggregated",
+            "Expected single client but got disaggregated",
+        )
+    })?;
 
-        let (prefill_label, decode_label) = pd_leg_labels(workers);
+    let result = client.embed(proto_request).await;
+    workers.record_outcome(result.cb_status_code());
 
-        // Handle prefill result
-        let prefill_stream = prefill_result.map_err(|e| {
-            Metrics::record_worker_error(
-                metrics_labels::WORKER_PREFILL,
-                prefill_label,
-                metrics_labels::ERROR_BACKEND,
+    let complete = result.map_err(|e| {
+        error!(function = "execute_single_embed", error = %e, "Failed to start embedding");
+        e.to_http_error(
+            "start_embedding_failed",
+            format!("Failed to start embedding: {}", e.message()),
+        )
+    })?;
+
+    Ok(ExecutionResult::Embedding { response: complete })
+}
+
+async fn execute_parallel_pd(
+    proto_request: ProtoGenerateRequest,
+    clients: &mut ClientSelection,
+    workers: &WorkerSelection,
+    protocol: PdProtocol,
+) -> Result<ExecutionResult, Response> {
+    let runtime = workers
+        .disaggregated_runtime_type()
+        .map(|r| r.as_str())
+        .unwrap_or("");
+    let (prefill_client, decode_client) = clients.disaggregated_mut().ok_or_else(|| {
+        error!(
+            function = "execute_parallel_pd",
+            "Expected disaggregated clients but got single"
+        );
+        error::internal_error(
+            "expected_disaggregated_clients_got_single",
+            "Expected disaggregated clients but got single",
+        )
+    })?;
+
+    // Decode consumes the KV handoff from prefill, but TokenSpeed still
+    // needs multimodal metadata to pad placeholders and compute MRoPE in
+    // the same way as prefill. Drop raw pixels and prefill-only encode
+    // rooms, but keep the per-item metadata. The pixel-free leg is the
+    // clone, so pixel tensors are never duplicated.
+    let mut prefill_request = proto_request;
+    let mut decode_request = prefill_request.clone_without_mm_pixels();
+    decode_request.clear_encode_bootstrap_info();
+    // Pin each leg's DP rank only when the engine reads placement from
+    // the request field; `RoomResidue` engines take it from the bootstrap
+    // room minted in maybe_inject_pd_rendezvous, ignore the pin, and spam
+    // conflict warnings on a mismatched decode-leg pin.
+    if protocol.dp_placement == DpPlacement::PinField {
+        if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
+            prefill_request.set_data_parallel_rank(rank as i32);
+        }
+        if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
+            decode_request.set_data_parallel_rank(rank as i32);
+        }
+    }
+
+    // `generate` only establishes the prefill stream here (SMG does not drain
+    // it on this path), so prefill duration cannot be measured — only TTFT,
+    // recorded at the first decode token in streaming. prefill_start anchors it.
+    let prefill_start = Instant::now();
+    let (prefill_label, decode_label) = pd_leg_labels(workers);
+    // Each leg owns its client handle (a cheap channel clone, the same one
+    // batched dispatch takes per sub-request) so the leg still in flight when
+    // its partner fails can be moved off the request path.
+    let mut prefill_client = prefill_client.clone();
+    let mut decode_client = decode_client.clone();
+    let prefill_dispatch: PdLegDispatch =
+        Box::pin(async move { prefill_client.generate(prefill_request).await });
+    let decode_dispatch: PdLegDispatch =
+        Box::pin(async move { decode_client.generate(decode_request).await });
+
+    match dispatch_pd_legs(prefill_dispatch, decode_dispatch).await {
+        PdDispatchOutcome::Both(prefill_result, decode_result) => {
+            // Record circuit breaker outcomes (client errors don't count as failures)
+            workers.record_prefill_decode_outcomes(
+                prefill_result.cb_status_code(),
+                decode_result.cb_status_code(),
             );
-            error!(function = "execute_parallel_pd", error = %e, "Prefill worker failed to start");
-            e.to_http_error(
-                "prefill_worker_failed_to_start",
-                format!("Prefill worker failed to start: {}", e.message()),
-            )
-        })?;
 
-        // Handle decode result
-        let decode_stream = decode_result.map_err(|e| {
-            Metrics::record_worker_error(
-                metrics_labels::WORKER_DECODE,
-                decode_label,
-                metrics_labels::ERROR_BACKEND,
-            );
-            error!(function = "execute_parallel_pd", error = %e, "Decode worker failed to start");
-            e.to_http_error(
-                "decode_worker_failed_to_start",
-                format!("Decode worker failed to start: {}", e.message()),
-            )
-        })?;
+            // Both legs are translated before either is propagated: a
+            // decode-side failure is logged and counted even when the prefill
+            // error is the one the client sees.
+            let prefill =
+                prefill_result.map_err(|e| pd_leg_error(PdLeg::Prefill, prefill_label, &e));
+            let decode = decode_result.map_err(|e| pd_leg_error(PdLeg::Decode, decode_label, &e));
+            let (prefill_stream, decode_stream) = match (prefill, decode) {
+                (Ok(prefill), Ok(decode)) => (prefill, decode),
+                // The surviving leg's stream drops here, which aborts its
+                // room on the worker.
+                (Err(response), _) | (Ok(_), Err(response)) => return Err(response),
+            };
 
-        // A client disconnect drops both leg streams, which normally fires an
-        // immediate abort to each worker. The decode leg must not be aborted
-        // while it is still receiving the KV handoff from prefill — tearing
-        // the request down mid-transfer can crash or leak on the engine — so
-        // its abort is deferred until the first decode response (the proof
-        // the handoff completed). The prefill leg keeps the immediate abort:
-        // if prefill is still running there is nothing to hand off yet, and
-        // stopping it promptly frees capacity.
-        let decode_stream = decode_stream.defer_abort_until_first_item();
+            // A client disconnect drops both leg streams, which normally fires an
+            // immediate abort to each worker. The decode leg must not be aborted
+            // while it is still receiving the KV handoff from prefill — tearing
+            // the request down mid-transfer can crash or leak on the engine — so
+            // its abort is deferred until the first decode response (the proof
+            // the handoff completed). The prefill leg keeps the immediate abort:
+            // if prefill is still running there is nothing to hand off yet, and
+            // stopping it promptly frees capacity.
+            let decode_stream = decode_stream.defer_abort_until_first_item();
 
-        Ok(ExecutionResult::PrefillDecode {
-            prefill: prefill_stream,
-            decode: Box::new(decode_stream),
-            pd_timing: PdTiming {
-                prefill_start,
-                runtime,
+            Ok(ExecutionResult::PrefillDecode {
+                prefill: prefill_stream,
+                decode: Box::new(decode_stream),
+                pd_timing: PdTiming {
+                    prefill_start,
+                    runtime,
+                },
+            })
+        }
+        PdDispatchOutcome::FailedFirst {
+            leg,
+            error,
+            partner,
+        } => {
+            let status = error.http_status().as_u16();
+            // Only the leg that answered is recorded: the abandoned one has
+            // said nothing about its worker yet, and `retire_pd_leg` records
+            // it when it finally does.
+            let (label, partner_label, partner_worker) = match leg {
+                PdLeg::Prefill => {
+                    workers.record_outcome_prefill(status);
+                    (prefill_label, decode_label, workers.decode_worker())
+                }
+                PdLeg::Decode => {
+                    workers.record_outcome_decode(status);
+                    (decode_label, prefill_label, workers.prefill_worker())
+                }
+            };
+            if let Some(worker) = partner_worker {
+                retire_pd_leg(leg.partner(), partner_label, Arc::clone(worker), partner);
+            }
+            Err(pd_leg_error(leg, label, &error))
+        }
+    }
+}
+
+/// Dispatch both legs together and answer with the first failure.
+///
+/// The legs rendezvous on one bootstrap room, so a leg that cannot start
+/// leaves its partner's room unreachable — and the engine holding that room
+/// for the whole of its own deadline. Waiting for the second verdict before
+/// reporting the first failure is what turned a 120 s prefill bootstrap
+/// timeout into a 300 s decode transfer timeout for the client, with the
+/// pair's slot held throughout. A leg that has already answered is never
+/// discarded, so the success path is byte-for-byte what a join produced.
+async fn dispatch_pd_legs(
+    mut prefill: PdLegDispatch,
+    mut decode: PdLegDispatch,
+) -> PdDispatchOutcome {
+    /// One turn of the dispatch loop. The `select!` handlers may only
+    /// classify — moving a still-pending leg out happens after the macro's
+    /// borrows end.
+    enum LegStep {
+        /// The prefill leg answered; a failure here was beaten to the finish
+        /// by its partner, so both verdicts are in.
+        Prefill(StreamResult),
+        Decode(StreamResult),
+        /// This leg failed while its partner was still dispatching.
+        Alone(PdLeg, tonic::Status),
+    }
+
+    // At most one of these is `Some` at the top of the loop: the second
+    // answer returns rather than being stored, which is also what keeps both
+    // `select!` branches from being disabled at once.
+    let mut prefill_result: Option<StreamResult> = None;
+    let mut decode_result: Option<StreamResult> = None;
+
+    loop {
+        let step = tokio::select! {
+            result = &mut prefill, if prefill_result.is_none() => match result {
+                Err(error) if decode_result.is_none() => LegStep::Alone(PdLeg::Prefill, error),
+                result => LegStep::Prefill(result),
             },
-        })
+            result = &mut decode, if decode_result.is_none() => match result {
+                Err(error) if prefill_result.is_none() => LegStep::Alone(PdLeg::Decode, error),
+                result => LegStep::Decode(result),
+            },
+        };
+
+        match step {
+            LegStep::Alone(leg, error) => {
+                let partner = match leg {
+                    PdLeg::Prefill => decode,
+                    PdLeg::Decode => prefill,
+                };
+                return PdDispatchOutcome::FailedFirst {
+                    leg,
+                    error,
+                    partner,
+                };
+            }
+            LegStep::Prefill(result) => match decode_result.take() {
+                Some(decode) => return PdDispatchOutcome::Both(result, decode),
+                None => prefill_result = Some(result),
+            },
+            LegStep::Decode(result) => match prefill_result.take() {
+                Some(prefill) => return PdDispatchOutcome::Both(prefill, result),
+                None => decode_result = Some(result),
+            },
+        }
     }
+}
 
-    /// Execute vLLM PD: send to prefill with max_tokens=1 first, wait for completion,
-    /// then send original request to decode.
-    ///
-    /// For Mooncake: injects bootstrap_host/port from prefill worker metadata into
-    /// the decode request. For NIXL: tags the prefill request with do_remote_decode,
-    /// then relays the kv_transfer_params returned by the prefill engine to decode.
-    async fn execute_sequential_pd(
-        &self,
-        mut proto_request: ProtoGenerateRequest,
-        clients: &mut ClientSelection,
-        workers: &WorkerSelection,
-        model: &str,
-    ) -> Result<ExecutionResult, Response> {
-        let runtime = workers
-            .disaggregated_runtime_type()
-            .map(|r| r.as_str())
-            .unwrap_or("");
-        let (prefill_client, decode_client) = clients.disaggregated_mut().ok_or_else(|| {
-            error!(
-                function = "execute_sequential_pd",
-                "Expected disaggregated clients but got single"
-            );
-            error::internal_error(
-                "expected_disaggregated_clients_got_single",
-                "Expected disaggregated clients but got single",
-            )
-        })?;
+/// Log, count and translate one leg's dispatch failure into the client answer.
+fn pd_leg_error(leg: PdLeg, connection: &'static str, error: &tonic::Status) -> Response {
+    Metrics::record_worker_error(leg.name(), connection, metrics_labels::ERROR_BACKEND);
+    match leg {
+        PdLeg::Prefill => {
+            error!(function = "execute_parallel_pd", error = %error, "Prefill worker failed to start");
+        }
+        PdLeg::Decode => {
+            error!(function = "execute_parallel_pd", error = %error, "Decode worker failed to start");
+        }
+    }
+    error.to_http_error(
+        leg.error_code(),
+        format!("{}: {}", leg.error_message(), error.message()),
+    )
+}
 
-        let mode = workers
-            .prefill_worker()
-            .map(|w| connector_mode_for_worker(w.as_ref()))
-            .unwrap_or(KvConnectorMode::Passthrough);
+/// Finish off the leg that was still dispatching when its partner failed.
+///
+/// The request is already answered; what is left is the engine-side room,
+/// which the abandoned leg will allocate the moment its dispatch lands and
+/// then hold for its own deadline. Dropping the leg's stream as soon as it
+/// arrives is the abort path the router already uses on a client disconnect,
+/// and it is the only thing that releases that room early. The abort is *not*
+/// deferred here: deferral exists to protect an in-flight KV handoff, and the
+/// peer that would have written it is the leg that just failed.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the abandoned PD leg is retired off the request path; its dispatch is bounded by the engine's own deadline"
+)]
+fn retire_pd_leg(
+    leg: PdLeg,
+    connection: &'static str,
+    worker: Arc<dyn Worker>,
+    dispatch: PdLegDispatch,
+) {
+    tokio::spawn(async move {
+        let result = dispatch.await;
+        worker.record_outcome(result.cb_status_code());
+        match result {
+            Ok(stream) => {
+                debug!(
+                    leg = leg.name(),
+                    worker = worker.url(),
+                    "Aborting the room of the PD leg abandoned after its partner failed"
+                );
+                drop(stream);
+            }
+            Err(error) => {
+                Metrics::record_worker_error(leg.name(), connection, metrics_labels::ERROR_BACKEND);
+                error!(
+                    function = "retire_pd_leg",
+                    leg = leg.name(),
+                    worker = worker.url(),
+                    error = %error,
+                    "PD leg failed after its partner had already failed"
+                );
+            }
+        }
+    });
+}
 
-        // Recorded on the success path (after decode established) so failed
-        // requests don't pollute success metrics; captured here before use of mode.
-        let kv_connector_label = mode.metrics_label();
+/// Execute vLLM PD: send to prefill with max_tokens=1 first, wait for completion,
+/// then send original request to decode.
+///
+/// For Mooncake: injects bootstrap_host/port from prefill worker metadata into
+/// the decode request. For NIXL: tags the prefill request with do_remote_decode,
+/// then relays the kv_transfer_params returned by the prefill engine to decode.
+async fn execute_sequential_pd(
+    mut proto_request: ProtoGenerateRequest,
+    clients: &mut ClientSelection,
+    workers: &WorkerSelection,
+    model: &str,
+) -> Result<ExecutionResult, Response> {
+    let runtime = workers
+        .disaggregated_runtime_type()
+        .map(|r| r.as_str())
+        .unwrap_or("");
+    let (prefill_client, decode_client) = clients.disaggregated_mut().ok_or_else(|| {
+        error!(
+            function = "execute_sequential_pd",
+            "Expected disaggregated clients but got single"
+        );
+        error::internal_error(
+            "expected_disaggregated_clients_got_single",
+            "Expected disaggregated clients but got single",
+        )
+    })?;
 
-        match &mode {
+    let mode = workers
+        .prefill_worker()
+        .map(|w| connector_mode_for_worker(w.as_ref()))
+        .unwrap_or(KvConnectorMode::Passthrough);
+
+    // Recorded on the success path (after decode established) so failed
+    // requests don't pollute success metrics; captured here before use of mode.
+    let kv_connector_label = mode.metrics_label();
+
+    match &mode {
             KvConnectorMode::Mooncake {
                 host,
                 port,
@@ -540,58 +871,67 @@ impl RequestExecutionStage {
             }
         }
 
-        // The KV handoff is single-consumer: with n>1 each fan-out child on decode
-        // would pull, and the first completion frees the prefill blocks under its
-        // siblings (same hazard for NIXL and Mooncake)
-        let relay_kv_params = proto_request.sampling_n() <= 1;
+    // The KV handoff is single-consumer: with n>1 each fan-out child on decode
+    // would pull, and the first completion frees the prefill blocks under its
+    // siblings (same hazard for NIXL and Mooncake)
+    let relay_kv_params = proto_request.sampling_n() <= 1;
 
-        // Mooncake is push-based: the engine returns nothing, so the router mints
-        // the transfer correlation id and synthesizes decode params from metadata
-        let mooncake_transfer_id = match &mode {
-            KvConnectorMode::Mooncake {
-                engine_id: Some(_), ..
-            } if relay_kv_params => Some(format!("xfer-{}", uuid::Uuid::now_v7())),
-            _ => None,
-        };
+    // Mooncake is push-based: the engine returns nothing, so the router mints
+    // the transfer correlation id and synthesizes decode params from metadata
+    let mooncake_transfer_id = match &mode {
+        KvConnectorMode::Mooncake {
+            engine_id: Some(_), ..
+        } if relay_kv_params => Some(format!("xfer-{}", uuid::Uuid::now_v7())),
+        _ => None,
+    };
 
-        // Decode reuses the request minus pixels: it receives KV via the P/D
-        // transfer, and prefill reads and unlinks any /dev/shm segments, so a
-        // reused ShmHandle would be unreadable. Same request_id on both legs
-        // is load-bearing for NIXL P/D correlation on vLLM < 0.13. The
-        // pixel-free leg is the clone, so pixel tensors are never duplicated
-        // and die with the prefill send.
-        let mut decode_request = proto_request.clone_without_mm_pixels();
-        // Sanitize prefill sampling (max_tokens=1, n=1), stream=false.
-        let mut prefill_request = proto_request;
-        prefill_request.sanitize_sampling_for_prefill(1);
-        prefill_request.set_stream(false);
-        if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
-            prefill_request.set_data_parallel_rank(rank as i32);
+    // Decode normally reuses the request minus pixels: it receives KV via
+    // the P/D transfer, and prefill reads and unlinks any /dev/shm
+    // segments, so a reused ShmHandle would be unreadable. Same request_id
+    // on both legs is load-bearing for NIXL P/D correlation on vLLM <
+    // 0.13. The pixel-free leg is the clone, so pixel tensors are never
+    // duplicated and die with the prefill send; the per-image mm identity
+    // and grid tensors survive for decode-side hashing and positions.
+    // Without a KV handoff (n>1) decode recomputes the prompt locally and
+    // must run the vision encoder, so that leg keeps the full multimodal
+    // payload (SHM-backed tensors cannot serve both legs and fail loudly
+    // on the decode read).
+    let mut decode_request = if relay_kv_params {
+        proto_request.clone_without_mm_pixels()
+    } else {
+        proto_request.clone()
+    };
+    // Sanitize prefill sampling (max_tokens=1, n=1), stream=false.
+    let mut prefill_request = proto_request;
+    prefill_request.sanitize_sampling_for_prefill(1);
+    prefill_request.set_stream(false);
+    if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
+        prefill_request.set_data_parallel_rank(rank as i32);
+    }
+    if mode == KvConnectorMode::Nixl {
+        if relay_kv_params {
+            prefill_request.set_kv_transfer_params_json(NIXL_PREFILL_KV_PARAMS.to_string());
+        } else {
+            debug!(
+                request_id = %prefill_request.request_id(),
+                "vLLM PD (NIXL): n>1 request, skipping kv_transfer_params relay \
+                 (decode recomputes the prompt locally)"
+            );
         }
-        if mode == KvConnectorMode::Nixl {
-            if relay_kv_params {
-                prefill_request.set_kv_transfer_params_json(NIXL_PREFILL_KV_PARAMS.to_string());
-            } else {
-                debug!(
-                    request_id = %prefill_request.request_id(),
-                    "vLLM PD (NIXL): n>1 request, skipping kv_transfer_params relay \
-                     (decode recomputes the prompt locally)"
-                );
-            }
-        }
-        if let Some(ref transfer_id) = mooncake_transfer_id {
-            prefill_request.set_kv_transfer_params_json(mooncake_prefill_params(transfer_id));
-        }
+    }
+    if let Some(ref transfer_id) = mooncake_transfer_id {
+        prefill_request.set_kv_transfer_params_json(mooncake_prefill_params(transfer_id));
+    }
 
-        debug!(
-            request_id = %prefill_request.request_id(),
-            "vLLM PD: sending prefill request (max_tokens=1)"
-        );
+    debug!(
+        request_id = %prefill_request.request_id(),
+        "vLLM PD: sending prefill request (max_tokens=1)"
+    );
 
-        // Send to prefill, wait for completion
-        let (prefill_label, decode_label) = pd_leg_labels(workers);
-        let prefill_start = Instant::now();
-        let mut prefill_stream = prefill_client
+    // Send to prefill, wait for completion
+    let (prefill_label, decode_label) = pd_leg_labels(workers);
+    let prefill_start = Instant::now();
+    let mut prefill_stream = prefill_client
             .generate(prefill_request)
             .await
             .map_err(|e| {
@@ -605,151 +945,363 @@ impl RequestExecutionStage {
                 e.to_http_error("prefill_worker_failed_to_start", format!("Prefill worker failed to start: {}", e.message()))
             })?;
 
-        // Drain prefill response, harvesting connector params from the Complete frame
-        let mut prefill_kv_params: Option<String> = None;
-        while let Some(result) = prefill_stream.next().await {
-            match result {
-                Ok(response) => {
-                    if let ProtoResponseVariant::Complete(complete) = response.into_response() {
-                        if let Some(json) = complete.kv_transfer_params_json() {
-                            prefill_kv_params = Some(json.to_owned());
-                        }
+    // Drain prefill response, harvesting connector params from the Complete frame
+    let mut prefill_kv_params: Option<String> = None;
+    while let Some(result) = prefill_stream.next().await {
+        match result {
+            Ok(response) => {
+                if let ProtoResponseVariant::Complete(complete) = response.into_response() {
+                    if let Some(json) = complete.kv_transfer_params_json() {
+                        prefill_kv_params = Some(json.to_owned());
                     }
                 }
-                Err(e) => {
-                    workers.record_outcome_prefill(e.http_status().as_u16());
-                    Metrics::record_worker_error(
-                        metrics_labels::WORKER_PREFILL,
-                        prefill_label,
-                        metrics_labels::ERROR_BACKEND,
-                    );
-                    error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
-                    return Err(e.to_http_error(
-                        "prefill_stream_error",
-                        format!("Prefill stream error: {}", e.message()),
-                    ));
-                }
             }
-        }
-        prefill_stream.mark_completed();
-        workers.record_outcome_prefill(200);
-        // Captured at drain; recorded below only once decode is established.
-        let prefill_duration = prefill_start.elapsed();
-
-        // KV-transfer window: prefill drain complete to decode send complete.
-        let kv_window_start = Instant::now();
-
-        debug!("vLLM PD: prefill completed, sending decode request");
-
-        if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
-            decode_request.set_data_parallel_rank(rank as i32);
-        }
-        match (&mode, prefill_kv_params) {
-            // Modern Mooncake: synthesized params under the minted transfer_id
-            (
-                KvConnectorMode::Mooncake {
-                    host,
-                    port,
-                    engine_id: Some(engine_id),
-                },
-                _,
-            ) if mooncake_transfer_id.is_some() => {
-                let transfer_id = mooncake_transfer_id.as_deref().unwrap_or_default();
-                debug!(
-                    request_id = %decode_request.request_id(),
-                    transfer_id = %transfer_id,
-                    "vLLM PD (Mooncake): injecting minted kv_transfer_params into decode request"
+            Err(e) => {
+                workers.record_outcome_prefill(e.http_status().as_u16());
+                Metrics::record_worker_error(
+                    metrics_labels::WORKER_PREFILL,
+                    prefill_label,
+                    metrics_labels::ERROR_BACKEND,
                 );
-                decode_request.set_kv_transfer_params_json(mooncake_decode_params(
-                    transfer_id,
-                    engine_id,
-                    host,
-                    *port,
+                error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
+                return Err(e.to_http_error(
+                    "prefill_stream_error",
+                    format!("Prefill stream error: {}", e.message()),
                 ));
             }
-            // Legacy Mooncake (no engine_id discovered, or n>1): typed host/port injection
-            (KvConnectorMode::Mooncake { host, port, .. }, _) => {
-                debug!(
-                    remote_host = %host,
-                    remote_port = port,
-                    "vLLM PD: injecting kv_transfer_params into decode request"
-                );
-                decode_request.set_kv_transfer_params(host.clone(), *port);
-            }
-            (KvConnectorMode::Nixl | KvConnectorMode::Passthrough, Some(json))
-                if relay_kv_params =>
-            {
-                debug!(
-                    request_id = %decode_request.request_id(),
-                    params_len = json.len(),
-                    "vLLM PD: relaying prefill kv_transfer_params to decode request"
-                );
-                decode_request.set_kv_transfer_params_json(json);
-            }
-            (KvConnectorMode::Nixl, None) if relay_kv_params => {
-                Metrics::record_pd_kv_transfer_failure();
-                tracing::warn!(
-                    request_id = %decode_request.request_id(),
-                    "vLLM PD (NIXL): prefill returned no kv_transfer_params; decode will \
-                     recompute the prompt locally (outdated smg-grpc-servicer or missing \
-                     kv-transfer-config?)"
-                );
-            }
-            _ => {}
         }
-
-        // Send request to decode
-        let decode_stream = decode_client.generate(decode_request).await.map_err(|e| {
-            workers.record_outcome_decode(e.http_status().as_u16());
-            Metrics::record_worker_error(
-                metrics_labels::WORKER_DECODE,
-                decode_label,
-                metrics_labels::ERROR_BACKEND,
-            );
-            error!(function = "execute_sequential_pd", error = %e, "Decode worker failed to start");
-            e.to_http_error(
-                "decode_worker_failed_to_start",
-                format!("Decode worker failed to start: {}", e.message()),
-            )
-        })?;
-
-        workers.record_outcome_decode(200);
-        // Decode established: record the success-only PD metrics here.
-        Metrics::record_pd_kv_connector_mode(kv_connector_label);
-        Metrics::record_pd_prefill_duration(
-            metrics_labels::BACKEND_PD,
-            model,
-            runtime,
-            prefill_duration,
-        );
-        Metrics::record_pd_kv_transfer_duration(
-            metrics_labels::BACKEND_PD,
-            model,
-            runtime,
-            kv_window_start.elapsed(),
-        );
-
-        // Prefill has completed and its KV blocks are held pending decode's
-        // transfer; aborting decode mid-transfer on a client disconnect can
-        // crash or leak on the engine side. Defer the abort until the first
-        // decode response proves the handoff finished (see the parallel PD
-        // path for the same invariant).
-        let decode_stream = decode_stream.defer_abort_until_first_item();
-
-        Ok(ExecutionResult::Single {
-            stream: decode_stream,
-        })
     }
+    prefill_stream.mark_completed();
+    workers.record_outcome_prefill(200);
+    // Captured at drain; recorded below only once decode is established.
+    let prefill_duration = prefill_start.elapsed();
+
+    // KV-transfer window: prefill drain complete to decode send complete.
+    let kv_window_start = Instant::now();
+
+    debug!("vLLM PD: prefill completed, sending decode request");
+
+    if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
+        decode_request.set_data_parallel_rank(rank as i32);
+    }
+    match (&mode, prefill_kv_params) {
+        // Modern Mooncake: synthesized params under the minted transfer_id
+        (
+            KvConnectorMode::Mooncake {
+                host,
+                port,
+                engine_id: Some(engine_id),
+            },
+            _,
+        ) if mooncake_transfer_id.is_some() => {
+            let transfer_id = mooncake_transfer_id.as_deref().unwrap_or_default();
+            debug!(
+                request_id = %decode_request.request_id(),
+                transfer_id = %transfer_id,
+                "vLLM PD (Mooncake): injecting minted kv_transfer_params into decode request"
+            );
+            decode_request.set_kv_transfer_params_json(mooncake_decode_params(
+                transfer_id,
+                engine_id,
+                host,
+                *port,
+            ));
+        }
+        // Legacy Mooncake (no engine_id discovered, or n>1): typed host/port injection
+        (KvConnectorMode::Mooncake { host, port, .. }, _) => {
+            debug!(
+                remote_host = %host,
+                remote_port = port,
+                "vLLM PD: injecting kv_transfer_params into decode request"
+            );
+            decode_request.set_kv_transfer_params(host.clone(), *port);
+        }
+        (KvConnectorMode::Nixl | KvConnectorMode::Passthrough, Some(json)) if relay_kv_params => {
+            debug!(
+                request_id = %decode_request.request_id(),
+                params_len = json.len(),
+                "vLLM PD: relaying prefill kv_transfer_params to decode request"
+            );
+            decode_request.set_kv_transfer_params_json(json);
+        }
+        (KvConnectorMode::Nixl, None) if relay_kv_params => {
+            Metrics::record_pd_kv_transfer_failure();
+            tracing::warn!(
+                request_id = %decode_request.request_id(),
+                "vLLM PD (NIXL): prefill returned no kv_transfer_params; decode will \
+                 recompute the prompt locally (outdated smg-grpc-servicer or missing \
+                 kv-transfer-config?)"
+            );
+        }
+        _ => {}
+    }
+
+    // Send request to decode
+    let decode_stream = decode_client.generate(decode_request).await.map_err(|e| {
+        workers.record_outcome_decode(e.http_status().as_u16());
+        Metrics::record_worker_error(
+            metrics_labels::WORKER_DECODE,
+            decode_label,
+            metrics_labels::ERROR_BACKEND,
+        );
+        error!(function = "execute_sequential_pd", error = %e, "Decode worker failed to start");
+        e.to_http_error(
+            "decode_worker_failed_to_start",
+            format!("Decode worker failed to start: {}", e.message()),
+        )
+    })?;
+
+    workers.record_outcome_decode(200);
+    // Decode established: record the success-only PD metrics here.
+    Metrics::record_pd_kv_connector_mode(kv_connector_label);
+    Metrics::record_pd_prefill_duration(
+        metrics_labels::BACKEND_PD,
+        model,
+        runtime,
+        prefill_duration,
+    );
+    Metrics::record_pd_kv_transfer_duration(
+        metrics_labels::BACKEND_PD,
+        model,
+        runtime,
+        kv_window_start.elapsed(),
+    );
+
+    // Prefill has completed and its KV blocks are held pending decode's
+    // transfer; aborting decode mid-transfer on a client disconnect can
+    // crash or leak on the engine side. Defer the abort until the first
+    // decode response proves the handoff finished (see the parallel PD
+    // path for the same invariant).
+    let decode_stream = decode_stream.defer_abort_until_first_item();
+
+    Ok(ExecutionResult::Single {
+        stream: decode_stream,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
-    use smg_grpc_client::{tokenspeed_proto as ts, vllm_proto as vllm};
+    use smg_grpc_client::{sglang_proto as sglang, tokenspeed_proto as ts, vllm_proto as vllm};
 
     use super::*;
     use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType};
+
+    fn tokenspeed_request(n: u32, seed: Option<u64>) -> ProtoGenerateRequest {
+        ProtoGenerateRequest::TokenSpeed(Box::new(ts::GenerateRequest {
+            request_id: "req".to_string(),
+            sampling_params: Some(ts::SamplingParams {
+                n,
+                sampling_seed: seed,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+
+    fn tokenspeed_pair() -> WorkerSelection {
+        let leg = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(worker_type)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .build(),
+            )
+        };
+        WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: leg("grpc://prefill:30000", WorkerType::Prefill),
+            decode: leg("grpc://decode:30000", WorkerType::Decode),
+            runtime_type: RuntimeType::TokenSpeed,
+        }
+    }
+
+    #[test]
+    fn pd_fanout_width_applies_to_multi_sample_text_requests_on_parallel_pd() {
+        let tokenspeed = PdProtocol::for_runtime(RuntimeType::TokenSpeed).unwrap();
+        assert_eq!(
+            pd_fanout_width(&tokenspeed_request(3, None), tokenspeed),
+            Some(3)
+        );
+        assert_eq!(
+            pd_fanout_width(&tokenspeed_request(1, None), tokenspeed),
+            None
+        );
+        assert_eq!(
+            pd_fanout_width(&tokenspeed_request(0, None), tokenspeed),
+            None
+        );
+
+        let sglang = ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
+            request_id: "req".to_string(),
+            sampling_params: Some(sglang::SamplingParams {
+                n: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(
+            pd_fanout_width(
+                &sglang,
+                PdProtocol::for_runtime(RuntimeType::Sglang).unwrap()
+            ),
+            Some(2)
+        );
+
+        // A multimodal payload cannot be handed to n prefills.
+        let mut multimodal = tokenspeed_request(3, None);
+        if let ProtoGenerateRequest::TokenSpeed(req) = &mut multimodal {
+            req.mm_inputs = Some(ts::MultimodalInputs::default());
+        }
+        assert_eq!(pd_fanout_width(&multimodal, tokenspeed), None);
+
+        // The sequential (vLLM) path relays one KV handoff and already
+        // skips it for n>1; no fan-out there.
+        let vllm = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: "req".to_string(),
+            sampling_params: Some(vllm::SamplingParams {
+                n: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(
+            pd_fanout_width(&vllm, PdProtocol::for_runtime(RuntimeType::Vllm).unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn fan_out_pd_request_gives_each_sample_its_own_id_seed_and_room() {
+        let request = tokenspeed_request(3, Some(7));
+        let mut next_room = 100;
+        let subs = fan_out_pd_request(&request, 3, |sub| {
+            sub.set_kv_bootstrap_info("prefill".to_string(), 8998, next_room);
+            next_room += 1;
+        });
+        assert_eq!(subs.len(), 3);
+        let mut rooms = Vec::new();
+        for (i, sub) in subs.iter().enumerate() {
+            assert_eq!(sub.request_id(), format!("req-{i}"));
+            assert_eq!(sub.sampling_n(), 1);
+            let ProtoGenerateRequest::TokenSpeed(req) = sub else {
+                panic!("sub-request changed runtime");
+            };
+            let params = req.sampling_params.as_ref().unwrap();
+            assert_eq!(params.sampling_seed, Some(7 + i as u64));
+            rooms.push(req.kv_bootstrap_info.as_ref().unwrap().bootstrap_room);
+        }
+        assert_eq!(rooms, vec![100, 101, 102]);
+        // The original still asks for its three samples.
+        assert_eq!(request.sampling_n(), 3);
+    }
+
+    #[test]
+    fn fan_out_pd_request_leaves_an_unset_seed_unset() {
+        for sub in &fan_out_pd_request(&tokenspeed_request(2, None), 2, |_| {}) {
+            let ProtoGenerateRequest::TokenSpeed(req) = sub else {
+                panic!("sub-request changed runtime");
+            };
+            assert_eq!(req.sampling_params.as_ref().unwrap().sampling_seed, None);
+        }
+    }
+
+    #[test]
+    fn plan_sub_requests_counts_fanned_out_samples() {
+        let workers = tokenspeed_pair();
+        let fanned = ExecutionPlan::PrefillDecode(tokenspeed_request(4, None));
+        assert_eq!(plan_sub_requests(&fanned, Some(&workers)), 4);
+        // Without a disaggregated selection there is no PD protocol to fan out on.
+        assert_eq!(plan_sub_requests(&fanned, None), 1);
+
+        let plain = ExecutionPlan::PrefillDecode(tokenspeed_request(1, None));
+        assert_eq!(plan_sub_requests(&plain, Some(&workers)), 1);
+
+        let batch = ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::PrefillDecode,
+            shared_request_id: "cmpl-1".to_string(),
+            requests: vec![tokenspeed_request(2, None), tokenspeed_request(1, None)],
+        };
+        assert_eq!(plan_sub_requests(&batch, Some(&workers)), 3);
+    }
+
+    /// A leg that never answers — the decode leg stuck behind the engine's
+    /// transfer deadline while the prefill leg has already given up.
+    fn never_answers() -> PdLegDispatch {
+        Box::pin(std::future::pending())
+    }
+
+    fn fails_now(message: &'static str) -> PdLegDispatch {
+        Box::pin(async move { Err(tonic::Status::deadline_exceeded(message)) })
+    }
+
+    fn answers_after(delay: Duration) -> PdLegDispatch {
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Err(tonic::Status::unavailable("late leg"))
+        })
+    }
+
+    /// A prefill that times out must be reported without waiting for the
+    /// decode leg, and the decode's dispatch must come back so its room can
+    /// be released instead of being left to the engine's own deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_prefill_answers_without_waiting_for_the_decode_leg() {
+        let started = tokio::time::Instant::now();
+        let outcome = dispatch_pd_legs(fails_now("bootstrap timeout"), never_answers()).await;
+
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "the prefill error must not wait on the decode leg"
+        );
+        match outcome {
+            PdDispatchOutcome::FailedFirst { leg, error, .. } => {
+                assert_eq!(leg, PdLeg::Prefill);
+                assert_eq!(error.message(), "bootstrap timeout");
+            }
+            PdDispatchOutcome::Both(..) => panic!("expected a fail-fast outcome"),
+        }
+    }
+
+    /// The mirror case: a decode leg that cannot start is answered without
+    /// waiting out the prefill's bootstrap deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_decode_answers_without_waiting_for_the_prefill_leg() {
+        let outcome = dispatch_pd_legs(
+            answers_after(Duration::from_secs(120)),
+            fails_now("decode refused"),
+        )
+        .await;
+
+        match outcome {
+            PdDispatchOutcome::FailedFirst { leg, error, .. } => {
+                assert_eq!(leg, PdLeg::Decode);
+                assert_eq!(error.message(), "decode refused");
+            }
+            PdDispatchOutcome::Both(..) => panic!("expected a fail-fast outcome"),
+        }
+    }
+
+    /// Admission and the load guards read the same count, so a batched plan
+    /// claims one room per prompt instead of walking past a gate that only
+    /// asked about one.
+    #[test]
+    fn plan_sub_requests_counts_every_batched_prompt() {
+        let single = ExecutionPlan::PrefillDecode(ProtoGenerateRequest::Vllm(Box::default()));
+        assert_eq!(plan_sub_requests(&single, None), 1);
+
+        let batch = ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::PrefillDecode,
+            shared_request_id: "cmpl-1".to_string(),
+            requests: (0..4)
+                .map(|_| ProtoGenerateRequest::Vllm(Box::default()))
+                .collect(),
+        };
+        assert_eq!(plan_sub_requests(&batch, None), 4);
+    }
 
     #[test]
     fn pd_leg_labels_reflect_each_legs_transport() {
@@ -830,9 +1382,93 @@ mod tests {
         assert!(original.mm_inputs.is_some(), "prefill leg keeps pixels");
         assert!(
             decode.mm_inputs.is_none(),
-            "decode leg never carries pixels"
+            "hash-less mm payload is dropped whole on the decode leg"
         );
         assert_eq!(decode.request_id, "pd-1");
+    }
+
+    #[test]
+    fn clone_without_mm_pixels_keeps_vllm_identity_and_grid_tensors() {
+        // The decode leg drops the pixel tensors but keeps the per-image
+        // identity and the inline M-RoPE grid tensors.
+        let grid = vllm::TensorData {
+            shape: vec![1, 3],
+            dtype: "int64".to_string(),
+            payload: Some(vllm::tensor_data::Payload::Inline(vec![0; 24])),
+        };
+        let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: "pd-2".to_string(),
+            mm_inputs: Some(vllm::MultimodalInputs {
+                pixel_values: Some(vllm::TensorData::default()),
+                model_specific_tensors: std::collections::HashMap::from([
+                    ("image_grid_thw".to_string(), grid.clone()),
+                    // Payload-less grids and non-grid tensors are dropped.
+                    ("video_grid_thw".to_string(), vllm::TensorData::default()),
+                    ("aspect_ratios".to_string(), grid.clone()),
+                    // Flat-classified grid keys keep their sizes tensor.
+                    ("second_per_grid_ts".to_string(), grid.clone()),
+                    ("ts_sizes".to_string(), grid),
+                ]),
+                flat_keys: std::collections::HashMap::from([(
+                    "second_per_grid_ts".to_string(),
+                    "ts_sizes".to_string(),
+                )]),
+                im_token_id: Some(151_655),
+                mm_placeholders: vec![vllm::PlaceholderRange {
+                    offset: 3,
+                    length: 4,
+                }],
+                mm_hashes: vec!["h1".to_string()],
+                batched_keys: vec![
+                    "pixel_values".to_string(),
+                    "image_grid_thw".to_string(),
+                    "aspect_ratios".to_string(),
+                ],
+                keep_on_cpu_keys: vec!["image_grid_thw".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        let clone = request.clone_without_mm_pixels();
+        let ProtoGenerateRequest::Vllm(original) = request else {
+            panic!("expected vLLM request");
+        };
+        let ProtoGenerateRequest::Vllm(decode) = clone else {
+            panic!("expected vLLM clone");
+        };
+        let original_mm = original.mm_inputs.expect("prefill leg keeps mm_inputs");
+        assert!(
+            original_mm.pixel_values.is_some(),
+            "prefill leg keeps pixels"
+        );
+        assert_eq!(original_mm.model_specific_tensors.len(), 5);
+        assert_eq!(original_mm.batched_keys.len(), 3);
+        let decode_mm = decode.mm_inputs.expect("decode leg keeps identity");
+        assert!(
+            decode_mm.pixel_values.is_none(),
+            "decode leg never carries pixels"
+        );
+        let mut decode_keys: Vec<_> = decode_mm.model_specific_tensors.keys().collect();
+        decode_keys.sort();
+        assert_eq!(
+            decode_keys,
+            vec!["image_grid_thw", "second_per_grid_ts", "ts_sizes"]
+        );
+        assert_eq!(decode_mm.batched_keys, vec!["image_grid_thw".to_string()]);
+        assert_eq!(
+            decode_mm.keep_on_cpu_keys,
+            vec!["image_grid_thw".to_string()]
+        );
+        assert_eq!(
+            decode_mm.flat_keys,
+            std::collections::HashMap::from([(
+                "second_per_grid_ts".to_string(),
+                "ts_sizes".to_string()
+            )])
+        );
+        assert_eq!(decode_mm.mm_hashes, vec!["h1".to_string()]);
+        assert_eq!(decode_mm.mm_placeholders.len(), 1);
+        assert_eq!(decode_mm.im_token_id, Some(151_655));
     }
 
     #[test]

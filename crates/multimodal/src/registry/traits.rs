@@ -18,6 +18,8 @@ pub enum ModelRegistryError {
     TokenNotFound { token: String },
     #[error("missing config field '{field}'")]
     MissingConfigField { field: String },
+    #[error("invalid or missing preprocessed field '{field}'")]
+    InvalidPreprocessedField { field: String },
     #[error("model spec {spec} could not encode '{text}' with the model tokenizer")]
     TextEncodingFailed { spec: &'static str, text: String },
     #[error("modality {modality} is not supported by model spec {spec}")]
@@ -217,8 +219,24 @@ pub trait ModelProcessorSpec: Send + Sync {
         metadata: &ModelMetadata,
         requested: &[(Modality, usize)],
     ) -> RegistryResult<()> {
+        self.validate_media_request_with_limits(metadata, requested, &HashMap::new())
+    }
+
+    /// [`Self::validate_media_request`] with caller-supplied per-modality limit
+    /// overrides; each replaces the spec limit and beats the env override.
+    fn validate_media_request_with_limits(
+        &self,
+        metadata: &ModelMetadata,
+        requested: &[(Modality, usize)],
+        limit_overrides: &HashMap<Modality, usize>,
+    ) -> RegistryResult<()> {
         let limits = self.modality_limits(metadata)?;
-        check_media_counts(self.name(), &limits, requested, modality_limit_override)
+        check_media_counts(self.name(), &limits, requested, |modality| {
+            limit_overrides
+                .get(&modality)
+                .copied()
+                .or_else(|| modality_limit_override(modality))
+        })
     }
 
     fn processor_kwargs(&self, metadata: &ModelMetadata) -> RegistryResult<Value>;
@@ -402,6 +420,55 @@ mod tests {
             Err(ModelRegistryError::DuplicateModality {
                 spec: "test",
                 modality: Modality::Image,
+            })
+        );
+    }
+
+    #[test]
+    fn caller_limit_override_replaces_spec_limit() {
+        let tokenizer = TestTokenizer::new(&[]);
+        let config = json!({});
+        let metadata = ModelMetadata {
+            model_id: "test-model",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let overrides = HashMap::from([(Modality::Image, 5)]);
+
+        // TestSpec declares Image=2; the caller override wins in both directions.
+        assert_eq!(
+            TestSpec.validate_media_request_with_limits(
+                &metadata,
+                &[(Modality::Image, 5)],
+                &overrides
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            TestSpec.validate_media_request_with_limits(
+                &metadata,
+                &[(Modality::Image, 6)],
+                &overrides
+            ),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "test",
+                modality: Modality::Image,
+                limit: 5,
+                requested: 6,
+            })
+        );
+        // Unoverridden modalities keep the spec limit.
+        assert_eq!(
+            TestSpec.validate_media_request_with_limits(
+                &metadata,
+                &[(Modality::Audio, 2)],
+                &overrides
+            ),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "test",
+                modality: Modality::Audio,
+                limit: 1,
+                requested: 2,
             })
         );
     }

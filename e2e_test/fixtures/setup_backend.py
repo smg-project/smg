@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 import anthropic
 import openai
@@ -40,7 +41,7 @@ from infra.model_specs import get_model_spec
 from infra.worker import stop_workers
 from infra.worker_pool import get_pool
 
-from .markers import get_marker_kwargs, get_marker_value
+from .markers import get_marker_kwargs, get_marker_value, model_id_for_engine, resolve_class_marker
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +57,17 @@ _WORKER_DEFAULTS = {
     "count": 1,
     "prefill": None,
     "decode": None,
+    # PD only: per-leg tensor parallelism (None = the model spec's tp).
+    "prefill_tp": None,
+    "decode_tp": None,
+    # PD only: KV transfer backend per worker of each leg ("nixl" /
+    # "mooncake"), a list one entry per worker; None = the lane's default.
+    "prefill_kv": None,
+    "decode_kv": None,
     "gpus": None,
     "extra_engine_args": None,
+    # PD only: spawn every prefill/decode worker first and wait afterwards.
+    "parallel_start": False,
 }
 
 # Track worker startup failures — fail fast after repeated failures
@@ -135,6 +145,82 @@ def _make_openai_client(gateway: Gateway) -> openai.OpenAI:
     return openai.OpenAI(base_url=f"{gateway.base_url}/v1", api_key="not-used")
 
 
+# Statuses a fresh gateway returns while it is still wiring up (no worker
+# routable yet, tokenizer not registered) rather than rejecting the request.
+_NOT_SERVING_YET = frozenset({404, 408, 425, 429, 500, 502, 503, 504})
+# Error codes that are a settled verdict on the fleet, not a gateway still
+# wiring up: waiting longer cannot change them, and a test that builds such
+# a fleet asserts the verdict itself.
+_SETTLED_VERDICTS = frozenset({"no_compatible_pd_pair"})
+# How long a settled verdict must hold before it counts as the fleet's.
+_SETTLED_FOR_SECS = 5.0
+
+
+def _error_code_of(exc: openai.APIStatusError) -> str | None:
+    body = exc.body if isinstance(exc.body, dict) else {}
+    error = body.get("error", body)
+    return error.get("code") if isinstance(error, dict) else None
+
+
+def _wait_for_serving(
+    gateway: Gateway, model_id: str, model_path: str, timeout: float = 180.0
+) -> None:
+    """Block until the gateway answers a real chat request for ``model_path``.
+
+    PD lanes have returned 404 for a class's first request seconds after the
+    gateway reported ready, for reasons the readiness gate does not explain.
+    Wait for a request to succeed rather than trusting the gate.
+    """
+    if "chat" not in get_model_spec(model_id).get("features", []):
+        return
+    client = _make_openai_client(gateway).with_options(max_retries=0)
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    settled_code: str | None = None
+    settled_since = 0.0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            client.chat.completions.create(
+                model=model_path,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1,
+                timeout=min(60.0, remaining),
+            )
+            return
+        except openai.APIStatusError as exc:
+            code = _error_code_of(exc)
+            if code in _SETTLED_VERDICTS:
+                # A fleet still registering shows one worker per leg and can
+                # refuse a pair it accepts moments later; only a verdict the
+                # gateway has held for a few seconds is the fleet's.
+                if code != settled_code:
+                    settled_code, settled_since = code, time.monotonic()
+                elif time.monotonic() - settled_since >= _SETTLED_FOR_SECS:
+                    logger.info(
+                        "Gateway at %s settled on %s for %s; not waiting for it to serve",
+                        gateway.base_url,
+                        code,
+                        model_path,
+                    )
+                    return
+            else:
+                settled_code = None
+                if exc.status_code not in _NOT_SERVING_YET:
+                    raise
+            last_error = exc
+        except (openai.APIConnectionError, openai.APITimeoutError) as exc:
+            settled_code = None  # an unreachable gateway is not a settled one
+            last_error = exc
+        time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+    raise TimeoutError(
+        f"Gateway at {gateway.base_url} did not serve a chat request for "
+        f"{model_path} within {timeout}s: {last_error}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main fixture
 # ---------------------------------------------------------------------------
@@ -155,6 +241,12 @@ def setup_backend(request: pytest.FixtureRequest):
       - ``@pytest.mark.workers(gpus=2, extra_engine_args=[...])``: Per-worker
         GPU count and extra engine CLI args (local workers only)
       - ``@pytest.mark.workers(prefill=1, decode=1)``: PD worker counts
+      - ``("pd_grpc", (n_prefill, n_decode[, prefill_tp, decode_tp]))`` as
+        the param: PD counts, optionally with asymmetric per-leg tp; a
+        trailing dict may add ``prefill_kv`` / ``decode_kv`` lists naming
+        each worker's KV transfer backend, so one fleet can mix transports,
+        and ``prefill_env`` / ``decode_env`` dicts of engine environment
+        for one leg (a deployment-injected ``SMG_PAIRING_PROTOCOL``)
       - ``@pytest.mark.gateway(policy=..., timeout=..., extra_args=...)``: Gateway config
 
     Returns:
@@ -162,14 +254,14 @@ def setup_backend(request: pytest.FixtureRequest):
     """
     raw_param = request.param
     if isinstance(raw_param, tuple):
-        backend_name, epd_counts = raw_param
+        backend_name, leg_counts = raw_param
     else:
-        backend_name, epd_counts = raw_param, None
+        backend_name, leg_counts = raw_param, None
 
     if os.environ.get(ENV_SKIP_BACKEND_SETUP, "").lower() in ("1", "true", "yes"):
         pytest.skip(f"{ENV_SKIP_BACKEND_SETUP} is set")
 
-    model_id = get_marker_value(request, "model")
+    model_id = model_id_for_engine(resolve_class_marker(request.node, "model"), get_runtime())
     if model_id is None:
         model_id = os.environ.get(ENV_MODEL, DEFAULT_MODEL)
 
@@ -194,6 +286,34 @@ def setup_backend(request: pytest.FixtureRequest):
     _validate_connection_mode(connection_mode, engine)
     model_path = get_model_spec(model_id)["model"]
     workers_config = get_marker_kwargs(request, "workers", defaults=_WORKER_DEFAULTS)
+    if is_pd and leg_counts is not None:
+        # ``("pd_grpc", (n_prefill, n_decode))`` lets one class sweep PD
+        # topologies; setup_backend is class-scoped, so counts ride in the param.
+        leg_options: dict = {}
+        if leg_counts and isinstance(leg_counts[-1], dict):
+            leg_options = dict(leg_counts[-1])
+            leg_counts = tuple(leg_counts[:-1])
+        if len(leg_counts) not in (2, 4):
+            raise ValueError(
+                "pd_* backend params take (n_prefill, n_decode) or "
+                "(n_prefill, n_decode, prefill_tp, decode_tp), optionally followed by "
+                "a dict of per-worker options"
+            )
+        if any(not isinstance(n, int) or isinstance(n, bool) or n < 1 for n in leg_counts):
+            raise ValueError(f"pd_* leg counts and tp must be positive integers, got {leg_counts}")
+        workers_config = {**workers_config, "prefill": leg_counts[0], "decode": leg_counts[1]}
+        if len(leg_counts) == 4:
+            workers_config = {
+                **workers_config,
+                "prefill_tp": leg_counts[2],
+                "decode_tp": leg_counts[3],
+            }
+        for key in ("prefill_kv", "decode_kv"):
+            if key in leg_options:
+                workers_config = {**workers_config, key: list(leg_options[key])}
+        for key in ("prefill_env", "decode_env"):
+            if key in leg_options:
+                workers_config = {**workers_config, key: dict(leg_options[key])}
     log_dir = os.environ.get("E2E_LOG_DIR") or gateway_config.get("log_dir")
 
     fail_count = _worker_start_failures.get(engine, 0)
@@ -211,7 +331,7 @@ def setup_backend(request: pytest.FixtureRequest):
                 model_path,
                 engine,
                 connection_mode,
-                epd_counts,
+                leg_counts,
                 gateway_config,
                 gateway,
                 log_dir,
@@ -315,6 +435,68 @@ def _setup_local(
 # ---------------------------------------------------------------------------
 
 
+def _per_worker_kv(raw, count: int, leg: str) -> list[str] | None:
+    """Normalise a per-worker KV backend list for one PD leg (None = lane default)."""
+    if raw is None:
+        return None
+    backends = [str(b).lower() for b in raw]
+    if len(backends) != count:
+        raise ValueError(f"{leg}_kv names {len(backends)} backends for {count} {leg} workers")
+    return backends
+
+
+def _start_pd_leg(
+    *,
+    model_id: str,
+    engine: str,
+    mode,
+    count: int,
+    worker_type,
+    log_dir,
+    gpu_offset: int,
+    wait_ready: bool,
+    tp,
+    kv_backends: list[str] | None,
+    extra_engine_args: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> list:
+    """Start one PD leg; a per-worker KV backend list starts the workers one by one."""
+    if kv_backends is None:
+        return _start_workers_tracked(
+            model_id=model_id,
+            engine=engine,
+            mode=mode,
+            count=count,
+            worker_type=worker_type,
+            log_dir=log_dir,
+            gpu_offset=gpu_offset,
+            wait_ready=wait_ready,
+            tp=tp,
+            extra_engine_args=extra_engine_args,
+            extra_env=extra_env,
+        )
+    spec_tp = tp or get_model_spec(model_id).get("tp", 1)
+    workers: list = []
+    for i, backend in enumerate(kv_backends):
+        workers.extend(
+            _start_workers_tracked(
+                model_id=model_id,
+                engine=engine,
+                mode=mode,
+                count=1,
+                worker_type=worker_type,
+                log_dir=log_dir,
+                gpu_offset=gpu_offset + i * spec_tp,
+                wait_ready=wait_ready,
+                tp=tp,
+                kv_backend=backend,
+                extra_engine_args=extra_engine_args,
+                extra_env=extra_env,
+            )
+        )
+    return workers
+
+
 def _setup_pd(
     model_id,
     model_path,
@@ -329,32 +511,50 @@ def _setup_pd(
     spec = get_model_spec(model_id)
     num_prefill = workers_config.get("prefill") or 1
     num_decode = workers_config.get("decode") or 1
+    prefill_tp = workers_config.get("prefill_tp")
+    decode_tp = workers_config.get("decode_tp")
+    prefill_kv = _per_worker_kv(workers_config.get("prefill_kv"), num_prefill, "prefill")
+    decode_kv = _per_worker_kv(workers_config.get("decode_kv"), num_decode, "decode")
     backend_name = f"pd_{connection_mode.value}"
     runtime_label = RUNTIME_LABELS.get(engine, engine)
 
     logger.info(
-        "Starting %s PD backend: model=%s, %d prefill + %d decode",
+        "Starting %s PD backend: model=%s, %d prefill (tp=%s, kv=%s) + %d decode (tp=%s, kv=%s)",
         runtime_label,
         model_id,
         num_prefill,
+        prefill_tp or spec.get("tp", 1),
+        prefill_kv or "lane default",
         num_decode,
+        decode_tp or spec.get("tp", 1),
+        decode_kv or "lane default",
     )
 
+    parallel_start = bool(workers_config.get("parallel_start"))
+    # The class marker's engine flags (a decode window, a context length)
+    # reach every leg, as they do for regular workers.
+    extra_engine_args = workers_config.get("extra_engine_args")
     all_workers: list = []
     try:
-        prefill_workers = _start_workers_tracked(
+        prefill_workers = _start_pd_leg(
             model_id=model_id,
             engine=engine,
             mode=connection_mode,
             count=num_prefill,
             worker_type=WorkerType.PREFILL,
             log_dir=log_dir,
+            gpu_offset=0,
+            wait_ready=not parallel_start,
+            tp=prefill_tp,
+            kv_backends=prefill_kv,
+            extra_engine_args=extra_engine_args,
+            extra_env=workers_config.get("prefill_env"),
         )
         all_workers.extend(prefill_workers)
 
         # Decode workers start on GPUs after prefill workers
-        decode_gpu_offset = num_prefill * spec.get("tp", 1)
-        decode_workers = _start_workers_tracked(
+        decode_gpu_offset = num_prefill * (prefill_tp or spec.get("tp", 1))
+        decode_workers = _start_pd_leg(
             model_id=model_id,
             engine=engine,
             mode=connection_mode,
@@ -362,8 +562,27 @@ def _setup_pd(
             worker_type=WorkerType.DECODE,
             log_dir=log_dir,
             gpu_offset=decode_gpu_offset,
+            wait_ready=not parallel_start,
+            tp=decode_tp,
+            kv_backends=decode_kv,
+            extra_engine_args=extra_engine_args,
+            extra_env=workers_config.get("decode_env"),
         )
         all_workers.extend(decode_workers)
+        if parallel_start:
+            # Each worker loads on its own GPUs, so spawning them all first
+            # makes a topology cost one model load instead of one per worker.
+            # It also brings the legs up in no particular order, which is what
+            # a user launching a fleet does.
+            # One deadline for the fleet, and a failed load still counts toward
+            # the session's fail-fast budget as it does on the sequential path.
+            deadline = time.monotonic() + spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+            try:
+                for worker in all_workers:
+                    worker.wait_ready(max(1, int(deadline - time.monotonic())))
+            except (TimeoutError, RuntimeError):
+                _worker_start_failures[engine] = _worker_start_failures.get(engine, 0) + 1
+                raise
 
         _start_gateway(
             gateway,
@@ -371,6 +590,7 @@ def _setup_pd(
             prefill_workers=prefill_workers,
             decode_workers=decode_workers,
         )
+        _wait_for_serving(gateway, model_id, model_path)
         logger.info("%s PD backend ready at %s", runtime_label, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     finally:
