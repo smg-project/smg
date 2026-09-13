@@ -359,9 +359,8 @@ impl AppContextBuilder {
         let worker_registry = self
             .worker_registry
             .ok_or(AppContextBuildError::MissingField("worker_registry"))?;
-        worker_registry.set_overload_defaults(OverloadThresholds::from_gateway_config(
-            &router_config,
-        ));
+        worker_registry
+            .set_overload_defaults(OverloadThresholds::from_gateway_config(&router_config));
         let worker_job_queue = self
             .worker_job_queue
             .ok_or(AppContextBuildError::MissingField("worker_job_queue"))?;

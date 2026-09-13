@@ -445,11 +445,7 @@ struct CliArgs {
     /// header over body `rid`. This permits raw-body forwarding for trusted
     /// ingress that lifts the affinity key into a header; requests without a
     /// valid key header remain buffered.
-    #[arg(
-        long,
-        default_value_t = false,
-        help_heading = "Routing Policy"
-    )]
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     routing_key_override_prefer_header: bool,
 
     /// How strictly PD placement pairs a prefill with a decode on their KV

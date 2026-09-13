@@ -50,8 +50,7 @@ use crate::{
             attach_sized_body,
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
-                REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION,
-                REASON_WORKER_MUTATES_BODY,
+                REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_WORKER_MUTATES_BODY,
             },
             header_utils, overload,
             placement::{self, PlacementFailure, PlacementInputs},
@@ -204,11 +203,8 @@ impl Router {
                     }
                 }
 
-                match send_with_stale_conn_retry(
-                    request_builder,
-                    self.retry_config.max_retries > 1,
-                )
-                .await
+                match send_with_stale_conn_retry(request_builder, self.retry_config.max_retries > 1)
+                    .await
                 {
                     Ok(res) => {
                         let status = StatusCode::from_u16(res.status().as_u16())
@@ -2290,8 +2286,8 @@ mod tests {
         policies::{CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
         routers::common::{
             body_policy::{
-                REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT, REASON_RETRYABLE,
-                REASON_PURE_FORWARD, REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE,
+                REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT, REASON_PURE_FORWARD,
+                REASON_RETRYABLE, REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE,
                 REASON_WASM_REQUEST_HOOK,
             },
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
@@ -3127,9 +3123,7 @@ mod tests {
         let (url_a, captured_a) = spawn_capture_stub("application/json", "{}").await;
         let (url_b, captured_b) = spawn_capture_stub("application/json", "{}").await;
         let mut policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        policies.replace_default_policy_for_test(Arc::new(
-            OverloadFirstSelectionPolicy::default(),
-        ));
+        policies.replace_default_policy_for_test(Arc::new(OverloadFirstSelectionPolicy::default()));
         let router = streaming_router_with_registry(
             Arc::new(policies),
             1024 * 1024,
@@ -3156,7 +3150,10 @@ mod tests {
             .to_string();
         let a_received = captured_a.lock().await.is_some();
         let b_received = captured_b.lock().await.is_some();
-        assert_ne!(a_received, b_received, "exactly one worker receives the body");
+        assert_ne!(
+            a_received, b_received,
+            "exactly one worker receives the body"
+        );
         assert!(
             (overloaded_url == url_a && !a_received && b_received)
                 || (overloaded_url == url_b && !b_received && a_received),
@@ -3543,9 +3540,7 @@ mod tests {
         let (url_a, captured_a) = spawn_capture_stub("application/json", "{}").await;
         let (url_b, captured_b) = spawn_capture_stub("application/json", "{}").await;
         let mut policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        policies.replace_default_policy_for_test(Arc::new(
-            OverloadFirstSelectionPolicy::default(),
-        ));
+        policies.replace_default_policy_for_test(Arc::new(OverloadFirstSelectionPolicy::default()));
         let router = streaming_router_with_registry(
             Arc::new(policies),
             1024 * 1024,
@@ -3575,7 +3570,10 @@ mod tests {
             .to_string();
         let a_received = captured_a.lock().await.is_some();
         let b_received = captured_b.lock().await.is_some();
-        assert_ne!(a_received, b_received, "exactly one worker receives the body");
+        assert_ne!(
+            a_received, b_received,
+            "exactly one worker receives the body"
+        );
         assert!(
             (overloaded_url == url_a && !a_received && b_received)
                 || (overloaded_url == url_b && !b_received && a_received),
@@ -3676,6 +3674,9 @@ mod tests {
             .await
             .expect("known pre-send failure is returned directly");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(extract_error_code_from_response(&response), "model_not_found");
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "model_not_found"
+        );
     }
 }

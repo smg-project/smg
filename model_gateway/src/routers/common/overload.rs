@@ -338,14 +338,12 @@ mod tests {
 
         let mut unhinted = error::too_many_requests("upstream_busy", "busy");
         apply_capacity_contract(&mut unhinted);
-        assert!(
-            unhinted
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|seconds| seconds >= 1)
-        );
+        assert!(unhinted
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|seconds| seconds >= 1));
         assert!(!is_retryable_response(&unhinted));
 
         let mut unrelated = error::service_unavailable("unavailable", "down");

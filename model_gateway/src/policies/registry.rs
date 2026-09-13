@@ -232,10 +232,7 @@ impl PolicyRegistry {
     /// Whether sticky routing still needs the body to resolve its preferred
     /// key. In header-first mode a valid configured key header is sufficient;
     /// missing or malformed headers keep the request on the buffered path.
-    pub(crate) fn routing_key_override_needs_body(
-        &self,
-        headers: Option<&HeaderMap>,
-    ) -> bool {
+    pub(crate) fn routing_key_override_needs_body(&self, headers: Option<&HeaderMap>) -> bool {
         self.routing_key_sticky.is_some()
             && !(self.routing_key_prefer_header && self.resolve_routing_key(headers).is_some())
     }
@@ -606,10 +603,7 @@ impl PolicyRegistry {
     }
 
     #[cfg(test)]
-    pub(crate) fn replace_default_policy_for_test(
-        &mut self,
-        policy: Arc<dyn LoadBalancingPolicy>,
-    ) {
+    pub(crate) fn replace_default_policy_for_test(&mut self, policy: Arc<dyn LoadBalancingPolicy>) {
         self.default_policy = policy;
     }
 
@@ -1473,10 +1467,7 @@ mod tests {
             headers: Some(&headers),
             ..Default::default()
         };
-        assert_eq!(
-            reg.effective_sticky_key(&info),
-            Some(("header", "header"))
-        );
+        assert_eq!(reg.effective_sticky_key(&info), Some(("header", "header")));
         assert_eq!(
             reg.sticky_load_key(info.rid_key, info.headers),
             Some("header")

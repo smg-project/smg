@@ -543,10 +543,7 @@ impl PDRouter {
             match replacement {
                 Ok(pair) => (prefill, decode) = pair,
                 Err(_) => {
-                    return overload::shed_worker_overloaded(
-                        overloaded.as_ref(),
-                        context.model_id,
-                    )
+                    return overload::shed_worker_overloaded(overloaded.as_ref(), context.model_id)
                 }
             }
         }
@@ -2541,9 +2538,7 @@ mod tests {
                 r#"{"error":"prefill overloaded"}"#,
             )
         }));
-        let overloaded_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let overloaded_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let overloaded_addr = overloaded_listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(overloaded_listener, overloaded).await.unwrap();
@@ -2552,9 +2547,7 @@ mod tests {
         let hanging = axum::Router::new().fallback(axum::routing::any(|| async {
             std::future::pending::<Response>().await
         }));
-        let hanging_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let hanging_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let hanging_addr = hanging_listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(hanging_listener, hanging).await.unwrap();
@@ -2949,11 +2942,7 @@ mod tests {
             .unwrap();
 
         let response = router
-            .process_prefill_response(
-                reqwest::Response::from(upstream),
-                "http://prefill",
-                false,
-            )
+            .process_prefill_response(reqwest::Response::from(upstream), "http://prefill", false)
             .await
             .expect_err("engine admission must stop the parallel PD attempt");
 
@@ -2973,16 +2962,10 @@ mod tests {
     async fn parallel_prefill_429_does_not_wait_for_hanging_decode() {
         let (prefill_url, decode_url) = spawn_overloaded_and_hanging_stubs().await;
         let router = create_test_pd_router();
-        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
-            prefill_url,
-            WorkerType::Prefill,
-            true,
-        ));
-        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
-            decode_url,
-            WorkerType::Decode,
-            true,
-        ));
+        let prefill: Arc<dyn Worker> =
+            Arc::from(create_test_worker(prefill_url, WorkerType::Prefill, true));
+        let decode: Arc<dyn Worker> =
+            Arc::from(create_test_worker(decode_url, WorkerType::Decode, true));
         let context = PDRequestContext {
             route: "/generate",
             batch_size: None,

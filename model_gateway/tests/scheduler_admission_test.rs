@@ -371,8 +371,7 @@ async fn response_cancel_bypasses_saturated_priority_admission() {
     let config = scheduler_config(3607, "default", yaml_file.path().to_str().unwrap());
 
     let gate = HoldGate::new();
-    let ctx =
-        AppTestContext::new_with_config(config, vec![scheduler_worker(1, Some(&gate))]).await;
+    let ctx = AppTestContext::new_with_config(config, vec![scheduler_worker(1, Some(&gate))]).await;
     let app = ctx.create_app();
 
     let held_app = app.clone();

@@ -731,7 +731,10 @@ impl WorkerMonitor {
                 .is_some_and(|source| Arc::ptr_eq(&source, worker))
         });
         self.threshold_saturation.remove_if(url, |_, state| {
-            state.source.upgrade().is_some_and(|source| Arc::ptr_eq(&source, worker))
+            state
+                .source
+                .upgrade()
+                .is_some_and(|source| Arc::ptr_eq(&source, worker))
         });
         self.load_state.enqueue_eviction(Arc::clone(worker));
     }
@@ -855,13 +858,14 @@ impl WorkerMonitor {
 
         if !retained {
             // Do not remove a fresh verdict published after the read above.
-            self.threshold_saturation.remove_if(worker.url(), |_, state| {
-                state.observed_at == observed_at
-                    && state
-                        .source
-                        .upgrade()
-                        .is_some_and(|source| Arc::ptr_eq(&source, worker))
-            });
+            self.threshold_saturation
+                .remove_if(worker.url(), |_, state| {
+                    state.observed_at == observed_at
+                        && state
+                            .source
+                            .upgrade()
+                            .is_some_and(|source| Arc::ptr_eq(&source, worker))
+                });
         }
         Some(retained)
     }
@@ -1735,10 +1739,7 @@ mod worker_monitor_tests {
 
         // A response already in flight from the detached worker cannot
         // publish after replacement, even before the new worker reports.
-        assert_eq!(
-            monitor.resolve_ingress_saturation(&old, Some(false)),
-            None
-        );
+        assert_eq!(monitor.resolve_ingress_saturation(&old, Some(false)), None);
         assert_eq!(
             monitor.resolve_ingress_saturation(&replacement, Some(false)),
             Some(false)
@@ -1762,12 +1763,7 @@ mod worker_monitor_tests {
         let observed_at = Instant::now();
 
         assert_eq!(
-            monitor.resolve_threshold_saturation_at(
-                &worker,
-                Some(true),
-                interval,
-                observed_at,
-            ),
+            monitor.resolve_threshold_saturation_at(&worker, Some(true), interval, observed_at,),
             Some(true)
         );
         assert_eq!(
@@ -1827,12 +1823,7 @@ mod worker_monitor_tests {
         );
 
         assert_eq!(
-            monitor.resolve_threshold_saturation_at(
-                &replacement,
-                Some(true),
-                interval,
-                now,
-            ),
+            monitor.resolve_threshold_saturation_at(&replacement, Some(true), interval, now,),
             Some(true)
         );
         monitor.evict_worker_loads(&old);
@@ -2075,7 +2066,10 @@ sglang:utilization{model="llama"} 0.9
         // Bad boolean-gauge values are not authoritative and cannot clear a
         // veto owned by another source.
         let invalid = PromScrape::parse("msl_generate_admission_blocked 0.5\n");
-        assert_eq!(VllmIngressAdmission::from_scrape(&invalid).saturation(), None);
+        assert_eq!(
+            VllmIngressAdmission::from_scrape(&invalid).saturation(),
+            None
+        );
     }
 
     #[test]
@@ -2239,8 +2233,7 @@ mod native_loads_tests {
          vllm:num_requests_waiting{m=\"a\"} 11.0\n\
          vllm:kv_cache_usage_perc{m=\"a\"} 0.5\n";
 
-    const VLLM_INGRESS_BLOCKED_METRICS: &str =
-        "msl_generate_preprocess_active_leases 1\n\
+    const VLLM_INGRESS_BLOCKED_METRICS: &str = "msl_generate_preprocess_active_leases 1\n\
          msl_generate_preprocess_max_leases 8\n\
          msl_generate_admission_blocked 1\n";
 
@@ -2248,8 +2241,7 @@ mod native_loads_tests {
         r#"{"admission_blocked":true,"loads":[{"dp_rank":0,"token_usage":0.25}]}"#;
     const NATIVE_ADMISSION_OPEN_BODY: &str =
         r#"{"admission_blocked":false,"loads":[{"dp_rank":0,"token_usage":0.25}]}"#;
-    const NATIVE_GUARD_ONLY_BODY: &str =
-        r#"{"admission_blocked":true,"loads":[]}"#;
+    const NATIVE_GUARD_ONLY_BODY: &str = r#"{"admission_blocked":true,"loads":[]}"#;
 
     /// Carries `num_waiting_uncached_tokens`, which the `/metrics` arm has no
     /// gauge for — so its presence identifies which path answered.

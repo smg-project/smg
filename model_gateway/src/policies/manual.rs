@@ -497,12 +497,12 @@ mod tests {
 
         assert!(result.is_some());
         assert_eq!(branch, ExecutionBranch::Vacant);
-        assert!(
-            policy
-                .routing_map
-                .contains_key(&RoutingId::new("configured-key"))
-        );
-        assert!(!policy.routing_map.contains_key(&RoutingId::new("legacy-key")));
+        assert!(policy
+            .routing_map
+            .contains_key(&RoutingId::new("configured-key")));
+        assert!(!policy
+            .routing_map
+            .contains_key(&RoutingId::new("legacy-key")));
     }
 
     #[test]

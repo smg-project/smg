@@ -1361,10 +1361,7 @@ mod tests {
                 verdict: PlacementFailure::NoCandidates,
             },
         );
-        assert_eq!(
-            known_but_leg_absent.status(),
-            StatusCode::TOO_MANY_REQUESTS
-        );
+        assert_eq!(known_but_leg_absent.status(), StatusCode::TOO_MANY_REQUESTS);
         let unknown = stage.pair_failure(
             "no-such-model",
             PairFailure {

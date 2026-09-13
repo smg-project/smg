@@ -1996,14 +1996,8 @@ mod request_release_tests {
         register_worker(&worker_registry, port_a, WorkerType::Regular);
         register_worker(&worker_registry, port_b, WorkerType::Regular);
         let mut policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        policies.replace_default_policy_for_test(Arc::new(
-            OverloadFirstSelectionPolicy::default(),
-        ));
-        let deps = PipelineDeps::pair(
-            Arc::clone(&worker_registry),
-            Arc::new(policies),
-            None,
-        );
+        policies.replace_default_policy_for_test(Arc::new(OverloadFirstSelectionPolicy::default()));
+        let deps = PipelineDeps::pair(Arc::clone(&worker_registry), Arc::new(policies), None);
         let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
             .expect("completion pipeline");
         let components = components(Arc::clone(&worker_registry)).await;

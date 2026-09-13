@@ -32,9 +32,7 @@ pub(crate) enum ClientAcquisitionError {
 
 fn first_overloaded_worker(workers: &WorkerSelection) -> Option<Arc<dyn Worker>> {
     match workers {
-        WorkerSelection::Single { worker } => {
-            worker.is_overloaded().then(|| Arc::clone(worker))
-        }
+        WorkerSelection::Single { worker } => worker.is_overloaded().then(|| Arc::clone(worker)),
         WorkerSelection::Disaggregated {
             encode_assignments,
             prefill,
@@ -76,9 +74,7 @@ pub(crate) async fn acquire_clients(
             Ok(ClientSelection::Single { client })
         }
         WorkerSelection::Disaggregated {
-            prefill,
-            decode,
-            ..
+            prefill, decode, ..
         } => {
             let prefill_client = get_backend_client_from_worker(prefill)
                 .await
