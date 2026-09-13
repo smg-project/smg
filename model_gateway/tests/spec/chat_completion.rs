@@ -17,6 +17,7 @@ fn test_max_tokens_normalizes_to_max_completion_tokens() {
     let mut req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -50,6 +51,7 @@ fn test_max_completion_tokens_takes_precedence() {
     let mut req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -76,6 +78,7 @@ fn test_functions_normalizes_to_tools() {
     let mut req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -112,6 +115,7 @@ fn test_function_call_normalizes_to_tool_choice() {
     let mut req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -148,6 +152,7 @@ fn test_function_call_function_variant_normalizes() {
     let mut req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -196,6 +201,7 @@ fn test_min_tokens_zero_is_valid() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -214,6 +220,7 @@ fn test_stream_options_requires_stream_enabled() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -242,6 +249,7 @@ fn test_stream_options_valid_when_stream_enabled() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -265,6 +273,7 @@ fn test_no_stream_options_valid_when_stream_disabled() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -285,6 +294,7 @@ fn test_stream_options_continuous_usage_stats_valid() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -329,6 +339,7 @@ fn test_tool_choice_function_not_found() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -364,6 +375,7 @@ fn test_tool_choice_function_exists_valid() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -394,6 +406,7 @@ fn test_tool_choice_allowed_tools_invalid_mode() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -430,6 +443,7 @@ fn test_tool_choice_allowed_tools_valid_mode_auto() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -461,6 +475,7 @@ fn test_tool_choice_allowed_tools_valid_mode_required() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -492,6 +507,7 @@ fn test_tool_choice_allowed_tools_tool_not_found() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -528,6 +544,7 @@ fn test_tool_choice_allowed_tools_multiple_tools_valid() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -575,6 +592,7 @@ fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],

@@ -161,6 +161,7 @@ fn create_sample_chat_completion_request() -> ChatCompletionRequest {
                 name: None,
             },
             ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Text(
                     "Explain quantum computing in simple terms".to_string(),
                 ),
@@ -207,10 +208,12 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
     // Add many user/assistant pairs to simulate a long conversation
     for i in 0..50 {
         messages.push(ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text(format!("Question {}: What do you think about topic number {} which involves complex reasoning about multiple interconnected systems and their relationships?", i, i)),
             name: None,
         });
         messages.push(ChatMessage::Assistant {
+            ext: Default::default(),
             content: Some(MessageContent::Text(format!("Answer {}: This is a detailed response about topic {} that covers multiple aspects and provides comprehensive analysis of the interconnected systems you mentioned.", i, i))),
             name: None,
             tool_calls: None,

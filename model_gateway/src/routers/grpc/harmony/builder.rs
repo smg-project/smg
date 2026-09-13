@@ -1008,11 +1008,7 @@ impl HarmonyBuilder {
                     };
                     harmony_messages.push(harmony_msg);
                 }
-                ChatMessage::Developer {
-                    content,
-                    name,
-                    tools: _,
-                } => {
+                ChatMessage::Developer { content, name, .. } => {
                     // Developer messages stay as-is
                     let harmony_msg = HarmonyMessage {
                         author: Author {
@@ -1029,7 +1025,7 @@ impl HarmonyBuilder {
                     harmony_messages.push(harmony_msg);
                 }
 
-                ChatMessage::User { content, name } => {
+                ChatMessage::User { content, name, .. } => {
                     // Extract text from user content
                     let text = match content {
                         MessageContent::Text(text) => text.clone(),
@@ -1067,6 +1063,7 @@ impl HarmonyBuilder {
                     name,
                     tool_calls,
                     reasoning_content,
+                    ..
                 } => {
                     if let Some(calls) = tool_calls.as_ref().filter(|c| !c.is_empty()) {
                         // Per Harmony spec: when tool calls are present, include
@@ -1285,6 +1282,7 @@ mod tests {
 
         for part in audio_parts {
             let messages = vec![ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Parts(vec![part]),
                 name: None,
             }];

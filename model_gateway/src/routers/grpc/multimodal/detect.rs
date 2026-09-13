@@ -152,6 +152,7 @@ mod tests {
     #[test]
     fn media_plan_detects_image() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "What is this?".to_string(),
@@ -173,6 +174,7 @@ mod tests {
     #[test]
     fn media_plan_detects_video() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![ContentPart::VideoUrl {
                 video_url: VideoUrl {
                     url: "https://example.com/clip.mp4".to_string(),
@@ -189,6 +191,7 @@ mod tests {
     #[test]
     fn media_plan_detects_audio() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![ContentPart::AudioUrl {
                 audio_url: AudioUrl {
                     url: "https://example.com/clip.wav".to_string(),
@@ -203,6 +206,7 @@ mod tests {
     #[test]
     fn media_plan_is_empty_for_string_text() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("Hello".to_string()),
             name: None,
         }];
@@ -213,6 +217,7 @@ mod tests {
     #[test]
     fn media_plan_is_empty_for_text_parts() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![ContentPart::Text {
                 text: "Just text".to_string(),
             }]),
@@ -231,6 +236,7 @@ mod tests {
                 name: None,
             },
             ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Parts(vec![
                     ContentPart::Text {
                         text: "Describe this:".to_string(),
@@ -262,6 +268,7 @@ mod tests {
     #[test]
     fn extracts_video_media_part() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![ContentPart::VideoUrl {
                 video_url: VideoUrl {
                     url: "https://example.com/video.mp4".to_string(),
@@ -285,6 +292,7 @@ mod tests {
     #[test]
     fn extracts_audio_url_media_part() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![ContentPart::AudioUrl {
                 audio_url: AudioUrl {
                     url: "https://example.com/audio.wav".to_string(),
@@ -306,6 +314,7 @@ mod tests {
     #[test]
     fn extracts_inline_audio_as_data_url() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![ContentPart::InputAudio {
                 input_audio: InputAudio {
                     data: "UklGRg==".to_string(),
