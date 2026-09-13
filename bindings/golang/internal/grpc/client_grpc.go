@@ -497,36 +497,59 @@ func (s *GrpcChatCompletionStream) processAndSendResponse(protoResp *proto.Gener
 }
 
 func (s *GrpcChatCompletionStream) RecvJSON() (string, error) {
+	errChan := s.errChan
+	resultChan := s.resultJSONChan
+	var ctxErr error
 	// Use a loop instead of recursion to avoid stack overflow if there are many empty strings
 	for {
 		// Check errChan first to prioritize actual errors over context cancellation
 		select {
-		case err, ok := <-s.errChan:
-			if !ok {
-				return "", io.EOF
+		case err, ok := <-errChan:
+			if ok {
+				return "", err
 			}
-			return "", err
+			errChan = nil
 		default:
 		}
 
+		// readLoop closes both channels and cancels the context on completion.
+		// Drain buffered chunks before reporting EOF or that cancellation.
 		select {
-		case resultJSON, ok := <-s.resultJSONChan:
+		case resultJSON, ok := <-resultChan:
 			if !ok {
-				return "", io.EOF
+				resultChan = nil
+				continue
 			}
-			// Skip empty strings and continue loop instead of recursing
 			if resultJSON != "" {
 				return resultJSON, nil
 			}
-			// Empty string, continue loop to get next result
 			continue
-		case err, ok := <-s.errChan:
+		default:
+		}
+
+		if resultChan == nil {
+			return "", io.EOF
+		}
+		if ctxErr != nil {
+			return "", ctxErr
+		}
+
+		select {
+		case resultJSON, ok := <-resultChan:
 			if !ok {
-				return "", io.EOF
+				resultChan = nil
+			} else if resultJSON != "" {
+				return resultJSON, nil
 			}
-			return "", err
+		case err, ok := <-errChan:
+			if ok {
+				return "", err
+			}
+			errChan = nil
 		case <-s.ctx.Done():
-			return "", s.ctx.Err()
+			// Completion may have raced the probes above. Check the channels
+			// once more before returning the context error.
+			ctxErr = s.ctx.Err()
 		}
 	}
 }
