@@ -1620,8 +1620,9 @@ impl CacheAwarePolicy {
         candidates.last().map(|c| c.idx)
     }
 
-    /// One decision line per tree-routed request. `selected_url == None`
-    /// means the caller fell back to `fallback_url` (first healthy).
+    /// One decision per tree-routed request: the branch counter and match
+    /// ratio histogram always, the debug line when enabled. `selected_url ==
+    /// None` means the caller fell back to `fallback_url` (first healthy).
     fn log_tree_decision(
         &self,
         selected_url: Option<&str>,
@@ -1631,13 +1632,16 @@ impl CacheAwarePolicy {
         matched_tenants: &[TenantId],
         model_id: &str,
     ) {
-        if !tracing::enabled!(tracing::Level::DEBUG) {
-            return;
-        }
-        let matched_ratio = if input_units == 0 {
-            0.0
+        // The branch mirrors the selection's f32 arithmetic; the histogram
+        // divides in f64 so exact deciles stay in their bucket (widening the
+        // f32 ratio would turn 1/10 into 0.100000001 > 0.1).
+        let (matched_ratio, histogram_ratio) = if input_units == 0 {
+            (0.0, 0.0)
         } else {
-            matched_units as f32 / input_units as f32
+            (
+                matched_units as f32 / input_units as f32,
+                matched_units as f64 / input_units as f64,
+            )
         };
         let branch = match selected_url {
             None => "first_healthy_fallback",
@@ -1650,6 +1654,8 @@ impl CacheAwarePolicy {
                 }
             }
         };
+        Metrics::record_worker_cache_aware_policy_branch(branch);
+        Metrics::record_cache_aware_match_ratio(histogram_ratio);
         debug!(
             index = "tree",
             branch,
@@ -2107,6 +2113,7 @@ impl Default for CacheAwarePolicy {
 #[cfg(test)]
 mod tests {
     use kv_index::{compute_content_hash, SequenceHash, StoredBlock, WorkerBlockMap};
+    use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
     use openai_protocol::worker::{
         HealthCheckConfig, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus,
     };
@@ -2145,7 +2152,10 @@ mod tests {
         );
         CacheAwarePolicy::affinity_score_group(&candidates, tuning.selection_temperature)
     }
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
+    use crate::{
+        observability::metrics::CACHE_AWARE_MATCH_RATIO_BUCKETS,
+        worker::{BasicWorkerBuilder, WorkerType},
+    };
 
     fn no_health_check() -> HealthCheckConfig {
         HealthCheckConfig {
@@ -3260,6 +3270,60 @@ mod tests {
             )
             .unwrap();
         assert!(logs_contain("expected_wait_fallback"));
+    }
+
+    /// The branch counter and match-ratio histogram are recorded on every
+    /// tree decision, independent of whether the debug line is enabled, and
+    /// the ratio is bucketed the way `start_prometheus` registers it: an
+    /// exact decile (32 of 320) must land in `le="0.1"`, not widen past it.
+    #[test]
+    fn token_tree_selection_records_branch_and_match_ratio_metrics() {
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let tokens: Vec<u32> = (0..32).collect();
+        seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
+        let novel: Vec<u32> = (1000..1064).collect();
+        let decile: Vec<u32> = (0..320).collect();
+
+        let recorder = PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                Matcher::Full(String::from("smg_cache_aware_match_ratio")),
+                CACHE_AWARE_MATCH_RATIO_BUCKETS,
+            )
+            .unwrap()
+            .build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            // A full-prefix hit (1.0), a novel prompt (0.0), and a prompt
+            // sharing only the seeded 32 tokens of 320 (0.1).
+            for request in [&tokens, &novel, &decile] {
+                policy
+                    .select_worker(
+                        &workers,
+                        &SelectWorkerInfo {
+                            tokens: Some(request),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+        });
+        let rendered = handle.render();
+
+        for series in [
+            "smg_cache_aware_policy_branch_total{branch=\"tree_match\"} 1",
+            "smg_cache_aware_policy_branch_total{branch=\"expected_wait_fallback\"} 2",
+            "smg_cache_aware_match_ratio_bucket{le=\"0\"} 1",
+            "smg_cache_aware_match_ratio_bucket{le=\"0.1\"} 2",
+            "smg_cache_aware_match_ratio_bucket{le=\"0.9\"} 2",
+            "smg_cache_aware_match_ratio_bucket{le=\"1\"} 3",
+            "smg_cache_aware_match_ratio_count 3",
+        ] {
+            assert!(
+                rendered.lines().any(|l| l == series),
+                "{series} missing; rendered:\n{rendered}"
+            );
+        }
     }
 
     #[test]
