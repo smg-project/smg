@@ -4,11 +4,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use openai_protocol::worker::WorkerStatus;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    worker::{overload::OverloadThresholds, BasicWorkerBuilder, ConnectionMode, Worker},
+    worker::{
+        overload::OverloadThresholds, BasicWorker, BasicWorkerBuilder, ConnectionMode, Worker,
+    },
     workflow::data::WorkerUpdateWorkflowData,
 };
 
@@ -72,8 +74,8 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 .clone()
                 .or_else(|| worker.metadata().spec.api_key.clone());
 
-            // Create a new worker with updated properties.
-            // Use base_url() so DP workers start from the un-suffixed URL.
+            // Keep the full spec so a metadata update preserves PD transport
+            // and DP configuration.
             //
             // Status: a metadata-only update is not a re-registration — the
             // worker is the same endpoint. Preserve the old status so a
@@ -87,15 +89,11 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             } else {
                 worker.status()
             };
-            let mut builder = BasicWorkerBuilder::new(worker.base_url())
-                .worker_type(*worker.worker_type())
-                .connection_mode(*worker.connection_mode())
+            let mut builder = BasicWorkerBuilder::from_spec((*worker.metadata().spec).clone())
                 .http2(worker.http2())
-                .runtime_type(worker.metadata().spec.runtime_type)
                 .labels(updated_labels)
                 .health_config(updated_health_config.clone())
                 .health_endpoint(&health_endpoint)
-                .models(worker.metadata().spec.models.clone())
                 .resilience(worker.resilience().clone())
                 .priority(updated_priority)
                 .cost(updated_cost)
@@ -119,38 +117,20 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 builder = builder.api_key(api_key.clone());
             }
 
-            // Preserve DP configuration if the worker is DP-aware
-            if worker.is_dp_aware() {
-                if let (Some(rank), Some(size)) = (worker.dp_rank(), worker.dp_size()) {
-                    builder = builder.dp_config(rank, size);
-                } else {
-                    warn!(
-                        worker_url = %worker.url(),
-                        dp_rank = ?worker.dp_rank(),
-                        dp_size = ?worker.dp_size(),
-                        "DP-aware worker is missing dp_rank or dp_size; skipping DP config"
-                    );
-                }
-            } else if let Some(size) = worker.dp_size() {
-                // Grouped ZMQ worker: `dp_size` with no rank. Dropping it would
-                // shrink the handshake's engine count to 1 on the next connect.
-                builder = builder.zmq_engine_group(size);
-            }
-
-            // ZMQ transport state must survive a metadata-only update: the
-            // handshake address defines the socket this worker's engines dialed
-            // into, and the connect signal is how the manager learns a handshake
-            // landed. The live backend client itself is adopted from the
-            // replaced worker by `inherit_shared_state_from` below.
-            if let Some(address) = worker.metadata().spec.zmq_handshake_address.clone() {
-                builder = builder.zmq_handshake_address(address);
-            }
+            // The spec retains the ZMQ address and engine count. The connect
+            // signal still has to come from the registry.
             if *worker.connection_mode() == ConnectionMode::Zmq {
                 builder =
                     builder.connect_signal_tx(app_context.worker_registry.connect_signal_sender());
             }
 
-            let new_worker: Arc<dyn Worker> = Arc::new(builder.build());
+            let mut new_worker = builder.build();
+            if let Some(previous) = worker.as_any().downcast_ref::<BasicWorker>() {
+                // A health probe may finish after this update. Share its state
+                // so the result reaches the replacement too.
+                new_worker.share_kv_engine_state(previous);
+            }
+            let new_worker: Arc<dyn Worker> = Arc::new(new_worker);
 
             // Replace the worker in the registry (overwrite-then-diff)
             let worker_id = app_context
@@ -196,16 +176,22 @@ mod tests {
         mock_engine::{connect_to_frontend, default_ready_response},
         EngineId,
     };
-    use openai_protocol::worker::{HealthCheckConfig, OverloadUpdate, WorkerUpdateRequest};
+    use openai_protocol::worker::{
+        HealthCheckConfig, HealthCheckUpdate, OverloadUpdate, WorkerSpec, WorkerType,
+        WorkerUpdateRequest,
+    };
     use wfaas::WorkflowInstanceId;
 
     use super::*;
     use crate::{
         app_context::AppContext,
         middleware::AuthConfig,
-        routers::grpc::{
-            backend_client::BackendClient,
-            zmq_client::{EosTokenIds, ZmqEngineClient},
+        routers::{
+            common::kv_transfer::{connector_mode_for_worker, KvConnectorMode},
+            grpc::{
+                backend_client::BackendClient,
+                zmq_client::{EosTokenIds, ZmqEngineClient},
+            },
         },
         worker::{BasicWorker, RuntimeType},
     };
@@ -292,6 +278,142 @@ mod tests {
             updated_workers: None,
         };
         WorkflowContext::new(WorkflowInstanceId::new(), data)
+    }
+
+    #[tokio::test]
+    async fn pd_update_preserves_connector_and_pair_descriptor() {
+        for (connector, mode, protocol, transport, pair_key, expected_mode) in [
+            (
+                "MooncakeConnector",
+                ConnectionMode::Http,
+                None,
+                "mooncake",
+                "vllm/mooncake/page=16",
+                KvConnectorMode::Mooncake {
+                    host: "prefill".to_string(),
+                    port: 9123,
+                    engine_id: Some("engine-1_dp1".to_string()),
+                },
+            ),
+            (
+                "NixlConnector",
+                ConnectionMode::Grpc,
+                Some("cluster-blue"),
+                "nixl",
+                "cluster-blue",
+                KvConnectorMode::Nixl,
+            ),
+        ] {
+            let mut spec = WorkerSpec::new("http://prefill:8000");
+            spec.worker_type = WorkerType::Prefill;
+            spec.runtime_type = RuntimeType::Vllm;
+            spec.connection_mode = mode;
+            spec.kv_connector = Some(connector.to_string());
+            spec.kv_role = Some("kv_producer".to_string());
+            spec.kv_engine_id = Some("engine-1".to_string());
+            spec.bootstrap_port = Some(9123);
+            spec.pairing_protocol = protocol.map(str::to_string);
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::from_spec(spec)
+                    .dp_config(1, 2)
+                    .label("block_size", "16")
+                    .label("tier", "silver")
+                    .priority(2)
+                    .cost(1.5)
+                    .health_config(HealthCheckConfig {
+                        timeout_secs: 3,
+                        check_interval_secs: 11,
+                        ..Default::default()
+                    })
+                    .status(WorkerStatus::Ready)
+                    .build(),
+            );
+            let app_ctx = make_app_context(std::slice::from_ref(&worker));
+            let mut ctx = make_context(
+                Arc::clone(&app_ctx),
+                Arc::clone(&worker),
+                HashMap::from([("tier".to_string(), "gold".to_string())]),
+            );
+            ctx.data.config.priority = Some(9);
+            ctx.data.config.health = Some(HealthCheckUpdate {
+                timeout_secs: Some(7),
+                ..Default::default()
+            });
+
+            assert_eq!(
+                UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap(),
+                StepResult::Success
+            );
+
+            let updated = app_ctx
+                .worker_registry
+                .get_by_url("http://prefill:8000@1")
+                .expect("worker stays registered");
+            assert!(Arc::ptr_eq(
+                &updated,
+                &ctx.data.updated_workers.as_ref().unwrap()[0]
+            ));
+            assert_eq!(updated.base_url(), "http://prefill:8000");
+            assert_eq!(updated.url(), "http://prefill:8000@1");
+            assert_eq!(updated.dp_rank(), Some(1));
+            assert_eq!(updated.dp_size(), Some(2));
+            assert_eq!(
+                updated.metadata().spec.kv_role.as_deref(),
+                Some("kv_producer")
+            );
+            assert_eq!(connector_mode_for_worker(updated.as_ref()), expected_mode);
+            assert_eq!(updated.pd_pairing().transport(), Some(transport));
+            assert_eq!(updated.pd_pairing().explicit(), protocol);
+            assert_eq!(updated.pd_pairing().key(), pair_key);
+            assert_eq!(updated.metadata().spec.labels["tier"], "gold");
+            assert_eq!(updated.metadata().spec.labels["block_size"], "16");
+            assert_eq!(updated.priority(), 9);
+            assert_eq!(updated.cost(), 1.5);
+            assert_eq!(updated.metadata().health_config.timeout_secs, 7);
+            assert_eq!(updated.metadata().health_config.check_interval_secs, 11);
+            assert_eq!(updated.status(), WorkerStatus::Ready);
+        }
+    }
+
+    #[tokio::test]
+    async fn pd_update_retains_live_kv_engine_state() {
+        for current_id in [Some("engine-current"), None] {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("grpc://prefill:8000")
+                    .worker_type(WorkerType::Prefill)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(RuntimeType::Vllm)
+                    .kv_connector("MooncakeConnector")
+                    .kv_engine_id("engine-initial")
+                    .bootstrap_port(Some(9123))
+                    .status(WorkerStatus::Ready)
+                    .build(),
+            );
+            worker.refresh_kv_engine_id(current_id.map(str::to_string));
+            worker.set_kv_engine_id_confirmed(false);
+            let app_ctx = make_app_context(std::slice::from_ref(&worker));
+            let mut ctx = make_context(app_ctx, Arc::clone(&worker), HashMap::new());
+
+            UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap();
+
+            let updated = &ctx.data.updated_workers.as_ref().unwrap()[0];
+            assert_eq!(updated.kv_engine_id().as_deref(), current_id);
+            assert!(!updated.kv_engine_id_confirmed());
+
+            // A probe that began before the update still holds the old worker.
+            worker.refresh_kv_engine_id(Some("engine-late".to_string()));
+            worker.set_kv_engine_id_confirmed(true);
+            assert_eq!(updated.kv_engine_id().as_deref(), Some("engine-late"));
+            assert!(updated.kv_engine_id_confirmed());
+            assert_eq!(
+                connector_mode_for_worker(updated.as_ref()),
+                KvConnectorMode::Mooncake {
+                    host: "prefill".to_string(),
+                    port: 9123,
+                    engine_id: Some("engine-late".to_string()),
+                }
+            );
+        }
     }
 
     /// A label-only PATCH must not disturb a ZMQ worker's transport: the engine

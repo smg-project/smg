@@ -1309,14 +1309,12 @@ pub struct BasicWorker {
     pub models_override: Arc<ArcSwap<WorkerModels>>,
     /// The KV transfer engine id in force, seeded from the spec and replaced
     /// when a recovered engine reports a new one (see
-    /// [`Worker::refresh_kv_engine_id`]). Not shared across same-URL
-    /// replacements: a worker built from a fresh discovery starts from its
-    /// own spec, and one rebuilt by a properties update starts from that
-    /// spec's (unrefreshed) id.
-    pub kv_engine_id: ArcSwapOption<String>,
+    /// [`Worker::refresh_kv_engine_id`]). A metadata update shares this state
+    /// with the old worker. A fresh discovery starts from its own spec.
+    pub kv_engine_id: Arc<ArcSwapOption<String>>,
     /// Set while a recovery re-read of the engine id has not succeeded yet
     /// (see [`Worker::kv_engine_id_confirmed`]).
-    pub kv_engine_id_unconfirmed: AtomicBool,
+    pub kv_engine_id_unconfirmed: Arc<AtomicBool>,
     /// Worker-directed HTTP client, shared across same-config workers, built
     /// on first use (see [`LazyHttpClient`]).
     pub http_client: Arc<LazyHttpClient>,
@@ -1335,10 +1333,10 @@ impl Clone for BasicWorker {
             zmq_connect_abort: Arc::clone(&self.zmq_connect_abort),
             connect_signal_tx: self.connect_signal_tx.clone(),
             models_override: Arc::clone(&self.models_override),
-            kv_engine_id: ArcSwapOption::new(self.kv_engine_id.load_full()),
-            kv_engine_id_unconfirmed: AtomicBool::new(
+            kv_engine_id: Arc::new(ArcSwapOption::new(self.kv_engine_id.load_full())),
+            kv_engine_id_unconfirmed: Arc::new(AtomicBool::new(
                 self.kv_engine_id_unconfirmed.load(Ordering::Relaxed),
-            ),
+            )),
             http_client: Arc::clone(&self.http_client),
             resilience: self.resilience.clone(),
         }
@@ -1359,6 +1357,12 @@ impl fmt::Debug for BasicWorker {
 }
 
 impl BasicWorker {
+    /// Keep the live KV state across a metadata update.
+    pub(crate) fn share_kv_engine_state(&mut self, previous: &BasicWorker) {
+        self.kv_engine_id = Arc::clone(&previous.kv_engine_id);
+        self.kv_engine_id_unconfirmed = Arc::clone(&previous.kv_engine_id_unconfirmed);
+    }
+
     fn update_running_requests_metrics(&self) {
         let load = self.load();
         Metrics::set_worker_requests_active(self.url(), load);
@@ -2061,6 +2065,27 @@ mod tests {
             disable_health_check: true,
             ..HealthCheckConfig::default()
         }
+    }
+
+    #[test]
+    fn rediscovered_worker_keeps_its_own_kv_engine_state() {
+        let old = BasicWorkerBuilder::new("grpc://worker:8080")
+            .kv_engine_id("old-engine")
+            .build();
+        old.set_kv_engine_id_confirmed(false);
+        let new = BasicWorkerBuilder::new("grpc://worker:8080")
+            .kv_engine_id("new-engine")
+            .build();
+
+        assert!(new.inherit_shared_state_from(&old));
+        assert_eq!(new.kv_engine_id().as_deref(), Some("new-engine"));
+        assert!(new.kv_engine_id_confirmed());
+
+        // A late probe for the old worker must not alter the new discovery.
+        old.refresh_kv_engine_id(Some("late-engine".to_string()));
+        old.set_kv_engine_id_confirmed(false);
+        assert_eq!(new.kv_engine_id().as_deref(), Some("new-engine"));
+        assert!(new.kv_engine_id_confirmed());
     }
 
     #[test]
