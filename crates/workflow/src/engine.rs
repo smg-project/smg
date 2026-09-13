@@ -1149,6 +1149,10 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
         loop {
             if start.elapsed() > timeout_duration {
+                // Only removes already-terminal state; a still-running
+                // workflow stays readable and is reclaimed by the periodic
+                // cleanup task once it terminates.
+                self.state_store.cleanup_if_terminal(instance_id).await;
                 return Err(format!(
                     "Workflow timeout after {}s for {}",
                     timeout_duration.as_secs(),

@@ -2,7 +2,8 @@
 // (vllm-project/vllm): protocol/logprobs.rs + protocol/logprobs/wire.rs.
 // The numpy-array decoders live in `crate::codec::tensor`.
 
-use serde::{Deserialize, Deserializer, Serialize};
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use crate::{
@@ -88,27 +89,27 @@ impl Logprobs {
 /// aux-frame references and raw-view payloads are resolved. Mirrors Python
 /// `vllm/v1/outputs.py`.
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
-pub struct WireLogprobs {
+pub(crate) struct WireLogprobs {
     /// Wire array with shape `[num_positions, max_num_logprobs + 1]`.
-    pub logprob_token_ids: WireNdArray,
+    pub(crate) logprob_token_ids: WireNdArray,
     /// Wire array with shape `[num_positions, max_num_logprobs + 1]`.
-    pub logprobs: WireNdArray,
+    pub(crate) logprobs: WireNdArray,
     /// Wire array with shape `[num_positions]`. Python names it
     /// `sampled_token_ranks` (sample logprobs) / `selected_token_ranks` (prompt
     /// logprobs); one neutral field here since both share the wire shape.
-    pub token_ranks: WireNdArray,
+    pub(crate) token_ranks: WireNdArray,
     /// Preserved only for wire compatibility with batch-level Python tensors.
     /// Scheduler-sliced per-request outputs emit `None`; any other value is
     /// rejected by the semantic decoder.
     #[serde(default)]
-    pub cu_num_generated_tokens: Option<Vec<usize>>,
+    pub(crate) cu_num_generated_tokens: Option<Vec<usize>>,
 }
 
 impl WireLogprobs {
     /// Convert semantic per-position logprobs into the Python wire tuple shape.
     /// Exists mainly so tests can inject semantic logprobs without hand-building
     /// ndarray raw-view tuples.
-    fn from_direct(value: &Logprobs) -> std::result::Result<Self, String> {
+    pub(crate) fn from_direct(value: &Logprobs) -> std::result::Result<Self, String> {
         let rows = value.positions.len();
         let cols = value
             .positions
@@ -160,10 +161,7 @@ impl WireLogprobs {
 
     /// Resolve wire-format logprobs into semantic [`Logprobs`] by decoding the
     /// three arrays (via aux frames as needed) and grouping each row.
-    fn resolve<Frame>(self, frames: &[Frame], field_prefix: &str) -> Result<Logprobs>
-    where
-        Frame: AsRef<[u8]>,
-    {
+    pub(crate) fn resolve(self, frames: &[Bytes], field_prefix: &str) -> Result<Logprobs> {
         if let Some(indices) = self.cu_num_generated_tokens {
             return Err(Error::ExtValueDecode {
                 message: format!(
@@ -237,68 +235,8 @@ impl WireLogprobs {
     }
 }
 
-/// Output field wrapper deserialized from the Python wire shape, then resolved
-/// into [`Logprobs`] before the decoded message is returned to callers.
-#[derive(Clone, PartialEq, Debug)]
-pub enum MaybeWireLogprobs {
-    /// Still in wire format; needs [`MaybeWireLogprobs::resolve`]. Internal use
-    /// only during deserialization.
-    Wire(Box<WireLogprobs>),
-    /// The decoded logprobs value.
-    Direct(Logprobs),
-}
-
-impl MaybeWireLogprobs {
-    /// The decoded logprobs, if already resolved.
-    pub fn as_direct(&self) -> Option<&Logprobs> {
-        match self {
-            Self::Direct(value) => Some(value),
-            Self::Wire(_) => None,
-        }
-    }
-
-    /// Resolve the wire representation into decoded logprobs, looking up aux
-    /// frames and decoding raw views as needed.
-    pub(crate) fn resolve<Frame>(self, frames: &[Frame], field_prefix: &str) -> Result<Self>
-    where
-        Frame: AsRef<[u8]>,
-    {
-        match self {
-            Self::Direct(value) => Ok(Self::Direct(value)),
-            Self::Wire(value) => value.resolve(frames, field_prefix).map(Self::Direct),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for MaybeWireLogprobs {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // On the wire it is always the wire form.
-        WireLogprobs::deserialize(deserializer).map(|v| Self::Wire(Box::new(v)))
-    }
-}
-
-impl Serialize for MaybeWireLogprobs {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        // Test-only: we never actually serialize into aux frames on the send path.
-        match self {
-            Self::Wire(value) => value.serialize(serializer),
-            Self::Direct(value) => WireLogprobs::from_direct(value)
-                .map_err(serde::ser::Error::custom)?
-                .serialize(serializer),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
-
     use super::*;
 
     fn direct(positions: Vec<Vec<(u32, f32, u32)>>) -> Logprobs {
@@ -350,17 +288,13 @@ mod tests {
     }
 
     #[test]
-    fn maybe_wire_logprobs_deserializes_as_wire_then_resolves() {
+    fn wire_logprobs_deserialize_then_resolve() {
         let bytes = rmp_serde::to_vec_named(
             &WireLogprobs::from_direct(&direct(vec![vec![(7, -0.2, 3)]])).unwrap(),
         )
         .unwrap();
-        let maybe: MaybeWireLogprobs = rmp_serde::from_slice(&bytes).unwrap();
-        assert!(maybe.as_direct().is_none()); // still wire
-        let resolved = maybe.resolve(&[Bytes::new()], "lp").unwrap();
-        assert_eq!(
-            resolved.as_direct().unwrap().positions[0].entries[0].token_id,
-            7
-        );
+        let wire: WireLogprobs = rmp_serde::from_slice(&bytes).unwrap();
+        let resolved = wire.resolve(&[Bytes::new()], "lp").unwrap();
+        assert_eq!(resolved.positions[0].entries[0].token_id, 7);
     }
 }

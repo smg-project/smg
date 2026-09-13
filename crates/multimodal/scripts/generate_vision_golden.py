@@ -254,8 +254,19 @@ def generate_golden_qwen2_vl(image_path: str, output_dir: str) -> dict:
     patch_size = processor.patch_size
     merge_size = processor.merge_size
     temporal_patch_size = getattr(processor, "temporal_patch_size", 2)
-    min_pixels = processor.min_pixels
-    max_pixels = processor.max_pixels
+    # transformers < 5 exposes the pixel bounds as attributes; 5.x keeps them
+    # only in size={"shortest_edge": min_pixels, "longest_edge": max_pixels}.
+    size = getattr(processor, "size", None) or {}
+    min_pixels = getattr(processor, "min_pixels", None)
+    max_pixels = getattr(processor, "max_pixels", None)
+    if min_pixels is None:
+        min_pixels = size.get("shortest_edge") if hasattr(size, "get") else None
+    if max_pixels is None:
+        max_pixels = size.get("longest_edge") if hasattr(size, "get") else None
+    if min_pixels is None or max_pixels is None:
+        raise RuntimeError(
+            f"could not resolve Qwen2-VL pixel bounds from processor (size={size!r})"
+        )
 
     # Calculate number of tokens
     # tokens = (T * H * W) / merge_size²
@@ -607,8 +618,8 @@ def generate_golden_pixtral(image_path: str, output_dir: str) -> dict:
     return result
 
 
-def generate_for_model(model_key: str, image_paths: list, output_dir: str):
-    """Generate golden outputs for a specific model."""
+def generate_for_model(model_key: str, image_paths: list, output_dir: str) -> int:
+    """Generate golden outputs for a specific model; returns the failure count."""
     print(f"\nGenerating golden outputs for {model_key}...")
 
     generator_fn = {
@@ -625,11 +636,13 @@ def generate_for_model(model_key: str, image_paths: list, output_dir: str):
 
     if generator_fn is None:
         print(f"  No generator for {model_key}, skipping")
-        return
+        return 0
 
+    failures = 0
     for image_path in image_paths:
         if not os.path.exists(image_path):
-            print(f"  Image not found: {image_path}, skipping")
+            failures += 1
+            print(f"  Image not found: {image_path}")
             continue
 
         image_name = Path(image_path).stem
@@ -637,14 +650,20 @@ def generate_for_model(model_key: str, image_paths: list, output_dir: str):
 
         try:
             data = generator_fn(image_path, output_dir)
-            if data is not None:
-                save_golden(model_key, image_name, data, output_dir)
-                print(f"    pixel_values shape: {data['pixel_values'].shape}")
-                print(
-                    f"    pixel_values range: [{data['pixel_values'].min():.4f}, {data['pixel_values'].max():.4f}]"
-                )
+            if data is None:
+                # The generator printed why (typically the processor class is
+                # missing from the installed transformers); no fixture was written.
+                failures += 1
+                continue
+            save_golden(model_key, image_name, data, output_dir)
+            print(f"    pixel_values shape: {data['pixel_values'].shape}")
+            print(
+                f"    pixel_values range: [{data['pixel_values'].min():.4f}, {data['pixel_values'].max():.4f}]"
+            )
         except Exception as e:
+            failures += 1
             print(f"    Error: {e}")
+    return failures
 
 
 def main():
@@ -658,6 +677,13 @@ def main():
         "-o",
         default="crates/multimodal/tests/fixtures/golden",
         help="Output directory for golden files",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit non-zero if any golden output fails to generate. CI uses this so a "
+        "processor API change cannot silently drop fixtures (the Rust golden tests skip "
+        "when a fixture directory is missing).",
     )
     args = parser.parse_args()
 
@@ -679,9 +705,14 @@ def main():
     print(f"Models: {models_to_generate}")
 
     # Generate golden outputs
+    failures = 0
     for model_key in models_to_generate:
-        generate_for_model(model_key, image_paths, args.output_dir)
+        failures += generate_for_model(model_key, image_paths, args.output_dir)
 
+    if failures:
+        print(f"\n{failures} golden output(s) failed to generate")
+        if args.strict:
+            sys.exit(1)
     print("\nDone!")
 
 

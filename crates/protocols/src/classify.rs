@@ -39,6 +39,10 @@ pub struct ClassifyRequest {
 }
 
 impl GenerationRequest for ClassifyRequest {
+    fn rid(&self) -> Option<&str> {
+        self.rid.as_deref()
+    }
+
     fn is_stream(&self) -> bool {
         false // Classification is always non-streaming
     }

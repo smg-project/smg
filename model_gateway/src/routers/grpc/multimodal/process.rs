@@ -22,7 +22,7 @@ use super::{
     pixel_cache::{config_fingerprint, CachedPreprocessedItem, PixelCache, PixelCacheKey},
     plan::MediaPlan,
     MediaBatch, MultimodalIntermediate, MultimodalOutput, PrecomputedMultimodalIntermediate,
-    PromptBinding,
+    PromptBinding, RegistryTokenizer,
 };
 
 struct PreparedMultimodalPart {
@@ -171,9 +171,10 @@ pub(crate) async fn process_multimodal_plan(
         .config
         .get("model_type")
         .and_then(|v| v.as_str());
+    let registry_tokenizer = RegistryTokenizer(tokenizer);
     let metadata = ModelMetadata {
         model_id,
-        tokenizer,
+        tokenizer: &registry_tokenizer,
         config: &model_config.config,
     };
     let spec = components

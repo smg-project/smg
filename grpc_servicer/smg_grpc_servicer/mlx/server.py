@@ -144,7 +144,7 @@ async def serve_grpc(args):
         options=[
             ("grpc.max_send_message_length", 1024 * 1024 * 256),
             ("grpc.max_receive_message_length", 1024 * 1024 * 256),
-            ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
+            ("grpc.http2.min_ping_interval_without_data_ms", 10000),
             ("grpc.keepalive_permit_without_calls", True),
         ],
     )

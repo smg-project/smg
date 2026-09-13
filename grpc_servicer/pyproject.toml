@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smg-grpc-servicer"
-version = "0.8.0"
+version = "0.9.1"
 description = "SMG gRPC servicer implementations for LLM inference engines (vLLM, MLX, TokenSpeed, SGLang)"
 requires-python = ">=3.10"
 dependencies = [
-    "smg-grpc-proto>=0.4.13",
+    "smg-grpc-proto>=0.4.18",  # 0.4.18: first release with GetServerInfoResponse.pairing_protocol (15)
     "grpcio>=1.81.1",
     "grpcio-reflection>=1.81.1",
     "grpcio-health-checking>=1.81.1",
@@ -31,9 +31,12 @@ classifiers = [
 
 [project.optional-dependencies]
 vllm = ["vllm>=0.19.0", "pyzmq>=25.0.0", "msgspec>=0.18.0"]
-# 0.5.13 is the first release with the shmem load snapshots that replaced
-# the WatchLoadUpdateReq piggyback path (removed upstream in v0.5.14).
-sglang = ["sglang>=0.5.16"]
+# 0.5.18 dropped the server_args parameter from
+# create_load_snapshot_reader(); the floor tracks that signature, which the
+# request manager calls unconditionally. (Earlier floors recorded the shmem
+# load snapshots that replaced the WatchLoadUpdateReq piggyback path in
+# 0.5.13, removed upstream in v0.5.14.)
+sglang = ["sglang>=0.5.18"]
 # smg-grpc-proto>=0.4.7 is the first release that ships mlx_engine_pb2;
 # without this floor, installing [mlx] against an older proto build would
 # crash at import time when smg_grpc_servicer.mlx.server runs.

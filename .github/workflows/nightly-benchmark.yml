@@ -34,7 +34,14 @@ jobs:
   # ---------------------------------------------------------------------------
 
   build-wheel:
-    runs-on: k8s-runner-gpu
+    # CPU-only work: a Rust/maturin compile plus openapi-gen and
+    # datamodel-codegen. It never needed a GPU, and the label it asked for
+    # ('k8s-runner-gpu') no longer has any runners behind it, so the job was
+    # never claimed -- it sat queued for 24h until GitHub's self-hosted limit
+    # reaped it, which reports as `cancelled` and took the whole run with it.
+    # pr-test-rust.yml's build-wheel already builds the same wheel on the CPU
+    # pool; match it.
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
       contents: read
     steps:
@@ -110,7 +117,7 @@ jobs:
     name: "${{ matrix.model.id }} / single-${{ matrix.variant.id }}"
     needs: build-wheel
     if: ${{ !cancelled() }}
-    runs-on: 4-gpu-h100
+    runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     timeout-minutes: 1440
     strategy:
       fail-fast: false
@@ -226,7 +233,7 @@ jobs:
     name: "${{ matrix.model.id }} / multi-${{ matrix.variant.id }}"
     needs: build-wheel
     if: ${{ !cancelled() }}
-    runs-on: 4-gpu-h100
+    runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     timeout-minutes: 1440
     strategy:
       fail-fast: false
@@ -340,7 +347,7 @@ jobs:
     name: "${{ matrix.model.id }} / single-${{ matrix.variant.id }}"
     needs: build-wheel
     if: ${{ !cancelled() }}
-    runs-on: ["8-gpu-h200"]
+    runs-on: ${{ vars.SMG_RUNNER_GPU_8 || '8-gpu-h200' }}
     timeout-minutes: 1440
     strategy:
       fail-fast: false
@@ -459,7 +466,7 @@ jobs:
   #   name: "${{ matrix.model.id }} / multi-${{ matrix.variant.id }}"
   #   needs: build-wheel
   #   if: ${{ !cancelled() }}
-  #   runs-on: ["8-gpu-h200"]
+  #   runs-on: ${{ vars.SMG_RUNNER_GPU_8 || '8-gpu-h200' }}
   #   timeout-minutes: 1440
   #   strategy:
   #     fail-fast: false

@@ -36,8 +36,9 @@ use uuid::Uuid;
 use crate::policies::{TreeHandle, TreeKind};
 
 const PREFIX: &str = "td:";
-const REPAIR_REQUEST_PREFIX: &str = "tree:req:";
-const REPAIR_PAGE_PREFIX: &str = "tree:page:";
+pub(crate) const REPAIR_REQUEST_PREFIX: &str = "tree:req:";
+pub(crate) const REPAIR_PAGE_PREFIX: &str = "tree:page:";
+pub(crate) const TENANT_DELTA_PREFIX: &str = PREFIX;
 
 /// Duration a repair session may sit without progress before
 /// the periodic retry scan reissues it. Spec §15 default: 5 s.
@@ -113,8 +114,13 @@ pub struct TreeDelta {
     pub node_hash: u64,
     /// Worker URL that cached the prefix.
     pub worker_url: String,
-    /// Cache-event epoch for intra-batch ordering on the receiver;
-    /// the stream transport itself doesn't inspect it.
+    /// Reserved on-wire slot for a future intra-batch ordering
+    /// value. The current receiver does not consult it — it appears
+    /// only in `trace!`/`debug!` log lines — so producers may set
+    /// `0` until a consumer that orders by epoch lands. Kept on
+    /// `TreeDelta` (rather than added later) so a newer receiver
+    /// paired with an older producer just sees zeros instead of a
+    /// deserialization mismatch.
     pub epoch: u64,
 }
 
@@ -678,6 +684,17 @@ impl TreeSyncAdapter {
             .entry(model_id.to_string())
             .or_default()
             .push(delta);
+    }
+
+    /// Test-only view onto the outbound buffer so integration tests
+    /// outside this file can assert that a producer hook fired without
+    /// having to wait a full gossip tick for drain.
+    #[cfg(test)]
+    pub(crate) fn pending_delta_count_for_test(&self, model_id: &str) -> usize {
+        self.pending_deltas
+            .get(model_id)
+            .map(|d| d.len())
+            .unwrap_or(0)
     }
 
     /// Collect each model's buffer into one `td:{model_id}` stream

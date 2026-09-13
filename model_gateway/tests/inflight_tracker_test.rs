@@ -11,6 +11,7 @@ use common::{
     mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
     AppTestContext,
 };
+use http_body_util::BodyExt;
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -103,10 +104,13 @@ async fn test_inflight_request_appears_in_bucket() {
     let resp = response_future.await.unwrap().unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The in-flight guard rides the response BODY (streaming responses stay
+    // counted while they generate), so the request deregisters when the body
+    // is consumed to completion, not when the handler returns.
+    let _ = resp.into_body().collect().await.unwrap();
     assert!(
         tracker_clone.is_empty(),
-        "Request should be deregistered after completion"
+        "Request should be deregistered after the body completes"
     );
 
     ctx.shutdown().await;
@@ -143,6 +147,9 @@ async fn test_failed_request_still_deregisters() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
+    // Dropping the response without reading its body (client-disconnect
+    // shape) must also release the body-held guard.
+    drop(resp);
     assert!(tracker.is_empty());
 
     ctx.shutdown().await;

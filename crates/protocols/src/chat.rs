@@ -6,15 +6,16 @@ use validator::Validate;
 
 use super::{
     common::{
-        default_true, deserialize_null_as_false, validate_stop, ChatLogProbs, ContentPart,
-        Function, FunctionCall, FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions,
-        StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference,
-        Usage,
+        default_true, deserialize_null_as_false, is_false, is_true, validate_stop, CachePartition,
+        ChatLogProbs, ContentPart, Function, FunctionCall, FunctionChoice, GenerationRequest,
+        ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice,
+        ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
 use crate::{
     builders::{ChatCompletionResponseBuilder, ChatCompletionStreamResponseBuilder},
+    ext::kimi::KimiSystemExt,
     validated::Normalizable,
 };
 
@@ -28,8 +29,12 @@ use crate::{
 pub enum ChatMessage {
     #[serde(rename = "system")]
     System {
+        /// Defaults to empty text: K3 tools-only system messages omit content entirely
+        #[serde(default)]
         content: MessageContent,
         name: Option<String>,
+        #[serde(flatten)]
+        ext: KimiSystemExt,
     },
     #[serde(rename = "user")]
     User {
@@ -64,6 +69,12 @@ pub enum ChatMessage {
 pub enum MessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+}
+
+impl Default for MessageContent {
+    fn default() -> Self {
+        MessageContent::Text(String::new())
+    }
 }
 
 impl MessageContent {
@@ -285,15 +296,15 @@ pub struct ChatCompletionRequest {
     pub stop_token_ids: Option<Vec<u32>>,
 
     /// Skip trimming stop tokens from output
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub no_stop_trim: bool,
 
     /// Ignore end-of-sequence tokens during generation
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub ignore_eos: bool,
 
     /// Continue generating from final assistant message
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub continue_final_message: bool,
 
     /// Skip special tokens during detokenization
@@ -307,18 +318,18 @@ pub struct ChatCompletionRequest {
     pub session_params: Option<HashMap<String, Value>>,
 
     /// Separate reasoning content from final answer (O1-style models)
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub separate_reasoning: bool,
 
     /// Stream reasoning tokens during generation
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub stream_reasoning: bool,
 
     /// Chat template kwargs
     pub chat_template_kwargs: Option<HashMap<String, Value>>,
 
     /// Return model hidden states
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub return_hidden_states: bool,
 
     /// Random seed for sampling for deterministic outputs
@@ -467,14 +478,21 @@ fn validate_chat_cross_parameters(
         }
     }
 
-    // 7. Validate tool_choice requires tools (except for "none")
+    // 7. Validate tool_choice requires tools — except "none" and "auto", which are valid without tools
     if let Some(ref tool_choice) = req.tool_choice {
-        let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+        // Dynamic tools on system messages count as tools (Kimi K3)
+        let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty())
+            || req.messages.iter().any(|m| {
+                matches!(m, ChatMessage::System { ext, .. }
+                    if ext.tools.as_ref().is_some_and(|t| !t.is_empty()))
+            });
 
-        // Check if tool_choice is anything other than "none"
-        let is_some_choice = !matches!(tool_choice, ToolChoice::Value(ToolChoiceValue::None));
+        let requires_tools = !matches!(
+            tool_choice,
+            ToolChoice::Value(ToolChoiceValue::None) | ToolChoice::Value(ToolChoiceValue::Auto)
+        );
 
-        if is_some_choice && !has_tools {
+        if requires_tools && !has_tools {
             let mut e = validator::ValidationError::new("tool_choice_requires_tools");
             e.message = Some("Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.".into());
             return Err(e);
@@ -631,8 +649,22 @@ impl Normalizable for ChatCompletionRequest {
 // ============================================================================
 
 impl GenerationRequest for ChatCompletionRequest {
+    fn rid(&self) -> Option<&str> {
+        self.rid.as_deref()
+    }
+
     fn is_stream(&self) -> bool {
         self.stream
+    }
+
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition {
+            // Engine extensions carried in the passthrough map, not typed
+            // fields: vLLM/SGLang `cache_salt`, SGLang `extra_key`.
+            cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
+            extra_key: self.other.get("extra_key").and_then(Value::as_str),
+            lora_path: self.lora_path.as_deref(),
+        }
     }
 
     fn get_model(&self) -> Option<&str> {
@@ -801,7 +833,7 @@ pub struct ChatStreamChoice {
 mod tests {
     use serde_json::{json, Value};
 
-    use super::{thinking_from_reasoning_effort, ChatCompletionRequest};
+    use super::{thinking_from_reasoning_effort, ChatCompletionRequest, GenerationRequest};
 
     fn request_with_output_fields(fields: &[(&str, Value)]) -> ChatCompletionRequest {
         let mut value = json!({
@@ -813,6 +845,57 @@ mod tests {
             object.insert((*name).to_string(), field_value.clone());
         }
         serde_json::from_value(value).expect("request must deserialize")
+    }
+
+    #[test]
+    fn default_sglang_flags_are_omitted_and_absent_reads_defaults() {
+        let request = request_with_output_fields(&[]);
+        let value = serde_json::to_value(&request).expect("serialize");
+        for field in [
+            "no_stop_trim",
+            "ignore_eos",
+            "continue_final_message",
+            "return_hidden_states",
+            "separate_reasoning",
+            "stream_reasoning",
+        ] {
+            assert!(value.get(field).is_none(), "{field} serialized at default");
+        }
+
+        let back: ChatCompletionRequest = serde_json::from_value(value).expect("roundtrip");
+        assert!(!back.no_stop_trim);
+        assert!(!back.ignore_eos);
+        assert!(!back.continue_final_message);
+        assert!(!back.return_hidden_states);
+        assert!(back.separate_reasoning);
+        assert!(back.stream_reasoning);
+    }
+
+    #[test]
+    fn non_default_sglang_flags_round_trip() {
+        let request = request_with_output_fields(&[
+            ("no_stop_trim", json!(true)),
+            ("ignore_eos", json!(true)),
+            ("continue_final_message", json!(true)),
+            ("return_hidden_states", json!(true)),
+            ("separate_reasoning", json!(false)),
+            ("stream_reasoning", json!(false)),
+        ]);
+        let value = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(value["no_stop_trim"], true);
+        assert_eq!(value["ignore_eos"], true);
+        assert_eq!(value["continue_final_message"], true);
+        assert_eq!(value["return_hidden_states"], true);
+        assert_eq!(value["separate_reasoning"], false);
+        assert_eq!(value["stream_reasoning"], false);
+
+        let back: ChatCompletionRequest = serde_json::from_value(value).expect("roundtrip");
+        assert!(back.no_stop_trim);
+        assert!(back.ignore_eos);
+        assert!(back.continue_final_message);
+        assert!(back.return_hidden_states);
+        assert!(!back.separate_reasoning);
+        assert!(!back.stream_reasoning);
     }
 
     #[test]
@@ -888,5 +971,28 @@ mod tests {
             serde_json::from_value(value).expect("request must deserialize");
         let tools = request.tools.expect("tools must be present");
         assert_eq!(tools[0].function.parameters, json!({}));
+    }
+
+    #[test]
+    fn cache_partition_reads_passthrough_salt_and_typed_lora() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "cache_salt": "tenant-a",
+            "extra_key": "k",
+            "lora_path": "adapter"
+        }))
+        .unwrap();
+        let partition = request.cache_partition();
+        assert_eq!(partition.cache_salt, Some("tenant-a"));
+        assert_eq!(partition.extra_key, Some("k"));
+        assert_eq!(partition.lora_path, Some("adapter"));
+
+        let bare: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(bare.cache_partition().is_empty());
     }
 }

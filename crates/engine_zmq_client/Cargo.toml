@@ -34,7 +34,6 @@ half.workspace = true
 # Transport + async runtime.
 zeromq.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros"] }
-tokio-util.workspace = true
 futures.workspace = true
 parking_lot.workspace = true
 

@@ -35,3 +35,28 @@ class TestGetServerInfoResponseDataParallelSize:
         info = vllm_engine_pb2.GetServerInfoResponse(data_parallel_size=4)
         parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(info.SerializeToString())
         assert parsed.data_parallel_size == 4
+
+
+class TestTokenSpeedGenerateRequestDataParallelRank:
+    """TokenSpeed mirror of the vLLM pin-field presence contract (field 12)."""
+
+    def test_unset_by_default(self):
+        from smg_grpc_proto.generated import tokenspeed_scheduler_pb2
+
+        request = tokenspeed_scheduler_pb2.GenerateRequest()
+        assert not request.HasField("data_parallel_rank")
+
+    def test_rank_zero_is_distinguishable_from_unset(self):
+        from smg_grpc_proto.generated import tokenspeed_scheduler_pb2
+
+        request = tokenspeed_scheduler_pb2.GenerateRequest(data_parallel_rank=0)
+        assert request.HasField("data_parallel_rank")
+        assert request.data_parallel_rank == 0
+
+    def test_set_rank_roundtrips(self):
+        from smg_grpc_proto.generated import tokenspeed_scheduler_pb2
+
+        request = tokenspeed_scheduler_pb2.GenerateRequest(data_parallel_rank=3)
+        parsed = tokenspeed_scheduler_pb2.GenerateRequest.FromString(request.SerializeToString())
+        assert parsed.HasField("data_parallel_rank")
+        assert parsed.data_parallel_rank == 3

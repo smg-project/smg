@@ -438,7 +438,12 @@ class TestToolCallingCloud:
         assert message.content is not None
         text_parts = [part.text for part in message.content if part.type == "output_text"]
         full_text = " ".join(text_parts).lower()
-        assert "baby otter" in full_text or "aquarius" in full_text
+        # "baby otter" is the sentinel injected via function_call_output above;
+        # its presence proves the tool result was actually consumed. ("aquarius"
+        # would be satisfiable from the prompt alone.)
+        assert "baby otter" in full_text, (
+            f"Tool-output sentinel 'baby otter' missing from final response: {full_text!r}"
+        )
 
     def test_mcp_basic_tool_call(self, model, api_client):
         """Test basic MCP tool call (non-streaming)."""

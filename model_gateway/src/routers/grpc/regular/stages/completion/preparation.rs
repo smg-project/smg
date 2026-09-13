@@ -24,7 +24,7 @@ pub(crate) struct CompletionPreparationStage;
 
 #[async_trait]
 impl PipelineStage for CompletionPreparationStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         let request = ctx.completion_request_arc();
 
         let tokenizer =
@@ -84,7 +84,7 @@ impl PipelineStage for CompletionPreparationStage {
 
         ctx.state.response.stop_decoder = Some(stop_decoder);
 
-        Ok(None)
+        Ok(())
     }
 
     fn name(&self) -> &'static str {

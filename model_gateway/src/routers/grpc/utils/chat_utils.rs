@@ -12,12 +12,15 @@ use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
     stop::StopSequenceDecoderBuilder,
-    traits::{Encoding, Tokenizer},
+    traits::{Encoding, PromptEncoding, Tokenizer},
     StopSequenceDecoder,
 };
 use openai_protocol::{
-    chat::{ChatCompletionRequest, ChatMessage},
-    common::{FunctionCallResponse, StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue},
+    chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+    common::{
+        ContentPart, FunctionCallResponse, StringOrArray, Tool, ToolCall, ToolChoice,
+        ToolChoiceValue,
+    },
     generate::GenerateFinishReason,
 };
 use serde_json::{json, Value};
@@ -114,25 +117,50 @@ fn encode_permits() -> &'static Semaphore {
     })
 }
 
-/// Tokenize off the async worker threads so CPU-bound `encode` cannot stall the
-/// runtime, bounded by [`encode_permits`] so concurrent offloaded encodes cannot
-/// oversubscribe the CPU. Small inputs are encoded inline to avoid the offload
-/// round-trip dominating.
-pub(crate) async fn encode_blocking(
-    tokenizer: Arc<dyn Tokenizer>,
-    text: String,
-    add_special_tokens: bool,
-) -> anyhow::Result<Encoding> {
-    if text.len() < ENCODE_OFFLOAD_MIN_BYTES {
-        return tokenizer.encode(&text, add_special_tokens);
+/// Run CPU-bound tokenization off the async worker threads so it cannot stall
+/// the runtime, bounded by [`encode_permits`] so concurrent offloaded encodes
+/// cannot oversubscribe the CPU. Inputs below the threshold run inline to avoid
+/// the offload round-trip dominating.
+async fn offload<F>(len: usize, encode: F) -> anyhow::Result<Encoding>
+where
+    F: FnOnce() -> anyhow::Result<Encoding> + Send + 'static,
+{
+    if len < ENCODE_OFFLOAD_MIN_BYTES {
+        return encode();
     }
     let _permit = encode_permits()
         .acquire()
         .await
         .map_err(|e| anyhow!("encode semaphore closed: {e}"))?;
-    tokio::task::spawn_blocking(move || tokenizer.encode(&text, add_special_tokens))
+    tokio::task::spawn_blocking(encode)
         .await
         .map_err(|e| anyhow!("tokenization task failed: {e}"))?
+}
+
+/// Tokenize `text` through the offload policy of [`offload`].
+pub(crate) async fn encode_blocking(
+    tokenizer: Arc<dyn Tokenizer>,
+    text: String,
+    add_special_tokens: bool,
+) -> anyhow::Result<Encoding> {
+    offload(text.len(), move || {
+        tokenizer.encode(&text, add_special_tokens)
+    })
+    .await
+}
+
+/// Tokenize a rendered chat prompt the way its renderer said to: a deferred
+/// encode runs as the job the renderer prepared, anything else encodes `text`.
+/// Both take the same offload policy as [`encode_blocking`].
+pub(crate) async fn encode_prompt_blocking(
+    tokenizer: Arc<dyn Tokenizer>,
+    text: &str,
+    encoding: PromptEncoding,
+) -> anyhow::Result<Encoding> {
+    match encoding {
+        PromptEncoding::FromText => encode_blocking(tokenizer, text.to_string(), false).await,
+        PromptEncoding::Deferred(job) => offload(text.len(), move || job.run()).await,
+    }
 }
 
 /// Process tool call arguments in messages
@@ -220,6 +248,34 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
         combined.extend(template_kwargs.clone());
     }
     combined
+}
+
+/// gRPC backends require content parts the gateway knows how to render.
+pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<(), String> {
+    for message in messages {
+        let content = match message {
+            ChatMessage::System { content, .. }
+            | ChatMessage::User { content, .. }
+            | ChatMessage::Tool { content, .. }
+            | ChatMessage::Developer { content, .. } => Some(content),
+            ChatMessage::Assistant { content, .. } => content.as_ref(),
+            ChatMessage::Function { .. } => None,
+        };
+        if let Some(MessageContent::Parts(parts)) = content {
+            for part in parts {
+                if let ContentPart::Unknown(fields) = part {
+                    let type_name = fields
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<missing>");
+                    return Err(format!(
+                        "Unsupported chat content part type {type_name:?} for gRPC backends"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn process_content_format_with_order(
@@ -441,31 +497,52 @@ pub(crate) fn filter_chat_request_by_tool_choice(
 
 /// Process chat messages and apply template (shared by both routers)
 /// Requires HuggingFace tokenizer with chat template support
+///
+/// Returns the flat prompt only. A renderer that must encode the prompt itself
+/// (Kimi-K3) cannot be honored through this entry point; the gRPC pipeline
+/// uses [`process_chat_messages_with_placeholders`] and encodes what it
+/// returns.
 pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
     image_placeholder: Option<&str>,
 ) -> Result<ProcessedMessages, String> {
+    // Bindings call this entry point without the gRPC preparation stage.
+    validate_chat_content_parts(&request.messages)?;
     let placeholder_tokens = image_placeholder.map(|token| {
         let mut placeholders = PlaceholderTokens::default();
         placeholders.insert(Modality::Image, token.to_string());
         placeholders
     });
-    process_chat_messages_with_placeholders(
+    let (processed, encoding) = process_chat_messages_with_placeholders(
         request,
         tokenizer,
         placeholder_tokens.as_ref(),
         MediaPartOrder::MediaFirst,
-    )
+    )?;
+    if matches!(encoding, PromptEncoding::Deferred(_)) {
+        static WARNED: OnceLock<()> = OnceLock::new();
+        WARNED.get_or_init(|| {
+            tracing::warn!(
+                "the tokenizer's renderer encodes prompts itself; a flat encode of \
+                 ProcessedMessages.text may not reproduce its token ids (marker strings \
+                 in message text, BPE merges across attribute-piece boundaries)"
+            );
+        });
+    }
+    Ok(processed)
 }
 
+/// Render the chat prompt. The second element says how the tokenize step must
+/// encode it: [`PromptEncoding::FromText`] for every flat renderer, or the
+/// deferred encode a segment-aware renderer prepared.
 pub(crate) fn process_chat_messages_with_placeholders(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
-) -> Result<ProcessedMessages, String> {
-    let formatted_text = {
+) -> Result<(ProcessedMessages, PromptEncoding), String> {
+    let rendered = {
         // Get content format and transform messages accordingly
         let content_format = tokenizer.chat_template_content_format();
         let mut transformed_messages = process_content_format_with_order(
@@ -523,10 +600,13 @@ pub(crate) fn process_chat_messages_with_placeholders(
         {
             // Pop the last message to handle it separately — guarded by !is_empty() check above
             let Some(last_msg) = transformed_messages.pop() else {
-                return Ok(ProcessedMessages {
-                    text: String::new(),
-                    stop_sequences: request.stop.clone(),
-                });
+                return Ok((
+                    ProcessedMessages {
+                        text: String::new(),
+                        stop_sequences: request.stop.clone(),
+                    },
+                    PromptEncoding::FromText,
+                ));
             };
             last_msg
                 .get("content")
@@ -536,23 +616,25 @@ pub(crate) fn process_chat_messages_with_placeholders(
             None
         };
 
-        // Apply chat template with the (now possibly shorter) list of messages
-        let rendered = tokenizer
-            .apply_chat_template(&transformed_messages, params)
-            .map_err(|e| format!("Failed to apply chat template: {e}"))?;
-
-        // Append assistant prefix if we have one
-        if let Some(prefix) = assistant_prefix {
-            format!("{rendered}{prefix}")
-        } else {
-            rendered
-        }
+        // Apply chat template with the (now possibly shorter) list of messages.
+        // The prefill goes into the same call so the text and its encoding are
+        // produced together and cannot drift apart.
+        tokenizer
+            .apply_chat_template_with_encoding(
+                &transformed_messages,
+                params,
+                assistant_prefix.as_deref(),
+            )
+            .map_err(|e| format!("Failed to apply chat template: {e}"))?
     };
 
-    Ok(ProcessedMessages {
-        text: formatted_text,
-        stop_sequences: request.stop.clone(),
-    })
+    Ok((
+        ProcessedMessages {
+            text: rendered.text,
+            stop_sequences: request.stop.clone(),
+        },
+        rendered.encoding,
+    ))
 }
 
 /// Create a StopSequenceDecoder from stop parameters
@@ -808,6 +890,57 @@ mod tests {
     }
 
     #[test]
+    fn unknown_chat_content_parts_are_rejected_in_every_role() {
+        for role in ["system", "user", "assistant", "tool", "developer"] {
+            let message: ChatMessage = serde_json::from_value(json!({
+                "role": role,
+                "tool_call_id": "call_1",
+                "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "vendor_media", "payload": {"id": "media_1"}}
+                ]
+            }))
+            .unwrap();
+            let error = validate_chat_content_parts(&[message]).unwrap_err();
+            assert!(error.contains("vendor_media"), "{role}: {error}");
+            assert!(error.contains("gRPC"), "{role}: {error}");
+        }
+    }
+
+    #[test]
+    fn process_chat_messages_rejects_unknown_content_parts() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Describe this attachment"},
+                {"type": "vendor_media", "payload": "media_1"}
+            ]}]
+        }))
+        .unwrap();
+        let tokenizer = llm_tokenizer::MockTokenizer::new();
+        let error = process_chat_messages(&request, &tokenizer, None).unwrap_err();
+        assert!(error.contains("vendor_media"));
+    }
+
+    #[test]
+    fn known_chat_content_parts_are_accepted() {
+        let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+                {"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}},
+                {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}},
+                {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
+            ]},
+            {"role": "assistant", "content": null},
+            {"role": "function", "name": "lookup", "content": "result"}
+        ]))
+        .unwrap();
+        assert!(validate_chat_content_parts(&messages).is_ok());
+    }
+
+    #[test]
     fn test_transform_messages_string_format() {
         let messages = vec![ChatMessage::User {
             content: MessageContent::Parts(vec![
@@ -818,6 +951,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "https://example.com/image.jpg".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
                 ContentPart::Text {
@@ -854,6 +988,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "https://example.com/image.png".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -876,6 +1011,8 @@ mod tests {
                 ContentPart::VideoUrl {
                     video_url: VideoUrl {
                         url: "https://example.com/video.mp4".to_string(),
+                        fps: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -905,6 +1042,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "image".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
                 ContentPart::AudioUrl {
@@ -1004,6 +1142,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "https://example.com/image.jpg".to_string(),
                         detail: Some("high".to_string()),
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -1056,6 +1195,7 @@ mod tests {
     fn test_transform_messages_multiple_messages() {
         let messages = vec![
             ChatMessage::System {
+                ext: Default::default(),
                 content: MessageContent::Text("System prompt".to_string()),
                 name: None,
             },
@@ -1068,6 +1208,7 @@ mod tests {
                         image_url: ImageUrl {
                             url: "https://example.com/image.jpg".to_string(),
                             detail: None,
+                            max_long_side_pixel: None,
                         },
                     },
                 ]),
@@ -1101,6 +1242,7 @@ mod tests {
                 image_url: ImageUrl {
                     url: "https://example.com/image.jpg".to_string(),
                     detail: None,
+                    max_long_side_pixel: None,
                 },
             }]),
             name: None,
@@ -1133,6 +1275,7 @@ mod tests {
                         image_url: ImageUrl {
                             url: "https://example.com/image.jpg".to_string(),
                             detail: Some("low".to_string()),
+                            max_long_side_pixel: None,
                         },
                     },
                 ]),
@@ -1177,6 +1320,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "data:image/jpeg;base64,XXX".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -1202,6 +1346,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "data:image/jpeg;base64,XXX".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -1230,6 +1375,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "i1".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
                 ContentPart::Text {
@@ -1239,6 +1385,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "i2".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -1265,6 +1412,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "image".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -1315,6 +1463,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "image".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -1427,6 +1576,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "data:image/jpeg;base64,XXX".to_string(),
                         detail: None,
+                        max_long_side_pixel: None,
                     },
                 },
             ]),
@@ -1514,5 +1664,142 @@ mod tests {
         let id = generate_tool_call_id("gpt-4o", "get_weather", 0, 0);
         assert!(id.starts_with("call_"), "got: {id}");
         assert!(!id.contains("get_weather"), "got: {id}");
+    }
+
+    // --- render -> encode contract -------------------------------------------
+
+    fn prefill_request() -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "continue_final_message": true,
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Sure"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    #[test]
+    fn flat_renderer_joins_the_prefill_and_reports_from_text() {
+        let tokenizer = llm_tokenizer::MockTokenizer::new();
+        let (processed, encoding) = process_chat_messages_with_placeholders(
+            &prefill_request(),
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        assert_eq!(processed.text, "user: Hello\nassistant: Sure");
+        assert!(matches!(encoding, PromptEncoding::FromText));
+
+        // The tokenize step encodes the text exactly as before.
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(tokenizer);
+        let ids = block_on(encode_prompt_blocking(
+            tokenizer.clone(),
+            &processed.text,
+            encoding,
+        ))
+        .unwrap();
+        assert_eq!(
+            ids.token_ids(),
+            tokenizer
+                .encode(&processed.text, false)
+                .unwrap()
+                .token_ids()
+        );
+    }
+
+    #[test]
+    fn deferred_renderer_gets_the_prefill_and_its_job_runs_in_the_tokenize_step() {
+        let tokenizer = llm_tokenizer::MockTokenizer::new().with_deferred_chat_ids(vec![7, 8, 9]);
+        let (processed, encoding) = process_chat_messages_with_placeholders(
+            &prefill_request(),
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        assert_eq!(
+            processed.text, "user: Hello\nassistant: Sure",
+            "the prefill is passed into the render call"
+        );
+        assert!(matches!(encoding, PromptEncoding::Deferred(_)));
+
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(tokenizer);
+        let ids = block_on(encode_prompt_blocking(tokenizer, &processed.text, encoding)).unwrap();
+        assert_eq!(ids.token_ids(), &[7, 8, 9]);
+    }
+
+    #[test]
+    fn deferred_encode_takes_the_offload_path_for_large_prompts() {
+        use std::{
+            sync::Mutex,
+            thread::{self, ThreadId},
+        };
+        // The job records the thread it ran on. `block_on` polls on this
+        // thread, so an offloaded job runs somewhere else.
+        let ran_on: Arc<Mutex<Option<ThreadId>>> = Arc::new(Mutex::new(None));
+        let probe = {
+            let ran_on = ran_on.clone();
+            move || *ran_on.lock().unwrap() = Some(thread::current().id())
+        };
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            llm_tokenizer::MockTokenizer::new()
+                .with_deferred_chat_ids(vec![1, 2])
+                .with_deferred_chat_probe(probe),
+        );
+        let render = |content: &str| {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": content}]
+            }))
+            .unwrap();
+            process_chat_messages_with_placeholders(
+                &request,
+                &*tokenizer,
+                None,
+                MediaPartOrder::MediaFirst,
+            )
+            .unwrap()
+        };
+        let encode = |text: &str, encoding: PromptEncoding| {
+            block_on(encode_prompt_blocking(tokenizer.clone(), text, encoding)).unwrap()
+        };
+
+        let (processed, encoding) = render(&"x".repeat(ENCODE_OFFLOAD_MIN_BYTES * 4));
+        assert!(processed.text.len() >= ENCODE_OFFLOAD_MIN_BYTES);
+        assert_eq!(encode(&processed.text, encoding).token_ids(), &[1, 2]);
+        let offloaded = ran_on.lock().unwrap().take().expect("the job ran");
+        assert_ne!(
+            offloaded,
+            thread::current().id(),
+            "a large deferred encode is offloaded"
+        );
+
+        let (processed, encoding) = render("hi");
+        assert!(processed.text.len() < ENCODE_OFFLOAD_MIN_BYTES);
+        encode(&processed.text, encoding);
+        let inline = ran_on.lock().unwrap().take().expect("the job ran");
+        assert_eq!(
+            inline,
+            thread::current().id(),
+            "a small deferred encode runs inline"
+        );
+    }
+
+    #[test]
+    fn public_entry_point_keeps_the_flat_text_for_a_deferred_renderer() {
+        let tokenizer = llm_tokenizer::MockTokenizer::new().with_deferred_chat_ids(vec![7]);
+        let processed = process_chat_messages(&prefill_request(), &tokenizer, None).unwrap();
+        assert_eq!(processed.text, "user: Hello\nassistant: Sure");
     }
 }

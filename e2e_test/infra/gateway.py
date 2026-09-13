@@ -12,7 +12,12 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from .constants import DEFAULT_HOST, DEFAULT_ROUTER_TIMEOUT, ENV_SHOW_ROUTER_LOGS
+from .constants import (
+    DEFAULT_HOST,
+    DEFAULT_ROUTER_TIMEOUT,
+    ENV_SHOW_ROUTER_LOGS,
+    get_zmq_engine_count,
+)
 from .process_utils import (
     get_open_port,
     kill_process_tree,
@@ -98,6 +103,10 @@ class Gateway:
         self.policy: str = "round_robin"
         self.log_level: str = "warn"
         self.log_dir: str | None = None
+        # The leg workers a PD/EPD gateway was started with (tests kill and restart them).
+        self.encode_workers: list[Worker] = []
+        self.prefill_workers: list[Worker] = []
+        self.decode_workers: list[Worker] = []
         self.pd_mode: bool = False
         self.igw_mode: bool = False
         self.cloud_mode: bool = False
@@ -174,6 +183,9 @@ class Gateway:
             encodes = encode_workers or []
             prefills = prefill_workers or []
             decodes = decode_workers or []
+            self.encode_workers = list(encodes)
+            self.prefill_workers = list(prefills)
+            self.decode_workers = list(decodes)
             mode_args = build_epd_mode_args(encodes, prefills, decodes, encode_policy)
             self._launch(
                 mode_args=mode_args,
@@ -190,6 +202,8 @@ class Gateway:
             self.igw_mode = False
             prefills = prefill_workers or []
             decodes = decode_workers or []
+            self.prefill_workers = list(prefills)
+            self.decode_workers = list(decodes)
 
             mode_args = ["--pd-disaggregation"]
             for pf in prefills:
@@ -235,6 +249,11 @@ class Gateway:
             # cannot probe the backend from the ipc:// URL — pin it explicitly.
             if backend is not None:
                 mode_args += ["--backend", backend]
+            # Grouped ZMQ lane: the handshake must await every engine the
+            # worker launched (see get_zmq_engine_count).
+            engine_count = get_zmq_engine_count()
+            if engine_count > 1:
+                mode_args += ["--zmq-engine-count", str(engine_count)]
             self._launch(
                 mode_args=mode_args,
                 timeout=timeout,
@@ -399,18 +418,29 @@ class Gateway:
                 "connection_mode": w.get("connection_mode"),
                 "priority": w.get("priority"),
                 "cost": w.get("cost"),
+                "pd_pairing": w.get("pd_pairing"),
             },
         )
 
-    def list_workers(self, timeout: float = 5.0) -> list[WorkerInfo]:
-        """List all workers connected to the gateway."""
+    def list_workers(self, timeout: float = 5.0, strict: bool = False) -> list[WorkerInfo]:
+        """List all workers connected to the gateway.
+
+        With ``strict=True``, request failures and non-200 responses raise
+        instead of degrading to ``[]`` — required when an empty list is the
+        assertion target (e.g. "worker was removed"), where a swallowed error
+        would pass vacuously.
+        """
         try:
             resp = httpx.get(f"{self.base_url}/workers", timeout=timeout)
             if resp.status_code == 200:
                 data = resp.json()
                 return [self._worker_from_api_response(w) for w in data.get("workers", [])]
+            if strict:
+                raise RuntimeError(f"GET /workers returned {resp.status_code}: {resp.text}")
             return []
         except (httpx.RequestError, httpx.TimeoutException):
+            if strict:
+                raise
             return []
 
     def add_worker(
@@ -420,15 +450,23 @@ class Gateway:
         wait_ready: bool = True,
         ready_timeout: float = 60.0,
         labels: dict[str, str] | None = None,
+        worker_type: str | None = None,
+        bootstrap_port: int | None = None,
     ) -> tuple[bool, str | None]:
         """Add a worker to the gateway. Returns (success, worker_id or error).
 
         ``labels`` are attached to the worker's ``WorkerSpec`` (e.g.
         ``{"realtime": "true"}`` to make it eligible for realtime routing).
+        ``worker_type`` (``"prefill"``/``"decode"``/``"encode"``) and the
+        prefill ``bootstrap_port`` register a disaggregated leg at runtime.
         """
         body: dict = {"url": worker_url}
         if labels:
             body["labels"] = labels
+        if worker_type:
+            body["worker_type"] = worker_type
+        if bootstrap_port is not None:
+            body["bootstrap_port"] = bootstrap_port
         try:
             resp = httpx.post(
                 f"{self.base_url}/workers",
@@ -467,8 +505,11 @@ class Gateway:
                 f"{self.base_url}/workers/{worker_id}",
                 timeout=timeout,
             )
-            if resp.status_code == 200:
-                return True, "Worker removed"
+            # 200 = removed synchronously; 202 = removal accepted and queued
+            # for background processing. Either means the request succeeded —
+            # callers that need completion poll list_workers for absence.
+            if resp.status_code in (200, 202):
+                return True, resp.text
             return False, resp.text
         except (httpx.RequestError, httpx.TimeoutException) as e:
             return False, str(e)

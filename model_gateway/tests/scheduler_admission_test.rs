@@ -7,8 +7,8 @@
 //!
 //! | Outcome              | Status | Extra                                   |
 //! |----------------------|--------|-----------------------------------------|
-//! | queue full           | 429    | `X-SMG-Error-Code: scheduler_queue_full`|
-//! | queue timeout        | 408    | `X-SMG-Error-Code: scheduler_queue_timeout` |
+//! | queue full           | 429    | `X-SMG-Error-Code: scheduler_queue_full`, `Retry-After: 2` |
+//! | queue timeout        | 503    | `X-SMG-Error-Code: scheduler_queue_timeout`, `Retry-After: 2` |
 //! | preempted (pre-TTFT) | 503    | `X-SMG-Preempted: true`, `Retry-After: 1` |
 //!
 //! ## How these are made deterministic
@@ -325,6 +325,13 @@ async fn queue_full_returns_429() {
         "queue full must map to 429"
     );
     assert_eq!(error_code(&resp).as_deref(), Some("scheduler_queue_full"));
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
+        Some("2"),
+        "queue-full 429 must carry Retry-After: 2"
+    );
     let body = body_json(resp).await;
     assert_eq!(body["error"]["code"], "scheduler_queue_full");
 
@@ -337,15 +344,16 @@ async fn queue_full_returns_429() {
     ctx.shutdown().await;
 }
 
-/// Queue timeout → 408. Capacity 1, occupied by a held request; the probe
-/// enqueues (queue_size 1) but the slot never frees, so it ages out.
+/// Queue timeout → 503 + Retry-After. Capacity 1, occupied by a held
+/// request; the probe enqueues (queue_size 1) but the slot never frees, so
+/// it ages out.
 #[expect(
     clippy::disallowed_methods,
     reason = "test infra: holds a request open in a spawned task"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn queue_timeout_returns_408() {
+async fn queue_timeout_returns_503() {
     let mut yaml = SchedulerYaml::base();
     yaml.default.queue_size = 4;
     yaml.default.queue_timeout_secs = 1; // short, but the mechanism — not a race
@@ -370,8 +378,15 @@ async fn queue_timeout_returns_408() {
     let resp = send(&app, generate_request("probe", None)).await;
     assert_eq!(
         resp.status(),
-        StatusCode::REQUEST_TIMEOUT,
-        "queue timeout must map to 408"
+        StatusCode::SERVICE_UNAVAILABLE,
+        "queue timeout must map to 503"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
+        Some("2"),
+        "queue-timeout 503 must carry Retry-After: 2"
     );
     assert_eq!(
         error_code(&resp).as_deref(),
@@ -556,7 +571,7 @@ async fn tenant_clamp_strips_system_header_of_preemption_power() {
 async fn slot_frees_after_response_drains() {
     let mut yaml = SchedulerYaml::base();
     // A tiny queue + short timeout means a *leaked* slot would surface as a
-    // fast 408 rather than hanging the test.
+    // fast 503 rather than hanging the test.
     yaml.default.queue_size = 1;
     yaml.default.queue_timeout_secs = 2;
     let yaml_file = write_scheduler_yaml(&yaml);

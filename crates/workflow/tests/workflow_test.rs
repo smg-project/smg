@@ -9,11 +9,15 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::time::sleep;
+use tokio::{
+    sync::Notify,
+    time::{sleep, timeout},
+};
 use wfaas::{
-    BackoffStrategy, FailureAction, LoggingSubscriber, RetryPolicy, StepDefinition, StepExecutor,
-    StepId, StepResult, StepStatus, ValidationError, WorkflowContext, WorkflowData,
-    WorkflowDefinition, WorkflowEngine, WorkflowError, WorkflowResult, WorkflowStatus,
+    BackoffStrategy, FailureAction, LoggingSubscriber, RetryPolicy, StateStore, StepDefinition,
+    StepExecutor, StepId, StepResult, StepStatus, ValidationError, WorkflowContext, WorkflowData,
+    WorkflowDefinition, WorkflowEngine, WorkflowError, WorkflowInstanceId, WorkflowResult,
+    WorkflowStatus,
 };
 
 /// Test workflow data type for integration tests.
@@ -1513,4 +1517,204 @@ async fn test_skip_does_not_clobber_parallel_context_mutation() {
         Some("survived"),
         "a Skip step clobbered a parallel step's committed context mutation"
     );
+}
+
+// ============================================================================
+// Terminal State Reclamation Tests
+// ============================================================================
+
+/// Poll until the workflow reaches `Completed`, bounded at 1s total.
+async fn wait_until_completed(
+    engine: &WorkflowEngine<TestWorkflowData>,
+    instance_id: WorkflowInstanceId,
+) -> bool {
+    for _ in 0..50 {
+        if engine
+            .get_status(instance_id)
+            .await
+            .is_ok_and(|state| state.status == WorkflowStatus::Completed)
+        {
+            return true;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+fn single_step_workflow(id: &str) -> WorkflowDefinition<TestWorkflowData> {
+    WorkflowDefinition::new(id, "Single Step").add_step(StepDefinition::new(
+        "step1",
+        "Step 1",
+        Arc::new(AlwaysSucceedStep),
+    ))
+}
+
+struct BlockUntilNotifiedStep {
+    notify: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for BlockUntilNotifiedStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        self.notify.notified().await;
+        Ok(StepResult::Success)
+    }
+}
+
+fn blocked_workflow(id: &str, notify: Arc<Notify>) -> WorkflowDefinition<TestWorkflowData> {
+    WorkflowDefinition::new(id, "Blocked").add_step(StepDefinition::new(
+        "blocked_step",
+        "Blocked Step",
+        Arc::new(BlockUntilNotifiedStep { notify }),
+    ))
+}
+
+#[tokio::test]
+async fn test_sweep_reclaims_state_after_waiter_timeout() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let notify = Arc::new(Notify::new());
+
+    let workflow = blocked_workflow("waiter_timeout", Arc::clone(&notify));
+    let workflow_id = workflow.id.clone();
+    engine.register_workflow(workflow).unwrap();
+    let instance_id = engine
+        .start_workflow(workflow_id, TestWorkflowData::default())
+        .await
+        .unwrap();
+
+    let err = engine
+        .wait_for_completion(instance_id, "test", Duration::from_millis(50))
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("timeout"),
+        "expected timeout error, got: {err}"
+    );
+
+    // The timed-out waiter must not remove a still-running workflow's state,
+    // and the sweep must not reclaim non-terminal state even with a zero TTL.
+    assert_eq!(
+        engine.get_status(instance_id).await.unwrap().status,
+        WorkflowStatus::Running
+    );
+    assert_eq!(
+        engine
+            .state_store()
+            .cleanup_old_workflows(Duration::ZERO)
+            .await,
+        0
+    );
+
+    notify.notify_one();
+    assert!(
+        wait_until_completed(&engine, instance_id).await,
+        "workflow did not complete after notify"
+    );
+
+    // The workflow outlived its waiter; the sweep reclaims the terminal state.
+    assert_eq!(
+        engine
+            .state_store()
+            .cleanup_old_workflows(Duration::ZERO)
+            .await,
+        1
+    );
+    assert!(matches!(
+        engine.get_status(instance_id).await,
+        Err(WorkflowError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_waiter_timeout_reclaims_already_terminal_state() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let notify = Arc::new(Notify::new());
+
+    let workflow = blocked_workflow("timeout_terminal", Arc::clone(&notify));
+    let workflow_id = workflow.id.clone();
+    engine.register_workflow(workflow).unwrap();
+    let instance_id = engine
+        .start_workflow(workflow_id, TestWorkflowData::default())
+        .await
+        .unwrap();
+
+    // The waiter sees Running at t=0 and sleeps 100ms, past its 50ms timeout;
+    // the workflow terminates mid-sleep (notify at t=20ms), so the timeout
+    // branch runs against an already-terminal state and must reclaim it.
+    let (result, ()) = tokio::join!(
+        engine.wait_for_completion(instance_id, "test", Duration::from_millis(50)),
+        async {
+            sleep(Duration::from_millis(20)).await;
+            notify.notify_one();
+        }
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("timeout"),
+        "expected timeout error, got: {err}"
+    );
+    assert!(matches!(
+        engine.get_status(instance_id).await,
+        Err(WorkflowError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_wait_for_completion_removes_terminal_state() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    let workflow = single_step_workflow("terminal_cleanup");
+    let workflow_id = workflow.id.clone();
+    engine.register_workflow(workflow).unwrap();
+    let instance_id = engine
+        .start_workflow(workflow_id, TestWorkflowData::default())
+        .await
+        .unwrap();
+
+    engine
+        .wait_for_completion(instance_id, "test", Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        engine.get_status(instance_id).await,
+        Err(WorkflowError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_cleanup_task_reclaims_state_and_stops_on_shutdown() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let handle = engine.start_cleanup_task(Some(Duration::ZERO), Some(Duration::from_millis(20)));
+
+    let workflow = single_step_workflow("cleanup_task");
+    let workflow_id = workflow.id.clone();
+    engine.register_workflow(workflow).unwrap();
+    let instance_id = engine
+        .start_workflow(workflow_id, TestWorkflowData::default())
+        .await
+        .unwrap();
+
+    // No waiter runs; only the cleanup task can reclaim the terminal state.
+    let mut reclaimed = false;
+    for _ in 0..50 {
+        if matches!(
+            engine.get_status(instance_id).await,
+            Err(WorkflowError::NotFound(_))
+        ) {
+            reclaimed = true;
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(reclaimed, "cleanup task did not reclaim terminal state");
+
+    engine.shutdown();
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("cleanup task did not stop on shutdown")
+        .unwrap();
 }

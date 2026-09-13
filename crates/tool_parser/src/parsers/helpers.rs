@@ -124,6 +124,27 @@ pub fn get_unstreamed_args(
     }])
 }
 
+/// End-of-stream flush: take any text still buffered as a *prospective* tool
+/// call so the caller can emit it as normal content instead of dropping it.
+///
+/// Returns the buffer verbatim when no tool call was ever announced this
+/// request (`current_tool_id == -1`): the buffered text was only ever a
+/// tool-call *candidate* (e.g. a bare `{` prefix or a partial start marker)
+/// that never materialized, so it is content. Once a tool call has been
+/// announced (`current_tool_id >= 0`), the buffered tail is tool-call syntax
+/// (separators, closing brackets, or a partially-streamed call whose
+/// remaining arguments are recovered via [`get_unstreamed_args`]) and is
+/// discarded — matching the non-streaming path, which drops trailing
+/// non-JSON text once tool calls were extracted.
+pub fn take_unstreamed_normal_text(buffer: &mut String, current_tool_id: i32) -> String {
+    let text = std::mem::take(buffer);
+    if current_tool_id == -1 {
+        text
+    } else {
+        String::new()
+    }
+}
+
 /// Check if a buffer ends with a partial occurrence of a token
 /// Returns Some(length) if there's a partial match, None otherwise
 pub fn ends_with_partial_token(buffer: &str, token: &str) -> Option<usize> {
@@ -244,59 +265,130 @@ pub(crate) fn handle_json_tool_streaming(
     streamed_args_for_tool: &mut Vec<String>,
     prev_tool_call_arr: &mut Vec<Value>,
 ) -> ParserResult<StreamingParseResult> {
-    // Check if we have content to parse
-    if start_idx >= current_text.len() {
-        return Ok(StreamingParseResult::default());
-    }
+    // Text this call has bailed out of tool parsing (see the loop below).
+    let mut normal_text = String::new();
+    // Where the next JSON value starts in `current_text`.
+    let mut cursor = start_idx;
 
-    // Extract JSON string from current position
-    let json_str = &current_text[start_idx..];
-
-    // When current_tool_name_sent is false, don't allow partial strings to avoid
-    // parsing incomplete tool names as empty strings
-    let allow_partial_strings = *current_tool_name_sent;
-
-    // Parse partial JSON
-    let (obj, end_idx) = match partial_json.parse_value(json_str, allow_partial_strings) {
-        Ok(result) => result,
-        Err(_) => {
-            return Ok(StreamingParseResult::default());
+    // Each iteration parses one JSON value. A value that can never become a
+    // declared tool call is emitted as content and the loop advances past it,
+    // so a declared call trailing a non-tool value in the same chunk still
+    // becomes tool-call deltas. Looping rather than recursing keeps stack
+    // depth constant however many values a single chunk carries.
+    let (current_tool_call, end_idx, is_complete) = loop {
+        if cursor >= current_text.len() {
+            if cursor > start_idx {
+                buffer.clear();
+            }
+            return Ok(StreamingParseResult {
+                normal_text,
+                calls: vec![],
+            });
         }
+
+        let json_str = &current_text[cursor..];
+
+        // When current_tool_name_sent is false, don't allow partial strings to avoid
+        // parsing incomplete tool names as empty strings
+        let allow_partial_strings = *current_tool_name_sent;
+
+        let Ok((obj, end_idx)) = partial_json.parse_value(json_str, allow_partial_strings) else {
+            // Not parseable yet - keep it buffered for the next chunk.
+            if cursor > start_idx {
+                *buffer = json_str.to_string();
+            }
+            return Ok(StreamingParseResult {
+                normal_text,
+                calls: vec![],
+            });
+        };
+
+        // Check if JSON is complete - validate only the parsed portion.
+        // Ensure end_idx is on a valid UTF-8 character boundary
+        let safe_end_idx = if json_str.is_char_boundary(end_idx) {
+            end_idx
+        } else {
+            // Find the nearest valid character boundary before end_idx
+            (0..end_idx)
+                .rev()
+                .find(|&i| json_str.is_char_boundary(i))
+                .unwrap_or(0)
+        };
+        let is_complete = is_complete_json(&json_str[..safe_end_idx]);
+
+        // Normalize all tool call fields first (handles tool_name -> name, parameters -> arguments)
+        // This must happen before validation since different LLMs use different field names
+        let current_tool_call = normalize_tool_call_fields(obj);
+
+        // A value that can never become a declared tool call is content: a
+        // complete value with no `name`, or a `name` (complete by construction,
+        // since partial strings are disallowed until the name is sent) that is
+        // not among the declared tools. Dropping it here is what left streams
+        // with neither content nor tool-call deltas, while the non-streaming
+        // path returned the same text as content.
+        let consumed = match current_tool_call.get("name").and_then(|v| v.as_str()) {
+            Some(name) if !tool_indices.contains_key(name) => {
+                tracing::debug!(
+                    "Undeclared tool name '{}' - emitting buffered text as content",
+                    name
+                );
+                reset_current_tool_state(
+                    buffer,
+                    current_tool_name_sent,
+                    streamed_args_for_tool,
+                    prev_tool_call_arr,
+                );
+                if is_complete {
+                    cursor + safe_end_idx
+                } else {
+                    current_text.len()
+                }
+            }
+            None if is_complete => cursor + safe_end_idx,
+            _ => {
+                // A declared tool call: hand it to the streaming cases below,
+                // leaving the buffer holding everything from this value on.
+                if cursor > start_idx {
+                    *buffer = current_text[cursor..].to_string();
+                }
+                break (current_tool_call, end_idx, is_complete);
+            }
+        };
+
+        // The first bail-out emits any marker prefix too, matching the
+        // non-streaming fallback which returns unparsed tool text verbatim.
+        let emit_from = if cursor > start_idx { cursor } else { 0 };
+        normal_text.push_str(&current_text[emit_from..consumed]);
+        cursor = consumed;
+
+        // Keep parsing only if another *bare* JSON value follows. Anything
+        // else - prose, or a marker-framed call such as qwen's
+        // `</tool_call><tool_call>{..}` - stays buffered: a later chunk lets
+        // the parser re-run its own marker detection over it, but if this was
+        // the final chunk the end-of-stream flush surfaces it as content
+        // instead. Marker-aware re-entry belongs in the parsers, which own
+        // their start markers; see `take_unstreamed_normal_text`.
+        let tail = &current_text[cursor..];
+        let value_start = tail
+            .char_indices()
+            .find(|(_, c)| !c.is_whitespace() && *c != ',' && *c != ';')
+            .map_or(tail.len(), |(i, _)| i);
+        if !tail[value_start..].starts_with(['{', '[']) {
+            *buffer = tail.to_string();
+            return Ok(StreamingParseResult {
+                normal_text,
+                calls: vec![],
+            });
+        }
+        // Separators between adjacent values belong to the emitted text.
+        normal_text.push_str(&tail[..value_start]);
+        cursor += value_start;
     };
 
-    // Check if JSON is complete - validate only the parsed portion
-    // Ensure end_idx is on a valid UTF-8 character boundary
-    let safe_end_idx = if json_str.is_char_boundary(end_idx) {
-        end_idx
-    } else {
-        // Find the nearest valid character boundary before end_idx
-        (0..end_idx)
-            .rev()
-            .find(|&i| json_str.is_char_boundary(i))
-            .unwrap_or(0)
+    let mut result = StreamingParseResult {
+        normal_text,
+        calls: vec![],
     };
-    let is_complete = is_complete_json(&json_str[..safe_end_idx]);
-
-    // Normalize all tool call fields first (handles tool_name -> name, parameters -> arguments)
-    // This must happen before validation since different LLMs use different field names
-    let current_tool_call = normalize_tool_call_fields(obj);
-
-    // Validate tool name if present
-    if let Some(name) = current_tool_call.get("name").and_then(|v| v.as_str()) {
-        if !tool_indices.contains_key(name) {
-            // Invalid tool name - skip this tool, preserve indexing for next tool
-            tracing::debug!("Invalid tool name '{}' - skipping", name);
-            reset_current_tool_state(
-                buffer,
-                current_tool_name_sent,
-                streamed_args_for_tool,
-                prev_tool_call_arr,
-            );
-            return Ok(StreamingParseResult::default());
-        }
-    }
-
-    let mut result = StreamingParseResult::default();
 
     // Case 1: Handle tool name streaming
     if !*current_tool_name_sent {
@@ -321,8 +413,19 @@ pub(crate) fn handle_json_tool_streaming(
             }
         }
     }
-    // Case 2: Handle streaming arguments
-    else if let Some(cur_arguments) = current_tool_call.get("arguments") {
+
+    // Case 2: Handle streaming arguments. This is deliberately not an `else`:
+    // when the whole call arrives in one chunk, Case 1 sends the name and the
+    // arguments must still stream in the *same* invocation. There is no later
+    // call to fall back on - the router stops feeding the parser once the
+    // engine stream ends - so returning here would emit a tool call with an
+    // empty `arguments`, and `get_unstreamed_tool_args()` could not recover
+    // them either because only this branch populates `prev_tool_call_arr`.
+    // `current_tool_name_sent` implies `current_tool_id >= 0`.
+    if *current_tool_name_sent {
+        let Some(cur_arguments) = current_tool_call.get("arguments") else {
+            return Ok(result);
+        };
         let tool_id = *current_tool_id as usize;
         let sent = streamed_args_for_tool
             .get(tool_id)
@@ -388,7 +491,7 @@ pub(crate) fn handle_json_tool_streaming(
 
         // If complete, advance to next tool
         if is_complete {
-            *buffer = current_text[start_idx + end_idx..].to_string();
+            *buffer = current_text[cursor + end_idx..].to_string();
             *current_tool_name_sent = false;
             *current_tool_id += 1;
         }

@@ -32,7 +32,7 @@ use smg::{
         circuit_breaker::{CircuitBreaker, CircuitState},
         resilience::ResolvedResilience,
         worker::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
-        ConnectionMode, Worker, WorkerResult, WorkerType,
+        ConnectionMode, OverloadThresholds, PdPairing, Worker, WorkerResult, WorkerType,
     },
 };
 use smg_grpc_client::sglang_scheduler::{SglangGenerateRequestOptions, SglangSchedulerClient};
@@ -60,7 +60,7 @@ pub struct GrpcWorker {
     pub(crate) metadata: WorkerMetadata,
     pub(crate) routing_key_load: WorkerRoutingKeyLoad,
     pub(crate) api_key: Option<String>,
-    pub(crate) http_client: reqwest::Client,
+    pub(crate) http_client: Arc<reqwest::Client>,
     pub(crate) resilience: ResolvedResilience,
 }
 
@@ -71,9 +71,12 @@ impl GrpcWorker {
         spec.runtime_type = RuntimeType::Sglang;
 
         let metadata = WorkerMetadata {
+            pd_pairing: PdPairing::derive(&spec),
             spec: Arc::new(spec),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
+            overload: OverloadThresholds::default(),
+            http2: false,
         };
         Self {
             client,
@@ -85,7 +88,7 @@ impl GrpcWorker {
             circuit_breaker: CircuitBreaker::new(),
             metadata,
             api_key: None,
-            http_client: reqwest::Client::new(),
+            http_client: Arc::new(reqwest::Client::new()),
             resilience: ResolvedResilience::default(),
         }
     }
@@ -177,6 +180,10 @@ impl Worker for GrpcWorker {
         self.routing_key_load.value()
     }
 
+    fn routing_key_inflight(&self, routing_key: &str) -> usize {
+        self.routing_key_load.key_inflight(routing_key)
+    }
+
     fn increment_routing_key_load(&self, routing_key: &str) {
         self.routing_key_load.increment(routing_key);
     }
@@ -215,6 +222,10 @@ impl Worker for GrpcWorker {
 
     fn http_client(&self) -> &reqwest::Client {
         &self.http_client
+    }
+
+    fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
+        Some(Arc::clone(&self.http_client))
     }
 
     async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>> {

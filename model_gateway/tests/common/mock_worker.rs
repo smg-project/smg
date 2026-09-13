@@ -13,7 +13,7 @@ use std::{
 
 use axum::{
     extract::{Json, Multipart, Path, State},
-    http::StatusCode,
+    http::{StatusCode, Version},
     response::{
         sse::{Event, KeepAlive},
         IntoResponse, Response, Sse,
@@ -169,11 +169,24 @@ fn clear_scheduler_controls(port: u16) {
 #[derive(Default)]
 pub struct RequestRecorder {
     bodies: Mutex<Vec<serde_json::Value>>,
+    versions: Mutex<Vec<Version>>,
 }
 
 impl RequestRecorder {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// The HTTP version each recorded request arrived on, oldest first.
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper - panicking on failure is intentional"
+    )]
+    pub fn versions(&self) -> Vec<Version> {
+        self.versions
+            .lock()
+            .expect("request recorder mutex poisoned")
+            .clone()
     }
 
     /// Every body received so far, oldest first.
@@ -224,7 +237,7 @@ pub fn set_request_recorder(port: u16, recorder: Arc<RequestRecorder>) {
         .insert(port, recorder);
 }
 
-fn record_request(port: u16, body: &serde_json::Value) {
+fn record_request(port: u16, version: Version, body: &serde_json::Value) {
     let recorder = request_recorders_table()
         .lock()
         .ok()
@@ -232,6 +245,9 @@ fn record_request(port: u16, body: &serde_json::Value) {
     if let Some(recorder) = recorder {
         if let Ok(mut bodies) = recorder.bodies.lock() {
             bodies.push(body.clone());
+        }
+        if let Ok(mut versions) = recorder.versions.lock() {
+            versions.push(version);
         }
     }
 }
@@ -340,6 +356,13 @@ impl MockWorker {
                 post(responses_cancel_handler),
             )
             .route("/flush_cache", post(flush_cache_handler))
+            .route("/pause_generation", post(rl_control_handler))
+            .route("/continue_generation", post(rl_control_handler))
+            .route("/update_weights_from_disk", post(rl_control_handler))
+            .route("/update_weight_version", post(rl_control_handler))
+            .route("/pause", post(rl_control_handler))
+            .route("/resume", post(rl_control_handler))
+            .route("/v1/loads", get(loads_handler))
             .route("/v1/models", get(v1_models_handler))
             .with_state(config);
 
@@ -683,12 +706,13 @@ async fn generate_handler(
 )]
 async fn chat_completions_handler(
     State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    version: Version,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
     // Before any early return, so a test still sees what arrived even when the
     // mock is configured to fail the request.
-    record_request(config.port, &payload);
+    record_request(config.port, version, &payload);
 
     if should_fail(&config) {
         return (
@@ -769,10 +793,11 @@ async fn chat_completions_handler(
 
 async fn realtime_rest_handler(
     State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    version: Version,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
-    record_request(config.port, &payload);
+    record_request(config.port, version, &payload);
 
     if should_fail(&config) {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -1487,6 +1512,53 @@ async fn responses_handler(
     }
 }
 
+/// Engine-native RL control routes. Records the body (verbatim-forwarding
+/// assertions) and answers like SGLang: `{"success": true, "message": ...}`.
+async fn rl_control_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    version: Version,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
+    let config = config.read().await;
+
+    if should_fail(&config) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"success": false, "message": "Random failure for testing"})),
+        )
+            .into_response();
+    }
+
+    if let Some(Json(body)) = body {
+        record_request(config.port, version, &body);
+    }
+
+    Json(json!({"success": true, "message": "ok"})).into_response()
+}
+
+/// Engine-native load report. The gateway's load monitor prefers this route
+/// over `/metrics`, so serving it is what puts a mock worker into `/loads`.
+async fn loads_handler() -> Response {
+    Json(json!({
+        "dp_rank_count": 1,
+        "loads": [{
+            "dp_rank": 0,
+            "num_running_reqs": 2,
+            "num_waiting_reqs": 1,
+            "num_used_tokens": 1024,
+            "max_total_num_tokens": 8192,
+            "token_usage": 0.125,
+        }],
+        "aggregate": {
+            "total_running_reqs": 2,
+            "total_waiting_reqs": 1,
+            "total_reqs": 3,
+            "avg_token_usage": 0.125,
+        },
+    }))
+    .into_response()
+}
+
 async fn flush_cache_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
     let config = config.read().await;
 
@@ -1655,6 +1727,7 @@ fn response_exists_for_port(port: u16, response_id: &str) -> bool {
 /// part itself is drained and discarded.
 async fn audio_transcriptions_handler(
     State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    version: Version,
     mut multipart: Multipart,
 ) -> Response {
     let config = config.read().await;
@@ -1672,7 +1745,7 @@ async fn audio_transcriptions_handler(
             fields.insert(name, serde_json::Value::String(value));
         }
     }
-    record_request(config.port, &serde_json::Value::Object(fields));
+    record_request(config.port, version, &serde_json::Value::Object(fields));
 
     if should_fail(&config) {
         return (StatusCode::INTERNAL_SERVER_ERROR, "Simulated failure").into_response();
@@ -1684,14 +1757,16 @@ async fn audio_transcriptions_handler(
 // Minimal rerank handler returning mock results; router shapes final response
 #[expect(
     clippy::unwrap_used,
+    clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
 async fn rerank_handler(
     State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    version: Version,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let config = config.read().await;
-    record_request(config.port, &payload);
+    record_request(config.port, version, &payload);
 
     // Simulate response delay
     if config.response_delay_ms > 0 {
@@ -1714,9 +1789,17 @@ async fn rerank_handler(
     let mut mock_results = Vec::new();
     for (i, doc) in documents.iter().enumerate() {
         let score = 0.95 - (i as f32 * 0.1); // Decreasing scores
+
+        // "PAD:<n>" documents are echoed back as n-byte strings so tests can
+        // make the worker return a body far larger than the request.
+        let doc = doc.as_str().unwrap_or("");
+        let doc = match doc.strip_prefix("PAD:") {
+            Some(n) => "x".repeat(n.parse().expect("PAD size must be a usize")),
+            None => doc.to_string(),
+        };
         let result = serde_json::json!({
             "score": score,
-            "document": doc.as_str().unwrap_or(""),
+            "document": doc,
             "index": i,
             "meta_info": {
                 "confidence": if score > 0.9 { "high" } else { "medium" }

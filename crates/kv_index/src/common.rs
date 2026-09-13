@@ -34,3 +34,8 @@ pub trait MatchResult {
         }
     }
 }
+
+/// Candidate cap for a match result's `matched_tenants`: enough for
+/// pressure selection to discriminate, small enough to bound the per-match
+/// allocation.
+pub const MATCHED_TENANTS_CAP: usize = 8;

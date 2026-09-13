@@ -226,12 +226,10 @@ async fn decode_audio_with_ffmpeg(bytes: &[u8]) -> Result<DecodedAudio, Transfor
 
     let samples = output
         .stdout
-        .chunks_exact(4)
-        .map(|bytes| {
-            let mut sample = [0_u8; size_of::<f32>()];
-            sample.copy_from_slice(bytes);
-            f32::from_le_bytes(sample)
-        })
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
         .collect();
     finish_decoded_audio(samples, sample_rate)
 }

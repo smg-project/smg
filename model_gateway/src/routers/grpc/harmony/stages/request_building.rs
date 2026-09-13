@@ -5,21 +5,20 @@ use axum::response::Response;
 use smg_grpc_client::{SglangGenerateRequestOptions, TokenSpeedSchedulerClient, VllmEngineClient};
 use tracing::{debug, error};
 
-use crate::{
-    routers::{
-        error,
-        grpc::{
-            backend_client::BackendClient,
-            client::GrpcClient,
-            common::stages::{helpers, PipelineStage},
-            context::{
-                ClientSelection, ExecutionPlan, ExecutionPlanKind, PreparationOutput,
-                RequestContext, RequestType,
-            },
-            proto_wrapper::ProtoGenerateRequest,
+use crate::routers::{
+    error,
+    grpc::{
+        backend_client::BackendClient,
+        client::GrpcClient,
+        common::stages::{helpers, BuildStage},
+        context::{
+            AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
+            PreparationOutput, RequestContext, RequestType,
         },
+        proto_wrapper::ProtoGenerateRequest,
+        spec::{HarmonyResponseSpec, ResponseSpec},
+        zmq_client::ZmqDialect,
     },
-    worker::RuntimeType,
 };
 
 /// Harmony Request Building stage: Convert Harmony tokens to gRPC request
@@ -42,12 +41,12 @@ impl HarmonyRequestBuildingStage {
 }
 
 #[async_trait]
-impl PipelineStage for HarmonyRequestBuildingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+impl BuildStage for HarmonyRequestBuildingStage {
+    async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         // Take preparation output (last consumer — worker_selection already ran)
         let prep = ctx.state.preparation.take().ok_or_else(|| {
             error!(
-                function = "HarmonyRequestBuildingStage::execute",
+                function = "HarmonyRequestBuildingStage::build",
                 "Preparation stage not completed"
             );
             error::internal_error("preparation_not_completed", "Preparation not completed")
@@ -70,7 +69,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
         // Get clients
         let clients = ctx.state.clients.as_ref().ok_or_else(|| {
             error!(
-                function = "HarmonyRequestBuildingStage::execute",
+                function = "HarmonyRequestBuildingStage::build",
                 "Client acquisition stage not completed"
             );
             error::internal_error(
@@ -83,28 +82,37 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             ClientSelection::Disaggregated { prefill, .. } => prefill,
         };
 
-        // Generate request_id based on request type
+        // Generate request_id based on request type. The Harmony spec owns a
+        // handle to the request: the tool loop legitimately re-reads it
+        // across iterations (the one deliberate post-build request holder).
         let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
-        let request_id = match &ctx.input.request_type {
-            RequestType::Chat(_) => helpers::resolve_request_id(
-                &ctx.input.request_type,
-                ctx.input.tenant_request_meta.as_ref(),
-                "chatcmpl-",
-                disaggregated,
-            ),
-            RequestType::Responses(_) => helpers::resolve_request_id(
-                &ctx.input.request_type,
-                ctx.input.tenant_request_meta.as_ref(),
-                "responses-",
-                disaggregated,
-            ),
+        let (request_id, id_stamp, harmony_spec) = match &ctx.input.request_type {
+            RequestType::Chat(request) => {
+                let (id, stamp) = helpers::resolve_request_id_stamp(
+                    &ctx.input.request_type,
+                    ctx.input.tenant_request_meta.as_ref(),
+                    "chatcmpl-",
+                    disaggregated,
+                );
+                (id, stamp, HarmonyResponseSpec::Chat(request.clone()))
+            }
+            RequestType::Responses(request) => {
+                let (id, stamp) = helpers::resolve_request_id_stamp(
+                    &ctx.input.request_type,
+                    ctx.input.tenant_request_meta.as_ref(),
+                    "responses-",
+                    disaggregated,
+                );
+                (id, stamp, HarmonyResponseSpec::Responses(request.clone()))
+            }
             request_type @ (RequestType::Generate(_)
             | RequestType::Completion(_)
             | RequestType::Embedding(_)
             | RequestType::Classify(_)
-            | RequestType::Messages(_)) => {
+            | RequestType::Messages(_)
+            | RequestType::Transcription { .. }) => {
                 error!(
-                    function = "HarmonyRequestBuildingStage::execute",
+                    function = "HarmonyRequestBuildingStage::build",
                     request_type = %request_type,
                     "{request_type} request type not supported for Harmony models"
                 );
@@ -151,18 +159,12 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             token_ids,
             tool_constraints,
         )
-        .map_err(|e| match e {
-            HarmonyBuildError::Request(e) => {
-                error!(function = "HarmonyRequestBuildingStage::execute", error = %e, "Failed to build Harmony generate request");
-                error::bad_request(
-                    "invalid_request_parameters",
-                    format!("Invalid request parameters: {e}"),
-                )
-            }
-            HarmonyBuildError::Wiring(e) => {
-                error!(function = "HarmonyRequestBuildingStage::execute", error = %e, "Harmony backend wiring bug");
-                error::internal_error("unsupported_backend_runtime", e)
-            }
+        .map_err(|e| {
+            error!(function = "HarmonyRequestBuildingStage::build", error = %e, "Failed to build Harmony generate request");
+            error::bad_request(
+                "invalid_request_parameters",
+                format!("Invalid request parameters: {e}"),
+            )
         })?;
 
         // Inject the Harmony stop ids (<|return|> and <|call|>) so the model
@@ -193,8 +195,18 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             }
         }
 
-        ctx.state.execution_plan = Some(ExecutionPlan::generate(self.plan_kind, proto_request));
-        Ok(None)
+        Ok(BuildOutput {
+            plan: ExecutionPlan::generate(self.plan_kind, proto_request),
+            spec: ResponseSpec::Harmony(harmony_spec),
+            stamp: AttemptStamp {
+                id: id_stamp,
+                // Harmony builds never applied worker sampling defaults;
+                // retries must not start applying them.
+                sampling_mask: None,
+                sampling_baseline: None,
+                inject_pd_metadata: self.inject_pd_metadata,
+            },
+        })
     }
 
     fn name(&self) -> &'static str {
@@ -217,23 +229,12 @@ enum HarmonyBody<'a> {
     Responses(&'a openai_protocol::responses::ResponsesRequest),
 }
 
-/// Build failure classes: a bad request (builder rejected the parameters,
-/// HTTP 400) vs. a wiring bug (a backend/runtime pairing that cannot exist,
-/// HTTP 500).
-enum HarmonyBuildError {
-    Request(String),
-    Wiring(String),
-}
-
-impl From<String> for HarmonyBuildError {
-    fn from(reason: String) -> Self {
-        Self::Request(reason)
-    }
-}
-
 /// One (backend x request-kind) dispatch for Harmony request building: every
 /// arm is just the engine's builder call. vLLM and TokenSpeed build through
-/// static translators, so one arm each covers both gRPC and direct-ZMQ.
+/// static translators, so a direct-ZMQ backend routes into the same builders
+/// as its gRPC counterpart via its [`ZmqDialect`] — leaving the match
+/// exhaustive over transports and engines, with no unrepresentable pairing to
+/// error on.
 fn build_harmony_proto(
     client: &BackendClient,
     body: HarmonyBody<'_>,
@@ -241,9 +242,8 @@ fn build_harmony_proto(
     text: String,
     token_ids: Vec<u32>,
     tool_constraints: Option<(String, String)>,
-) -> Result<ProtoGenerateRequest, HarmonyBuildError> {
+) -> Result<ProtoGenerateRequest, String> {
     use HarmonyBody::{Chat, Responses};
-    let runtime = client.runtime_type();
     Ok(match (client, body) {
         (BackendClient::Grpc(GrpcClient::Sglang(c)), Chat(b)) => {
             ProtoGenerateRequest::Sglang(Box::new(c.build_generate_request_from_chat(
@@ -298,67 +298,76 @@ fn build_harmony_proto(
                 tool_constraints,
             )?))
         }
-        (BackendClient::Grpc(GrpcClient::Vllm(_)) | BackendClient::Zmq(_), Chat(b))
-            if runtime == RuntimeType::Vllm =>
-        {
-            ProtoGenerateRequest::Vllm(Box::new(
-                VllmEngineClient::build_generate_request_from_chat(
-                    request_id,
-                    b,
-                    text,
-                    token_ids,
-                    None, // No multimodal in the Harmony pipeline
-                    tool_constraints,
-                )?,
-            ))
+        (BackendClient::Grpc(GrpcClient::Vllm(_)), body) => {
+            build_vllm(body, request_id, text, token_ids, tool_constraints)?
         }
-        (BackendClient::Grpc(GrpcClient::Vllm(_)) | BackendClient::Zmq(_), Responses(b))
-            if runtime == RuntimeType::Vllm =>
-        {
-            ProtoGenerateRequest::Vllm(Box::new(
-                VllmEngineClient::build_generate_request_from_responses(
-                    request_id,
-                    b,
-                    text,
-                    token_ids,
-                    tool_constraints,
-                )?,
-            ))
+        (BackendClient::Grpc(GrpcClient::TokenSpeed(_)), body) => {
+            build_tokenspeed(body, request_id, text, token_ids, tool_constraints)?
         }
-        (BackendClient::Grpc(GrpcClient::TokenSpeed(_)) | BackendClient::Zmq(_), Chat(b))
-            if runtime == RuntimeType::TokenSpeed =>
-        {
-            ProtoGenerateRequest::TokenSpeed(Box::new(
-                TokenSpeedSchedulerClient::build_generate_request_from_chat(
-                    request_id,
-                    b,
-                    text,
-                    token_ids,
-                    None, // Harmony path: multimodal not yet wired
-                    tool_constraints,
-                )?,
-            ))
-        }
-        (BackendClient::Grpc(GrpcClient::TokenSpeed(_)) | BackendClient::Zmq(_), Responses(b))
-            if runtime == RuntimeType::TokenSpeed =>
-        {
-            ProtoGenerateRequest::TokenSpeed(Box::new(
-                TokenSpeedSchedulerClient::build_generate_request_from_responses(
-                    request_id,
-                    b,
-                    text,
-                    token_ids,
-                    tool_constraints,
-                )?,
-            ))
-        }
-        // Guards above keep the match non-exhaustive to the compiler; the only
-        // real way here is a ZMQ client reporting a runtime it cannot have
-        // (connect() admits vLLM/TokenSpeed only) - a wiring bug, so error out.
-        _ => {
-            return Err(HarmonyBuildError::Wiring(format!(
-                "unsupported backend runtime {runtime:?} for Harmony requests"
-            )))
-        }
+        (BackendClient::Zmq(zmq), body) => match zmq.dialect() {
+            ZmqDialect::Vllm => build_vllm(body, request_id, text, token_ids, tool_constraints)?,
+            ZmqDialect::TokenSpeed => {
+                build_tokenspeed(body, request_id, text, token_ids, tool_constraints)?
+            }
+        },
     })
+}
+
+/// vLLM Harmony builders, shared by the gRPC and direct-ZMQ vLLM backends.
+fn build_vllm(
+    body: HarmonyBody<'_>,
+    request_id: String,
+    text: String,
+    token_ids: Vec<u32>,
+    tool_constraints: Option<(String, String)>,
+) -> Result<ProtoGenerateRequest, String> {
+    let request = match body {
+        HarmonyBody::Chat(b) => VllmEngineClient::build_generate_request_from_chat(
+            request_id,
+            b,
+            text,
+            token_ids,
+            None, // No multimodal in the Harmony pipeline
+            tool_constraints,
+        )?,
+        HarmonyBody::Responses(b) => VllmEngineClient::build_generate_request_from_responses(
+            request_id,
+            b,
+            text,
+            token_ids,
+            tool_constraints,
+        )?,
+    };
+    Ok(ProtoGenerateRequest::Vllm(Box::new(request)))
+}
+
+/// TokenSpeed Harmony builders, shared by the gRPC and direct-ZMQ TokenSpeed
+/// backends.
+fn build_tokenspeed(
+    body: HarmonyBody<'_>,
+    request_id: String,
+    text: String,
+    token_ids: Vec<u32>,
+    tool_constraints: Option<(String, String)>,
+) -> Result<ProtoGenerateRequest, String> {
+    let request = match body {
+        HarmonyBody::Chat(b) => TokenSpeedSchedulerClient::build_generate_request_from_chat(
+            request_id,
+            b,
+            text,
+            token_ids,
+            None, // Harmony path: multimodal not yet wired
+            tool_constraints,
+        )?,
+        HarmonyBody::Responses(b) => {
+            TokenSpeedSchedulerClient::build_generate_request_from_responses(
+                request_id,
+                b,
+                text,
+                token_ids,
+                tool_constraints,
+            )?
+        }
+    };
+    Ok(ProtoGenerateRequest::TokenSpeed(Box::new(request)))
 }

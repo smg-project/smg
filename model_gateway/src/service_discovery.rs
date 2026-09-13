@@ -27,7 +27,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     app_context::AppContext,
     observability::metrics::{metrics_labels, Metrics},
-    worker::WorkerOrigin,
+    worker::{WorkerOrigin, MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
     workflow::{Job, WorkerRegistrationMode},
 };
 
@@ -101,6 +101,9 @@ pub struct ServiceDiscoveryConfig {
     /// Annotation listing the pod's worker data ports (comma-separated).
     /// Absent = single worker at `port`.
     pub worker_ports_annotation: String,
+    /// KV metadata is captured at worker registration; replace a Pod after changing it.
+    pub kv_connector_annotation: String,
+    pub kv_engine_id_annotation: String,
     // Router node discovery for mesh
     pub router_selector: HashMap<String, String>,
     pub router_mesh_port_annotation: String,
@@ -195,6 +198,8 @@ impl Default for ServiceDiscoveryConfig {
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
             worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+            kv_connector_annotation: "smg.ai/kv-connector".to_string(),
+            kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
@@ -228,6 +233,8 @@ pub struct PodInfo {
     pub ports: Vec<u16>,
     /// Per-port bootstrap ports (Encode/Prefill only), aligned with `ports`.
     pub bootstrap_ports: Vec<Option<u16>>,
+    pub kv_connector: Option<String>,
+    pub kv_engine_ids: Vec<Option<String>>,
     pub is_router: bool,
     pub mesh_port: Option<u16>,
     pub model_id_override: Option<String>,
@@ -318,6 +325,20 @@ impl PodInfo {
         } else {
             vec![None; ports.len()]
         };
+        let kv_connector = config.and_then(|config| {
+            let connector = annotation_value(pod, &config.kv_connector_annotation)?;
+            if connector != MOONCAKE_CONNECTOR && connector != NIXL_CONNECTOR {
+                warn!(
+                    "Pod {}: {} annotation '{}' is not a connector with explicit PD handling; \
+                     using passthrough behavior",
+                    name, config.kv_connector_annotation, connector
+                );
+            }
+            Some(connector.to_string())
+        });
+        let kv_engine_ids = config
+            .map(|config| resolve_kv_engine_ids(&name, pod, config, ports.len()))
+            .unwrap_or_else(|| vec![None; ports.len()]);
 
         // Check if this is a router pod
         let is_router = if let Some(config) = config {
@@ -356,6 +377,8 @@ impl PodInfo {
             pod_type,
             ports,
             bootstrap_ports,
+            kv_connector,
+            kv_engine_ids,
             is_router,
             mesh_port,
             model_id_override,
@@ -405,6 +428,42 @@ fn resolve_worker_ports(pod_name: &str, pod: &Pod, config: &ServiceDiscoveryConf
             vec![config.port]
         }
     }
+}
+
+fn annotation_value<'a>(pod: &'a Pod, key: &str) -> Option<&'a str> {
+    pod.metadata
+        .annotations
+        .as_ref()?
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+}
+
+/// Resolve one unique KV engine ID per worker port; unlike bootstrap ports,
+/// one ID cannot be broadcast because each engine core owns a distinct ID.
+fn resolve_kv_engine_ids(
+    pod_name: &str,
+    pod: &Pod,
+    config: &ServiceDiscoveryConfig,
+    num_ports: usize,
+) -> Vec<Option<String>> {
+    let Some(raw) = annotation_value(pod, &config.kv_engine_id_annotation) else {
+        return vec![None; num_ports];
+    };
+    let ids: Vec<&str> = raw.split(',').map(str::trim).collect();
+    let mut seen = HashSet::new();
+    if ids.len() != num_ports
+        || ids.iter().any(|id| id.is_empty())
+        || !ids.iter().all(|id| seen.insert(*id))
+    {
+        warn!(
+            "Pod {}: {} annotation '{}' must contain one distinct non-empty ID for each of {} \
+             worker port(s), ignoring",
+            pod_name, config.kv_engine_id_annotation, raw, num_ports
+        );
+        return vec![None; num_ports];
+    }
+    ids.into_iter().map(|id| Some(id.to_string())).collect()
 }
 
 /// Bootstrap ports aligned with the pod's worker ports: a single value applies
@@ -662,17 +721,18 @@ struct DesiredWorker {
     pod_name: String,
     pod_uid: String,
     model_id_override: Option<String>,
+    kv_connector: Option<String>,
+    kv_engine_id: Option<String>,
 }
 
 /// Desired view of the cluster derived from the store snapshot.
 #[derive(Debug, Default)]
 struct DesiredState {
-    /// Owning pod uid per worker URL, for all live, non-terminating pods
-    /// (any readiness). Registered workers whose URL is absent — or owned by
-    /// a different pod uid — are removed; unready pods keep their own
-    /// workers (the health checker owns readiness flaps).
+    /// Owning pod uid per worker URL for Ready, non-terminating Pods.
+    /// Registered workers whose URL is absent — or owned by a different Pod
+    /// uid — enter the existing drain/remove workflow.
     uid_by_url: HashMap<String, String>,
-    /// Workers on healthy pods — registration candidates.
+    /// Workers on Running, Ready Pods — registration candidates.
     addable: Vec<DesiredWorker>,
 }
 
@@ -703,6 +763,13 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
         let Some(info) = PodInfo::from_pod(pod, Some(config)) else {
             continue;
         };
+        // Pod readiness is Kubernetes' standard traffic-admission signal.
+        // Controllers can drive it through readiness gates; direct Pod-IP
+        // routing must honor the aggregate Ready condition just like a
+        // Service/EndpointSlice consumer would.
+        if !info.is_ready {
+            continue;
+        }
         for (index, port) in info.ports.iter().enumerate() {
             let url = format!("{}:{}", info.ip, port);
             if state.uid_by_url.contains_key(&url) {
@@ -717,6 +784,8 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
                     pod_name: info.name.clone(),
                     pod_uid: info.uid.clone(),
                     model_id_override: info.model_id_override.clone(),
+                    kv_connector: info.kv_connector.clone(),
+                    kv_engine_id: info.kv_engine_ids.get(index).cloned().flatten(),
                 });
             }
         }
@@ -814,6 +883,8 @@ fn build_worker_spec(desired: &DesiredWorker, app_context: &AppContext) -> Worke
         spec.labels
             .insert("served_model_name".to_string(), model_id.clone());
     }
+    spec.kv_connector.clone_from(&desired.kv_connector);
+    spec.kv_engine_id.clone_from(&desired.kv_engine_id);
     spec.api_key.clone_from(&app_context.router_config.api_key);
     spec.max_connection_attempts = app_context
         .router_config
@@ -892,7 +963,10 @@ async fn reconcile_workers(
     );
 
     for worker in removals {
-        info!("Removing worker {}: pod gone or terminating", worker.url);
+        info!(
+            "Removing worker {}: pod unready, gone, terminating, or replaced",
+            worker.url
+        );
         let job = Job::RemoveWorker {
             url: worker.url.clone(),
             expected_revision: Some(worker.revision),
@@ -1034,7 +1108,10 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::routers::{common::openai_bridge, grpc::multimodal::MultimodalConfigRegistry};
+    use crate::{
+        middleware::AuthConfig,
+        routers::{common::openai_bridge, grpc::multimodal::MultimodalConfigRegistry},
+    };
 
     fn create_k8s_pod(
         name: Option<&str>,
@@ -1132,6 +1209,7 @@ mod tests {
         // Note: Using uninitialized queue for tests to avoid spawning background workers
         // Jobs submitted during tests will queue but not be processed
         Arc::new(AppContext {
+            gateway_auth: AuthConfig::new(None),
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
@@ -1143,7 +1221,7 @@ mod tests {
             )),
             reasoning_parser_factory: None,
             tool_parser_factory: None,
-            router_manager: None,
+            gateway: None,
             response_storage: Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             conversation_storage: Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             conversation_item_storage: Arc::new(
@@ -1159,6 +1237,9 @@ mod tests {
             tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
             wasm_manager: None,
+            worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
+                &router_config,
+            )),
             worker_service: Arc::new(WorkerService::new(
                 worker_registry,
                 worker_job_queue,
@@ -1166,6 +1247,7 @@ mod tests {
             )),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
+            rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
@@ -1193,6 +1275,8 @@ mod tests {
             decode_selector,
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
             worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+            kv_connector_annotation: "smg.ai/kv-connector".to_string(),
+            kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
@@ -1261,6 +1345,8 @@ mod tests {
         assert!(config.decode_selector.is_empty());
         assert_eq!(config.bootstrap_port_annotation, "sglang.ai/bootstrap-port");
         assert_eq!(config.worker_ports_annotation, "smg.ai/worker-ports");
+        assert_eq!(config.kv_connector_annotation, "smg.ai/kv-connector");
+        assert_eq!(config.kv_engine_id_annotation, "smg.ai/kv-engine-id");
     }
 
     #[test]
@@ -1445,6 +1531,8 @@ mod tests {
             pod_type: None,
             ports: vec![],
             bootstrap_ports: vec![],
+            kv_connector: None,
+            kv_engine_ids: vec![],
             is_router: false,
             mesh_port: None,
             model_id_override: None,
@@ -1460,6 +1548,8 @@ mod tests {
             pod_type: None,
             ports: vec![],
             bootstrap_ports: vec![],
+            kv_connector: None,
+            kv_engine_ids: vec![],
             is_router: false,
             mesh_port: None,
             model_id_override: None,
@@ -1475,6 +1565,8 @@ mod tests {
             pod_type: None,
             ports: vec![],
             bootstrap_ports: vec![],
+            kv_connector: None,
+            kv_engine_ids: vec![],
             is_router: false,
             mesh_port: None,
             model_id_override: None,
@@ -1524,6 +1616,39 @@ mod tests {
         let info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
         assert_eq!(info.ports, vec![8080, 8081, 8082, 8083]);
         assert_eq!(info.bootstrap_ports, vec![None; 4]);
+    }
+
+    #[test]
+    fn test_from_pod_kv_metadata_aligns_with_worker_ports() {
+        let config = make_regular_config();
+        let pod = pod_with_annotations(
+            "w",
+            &[
+                ("smg.ai/worker-ports", "8080,8081"),
+                ("smg.ai/kv-connector", "MooncakeConnector"),
+                ("smg.ai/kv-engine-id", "engine-0,engine-1"),
+            ],
+        );
+        let info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        assert_eq!(info.kv_connector.as_deref(), Some("MooncakeConnector"));
+        assert_eq!(
+            info.kv_engine_ids,
+            vec![Some("engine-0".to_string()), Some("engine-1".to_string())]
+        );
+
+        for invalid_ids in ["shared", "shared,shared"] {
+            let invalid = pod_with_annotations(
+                "w",
+                &[
+                    ("smg.ai/worker-ports", "8080,8081"),
+                    ("smg.ai/kv-connector", "NixlConnector"),
+                    ("smg.ai/kv-engine-id", invalid_ids),
+                ],
+            );
+            let info = PodInfo::from_pod(&invalid, Some(&config)).unwrap();
+            assert_eq!(info.kv_connector.as_deref(), Some("NixlConnector"));
+            assert_eq!(info.kv_engine_ids, vec![None, None]);
+        }
     }
 
     #[test]
@@ -1621,9 +1746,9 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_desired_state_unready_pod_present_but_not_addable() {
+    fn test_compute_desired_state_unready_pod_excluded() {
         let config = make_regular_config();
-        let mut pod = make_labeled_pod("w", "10.0.0.1", &[("app", "sglang")]);
+        let mut pod = pod_with_annotations("w", &[("smg.ai/worker-ports", "8080,8081")]);
         if let Some(status) = pod.status.as_mut() {
             status.conditions = Some(vec![PodCondition {
                 type_: "Ready".to_string(),
@@ -1636,7 +1761,27 @@ mod tests {
             }]);
         }
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
-        assert!(desired.uid_by_url.contains_key("10.0.0.1:8000"));
+        assert!(desired.uid_by_url.is_empty());
+        assert!(desired.addable.is_empty());
+    }
+
+    #[test]
+    fn test_compute_desired_state_unknown_readiness_excluded() {
+        let config = make_regular_config();
+        let mut pod = make_labeled_pod("w", "10.0.0.1", &[("app", "sglang")]);
+        if let Some(status) = pod.status.as_mut() {
+            status.conditions = Some(vec![PodCondition {
+                type_: "Ready".to_string(),
+                status: "Unknown".to_string(),
+                last_probe_time: None,
+                last_transition_time: None,
+                message: None,
+                reason: None,
+                observed_generation: None,
+            }]);
+        }
+        let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
+        assert!(desired.uid_by_url.is_empty());
         assert!(desired.addable.is_empty());
     }
 
@@ -1721,21 +1866,18 @@ mod tests {
             pod_name: "w".to_string(),
             pod_uid: uid.to_string(),
             model_id_override: None,
+            kv_connector: None,
+            kv_engine_id: None,
         }
     }
 
-    fn desired_state_of(workers: &[DesiredWorker], present_only: &[(&str, &str)]) -> DesiredState {
+    fn desired_state_of(workers: &[DesiredWorker]) -> DesiredState {
         let mut state = DesiredState::default();
         for worker in workers {
             state
                 .uid_by_url
                 .insert(worker.url.clone(), worker.pod_uid.clone());
             state.addable.push(worker.clone());
-        }
-        for (url, uid) in present_only {
-            state
-                .uid_by_url
-                .insert((*url).to_string(), (*uid).to_string());
         }
         state
     }
@@ -1750,21 +1892,20 @@ mod tests {
 
     #[test]
     fn test_compute_actions_adds_missing_workers() {
-        let desired = desired_state_of(
-            &[
-                desired_worker("10.0.0.1:8080", "u1"),
-                desired_worker("10.0.0.1:8081", "u1"),
-            ],
-            &[],
-        );
+        let desired = desired_state_of(&[
+            desired_worker("10.0.0.1:8080", "u1"),
+            desired_worker("10.0.0.1:8081", "u1"),
+        ]);
         let actions = compute_actions(&desired, &[]);
         assert_eq!(actions.add.len(), 2);
         assert!(actions.remove.is_empty());
     }
 
     #[test]
-    fn test_compute_actions_noop_when_converged() {
-        let desired = desired_state_of(&[desired_worker("10.0.0.1:8080", "u1")], &[]);
+    fn test_compute_actions_same_uid_metadata_change_is_noop() {
+        let mut worker = desired_worker("10.0.0.1:8080", "u1");
+        worker.kv_connector = Some("NixlConnector".to_string());
+        let desired = desired_state_of(&[worker]);
         let registered = [owned("10.0.0.1:8080", "u1")];
         let actions = compute_actions(&desired, &registered);
         assert!(actions.add.is_empty());
@@ -1773,7 +1914,7 @@ mod tests {
 
     #[test]
     fn test_compute_actions_removes_workers_for_gone_pods() {
-        let desired = desired_state_of(&[desired_worker("10.0.0.1:8080", "u1")], &[]);
+        let desired = desired_state_of(&[desired_worker("10.0.0.1:8080", "u1")]);
         let registered = [owned("10.0.0.1:8080", "u1"), owned("10.0.0.2:8080", "u2")];
         let actions = compute_actions(&desired, &registered);
         assert!(actions.add.is_empty());
@@ -1786,7 +1927,7 @@ mod tests {
         // Same-IP pod restart (hostNetwork / stable IP): URL unchanged but
         // uid differs → the stale worker is removed (covers a scheme-flipped
         // sibling the Upsert cannot replace) and the new one registered.
-        let desired = desired_state_of(&[desired_worker("10.0.0.1:8080", "uid-new")], &[]);
+        let desired = desired_state_of(&[desired_worker("10.0.0.1:8080", "uid-new")]);
         let registered = [owned("10.0.0.1:8080", "uid-old")];
         let actions = compute_actions(&desired, &registered);
         assert_eq!(actions.add.len(), 1);
@@ -1796,15 +1937,30 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_actions_removes_stale_worker_behind_unready_replacement() {
-        // Pod A was deleted; unready replacement B holds the same URL. A's
-        // worker must go now — B registers only once it turns healthy.
-        let desired = desired_state_of(&[], &[("10.0.0.1:8080", "uid-b")]);
-        let registered = [owned("10.0.0.1:8080", "uid-a")];
+    fn test_compute_actions_unready_pod_removes_registered_workers() {
+        let config = make_regular_config();
+        let mut pod = pod_with_annotations("w", &[("smg.ai/worker-ports", "8080,8081")]);
+        if let Some(status) = pod.status.as_mut() {
+            status.conditions = Some(vec![PodCondition {
+                type_: "Ready".to_string(),
+                status: "False".to_string(),
+                last_probe_time: None,
+                last_transition_time: None,
+                message: None,
+                reason: None,
+                observed_generation: None,
+            }]);
+        }
+        let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
+        let registered = [
+            owned("10.0.0.1:8080", "uid-w"),
+            owned("10.0.0.1:8081", "uid-w"),
+        ];
         let actions = compute_actions(&desired, &registered);
         assert!(actions.add.is_empty());
-        assert_eq!(actions.remove.len(), 1);
-        assert_eq!(actions.remove[0].pod_uid, "uid-a");
+        assert_eq!(actions.remove.len(), 2);
+        assert_eq!(actions.remove[0].pod_uid, "uid-w");
+        assert_eq!(actions.remove[1].pod_uid, "uid-w");
     }
 
     #[test]
@@ -1815,17 +1971,6 @@ mod tests {
         assert_eq!(actions.remove[0].url, "10.0.0.1:8080");
         assert_eq!(actions.remove[0].revision, 1);
         assert!(actions.add.is_empty());
-    }
-
-    #[test]
-    fn test_compute_actions_unready_pod_keeps_registered_worker() {
-        // URL present (pod exists, unready → not addable) and registered:
-        // neither added nor removed — the health checker owns readiness.
-        let desired = desired_state_of(&[], &[("10.0.0.1:8080", "u1")]);
-        let registered = [owned("10.0.0.1:8080", "u1")];
-        let actions = compute_actions(&desired, &registered);
-        assert!(actions.add.is_empty());
-        assert!(actions.remove.is_empty());
     }
 
     #[test]
@@ -1896,11 +2041,15 @@ mod tests {
             pod_name: "prefill-0".to_string(),
             pod_uid: "uid-1".to_string(),
             model_id_override: Some("llama".to_string()),
+            kv_connector: Some("MooncakeConnector".to_string()),
+            kv_engine_id: Some("engine-1".to_string()),
         };
         let spec = build_worker_spec(&desired, &app_context);
         assert_eq!(spec.url, "10.0.0.1:8081");
         assert_eq!(spec.worker_type, WorkerType::Prefill);
         assert_eq!(spec.bootstrap_port, Some(9080));
+        assert_eq!(spec.kv_connector.as_deref(), Some("MooncakeConnector"));
+        assert_eq!(spec.kv_engine_id.as_deref(), Some("engine-1"));
         assert_eq!(
             spec.labels.get(POD_NAME_LABEL),
             Some(&"prefill-0".to_string())

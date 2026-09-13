@@ -30,6 +30,10 @@ pub struct EmbeddingRequest {
 }
 
 impl GenerationRequest for EmbeddingRequest {
+    fn rid(&self) -> Option<&str> {
+        self.rid.as_deref()
+    }
+
     fn is_stream(&self) -> bool {
         // Embeddings are non-streaming
         false

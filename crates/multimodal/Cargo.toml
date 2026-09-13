@@ -1,6 +1,6 @@
 [package]
 name = "llm-multimodal"
-version = "1.9.0"
+version = "1.11.0"
 edition = "2021"
 description = "Multimodal processing for vision and other modalities"
 license = "Apache-2.0"
@@ -48,7 +48,6 @@ tracing.workspace = true
 url = "2.5.8"
 
 # Workspace crates
-llm-tokenizer.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 

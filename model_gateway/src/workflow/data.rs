@@ -18,7 +18,7 @@ use openai_protocol::{
     model_card::ModelCard, worker::WorkerUpdateRequest as ProtocolWorkerUpdateRequest,
 };
 use serde::{Deserialize, Serialize};
-use wfaas::{WorkflowData, WorkflowError};
+use wfaas::{StepId, WorkflowData, WorkflowError, WorkflowResult};
 
 // ============================================================================
 // Worker kind classification
@@ -132,6 +132,14 @@ pub struct WorkerWorkflowData {
     pub worker_kind: Option<WorkerKind>,
     // -- Local-only fields --
     pub connection_mode: Option<crate::worker::ConnectionMode>,
+    /// HTTP workers: whether the router speaks HTTP/2 prior knowledge,
+    /// resolved by DetectConnectionModeStep.
+    #[serde(default)]
+    pub http2: Option<bool>,
+    /// The worker-directed client for `http2` (transient; see
+    /// [`Self::http_client`]).
+    #[serde(skip, default)]
+    pub http_client_handle: Option<Arc<reqwest::Client>>,
     pub detected_runtime_type: Option<String>,
     pub discovered_labels: HashMap<String, String>,
     pub dp_info: Option<super::steps::local::DpInfo>,
@@ -163,6 +171,25 @@ impl WorkerWorkflowData {
             ));
         }
         Ok(())
+    }
+
+    /// The worker-directed client for the resolved HTTP version, re-fetched
+    /// from the cache when a deserialize dropped the transient handle.
+    pub fn http_client(&self, step_id: &str) -> WorkflowResult<Arc<reqwest::Client>> {
+        if let Some(client) = &self.http_client_handle {
+            return Ok(Arc::clone(client));
+        }
+        let app_context = self
+            .app_context
+            .as_ref()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        app_context
+            .worker_client_cache
+            .get(&self.config.http_pool, self.http2.unwrap_or(false))
+            .map_err(|message| WorkflowError::StepFailed {
+                step_id: StepId::new(step_id),
+                message,
+            })
     }
 }
 

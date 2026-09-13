@@ -425,7 +425,7 @@ def main() -> int:
     )
     p.add_argument(
         "--agent-model",
-        default="Qwen/Qwen3.6-27B",
+        default="Qwen/Qwen3.8-27B",
         help="served model name on both arms (used as openai/<name>)",
     )
     p.add_argument("--user-llm", default="gpt-5.2", help="fixed user-sim model")

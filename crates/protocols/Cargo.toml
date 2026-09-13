@@ -1,6 +1,6 @@
 [package]
 name = "openai-protocol"
-version = "1.11.0"
+version = "1.13.0"
 edition = "2021"
 description = "OpenAI-compatible API protocol definitions and types"
 license = "Apache-2.0"

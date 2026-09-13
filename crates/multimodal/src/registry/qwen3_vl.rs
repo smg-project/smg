@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use llm_tokenizer::Encoding;
 use serde_json::{json, Value};
 
 use crate::{
@@ -69,18 +68,8 @@ impl Qwen3VLVisionSpec {
     fn encode_plain_text(metadata: &ModelMetadata, text: &str) -> Vec<TokenId> {
         metadata
             .tokenizer
-            .encode(text, false)
-            .ok()
-            .map(|encoding| match encoding {
-                Encoding::Hf(inner) => inner
-                    .get_ids()
-                    .iter()
-                    .map(|&id| id as TokenId)
-                    .collect::<Vec<_>>(),
-                Encoding::Plain(ids) | Encoding::Tiktoken(ids) => {
-                    ids.into_iter().map(|id| id as TokenId).collect()
-                }
-            })
+            .encode_text(text)
+            .map(|ids| ids.into_iter().map(|id| id as TokenId).collect())
             .unwrap_or_default()
     }
 
@@ -148,7 +137,8 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         let is_qwen3_5 = id.contains("qwen3.5")
             || id.contains("qwen3.6")
             || model_type.is_some_and(|mt| mt == "qwen3_5" || mt == "qwen3_5_moe");
-        is_qwen3_vl || is_qwen3_5
+        let is_qwen4_exp = model_type.is_some_and(|mt| mt == "qwen4_exp");
+        is_qwen3_vl || is_qwen3_5 || is_qwen4_exp
     }
 
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String> {
@@ -512,6 +502,25 @@ mod tests {
         let spec = registry
             .lookup(&metadata)
             .expect("should match qwen3.5 alias");
+        assert_eq!(spec.name(), "qwen3_vl");
+    }
+
+    #[test]
+    fn qwen4_exp_matches_alias_via_model_type() {
+        let tokenizer = TestTokenizer::new(&[("<|image_pad|>", 151655)]);
+        let config = json!({
+            "model_type": "qwen4_exp",
+            "image_token_id": 151655,
+        });
+        let metadata = ModelMetadata {
+            model_id: "custom-model",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let registry = ModelRegistry::new();
+        let spec = registry
+            .lookup(&metadata)
+            .expect("should match qwen4_exp alias");
         assert_eq!(spec.name(), "qwen3_vl");
     }
 }

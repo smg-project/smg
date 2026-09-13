@@ -14,9 +14,14 @@
 
 use std::{
     collections::{BTreeSet, HashSet},
-    sync::Arc,
+    ops::Deref,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+    },
 };
 
+use arc_swap::ArcSwap;
 use dashmap::{mapref::entry::Entry, DashMap};
 use openai_protocol::worker::WorkerStatus;
 use tokio::sync::{broadcast, mpsc};
@@ -29,6 +34,8 @@ use crate::{
         circuit_breaker::CircuitState,
         event::{WorkerConnected, WorkerEvent},
         hash_ring::HashRing,
+        pd_pair_index::{PdPairIndex, PdWire},
+        pd_pairing::PdPairingMode,
         worker::{RuntimeType, WorkerType},
         ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
     },
@@ -79,10 +86,169 @@ pub struct WorkerDescriptor {
     pub check_interval_secs: u64,
 }
 
+/// Static routing pool inside a model snapshot.
+///
+/// Availability is deliberately not encoded here: health, circuit-breaker and
+/// overload state change independently of membership and remain lock-free on
+/// each worker. Policies validate that live state while selecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoutingPool {
+    HttpRegular,
+    GrpcPipelineRegular,
+    /// Strictly gRPC, unlike [`Self::GrpcPipelineRegular`]: the ZMQ wire
+    /// carries no KV-transfer rendezvous, so a ZMQ worker must never join a
+    /// PD leg even though it rides the gRPC pipeline elsewhere.
+    GrpcPrefill,
+    /// Strictly gRPC (see [`Self::GrpcPrefill`]).
+    GrpcDecode,
+    /// Strictly gRPC: encode dispatch is a gRPC encoder RPC the direct-ZMQ
+    /// worker has no path for.
+    GrpcEncode,
+    /// HTTP-transport prefill pool for the HTTP PD router: it proxies plain
+    /// HTTP to the selected worker's URL, so a gRPC or ZMQ worker must never
+    /// be selectable (the same rule `select_first_worker` follows).
+    HttpPrefill,
+    /// HTTP-transport decode pool (same contract as [`Self::HttpPrefill`]).
+    HttpDecode,
+    /// Workers that front a third-party provider, whatever their type.
+    External,
+}
+
+type WorkerSnapshot = Arc<[Arc<dyn Worker>]>;
+type LazyRoutingPool = OnceLock<WorkerSnapshot>;
+
+impl RoutingPool {
+    const COUNT: usize = 8;
+
+    const fn index(self) -> usize {
+        match self {
+            Self::HttpRegular => 0,
+            Self::GrpcPipelineRegular => 1,
+            Self::GrpcPrefill => 2,
+            Self::GrpcDecode => 3,
+            Self::GrpcEncode => 4,
+            Self::HttpPrefill => 5,
+            Self::HttpDecode => 6,
+            Self::External => 7,
+        }
+    }
+
+    fn matches(self, worker: &Arc<dyn Worker>) -> bool {
+        match self {
+            Self::HttpRegular => {
+                *worker.worker_type() == WorkerType::Regular
+                    && *worker.connection_mode() == ConnectionMode::Http
+            }
+            Self::GrpcPipelineRegular => {
+                *worker.worker_type() == WorkerType::Regular
+                    && worker.connection_mode().uses_grpc_pipeline()
+            }
+            Self::GrpcPrefill => {
+                *worker.worker_type() == WorkerType::Prefill
+                    && *worker.connection_mode() == ConnectionMode::Grpc
+            }
+            Self::GrpcDecode => {
+                *worker.worker_type() == WorkerType::Decode
+                    && *worker.connection_mode() == ConnectionMode::Grpc
+            }
+            Self::GrpcEncode => {
+                *worker.worker_type() == WorkerType::Encode
+                    && *worker.connection_mode() == ConnectionMode::Grpc
+            }
+            Self::HttpPrefill => {
+                *worker.worker_type() == WorkerType::Prefill
+                    && *worker.connection_mode() == ConnectionMode::Http
+            }
+            Self::HttpDecode => {
+                *worker.worker_type() == WorkerType::Decode
+                    && *worker.connection_mode() == ConnectionMode::Http
+            }
+            Self::External => worker.metadata().spec.runtime_type == RuntimeType::External,
+        }
+    }
+}
+
+/// Immutable membership snapshot. Route-specific projections are populated
+/// lazily once and then shared by every request until membership changes
+/// publish a replacement snapshot.
+///
+/// Multi-leg selection (PD/EPD) must derive every leg from ONE snapshot: two
+/// separate registry lookups can straddle a concurrent membership change and
+/// pair workers that never coexisted.
+#[derive(Debug)]
+pub(crate) struct ModelWorkerSnapshot {
+    all: WorkerSnapshot,
+    pools: [LazyRoutingPool; RoutingPool::COUNT],
+    /// The compatible prefill/decode pairs per wire and pairing mode, built
+    /// once from the pools above (see [`PdPairIndex`]).
+    pd_pairs: [[OnceLock<Arc<PdPairIndex>>; PdPairingMode::COUNT]; PdWire::COUNT],
+}
+
+impl ModelWorkerSnapshot {
+    fn new(all: WorkerSnapshot) -> Self {
+        Self {
+            all,
+            pools: std::array::from_fn(|_| OnceLock::new()),
+            pd_pairs: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
+        }
+    }
+
+    /// The compatible prefill/decode pairs of `wire` under `mode`: descriptor
+    /// comparisons happen here, once per membership snapshot, never on the
+    /// request path.
+    pub(crate) fn pd_pairs(&self, wire: PdWire, mode: PdPairingMode) -> Arc<PdPairIndex> {
+        self.pd_pairs[wire.index()][mode.index()]
+            .get_or_init(|| {
+                let (prefill, decode) = wire.pools();
+                Arc::new(PdPairIndex::build(
+                    self.pool(prefill),
+                    self.pool(decode),
+                    mode,
+                ))
+            })
+            .clone()
+    }
+
+    pub(crate) fn pool(&self, pool: RoutingPool) -> WorkerSnapshot {
+        self.pools[pool.index()]
+            .get_or_init(|| {
+                if self.all.iter().all(|worker| pool.matches(worker)) {
+                    return Arc::clone(&self.all);
+                }
+                self.all
+                    .iter()
+                    .filter(|worker| pool.matches(worker))
+                    .cloned()
+                    .collect()
+            })
+            .clone()
+    }
+}
+
+impl Deref for ModelWorkerSnapshot {
+    type Target = [Arc<dyn Worker>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.all
+    }
+}
+
+/// The global membership snapshot together with the epoch it was built at.
+///
+/// Carrying the epoch inside the published object makes the read fast path
+/// self-validating: load the object, compare its epoch to the live counter.
+/// A bump installs a marker with `epoch: usize::MAX`, which can never match
+/// and therefore can never be served.
+#[derive(Debug)]
+struct GlobalRoutingSnapshot {
+    epoch: usize,
+    snapshot: Arc<ModelWorkerSnapshot>,
+}
+
 /// Model index using immutable snapshots for lock-free reads.
-/// Each model maps to an Arc'd slice of workers that can be read without locking.
-/// Updates create new snapshots (copy-on-write semantics).
-type ModelIndex = Arc<DashMap<String, Arc<[Arc<dyn Worker>]>>>;
+/// Updates create new snapshots (copy-on-write semantics); route projections
+/// are cached lazily inside each immutable snapshot.
+type ModelIndex = Arc<DashMap<String, Arc<ModelWorkerSnapshot>>>;
 
 /// Model alias to canonical model ID.
 type ModelAliasIndex = Arc<DashMap<String, Arc<str>>>;
@@ -96,6 +262,33 @@ pub struct WorkerRegistry {
     /// Model index for O(1) lookups using immutable snapshots.
     /// Uses Arc<[T]> instead of Arc<RwLock<Vec<T>>> for lock-free reads.
     model_index: ModelIndex,
+
+    /// Immutable snapshot spanning every registered worker, tagged with the
+    /// `global_epoch` it was built at. Model-less routes use its lazy route
+    /// projections instead of scanning the worker map and cloning every
+    /// matching `Arc` on each request.
+    ///
+    /// Rebuilt lazily: membership mutations only bump `global_epoch` and
+    /// install the shared empty marker (O(1) amortized), and the first read
+    /// after a change rebuilds once from the worker map. A registration or
+    /// removal storm therefore costs one rebuild total, not one full-fleet
+    /// copy per worker.
+    global_routing_snapshot: ArcSwap<GlobalRoutingSnapshot>,
+
+    /// Monotonic membership generation; bumped on every register / replace /
+    /// remove.
+    global_epoch: AtomicUsize,
+
+    /// Orders membership writes against rebuild scans. Mutators hold the
+    /// (shared, O(1)) read side across the worker-map write and the epoch
+    /// bump; the rebuild scan holds the write side, so a published snapshot
+    /// is always a map state that truly existed — DashMap iteration alone
+    /// locks shard by shard and can capture a mixture of generations.
+    global_membership_order: parking_lot::RwLock<()>,
+
+    /// Serializes the cold rebuild path so concurrent stale readers rebuild
+    /// once. Mutations never take it.
+    global_routing_update: parking_lot::Mutex<()>,
 
     /// Alias index kept separate from `model_index` so aliases do not appear as
     /// models in discovery or statistics.
@@ -122,6 +315,19 @@ pub struct WorkerRegistry {
     /// Per-worker-ID locks for serializing replace() operations.
     /// Only held during the in-memory model index diff (no I/O, microseconds).
     worker_mutation_locks: Arc<DashMap<WorkerId, Arc<parking_lot::Mutex<()>>>>,
+
+    /// Count of workers currently flagged overloaded, per model-index key.
+    /// Moved only on flag transitions and on registry membership changes, so
+    /// reading it costs one map probe and no worker walk.
+    model_overloaded: Arc<DashMap<String, AtomicUsize>>,
+
+    /// Serializes overload *edges* so a flag flip and its counter adjustment
+    /// land as one step. Two group loops flipping the same worker in opposite
+    /// directions would otherwise be free to apply their deltas in the reverse
+    /// order and leave the counter disagreeing with the flag. Never taken when
+    /// the verdict is unchanged, which is every poll but the crossing ones, and
+    /// never taken on a request path.
+    overload_transitions: Arc<parking_lot::Mutex<()>>,
 
     /// Per-model retry config (last write wins).
     /// Updated when a worker with non-empty retry overrides registers.
@@ -166,12 +372,21 @@ impl WorkerRegistry {
         Self {
             workers: Arc::new(DashMap::new()),
             model_index: Arc::new(DashMap::new()),
+            global_routing_snapshot: ArcSwap::from_pointee(GlobalRoutingSnapshot {
+                epoch: 0,
+                snapshot: Self::empty_routing_snapshot(),
+            }),
+            global_epoch: AtomicUsize::new(0),
+            global_membership_order: parking_lot::RwLock::new(()),
+            global_routing_update: parking_lot::Mutex::new(()),
             model_alias_index: Arc::new(DashMap::new()),
             hash_rings: Arc::new(DashMap::new()),
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
             worker_mutation_locks: Arc::new(DashMap::new()),
+            model_overloaded: Arc::new(DashMap::new()),
+            overload_transitions: Arc::new(parking_lot::Mutex::new(())),
             model_retry_configs: Arc::new(DashMap::new()),
             worker_origins: Arc::new(DashMap::new()),
             // Sized for fleet-scale bursts (startup registration, probe
@@ -326,6 +541,10 @@ impl WorkerRegistry {
     /// this registry except [`Self::get_by_model`]. A caller holding a
     /// client-supplied name resolves it with [`Self::resolve_model_alias`]
     /// once at request entry and passes the canonical ID from there on.
+    ///
+    /// [`UNKNOWN_MODEL_ID`] returns the wildcard ring spanning every worker,
+    /// matching the candidate set a request that names no model is routed
+    /// against.
     pub fn get_hash_ring(&self, model_id: &str) -> Option<Arc<HashRing>> {
         self.hash_rings.get(model_id).map(|r| Arc::clone(&r))
     }
@@ -345,16 +564,221 @@ impl WorkerRegistry {
     /// slice when the model is unknown.
     pub fn get_by_model(&self, model_id: &str) -> Arc<[Arc<dyn Worker>]> {
         if let Some(workers) = self.model_index.get(model_id) {
-            return Arc::clone(&workers);
+            return Arc::clone(&workers.all);
         }
         self.model_alias_index
             .get(model_id)
             .and_then(|canonical_id| {
                 self.model_index
                     .get(canonical_id.as_ref())
-                    .map(|workers| Arc::clone(&workers))
+                    .map(|workers| Arc::clone(&workers.all))
             })
             .unwrap_or_else(|| Arc::from(Self::EMPTY_WORKERS))
+    }
+
+    /// Return a shared route-specific candidate snapshot for a model.
+    ///
+    /// The first lookup after a membership change builds the projection once;
+    /// subsequent requests only clone the outer `Arc`. Dynamic availability is
+    /// intentionally checked by the policy so health, circuit-breaker and
+    /// overload changes never require rebuilding this snapshot. The wildcard
+    /// model ID uses the global registry snapshot.
+    pub(crate) fn get_routing_pool(
+        &self,
+        model_id: &str,
+        pool: RoutingPool,
+    ) -> Arc<[Arc<dyn Worker>]> {
+        if model_id == UNKNOWN_MODEL_ID {
+            return self.current_global_routing_snapshot().pool(pool);
+        }
+        self.get_model_routing_pool(model_id, pool)
+    }
+
+    /// Like [`Self::get_routing_pool`] but never widens to the global
+    /// snapshot: the wildcard id resolves through the literal `"unknown"`
+    /// model-index entry (untagged workers index there), yielding an empty
+    /// slice when no such entry exists. The HTTP PD router uses this to keep
+    /// its conditional wildcard fallback — untagged workers win when present,
+    /// and only an empty entry widens to the global pool.
+    pub(crate) fn get_model_routing_pool(
+        &self,
+        model_id: &str,
+        pool: RoutingPool,
+    ) -> Arc<[Arc<dyn Worker>]> {
+        self.model_routing_snapshot(model_id).map_or_else(
+            || Arc::from(Self::EMPTY_WORKERS),
+            |snapshot| snapshot.pool(pool),
+        )
+    }
+
+    /// One membership snapshot for a model (alias-aware), from which several
+    /// leg pools can be derived atomically: a PD/EPD selection must draw all
+    /// its legs from a single generation, and two separate pool lookups could
+    /// straddle a concurrent membership change.
+    pub(crate) fn model_routing_snapshot(
+        &self,
+        model_id: &str,
+    ) -> Option<Arc<ModelWorkerSnapshot>> {
+        // Bind the clone via a `let` so the shard `Ref` drops at the end of
+        // the statement (edition 2021 keeps `if let` scrutinee temporaries
+        // alive through the body): the caller's first post-change `pool()`
+        // call does an O(workers) projection build that must not run under
+        // the shard read guard.
+        let snapshot = self
+            .model_index
+            .get(model_id)
+            .map(|workers| Arc::clone(workers.value()));
+        if snapshot.is_some() {
+            return snapshot;
+        }
+        let canonical_id = self
+            .model_alias_index
+            .get(model_id)
+            .map(|canonical_id| Arc::clone(canonical_id.value()));
+        canonical_id.and_then(|canonical_id| {
+            self.model_index
+                .get(canonical_id.as_ref())
+                .map(|workers| Arc::clone(workers.value()))
+        })
+    }
+
+    /// One membership snapshot for multi-leg selection, with the wildcard
+    /// model mapping to the global snapshot and an unknown model to a shared
+    /// empty one.
+    pub(crate) fn get_routing_snapshot(&self, model_id: &str) -> Arc<ModelWorkerSnapshot> {
+        if model_id == UNKNOWN_MODEL_ID {
+            return self.current_global_routing_snapshot();
+        }
+        self.model_routing_snapshot(model_id)
+            .unwrap_or_else(Self::empty_routing_snapshot)
+    }
+
+    /// Shared empty snapshot for unknown models.
+    fn empty_routing_snapshot() -> Arc<ModelWorkerSnapshot> {
+        static EMPTY: OnceLock<Arc<ModelWorkerSnapshot>> = OnceLock::new();
+        Arc::clone(
+            EMPTY
+                .get_or_init(|| Arc::new(ModelWorkerSnapshot::new(Arc::from(Self::EMPTY_WORKERS)))),
+        )
+    }
+
+    /// Return the immutable global membership snapshot used by routing paths
+    /// whose model/provider filters are evaluated dynamically.
+    pub(crate) fn get_routing_workers(&self) -> Arc<[Arc<dyn Worker>]> {
+        Arc::clone(&self.current_global_routing_snapshot().all)
+    }
+
+    /// Apply the absolute overload veto to `worker`, returning `true` when the
+    /// flag transitioned. The only sanctioned writer of
+    /// [`Worker::set_overloaded`]: counters and gauge move once per edge.
+    ///
+    /// Writes through a handle the registry no longer holds are dropped — the
+    /// monitor writes its verdict after a multi-second fetch await, by which
+    /// time the worker may have been removed or replaced, and a stale write
+    /// would move a counter no reset path can reach again.
+    pub fn set_worker_overloaded(&self, worker: &Arc<dyn Worker>, overloaded: bool) -> bool {
+        // Lock-free fast path for the common case: the poll re-asserted a
+        // verdict the worker already carries, so there is no edge to record.
+        if worker.is_overloaded() == overloaded {
+            return false;
+        }
+        // Allocate the keys before taking the edge lock; only the flag flip,
+        // the counter deltas and the gauge publish go inside it. The publish
+        // must share the critical section: published after release, two edges
+        // on one model can land their gauge writes in the reverse order and
+        // pin a stale value until the next transition. Counter GC re-locks a
+        // `model_overloaded` shard, so it stays outside.
+        let model_ids = Self::worker_model_ids(worker);
+        let mut updates = Vec::with_capacity(model_ids.len());
+        {
+            let _edge = self.overload_transitions.lock();
+            if !self.is_current_handle(worker) {
+                return false;
+            }
+            if !worker.set_overloaded(overloaded) {
+                return false;
+            }
+            for model_id in model_ids {
+                let updated = self.adjust_model_overloaded(&model_id, overloaded);
+                Metrics::set_workers_overloaded(&model_id, updated);
+                updates.push((model_id, updated));
+            }
+        }
+        for (model_id, updated) in updates {
+            if updated == 0 {
+                self.model_overloaded
+                    .remove_if(&model_id, |_, count| count.load(Ordering::Acquire) == 0);
+            }
+        }
+        true
+    }
+
+    /// Whether `worker` is the `Arc` the registry currently holds for its URL.
+    ///
+    /// The identity check is by pointer, not by URL: a `replace()` keeps the URL
+    /// and the shared runtime but installs a new worker object with a possibly
+    /// different model card, and the replaced handle must not be allowed to
+    /// attribute a counter move to the model set it used to carry.
+    fn is_current_handle(&self, worker: &Arc<dyn Worker>) -> bool {
+        let Some(worker_id) = self.url_to_id.get(worker.url()).map(|id| id.clone()) else {
+            return false;
+        };
+        self.workers
+            .get(&worker_id)
+            .is_some_and(|current| Arc::ptr_eq(current.value(), worker))
+    }
+
+    /// Clear the veto on every registered worker, returning how many were
+    /// flagged. Used by the load monitor's reset paths, where the feed that
+    /// would otherwise clear the flags is itself being torn down.
+    pub fn clear_all_overload_flags(&self) -> usize {
+        let workers: Vec<Arc<dyn Worker>> = self
+            .workers
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .collect();
+        workers
+            .iter()
+            .filter(|worker| self.set_worker_overloaded(worker, false))
+            .count()
+    }
+
+    /// Workers of `model_id` currently flagged overloaded. O(1).
+    pub fn overloaded_worker_count(&self, model_id: &str) -> usize {
+        if let Some(count) = self.model_overloaded.get(model_id) {
+            return count.load(Ordering::Acquire);
+        }
+        self.model_alias_index
+            .get(model_id)
+            .and_then(|canonical_id| {
+                self.model_overloaded
+                    .get(canonical_id.as_ref())
+                    .map(|count| count.load(Ordering::Acquire))
+            })
+            .unwrap_or(0)
+    }
+
+    /// Move one worker in or out of `model_id`'s overloaded count, returning
+    /// the updated count. Feeds the gauge only — the shed verdict walks the
+    /// caller's candidate pool, since a per-model counter cannot describe a
+    /// type/transport-narrowed sub-pool.
+    fn adjust_model_overloaded(&self, model_id: &str, overloaded: bool) -> usize {
+        let entry = self
+            .model_overloaded
+            .entry(model_id.to_string())
+            .or_default();
+        if overloaded {
+            entry.fetch_add(1, Ordering::AcqRel) + 1
+        } else {
+            // Saturating: a double-clear must never wrap the counter into a
+            // permanent all-overloaded verdict for the model.
+            entry
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_sub(1))
+                })
+                .unwrap_or(0)
+                .saturating_sub(1)
+        }
     }
 
     /// Resolve an alias to its canonical model ID without copying the string.
@@ -374,13 +798,13 @@ impl WorkerRegistry {
     /// other is pinned — and substituting one for the other would silently run
     /// a model the client did not ask for.
     ///
-    /// External workers reach only the OpenAI, Anthropic and Gemini routers
-    /// ([`RouterManager::select_router_for_workers`] gives them priority, and
+    /// External workers reach only the provider routers
+    /// ([`Gateway::select_router_for_model`] gives them priority, and
     /// single-router mode picks by routing mode), none of which rewrite the
     /// outbound model. Keep it that way: canonicalize registry lookups there
     /// if needed, never the request body.
     ///
-    /// [`RouterManager::select_router_for_workers`]: crate::routers::RouterManager
+    /// [`Gateway::select_router_for_model`]: crate::routers::gateway::Gateway
     pub fn resolve_model_alias(&self, model_id: &str) -> Option<Arc<str>> {
         if model_id == UNKNOWN_MODEL_ID || self.model_index.contains_key(model_id) {
             return None;
@@ -574,6 +998,15 @@ impl WorkerRegistry {
             .collect()
     }
 
+    /// Distinct canonical models with at least one worker serving them.
+    /// Wildcard workers carry no model and contribute nothing.
+    pub fn model_count(&self) -> usize {
+        self.model_index
+            .iter()
+            .filter(|entry| !entry.value().is_empty())
+            .count()
+    }
+
     /// Whether at least one worker serves this name, as a canonical model ID
     /// or as an alias.
     ///
@@ -628,6 +1061,7 @@ impl WorkerRegistry {
         let mut decode_count = 0;
         let mut http_count = 0;
         let mut grpc_count = 0;
+        let mut zmq_count = 0;
         let mut cb_open_count = 0;
         let mut cb_half_open_count = 0;
 
@@ -648,7 +1082,8 @@ impl WorkerRegistry {
 
             match worker.connection_mode() {
                 ConnectionMode::Http => http_count += 1,
-                ConnectionMode::Grpc | ConnectionMode::Zmq => grpc_count += 1,
+                ConnectionMode::Grpc => grpc_count += 1,
+                ConnectionMode::Zmq => zmq_count += 1,
             }
 
             match worker.circuit_breaker_state() {
@@ -670,6 +1105,7 @@ impl WorkerRegistry {
             decode_workers: decode_count,
             http_workers: http_count,
             grpc_workers: grpc_count,
+            zmq_workers: zmq_count,
             circuit_breaker_open: cb_open_count,
             circuit_breaker_half_open: cb_half_open_count,
         }
@@ -706,6 +1142,15 @@ impl WorkerRegistry {
         self.model_retry_configs
             .get(model_id)
             .map(|entry| entry.value().clone())
+    }
+
+    /// True when any per-model retry override still allows retries; the
+    /// content-blind streamed path cannot know the model, so it must assume
+    /// the strictest override.
+    pub fn any_model_retry_override_enables_retries(&self) -> bool {
+        self.model_retry_configs
+            .iter()
+            .any(|entry| entry.value().max_retries > 1)
     }
 
     // ───────────────────────────────────────────────────────────────────
@@ -890,6 +1335,12 @@ impl WorkerRegistry {
             return false;
         }
 
+        // Release the verdict while `old_worker` is still the current handle:
+        // the replacement inherits the shared runtime, and a flag carried onto
+        // a possibly different model set would leak its counter. The next poll
+        // re-derives the verdict for the URL.
+        self.set_worker_overloaded(&old_worker, false);
+
         if !new_worker.inherit_shared_state_from(&*old_worker) {
             tracing::warn!(
                 worker_id = %worker_id.as_str(),
@@ -898,10 +1349,20 @@ impl WorkerRegistry {
             );
         }
 
-        // Overwrite worker object atomically
-        self.workers.insert(worker_id.clone(), new_worker.clone());
+        // Overwrite worker object atomically. The membership-order read
+        // guard keeps the rebuild scan from interleaving with this write.
+        {
+            let _order = self.global_membership_order.read();
+            self.workers.insert(worker_id.clone(), new_worker.clone());
+            self.bump_global_routing_epoch();
+        }
 
-        // Diff model indexes: remove stale, add new
+        // The replacement carries its own backend-client slot, so the old
+        // instance's ZMQ handshake driver can now only hold its socket binds
+        // against the new worker's connect.
+        old_worker.abort_background_tasks();
+
+        // Diff model indexes: remove stale, add new.
         for removed_model in old_models.difference(&new_models) {
             self.remove_worker_from_model_index(removed_model, old_worker.url());
             // Mirror `remove()`: drop any per-model retry override when
@@ -1155,7 +1616,31 @@ impl WorkerRegistry {
             }
         }
 
-        if let Some((_, worker)) = self.workers.remove(worker_id) {
+        // Release the overload count and demote the worker before it leaves
+        // `self.workers` — stale-handle writes are dropped after removal, so
+        // clearing afterwards would leak the count, and routing snapshots
+        // that still hold this worker must already see it ineligible by the
+        // time the removal becomes visible.
+        if let Some(entry) = self.workers.get(worker_id) {
+            let worker = Arc::clone(entry.value());
+            drop(entry);
+            self.set_worker_overloaded(&worker, false);
+            if worker.status() == WorkerStatus::Ready {
+                worker.set_status(WorkerStatus::NotReady);
+            }
+        }
+
+        // The membership-order read guard keeps the rebuild scan from
+        // interleaving with this write.
+        let removed = {
+            let _order = self.global_membership_order.read();
+            let removed = self.workers.remove(worker_id);
+            if removed.is_some() {
+                self.bump_global_routing_epoch();
+            }
+            removed
+        };
+        if let Some((_, worker)) = removed {
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
@@ -1184,17 +1669,12 @@ impl WorkerRegistry {
                 conn_workers.retain(|id| id != worker_id);
             }
 
-            // Mark the worker as not-ready before tearing down its
-            // metrics so any in-flight `is_healthy()` callers that
-            // still hold an `Arc` see the correct state. Skip the
-            // transition for `Pending` (hasn't proven itself) and
-            // `Failed` (already terminal); only Ready warrants the
-            // explicit demotion. Mirrors the legacy `set_healthy(false)`
-            // semantics without going through the deprecated shim.
-            if worker.status() == WorkerStatus::Ready {
-                worker.set_status(WorkerStatus::NotReady);
-            }
             Metrics::remove_worker_metrics(worker.url());
+
+            // Release background work owned by this instance — notably the ZMQ
+            // handshake driver, whose bound sockets would otherwise block a
+            // re-registration at the same URL until it times out.
+            worker.abort_background_tasks();
 
             // Mesh tombstoning rides the `Removed` event below: the
             // outbound sync loop deletes `worker:{id}` for local workers.
@@ -1388,7 +1868,13 @@ impl WorkerRegistry {
         // mesh-imported (peer state could mutate a local worker's status).
         self.worker_origins.insert(worker_id.clone(), origin);
 
-        self.workers.insert(worker_id.clone(), worker.clone());
+        // The membership-order read guard keeps the rebuild scan from
+        // interleaving with this write.
+        {
+            let _order = self.global_membership_order.read();
+            self.workers.insert(worker_id.clone(), worker.clone());
+            self.bump_global_routing_epoch();
+        }
 
         // Update model index for O(1) lookups using copy-on-write.
         for model_id in Self::worker_model_ids(&worker) {
@@ -1428,14 +1914,79 @@ impl WorkerRegistry {
         Some(worker_id)
     }
 
-    /// Rebuild the hash ring for a model based on current workers in the model index.
+    /// Reconcile the hash ring for a model to the current model index.
+    ///
+    /// Diffs against the cached ring so only changed URLs are rehashed: a
+    /// full rebuild is O(workers) hashing plus a sort on every mutation,
+    /// which at fleet scale turns a registration wave quadratic and
+    /// saturates the runtime.
     fn rebuild_hash_ring(&self, model_id: &str) {
-        if let Some(workers) = self.model_index.get(model_id) {
-            let ring = HashRing::new(workers.value().iter().map(|w| w.url()));
-            self.hash_rings.insert(model_id.to_string(), Arc::new(ring));
-        } else {
-            // No workers for this model, remove the ring
-            self.hash_rings.remove(model_id);
+        // Clone the copy-on-write slice out so the ring build never runs
+        // under the index shard guard.
+        let workers = self.model_index.get(model_id).map(|entry| entry.clone());
+
+        match workers {
+            Some(workers) => {
+                let previous = self.hash_rings.get(model_id).map(|ring| Arc::clone(&ring));
+                let urls = workers.iter().map(|w| w.url());
+                let ring = match previous {
+                    Some(previous) => previous.updated(urls),
+                    None => HashRing::new(urls),
+                };
+                self.hash_rings.insert(model_id.to_string(), Arc::new(ring));
+            }
+            None => {
+                // No workers for this model, remove the ring
+                self.hash_rings.remove(model_id);
+            }
+        }
+
+        self.rebuild_wildcard_hash_ring();
+    }
+
+    /// Rebuild the ring stored under [`UNKNOWN_MODEL_ID`], which requests that
+    /// name no model are routed against. Those requests may land on any worker,
+    /// so the ring spans every model's workers, deduplicated by URL.
+    fn rebuild_wildcard_hash_ring(&self) {
+        let model_ids: Vec<String> = self
+            .model_index
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        match model_ids.as_slice() {
+            [] => {
+                self.hash_rings.remove(UNKNOWN_MODEL_ID);
+            }
+            // A single model already covers every worker, so share its ring
+            // instead of hashing the same URLs a second time.
+            [only] => {
+                let ring = self.hash_rings.get(only).map(|ring| Arc::clone(&ring));
+                match ring {
+                    Some(ring) => {
+                        self.hash_rings.insert(UNKNOWN_MODEL_ID.to_string(), ring);
+                    }
+                    None => {
+                        self.hash_rings.remove(UNKNOWN_MODEL_ID);
+                    }
+                }
+            }
+            _ => {
+                let mut urls: HashSet<String> = HashSet::new();
+                for entry in self.model_index.iter() {
+                    urls.extend(entry.value().iter().map(|w| w.url().to_string()));
+                }
+                let previous = self
+                    .hash_rings
+                    .get(UNKNOWN_MODEL_ID)
+                    .map(|ring| Arc::clone(&ring));
+                let ring = match previous {
+                    Some(previous) => previous.updated(&urls),
+                    None => HashRing::new(&urls),
+                };
+                self.hash_rings
+                    .insert(UNKNOWN_MODEL_ID.to_string(), Arc::new(ring));
+            }
         }
     }
 
@@ -1443,6 +1994,10 @@ impl WorkerRegistry {
     /// Replaces any existing entry with the same URL so updates via replace()
     /// do not leave duplicate rows.
     fn add_worker_to_model_index(&self, model_id: &str, worker: Arc<dyn Worker>) {
+        // The replaced snapshot (and its cached projections) must not drop
+        // under the shard write guard: capture it and let it fall after the
+        // entry expression releases the lock.
+        let mut previous = None;
         self.model_index
             .entry(model_id.to_string())
             .and_modify(|existing| {
@@ -1452,15 +2007,99 @@ impl WorkerRegistry {
                     .cloned()
                     .collect();
                 new_workers.push(worker.clone());
-                *existing = Arc::from(new_workers.into_boxed_slice());
+                previous = Some(std::mem::replace(
+                    existing,
+                    Arc::new(ModelWorkerSnapshot::new(Arc::from(
+                        new_workers.into_boxed_slice(),
+                    ))),
+                ));
             })
-            .or_insert_with(|| Arc::from(vec![worker].into_boxed_slice()));
+            .or_insert_with(|| {
+                Arc::new(ModelWorkerSnapshot::new(Arc::from(
+                    vec![worker].into_boxed_slice(),
+                )))
+            });
+        drop(previous);
+    }
+
+    /// Mark the global routing snapshot stale and release the superseded
+    /// generation. O(1) amortized: the first bump after a published
+    /// generation drops it (otherwise model-scoped-only traffic would retain
+    /// a full-fleet generation until a model-less read that may never come),
+    /// and every further bump in a storm drops only the shared marker. The
+    /// marker's `usize::MAX` epoch can never match the live counter, so a
+    /// racing fast-path reader can never serve it.
+    ///
+    /// Callers must hold a `global_membership_order` read guard across the
+    /// worker-map mutation and this bump, so the rebuild scan cannot observe
+    /// a half-applied write.
+    fn bump_global_routing_epoch(&self) {
+        self.global_epoch.fetch_add(1, Ordering::Release);
+        let previous = self
+            .global_routing_snapshot
+            .swap(Arc::new(GlobalRoutingSnapshot {
+                epoch: usize::MAX,
+                snapshot: Self::empty_routing_snapshot(),
+            }));
+        drop(previous);
+    }
+
+    /// The current global membership snapshot, rebuilt first when membership
+    /// changed since it was last published.
+    ///
+    /// The fast path is self-validating: the published object carries the
+    /// epoch it was built at, so a snapshot superseded between the counter
+    /// load and the pointer load fails the comparison and falls through to
+    /// the rebuild. The rebuild scans the worker map under the
+    /// `global_membership_order` write side, so every published snapshot is
+    /// a membership state that truly existed at one instant — never a
+    /// mixture of generations from interleaved shard reads.
+    fn current_global_routing_snapshot(&self) -> Arc<ModelWorkerSnapshot> {
+        let published = self.global_routing_snapshot.load_full();
+        if published.epoch == self.global_epoch.load(Ordering::Acquire) {
+            return Arc::clone(&published.snapshot);
+        }
+        drop(published);
+        let _update = self.global_routing_update.lock();
+        // Re-check under the rebuild lock: a concurrent reader may have
+        // already rebuilt for the current epoch.
+        let published = self.global_routing_snapshot.load_full();
+        if published.epoch == self.global_epoch.load(Ordering::Acquire) {
+            return Arc::clone(&published.snapshot);
+        }
+        drop(published);
+        let (epoch, fresh) = {
+            let _order = self.global_membership_order.write();
+            let epoch = self.global_epoch.load(Ordering::Acquire);
+            let members: Vec<Arc<dyn Worker>> = self
+                .workers
+                .iter()
+                .map(|entry| Arc::clone(entry.value()))
+                .collect();
+            let fresh = Arc::new(ModelWorkerSnapshot::new(Arc::from(
+                members.into_boxed_slice(),
+            )));
+            (epoch, fresh)
+        };
+        let previous = self
+            .global_routing_snapshot
+            .swap(Arc::new(GlobalRoutingSnapshot {
+                epoch,
+                snapshot: Arc::clone(&fresh),
+            }));
+        // Superseded generations can own large projection slices; drop them
+        // outside the membership-order guard.
+        drop(previous);
+        fresh
     }
 
     /// Drop `worker_url` from the copy-on-write model index slice for `model_id`
     /// and rebuild the hash ring. Evicts the whole model entry when empty.
     fn remove_worker_from_model_index(&self, model_id: &str, worker_url: &str) {
         let mut should_remove_entry = false;
+        // As in add_worker_to_model_index: the replaced snapshot drops after
+        // the shard guard, not under it.
+        let mut previous = None;
 
         if let Some(mut entry) = self.model_index.get_mut(model_id) {
             let new_workers: Vec<Arc<dyn Worker>> = entry
@@ -1470,12 +2109,23 @@ impl WorkerRegistry {
                 .collect();
 
             if new_workers.is_empty() {
-                *entry = Arc::from(Vec::<Arc<dyn Worker>>::new().into_boxed_slice());
+                previous = Some(std::mem::replace(
+                    &mut *entry,
+                    Arc::new(ModelWorkerSnapshot::new(Arc::from(
+                        Vec::<Arc<dyn Worker>>::new().into_boxed_slice(),
+                    ))),
+                ));
                 should_remove_entry = true;
             } else {
-                *entry = Arc::from(new_workers.into_boxed_slice());
+                previous = Some(std::mem::replace(
+                    &mut *entry,
+                    Arc::new(ModelWorkerSnapshot::new(Arc::from(
+                        new_workers.into_boxed_slice(),
+                    ))),
+                ));
             }
         }
+        drop(previous);
 
         if should_remove_entry {
             self.model_index
@@ -1683,6 +2333,18 @@ impl WorkerRegistry {
     pub fn on_remote_worker_state(&self, state: &smg_mesh::WorkerState) {
         use openai_protocol::model_card::ModelCard;
 
+        // ZMQ is a same-host transport: its `ipc://` endpoint names a socket
+        // on the publisher's machine, so importing it here would advertise a
+        // route that can never reach the engine. Publishers filter these out;
+        // this guard also covers peers running older builds.
+        if ConnectionMode::from_url(&state.url) == Some(ConnectionMode::Zmq) {
+            tracing::debug!(
+                url = %state.url,
+                "Ignoring mesh state for host-local ZMQ worker"
+            );
+            return;
+        }
+
         // If worker already exists at this URL, update its health
         // status from the mesh state. Don't re-register — the existing
         // worker has full config from its creation workflow.
@@ -1721,6 +2383,38 @@ impl WorkerRegistry {
             }
         }
 
+        // Decode the spec (and run the transport gate it declares) BEFORE
+        // touching any index: a rejected state must leave no trace, or the
+        // id reservation below would outlive it and a legitimate worker
+        // later arriving at this URL would silently inherit the rejected
+        // publisher's id — breaking tombstone routing for it.
+        let spec = if state.spec.is_empty() {
+            None
+        } else {
+            match serde_json::from_slice::<openai_protocol::worker::WorkerSpec>(&state.spec) {
+                Ok(spec) => {
+                    // Same-host transport declared by the spec rather than by
+                    // the URL scheme — not routable from this node.
+                    if spec.connection_mode == ConnectionMode::Zmq {
+                        tracing::debug!(
+                            url = %state.url,
+                            "Ignoring mesh state for host-local ZMQ worker"
+                        );
+                        return;
+                    }
+                    Some(spec)
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        url = %state.url,
+                        %err,
+                        "undecodable WorkerSpec in mesh state; importing minimal worker"
+                    );
+                    None
+                }
+            }
+        };
+
         // Adopt the publisher's worker id for the import so a later
         // tombstone for `worker:{id}` (which carries no value, only the
         // key) resolves to this worker. A pre-existing reservation for
@@ -1734,31 +2428,14 @@ impl WorkerRegistry {
                 .or_insert_with(|| WorkerId::from_string(state.worker_id.clone()));
         }
 
-        // New worker — build from the full WorkerSpec (JSON) if available,
+        // New worker — build from the full WorkerSpec if it decoded,
         // otherwise fall back to the minimal builder.
-        let minimal = || {
-            super::builder::BasicWorkerBuilder::new(&state.url)
+        let spec_applied = spec.is_some();
+        let worker = match spec {
+            Some(spec) => super::builder::BasicWorkerBuilder::from_spec(spec).build(),
+            None => super::builder::BasicWorkerBuilder::new(&state.url)
                 .model(ModelCard::new(&state.model_id))
-                .build()
-        };
-        let mut spec_applied = false;
-        let worker = if state.spec.is_empty() {
-            minimal()
-        } else {
-            match serde_json::from_slice::<openai_protocol::worker::WorkerSpec>(&state.spec) {
-                Ok(spec) => {
-                    spec_applied = true;
-                    super::builder::BasicWorkerBuilder::from_spec(spec).build()
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        url = %state.url,
-                        %err,
-                        "undecodable WorkerSpec in mesh state; importing minimal worker"
-                    );
-                    minimal()
-                }
-            }
+                .build(),
         };
 
         // An explicitly-unhealthy import must not be routable: the builder
@@ -1815,6 +2492,8 @@ pub struct WorkerRegistryStats {
     pub http_workers: usize,
     /// Number of gRPC-connected workers
     pub grpc_workers: usize,
+    /// Number of ZMQ-connected workers (direct-backend transport)
+    pub zmq_workers: usize,
     /// Number of workers with circuit breaker in Open state (not accepting requests)
     pub circuit_breaker_open: usize,
     /// Number of workers with circuit breaker in HalfOpen state (testing recovery)
@@ -2016,6 +2695,34 @@ mod tests {
         assert_eq!(stats.decode_workers, 0);
         assert_eq!(stats.regular_workers, 0);
         assert_eq!(stats.grpc_workers, 1);
+        assert_eq!(stats.zmq_workers, 0);
+    }
+
+    #[test]
+    fn test_stats_counts_zmq_workers_separately_from_grpc() {
+        // ZMQ rides the gRPC request pipeline but is its own transport;
+        // folding it into grpc_workers hid it from observability output.
+        let registry = WorkerRegistry::new();
+
+        for (url, mode) in [
+            ("grpc://worker:8080", ConnectionMode::Grpc),
+            ("ipc:///tmp/smg-zmq/engine.ipc", ConnectionMode::Zmq),
+            ("http://worker:8080", ConnectionMode::Http),
+        ] {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(mode)
+                    .build(),
+            );
+            registry.register(worker).unwrap();
+        }
+
+        let stats = registry.stats();
+        assert_eq!(stats.total_workers, 3);
+        assert_eq!(stats.http_workers, 1);
+        assert_eq!(stats.grpc_workers, 1);
+        assert_eq!(stats.zmq_workers, 1);
     }
 
     #[test]
@@ -2074,6 +2781,95 @@ mod tests {
             Some(WorkerId::from_string("peer-w1".to_string())),
             "import keys under the publisher's id so its tombstone resolves"
         );
+    }
+
+    #[test]
+    fn mesh_state_for_zmq_worker_is_never_imported() {
+        // ZMQ is same-host: an `ipc://` endpoint published by a peer names a
+        // socket path on that peer's machine, so importing it would advertise
+        // an unroutable worker.
+        let registry = WorkerRegistry::new();
+        registry.on_remote_worker_state(&remote_state(
+            "peer-w1",
+            "ipc:///tmp/smg-peer.sock",
+            true,
+            vec![],
+        ));
+        assert!(
+            registry.get_by_url("ipc:///tmp/smg-peer.sock").is_none(),
+            "a host-local ZMQ worker must not be imported from the mesh"
+        );
+
+        // Same rejection when the transport is declared only by the spec.
+        let spec: openai_protocol::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+            "url": "http://remote:8080",
+            "connection_mode": "zmq"
+        }))
+        .unwrap();
+        registry.on_remote_worker_state(&remote_state(
+            "peer-w2",
+            "http://remote:8080",
+            true,
+            serde_json::to_vec(&spec).unwrap(),
+        ));
+        assert!(
+            registry.get_by_url("http://remote:8080").is_none(),
+            "a spec-declared ZMQ worker must not be imported from the mesh"
+        );
+    }
+
+    #[test]
+    fn rejected_zmq_state_leaves_no_url_to_id_residue() {
+        // Both transport gates run before the id reservation. A leftover
+        // `url_to_id` entry would be invisible to `get_id_by_url` (which
+        // skips ids with no live worker) yet still win the `Entry::Occupied`
+        // arm in `register_inner`, handing the next legitimate worker at
+        // this URL the rejected publisher's id — so a peer tombstone for
+        // that id would delete a worker that never came from the mesh.
+        let registry = WorkerRegistry::new();
+
+        // Rejected by the URL scheme.
+        registry.on_remote_worker_state(&remote_state(
+            "peer-w1",
+            "ipc:///tmp/smg-peer.sock",
+            true,
+            vec![],
+        ));
+        assert!(
+            registry.url_to_id.get("ipc:///tmp/smg-peer.sock").is_none(),
+            "a URL-scheme rejection must not reserve an id"
+        );
+
+        // Rejected by the spec's declared connection mode.
+        let spec: openai_protocol::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+            "url": "http://remote:8080",
+            "connection_mode": "zmq"
+        }))
+        .unwrap();
+        registry.on_remote_worker_state(&remote_state(
+            "peer-w2",
+            "http://remote:8080",
+            true,
+            serde_json::to_vec(&spec).unwrap(),
+        ));
+        assert!(
+            registry.url_to_id.get("http://remote:8080").is_none(),
+            "a spec rejection must not reserve an id"
+        );
+
+        // A legitimate worker later arriving at the same URL gets its own id.
+        let local: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://remote:8080")
+                .model(ModelCard::new("llama-3"))
+                .build(),
+        );
+        let local_id = registry.register(local).expect("registers");
+        assert_ne!(
+            local_id,
+            WorkerId::from_string("peer-w2".to_string()),
+            "a later worker must not inherit the rejected publisher's id"
+        );
+        assert_eq!(registry.get_id_by_url("http://remote:8080"), Some(local_id));
     }
 
     #[test]
@@ -2320,6 +3116,326 @@ mod tests {
         let llama_workers_after = registry.get_by_model("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
+    }
+
+    #[test]
+    fn routing_pool_reuses_uniform_model_snapshot() {
+        let registry = WorkerRegistry::new();
+        for url in ["http://worker1:8080", "http://worker2:8080"] {
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new("llama-3"))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Http)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        }
+
+        let all = registry.get_by_model("llama-3");
+        let first = registry.get_routing_pool("llama-3", RoutingPool::HttpRegular);
+        let second = registry.get_routing_pool("llama-3", RoutingPool::HttpRegular);
+
+        assert!(Arc::ptr_eq(&all, &first));
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn routing_pool_is_cached_and_replaced_with_membership_snapshot() {
+        let registry = WorkerRegistry::new();
+        let http_id = registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://worker1:8080")
+                    .model(ModelCard::new("llama-3"))
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Http)
+                    .health_config(no_health_check())
+                    .build(),
+            ))
+            .unwrap();
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("grpc://worker2:8080")
+                    .model(ModelCard::new("llama-3"))
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .health_config(no_health_check())
+                    .build(),
+            ))
+            .unwrap();
+
+        let first = registry.get_routing_pool("llama-3", RoutingPool::HttpRegular);
+        let second = registry.get_routing_pool("llama-3", RoutingPool::HttpRegular);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].url(), "http://worker1:8080");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        registry
+            .transition_status(&http_id, WorkerStatus::NotReady)
+            .unwrap();
+        let after_health_change = registry.get_routing_pool("llama-3", RoutingPool::HttpRegular);
+        assert!(Arc::ptr_eq(&first, &after_health_change));
+        assert!(!after_health_change[0].is_available());
+
+        registry.remove(&http_id).unwrap();
+        let after_remove = registry.get_routing_pool("llama-3", RoutingPool::HttpRegular);
+        assert!(after_remove.is_empty());
+        assert!(!Arc::ptr_eq(&first, &after_remove));
+        assert_eq!(first.len(), 1, "held snapshots remain immutable");
+    }
+
+    #[test]
+    fn wildcard_routing_pool_reuses_global_snapshot() {
+        let registry = WorkerRegistry::new();
+        let http_worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker1:8080")
+                .model(ModelCard::new("model-a"))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .health_config(no_health_check())
+                .build(),
+        );
+        let http_id = registry.register(http_worker.clone()).unwrap();
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("grpc://worker2:8080")
+                    .model(ModelCard::new("model-b"))
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .health_config(no_health_check())
+                    .build(),
+            ))
+            .unwrap();
+
+        let before = Arc::strong_count(&http_worker);
+        let first = registry.get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
+        let after_first = Arc::strong_count(&http_worker);
+        let second = registry.get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].url(), "http://worker1:8080");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(after_first > before);
+        assert_eq!(Arc::strong_count(&http_worker), after_first);
+
+        registry
+            .transition_status(&http_id, WorkerStatus::NotReady)
+            .unwrap();
+        let after_health_change =
+            registry.get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
+        assert!(Arc::ptr_eq(&first, &after_health_change));
+        assert!(!after_health_change[0].is_available());
+
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker1:8080")
+                .model(ModelCard::new("model-a"))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .build(),
+        );
+        assert!(registry.replace(&http_id, replacement));
+        let after_replace = registry.get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
+        assert!(after_replace.is_empty());
+        assert!(!Arc::ptr_eq(&first, &after_replace));
+        assert_eq!(
+            registry
+                .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::GrpcPipelineRegular)
+                .len(),
+            2
+        );
+        assert_eq!(first.len(), 1, "held snapshots remain immutable");
+    }
+
+    #[test]
+    fn concurrent_global_snapshot_updates_preserve_all_workers() {
+        let registry = Arc::new(WorkerRegistry::new());
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let registry = Arc::clone(&registry);
+                scope.spawn(move || {
+                    registry
+                        .register(Arc::new(
+                            BasicWorkerBuilder::new(format!("http://worker{i}:8080"))
+                                .worker_type(WorkerType::Regular)
+                                .connection_mode(ConnectionMode::Http)
+                                .health_config(no_health_check())
+                                .build(),
+                        ))
+                        .unwrap();
+                });
+            }
+        });
+
+        let workers = registry.get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
+        assert_eq!(workers.len(), 8);
+        assert_eq!(
+            workers
+                .iter()
+                .map(|worker| worker.url())
+                .collect::<HashSet<_>>()
+                .len(),
+            8
+        );
+    }
+
+    /// The writer replaces the prefill worker before the decode worker on
+    /// every generation, so in every membership state that ever truly
+    /// existed, generation(prefill) >= generation(decode). A rebuild scan
+    /// that interleaved with the writer could publish the reverse — an old
+    /// prefill paired with a newer decode — which is exactly the torn pair a
+    /// live PD selection must never draw from.
+    #[test]
+    fn global_snapshot_never_publishes_a_torn_generation() {
+        use std::sync::atomic::AtomicBool;
+
+        fn pd_worker(url: &str, worker_type: WorkerType, generation: usize) -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new("model"))
+                    .worker_type(worker_type)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .label("generation", generation.to_string())
+                    .health_config(no_health_check())
+                    .build(),
+            )
+        }
+
+        fn generation(pool: &[Arc<dyn Worker>]) -> usize {
+            pool[0]
+                .metadata()
+                .spec
+                .labels
+                .get("generation")
+                .and_then(|generation| generation.parse().ok())
+                .expect("every test worker carries a generation label")
+        }
+
+        let registry = WorkerRegistry::new();
+        registry.register_or_replace(pd_worker("grpc://prefill:1", WorkerType::Prefill, 0));
+        registry.register_or_replace(pd_worker("grpc://decode:1", WorkerType::Decode, 0));
+
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for generation in 1..=300 {
+                    registry.register_or_replace(pd_worker(
+                        "grpc://prefill:1",
+                        WorkerType::Prefill,
+                        generation,
+                    ));
+                    registry.register_or_replace(pd_worker(
+                        "grpc://decode:1",
+                        WorkerType::Decode,
+                        generation,
+                    ));
+                }
+                done.store(true, Ordering::Release);
+            });
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    let snapshot = registry.get_routing_snapshot(UNKNOWN_MODEL_ID);
+                    let prefill = snapshot.pool(RoutingPool::GrpcPrefill);
+                    let decode = snapshot.pool(RoutingPool::GrpcDecode);
+                    if prefill.is_empty() || decode.is_empty() {
+                        continue;
+                    }
+                    assert!(
+                        generation(&prefill) >= generation(&decode),
+                        "torn snapshot: decode generation passed prefill"
+                    );
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn routing_pools_filter_regular_workers_by_transport() {
+        let registry = WorkerRegistry::new();
+        let workers = [
+            ("http://regular", WorkerType::Regular, ConnectionMode::Http),
+            ("grpc://regular", WorkerType::Regular, ConnectionMode::Grpc),
+            ("zmq://regular", WorkerType::Regular, ConnectionMode::Zmq),
+            ("http://prefill", WorkerType::Prefill, ConnectionMode::Http),
+            ("grpc://prefill", WorkerType::Prefill, ConnectionMode::Grpc),
+            ("zmq://prefill", WorkerType::Prefill, ConnectionMode::Zmq),
+            ("http://decode", WorkerType::Decode, ConnectionMode::Http),
+            ("grpc://decode", WorkerType::Decode, ConnectionMode::Grpc),
+            ("grpc://encode", WorkerType::Encode, ConnectionMode::Grpc),
+            ("http://encode", WorkerType::Encode, ConnectionMode::Http),
+        ];
+        for (url, worker_type, connection_mode) in workers {
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new("model"))
+                        .worker_type(worker_type)
+                        .connection_mode(connection_mode)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        }
+
+        let urls = |pool| {
+            registry
+                .get_routing_pool("model", pool)
+                .iter()
+                .map(|worker| worker.url().to_string())
+                .collect::<HashSet<_>>()
+        };
+
+        assert_eq!(
+            urls(RoutingPool::HttpRegular),
+            HashSet::from(["http://regular".to_string()])
+        );
+        assert_eq!(
+            urls(RoutingPool::GrpcPipelineRegular),
+            HashSet::from(["grpc://regular".to_string(), "zmq://regular".to_string()])
+        );
+        // PD/EPD legs are strictly gRPC: a ZMQ prefill worker that slipped
+        // past registration must not appear.
+        assert_eq!(
+            urls(RoutingPool::GrpcPrefill),
+            HashSet::from(["grpc://prefill".to_string()])
+        );
+        assert_eq!(
+            urls(RoutingPool::GrpcDecode),
+            HashSet::from(["grpc://decode".to_string()])
+        );
+        assert_eq!(
+            urls(RoutingPool::GrpcEncode),
+            HashSet::from(["grpc://encode".to_string()])
+        );
+        // The HTTP PD legs are HTTP-only: the router proxies plain HTTP to
+        // the selected URL, so gRPC and ZMQ workers must never be selectable.
+        assert_eq!(
+            urls(RoutingPool::HttpPrefill),
+            HashSet::from(["http://prefill".to_string()])
+        );
+        assert_eq!(
+            urls(RoutingPool::HttpDecode),
+            HashSet::from(["http://decode".to_string()])
+        );
+    }
+
+    #[test]
+    fn routing_pool_alias_reuses_canonical_snapshot() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(worker_with_model_aliases(
+                "http://worker:8080",
+                "canonical-model",
+                &["model-alias"],
+                WorkerType::Regular,
+            ))
+            .unwrap();
+
+        let canonical = registry.get_routing_pool("canonical-model", RoutingPool::HttpRegular);
+        let alias = registry.get_routing_pool("model-alias", RoutingPool::HttpRegular);
+        assert!(Arc::ptr_eq(&canonical, &alias));
     }
 
     // Health-checker integration tests moved to worker/manager.rs along with
@@ -3310,5 +4426,376 @@ mod tests {
             }
             other => panic!("Expected Removed event, got: {other:?}"),
         }
+    }
+
+    fn worker_serving(url: &str, model_ids: &[&str]) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .models(
+                    model_ids
+                        .iter()
+                        .map(|id| ModelCard::new(*id))
+                        .collect::<Vec<_>>(),
+                )
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    #[test]
+    fn test_wildcard_hash_ring_matches_the_only_model() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(worker_serving("http://w1:8080", &["llama-3"]))
+            .unwrap();
+        registry
+            .register(worker_serving("http://w2:8080", &["llama-3"]))
+            .unwrap();
+
+        let wildcard = registry
+            .get_hash_ring(UNKNOWN_MODEL_ID)
+            .expect("requests naming no model need a ring");
+        let model_ring = registry.get_hash_ring("llama-3").expect("per-model ring");
+
+        assert_eq!(wildcard.worker_count(), 2);
+        for key in ["alpha", "beta", "gamma"] {
+            assert_eq!(
+                wildcard.find_healthy_url(key, |_| true),
+                model_ring.find_healthy_url(key, |_| true),
+                "wildcard and single-model rings must agree on {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wildcard_hash_ring_unions_models() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(worker_serving("http://w1:8080", &["llama-3"]))
+            .unwrap();
+        registry
+            .register(worker_serving("http://w2:8080", &["gpt-4"]))
+            .unwrap();
+
+        let wildcard = registry.get_hash_ring(UNKNOWN_MODEL_ID).expect("ring");
+        assert_eq!(wildcard.worker_count(), 2);
+        assert_eq!(
+            wildcard.find_healthy_url("key", |url| url == "http://w1:8080"),
+            Some("http://w1:8080")
+        );
+        assert_eq!(
+            wildcard.find_healthy_url("key", |url| url == "http://w2:8080"),
+            Some("http://w2:8080")
+        );
+
+        // Per-model rings stay scoped to their own workers.
+        assert_eq!(
+            registry
+                .get_hash_ring("llama-3")
+                .expect("ring")
+                .worker_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_wildcard_hash_ring_weights_multi_model_worker_once() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(worker_serving("http://w1:8080", &["llama-3", "gpt-4"]))
+            .unwrap();
+        registry
+            .register(worker_serving("http://w2:8080", &["gpt-4"]))
+            .unwrap();
+
+        let wildcard = registry.get_hash_ring(UNKNOWN_MODEL_ID).expect("ring");
+        assert_eq!(
+            wildcard.worker_count(),
+            2,
+            "a worker serving two models must not take a double share of the ring"
+        );
+    }
+
+    #[test]
+    fn test_wildcard_hash_ring_follows_removals() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(worker_serving("http://w1:8080", &["llama-3"]))
+            .unwrap();
+        registry
+            .register(worker_serving("http://w2:8080", &["gpt-4"]))
+            .unwrap();
+
+        registry.remove_by_url("http://w2:8080");
+        let wildcard = registry.get_hash_ring(UNKNOWN_MODEL_ID).expect("ring");
+        assert_eq!(wildcard.worker_count(), 1);
+        assert_eq!(
+            wildcard.find_healthy_url("key", |_| true),
+            Some("http://w1:8080")
+        );
+
+        registry.remove_by_url("http://w1:8080");
+        assert!(
+            registry.get_hash_ring(UNKNOWN_MODEL_ID).is_none(),
+            "an empty registry has no ring to route against"
+        );
+    }
+
+    /// A ZMQ worker whose handshake driver is in flight, holding the socket
+    /// binds derived from `dir`.
+    async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<crate::worker::BasicWorker> {
+        let worker = Arc::new(
+            BasicWorkerBuilder::new(format!("ipc://{}", dir.join("ts0.ipc").display()))
+                .connection_mode(ConnectionMode::Zmq)
+                .health_config(no_health_check())
+                .build(),
+        );
+        assert!(
+            !worker.zmq_health_check().await.unwrap(),
+            "worker is not ready until the handshake lands"
+        );
+        assert!(
+            worker.zmq_connect_abort.load_full().is_some(),
+            "probe must start the background handshake driver"
+        );
+        worker
+    }
+
+    /// A removed worker's ZMQ handshake driver must not outlive its registry
+    /// entry: it holds the worker's socket binds until it lands, which would
+    /// fail a re-registration at the same URL.
+    #[tokio::test]
+    async fn remove_aborts_the_zmq_handshake_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = WorkerRegistry::new();
+        let worker = connecting_zmq_worker(dir.path()).await;
+
+        let id = registry
+            .register(worker.clone() as Arc<dyn Worker>)
+            .unwrap();
+        registry.remove(&id).expect("worker removed");
+
+        assert!(
+            worker.zmq_connect_abort.load_full().is_none(),
+            "removal must abort the in-flight handshake driver"
+        );
+    }
+
+    /// Same for a replacement: it brings its own backend-client slot, so the
+    /// old instance's driver could only collide with the new worker's connect.
+    #[tokio::test]
+    async fn replace_aborts_the_replaced_workers_zmq_handshake_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = WorkerRegistry::new();
+        let worker = connecting_zmq_worker(dir.path()).await;
+        let url = worker.url().to_string();
+
+        let id = registry
+            .register(worker.clone() as Arc<dyn Worker>)
+            .unwrap();
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .connection_mode(ConnectionMode::Zmq)
+                .health_config(no_health_check())
+                .build(),
+        );
+        assert!(registry.replace(&id, replacement));
+
+        assert!(
+            worker.zmq_connect_abort.load_full().is_none(),
+            "replacement must abort the replaced worker's handshake driver"
+        );
+    }
+
+    fn overload_worker(url: &str, model_id: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(model_id))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    /// The counters and the gauge must move on edges only, so a repeated
+    /// verdict from the same poll cannot inflate them.
+    #[test]
+    fn overload_counters_move_only_on_transitions() {
+        let registry = WorkerRegistry::new();
+        let a = overload_worker("http://127.0.0.1:9401", "m");
+        let b = overload_worker("http://127.0.0.1:9402", "m");
+        registry.register(Arc::clone(&a)).unwrap();
+        registry.register(Arc::clone(&b)).unwrap();
+
+        assert_eq!(registry.overloaded_worker_count("m"), 0);
+
+        assert!(
+            registry.set_worker_overloaded(&a, true),
+            "first set is an edge"
+        );
+        assert!(
+            !registry.set_worker_overloaded(&a, true),
+            "re-asserting the same verdict is not an edge"
+        );
+        assert_eq!(registry.overloaded_worker_count("m"), 1);
+
+        registry.set_worker_overloaded(&b, true);
+        assert_eq!(registry.overloaded_worker_count("m"), 2);
+
+        // Recovery re-admits.
+        assert!(registry.set_worker_overloaded(&a, false));
+        assert!(!registry.set_worker_overloaded(&a, false));
+        assert_eq!(registry.overloaded_worker_count("m"), 1);
+        assert!(a.is_available(), "a recovered worker is routable again");
+    }
+
+    /// A model with no workers has nothing flagged — the shed helper reads
+    /// "empty pool", which its callers answer with a 404, not a shed.
+    #[test]
+    fn empty_model_has_no_overloaded_workers() {
+        let registry = WorkerRegistry::new();
+        assert_eq!(registry.overloaded_worker_count("nobody"), 0);
+    }
+
+    /// Removing a flagged worker must give its count back, or the model would
+    /// stay stuck at "all overloaded" with live workers left.
+    #[test]
+    fn removing_a_flagged_worker_releases_its_count() {
+        let registry = WorkerRegistry::new();
+        let a = overload_worker("http://127.0.0.1:9411", "m");
+        let b = overload_worker("http://127.0.0.1:9412", "m");
+        let a_id = registry.register(Arc::clone(&a)).unwrap();
+        registry.register(Arc::clone(&b)).unwrap();
+        registry.set_worker_overloaded(&a, true);
+        registry.set_worker_overloaded(&b, true);
+        assert_eq!(registry.overloaded_worker_count("m"), 2);
+
+        registry.remove(&a_id);
+
+        // b is still flagged, so the model is still shedding — but on one
+        // worker's count, not two.
+        assert_eq!(registry.overloaded_worker_count("m"), 1);
+
+        registry.set_worker_overloaded(&b, false);
+        assert_eq!(registry.overloaded_worker_count("m"), 0);
+    }
+
+    /// The monitor snapshots worker `Arc`s at tick start and writes its verdict
+    /// after a multi-second fetch await. A worker removed inside that window
+    /// must not be able to move the live model's counter through its detached
+    /// handle: nothing would ever decrement it again, since every reset path
+    /// walks the registry's own worker map.
+    #[test]
+    fn a_removed_worker_cannot_move_the_counter_through_a_stale_handle() {
+        let registry = WorkerRegistry::new();
+        let a = overload_worker("http://127.0.0.1:9421", "m");
+        let b = overload_worker("http://127.0.0.1:9422", "m");
+        let a_id = registry.register(Arc::clone(&a)).unwrap();
+        registry.register(Arc::clone(&b)).unwrap();
+
+        registry.remove(&a_id);
+        assert!(
+            !registry.set_worker_overloaded(&a, true),
+            "a detached handle records no edge"
+        );
+        assert_eq!(registry.overloaded_worker_count("m"), 0);
+
+        // And the same in the clearing direction, which would otherwise
+        // under-count a live worker's flag.
+        registry.set_worker_overloaded(&b, true);
+        assert!(!registry.set_worker_overloaded(&a, false));
+        assert_eq!(registry.overloaded_worker_count("m"), 1);
+    }
+
+    /// The counter is written from the monitor's per-report loop, which runs
+    /// concurrently across groups. Flipping the same worker from many threads
+    /// must leave the count consistent with the flag.
+    #[test]
+    fn overload_counter_is_consistent_under_concurrent_transitions() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| {
+                let w = overload_worker(&format!("http://127.0.0.1:{}", 9500 + i), "m");
+                registry.register(Arc::clone(&w)).unwrap();
+                w
+            })
+            .collect();
+
+        let mut handles = Vec::new();
+        for worker in &workers {
+            for _ in 0..4 {
+                let registry = Arc::clone(&registry);
+                let worker = Arc::clone(worker);
+                handles.push(std::thread::spawn(move || {
+                    for i in 0..200 {
+                        registry.set_worker_overloaded(&worker, i % 2 == 0);
+                    }
+                }));
+            }
+        }
+        for handle in handles {
+            handle.join().expect("worker flip thread");
+        }
+
+        // Whatever the interleaving settled on, the counter must equal the
+        // number of workers actually carrying the flag.
+        let flagged = workers.iter().filter(|w| w.is_overloaded()).count();
+        assert_eq!(registry.overloaded_worker_count("m"), flagged);
+
+        for worker in &workers {
+            registry.set_worker_overloaded(worker, false);
+        }
+        assert_eq!(registry.overloaded_worker_count("m"), 0);
+    }
+
+    /// A same-URL replacement shares its runtime with the worker it replaces,
+    /// so a verdict left set would be carried onto a possibly different model
+    /// set — and the monitor's `Replaced` eviction, which clears through the
+    /// *old* handle, could not put the counter back. The verdict is therefore
+    /// released before the handover and re-derived by the next poll.
+    #[test]
+    fn replacement_releases_the_verdict_and_leaves_no_counter_behind() {
+        let registry = WorkerRegistry::new();
+        let original = overload_worker("http://127.0.0.1:9601", "old");
+        let id = registry.register(Arc::clone(&original)).unwrap();
+        registry.set_worker_overloaded(&original, true);
+        assert_eq!(registry.overloaded_worker_count("old"), 1);
+
+        let replacement = overload_worker("http://127.0.0.1:9601", "new");
+        assert!(registry.replace(&id, Arc::clone(&replacement)));
+
+        assert!(
+            !replacement.is_overloaded(),
+            "the replacement starts unvetoed and is routable until its next poll"
+        );
+        assert_eq!(registry.overloaded_worker_count("old"), 0);
+        assert_eq!(registry.overloaded_worker_count("new"), 0);
+
+        // The monitor's `Replaced` handler clears through the old handle. That
+        // handle is detached now, so it must be a no-op rather than a second
+        // decrement against a model it no longer belongs to.
+        registry.set_worker_overloaded(&replacement, true);
+        assert!(!registry.set_worker_overloaded(&original, false));
+        assert_eq!(registry.overloaded_worker_count("new"), 1);
+        assert_eq!(registry.overloaded_worker_count("old"), 0);
+    }
+
+    #[test]
+    fn clear_all_overload_flags_resets_every_model() {
+        let registry = WorkerRegistry::new();
+        let a = overload_worker("http://127.0.0.1:9701", "m1");
+        let b = overload_worker("http://127.0.0.1:9702", "m2");
+        registry.register(Arc::clone(&a)).unwrap();
+        registry.register(Arc::clone(&b)).unwrap();
+        registry.set_worker_overloaded(&a, true);
+        registry.set_worker_overloaded(&b, true);
+
+        assert_eq!(registry.clear_all_overload_flags(), 2);
+
+        assert!(!a.is_overloaded());
+        assert!(!b.is_overloaded());
+        assert_eq!(registry.overloaded_worker_count("m1"), 0);
+        assert_eq!(registry.overloaded_worker_count("m2"), 0);
     }
 }

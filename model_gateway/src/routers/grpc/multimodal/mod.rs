@@ -22,6 +22,29 @@ use llm_multimodal::{
     AudioClip, EncoderFieldLayouts, ImageFrame, Modality, PlaceholderRange,
     PreprocessedEncoderInputs, VideoClip,
 };
+use llm_tokenizer::{Encoding, TokenizerTrait};
+
+/// Bridges the gateway's tokenizer to the model registry's local tokenizer
+/// seam: `llm-multimodal` deliberately depends on no tokenizer crate, so the
+/// flattening from [`Encoding`] to plain ids lives here, on the caller side.
+pub(crate) struct RegistryTokenizer<'a>(pub(crate) &'a dyn TokenizerTrait);
+
+impl llm_multimodal::Tokenizer for RegistryTokenizer<'_> {
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.0.token_to_id(token)
+    }
+
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.0.id_to_token(id)
+    }
+
+    fn encode_text(&self, text: &str) -> Option<Vec<u32>> {
+        Some(match self.0.encode(text, false).ok()? {
+            Encoding::Hf(inner) => inner.get_ids().to_vec(),
+            Encoding::Plain(ids) | Encoding::Tiktoken(ids) => ids,
+        })
+    }
+}
 
 mod assemble;
 mod capability;
@@ -39,7 +62,7 @@ pub(crate) use assemble::{
 };
 pub(crate) use capability::ensure_backend_supports_modalities;
 pub(crate) use config::{
-    load_preprocessor_config_file, load_video_preprocessor_config, MultimodalComponents,
+    load_image_preprocessor_config, load_video_preprocessor_config, MultimodalComponents,
     MultimodalConfigRegistry, MultimodalModelConfig,
 };
 pub(crate) use detect::{media_plan_chat, media_plan_messages};

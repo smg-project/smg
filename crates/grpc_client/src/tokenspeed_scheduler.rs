@@ -229,6 +229,9 @@ impl TokenSpeedSchedulerClient {
             // `kv_bootstrap_info` (P->D KV).
             encode_bootstrap_info: None,
             kv_bootstrap_info: None,
+            // Attention-DP pin injected later via
+            // ProtoGenerateRequest::set_data_parallel_rank, if applicable.
+            data_parallel_rank: None,
         })
     }
 
@@ -326,6 +329,7 @@ impl TokenSpeedSchedulerClient {
             spaces_between_special_tokens: true,
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
+            sampling_seed: Self::chat_sampling_seed(request)?,
             n: request.n.unwrap_or(1),
             constraint: Self::build_constraint_for_chat(request, tool_call_constraint)?,
             ..Default::default()
@@ -412,6 +416,7 @@ impl TokenSpeedSchedulerClient {
             spaces_between_special_tokens: true,
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
+            sampling_seed: Self::completion_sampling_seed(request)?,
             n: request.n.unwrap_or(1),
             constraint: Self::build_constraint_from_completion(request)?,
             ..Default::default()
@@ -484,6 +489,7 @@ impl TokenSpeedSchedulerClient {
         if let Some(v) = p.n {
             sampling.n = v;
         }
+        sampling.sampling_seed = p.sampling_seed;
 
         sampling.constraint = Self::build_constraint_from_plain(p)?;
 
@@ -643,6 +649,37 @@ impl TokenSpeedSchedulerClient {
             _ => Err("Multiple structured constraints are not allowed".to_string()),
         }
     }
+
+    fn unsigned_sampling_seed(seed: Option<i64>) -> Result<Option<u64>, String> {
+        seed.map(|seed| {
+            u64::try_from(seed).map_err(|_| "sampling seed must be an unsigned integer".to_owned())
+        })
+        .transpose()
+    }
+
+    /// Resolve the TokenSpeed sampling seed: the native `sampling_seed` field
+    /// wins when set; the OpenAI-compatible `seed` is only the fallback.
+    fn resolve_sampling_seed(
+        sampling_seed: Option<u64>,
+        legacy_seed: Option<i64>,
+    ) -> Result<Option<u64>, String> {
+        match sampling_seed {
+            Some(seed) => Ok(Some(seed)),
+            None => Self::unsigned_sampling_seed(legacy_seed),
+        }
+    }
+
+    #[expect(
+        deprecated,
+        reason = "TokenSpeed preserves the OpenAI-compatible chat seed on its sampling wire"
+    )]
+    fn chat_sampling_seed(request: &ChatCompletionRequest) -> Result<Option<u64>, String> {
+        Self::resolve_sampling_seed(request.sampling_seed, request.seed)
+    }
+
+    fn completion_sampling_seed(request: &CompletionRequest) -> Result<Option<u64>, String> {
+        Self::resolve_sampling_seed(request.sampling_seed, request.seed)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -651,6 +688,24 @@ impl TokenSpeedSchedulerClient {
 
 impl From<tokenspeed_proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapshot {
     fn from(load: tokenspeed_proto::SchedulerLoad) -> Self {
+        let memory =
+            load.memory.map(
+                |memory| openai_protocol::worker::EngineMemoryMetricsSnapshot {
+                    weight_gb: memory.weight_gb,
+                    kv_cache_gb: memory.kv_cache_gb,
+                    graph_gb: memory.graph_gb,
+                    token_capacity: memory.token_capacity,
+                },
+            );
+        let queues =
+            load.queues.map(
+                |queues| openai_protocol::worker::EngineQueueMetricsSnapshot {
+                    waiting: queues.waiting,
+                    grammar: queues.grammar,
+                    paused: queues.paused,
+                    retracted: queues.retracted,
+                },
+            );
         Self {
             dp_rank: load.dp_rank,
             num_running_reqs: load.num_running_reqs,
@@ -664,6 +719,8 @@ impl From<tokenspeed_proto::SchedulerLoad> for openai_protocol::worker::Schedule
             cache_hit_rate: load.cache_hit_rate,
             utilization: load.utilization,
             max_running_requests: load.max_running_requests,
+            memory,
+            queues,
             // TokenSpeed has no disagg section; canonical PD fields stay None.
             ..Default::default()
         }
@@ -672,10 +729,134 @@ impl From<tokenspeed_proto::SchedulerLoad> for openai_protocol::worker::Schedule
 
 impl From<tokenspeed_proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadResponse {
     fn from(resp: tokenspeed_proto::GetLoadsResponse) -> Self {
+        let aggregate = resp.aggregate.map(|aggregate| {
+            openai_protocol::worker::EngineAggregateMetricsSnapshot {
+                total_running_reqs: aggregate.total_running_reqs,
+                total_waiting_reqs: aggregate.total_waiting_reqs,
+                total_reqs: aggregate.total_reqs,
+                avg_token_usage: aggregate.avg_token_usage,
+                avg_throughput: aggregate.avg_throughput,
+                avg_utilization: aggregate.avg_utilization,
+            }
+        });
         Self {
             timestamp: resp.timestamp,
+            version: resp.version,
             dp_rank_count: resp.dp_rank_count,
             loads: resp.loads.into_iter().map(Into::into).collect(),
+            aggregate,
         }
+    }
+}
+
+#[cfg(test)]
+mod load_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn conversion_preserves_version_sections_and_aggregate() {
+        let response = tokenspeed_proto::GetLoadsResponse {
+            timestamp: "2026-08-09T12:34:56Z".to_owned(),
+            version: "dsv4-engine/0.1.0".to_owned(),
+            dp_rank_count: 1,
+            loads: vec![tokenspeed_proto::SchedulerLoad {
+                dp_rank: 0,
+                num_running_reqs: 3,
+                num_waiting_reqs: 2,
+                num_total_reqs: 5,
+                num_used_tokens: 98_304,
+                max_total_num_tokens: 196_608,
+                max_running_requests: 32,
+                num_waiting_uncached_tokens: 1_280,
+                token_usage: 0.5,
+                gen_throughput: 105.25,
+                cache_hit_rate: 0.75,
+                utilization: 0.5,
+                memory: Some(tokenspeed_proto::MemoryMetrics {
+                    weight_gb: 44.0,
+                    kv_cache_gb: 12.5,
+                    graph_gb: 0.75,
+                    token_capacity: 196_608,
+                }),
+                queues: Some(tokenspeed_proto::QueueMetrics {
+                    waiting: 2,
+                    grammar: 0,
+                    paused: 0,
+                    retracted: 0,
+                }),
+            }],
+            aggregate: Some(tokenspeed_proto::AggregateMetrics {
+                total_running_reqs: 3,
+                total_waiting_reqs: 2,
+                total_reqs: 5,
+                avg_token_usage: 0.5,
+                avg_throughput: 105.25,
+                avg_utilization: 0.5,
+            }),
+        };
+
+        let converted = openai_protocol::worker::WorkerLoadResponse::from(response);
+        assert_eq!(converted.timestamp, "2026-08-09T12:34:56Z");
+        assert_eq!(converted.version, "dsv4-engine/0.1.0");
+        let load = &converted.loads[0];
+        assert!(matches!(
+            load.memory,
+            Some(ref memory)
+                if memory.weight_gb == 44.0
+                    && memory.kv_cache_gb == 12.5
+                    && memory.graph_gb == 0.75
+                    && memory.token_capacity == 196_608
+        ));
+        assert!(matches!(
+            load.queues,
+            Some(ref queues)
+                if queues.waiting == 2
+                    && queues.grammar == 0
+                    && queues.paused == 0
+                    && queues.retracted == 0
+        ));
+        assert!(matches!(
+            converted.aggregate,
+            Some(ref aggregate)
+                if aggregate.total_running_reqs == 3
+                    && aggregate.total_waiting_reqs == 2
+                    && aggregate.total_reqs == 5
+                    && aggregate.avg_token_usage == 0.5
+                    && aggregate.avg_throughput == 105.25
+                    && aggregate.avg_utilization == 0.5
+        ));
+    }
+}
+
+#[cfg(test)]
+mod seed_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn native_sampling_seed_wins_over_legacy_seed() {
+        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(Some(7), Some(42))
+            .expect("native seed should resolve");
+        assert_eq!(resolved, Some(7));
+    }
+
+    #[test]
+    fn legacy_seed_is_the_fallback() {
+        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(42))
+            .expect("legacy seed should resolve");
+        assert_eq!(resolved, Some(42));
+    }
+
+    #[test]
+    fn negative_legacy_seed_is_rejected() {
+        let err = TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(-1))
+            .expect_err("negative legacy seed must be rejected");
+        assert!(err.contains("unsigned integer"), "{err}");
+    }
+
+    #[test]
+    fn no_seed_stays_none() {
+        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, None)
+            .expect("absent seeds should resolve");
+        assert_eq!(resolved, None);
     }
 }

@@ -165,6 +165,34 @@ pub fn compute_content_hash(token_ids: &[u32]) -> ContentHash {
     ContentHash(hasher.finish())
 }
 
+/// Rolling prefix hash over content hashes: `XXH3(prev || current)`, the
+/// same chaining `PositionalIndexer` computes internally. Exported so
+/// out-of-process publishers (the radix index service's placement feed)
+/// can synthesize byte-identical position chains for identical prefixes.
+///
+/// Note the base case: position 0's `SequenceHash` is the bare
+/// `ContentHash` value (`SequenceHash(c0.0)`), NOT
+/// `chain_prefix_hash(SequenceHash(0), c0)`. Callers must seed with the
+/// first content hash and chain from position 1, or the whole chain
+/// silently diverges from the indexer's (zero prefix matches, no error):
+///
+/// ```
+/// use kv_index::{chain_prefix_hash, ContentHash, SequenceHash};
+/// let contents = [ContentHash(11), ContentHash(22), ContentHash(33)];
+/// let mut chain = vec![SequenceHash(contents[0].0)];
+/// for &c in &contents[1..] {
+///     let prev = *chain.last().unwrap();
+///     chain.push(chain_prefix_hash(prev, c));
+/// }
+/// assert_eq!(chain.len(), 3);
+/// ```
+pub fn chain_prefix_hash(prev: SequenceHash, current: ContentHash) -> SequenceHash {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&prev.0.to_le_bytes());
+    bytes[8..].copy_from_slice(&current.0.to_le_bytes());
+    SequenceHash(xxhash_rust::xxh3::xxh3_64_with_seed(&bytes, XXH3_SEED))
+}
+
 /// Chunk request tokens by block size and compute a [`ContentHash`] per full block.
 ///
 /// This is the entry point for the **query path**: given a request's token IDs and
@@ -683,9 +711,10 @@ impl PositionalIndexer {
     /// Remove a worker entirely — takes ownership of blocks, cleans index, worker is gone.
     ///
     /// `worker_id`: internal ID from [`intern_worker`].
-    /// `worker_blocks`: caller-owned reverse lookup — consumed.
+    /// `worker_blocks`: caller-owned reverse lookup — consumed. Removal is
+    /// proportional to this worker's blocks, not to the total index size.
     pub fn remove_worker(&self, worker_id: u32, worker_blocks: WorkerBlockMap) {
-        for &(position, content_hash, prefix_hash) in worker_blocks.values() {
+        for (position, content_hash, prefix_hash) in worker_blocks.into_values() {
             if let Entry::Occupied(mut occ) = self.index.entry((position, content_hash)) {
                 let (_, now_empty) = occ.get_mut().seq.remove(prefix_hash, worker_id);
                 if now_empty {
@@ -1397,6 +1426,31 @@ mod tests {
         let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
         assert!(scores.scores.is_empty());
         assert_eq!(indexer.current_size(), 0);
+    }
+
+    #[test]
+    fn test_remove_worker_uses_reverse_map_and_preserves_unrelated_entries() {
+        let indexer = PositionalIndexer::new(64);
+        let removed = indexer.intern_worker("http://removed:8000").unwrap();
+        let survivor = indexer.intern_worker("http://survivor:8000").unwrap();
+        let mut removed_blocks = WorkerBlockMap::default();
+        let mut survivor_blocks = WorkerBlockMap::default();
+
+        indexer
+            .apply_stored(removed, &make_blocks(&[1]), None, &mut removed_blocks)
+            .unwrap();
+        for value in 10_000..11_000 {
+            indexer
+                .apply_stored(survivor, &make_blocks(&[value]), None, &mut survivor_blocks)
+                .unwrap();
+        }
+
+        indexer.remove_worker(removed, removed_blocks);
+
+        assert_eq!(indexer.current_size(), survivor_blocks.len());
+        let scores = indexer.find_matches(&hashes(&[10_999]), false);
+        assert_eq!(scores.scores.get(&survivor), Some(&1));
+        assert!(!scores.scores.contains_key(&removed));
     }
 
     #[test]

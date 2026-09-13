@@ -327,6 +327,20 @@ impl ToolParser for CohereParser {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
 
+    fn take_unstreamed_normal_text(&mut self) -> String {
+        // Covers both a partial START_ACTION held in Text state and an action
+        // block whose END_ACTION never arrived (truncated stream). Text held
+        // in the Text state still carries response markers, which every other
+        // emission path in this parser strips, so clean it the same way rather
+        // than leaking control tokens into client-visible content.
+        let text = helpers::take_unstreamed_normal_text(&mut self.buffer, self.current_tool_id);
+        if text.is_empty() {
+            text
+        } else {
+            Self::clean_text(&text)
+        }
+    }
+
     fn reset(&mut self) {
         self.state = ParseState::Text;
         helpers::reset_parser_state(

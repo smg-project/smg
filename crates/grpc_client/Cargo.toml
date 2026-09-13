@@ -1,6 +1,6 @@
 [package]
 name = "smg-grpc-client"
-version = "1.10.0"
+version = "1.12.0"
 edition = "2021"
 description = "gRPC clients for vLLM, TensorRT-LLM, MLX, TokenSpeed, and SGLang backends"
 license = "Apache-2.0"
@@ -42,9 +42,11 @@ tonic-prost-build = "0.14.6"
 prost-build = "0.14.4"
 
 [dev-dependencies]
+hyper-util = { version = "0.1", features = ["tokio"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # Mock-server harness for the abort-on-drop behavioral tests.
 tokio-stream = { version = "0.1", features = ["net"] }
+tower = { version = "0.5", default-features = false }
 
 [lints]
 workspace = true

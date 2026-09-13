@@ -1,18 +1,26 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+
+// Jemalloc as the global allocator: glibc malloc retains freed pages badly
+// under the gateway's allocation churn. Prefixed symbols only — vendored C
+// libraries keep their own malloc.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use openai_protocol::worker::TransportMode;
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        validate_mesh_server_name, CircuitBreakerConfig, ConfigError, ConfigResult,
-        DiscoveryConfig, HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig,
-        OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
+        resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
+        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
+        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PdPairingMode,
+        PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
         RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
         TokenizerCacheConfig, TraceConfig,
     },
     observability::{
-        metrics::PrometheusConfig,
+        metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
         otel_trace::{is_otel_enabled, shutdown_otel},
     },
     server::{self, ServerConfig},
@@ -157,6 +165,42 @@ fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
         .ok_or_else(|| format!("invalid value '{value}'; expected inline, shm, auto, or rdma"))
 }
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(n) if n >= 1 => Ok(n),
+        Ok(_) => Err(format!("invalid value '{value}'; expected a count >= 1")),
+        Err(err) => Err(format!("invalid value '{value}': {err}")),
+    }
+}
+
+fn parse_usize_in_range(value: &str, max: usize) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(n) if (1..=max).contains(&n) => Ok(n),
+        Ok(n) => Err(format!("invalid value '{n}'; expected 1..={max}")),
+        Err(err) => Err(format!("invalid value '{value}': {err}")),
+    }
+}
+
+/// Parse a ratio in `(0.0, 1.0]`. Zero is excluded because a `>=` threshold of
+/// 0.0 would mark every worker overloaded unconditionally.
+fn parse_unit_fraction(value: &str) -> Result<f64, String> {
+    match value.parse::<f64>() {
+        Ok(v) if v > 0.0 && v <= 1.0 => Ok(v),
+        Ok(_) => Err(format!(
+            "invalid value '{value}'; expected a fraction in (0.0, 1.0]"
+        )),
+        Err(err) => Err(format!("invalid value '{value}': {err}")),
+    }
+}
+
+fn parse_job_queue_capacity(value: &str) -> Result<usize, String> {
+    parse_usize_in_range(value, 1_000_000)
+}
+
+fn parse_job_queue_concurrency(value: &str) -> Result<usize, String> {
+    parse_usize_in_range(value, 100_000)
+}
+
 #[derive(Parser, Debug)]
 struct CliArgs {
     // ==================== Worker Configuration ====================
@@ -190,59 +234,173 @@ struct CliArgs {
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
     policy: String,
 
-    /// Cache threshold (0.0-1.0) for cache-aware routing
-    #[arg(long, default_value_t = 0.3, help_heading = "Routing Policy")]
+    /// Minimum matched-prefix share (0.0-1.0) before cache-aware routing
+    /// pins a request to a worker already holding that prefix; below it the
+    /// request is load-balanced instead
+    #[arg(
+        long,
+        visible_alias = "cache-match-threshold",
+        default_value_t = 0.3,
+        help_heading = "Routing Policy"
+    )]
     cache_threshold: f32,
 
-    /// Absolute threshold for load balancing trigger
-    #[arg(long, default_value_t = 64, help_heading = "Routing Policy")]
+    /// Spill gate, absolute part: a matched worker is skipped for the
+    /// least-loaded one when its load exceeds the healthy-fleet mean by this
+    /// many requests AND by --balance-rel-threshold
+    #[arg(
+        long,
+        visible_alias = "spill-abs-threshold",
+        default_value_t = 64,
+        help_heading = "Routing Policy"
+    )]
     balance_abs_threshold: usize,
 
-    /// Relative threshold for load balancing trigger
-    #[arg(long, default_value_t = 1.5, help_heading = "Routing Policy")]
+    /// Spill gate, relative part (multiple of the healthy-fleet mean); fires
+    /// only together with --balance-abs-threshold
+    #[arg(
+        long,
+        visible_alias = "spill-rel-threshold",
+        default_value_t = 1.5,
+        help_heading = "Routing Policy"
+    )]
     balance_rel_threshold: f32,
 
-    /// Cache-aware KV-usage spread (hottest minus coldest backend, 0.0-1.0)
-    /// above which cache affinity is abandoned for shortest-queue, even if
-    /// request counts look balanced (catches long-context KV imbalance). Backend
-    /// must report token_usage. >= 1.0 disables it.
+    /// Abandon cache affinity for shortest-queue when the KV-usage spread
+    /// (hottest minus coldest backend, 0.0-1.0) exceeds this — catches
+    /// long-context KV imbalance that request counts miss. Backend must
+    /// report token_usage. >= 1.0 disables it.
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     balance_token_usage_threshold: f32,
 
-    /// Cache-aware KV-utilization ceiling (0.0-1.0): when the hottest backend
-    /// exceeds it, shed load off that engine regardless of spread. A safety
-    /// valve for critically-saturated engines, best set high (e.g. 0.9).
-    /// >= 1.0 disables it.
+    /// Safety valve for critically-saturated engines: when the hottest
+    /// backend's KV utilization (0.0-1.0) exceeds this, shed load off it
+    /// regardless of spread. Best set high (e.g. 0.9). >= 1.0 disables it.
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     overload_token_usage_threshold: f32,
 
-    /// Interval in seconds between cache eviction operations
+    /// Enable worker overload protection with the gateway default thresholds.
+    ///
+    /// A worker whose load signal crosses a threshold is considered overloaded
+    /// and excluded from routing until the signal recovers; when every worker
+    /// is overloaded, requests are shed immediately rather than queued.
+    ///
+    /// This flag alone applies --worker-overload-token-usage 0.9 and leaves
+    /// --worker-overload-waiting-requests unset: KV token usage means the same
+    /// thing on every engine, while a sensible waiting-requests ceiling is
+    /// workload-dependent, so it has no universal default. Explicit thresholds
+    /// override the default, and either threshold set on its own enables
+    /// protection without this flag — exactly as before it existed. Per-worker
+    /// `overload` blocks on a WorkerSpec override the gateway values per
+    /// signal, and enable protection for that worker even with everything here
+    /// unset.
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    worker_overload_protection: bool,
+
+    /// Queued-request count at or above which a worker is considered
+    /// overloaded and excluded from routing until the signal recovers; when
+    /// every worker is overloaded, requests are shed immediately rather than
+    /// queued. Unset disables overload protection.
+    ///
+    /// Queued (waiting) requests, summed across DP ranks. Must be >= 1: the
+    /// comparison is inclusive, so 0 would veto every worker unconditionally.
+    #[arg(long, value_parser = parse_positive_usize, help_heading = "Routing Policy")]
+    worker_overload_waiting_requests: Option<usize>,
+
+    /// KV-cache token usage at or above which a worker is considered
+    /// overloaded and excluded from routing until the signal recovers; when
+    /// every worker is overloaded, requests are shed immediately rather than
+    /// queued. Unset disables overload protection.
+    ///
+    /// Mean KV-cache token usage across DP ranks, the same signal
+    /// `--balance-token-usage-threshold` reads, applied as an absolute
+    /// per-worker ceiling rather than a fleet-relative spread. Backend must
+    /// report token_usage. Must be in (0.0, 1.0]: the comparison is inclusive,
+    /// so 0.0 would veto every worker unconditionally.
+    ///
+    /// Distinct from `--overload-token-usage-threshold`, which only de-ranks
+    /// the hottest backend within cache-aware affinity; this flag removes the
+    /// worker from routing entirely and sheds when every worker crosses it.
+    #[arg(long, value_parser = parse_unit_fraction, help_heading = "Routing Policy")]
+    worker_overload_token_usage: Option<f64>,
+
+    /// Anti-hotspot decay: de-rank cache-affine candidates by their
+    /// waiting-prefill backlog (overlap score divided by 1 + overlap_decay
+    /// * backlog blocks per request block). Requires backend load
+    /// reporting. 0.0 disables.
+    #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
+    overlap_decay: f32,
+
+    /// Spread event-driven cache-aware picks across near-equal candidates:
+    /// softmax temperature over min-max normalized scores. 0.0 is exact
+    /// argmax.
+    #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
+    selection_temperature: f32,
+
+    /// Interval in seconds between cache-tree eviction cycles
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
     eviction_interval: u64,
 
-    /// Maximum size of the approximation tree for cache-aware routing
+    /// Maximum total size of each model's approximation tree for cache-aware
+    /// routing (chars for HTTP, tokens for gRPC), shared across all workers;
+    /// eviction keeps every tree at or under this bound
     #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
 
-    /// KV cache block size for event-driven cache-aware routing
+    /// Match granularity for cache-aware token routing: the token-tree page
+    /// size, and the KV block size assumed for event-driven selection
     #[arg(long, default_value_t = 16, help_heading = "Routing Policy")]
     block_size: usize,
 
-    /// Maximum idle time in seconds before eviction (for manual policy)
-    #[arg(long, default_value_t = 14400, help_heading = "Routing Policy")]
+    /// Token positions at which serving engines retain reusable prefix
+    /// state; cache-affinity policies hash request heads at the deepest
+    /// applicable boundary.
+    #[arg(long, value_delimiter = ',', help_heading = "Routing Policy")]
+    cache_boundaries: Vec<usize>,
+
+    /// Index under-layer for cache_aware: "tree" (radix prefix trees) or
+    /// "hash" (TTL'd exact-match placement map keyed on request heads at
+    /// --cache-boundaries; token-bearing requests only — untokenized
+    /// requests stay load-balanced)
+    #[arg(long, default_value = "tree", value_parser = ["tree", "hash"], help_heading = "Routing Policy")]
+    cache_index: String,
+
+    /// Seconds a cache-affinity placement stays routable; should
+    /// approximate serving-engine cache retention
+    #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Routing Policy")]
+    cache_ttl_secs: u64,
+
+    /// How long an unused sticky routing key stays pinned: keys idle beyond
+    /// this many seconds are evicted from the manual-policy / sticky-session
+    /// map
+    #[arg(
+        long,
+        visible_alias = "sticky-key-idle-secs",
+        default_value_t = 14400,
+        help_heading = "Routing Policy"
+    )]
     max_idle_secs: u64,
 
-    /// Assignment mode for manual policy when encountering a new routing key
-    #[arg(long, default_value = "random", value_parser = ["random", "min_load", "min_group"], help_heading = "Routing Policy")]
-    assignment_mode: String,
+    /// How a first-seen routing key picks its worker: random, min_load
+    /// (fewest requests), min_group (fewest keys), or delegate (route via
+    /// the underlying policy, then pin). Defaults to random for the manual
+    /// policy and delegate for the sticky-session map
+    #[arg(long, value_parser = ["random", "min_load", "min_group", "delegate"], help_heading = "Routing Policy")]
+    assignment_mode: Option<String>,
 
-    /// Number of prefix tokens to use for prefix_hash policy
+    /// Number of prefix tokens to use for prefix_hash policy, or four times
+    /// as many characters of the prompt when the request is untokenized
     #[arg(long, default_value_t = 256, help_heading = "Routing Policy")]
     prefix_token_count: usize,
 
     /// Load factor threshold for prefix_hash policy
     #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     prefix_hash_load_factor: f64,
+
+    /// Absolute load difference over average a worker must also exceed before
+    /// the prefix_hash policy treats it as overloaded
+    #[arg(long, default_value_t = 10, help_heading = "Routing Policy")]
+    prefix_hash_balance_abs_threshold: usize,
 
     /// KV-pressure weight (seconds) for the least_load policy
     #[arg(long, default_value_t = 0.15, help_heading = "Routing Policy")]
@@ -258,14 +416,50 @@ struct CliArgs {
     #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
     least_load_mean_prefill_tokens: u32,
 
+    /// Per-worker waiting-queue cap for least_load: skip workers whose reported
+    /// waiting requests (plus dispatches since their last poll) have reached
+    /// this count; 0 disables. Set below the engine's max batch size
+    #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
+    least_load_max_waiting_requests: u32,
+
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
 
-    /// Honor X-SMG-Routing-Key for sticky routing on any policy (reuses the
-    /// manual eviction/idle/assignment knobs for the sticky map)
-    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    /// Sticky sessions: route every request of a conversation to the same
+    /// worker, on any policy. The key is derived from the request body's rid
+    /// with per-turn/per-retry suffixes stripped (conv_t2_r1 -> conv),
+    /// falling back to the routing-key headers when no rid is present.
+    /// Enabling this keeps automatic body forwarding buffered so body rid
+    /// precedence is preserved.
+    /// Reuses the manual eviction/idle/assignment knobs for the sticky map
+    #[arg(
+        long,
+        visible_alias = "sticky-sessions",
+        default_value_t = false,
+        help_heading = "Routing Policy"
+    )]
     routing_key_override: bool,
+
+    /// How strictly PD placement pairs a prefill with a decode on their KV
+    /// transfer protocol. `lenient` refuses only a known difference in
+    /// runtime, transport or KV layout (unknown components and engine
+    /// versions pair with anything); `strict` also refuses unknown
+    /// components and version differences; `off` pairs on nothing.
+    #[arg(
+        long,
+        value_parser = ["off", "lenient", "strict"],
+        default_value = "lenient",
+        help_heading = "Routing Policy"
+    )]
+    pd_pairing_mode: String,
+
+    /// Ordered header names checked for the routing key; the first header
+    /// present with a valid value wins. Header keys get the same
+    /// per-turn/per-retry suffix stripping as rid-derived keys when the
+    /// override is enabled
+    #[arg(long, num_args = 0.., default_value = "x-smg-routing-key", value_parser = parse_routing_key_header, help_heading = "Routing Policy")]
+    routing_key_headers: Vec<String>,
 
     /// Enable IGW (Inference Gateway) mode for multi-model support
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
@@ -274,6 +468,22 @@ struct CliArgs {
     /// Enable minimum tokens scheduler for data parallel group
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
+
+    // ==================== RL Control Plane ====================
+    /// Mount the RL control plane under /v1/rl (worker discovery,
+    /// engine-route passthrough, fan-out). Off by default; when off, no RL
+    /// code path is reachable.
+    #[arg(long, default_value_t = false, help_heading = "RL Control Plane")]
+    enable_rl: bool,
+
+    /// Total timeout for one proxied engine control call (weight refits can
+    /// take minutes)
+    #[arg(long, default_value_t = 600, help_heading = "RL Control Plane")]
+    rl_control_timeout_secs: u64,
+
+    /// Maximum concurrent engine calls in one fan-out
+    #[arg(long, default_value_t = 32, help_heading = "RL Control Plane")]
+    rl_fanout_concurrency: usize,
 
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
@@ -314,14 +524,56 @@ struct CliArgs {
     #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
     worker_startup_check_interval: u64,
 
+    /// Max pending control-plane jobs (worker add/remove, tokenizer, MCP,
+    /// WASM). Size to fleet scale so a service-discovery reconcile pass can
+    /// enqueue every worker without blocking.
+    #[arg(long, default_value_t = 1000, value_parser = parse_job_queue_capacity, help_heading = "Worker Configuration")]
+    job_queue_capacity: usize,
+
+    /// Max control-plane jobs dispatched concurrently
+    #[arg(long, default_value_t = 200, value_parser = parse_job_queue_concurrency, help_heading = "Worker Configuration")]
+    job_queue_concurrency: usize,
+
+    /// DP engines per startup ZMQ worker: each ipc:// worker becomes a grouped
+    /// worker whose handshake awaits this many engines on one socket set.
+    #[arg(long, value_parser = parse_positive_usize, help_heading = "Worker Configuration")]
+    zmq_engine_count: Option<usize>,
+
+    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext) on all
+    /// engine-directed connections — request dispatch and health/probe traffic
+    /// alike — multiplexing every request to a worker over one connection.
+    /// Negotiated per worker at registration: a worker that does not answer
+    /// HTTP/2 stays on HTTP/1.1, so mixed fleets roll out in any order.
+    /// `http_pool.http2` on a worker spec pins the version instead.
+    #[arg(long, default_value_t = false, help_heading = "Worker Configuration")]
+    upstream_http2: bool,
+
     /// Interval in seconds between load monitor checks for PowerOfTwo routing
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
 
-    /// Re-export engine GetLoads signals (incl. PD) as smg_engine_* Prometheus
-    /// gauges, polling even without a load-aware routing policy.
+    /// Only poll worker loads when a load-aware routing policy,
+    /// --engine-metrics, or worker overload protection needs the data. By
+    /// default every worker group is polled from registration onward; this
+    /// restores the old conditional gate (a load-aware policy is always fed
+    /// regardless).
+    #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
+    disable_load_monitoring: bool,
+
+    /// Force GetLoads polling for smg_engine_* Prometheus gauges even without
+    /// a load-aware routing policy. Routing-owned polls are always re-exported.
     #[arg(long, default_value_t = false, help_heading = "Load Monitoring")]
     engine_metrics: bool,
+
+    /// Seconds a prefill/decode dispatch waits for a free slot in the decode
+    /// engine's running window (--max-num-seqs / --max-running-requests)
+    /// before shedding with 503 worker_overload_protection_shed. Keep it well
+    /// under the engine's bootstrap deadline (120s on TokenSpeed) so a
+    /// request that waits still dispatches with the deadline ahead of it. 0
+    /// sheds immediately. Engines that report no running window are never
+    /// gated
+    #[arg(long, default_value_t = 30, help_heading = "Load Monitoring")]
+    pd_admission_wait_secs: u64,
 
     /// TTL in seconds for event-driven cache-aware indexer entries: entries
     /// neither stored nor read by a query within this window are pruned.
@@ -346,6 +598,11 @@ struct CliArgs {
     /// Overridable per worker via `WorkerSpec.multimodal_shm_min_bytes`.
     #[arg(long, help_heading = "Multimodal")]
     multimodal_shm_min_bytes: Option<usize>,
+
+    /// Per-request image-count limit applied to every model, replacing each
+    /// spec's built-in limit (e.g. to match the engine's `--limit-mm-per-prompt`).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Multimodal")]
+    mm_per_request_image_limit: Option<u64>,
 
     // ==================== Service Discovery (Kubernetes) ====================
     /// Enable Kubernetes service discovery
@@ -372,6 +629,22 @@ struct CliArgs {
     /// Kubernetes namespace to watch for pods
     #[arg(long, help_heading = "Service Discovery (Kubernetes)")]
     service_discovery_namespace: Option<String>,
+
+    /// Pod annotation containing the vLLM KV connector name
+    #[arg(
+        long,
+        default_value = "smg.ai/kv-connector",
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    kv_connector_annotation: String,
+
+    /// Pod annotation containing per-worker KV engine IDs
+    #[arg(
+        long,
+        default_value = "smg.ai/kv-engine-id",
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    kv_engine_id_annotation: String,
 
     /// Label selector for encode server pods in EPD mode
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
@@ -416,7 +689,7 @@ struct CliArgs {
     log_json: bool,
 
     // ==================== Prometheus Metrics ====================
-    /// Port to expose Prometheus metrics
+    /// Port to expose Prometheus metrics; 0 binds an OS-assigned ephemeral port
     #[arg(long, default_value_t = 29000, help_heading = "Prometheus Metrics")]
     prometheus_port: u16,
 
@@ -453,6 +726,13 @@ struct CliArgs {
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     request_timeout_secs: u64,
 
+    /// Idle timeout in seconds for pooled upstream connections. Must stay
+    /// below the backend HTTP server's keep-alive timeout (vLLM and SGLang
+    /// default to 5), or reused connections the server already closed fail
+    /// non-idempotent sends. 0 keeps idle connections forever.
+    #[arg(long, default_value_t = 3, help_heading = "Request Handling")]
+    upstream_pool_idle_timeout_secs: u64,
+
     /// Grace period in seconds to wait for in-flight requests during shutdown
     #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
     shutdown_grace_period_secs: u64,
@@ -461,12 +741,33 @@ struct CliArgs {
     #[arg(long, default_value_t = 536870912, help_heading = "Request Handling")]
     max_payload_size: usize,
 
+    /// Most bytes the router may hold for a request it buffers only to keep
+    /// it retryable. The router decides per request: a request it must parse
+    /// (text-routing policy without a routing hint, body-mutating worker,
+    /// WASM request hooks, missing Content-Length, PD/batch backends) always
+    /// buffers, bounded by max-payload-size; an eligible request buffers up
+    /// to this many bytes when router retries are enabled, and otherwise
+    /// streams to the worker verbatim — forfeiting router-level retries,
+    /// with JSON validation deferring to the worker. 0 never buffers for
+    /// retries
+    #[arg(long, default_value_t = 1_048_576, help_heading = "Request Handling")]
+    max_buffered_request_bytes: u64,
+
+    /// Abort a streamed request body once the upstream sender has waited on
+    /// the client for this many seconds (408, request_body_stalled). The
+    /// clock pauses while the worker applies backpressure, so a slow worker
+    /// read never trips it. Applies only to streamed request bodies. 0
+    /// disables
+    #[arg(long, default_value_t = 300, help_heading = "Request Handling")]
+    stream_body_stall_timeout_secs: u64,
+
     /// CORS allowed origins
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     cors_allowed_origins: Vec<String>,
 
     // ==================== Rate Limiting ====================
-    /// Maximum concurrent requests (-1 to disable)
+    /// Maximum standing concurrent requests (-1 to disable). Each admission
+    /// permit is held for the full response, including streaming bodies.
     #[arg(long, default_value_t = -1, help_heading = "Rate Limiting")]
     max_concurrent_requests: i32,
 
@@ -508,7 +809,8 @@ struct CliArgs {
     #[arg(long, help_heading = "Tenant Rate Limit")]
     tenant_rate_limit_config: Option<String>,
 
-    /// Token bucket refill rate (tokens per second)
+    /// Token bucket refill rate (tokens per second). Unset or 0 = no refill:
+    /// --max-concurrent-requests bounds standing concurrency alone.
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
 
@@ -559,33 +861,48 @@ struct CliArgs {
     disable_circuit_breaker: bool,
 
     // ==================== Health Checks ====================
-    /// Failures before marking worker unhealthy
+    /// Consecutive probe failures before a worker is taken out of rotation
     #[arg(long, default_value_t = 3, help_heading = "Health Checks")]
     health_failure_threshold: u32,
 
-    /// Successes before marking worker healthy
+    /// Consecutive probe successes before a worker returns to rotation
     #[arg(long, default_value_t = 2, help_heading = "Health Checks")]
     health_success_threshold: u32,
 
-    /// Timeout in seconds for health check requests
+    /// Timeout in seconds for a single health probe
     #[arg(long, default_value_t = 5, help_heading = "Health Checks")]
     health_check_timeout_secs: u64,
 
-    /// Interval in seconds between health checks
+    /// Interval in seconds between health probes of each worker
     #[arg(long, default_value_t = 60, help_heading = "Health Checks")]
     health_check_interval_secs: u64,
 
-    /// Health check endpoint path
+    /// HTTP path probed on each worker
     #[arg(long, default_value = "/health", help_heading = "Health Checks")]
     health_check_endpoint: String,
 
-    /// Disable all worker health checks at startup
+    /// Disable all worker health probing
     #[arg(long, default_value_t = false, help_heading = "Health Checks")]
     disable_health_check: bool,
 
-    /// Remove workers from the registry when they are marked unhealthy
-    #[arg(long, default_value_t = false, help_heading = "Health Checks")]
-    remove_unhealthy_workers: bool,
+    /// Recover failed workers by removal: a worker that stays unhealthy
+    /// long enough (Failed, ~12 minutes at the default thresholds) is
+    /// removed from the registry so service discovery re-registers and
+    /// re-probes it once its engine returns. Without this a Failed worker
+    /// stays registered, out of rotation, and keeps being probed, so it
+    /// rejoins in place as soon as it answers again. Defaults to the
+    /// --service-discovery setting: discovery-managed fleets recover by
+    /// removal plus re-registration, while a static fleet has nothing to
+    /// re-add a removed worker and recovers in place instead. Pass =false
+    /// to keep it off under discovery.
+    #[arg(
+        long,
+        visible_alias = "worker-auto-recovery",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help_heading = "Health Checks"
+    )]
+    remove_unhealthy_workers: Option<bool>,
 
     /// Seconds to keep a Ready worker in `Draining` before removing it from
     /// the registry. Applies to all RemoveWorker submissions (K8s deletion,
@@ -866,6 +1183,14 @@ fn parse_model_id_from(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
+/// Validate `--routing-key-headers` values at CLI parse time; names are
+/// normalized to lowercase.
+fn parse_routing_key_header(s: &str) -> Result<String, String> {
+    http::header::HeaderName::try_from(s)
+        .map(|name| name.as_str().to_string())
+        .map_err(|e| format!("Invalid header name '{s}': {e}"))
+}
+
 /// Validate `--model-alias` value at CLI parse time (format: alias=canonical).
 fn parse_model_alias(s: &str) -> Result<String, String> {
     let Some((alias, canonical)) = s.split_once('=') else {
@@ -1119,6 +1444,11 @@ impl CliArgs {
                 block_size: self.block_size,
                 balance_token_usage_threshold: self.balance_token_usage_threshold,
                 overload_token_usage_threshold: self.overload_token_usage_threshold,
+                overlap_decay: self.overlap_decay,
+                selection_temperature: self.selection_temperature,
+                cache_index: Self::parse_cache_index(&self.cache_index),
+                cache_ttl_secs: self.cache_ttl_secs,
+                cache_boundaries: self.cache_boundaries.clone(),
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
@@ -1128,6 +1458,7 @@ impl CliArgs {
                 kv_pressure_weight: self.least_load_kv_pressure_weight,
                 mean_prefill_tokens: self.least_load_mean_prefill_tokens,
                 default_throughput: self.least_load_default_throughput,
+                max_waiting_requests: self.least_load_max_waiting_requests,
             },
             "bucket" => PolicyConfig::Bucket {
                 balance_abs_threshold: self.balance_abs_threshold,
@@ -1137,12 +1468,17 @@ impl CliArgs {
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.prefix_token_count,
                 load_factor: self.prefix_hash_load_factor,
+                balance_abs_threshold: self.prefix_hash_balance_abs_threshold,
+                cache_boundaries: self.cache_boundaries.clone(),
             },
             "consistent_hashing" => PolicyConfig::ConsistentHashing,
             "manual" => PolicyConfig::Manual {
                 eviction_interval_secs: self.eviction_interval,
                 max_idle_secs: self.max_idle_secs,
-                assignment_mode: Self::parse_assignment_mode(&self.assignment_mode),
+                assignment_mode: Self::parse_assignment_mode(
+                    self.assignment_mode.as_deref(),
+                    ManualAssignmentMode::Random,
+                ),
             },
             _ => PolicyConfig::RoundRobin,
         }
@@ -1150,13 +1486,30 @@ impl CliArgs {
 
     #[expect(
         clippy::panic,
+        reason = "unreachable: clap value_parser restricts valid cache index kinds"
+    )]
+    fn parse_cache_index(kind: &str) -> CacheIndexKind {
+        match kind {
+            "tree" => CacheIndexKind::Tree,
+            "hash" => CacheIndexKind::Hash,
+            other => panic!("Unknown cache index: {other}"),
+        }
+    }
+
+    #[expect(
+        clippy::panic,
         reason = "unreachable: clap value_parser restricts valid assignment modes"
     )]
-    fn parse_assignment_mode(mode: &str) -> ManualAssignmentMode {
+    fn parse_assignment_mode(
+        mode: Option<&str>,
+        default: ManualAssignmentMode,
+    ) -> ManualAssignmentMode {
+        let Some(mode) = mode else { return default };
         match mode {
             "random" => ManualAssignmentMode::Random,
             "min_load" => ManualAssignmentMode::MinLoad,
             "min_group" => ManualAssignmentMode::MinGroup,
+            "delegate" => ManualAssignmentMode::Delegate,
             other => panic!("Unknown assignment mode: {other}"),
         }
     }
@@ -1361,6 +1714,8 @@ impl CliArgs {
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                 worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+                kv_connector_annotation: self.kv_connector_annotation.clone(),
+                kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
                 router_selector: Self::parse_selector(&self.router_selector),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source: self.model_id_from.clone(),
@@ -1480,23 +1835,36 @@ impl CliArgs {
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
+            .cache_boundaries(self.cache_boundaries.clone())
             .connection_mode(connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
+            .zmq_engine_count(self.zmq_engine_count)
             .host(&self.host)
             .port(self.port)
             .health_check_port(self.health_check_port)
             .runtime_worker_threads(self.runtime_worker_threads)
             .max_payload_size(self.max_payload_size)
+            .max_buffered_request_bytes(self.max_buffered_request_bytes)
+            .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
             .request_timeout_secs(self.request_timeout_secs)
+            .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
+            .job_queue_capacity(self.job_queue_capacity)
+            .job_queue_concurrency(self.job_queue_concurrency)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .pd_admission_wait_secs(self.pd_admission_wait_secs)
+            .disable_load_monitoring(self.disable_load_monitoring)
+            .worker_overload_protection(self.worker_overload_protection)
+            .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
+            .worker_overload_token_usage(self.worker_overload_token_usage)
             .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
             .kv_indexer_max_entries(self.kv_indexer_max_entries)
             .engine_metrics(self.engine_metrics)
             .multimodal_tensor_transport(self.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
+            .mm_per_request_image_limit(self.mm_per_request_image_limit.map(|v| v as usize))
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -1527,7 +1895,10 @@ impl CliArgs {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
                 disable_health_check: self.disable_health_check,
-                remove_unhealthy_workers: self.remove_unhealthy_workers,
+                remove_unhealthy_workers: resolve_worker_auto_recovery(
+                    self.remove_unhealthy_workers,
+                    self.service_discovery,
+                ),
                 drain_settle_secs: self.drain_settle_secs,
             })
             .tokenizer_cache(TokenizerCacheConfig {
@@ -1566,17 +1937,28 @@ impl CliArgs {
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
+            .pd_pairing_mode(PdPairingMode::parse(&self.pd_pairing_mode).unwrap_or_default())
             .routing_key_override(RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval,
                 max_idle_secs: self.max_idle_secs,
-                assignment_mode: Self::parse_assignment_mode(&self.assignment_mode),
+                assignment_mode: Self::parse_assignment_mode(
+                    self.assignment_mode.as_deref(),
+                    ManualAssignmentMode::Delegate,
+                ),
+                headers: self.routing_key_headers.clone(),
             })
             .retries(!self.disable_retries)
+            .upstream_http2(self.upstream_http2)
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .igw(self.enable_igw)
+            .rl(smg_rl::RlConfig {
+                enabled: self.enable_rl,
+                control_timeout_secs: self.rl_control_timeout_secs,
+                fanout_concurrency: self.rl_fanout_concurrency,
+            })
             .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
             .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
 
@@ -1586,16 +1968,30 @@ impl CliArgs {
     fn to_server_config(&self, router_config: RouterConfig) -> ConfigResult<ServerConfig> {
         let service_discovery_config = if self.service_discovery {
             // Get router discovery config from router_config.discovery if available
-            let (router_selector, router_mesh_port_annotation) = router_config
+            let (
+                router_selector,
+                router_mesh_port_annotation,
+                kv_connector_annotation,
+                kv_engine_id_annotation,
+            ) = router_config
                 .discovery
                 .as_ref()
                 .map(|d| {
                     (
                         d.router_selector.clone(),
                         d.router_mesh_port_annotation.clone(),
+                        d.kv_connector_annotation.clone(),
+                        d.kv_engine_id_annotation.clone(),
                     )
                 })
-                .unwrap_or_else(|| (HashMap::new(), "sglang.ai/mesh-port".to_string()));
+                .unwrap_or_else(|| {
+                    (
+                        HashMap::new(),
+                        "sglang.ai/mesh-port".to_string(),
+                        self.kv_connector_annotation.clone(),
+                        self.kv_engine_id_annotation.clone(),
+                    )
+                });
 
             let model_id_source = self
                 .model_id_from
@@ -1627,6 +2023,8 @@ impl CliArgs {
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                 worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+                kv_connector_annotation,
+                kv_engine_id_annotation,
                 router_selector,
                 router_mesh_port_annotation,
                 model_id_source,
@@ -1690,6 +2088,8 @@ impl CliArgs {
     reason = "pre-logger startup output and version display"
 )]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    register_jemalloc_as_global_allocator();
+
     // Check for version flags before parsing other args to avoid errors
     let args: Vec<String> = std::env::args().collect();
     for arg in &args {
@@ -1815,6 +2215,26 @@ mod tests {
         Cli::parse_from(argv).router_args
     }
 
+    /// A grouped ZMQ handshake needs at least one engine, so `0` (and any
+    /// non-positive value) must be rejected at parse time rather than silently
+    /// degrading to an ungrouped worker.
+    #[test]
+    fn zmq_engine_count_rejects_non_positive() {
+        assert_eq!(
+            cli_args_from(&["--zmq-engine-count", "2"]).zmq_engine_count,
+            Some(2)
+        );
+        assert_eq!(cli_args_from(&[]).zmq_engine_count, None);
+
+        for bad in ["0", "-1"] {
+            let argv = ["smg", "--zmq-engine-count", bad];
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "--zmq-engine-count {bad} should be rejected"
+            );
+        }
+    }
+
     /// The indexer prune flags are router-only settings and must flow into
     /// `RouterConfig` (unset by default so the indexer stays unbounded).
     #[test]
@@ -1832,6 +2252,259 @@ mod tests {
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.kv_indexer_ttl_secs, None);
         assert_eq!(defaults.kv_indexer_max_entries, None);
+    }
+
+    /// The retry-buffer cap must flow through both conversion paths.
+    #[test]
+    fn max_buffered_request_bytes_flows_into_both_config_paths() {
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.max_buffered_request_bytes, 1_048_576);
+
+        let cli = cli_args_from(&["--max-buffered-request-bytes", "4096"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.max_buffered_request_bytes, 4096);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.max_buffered_request_bytes, 4096);
+
+        let zeroed = cli_args_from(&["--max-buffered-request-bytes", "0"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert_eq!(zeroed.max_buffered_request_bytes, 0);
+    }
+
+    /// Job queue sizing must flow through both conversion paths: into
+    /// `RouterConfig` and through the `RouterConfig` carried by
+    /// `ServerConfig`, which is what constructs the queue at startup.
+    #[test]
+    fn job_queue_flags_flow_into_both_config_paths() {
+        let cli = cli_args_from(&[
+            "--job-queue-capacity",
+            "20000",
+            "--job-queue-concurrency",
+            "500",
+        ]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.job_queue_capacity, 20_000);
+        assert_eq!(router_config.job_queue_concurrency, 500);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.job_queue_capacity, 20_000);
+        assert_eq!(server_config.router_config.job_queue_concurrency, 500);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.job_queue_capacity, 1000);
+        assert_eq!(defaults.job_queue_concurrency, 200);
+    }
+
+    /// A zero-capacity channel panics at construction and a zero-permit
+    /// dispatcher never dequeues; both bounds are enforced at parse time.
+    #[test]
+    fn job_queue_flags_reject_out_of_range_values() {
+        for (flag, bad) in [
+            ("--job-queue-capacity", "0"),
+            ("--job-queue-capacity", "1000001"),
+            ("--job-queue-concurrency", "0"),
+            ("--job-queue-concurrency", "100001"),
+        ] {
+            let argv = ["smg", flag, bad];
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "{flag} {bad} should be rejected"
+            );
+        }
+    }
+
+    /// The PD admission wait is a router-only setting and must flow into
+    /// `RouterConfig`, where the dispatch path latches it at startup.
+    #[test]
+    fn pd_admission_wait_flag_flows_into_router_config() {
+        let cli = cli_args_from(&["--pd-admission-wait-secs", "5"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.pd_admission_wait_secs, 5);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.pd_admission_wait_secs, 5);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.pd_admission_wait_secs, 30);
+    }
+
+    /// The streamed-body stall timeout is a router-only setting and must
+    /// flow into `RouterConfig`.
+    #[test]
+    fn stream_stall_timeout_flag_flows_into_router_config() {
+        let cli = cli_args_from(&["--stream-body-stall-timeout-secs", "120"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.stream_body_stall_timeout_secs, 120);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.stream_body_stall_timeout_secs, 300);
+    }
+
+    #[test]
+    fn routing_key_flags_flow_into_router_config() {
+        // The override enables with no other configuration; the sticky map
+        // defaults to delegate while the manual policy default stays random.
+        let cli = cli_args_from(&["--routing-key-override"]);
+        let config = cli.to_router_config(vec![], vec![]).unwrap();
+        let override_cfg = &config.routing_key_override;
+        assert!(override_cfg.enabled);
+        assert_eq!(override_cfg.assignment_mode, ManualAssignmentMode::Delegate);
+
+        // An explicit --assignment-mode overrides the sticky-map default.
+        let explicit = cli_args_from(&["--routing-key-override", "--assignment-mode", "min_load"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert_eq!(
+            explicit.routing_key_override.assignment_mode,
+            ManualAssignmentMode::MinLoad
+        );
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(!defaults.routing_key_override.enabled);
+        assert_eq!(
+            defaults.routing_key_override.headers,
+            vec!["x-smg-routing-key".to_string()]
+        );
+    }
+
+    #[test]
+    fn routing_key_headers_flow_into_router_config() {
+        // Space-separated list, order preserved; names normalize to lowercase.
+        let config = cli_args_from(&[
+            "--routing-key-headers",
+            "X-Routing-Key",
+            "x-smg-routing-key",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        assert_eq!(
+            config.routing_key_override.headers,
+            vec!["x-routing-key".to_string(), "x-smg-routing-key".to_string()]
+        );
+
+        for bad in ["has space", "bad\u{7f}name", ""] {
+            let argv = ["smg", "--routing-key-headers", bad];
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "--routing-key-headers {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_policy_assignment_default_stays_random() {
+        // One invocation, both contexts: the manual policy keeps its random
+        // default while the override sticky map defaults to delegate.
+        let config = cli_args_from(&["--policy", "manual", "--routing-key-override"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        match &config.policy {
+            PolicyConfig::Manual {
+                assignment_mode, ..
+            } => assert_eq!(*assignment_mode, ManualAssignmentMode::Random),
+            other => panic!("expected manual policy, got {other:?}"),
+        }
+        assert_eq!(
+            config.routing_key_override.assignment_mode,
+            ManualAssignmentMode::Delegate
+        );
+    }
+
+    #[test]
+    fn alias_flags_parse_identically_to_canonical() {
+        let canonical = cli_args_from(&[
+            "--policy",
+            "cache_aware",
+            "--cache-threshold",
+            "0.6",
+            "--balance-abs-threshold",
+            "8",
+            "--balance-rel-threshold",
+            "1.2",
+            "--max-idle-secs",
+            "300",
+            "--routing-key-override",
+            "--remove-unhealthy-workers",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        let aliased = cli_args_from(&[
+            "--policy",
+            "cache_aware",
+            "--cache-match-threshold",
+            "0.6",
+            "--spill-abs-threshold",
+            "8",
+            "--spill-rel-threshold",
+            "1.2",
+            "--sticky-key-idle-secs",
+            "300",
+            "--sticky-sessions",
+            "--worker-auto-recovery",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        assert_eq!(format!("{canonical:?}"), format!("{aliased:?}"));
+    }
+
+    #[test]
+    fn kv_annotation_flags_flow_into_both_configs() {
+        let cli = cli_args_from(&[
+            "--service-discovery",
+            "--selector",
+            "app=worker",
+            "--kv-connector-annotation",
+            "example.com/connector",
+            "--kv-engine-id-annotation",
+            "example.com/engine-id",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let discovery = router.discovery.as_ref().unwrap();
+        assert_eq!(discovery.kv_connector_annotation, "example.com/connector");
+        assert_eq!(discovery.kv_engine_id_annotation, "example.com/engine-id");
+
+        let server = cli.to_server_config(router).unwrap();
+        let discovery = server.service_discovery_config.as_ref().unwrap();
+        assert_eq!(discovery.kv_connector_annotation, "example.com/connector");
+        assert_eq!(discovery.kv_engine_id_annotation, "example.com/engine-id");
+
+        let defaults = cli_args_from(&["--service-discovery", "--selector", "app=worker"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        let defaults = defaults.discovery.as_ref().unwrap();
+        assert_eq!(defaults.kv_connector_annotation, "smg.ai/kv-connector");
+        assert_eq!(defaults.kv_engine_id_annotation, "smg.ai/kv-engine-id");
+    }
+
+    /// `--worker-auto-recovery` defaults to the `--service-discovery`
+    /// setting: recovery works by removal plus discovery re-registration, so
+    /// it is on exactly when discovery can complete that loop, and off when
+    /// removal would permanently shrink a static fleet. Explicit values win
+    /// in both directions.
+    #[test]
+    fn worker_auto_recovery_follows_service_discovery_by_default() {
+        let derived_on = cli_args_from(&["--service-discovery", "--selector", "app=w"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert!(derived_on.health_check.remove_unhealthy_workers);
+
+        let derived_off = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(!derived_off.health_check.remove_unhealthy_workers);
+
+        let forced_off = cli_args_from(&[
+            "--service-discovery",
+            "--selector",
+            "app=w",
+            "--remove-unhealthy-workers=false",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        assert!(!forced_off.health_check.remove_unhealthy_workers);
+
+        let forced_on = cli_args_from(&["--remove-unhealthy-workers"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert!(forced_on.health_check.remove_unhealthy_workers);
     }
 
     /// `--health-check-port` must flow into BOTH conversion paths
@@ -1891,6 +2564,191 @@ mod tests {
         );
     }
 
+    /// The overload thresholds must reach `RouterConfig` and survive nesting
+    /// into `ServerConfig.router_config` — the consumer (load monitor) reads
+    /// them off `RouterConfig`. Two-path config-plumbing guard.
+    #[test]
+    fn worker_overload_thresholds_flow_into_both_configs() {
+        let cli = cli_args_from(&[
+            "--worker-overload-waiting-requests",
+            "64",
+            "--worker-overload-token-usage",
+            "0.9",
+        ]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(
+            router_config.worker_overload_waiting_requests,
+            Some(64),
+            "worker_overload_waiting_requests must reach RouterConfig via to_router_config"
+        );
+        assert_eq!(
+            router_config.worker_overload_token_usage,
+            Some(0.9),
+            "worker_overload_token_usage must reach RouterConfig via to_router_config"
+        );
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(
+            server_config.router_config.worker_overload_waiting_requests,
+            Some(64),
+            "worker_overload_waiting_requests must survive into ServerConfig"
+        );
+        assert_eq!(
+            server_config.router_config.worker_overload_token_usage,
+            Some(0.9),
+            "worker_overload_token_usage must survive into ServerConfig"
+        );
+    }
+
+    /// Unset means off on both paths: the feature must be byte-identical to
+    /// pre-feature behavior until an operator opts in.
+    #[test]
+    fn worker_overload_thresholds_default_to_unset_in_both_configs() {
+        let cli = cli_args_from(&[]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.worker_overload_waiting_requests, None);
+        assert_eq!(router_config.worker_overload_token_usage, None);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(
+            server_config.router_config.worker_overload_waiting_requests,
+            None
+        );
+        assert_eq!(
+            server_config.router_config.worker_overload_token_usage,
+            None
+        );
+    }
+
+    /// Both thresholds are `>=` comparisons, so the excluded ends of their
+    /// ranges would veto every worker unconditionally. Reject them at parse
+    /// time rather than letting a typo shed all traffic.
+    #[test]
+    fn degenerate_worker_overload_thresholds_are_rejected_at_parse_time() {
+        for argv in [
+            vec!["smg", "--worker-overload-waiting-requests", "0"],
+            vec!["smg", "--worker-overload-token-usage", "0"],
+            vec!["smg", "--worker-overload-token-usage", "1.5"],
+            vec!["smg", "--worker-overload-token-usage", "-0.5"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{argv:?} must be rejected at parse time"
+            );
+        }
+
+        // The inclusive ends of the accepted ranges must still parse.
+        assert!(Cli::try_parse_from(["smg", "--worker-overload-waiting-requests", "1"]).is_ok());
+        assert!(Cli::try_parse_from(["smg", "--worker-overload-token-usage", "1.0"]).is_ok());
+    }
+
+    /// `--worker-overload-protection` and `--disable-load-monitoring` must
+    /// reach `RouterConfig` and survive nesting into
+    /// `ServerConfig.router_config`. Two-path config-plumbing guard.
+    #[test]
+    fn overload_protection_and_monitoring_flags_flow_into_both_configs() {
+        let cli = cli_args_from(&["--worker-overload-protection", "--disable-load-monitoring"]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            router_config.worker_overload_protection,
+            "worker_overload_protection must reach RouterConfig via to_router_config"
+        );
+        assert!(
+            router_config.disable_load_monitoring,
+            "disable_load_monitoring must reach RouterConfig via to_router_config"
+        );
+        // The flag alone carries no thresholds; the token default is applied
+        // at resolution, not stored in config.
+        assert_eq!(router_config.worker_overload_waiting_requests, None);
+        assert_eq!(router_config.worker_overload_token_usage, None);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(
+            server_config.router_config.worker_overload_protection,
+            "worker_overload_protection must survive into ServerConfig"
+        );
+        assert!(
+            server_config.router_config.disable_load_monitoring,
+            "disable_load_monitoring must survive into ServerConfig"
+        );
+    }
+
+    /// Defaults: protection off, monitoring default-on (opt-out false) — the
+    /// behavior change is monitoring, and it is carried by the default here.
+    #[test]
+    fn overload_protection_and_monitoring_flags_default_off_in_both_configs() {
+        let cli = cli_args_from(&[]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(!router_config.worker_overload_protection);
+        assert!(!router_config.disable_load_monitoring);
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(!server_config.router_config.worker_overload_protection);
+        assert!(!server_config.router_config.disable_load_monitoring);
+    }
+
+    /// Cache-index flags must reach the cache_aware policy variant and the
+    /// shared `RouterConfig.cache_boundaries`, and survive into
+    /// `ServerConfig.router_config`. Two-path config-plumbing guard.
+    #[test]
+    fn cache_index_flags_flow_into_both_configs() {
+        let cli = cli_args_from(&[
+            "--cache-boundaries",
+            "2048,8192",
+            "--cache-index",
+            "hash",
+            "--cache-ttl-secs",
+            "60",
+        ]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.cache_boundaries, vec![2048, 8192]);
+        match &router_config.policy {
+            PolicyConfig::CacheAware {
+                cache_index,
+                cache_ttl_secs,
+                cache_boundaries,
+                ..
+            } => {
+                assert_eq!(*cache_index, CacheIndexKind::Hash);
+                assert_eq!(*cache_ttl_secs, 60);
+                assert_eq!(*cache_boundaries, vec![2048, 8192]);
+            }
+            other => panic!("expected cache_aware policy, got {other:?}"),
+        }
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(
+            server_config.router_config.cache_boundaries,
+            vec![2048, 8192],
+            "cache_boundaries must survive into ServerConfig via to_server_config"
+        );
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(defaults.cache_boundaries.is_empty());
+        match &defaults.policy {
+            PolicyConfig::CacheAware {
+                cache_index,
+                cache_ttl_secs,
+                cache_boundaries,
+                ..
+            } => {
+                assert_eq!(*cache_index, CacheIndexKind::Tree);
+                assert_eq!(*cache_ttl_secs, 180);
+                assert!(cache_boundaries.is_empty());
+            }
+            other => panic!("expected cache_aware policy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_ttl_secs_zero_rejected_at_parse() {
+        assert!(Cli::try_parse_from(["smg", "--cache-ttl-secs", "0"]).is_err());
+    }
+
     /// The multimodal transport flags must reach both `RouterConfig` and the
     /// wrapped `ServerConfig.router_config`. Two-path config-plumbing guard.
     #[test]
@@ -1900,6 +2758,8 @@ mod tests {
             "shm",
             "--multimodal-shm-min-bytes",
             "1024",
+            "--mm-per-request-image-limit",
+            "128",
         ]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
@@ -1909,6 +2769,7 @@ mod tests {
             "transport mode must reach RouterConfig via to_router_config"
         );
         assert_eq!(router_config.multimodal_shm_min_bytes, Some(1024));
+        assert_eq!(router_config.mm_per_request_image_limit, Some(128));
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(
@@ -1920,6 +2781,13 @@ mod tests {
             server_config.router_config.multimodal_shm_min_bytes,
             Some(1024)
         );
+        assert_eq!(
+            server_config.router_config.mm_per_request_image_limit,
+            Some(128)
+        );
+
+        // clap rejects a zero limit outright.
+        assert!(Cli::try_parse_from(["smg", "--mm-per-request-image-limit", "0"]).is_err());
     }
 
     /// Default is off: the flag stays false through both conversions so
@@ -2038,6 +2906,52 @@ mod tests {
             router_config.startup_worker_runtime_type,
             Some(RuntimeType::Vllm)
         );
+    }
+
+    /// The shared `--cache-boundaries` flag must also reach the prefix_hash
+    /// policy's resolved copy (the shared-field flow is covered by
+    /// `cache_index_flags_flow_into_both_configs`).
+    #[test]
+    fn cache_boundaries_flow_into_prefix_hash_policy() {
+        let cli = cli_args_from(&[
+            "--policy",
+            "prefix_hash",
+            "--cache-boundaries",
+            "2048,8192,32768",
+        ]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        match &router_config.policy {
+            PolicyConfig::PrefixHash {
+                cache_boundaries, ..
+            } => assert_eq!(cache_boundaries, &vec![2048, 8192, 32768]),
+            other => panic!("expected prefix_hash policy, got {other:?}"),
+        }
+
+        let defaults = cli_args_from(&["--policy", "prefix_hash"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        match &defaults.policy {
+            PolicyConfig::PrefixHash {
+                cache_boundaries, ..
+            } => assert!(cache_boundaries.is_empty()),
+            other => panic!("expected prefix_hash policy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_ascending_cache_boundaries_are_rejected() {
+        for bad in ["8192,2048", "0,2048", "2048,2048"] {
+            let cli = cli_args_from(&["--cache-boundaries", bad]);
+            assert!(
+                matches!(
+                    cli.to_router_config(vec![], vec![]),
+                    Err(ConfigError::InvalidValue { ref field, .. })
+                        if field == "cache_boundaries"
+                ),
+                "--cache-boundaries {bad} should be rejected"
+            );
+        }
     }
 
     #[test]

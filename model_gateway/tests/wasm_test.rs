@@ -67,9 +67,9 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
     let worker_monitor = Some(Arc::new(WorkerMonitor::new(
         worker_registry.clone(),
         policy_registry.clone(),
-        client.clone(),
         config.load_monitor_interval_secs,
         config.engine_metrics,
+        config.disable_load_monitoring,
     )));
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
@@ -193,8 +193,8 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
         router,
         probe_state: ProbeState::new(app_context.inflight_tracker.clone()),
         context: app_context.clone(),
-        concurrency_queue_tx: None,
-        router_manager: None,
+        admission_queue: None,
+        gateway: None,
         mesh_handler: None,
         mesh_adapters: None,
     });

@@ -1,6 +1,6 @@
 [package]
 name = "smg-python"
-version = "1.9.0"
+version = "1.10.1"
 edition = "2021"
 
 [lib]
@@ -15,7 +15,11 @@ serde_yaml = "0.9"
 
 [dependencies.smg]
 path = "../../model_gateway"
-default-features = true
+default-features = false
+features = ["grpc-client", "jemalloc-stats", "providers"]
+
+[dependencies.smg-rl]
+workspace = true
 
 [dependencies.smg-auth]
 workspace = true
@@ -36,6 +40,7 @@ workspace = true
 default = ["pyo3/extension-module"]
 opencv-video = ["smg/opencv-video"]
 vendored-openssl = ["smg/vendored-openssl"]
+jemalloc-profiling = ["smg/jemalloc-profiling", "tikv-jemallocator/profiling"]
 
 [profile.ci]
 inherits = "release"
@@ -46,3 +51,6 @@ strip = true
 
 [lints]
 workspace = true
+
+[target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dependencies]
+tikv-jemallocator = { workspace = true, features = ["disable_initial_exec_tls"] }

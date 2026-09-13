@@ -1,20 +1,25 @@
+mod glm53_flash;
 mod inkling;
 mod kimi_k25;
 mod kimi_k3;
 mod llama4;
 mod llava;
+mod minimax_m3;
 mod phi3_v;
-mod qwen3_asr;
+pub mod qwen3_asr;
 mod qwen3_omni;
 mod qwen3_vl;
 mod qwen_vl;
 mod traits;
+pub mod transcription;
 
+use glm53_flash::Glm53FlashSpec;
 use inkling::InklingSpec;
 use kimi_k25::KimiK25VisionSpec;
 use kimi_k3::KimiK3VisionSpec;
 use llama4::Llama4Spec;
 use llava::{LlavaNextSpec, LlavaSpec};
+use minimax_m3::MiniMaxM3VisionSpec;
 use once_cell::sync::Lazy;
 use phi3_v::Phi3VisionSpec;
 use qwen3_asr::Qwen3AsrSpec;
@@ -24,6 +29,7 @@ use qwen_vl::QwenVLVisionSpec;
 // Re-export public API from traits.
 pub use traits::{
     MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
+    Tokenizer,
 };
 
 pub struct ModelRegistry {
@@ -34,12 +40,14 @@ impl ModelRegistry {
     pub fn new() -> Self {
         Self {
             specs: vec![
+                LazySpec::new(|| Box::new(Glm53FlashSpec)),
                 LazySpec::new(|| Box::new(InklingSpec)),
                 // Kimi-K3 must be registered before Kimi-K2.5: the two families
                 // share a transport layout but not a prompt shape.
                 LazySpec::new(|| Box::new(KimiK3VisionSpec)),
                 LazySpec::new(|| Box::new(KimiK25VisionSpec)),
                 LazySpec::new(|| Box::new(Llama4Spec)),
+                LazySpec::new(|| Box::new(MiniMaxM3VisionSpec)),
                 // LlavaNext must be registered before Llava so "llava_next" model_type matches first.
                 LazySpec::new(|| Box::new(LlavaNextSpec)),
                 LazySpec::new(|| Box::new(LlavaSpec)),
@@ -90,9 +98,6 @@ impl LazySpec {
 pub(super) mod test_helpers {
     use std::collections::HashMap;
 
-    use llm_tokenizer::{Decoder, Encoder, Encoding, SpecialTokens, TokenizerTrait};
-    use once_cell::sync::Lazy;
-
     use crate::{
         encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
         types::ImageSize,
@@ -126,53 +131,7 @@ pub(super) mod test_helpers {
         }
     }
 
-    impl Encoder for TestTokenizer {
-        fn encode(&self, input: &str, _add_special_tokens: bool) -> anyhow::Result<Encoding> {
-            let Some(base) = self.text_base else {
-                return Ok(Encoding::Plain(Vec::new()));
-            };
-            Ok(Encoding::Plain(
-                input.bytes().map(|b| base + u32::from(b)).collect(),
-            ))
-        }
-
-        fn encode_batch(
-            &self,
-            inputs: &[&str],
-            add_special_tokens: bool,
-        ) -> anyhow::Result<Vec<Encoding>> {
-            inputs
-                .iter()
-                .map(|input| self.encode(input, add_special_tokens))
-                .collect()
-        }
-    }
-
-    impl Decoder for TestTokenizer {
-        fn decode(&self, _token_ids: &[u32], _skip_special_tokens: bool) -> anyhow::Result<String> {
-            Ok(String::new())
-        }
-    }
-
-    impl TokenizerTrait for TestTokenizer {
-        fn vocab_size(&self) -> usize {
-            self.vocab.len()
-        }
-
-        fn get_special_tokens(&self) -> &SpecialTokens {
-            static TOKENS: Lazy<SpecialTokens> = Lazy::new(|| SpecialTokens {
-                bos_token: None,
-                eos_token: None,
-                unk_token: None,
-                sep_token: None,
-                pad_token: None,
-                cls_token: None,
-                mask_token: None,
-                additional_special_tokens: vec![],
-            });
-            &TOKENS
-        }
-
+    impl crate::registry::Tokenizer for TestTokenizer {
         fn token_to_id(&self, token: &str) -> Option<u32> {
             self.vocab.get(token).copied()
         }
@@ -184,8 +143,13 @@ pub(super) mod test_helpers {
                 .map(|(k, _)| k.clone())
         }
 
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
+        fn encode_text(&self, text: &str) -> Option<Vec<u32>> {
+            // Mirrors the pre-seam stub behavior: without a byte encoder the
+            // stub encodes everything to nothing rather than failing.
+            Some(match self.text_base {
+                Some(base) => text.bytes().map(|b| base + u32::from(b)).collect(),
+                None => Vec::new(),
+            })
         }
     }
 

@@ -25,12 +25,10 @@ pub enum Error {
     ValueDecode(#[from] rmpv::decode::Error),
     #[error("messagepack ext value decode failed: {message}")]
     ExtValueDecode { message: String },
-    #[error("io error")]
+    #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("transport error")]
+    #[error("transport error: {0}")]
     Transport(#[from] zeromq::ZmqError),
-    #[error("ZMQ runtime task failed")]
-    ZmqRuntimeTask(#[from] tokio::task::JoinError),
     #[error("engine core reported fatal failure")]
     EngineCoreDead,
     #[error("startup handshake timed out while waiting for {stage} after {timeout:?}")]
@@ -40,12 +38,8 @@ pub enum Error {
     },
     #[error("engine input registration timed out after {timeout:?}")]
     InputRegistrationTimeout { timeout: Duration },
-    #[error("unexpected engine id in startup handshake: expected {expected:?}, got {actual:?}")]
-    UnexpectedHandshakeIdentity { expected: Vec<u8>, actual: Vec<u8> },
     #[error("unexpected startup handshake message: {message}")]
     UnexpectedHandshakeMessage { message: String },
-    #[error("unsupported auxiliary frame(s): expected {expected} frame(s), got {frame_count}")]
-    UnsupportedAuxFrames { expected: usize, frame_count: usize },
     #[error("unsupported field `{field}` in {context}")]
     UnsupportedField {
         context: &'static str,
@@ -59,8 +53,6 @@ pub enum Error {
     InvalidDataParallelRank { rank: u32, num_engines: u32 },
     #[error("request output stream for `{request_id}` closed unexpectedly")]
     RequestStreamClosed { request_id: String },
-    #[error("engine-core output dispatcher closed: {message}")]
-    DispatcherClosed { message: String },
     #[error("engine ZMQ client is closed: {message}")]
     ClientClosed { message: String },
 

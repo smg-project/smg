@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   detect:
-    runs-on: k8s-runner-cpu
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -85,7 +85,7 @@ jobs:
   research-and-file:
     needs: detect
     if: needs.detect.outputs.has_pending == 'true'
-    runs-on: k8s-runner-cpu
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 30
     permissions:
       contents: read

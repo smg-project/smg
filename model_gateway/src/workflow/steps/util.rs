@@ -1,8 +1,10 @@
 //! Shared URL normalization and network probe utilities for worker steps.
 
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
+use smg_grpc_client::connect_channel_with_timeout;
 
 use crate::routers::grpc::client::GrpcClient;
 
@@ -113,36 +115,118 @@ pub(crate) async fn do_grpc_health_check(
     Ok(())
 }
 
+/// Dial the endpoint once to decide whether it is worth probing per-runtime.
+///
+/// All five runtime clients dial the same authority, so an endpoint that
+/// cannot be reached at the transport level fails five identical connects.
+/// One dial answers that question, which matters during a mass worker
+/// registration: an unready pod that black-holes SYN would otherwise hold
+/// five in-flight sockets per attempt instead of one.
+async fn grpc_transport_reachable(grpc_url: &str, timeout_secs: u64) -> Result<(), String> {
+    let timeout = Duration::from_secs(timeout_secs);
+    let connect_future = connect_channel_with_timeout(grpc_url, timeout);
+
+    // tonic's connect timeout is applied to the connector. Keep an outer
+    // deadline as a safety net for the remaining Channel::connect setup.
+    tokio::time::timeout(timeout, connect_future)
+        .await
+        .map_err(|_| "gRPC connection timeout".to_string())?
+        .map_err(|e| format!("gRPC connection failed: {e}"))?;
+    Ok(())
+}
+
+const GRPC_RUNTIME_TYPES: [&str; 5] = ["sglang", "vllm", "trtllm", "mlx", "tokenspeed"];
+
+async fn first_success_or_all_errors<F>(
+    mut checks: FuturesUnordered<F>,
+    runtimes: &[&str],
+) -> Result<(), String>
+where
+    F: Future<Output = (usize, Result<(), String>)>,
+{
+    let mut errors = vec![None; runtimes.len()];
+
+    while let Some((index, result)) = checks.next().await {
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if let Some(slot) = errors.get_mut(index) {
+                    *slot = Some(error);
+                }
+            }
+        }
+    }
+
+    let details = runtimes
+        .iter()
+        .enumerate()
+        .map(|(index, runtime)| match errors[index].as_deref() {
+            Some(error) => format!("{runtime}={error}"),
+            None => format!("{runtime}=health check did not complete"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Err(format!(
+        "gRPC not reachable (tried {}): {details}",
+        runtimes.join(", ")
+    ))
+}
+
 /// Check if gRPC is reachable by trying all known runtime types in parallel.
 ///
 /// We don't care which runtime it is here — that's `DetectBackendStep`'s job.
 /// We just need to know: does this endpoint speak gRPC at all?
+///
+/// The per-runtime fan-out is gated behind a single transport probe so an
+/// unreachable endpoint costs one connect rather than five.
+/// The remaining runtime probes are cancelled after the first success.
+/// `timeout_secs` bounds the gate and fan-out together, not each phase.
 pub(crate) async fn try_grpc_reachable(url: &str, timeout_secs: u64) -> Result<(), String> {
     let grpc_url = grpc_reachable_url(url)?;
+    let timeout = Duration::from_secs(timeout_secs);
 
-    let (sglang, vllm, trtllm, mlx, tokenspeed) = tokio::join!(
-        do_grpc_health_check(&grpc_url, timeout_secs, "sglang"),
-        do_grpc_health_check(&grpc_url, timeout_secs, "vllm"),
-        do_grpc_health_check(&grpc_url, timeout_secs, "trtllm"),
-        do_grpc_health_check(&grpc_url, timeout_secs, "mlx"),
-        do_grpc_health_check(&grpc_url, timeout_secs, "tokenspeed"),
-    );
+    let reachability = Box::pin(async {
+        grpc_transport_reachable(&grpc_url, timeout_secs).await?;
 
-    match (sglang, vllm, trtllm, mlx, tokenspeed) {
-        (Ok(()), _, _, _, _)
-        | (_, Ok(()), _, _, _)
-        | (_, _, Ok(()), _, _)
-        | (_, _, _, Ok(()), _)
-        | (_, _, _, _, Ok(())) => Ok(()),
-        (Err(e1), Err(e2), Err(e3), Err(e4), Err(e5)) => Err(format!(
-            "gRPC not reachable (tried sglang, vllm, trtllm, mlx, tokenspeed): sglang={e1}, vllm={e2}, trtllm={e3}, mlx={e4}, tokenspeed={e5}",
-        )),
-    }
+        let checks = FuturesUnordered::new();
+        for (index, runtime) in GRPC_RUNTIME_TYPES.iter().copied().enumerate() {
+            let grpc_url = &grpc_url;
+            checks.push(async move {
+                (
+                    index,
+                    do_grpc_health_check(grpc_url, timeout_secs, runtime).await,
+                )
+            });
+        }
+
+        first_success_or_all_errors(checks, &GRPC_RUNTIME_TYPES).await
+    });
+
+    tokio::time::timeout(timeout, reachability)
+        .await
+        .map_err(|_| "gRPC reachability timeout".to_string())?
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        future::pending,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
+
     use super::*;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn http_health_url_accepts_http_https_and_bare_urls() {
@@ -186,5 +270,69 @@ mod tests {
     fn grpc_reachable_url_rejects_http_schemes() {
         assert!(grpc_reachable_url("http://localhost:30000").is_err());
         assert!(grpc_reachable_url("https://localhost:30000").is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_fanout_returns_on_first_success_and_cancels_stalled_checks() {
+        let stalled_started = Arc::new(AtomicBool::new(false));
+        let stalled_cancelled = Arc::new(AtomicBool::new(false));
+        let checks = FuturesUnordered::new();
+
+        for (index, succeeds) in [false, true].into_iter().enumerate() {
+            let stalled_started = Arc::clone(&stalled_started);
+            let stalled_cancelled = Arc::clone(&stalled_cancelled);
+            checks.push(async move {
+                let result = if succeeds {
+                    tokio::task::yield_now().await;
+                    Ok(())
+                } else {
+                    stalled_started.store(true, Ordering::SeqCst);
+                    let _drop_flag = DropFlag(stalled_cancelled);
+                    pending::<Result<(), String>>().await
+                };
+                (index, result)
+            });
+        }
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            first_success_or_all_errors(checks, &["stalled", "healthy"]),
+        )
+        .await;
+
+        assert!(matches!(result, Ok(Ok(()))));
+        assert!(stalled_started.load(Ordering::SeqCst));
+        assert!(stalled_cancelled.load(Ordering::SeqCst));
+    }
+
+    /// An endpoint that cannot be reached at the transport level must
+    /// short-circuit before the per-runtime fan-out, so one unreachable worker
+    /// costs one dial rather than five.
+    ///
+    /// TCP port 0 cannot be owned by a listener: binding it asks the OS for an
+    /// ephemeral nonzero port. This makes the local transport failure
+    /// deterministic without a bind-then-drop port-reuse race.
+    /// The fan-out aggregate can only be constructed after all runtime probes
+    /// run, so the transport error proves the gate returned first.
+    #[tokio::test]
+    async fn unreachable_transport_short_circuits_the_runtime_fanout() {
+        let err = try_grpc_reachable("grpc://127.0.0.1:0", 1)
+            .await
+            .expect_err("closed local endpoint should not be reachable");
+
+        assert!(
+            err.starts_with("gRPC connection"),
+            "expected the transport-gate error, got: {err}"
+        );
+        assert!(
+            !err.contains("gRPC not reachable"),
+            "fan-out aggregate was produced, so the gate did not short-circuit: {err}"
+        );
+        for runtime in ["sglang", "vllm", "trtllm", "mlx", "tokenspeed"] {
+            assert!(
+                !err.contains(runtime),
+                "error names {runtime}, so a per-runtime probe ran: {err}"
+            );
+        }
     }
 }

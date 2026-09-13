@@ -21,6 +21,7 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
+    time::Duration,
 };
 
 use tonic::Streaming;
@@ -29,7 +30,7 @@ use tracing::{debug, warn};
 /// Upper bound on how long a deferred abort waits for the stream's first
 /// item before aborting anyway. Bounds the detached drain task when the
 /// backend never produces output (e.g. its upstream handoff peer died).
-const DEFERRED_ABORT_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const DEFERRED_ABORT_MAX_WAIT: Duration = Duration::from_secs(30);
 
 /// Bridge between the generic [`AbortOnDropStream`] and an engine-specific
 /// client. Implementors provide an async function that the wrapper calls
@@ -120,7 +121,6 @@ impl<T: Send + 'static, C: AbortOnDropClient> Drop for AbortOnDropStream<T, C> {
         }
 
         let request_id = self.request_id.clone();
-        let request_id_for_log = request_id.clone();
         let client = self.client.clone();
 
         // Deferred mode, dropped before the first item: keep the stream
@@ -142,7 +142,7 @@ impl<T: Send + 'static, C: AbortOnDropClient> Drop for AbortOnDropStream<T, C> {
             if let Some(mut stream) = drain {
                 debug!(
                     "Stream dropped before first item for request {}, draining before abort",
-                    request_id_for_log
+                    request_id
                 );
                 let first_item = tokio::time::timeout(DEFERRED_ABORT_MAX_WAIT, async {
                     // `Streaming::message` resolves on the next message,
@@ -154,22 +154,41 @@ impl<T: Send + 'static, C: AbortOnDropClient> Drop for AbortOnDropStream<T, C> {
                 if first_item.is_err() {
                     warn!(
                         "Deferred abort for request {} timed out waiting for the first item",
-                        request_id_for_log
+                        request_id
                     );
                 }
-            } else {
-                debug!(
-                    "Stream dropped without completion for request {}, sending abort",
-                    request_id_for_log
-                );
             }
-            if let Err(e) = client.abort_for_drop(request_id).await {
-                warn!(
-                    "Failed to send abort on drop for request {}: {}",
-                    request_id_for_log, e
-                );
-            }
+            abort_with_deadline(client, request_id).await;
         });
+    }
+}
+
+/// Send the drop-abort RPC under a local deadline.
+///
+/// The abort runs in a detached task that no caller can cancel, so without a
+/// bound a wedged backend (whose gRPC layer answers pings while its handler
+/// hangs) would let these tasks accumulate without limit — precisely during the
+/// mass-disconnect a backend brownout causes. See [`crate::ABORT_RPC_DEADLINE`].
+async fn abort_with_deadline<C: AbortOnDropClient>(client: C, request_id: String) {
+    abort_within(crate::ABORT_RPC_DEADLINE, client, request_id).await;
+}
+
+/// Deadline-bounded abort, parameterized on `deadline` for testability.
+async fn abort_within<C: AbortOnDropClient>(deadline: Duration, client: C, request_id: String) {
+    debug!(
+        "Stream dropped without completion for request {}, sending abort",
+        request_id
+    );
+    match tokio::time::timeout(deadline, client.abort_for_drop(request_id.clone())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(
+            "Failed to send abort on drop for request {}: {}",
+            request_id, e
+        ),
+        Err(_elapsed) => warn!(
+            "Abort-on-drop RPC for request {} timed out after {:?}; giving up",
+            request_id, deadline
+        ),
     }
 }
 
@@ -229,5 +248,36 @@ mod tests {
         // `Send + Sync` regardless of `T`.
         fn assert_send_sync<X: Send + Sync>() {}
         assert_send_sync::<AbortOnDropStream<(), DummyClient>>();
+    }
+
+    /// A backend whose abort handler is wedged (answers the transport but never
+    /// completes the RPC) must not hang the detached drop-abort task forever.
+    /// The abort here never resolves, so the only way `abort_within` can return
+    /// is the deadline firing — an unbounded await would deadlock this test.
+    #[tokio::test]
+    async fn abort_within_gives_up_on_a_hung_backend() {
+        #[derive(Clone)]
+        struct HangingClient;
+
+        impl AbortOnDropClient for HangingClient {
+            fn abort_for_drop(
+                self,
+                _request_id: String,
+            ) -> Pin<Box<dyn Future<Output = Result<(), tonic::Status>> + Send>> {
+                Box::pin(async {
+                    std::future::pending::<()>().await;
+                    Ok(())
+                })
+            }
+        }
+
+        // Short real deadline keeps the test fast; it returns only because the
+        // timeout fires against the never-resolving abort.
+        abort_within(
+            Duration::from_millis(10),
+            HangingClient,
+            "req-1".to_string(),
+        )
+        .await;
     }
 }

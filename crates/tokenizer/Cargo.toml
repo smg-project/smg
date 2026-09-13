@@ -1,6 +1,6 @@
 [package]
 name = "llm-tokenizer"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 description = "LLM tokenizer library with caching and chat template support"
 license = "Apache-2.0"
@@ -36,8 +36,8 @@ hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "ru
 # alters rendered chat-template text. With no committed Cargo.lock, CI floats
 # to the newest release, so an unpinned minor bump broke every PR's
 # unit-tests lane. Bump deliberately, revalidating template output.
-minijinja = { version = "=2.21.0", features = ["unstable_machinery", "json", "builtins", "loader", "loop_controls", "preserve_order"] }
-minijinja-contrib = { version = "=2.21.0", features = ["pycompat"] }
+minijinja = { version = "=2.24.0", features = ["unstable_machinery", "json", "builtins", "loader", "loop_controls", "preserve_order"] }
+minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }
 rayon = "1.12"
 tiktoken-rs = "0.12"
 tokenizers = "0.23.1"

@@ -36,6 +36,8 @@ class TestMessagesBasic:
         assert response.content[0].type == "text"
         assert len(response.content[0].text) > 0
         assert response.usage is not None
+        assert isinstance(response.usage.input_tokens, int)
+        assert isinstance(response.usage.output_tokens, int)
         assert response.usage.input_tokens > 0
         assert response.usage.output_tokens > 0
 

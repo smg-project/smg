@@ -37,10 +37,13 @@
 //!
 //! Each group runs a single `tokio::time::interval` loop. Every tick:
 //!
-//! 1. Skip if no load-aware policy is currently active for this group
-//!    (matches the original `LoadMonitor` policy gate).
+//! 1. Fetch the group's `Ready` workers. Polling is unconditional by
+//!    default; with `--disable-load-monitoring` the tick is skipped
+//!    unless a load-aware policy, engine-metrics re-export, or overload
+//!    protection on a group member needs the data (the original
+//!    conditional gate — never "never poll").
 //! 2. Fetch loads concurrently from every `Ready` worker in the group.
-//! 3. Update PowerOfTwo policies and the DP cache.
+//! 3. Update load-aware policies and the DP cache.
 //! 4. Atomically clear stale entries for the group from the watch
 //!    channel and merge in the fresh loads.
 
@@ -51,21 +54,24 @@ use std::{
     time::Duration,
 };
 
+use dashmap::DashMap;
 use futures::future;
 use openai_protocol::worker::{
     RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey, WorkerLoadResponse, WorkerStatus,
 };
 use parking_lot::{Mutex, RwLock};
-use tokio::{
-    sync::{broadcast, watch},
-    task::JoinHandle,
-};
+use reqwest::StatusCode;
+use tokio::{sync::broadcast, task::JoinHandle};
 use tracing::{debug, info, warn};
 
 use crate::{
     observability::metrics::Metrics,
     policies::PolicyRegistry,
-    worker::{event::WorkerEvent, ConnectionMode, Worker, WorkerRegistry},
+    worker::{
+        event::WorkerEvent,
+        load_state::{LoadReceiver, LoadSnapshot, LoadState},
+        ConnectionMode, Worker, WorkerRegistry,
+    },
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -203,21 +209,141 @@ struct GroupState {
     interval: Duration,
 }
 
+/// Outcome of probing one native load endpoint.
+enum NativeLoads {
+    Available(WorkerLoadResponse),
+    /// The backend answered, and the endpoint is not there. Memoizable.
+    Absent,
+    /// Nothing was learned about the endpoint — retry on the next tick.
+    Inconclusive,
+}
+
+/// A route that answers with the native load schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeLoadsPath {
+    /// `/loads` — an SMG gateway registered as a worker.
+    Gateway,
+    /// `/v1/loads` — the engine-native route.
+    Engine,
+}
+
+impl NativeLoadsPath {
+    /// Probe order for a worker nothing is memoized about. Gateway first:
+    /// a gateway serves only `/loads`, and an engine 404s it once and is
+    /// then memoized onto its own route.
+    const DISCOVERY: [Self; 2] = [Self::Gateway, Self::Engine];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Gateway => 0,
+            Self::Engine => 1,
+        }
+    }
+
+    /// Where to probe this route on `worker`.
+    fn probe_url(self, worker: &Arc<dyn Worker>) -> String {
+        let base = worker.url();
+        match self {
+            // Sections beyond `core` degrade gracefully: an engine that does
+            // not report them omits the fields, which deserialize to `None`.
+            Self::Engine => format!("{base}/v1/loads?include=core,disagg,queues,memory"),
+            // A gateway serves a whole fleet, so an unscoped `/loads` blends
+            // every model it fronts. A worker registered for exactly one
+            // model must be asked about that model alone.
+            Self::Gateway => match worker.models().as_slice() {
+                [card] => {
+                    let model: String =
+                        url::form_urlencoded::byte_serialize(card.id.as_bytes()).collect();
+                    format!("{base}/loads?model={model}")
+                }
+                _ => format!("{base}/loads"),
+            },
+        }
+    }
+}
+
+/// What a worker's probes have established about its native load routes.
+///
+/// Absence is tracked per route, not per worker: a 404 on one route is a
+/// fact that outlives a timeout on the other. Collapsing the two into a
+/// single "answered nothing" flag would discard the 404 whenever the other
+/// route was merely inconclusive, and the dead route would be re-asked on
+/// every tick forever.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NativeLoadsMemo {
+    answered: Option<NativeLoadsPath>,
+    absent: [bool; NativeLoadsPath::DISCOVERY.len()],
+}
+
+impl NativeLoadsMemo {
+    /// Routes worth probing this tick, in discovery order: the route that
+    /// answered last if there is one, else everything not known absent.
+    fn candidates(self) -> impl Iterator<Item = NativeLoadsPath> {
+        NativeLoadsPath::DISCOVERY
+            .into_iter()
+            .filter(move |&path| match self.answered {
+                Some(answered) => path == answered,
+                None => !self.absent[path.index()],
+            })
+    }
+
+    fn record_answered(&mut self, path: NativeLoadsPath) {
+        self.answered = Some(path);
+        self.absent[path.index()] = false;
+    }
+
+    fn record_absent(&mut self, path: NativeLoadsPath) {
+        self.absent[path.index()] = true;
+        if self.answered == Some(path) {
+            self.answered = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn answered(self) -> Option<NativeLoadsPath> {
+        self.answered
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_absent(self, path: NativeLoadsPath) -> bool {
+        self.absent[path.index()]
+    }
+}
+
 /// Load monitoring service that subscribes to `WorkerRegistry` events.
 pub struct WorkerMonitor {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     pub worker_load_manager: Arc<WorkerLoadManager>,
-    client: reqwest::Client,
     default_interval: Duration,
-    /// When set, poll loads and re-export `smg_engine_*` gauges even if no
-    /// load-aware routing policy is active (`--engine-metrics`).
+    /// When set, force load polling even if no load-aware routing policy is
+    /// active (`--engine-metrics`). Every successful poll is re-exported.
     engine_metrics: bool,
-    load_tx: watch::Sender<HashMap<String, WorkerLoadResponse>>,
-    load_rx: watch::Receiver<HashMap<String, WorkerLoadResponse>>,
+    /// `--disable-load-monitoring`: restore the conditional poll gate (a
+    /// load-aware/dp-rank policy, engine metrics, or overload protection on a
+    /// group member still forces the poll) instead of polling every group
+    /// unconditionally from registration onward.
+    conditional_polling: bool,
+    /// Shared immutable load snapshots: group ticks and the eviction flusher
+    /// publish here; routing readers grab `Arc` snapshots.
+    load_state: Arc<LoadState>,
+    /// What each worker's probes established about its native load routes,
+    /// so discovery is not repeated every tick. A worker whose routes are
+    /// all absent is served from `/metrics`. Cleared by
+    /// [`Self::evict_worker_loads`], which also runs on `Replaced` — an
+    /// in-place image upgrade that adds or removes an endpoint is
+    /// re-discovered.
+    native_loads_memo: Arc<DashMap<String, NativeLoadsMemo>>,
     group_handles: Mutex<HashMap<WorkerGroupKey, GroupState>>,
     event_task: Mutex<Option<JoinHandle<()>>>,
+    eviction_flush_task: Mutex<Option<JoinHandle<()>>>,
 }
+
+/// Debounce window for batching worker evictions into one snapshot rebuild.
+/// Registry churn (a rollout, a scale-down) emits removals as a gradual
+/// stream; waiting a beat lets the whole wave land in a single publish while
+/// staying far below the polling cadence that refreshes live entries.
+const EVICTION_DEBOUNCE: Duration = Duration::from_millis(20);
 
 impl Debug for WorkerMonitor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -236,31 +362,40 @@ impl WorkerMonitor {
     pub fn new(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        client: reqwest::Client,
         default_interval_secs: u64,
         engine_metrics: bool,
+        conditional_polling: bool,
     ) -> Self {
-        let (load_tx, load_rx) = watch::channel(HashMap::new());
+        let load_state = Arc::new(LoadState::new(Arc::clone(&worker_registry)));
         Self {
             worker_registry,
             policy_registry,
             worker_load_manager: Arc::new(WorkerLoadManager::new()),
-            client,
             default_interval: Duration::from_secs(default_interval_secs.max(1)),
             engine_metrics,
-            load_tx,
-            load_rx,
+            conditional_polling,
+            load_state,
+            native_loads_memo: Arc::new(DashMap::new()),
             group_handles: Mutex::new(HashMap::new()),
             event_task: Mutex::new(None),
+            eviction_flush_task: Mutex::new(None),
         }
     }
 
-    /// Subscribe to the snapshot of per-worker loads.
+    /// The current published load snapshot — what routing is acting on, and
+    /// what `GET /loads` serves.
+    pub(crate) fn load_snapshot(&self) -> Arc<LoadSnapshot> {
+        self.load_state.snapshot()
+    }
+
+    /// Subscribe to the shared per-worker load snapshots.
     ///
-    /// The watch receiver returns the most recent fully merged map;
-    /// stale entries are pruned on each tick of the relevant group.
-    pub fn subscribe(&self) -> watch::Receiver<HashMap<String, WorkerLoadResponse>> {
-        self.load_rx.clone()
+    /// Each received value is an immutable `Arc<LoadSnapshot>`: clone the
+    /// `Arc` out of `borrow()` and scan without holding the watch guard.
+    /// Stale entries are pruned on each tick of the relevant group and by
+    /// the batched eviction flusher.
+    pub(crate) fn subscribe(&self) -> LoadReceiver {
+        self.load_state.subscribe()
     }
 
     /// Subscribe to registry events, run a synchronous bootstrap
@@ -298,6 +433,21 @@ impl WorkerMonitor {
         });
 
         *self.event_task.lock() = Some(handle);
+
+        // The debounced eviction flusher: holds the load state strongly (it
+        // is cheap and monitor-independent) and the monitor weakly, for the
+        // same cycle-breaking reason as the event loop.
+        let load_state = Arc::clone(&self.load_state);
+        let monitor = Arc::downgrade(self);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "eviction flusher runs for the monitor's lifetime; the JoinHandle is stored on the monitor and aborted in Drop"
+        )]
+        let flush_handle = tokio::spawn(async move {
+            eviction_flush_loop(load_state, monitor).await;
+        });
+
+        *self.eviction_flush_task.lock() = Some(flush_handle);
     }
 
     /// Stop every per-group polling loop and clear the shared load
@@ -322,12 +472,30 @@ impl WorkerMonitor {
             }
         }
 
-        // Always clear both caches. Skipping when `drained.is_empty()`
+        // Always clear every cache. Skipping when `drained.is_empty()`
         // would leave stale per-rank loads behind for any caller that
         // seeded the cache without going through a group loop, and
         // makes the function harder to reason about as a "reset".
-        self.load_tx.send_modify(|map| map.clear());
+        //
+        // The probe memo is dropped with the rest rather than retained
+        // per live URL: workers removed during the lag window would
+        // otherwise leak entries, and the cost is one re-probe per
+        // worker on a path that only runs on lag recovery.
+        self.load_state.clear();
         self.worker_load_manager.clear();
+        self.native_loads_memo.clear();
+        // The feed that would clear the vetoes is being torn down: fail open,
+        // but say so — a wiped gauge is otherwise indistinguishable from a
+        // genuine recovery. With no thresholds anywhere no flag was ever
+        // written, so this clears nothing and stays silent.
+        let cleared = self.worker_registry.clear_all_overload_flags();
+        if cleared > 0 {
+            warn!(
+                vetoes_cleared = cleared,
+                "Overload vetoes cleared with the load feed; every worker is routable again \
+                 until its next poll"
+            );
+        }
     }
 
     /// Recompute the polling state for every currently-known group.
@@ -421,24 +589,34 @@ impl WorkerMonitor {
         }
     }
 
-    /// Evict a single worker's cached loads from both the watch
-    /// channel snapshot and the DP cache. Used by the event loop on
+    /// Evict a single worker's cached loads. Used by the event loop on
     /// `Removed`, `Replaced`, and `StatusChanged` away from `Ready`.
     ///
-    /// Also sentinels the worker's `smg_engine_*` series when engine-metrics
-    /// re-export is on, since metrics-rs cannot delete series.
+    /// The overload flag, DP cache, and probe memo are cleared synchronously;
+    /// the shared snapshot removal is queued so a removal wave costs one
+    /// batched rebuild instead of one per worker (see
+    /// [`Self::flush_pending_evictions`]).
     fn evict_worker_loads(&self, worker: &Arc<dyn Worker>) {
         let url = worker.url();
-        self.load_tx.send_modify(|map| {
-            map.remove(url);
-        });
+        // No load feed, no verdict: a flag left set would strand the worker
+        // out of routing with nothing to ever clear it.
+        self.worker_registry.set_worker_overloaded(worker, false);
         self.worker_load_manager.remove_worker(url);
-        if self.engine_metrics {
+        self.native_loads_memo.remove(url);
+        self.load_state.enqueue_eviction(Arc::clone(worker));
+    }
+
+    /// Apply every queued eviction in one snapshot rebuild, and sentinel the
+    /// `smg_engine_*` series of workers whose own entry was removed —
+    /// metrics-rs cannot delete series. A same-URL replacement that already
+    /// republished keeps its entry, and its series continues uninterrupted.
+    pub(crate) fn flush_pending_evictions(&self) {
+        for worker in self.load_state.apply_pending_evictions() {
             // A worker can serve multiple models (one load group per model),
             // so sentinel every model's series — not just the primary.
             let dp_size = worker.dp_size().unwrap_or(1);
-            for model_id in WorkerRegistry::worker_model_ids(worker) {
-                Metrics::remove_engine_load_metrics(url, &model_id, dp_size);
+            for model_id in WorkerRegistry::worker_model_ids(&worker) {
+                Metrics::remove_engine_load_metrics(worker.url(), &model_id, dp_size);
             }
         }
     }
@@ -465,60 +643,111 @@ impl WorkerMonitor {
         handles.insert(key, GroupState { handle, interval });
     }
 
-    /// Fetch load over HTTP, dispatching on the worker's runtime type.
+    /// Fetch load over HTTP, preferring a native load endpoint over the
+    /// runtime's Prometheus gauges.
     ///
-    /// Each engine exposes load differently, so there is no single portable
-    /// endpoint. Every backend is normalized into a single-rank [`WorkerLoadResponse`] whose
-    /// `token_usage` field drives the load-aware policies. Returns `None` on
-    /// failure so the caller records the load as unavailable (`-1`).
+    /// The native schema reports the same scheduler state the `/metrics` arms
+    /// reconstruct from gauges, in two orders of magnitude fewer bytes, and
+    /// carries fields — queued tokens, generation throughput, the disagg
+    /// section — that no gauge exposes. Preferring it is both cheaper and
+    /// more informative wherever it exists.
+    ///
+    /// Two routes serve that schema: `/loads` on an SMG gateway registered as
+    /// a worker, and `/v1/loads` on an engine. Which one a worker answered on
+    /// is memoized, so the extra attempt costs one 404 per worker, once.
+    ///
+    /// Every backend is normalized into a single-rank [`WorkerLoadResponse`]
+    /// whose `token_usage` field drives the load-aware policies. Returns
+    /// `None` on failure so the caller records the load as unavailable (`-1`).
+    ///
+    /// `native_loads_memo` is the shared probe memo, or `None` for callers
+    /// with no monitor to borrow it from (they simply always discover).
     pub(crate) async fn fetch_http_load(
-        client: &reqwest::Client,
         worker: &Arc<dyn Worker>,
+        native_loads_memo: Option<&DashMap<String, NativeLoadsMemo>>,
     ) -> Option<WorkerLoadResponse> {
+        // Only workers already `Ready` are polled, so a definitive "no such
+        // endpoint" cannot be a warm-up artifact and is safe to memoize.
+        let known = native_loads_memo
+            .and_then(|store| store.get(worker.url()).map(|hit| *hit))
+            .unwrap_or_default();
+        let mut memo = known;
+
+        let mut response = None;
+        for path in known.candidates() {
+            match Self::probe_native_loads(worker, path).await {
+                NativeLoads::Available(load) => {
+                    memo.record_answered(path);
+                    response = Some(load);
+                    break;
+                }
+                NativeLoads::Absent => memo.record_absent(path),
+                NativeLoads::Inconclusive => {}
+            }
+        }
+        // Write back only what a probe actually settled, so a tick that
+        // learned nothing leaves the memo alone and retries next time.
+        if let Some(store) = native_loads_memo {
+            if memo != known {
+                store.insert(worker.url().to_string(), memo);
+            }
+        }
+        if response.is_some() {
+            return response;
+        }
+
         match worker.metadata().spec.runtime_type {
-            RuntimeType::Vllm => Self::fetch_http_load_vllm(client, worker).await,
-            RuntimeType::Sglang => Self::fetch_http_load_sglang(client, worker).await,
-            // Unspecified / custom engines that do serve `/v1/loads`, plus
-            // the mock worker used in tests.
-            _ => Self::fetch_http_load_native(client, worker).await,
+            RuntimeType::Vllm => Self::fetch_http_load_vllm(worker).await,
+            RuntimeType::Sglang => Self::fetch_http_load_sglang(worker).await,
+            // Custom engines expose no gauge schema we can parse; the native
+            // routes above were their only path.
+            _ => None,
         }
     }
 
-    /// Legacy path: `GET /v1/loads?include=core,disagg,queues,memory`.
-    /// Served by SGLang custom builds and the mock worker.
+    /// Probe one native load route.
     ///
-    /// Extra sections beyond `core` degrade gracefully: engines that do not
-    /// report them simply omit the fields, which deserialize to `None`.
-    ///
-    /// Returns `None` on transport failure, non-success status, JSON parse
-    /// failure, or an empty `loads` array.
-    async fn fetch_http_load_native(
-        client: &reqwest::Client,
-        worker: &Arc<dyn Worker>,
-    ) -> Option<WorkerLoadResponse> {
-        let url = format!(
-            "{}/v1/loads?include=core,disagg,queues,memory",
-            worker.url()
-        );
-        let resp = Self::authed_get(client, worker, &url).await?;
-        let response: WorkerLoadResponse = resp.json().await.ok()?;
-        (!response.loads.is_empty()).then_some(response)
+    /// Distinguishing [`NativeLoads::Absent`] from [`NativeLoads::Inconclusive`]
+    /// is what makes the memo safe. Collapsing both into "unsupported" would
+    /// let one timeout demote a healthy backend to the expensive `/metrics`
+    /// path permanently.
+    async fn probe_native_loads(worker: &Arc<dyn Worker>, path: NativeLoadsPath) -> NativeLoads {
+        let url = path.probe_url(worker);
+        let resp = match Self::authed_request(worker, &url).send().await {
+            Ok(resp) => resp,
+            // Transport error or timeout: says nothing about the route.
+            Err(_) => return NativeLoads::Inconclusive,
+        };
+
+        let status = resp.status();
+        if matches!(
+            status,
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+        ) {
+            return NativeLoads::Absent;
+        }
+        if !status.is_success() {
+            // 5xx and auth failures are conditions, not routing facts.
+            return NativeLoads::Inconclusive;
+        }
+
+        match resp.json::<WorkerLoadResponse>().await {
+            Ok(response) if !response.loads.is_empty() => NativeLoads::Available(response),
+            // Our schema, no ranks reported yet — keep probing.
+            Ok(_) => NativeLoads::Inconclusive,
+            // A 200 that is not a load response means something else is
+            // mounted here; that is as definitive as a 404.
+            Err(_) => NativeLoads::Absent,
+        }
     }
 
     /// vLLM HTTP: derive load from the Prometheus `/metrics` endpoint.
     /// The KV-cache usage ratio (0.0–1.0) maps onto `token_usage`; it is
     /// exposed as `vllm:gpu_cache_usage_perc` in vLLM v0 and renamed to
     /// `vllm:kv_cache_usage_perc` in vLLM v1, so accept either.
-    async fn fetch_http_load_vllm(
-        client: &reqwest::Client,
-        worker: &Arc<dyn Worker>,
-    ) -> Option<WorkerLoadResponse> {
+    async fn fetch_http_load_vllm(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
         let url = format!("{}/metrics", worker.url());
-        let body = Self::authed_get(client, worker, &url)
-            .await?
-            .text()
-            .await
-            .ok()?;
+        let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
         let m = PromScrape::parse(&body);
 
         // Require the KV-usage gauge: it is the signal load-aware routing acts
@@ -542,20 +771,9 @@ impl WorkerMonitor {
     /// KV-usage ratio (0.0–1.0) is `<prefix>token_usage`, where SGLang used
     /// the `sglang:` metric prefix through v0.5.3 and switched to `sglang_`
     /// in v0.5.4+, so detect whichever is present and use it throughout.
-    async fn fetch_http_load_sglang(
-        client: &reqwest::Client,
-        worker: &Arc<dyn Worker>,
-    ) -> Option<WorkerLoadResponse> {
-        if let Some(resp) = Self::fetch_http_load_native(client, worker).await {
-            return Some(resp);
-        }
-
+    async fn fetch_http_load_sglang(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
         let url = format!("{}/metrics", worker.url());
-        let body = Self::authed_get(client, worker, &url)
-            .await?
-            .text()
-            .await
-            .ok()?;
+        let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
         let m = PromScrape::parse(&body);
 
         // Require the KV-usage gauge — the load signal routing acts on.
@@ -576,18 +794,19 @@ impl WorkerMonitor {
         }))
     }
 
+    /// Shared authenticated GET builder with the standard timeout.
+    fn authed_request(worker: &Arc<dyn Worker>, url: &str) -> reqwest::RequestBuilder {
+        let req = worker.http_client().get(url).timeout(REQUEST_TIMEOUT);
+        match worker.api_key() {
+            Some(key) => req.bearer_auth(key),
+            None => req,
+        }
+    }
+
     /// Shared authenticated GET with the standard timeout. Returns `None` on
     /// transport error or non-success status.
-    async fn authed_get(
-        client: &reqwest::Client,
-        worker: &Arc<dyn Worker>,
-        url: &str,
-    ) -> Option<reqwest::Response> {
-        let mut req = client.get(url).timeout(REQUEST_TIMEOUT);
-        if let Some(key) = worker.api_key() {
-            req = req.bearer_auth(key);
-        }
-        match req.send().await {
+    async fn authed_get(worker: &Arc<dyn Worker>, url: &str) -> Option<reqwest::Response> {
+        match Self::authed_request(worker, url).send().await {
             Ok(r) if r.status().is_success() => Some(r),
             _ => None,
         }
@@ -600,8 +819,7 @@ impl WorkerMonitor {
     /// Such a snapshot carries the KV-usage ratio (`token_usage`) but no
     /// absolute token counts (`max_total_num_tokens`/`num_used_tokens` stay
     /// `0`), so `WorkerLoadResponse::has_absolute_token_data` reports `false`
-    /// for it — keeping it out of the DP-rank cache and the `/get_loads`
-    /// absolute-token scalar.
+    /// for it — keeping it out of the DP-rank cache.
     fn single_rank(snapshot: SchedulerLoadSnapshot) -> WorkerLoadResponse {
         WorkerLoadResponse {
             dp_rank_count: 1,
@@ -642,9 +860,32 @@ impl Drop for WorkerMonitor {
         if let Some(handle) = self.event_task.get_mut().take() {
             handle.abort();
         }
+        if let Some(handle) = self.eviction_flush_task.get_mut().take() {
+            handle.abort();
+        }
         for (_, state) in self.group_handles.get_mut().drain() {
             state.handle.abort();
         }
+    }
+}
+
+/// Debounced eviction flusher: waits for the first queued eviction, lets a
+/// gradual removal stream accumulate for [`EVICTION_DEBOUNCE`], then applies
+/// the whole backlog in one snapshot rebuild.
+///
+/// Holds the monitor weakly (same cycle-breaking rationale as the other
+/// loops); holding the `LoadState` strongly is fine — it owns no task
+/// handles back into the monitor.
+async fn eviction_flush_loop(load_state: Arc<LoadState>, monitor: Weak<WorkerMonitor>) {
+    loop {
+        load_state.eviction_wakeup().await;
+        tokio::time::sleep(EVICTION_DEBOUNCE).await;
+        let Some(monitor) = monitor.upgrade() else {
+            debug!("WorkerMonitor was dropped; exiting eviction flush loop");
+            return;
+        };
+        monitor.flush_pending_evictions();
+        drop(monitor);
     }
 }
 
@@ -739,10 +980,7 @@ async fn run_event_loop(
                 }
             }
             Ok(WorkerEvent::StatusChanged {
-                worker,
-                new_status,
-                old_status: _,
-                ..
+                worker, new_status, ..
             }) => {
                 if new_status != WorkerStatus::Ready {
                     monitor.evict_worker_loads(&worker);
@@ -790,17 +1028,6 @@ async fn group_monitor_loop(
             return;
         };
 
-        // Poll when a load-aware policy needs the data OR engine-metrics
-        // re-export is on; the latter decouples observability from routing.
-        let load_aware_policies = monitor.policy_registry.get_all_load_aware_policies();
-        let routing_needs_load = !load_aware_policies.is_empty()
-            || monitor.policy_registry.get_dp_rank_policy().is_some();
-        if !routing_needs_load && !monitor.engine_metrics {
-            debug!("No load-aware policies and engine metrics off, skipping load fetch for group {group_key}");
-            drop(monitor);
-            continue;
-        }
-
         // Only poll Ready workers — Pending/NotReady/Failed do not
         // serve traffic and should not contribute load samples.
         let workers: Vec<Arc<dyn Worker>> = monitor
@@ -822,22 +1049,39 @@ async fn group_monitor_loop(
             continue;
         }
 
+        // Polling is unconditional by default so registration alone gives a
+        // worker live load state. `--disable-load-monitoring` restores the
+        // conditional gate: a load-aware policy, engine-metrics re-export, or
+        // overload protection on any group member still forces the poll —
+        // never "never poll".
+        let load_aware_policies = monitor.policy_registry.get_all_load_aware_policies();
+        if monitor.conditional_polling {
+            let routing_needs_load = !load_aware_policies.is_empty()
+                || monitor.policy_registry.get_dp_rank_policy().is_some();
+            let overload_needs_load = workers.iter().any(|w| w.metadata().overload.is_enabled());
+            if !routing_needs_load && !monitor.engine_metrics && !overload_needs_load {
+                debug!("Load monitoring disabled and nothing needs the data, skipping load fetch for group {group_key}");
+                drop(monitor);
+                continue;
+            }
+        }
+
         let futures: Vec<_> = workers
             .iter()
             .map(|worker| {
-                let client = monitor.client.clone();
+                let native_loads_memo = Arc::clone(&monitor.native_loads_memo);
                 let worker = Arc::clone(worker);
                 let connection_mode = group_key.connection_mode;
                 async move {
                     let response = match connection_mode {
                         ConnectionMode::Http => {
-                            WorkerMonitor::fetch_http_load(&client, &worker).await
+                            WorkerMonitor::fetch_http_load(&worker, Some(&native_loads_memo)).await
                         }
                         ConnectionMode::Grpc | ConnectionMode::Zmq => {
                             WorkerMonitor::fetch_backend_load(&worker).await
                         }
                     };
-                    (worker.url().to_string(), response)
+                    (worker, response)
                 }
             })
             .collect();
@@ -847,13 +1091,31 @@ async fn group_monitor_loop(
         let mut group_loads: HashMap<String, WorkerLoadResponse> = HashMap::new();
         let mut group_dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
         let mut dp_evict: Vec<String> = Vec::new();
-        for (url, response) in results {
+        for (worker, response) in results {
+            let url = worker.url().to_string();
+            // The overload predicate runs exactly here, once per report, never
+            // on a request path, against the worker's effective thresholds
+            // (resolved at registration). A failed fetch means no fresh
+            // signal, which clears the flag — absent means no opinion.
+            let overload = worker.metadata().overload;
+            if overload.is_enabled() {
+                let verdict = response
+                    .as_ref()
+                    .is_some_and(|load| overload.is_overloaded(load));
+                monitor
+                    .worker_registry
+                    .set_worker_overloaded(&worker, verdict);
+            }
             if let Some(load) = response {
                 // Only feed the DP-rank cache from responses that carry real
                 // absolute per-rank token counts. Ratio-only snapshots,
                 // which would otherwise poison with a fake `{0: 0}`
                 // entry and collapse DP routing onto rank 0.
-                if load.has_absolute_token_data() {
+                //
+                // A fleet rollup from a gateway worker is keyed by downstream
+                // worker, not by rank, so its repeated `dp_rank: 0` entries
+                // would overwrite each other down to a single bogus rank.
+                if load.has_absolute_token_data() && load.ranks_are_dp_ranks() {
                     group_dp_loads.insert(url.clone(), load.dp_rank_loads());
                 } else {
                     dp_evict.push(url.clone());
@@ -871,11 +1133,9 @@ async fn group_monitor_loop(
 
         if group_loads.is_empty() {
             debug!("No loads fetched for group {group_key}, pruning stale entries");
-            monitor.load_tx.send_modify(|map| {
-                for url in &all_group_urls {
-                    map.remove(url);
-                }
-            });
+            monitor
+                .load_state
+                .publish_group(&all_group_urls, Vec::new());
             // The DP cache deliberately keeps last-known-good entries
             // so routing decisions still have a hint to fall back to
             // when the upstream is briefly unreachable.
@@ -898,24 +1158,32 @@ async fn group_monitor_loop(
             monitor.worker_load_manager.remove_workers(&dp_evict);
         }
 
-        // Re-export the freshly fetched loads as `smg_engine_*` gauges. Reuses
-        // this poll's data; no extra fetch. Model label comes from the group.
-        if monitor.engine_metrics {
-            for (url, load) in &group_loads {
-                Metrics::record_engine_load(url, &group_key.model_id, load);
-            }
+        // Every successful load poll is also the canonical observability
+        // sample. Load-aware policies already require this poll; the explicit
+        // engine-metrics option only forces polling when routing does not.
+        // Reusing the response avoids a second Engine RPC.
+        for (url, load) in &group_loads {
+            Metrics::record_engine_load(url, &group_key.model_id, load);
         }
 
-        // Atomically merge into the shared watch channel: clear stale
-        // entries for *this group's* URLs first, then insert the fresh
-        // loads. Workers that failed this tick get their stale entries
-        // pruned along with the rest.
-        monitor.load_tx.send_modify(|map| {
-            for url in &all_group_urls {
-                map.remove(url);
-            }
-            map.extend(group_loads);
-        });
+        // Merge into the shared snapshot in one rebuild: clear stale entries
+        // for *this group's* URLs first, then insert the fresh loads — each
+        // paired with the worker that produced it so the incarnation fence
+        // can drop reports that raced a removal or replacement. Workers that
+        // failed this tick get their stale entries pruned along with the
+        // rest. The responses move (no deep clones): the policy push and the
+        // metrics pass above already took their references.
+        let worker_by_url: HashMap<&str, &Arc<dyn Worker>> =
+            workers.iter().map(|w| (w.url(), w)).collect();
+        let fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)> = group_loads
+            .into_iter()
+            .filter_map(|(url, load)| {
+                worker_by_url
+                    .get(url.as_str())
+                    .map(|worker| (Arc::clone(worker), Arc::new(load)))
+            })
+            .collect();
+        monitor.load_state.publish_group(&all_group_urls, fresh);
 
         // Drop the temporary strong reference so we do not keep the
         // monitor alive across the next `interval_timer.tick().await`.
@@ -1030,8 +1298,8 @@ mod worker_monitor_tests {
         let monitor = Arc::new(WorkerMonitor::new(
             registry.clone(),
             policy_registry,
-            reqwest::Client::new(),
             5,
+            false,
             false,
         ));
         (registry, monitor)
@@ -1108,12 +1376,17 @@ mod worker_monitor_tests {
         let (registry, monitor) = build_monitor();
         let worker = ready_worker("http://w:8080", "llama-3");
         let url = worker.url().to_string();
-        let id = registry.register(worker).unwrap();
+        let id = registry.register(Arc::clone(&worker)).unwrap();
         monitor.start_event_loop();
 
-        monitor.load_tx.send_modify(|map| {
-            map.insert(url.clone(), WorkerLoadResponse::default());
-        });
+        monitor.load_state.publish_group(
+            &[],
+            vec![(Arc::clone(&worker), Arc::new(WorkerLoadResponse::default()))],
+        );
+        assert!(monitor.load_state.snapshot().contains(&url));
+        monitor
+            .native_loads_memo
+            .insert(url.clone(), NativeLoadsMemo::default());
         let mut dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
         let mut inner = HashMap::new();
         inner.insert(0, 5);
@@ -1123,17 +1396,38 @@ mod worker_monitor_tests {
         registry.remove(&id);
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
+        // The event loop has queued the eviction; apply it deterministically
+        // instead of racing the debounced flusher.
+        monitor.flush_pending_evictions();
 
-        let snapshot = monitor.load_rx.borrow().clone();
+        let snapshot = monitor.load_state.snapshot();
         assert!(
-            !snapshot.contains_key(&url),
-            "load_tx must not retain entries for removed workers"
+            !snapshot.contains(&url),
+            "the load snapshot must not retain entries for removed workers"
         );
         let cached = monitor.worker_load_manager.dp_cached_loads.read();
         assert!(
             !cached.contains_key(&url),
             "DP cache must not retain entries for removed workers"
         );
+        assert!(
+            !monitor.native_loads_memo.contains_key(&url),
+            "probe memo must not retain entries for removed workers"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_all_groups_clears_native_probe_memo() {
+        // A worker removed during a `RecvError::Lagged` window never
+        // fires an eviction, so the reset path must drop the memo too.
+        let (_registry, monitor) = build_monitor();
+        monitor
+            .native_loads_memo
+            .insert("http://w1:8080".to_string(), NativeLoadsMemo::default());
+
+        monitor.stop_all_groups();
+
+        assert!(monitor.native_loads_memo.is_empty());
     }
 
     #[tokio::test]
@@ -1154,7 +1448,7 @@ mod worker_monitor_tests {
 
         monitor.stop_all_groups();
 
-        assert!(monitor.load_rx.borrow().is_empty());
+        assert!(monitor.load_state.snapshot().is_empty());
         assert!(monitor
             .worker_load_manager
             .dp_cached_loads
@@ -1167,13 +1461,15 @@ mod worker_monitor_tests {
         let (registry, monitor) = build_monitor();
         let worker = ready_worker("http://w:8080", "llama-3");
         let url = worker.url().to_string();
-        let id = registry.register(worker).unwrap();
+        let id = registry.register(Arc::clone(&worker)).unwrap();
         monitor.start_event_loop();
 
-        // Seed the watch channel + DP cache as if a poll had succeeded.
-        monitor.load_tx.send_modify(|map| {
-            map.insert(url.clone(), WorkerLoadResponse::default());
-        });
+        // Seed the load snapshot + DP cache as if a poll had succeeded.
+        monitor.load_state.publish_group(
+            &[],
+            vec![(Arc::clone(&worker), Arc::new(WorkerLoadResponse::default()))],
+        );
+        assert!(monitor.load_state.snapshot().contains(&url));
         let mut dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
         let mut inner = HashMap::new();
         inner.insert(0, 5);
@@ -1183,10 +1479,13 @@ mod worker_monitor_tests {
         registry.transition_status(&id, WorkerStatus::NotReady);
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
+        // The event loop has queued the eviction; apply it deterministically
+        // instead of racing the debounced flusher.
+        monitor.flush_pending_evictions();
 
-        // Watch channel entry pruned.
-        let snapshot = monitor.load_rx.borrow().clone();
-        assert!(!snapshot.contains_key(&url));
+        // Load snapshot entry pruned.
+        let snapshot = monitor.load_state.snapshot();
+        assert!(!snapshot.contains(&url));
 
         // DP cache entry pruned.
         let cached = monitor.worker_load_manager.dp_cached_loads.read();
@@ -1340,8 +1639,8 @@ sglang:utilization{model="llama"} 0.9
     #[test]
     fn metric_derived_snapshot_has_no_absolute_token_data() {
         // A ratio-only snapshot (from `/metrics`) must not be treated as
-        // carrying absolute token counts: it stays out of the DP cache and
-        // the `/get_loads` scalar, even at high KV usage.
+        // carrying absolute token counts: it stays out of the DP cache,
+        // even at high KV usage.
         let resp = WorkerMonitor::single_rank(SchedulerLoadSnapshot {
             token_usage: 0.75,
             num_running_reqs: 3,
@@ -1363,5 +1662,660 @@ sglang:utilization{model="llama"} 0.9
         });
         assert!(resp.has_absolute_token_data());
         assert_eq!(resp.total_used_tokens(), 1024);
+    }
+
+    #[test]
+    fn fleet_rollup_is_not_dp_ranks() {
+        // A gateway worker answers `/loads` with one entry per downstream
+        // worker, all at `dp_rank: 0`. Keying those by rank collapses them
+        // onto a single entry, so the DP cache must reject the response.
+        let fleet = WorkerLoadResponse {
+            dp_rank_count: 2,
+            loads: vec![
+                SchedulerLoadSnapshot {
+                    worker: Some("http://a:8000".to_string()),
+                    max_total_num_tokens: 8192,
+                    num_used_tokens: 1024,
+                    ..Default::default()
+                },
+                SchedulerLoadSnapshot {
+                    worker: Some("http://b:8000".to_string()),
+                    max_total_num_tokens: 8192,
+                    num_used_tokens: 4096,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(fleet.has_absolute_token_data());
+        assert!(!fleet.ranks_are_dp_ranks());
+        assert_eq!(fleet.dp_rank_loads().len(), 1);
+
+        // One engine's own ranks are distinct and stay eligible.
+        let engine = WorkerLoadResponse {
+            dp_rank_count: 2,
+            loads: vec![
+                SchedulerLoadSnapshot {
+                    dp_rank: 0,
+                    max_total_num_tokens: 8192,
+                    num_used_tokens: 1024,
+                    ..Default::default()
+                },
+                SchedulerLoadSnapshot {
+                    dp_rank: 1,
+                    max_total_num_tokens: 8192,
+                    num_used_tokens: 4096,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(engine.ranks_are_dp_ranks());
+        assert_eq!(engine.dp_rank_loads().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod native_loads_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, OverloadUpdate},
+    };
+
+    use super::*;
+    use crate::{
+        config::types::PolicyConfig,
+        worker::{BasicWorkerBuilder, ConnectionMode, WorkerType},
+    };
+
+    const VLLM_METRICS: &str = "vllm:num_requests_running{m=\"a\"} 7.0\n\
+         vllm:num_requests_waiting{m=\"a\"} 11.0\n\
+         vllm:kv_cache_usage_perc{m=\"a\"} 0.5\n";
+
+    /// Carries `num_waiting_uncached_tokens`, which the `/metrics` arm has no
+    /// gauge for — so its presence identifies which path answered.
+    const NATIVE_BODY: &str = r#"{"loads":[{"dp_rank":0,"num_running_reqs":3,
+        "num_waiting_reqs":4,"num_waiting_uncached_tokens":900,"token_usage":0.25}]}"#;
+
+    struct Stub {
+        url: String,
+        /// `/v1/loads` hits.
+        probes: Arc<AtomicUsize>,
+        /// `/loads` hits.
+        gateway_probes: Arc<AtomicUsize>,
+        /// Query string of the last `/loads` hit.
+        gateway_query: Arc<Mutex<Option<String>>>,
+    }
+
+    /// Loopback backend stub. Each native route answers with the status and
+    /// body it was given and counts its hits; `/metrics` always serves the
+    /// vLLM gauges.
+    async fn spawn_backend(
+        gateway: (StatusCode, &'static str),
+        engine: (StatusCode, &'static str),
+    ) -> Stub {
+        fn route(
+            hits: &Arc<AtomicUsize>,
+            query: &Arc<Mutex<Option<String>>>,
+            (status, body): (StatusCode, &'static str),
+        ) -> axum::routing::MethodRouter {
+            let counter = Arc::clone(hits);
+            let sink = Arc::clone(query);
+            axum::routing::get(
+                move |axum::extract::RawQuery(raw): axum::extract::RawQuery| {
+                    let counter = Arc::clone(&counter);
+                    let sink = Arc::clone(&sink);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        *sink.lock() = raw;
+                        (status, body)
+                    }
+                },
+            )
+        }
+
+        let probes = Arc::new(AtomicUsize::new(0));
+        let gateway_probes = Arc::new(AtomicUsize::new(0));
+        let gateway_query = Arc::new(Mutex::new(None));
+        let engine_query = Arc::new(Mutex::new(None));
+        let app = axum::Router::new()
+            .route("/loads", route(&gateway_probes, &gateway_query, gateway))
+            .route("/v1/loads", route(&probes, &engine_query, engine))
+            .route("/metrics", axum::routing::get(|| async { VLLM_METRICS }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub address");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("stub serve");
+        });
+
+        Stub {
+            url: format!("http://{addr}"),
+            probes,
+            gateway_probes,
+            gateway_query,
+        }
+    }
+
+    /// An engine: serves `/v1/loads`, 404s the gateway route.
+    async fn spawn_engine(status: StatusCode, body: &'static str) -> Stub {
+        spawn_backend((StatusCode::NOT_FOUND, ""), (status, body)).await
+    }
+
+    /// A gateway registered as a worker: serves `/loads` only.
+    async fn spawn_gateway(body: &'static str) -> Stub {
+        spawn_backend((StatusCode::OK, body), (StatusCode::NOT_FOUND, "")).await
+    }
+
+    fn vllm_worker(url: &str) -> Arc<dyn Worker> {
+        vllm_worker_with_overload(url, OverloadUpdate::default())
+    }
+
+    /// Worker carrying a per-worker overload block — protection for it is
+    /// enabled by the spec alone, with no gateway thresholds anywhere.
+    fn vllm_worker_with_overload(url: &str, overload: OverloadUpdate) -> Arc<dyn Worker> {
+        vllm_worker_built(url, "a", overload)
+    }
+
+    fn vllm_worker_with_model(url: &str, model: &str) -> Arc<dyn Worker> {
+        vllm_worker_built(url, model, OverloadUpdate::default())
+    }
+
+    fn vllm_worker_built(url: &str, model: &str, overload: OverloadUpdate) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .runtime_type(RuntimeType::Vllm)
+                .model(ModelCard::new(model))
+                .overload(overload)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    fn cache_aware_policy_config(overlap_decay: f32) -> PolicyConfig {
+        PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 4096,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            overlap_decay,
+            selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
+        }
+    }
+
+    fn monitor_with_policy(config: PolicyConfig) -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
+        monitor_with(config, false)
+    }
+
+    fn monitor_with(
+        config: PolicyConfig,
+        conditional_polling: bool,
+    ) -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
+        let registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(config));
+        let monitor = Arc::new(WorkerMonitor::new(
+            registry.clone(),
+            policy_registry,
+            1,
+            false,
+            conditional_polling,
+        ));
+        (registry, monitor)
+    }
+
+    /// Poll `condition` until it holds or the timeout expires. The group loop
+    /// writes the flag out of band, so there is nothing to await directly.
+    async fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
+    }
+
+    /// `NATIVE_BODY` reports 4 waiting requests, so a threshold of 4 vetoes and
+    /// a threshold of 5 does not — the ingestion path must latch the verdict on
+    /// the worker itself, under a policy (round-robin) that reads no loads at
+    /// all. The threshold rides the worker's spec block, so this also proves a
+    /// spec block alone enables protection with no gateway flags anywhere.
+    #[tokio::test]
+    async fn load_ingestion_flags_worker_over_waiting_threshold() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, false);
+        let worker = vllm_worker_with_overload(
+            &stub.url,
+            OverloadUpdate {
+                waiting_requests: Some(4),
+                token_usage: None,
+            },
+        );
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+
+        wait_until("worker to be flagged overloaded", || worker.is_overloaded()).await;
+        assert_eq!(registry.overloaded_worker_count("a"), 1);
+        assert!(
+            !worker.is_available(),
+            "an overloaded worker is not routable"
+        );
+    }
+
+    /// A worker with real queueing that stays under the threshold must keep
+    /// serving: the veto is absolute, not comparative.
+    #[tokio::test]
+    async fn busy_worker_under_threshold_stays_eligible() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, false);
+        let worker = vllm_worker_with_overload(
+            &stub.url,
+            OverloadUpdate {
+                waiting_requests: Some(5),
+                token_usage: None,
+            },
+        );
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+
+        // Wait for the feed to actually land, then assert the verdict.
+        let mut rx = monitor.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !rx.borrow().contains(&stub.url) {
+                rx.changed().await.expect("watch sender alive");
+            }
+        })
+        .await
+        .expect("load feed must reach the watch channel");
+
+        assert!(!worker.is_overloaded());
+        assert!(worker.is_available());
+        assert_eq!(registry.overloaded_worker_count("a"), 0);
+    }
+
+    /// Overload protection alone must open the poll gate even under
+    /// `--disable-load-monitoring`: without it the feature would silently
+    /// never engage under a load-blind policy.
+    #[tokio::test]
+    async fn overload_thresholds_alone_start_load_polling() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, true);
+        let worker = vllm_worker_with_overload(
+            &stub.url,
+            OverloadUpdate {
+                waiting_requests: None,
+                token_usage: Some(0.2),
+            },
+        );
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+
+        wait_until("the engine to be polled", || {
+            stub.probes.load(Ordering::SeqCst) > 0
+        })
+        .await;
+        wait_until("token usage 0.25 to trip the 0.2 ceiling", || {
+            worker.is_overloaded()
+        })
+        .await;
+    }
+
+    /// With protection off and no spec block the feature is off: an engine
+    /// reporting a load that would trip either signal must still leave the
+    /// flag, the counters and every routing verdict exactly where they were.
+    #[tokio::test]
+    async fn unconfigured_thresholds_never_write_the_flag() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        // cache_aware with overlap_decay on, so loads are polled and ingested
+        // for reasons unrelated to overload protection.
+        let (registry, monitor) = monitor_with(cache_aware_policy_config(1.0), false);
+        let worker = vllm_worker(&stub.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+
+        let mut rx = monitor.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !rx.borrow().contains(&stub.url) {
+                rx.changed().await.expect("watch sender alive");
+            }
+        })
+        .await
+        .expect("load feed must reach the watch channel");
+        // A second tick, so this is not just "the first poll had not landed".
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        assert!(!worker.is_overloaded());
+        assert!(worker.is_available());
+        assert_eq!(registry.overloaded_worker_count("a"), 0);
+    }
+
+    /// A worker whose feed goes away has no verdict at all, so it must be
+    /// re-admitted rather than stranded out of routing forever.
+    #[tokio::test]
+    async fn losing_the_load_feed_clears_the_veto() {
+        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, false);
+        // Never-registered address: every fetch fails, so the report is absent.
+        let worker = vllm_worker_with_overload(
+            "http://127.0.0.1:1",
+            OverloadUpdate {
+                waiting_requests: Some(1),
+                token_usage: None,
+            },
+        );
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        registry.set_worker_overloaded(&worker, true);
+        assert_eq!(registry.overloaded_worker_count("a"), 1);
+
+        monitor.start_event_loop();
+        wait_until("the absent feed to clear the veto", || {
+            !worker.is_overloaded()
+        })
+        .await;
+        assert_eq!(registry.overloaded_worker_count("a"), 0);
+    }
+
+    /// `stop_all_groups` tears down the only writer that could clear the flag,
+    /// so it must clear it itself — same rule the load snapshot follows.
+    #[tokio::test]
+    async fn stop_all_groups_clears_overload_flags() {
+        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, false);
+        let worker = vllm_worker_with_overload(
+            "http://127.0.0.1:1",
+            OverloadUpdate {
+                waiting_requests: Some(1),
+                token_usage: None,
+            },
+        );
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        registry.set_worker_overloaded(&worker, true);
+
+        monitor.stop_all_groups();
+
+        assert!(!worker.is_overloaded());
+        assert_eq!(registry.overloaded_worker_count("a"), 0);
+    }
+
+    /// A load-aware policy must still be fed with the opt-out set — the
+    /// conditional gate is "poll when needed", never "never poll".
+    #[tokio::test]
+    async fn pressure_configured_cache_aware_starts_load_polling() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let (registry, monitor) = monitor_with(cache_aware_policy_config(1.0), true);
+        let worker = vllm_worker(&stub.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(worker).unwrap();
+        monitor.start_event_loop();
+
+        let mut rx = monitor.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let waiting = rx
+                    .borrow()
+                    .get(&stub.url)
+                    .map(|load| load.total_waiting_uncached_tokens());
+                if let Some(waiting) = waiting {
+                    assert_eq!(waiting, 900);
+                    break;
+                }
+                rx.changed().await.expect("watch sender alive");
+            }
+        })
+        .await
+        .expect("cache_aware with overlap_decay must trigger load polling");
+    }
+
+    /// Load monitoring is on by default: a load-blind policy with no flags and
+    /// no spec blocks still gets its workers polled from registration onward.
+    #[tokio::test]
+    async fn load_blind_policy_polls_by_default() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let (registry, monitor) = monitor_with_policy(cache_aware_policy_config(0.0));
+        let worker = vllm_worker(&stub.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.start_event_loop();
+
+        wait_until("default-on monitoring to poll the engine", || {
+            stub.probes.load(Ordering::SeqCst) > 0
+        })
+        .await;
+        // Polling alone must not write the overload flag.
+        assert!(!worker.is_overloaded());
+    }
+
+    /// `--disable-load-monitoring` restores the old conditional gate: a
+    /// load-blind policy with nothing needing the data is never polled.
+    #[tokio::test]
+    async fn disable_load_monitoring_restores_the_conditional_gate() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, true);
+        let worker = vllm_worker(&stub.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(worker).unwrap();
+        monitor.start_event_loop();
+
+        // Covers the immediate first tick plus one full 1s interval.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 0);
+        assert!(monitor.load_state.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_loads_preferred_over_metrics_on_vllm() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let worker = vllm_worker(&stub.url);
+        let memo = DashMap::new();
+
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+            .await
+            .expect("load response");
+
+        // `/metrics` cannot report queued tokens; only the native path can.
+        assert_eq!(resp.loads[0].num_waiting_uncached_tokens, 900);
+        assert_eq!(resp.loads[0].num_running_reqs, 3);
+        assert_eq!(
+            memo.get(worker.url()).and_then(|hit| hit.answered()),
+            Some(NativeLoadsPath::Engine)
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_native_endpoint_falls_back_and_is_probed_once() {
+        let stub = spawn_engine(StatusCode::NOT_FOUND, "").await;
+        let worker = vllm_worker(&stub.url);
+        let memo = DashMap::new();
+
+        for _ in 0..3 {
+            let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+                .await
+                .expect("metrics fallback");
+            assert_eq!(resp.loads[0].num_running_reqs, 7);
+            assert_eq!(resp.loads[0].num_waiting_reqs, 11);
+        }
+
+        let hit = memo.get(worker.url()).map(|hit| *hit).expect("memo entry");
+        assert_eq!(hit.answered(), None);
+        assert!(hit.is_absent(NativeLoadsPath::Gateway));
+        assert!(hit.is_absent(NativeLoadsPath::Engine));
+        assert_eq!(
+            stub.probes.load(Ordering::SeqCst),
+            1,
+            "a 404 is definitive; the probe must not repeat every tick"
+        );
+        assert_eq!(stub.gateway_probes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_native_failure_is_not_memoized() {
+        // 503 says the backend is unwell, not that the route is missing.
+        // Memoizing it would demote a healthy engine to `/metrics` forever.
+        // The gateway route's 404 next to it is a fact, though, and tracking
+        // absence per route is what lets the dead one be dropped while the
+        // unwell one keeps being asked.
+        let stub = spawn_engine(StatusCode::SERVICE_UNAVAILABLE, "").await;
+        let worker = vllm_worker(&stub.url);
+        let memo = DashMap::new();
+
+        for _ in 0..3 {
+            WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+                .await
+                .expect("metrics fallback");
+        }
+
+        let hit = memo.get(worker.url()).map(|hit| *hit).expect("memo entry");
+        assert!(!hit.is_absent(NativeLoadsPath::Engine));
+        assert_eq!(hit.answered(), None);
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 3, "probe must retry");
+        assert_eq!(stub.gateway_probes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn non_load_body_on_200_is_treated_as_absent() {
+        let stub = spawn_engine(StatusCode::OK, "<html>nope</html>").await;
+        let worker = vllm_worker(&stub.url);
+        let memo = DashMap::new();
+
+        WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+            .await
+            .expect("metrics fallback");
+
+        let hit = memo.get(worker.url()).map(|hit| *hit).expect("memo entry");
+        assert!(hit.is_absent(NativeLoadsPath::Engine));
+    }
+
+    #[tokio::test]
+    async fn empty_loads_array_keeps_probing() {
+        // Our schema, no ranks yet — the endpoint exists, so keep asking.
+        let stub = spawn_engine(StatusCode::OK, r#"{"loads":[]}"#).await;
+        let worker = vllm_worker(&stub.url);
+        let memo = DashMap::new();
+
+        for _ in 0..2 {
+            WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+                .await
+                .expect("metrics fallback");
+        }
+
+        let hit = memo.get(worker.url()).map(|hit| *hit).expect("memo entry");
+        assert!(!hit.is_absent(NativeLoadsPath::Engine));
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 2);
+        assert_eq!(stub.gateway_probes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn absent_memo_is_bypassed_when_caller_has_none() {
+        let stub = spawn_engine(StatusCode::NOT_FOUND, "").await;
+        let worker = vllm_worker(&stub.url);
+
+        for _ in 0..2 {
+            WorkerMonitor::fetch_http_load(&worker, None)
+                .await
+                .expect("metrics fallback");
+        }
+
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn gateway_route_answers_and_is_memoized() {
+        // A gateway registered as a worker: `/loads` is the only route it
+        // has, and it must be tried before the engine one.
+        let stub = spawn_gateway(NATIVE_BODY).await;
+        let worker = vllm_worker(&stub.url);
+        let memo = DashMap::new();
+
+        for _ in 0..3 {
+            let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+                .await
+                .expect("load response");
+            assert_eq!(resp.loads[0].num_waiting_uncached_tokens, 900);
+        }
+
+        assert_eq!(
+            memo.get(worker.url()).and_then(|hit| hit.answered()),
+            Some(NativeLoadsPath::Gateway)
+        );
+        assert_eq!(stub.gateway_probes.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            stub.probes.load(Ordering::SeqCst),
+            0,
+            "the engine route must not be probed once the gateway one answers"
+        );
+    }
+
+    #[tokio::test]
+    async fn memoized_route_that_stops_answering_is_rediscovered() {
+        // An engine-only stub with the gateway route memoized: the stale
+        // memo must be dropped, not treated as "serves neither".
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let worker = vllm_worker(&stub.url);
+        let memo = DashMap::new();
+        let mut stale = NativeLoadsMemo::default();
+        stale.record_answered(NativeLoadsPath::Gateway);
+        memo.insert(worker.url().to_string(), stale);
+
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+            .await
+            .expect("metrics fallback");
+        assert_eq!(resp.loads[0].num_running_reqs, 7, "served by /metrics");
+        let hit = memo.get(worker.url()).map(|hit| *hit).expect("memo entry");
+        assert_eq!(hit.answered(), None, "a stale memo must be forgotten");
+
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+            .await
+            .expect("load response");
+        assert_eq!(resp.loads[0].num_running_reqs, 3, "served by /v1/loads");
+        assert_eq!(
+            memo.get(worker.url()).and_then(|hit| hit.answered()),
+            Some(NativeLoadsPath::Engine)
+        );
+        assert_eq!(
+            stub.gateway_probes.load(Ordering::SeqCst),
+            1,
+            "the route that 404'd must not be probed again"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_probe_is_scoped_to_the_worker_model() {
+        // A gateway fronts many models; the load of the one this worker was
+        // registered for is the only load that belongs to it.
+        let stub = spawn_gateway(NATIVE_BODY).await;
+        let worker = vllm_worker_with_model(&stub.url, "meta-llama/Llama-3.1-8B");
+
+        WorkerMonitor::fetch_http_load(&worker, None)
+            .await
+            .expect("load response");
+
+        assert_eq!(
+            stub.gateway_query.lock().clone(),
+            Some("model=meta-llama%2FLlama-3.1-8B".to_string())
+        );
     }
 }

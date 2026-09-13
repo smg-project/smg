@@ -15,7 +15,7 @@ use axum::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(feature = "axum")]
-use serde_json::{json, Value};
+use serde_json::json;
 
 use super::model_card::ModelCard;
 
@@ -686,6 +686,16 @@ pub struct WorkerSpec {
     /// Typically matches the backend engine's page size (e.g. 16 for SGLang).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_block_size: Option<usize>,
+    /// Explicit PD pairing protocol. A prefill and a decode with this set
+    /// pair only when the values are equal, and nothing derived about their
+    /// transport, engine version or KV layout is compared. The same value
+    /// can arrive as a `pairing_protocol` worker label, or from the engine
+    /// itself: the gRPC servicers report their `SMG_PAIRING_PROTOCOL`
+    /// environment in server info, so a deployment can inject it into the
+    /// engine container. Absent everywhere: the router derives the pairing
+    /// descriptor from the worker's discovered labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing_protocol: Option<String>,
 
     /// Per-worker health check overrides (partial — only `Some` fields override router defaults).
     #[serde(default, skip_serializing_if = "HealthCheckUpdate::is_empty")]
@@ -727,6 +737,12 @@ pub struct WorkerSpec {
     /// fixed, pre-agreed address rather than the derived one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zmq_handshake_address: Option<String>,
+
+    /// Per-worker absolute overload threshold overrides (partial — only `Some`
+    /// fields override gateway defaults). Either field set enables overload
+    /// protection for this worker even when the gateway leaves it off.
+    #[serde(default, skip_serializing_if = "OverloadUpdate::is_empty")]
+    pub overload: OverloadUpdate,
 }
 
 impl WorkerSpec {
@@ -752,6 +768,7 @@ impl WorkerSpec {
             kv_role: None,
             kv_engine_id: None,
             kv_block_size: None,
+            pairing_protocol: None,
             health: HealthCheckUpdate::default(),
             http_pool: HttpPoolConfig::default(),
             resilience: ResilienceUpdate::default(),
@@ -760,6 +777,7 @@ impl WorkerSpec {
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,
             zmq_handshake_address: None,
+            overload: OverloadUpdate::default(),
         }
     }
 }
@@ -855,6 +873,25 @@ pub struct WorkerInfo {
     /// Current load on the worker.
     pub load: usize,
 
+    /// Whether the router speaks HTTP/2 to the worker.
+    #[serde(default)]
+    pub http2: bool,
+
+    /// The effective PD pairing key of a prefill or decode worker: the
+    /// explicit `pairing_protocol`, else the descriptor derived from the
+    /// engine's labels (`runtime/transport/layout`; the engine version is
+    /// left out because it only counts under strict mode). Prefill and
+    /// decode workers pair only within one key. Absent on regular workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pd_pairing: Option<String>,
+
+    /// The worker's last polled engine load, as published by the load
+    /// monitor. `None` when load monitoring has produced nothing for this
+    /// worker yet. Unrelated to `load` above, which counts in-flight
+    /// requests the router has sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_load: Option<WorkerLoadResponse>,
+
     /// Job status for async operations (if available).
     pub job_status: Option<JobStatus>,
 }
@@ -869,6 +906,9 @@ impl WorkerInfo {
             is_healthy: false,
             status: Some(WorkerStatus::Pending),
             load: 0,
+            http2: false,
+            pd_pairing: None,
+            engine_load: None,
             job_status,
         }
     }
@@ -1004,19 +1044,23 @@ impl HealthCheckUpdate {
     }
 }
 
-/// Per-worker HTTP connection pool configuration.
+/// Per-worker HTTP connection configuration.
 /// All fields optional — `None` means "use router/global default".
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HttpPoolConfig {
-    /// Max idle connections per host (default: 8).
+    /// Max idle connections per host (default: 500).
     pub pool_max_idle_per_host: Option<usize>,
-    /// Idle connection timeout in seconds (default: 50).
+    /// Idle connection timeout in seconds (default: the router's
+    /// `upstream_pool_idle_timeout_secs`).
     pub pool_idle_timeout_secs: Option<u64>,
-    /// Request timeout in seconds (default: 30).
+    /// Request timeout in seconds (default: the router's `request_timeout_secs`).
     pub timeout_secs: Option<u64>,
     /// Connect timeout in seconds (default: 10).
     pub connect_timeout_secs: Option<u64>,
+    /// Speak HTTP/2 to this worker via prior knowledge (h2c). `None` lets the
+    /// router negotiate per worker when `upstream_http2` is set.
+    pub http2: Option<bool>,
 }
 
 impl HttpPoolConfig {
@@ -1026,6 +1070,29 @@ impl HttpPoolConfig {
             && self.pool_idle_timeout_secs.is_none()
             && self.timeout_secs.is_none()
             && self.connect_timeout_secs.is_none()
+            && self.http2.is_none()
+    }
+}
+
+/// Per-worker absolute overload threshold overrides.
+/// All fields optional — `None` means "use gateway default". Either field set
+/// enables overload protection for this worker even when the gateway leaves
+/// it off. Mirrors `HealthCheckUpdate` pattern for PATCH-style config.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OverloadUpdate {
+    /// Queued (waiting) requests summed across DP ranks at or above which this
+    /// worker is considered overloaded. Must be `>= 1`.
+    pub waiting_requests: Option<usize>,
+    /// Mean KV-cache token usage across DP ranks at or above which this worker
+    /// is considered overloaded. Must be in `(0.0, 1.0]`.
+    pub token_usage: Option<f64>,
+}
+
+impl OverloadUpdate {
+    /// Returns `true` if all fields are `None` (no overrides specified).
+    pub fn is_empty(&self) -> bool {
+        self.waiting_requests.is_none() && self.token_usage.is_none()
     }
 }
 
@@ -1062,9 +1129,17 @@ pub struct ResilienceUpdate {
     pub disable_circuit_breaker: Option<bool>,
 
     // ── Retryable status codes ──
-    /// Custom retryable HTTP status codes.
-    /// When set, replaces the default set (408, 429, 500, 502, 503, 504).
+    /// HTTP status codes this worker counts as circuit-breaker failures.
+    /// When set, replaces the default set (408, 429, 500, 502, 503, 504)
+    /// verbatim - entries are not merged in. This does not gate retries:
+    /// whether a response is retried is a router-global rule, independent of
+    /// this set, so narrowing it cannot make a status non-retryable.
     pub retryable_status_codes: Option<Vec<u16>>,
+    /// Capacity-pushback HTTP status codes: still retryable on another
+    /// worker, but never counted as circuit-breaker failures (backpressure
+    /// is a routing signal, not a fault). When set, replaces the default
+    /// set (429).
+    pub capacity_status_codes: Option<Vec<u16>>,
 }
 
 impl ResilienceUpdate {
@@ -1082,6 +1157,7 @@ impl ResilienceUpdate {
             && self.cb_window_secs.is_none()
             && self.disable_circuit_breaker.is_none()
             && self.retryable_status_codes.is_none()
+            && self.capacity_status_codes.is_none()
     }
 }
 
@@ -1203,22 +1279,20 @@ pub struct StopProfileRequest {
     pub url: Option<String>,
 }
 
-/// Result from getting worker loads
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct WorkerLoadsResult {
-    pub loads: Vec<WorkerLoadInfo>,
-    pub total_workers: usize,
-    pub successful: usize,
-    pub failed: usize,
-}
-
 /// Per-DP-rank load snapshot from a backend.
 ///
 /// Contains core metrics from the sglang `/v1/loads` endpoint or `GetLoads` gRPC RPC.
 /// Each snapshot represents one data-parallel rank's scheduler state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SchedulerLoadSnapshot {
+    /// URL of the worker this rank belongs to. Set by a gateway serving a
+    /// fleet-wide `/loads`; engines reporting their own load leave it unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
+    /// `regular`, `prefill`, `decode`, or `encode`. Set alongside `worker`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_type: Option<String>,
     pub dp_rank: i32,
     pub num_running_reqs: i32,
     pub num_waiting_reqs: i32,
@@ -1234,6 +1308,10 @@ pub struct SchedulerLoadSnapshot {
     pub cache_hit_rate: f64,
     pub utilization: f64,
     pub max_running_requests: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<EngineMemoryMetricsSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queues: Option<EngineQueueMetricsSnapshot>,
     /// PD disaggregation signals, populated only when the backend reports a
     /// `disagg` section. `None` for HTTP or older engines. Canonical schema
     /// other engines map into; SGLang derives the queue depths from its
@@ -1251,13 +1329,78 @@ pub struct SchedulerLoadSnapshot {
     pub disagg_mode: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct EngineMemoryMetricsSnapshot {
+    pub weight_gb: f64,
+    pub kv_cache_gb: f64,
+    pub graph_gb: f64,
+    pub token_capacity: i32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct EngineQueueMetricsSnapshot {
+    pub waiting: i32,
+    pub grammar: i32,
+    pub paused: i32,
+    pub retracted: i32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct EngineAggregateMetricsSnapshot {
+    pub total_running_reqs: i32,
+    pub total_waiting_reqs: i32,
+    pub total_reqs: i32,
+    pub avg_token_usage: f64,
+    pub avg_throughput: f64,
+    pub avg_utilization: f64,
+}
+
+impl EngineAggregateMetricsSnapshot {
+    /// Roll per-rank snapshots up into one summary. Counts sum, ratios
+    /// average, rounded the way the engine servicers round so a gateway
+    /// aggregate and an engine aggregate read the same.
+    ///
+    /// Returns `None` for an empty slice: no ranks reported means no load
+    /// data, which must not read as an idle fleet.
+    pub fn from_ranks(loads: &[SchedulerLoadSnapshot]) -> Option<Self> {
+        if loads.is_empty() {
+            return None;
+        }
+        let n = loads.len() as f64;
+        let sum_i32 = |f: fn(&SchedulerLoadSnapshot) -> i32| {
+            loads.iter().map(f).fold(0i32, i32::saturating_add)
+        };
+        let avg = |f: fn(&SchedulerLoadSnapshot) -> f64, decimals: i32| {
+            let scale = 10f64.powi(decimals);
+            (loads.iter().map(f).sum::<f64>() / n * scale).round() / scale
+        };
+
+        let total_running_reqs = sum_i32(|l| l.num_running_reqs);
+        let total_waiting_reqs = sum_i32(|l| l.num_waiting_reqs);
+        Some(Self {
+            total_running_reqs,
+            total_waiting_reqs,
+            total_reqs: total_running_reqs.saturating_add(total_waiting_reqs),
+            avg_token_usage: avg(|l| l.token_usage, 4),
+            avg_throughput: avg(|l| l.gen_throughput, 2),
+            avg_utilization: avg(|l| l.utilization, 4),
+        })
+    }
+}
+
 /// Full load response for a single worker across all DP ranks.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct WorkerLoadResponse {
     pub timestamp: String,
+    pub version: String,
     pub dp_rank_count: i32,
     pub loads: Vec<SchedulerLoadSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<EngineAggregateMetricsSnapshot>,
 }
 
 impl WorkerLoadResponse {
@@ -1281,9 +1424,10 @@ impl WorkerLoadResponse {
     /// A running engine always reports its KV token capacity, so a positive
     /// `max_total_num_tokens` on any rank marks the absolute-token fields
     /// (`num_used_tokens`, `dp_rank_loads`, `total_used_tokens`) as
-    /// meaningful. Callers that need absolute tokens — the `/get_loads`
-    /// scalar and the DP-rank load cache — should gate on this so a
-    /// ratio-only snapshot is not read as "0 tokens used".
+    /// meaningful. Callers that need absolute tokens — the DP-rank load
+    /// cache — should gate on this so a ratio-only snapshot is not read as
+    /// "0 tokens used", and on [`Self::ranks_are_dp_ranks`] so a fleet
+    /// rollup is not read as one engine's ranks.
     pub fn has_absolute_token_data(&self) -> bool {
         self.loads.iter().any(|l| l.max_total_num_tokens > 0)
     }
@@ -1296,9 +1440,25 @@ impl WorkerLoadResponse {
             .sum()
     }
 
+    /// Total waiting (queued) requests summed across all DP ranks.
+    pub fn total_waiting_reqs(&self) -> i64 {
+        self.loads.iter().map(|l| l.num_waiting_reqs as i64).sum()
+    }
+
     /// Total generation throughput (tokens/s) summed across all DP ranks.
     pub fn total_gen_throughput(&self) -> f64 {
         self.loads.iter().map(|l| l.gen_throughput).sum()
+    }
+
+    /// Whether these ranks are one engine's DP ranks rather than a
+    /// gateway's fleet rollup, where every entry names its own `worker`.
+    ///
+    /// `dp_rank` is only unique within an engine, so a rollup repeats
+    /// `dp_rank: 0` once per non-DP worker. Callers that key by rank — the
+    /// DP-rank load cache — must gate on this, or one worker's entry
+    /// overwrites another's.
+    pub fn ranks_are_dp_ranks(&self) -> bool {
+        self.loads.iter().all(|l| l.worker.is_none())
     }
 
     pub fn dp_rank_loads(&self) -> HashMap<isize, isize> {
@@ -1308,17 +1468,6 @@ impl WorkerLoadResponse {
         }
         map
     }
-}
-
-/// Individual worker load information
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct WorkerLoadInfo {
-    pub worker: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker_type: Option<String>,
-    pub load: isize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<WorkerLoadResponse>,
 }
 
 #[cfg(feature = "axum")]
@@ -1386,24 +1535,6 @@ impl IntoResponse for ProfileResult {
         }
 
         (status, Json(body)).into_response()
-    }
-}
-
-#[cfg(feature = "axum")]
-impl IntoResponse for WorkerLoadsResult {
-    fn into_response(self) -> Response {
-        let loads: Vec<Value> = self
-            .loads
-            .iter()
-            .map(|info| {
-                let mut entry = json!({"worker": &info.worker, "load": info.load});
-                if let Some(ref details) = info.details {
-                    entry["details"] = json!(details);
-                }
-                entry
-            })
-            .collect();
-        Json(json!({"workers": loads})).into_response()
     }
 }
 
@@ -1571,5 +1702,131 @@ mod health_check_drain_settle_tests {
         }"#;
         let cfg: HealthCheckConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.drain_settle_secs, 5);
+    }
+}
+
+#[cfg(test)]
+mod overload_update_tests {
+    use serde_json::json;
+
+    use super::{OverloadUpdate, WorkerSpec};
+
+    #[test]
+    fn spec_without_block_deserializes_empty_and_is_not_serialized() {
+        // Existing serialized specs carry no `overload` key; they must keep
+        // deserializing, and an empty block must not appear on output.
+        let spec: WorkerSpec = serde_json::from_value(json!({"url": "http://w:1"})).unwrap();
+        assert!(spec.overload.is_empty());
+
+        let out = serde_json::to_value(&spec).unwrap();
+        assert!(out.get("overload").is_none());
+    }
+
+    #[test]
+    fn overload_block_round_trips_per_field() {
+        let spec: WorkerSpec = serde_json::from_value(json!({
+            "url": "http://w:1",
+            "overload": {"waiting_requests": 8, "token_usage": 0.85},
+        }))
+        .unwrap();
+        assert_eq!(spec.overload.waiting_requests, Some(8));
+        assert_eq!(spec.overload.token_usage, Some(0.85));
+
+        let out = serde_json::to_value(&spec).unwrap();
+        assert_eq!(out["overload"]["waiting_requests"], 8);
+        assert_eq!(out["overload"]["token_usage"], 0.85);
+
+        // A one-field block leaves the other signal unset, not defaulted.
+        let partial: WorkerSpec = serde_json::from_value(json!({
+            "url": "http://w:1",
+            "overload": {"token_usage": 0.9},
+        }))
+        .unwrap();
+        assert_eq!(partial.overload.waiting_requests, None);
+        assert_eq!(partial.overload.token_usage, Some(0.9));
+        assert!(!partial.overload.is_empty());
+    }
+
+    #[test]
+    fn is_empty_tracks_both_fields() {
+        let mut update = OverloadUpdate::default();
+        assert!(update.is_empty());
+        update.waiting_requests = Some(1);
+        assert!(!update.is_empty());
+        update = OverloadUpdate {
+            waiting_requests: None,
+            token_usage: Some(1.0),
+        };
+        assert!(!update.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod aggregate_rollup_tests {
+    use super::{EngineAggregateMetricsSnapshot, SchedulerLoadSnapshot};
+
+    fn rank(
+        num_running_reqs: i32,
+        num_waiting_reqs: i32,
+        token_usage: f64,
+        gen_throughput: f64,
+        utilization: f64,
+    ) -> SchedulerLoadSnapshot {
+        SchedulerLoadSnapshot {
+            num_running_reqs,
+            num_waiting_reqs,
+            token_usage,
+            gen_throughput,
+            utilization,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_ranks_is_none_not_idle() {
+        assert!(EngineAggregateMetricsSnapshot::from_ranks(&[]).is_none());
+    }
+
+    #[test]
+    fn counts_sum_and_ratios_average() {
+        let aggregate = EngineAggregateMetricsSnapshot::from_ranks(&[
+            rank(4, 1, 0.2, 100.0, 0.3),
+            rank(6, 3, 0.6, 200.0, 0.7),
+        ])
+        .expect("aggregate");
+
+        assert_eq!(aggregate.total_running_reqs, 10);
+        assert_eq!(aggregate.total_waiting_reqs, 4);
+        assert_eq!(aggregate.total_reqs, 14);
+        assert_eq!(aggregate.avg_token_usage, 0.4);
+        assert_eq!(aggregate.avg_throughput, 150.0);
+        assert_eq!(aggregate.avg_utilization, 0.5);
+    }
+
+    #[test]
+    fn averages_round_the_way_the_engines_round() {
+        // 1/3 at 4 decimals for ratios, 2 for throughput.
+        let aggregate = EngineAggregateMetricsSnapshot::from_ranks(&[
+            rank(0, 0, 1.0, 1.0, 1.0),
+            rank(0, 0, 0.0, 0.0, 0.0),
+            rank(0, 0, 0.0, 0.0, 0.0),
+        ])
+        .expect("aggregate");
+
+        assert_eq!(aggregate.avg_token_usage, 0.3333);
+        assert_eq!(aggregate.avg_throughput, 0.33);
+        assert_eq!(aggregate.avg_utilization, 0.3333);
+    }
+
+    #[test]
+    fn counts_saturate_instead_of_overflowing() {
+        let aggregate = EngineAggregateMetricsSnapshot::from_ranks(&[
+            rank(i32::MAX, i32::MAX, 0.0, 0.0, 0.0),
+            rank(1, 1, 0.0, 0.0, 0.0),
+        ])
+        .expect("aggregate");
+
+        assert_eq!(aggregate.total_running_reqs, i32::MAX);
+        assert_eq!(aggregate.total_reqs, i32::MAX);
     }
 }

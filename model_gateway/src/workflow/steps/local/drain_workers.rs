@@ -105,6 +105,7 @@ mod tests {
     use super::*;
     use crate::{
         app_context::AppContext,
+        middleware::AuthConfig,
         worker::{BasicWorkerBuilder, Worker, WorkerType},
         workflow::data::{WorkerList, WorkerRemovalWorkflowData},
     };
@@ -146,6 +147,7 @@ mod tests {
         let job_queue = Arc::new(std::sync::OnceLock::new());
 
         Arc::new(AppContext {
+            gateway_auth: AuthConfig::new(None),
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
@@ -156,7 +158,7 @@ mod tests {
             )),
             reasoning_parser_factory: None,
             tool_parser_factory: None,
-            router_manager: None,
+            gateway: None,
             response_storage: Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             conversation_storage: Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             conversation_item_storage: Arc::new(
@@ -172,9 +174,13 @@ mod tests {
             tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
             wasm_manager: None,
+            worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
+                &router_config,
+            )),
             worker_service: Arc::new(WorkerService::new(registry, job_queue, router_config)),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
+            rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,

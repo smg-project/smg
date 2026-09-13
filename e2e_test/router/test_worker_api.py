@@ -3,7 +3,7 @@
 Tests the gateway's worker management endpoints:
 - GET /workers - List all workers
 - POST /add_worker - Add a worker dynamically
-- POST /remove_worker - Remove a worker dynamically
+- DELETE /workers/{worker_id} - Remove a worker dynamically
 - GET /v1/models - List available models
 
 Usage:
@@ -152,14 +152,38 @@ class TestIGWMode:
                 initial_count = len(gateway.list_workers())
                 logger.info("Worker count after add: %d", initial_count)
 
-                # Remove worker
+                # Remove worker — removal must succeed and the worker must
+                # disappear from the registry.
                 success, msg = gateway.remove_worker(http_worker.base_url)
-                if success:
-                    logger.info("Removed worker: %s", msg)
-                    final_count = len(gateway.list_workers())
-                    logger.info("Worker count after remove: %d", final_count)
-                else:
-                    logger.warning("Remove worker not supported: %s", msg)
+                assert success, f"Failed to remove worker: {msg}"
+                logger.info("Removed worker: %s", msg)
+
+                # Poll briefly in case removal is applied asynchronously.
+                # Sample once up front so the assertion below always has a
+                # real observation to report, even if the deadline has already
+                # passed by the time the loop condition is first evaluated.
+                # Poll on the strict read: the degrading call returns [] on a
+                # transient /workers failure, which would look like "removed"
+                # and end the wait before the queued job has run.
+                def _worker_gone():
+                    try:
+                        return http_worker.base_url not in [
+                            w.url for w in gateway.list_workers(strict=True)
+                        ]
+                    except Exception:  # transient /workers failure: keep waiting
+                        return False
+
+                deadline = time.perf_counter() + 15
+                while not _worker_gone() and time.perf_counter() < deadline:
+                    time.sleep(1.0)
+
+                # Authoritative final read: strict, so a failed /workers call
+                # cannot masquerade as "no workers left".
+                remaining_urls = [w.url for w in gateway.list_workers(strict=True)]
+                assert http_worker.base_url not in remaining_urls, (
+                    f"Worker {http_worker.base_url} still listed after removal: {remaining_urls}"
+                )
+                logger.info("Worker count after remove: %d", len(remaining_urls))
             finally:
                 gateway.shutdown()
         finally:

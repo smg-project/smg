@@ -42,9 +42,9 @@ pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
 
 /// Tracks per-index completion token counts across streaming chunks.
 ///
-/// Handles the vLLM vs SGLang difference:
-/// - vLLM sends delta token counts per chunk (must accumulate)
-/// - SGLang sends cumulative counts in the Complete message
+/// Handles the two chunk conventions (`ChunkSemantics`):
+/// - delta streams send per-chunk token counts (must accumulate)
+/// - cumulative streams send the count in the Complete message
 pub(crate) struct CompletionTokenTracker {
     tokens: HashMap<u32, u32>,
 }
@@ -57,20 +57,20 @@ impl CompletionTokenTracker {
     }
 
     /// Record tokens from a streaming chunk.
-    /// For vLLM, accumulates the chunk's token count.
-    /// For SGLang/TRT-LLM, this is a no-op (they report in Complete).
+    /// Delta streams accumulate the chunk's token count; cumulative streams
+    /// report it in Complete instead, so this is a no-op for them.
     pub fn record_chunk(&mut self, chunk: &ProtoGenerateStreamChunk) {
-        if chunk.is_vllm() {
+        if chunk.chunk_semantics().is_delta() {
             *self.tokens.entry(chunk.index()).or_insert(0) += chunk.token_ids().len() as u32;
         }
     }
 
     /// Record the final count from a Complete message.
-    /// For vLLM, preserves the accumulated count.
-    /// For SGLang/TRT-LLM, uses the cumulative value from Complete.
+    /// Delta streams keep the count accumulated from their chunks; cumulative
+    /// streams take the value from Complete.
     pub fn record_complete(&mut self, complete: &ProtoGenerateComplete) {
         let index = complete.index();
-        if complete.is_vllm() {
+        if complete.chunk_semantics().is_delta() {
             // Keep accumulated count; ensure entry exists
             self.tokens.entry(index).or_insert(0);
         } else {
@@ -86,7 +86,7 @@ impl CompletionTokenTracker {
 
 #[cfg(test)]
 mod tests {
-    use smg_grpc_client::tokenspeed_proto as tokenspeed;
+    use smg_grpc_client::{tokenspeed_proto as tokenspeed, vllm_proto as vllm};
 
     use super::*;
 
@@ -120,6 +120,41 @@ mod tests {
         assert_eq!(
             usage.completion_tokens, 10,
             "each choice generates its own completion -- must be summed"
+        );
+    }
+
+    #[test]
+    fn completion_token_tracker_follows_chunk_semantics() {
+        // Delta stream (the vLLM shape, which the ZMQ lane also emits for
+        // TokenSpeed workers): the chunks carry the counts.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::Vllm(vllm::GenerateStreamChunk {
+            token_ids: vec![1, 2, 3],
+            ..Default::default()
+        }));
+        tracker.record_complete(&ProtoGenerateComplete::Vllm(vllm::GenerateComplete {
+            completion_tokens: 99,
+            ..Default::default()
+        }));
+        assert_eq!(
+            tracker.total(),
+            3,
+            "delta stream keeps the accumulated count"
+        );
+
+        // Cumulative stream: chunks are not accumulated, Complete is the count.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::TokenSpeed(
+            tokenspeed::GenerateStreamChunk {
+                token_ids: vec![1, 2, 3],
+                ..Default::default()
+            },
+        ));
+        tracker.record_complete(&complete(0, 0, 7));
+        assert_eq!(
+            tracker.total(),
+            7,
+            "cumulative stream reports it in Complete"
         );
     }
 }

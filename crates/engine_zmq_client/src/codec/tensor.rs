@@ -279,14 +279,7 @@ pub struct DecodedArray2<T> {
 
 /// Resolve an array payload to raw bytes, following an aux-frame index into
 /// `frames` (frame 0 is the primary msgpack, so indices are one-based).
-pub fn resolve_array_bytes<Frame>(
-    value: WireArrayData,
-    field: &str,
-    frames: &[Frame],
-) -> Result<Bytes>
-where
-    Frame: AsRef<[u8]>,
-{
+pub fn resolve_array_bytes(value: WireArrayData, field: &str, frames: &[Bytes]) -> Result<Bytes> {
     match value {
         WireArrayData::RawView(bytes) => Ok(bytes),
         WireArrayData::AuxIndex(index) => {
@@ -299,7 +292,8 @@ where
                     ),
                 )
             })?;
-            Ok(Bytes::copy_from_slice(frame.as_ref()))
+            // Aux frames are refcounted buffers off the wire: share, do not copy.
+            Ok(frame.clone())
         }
     }
 }
@@ -325,15 +319,12 @@ pub fn validate_byte_length(
     Ok(())
 }
 
-fn decode_array_metadata<Frame>(
+fn decode_array_metadata(
     value: WireNdArray,
     field: &str,
-    frames: &[Frame],
+    frames: &[Bytes],
     expected_scalars: &[ScalarType],
-) -> Result<(Vec<usize>, Bytes, ScalarType, Endianness)>
-where
-    Frame: AsRef<[u8]>,
-{
+) -> Result<(Vec<usize>, Bytes, ScalarType, Endianness)> {
     let WireNdArray { dtype, shape, data } = value;
     let (scalar, endianness) = parse_dtype(&dtype, field)?;
     if !expected_scalars.contains(&scalar) {
@@ -348,14 +339,11 @@ where
 }
 
 /// Decode a rank-2 integer array (i32/i64) to `u32` rows.
-pub fn decode_array2_u32<Frame>(
+pub fn decode_array2_u32(
     value: WireNdArray,
     field: &str,
-    frames: &[Frame],
-) -> Result<DecodedArray2<u32>>
-where
-    Frame: AsRef<[u8]>,
-{
+    frames: &[Bytes],
+) -> Result<DecodedArray2<u32>> {
     let (shape, bytes, scalar, endianness) =
         decode_array_metadata(value, field, frames, &[ScalarType::I32, ScalarType::I64])?;
     if shape.len() != 2 {
@@ -373,14 +361,7 @@ where
 }
 
 /// Decode a rank-1 integer array (i32/i64) to a `Vec<u32>`.
-pub fn decode_array1_u32<Frame>(
-    value: WireNdArray,
-    field: &str,
-    frames: &[Frame],
-) -> Result<Vec<u32>>
-where
-    Frame: AsRef<[u8]>,
-{
+pub fn decode_array1_u32(value: WireNdArray, field: &str, frames: &[Bytes]) -> Result<Vec<u32>> {
     let (shape, bytes, scalar, endianness) =
         decode_array_metadata(value, field, frames, &[ScalarType::I32, ScalarType::I64])?;
     if shape.len() != 1 {
@@ -393,14 +374,11 @@ where
 }
 
 /// Decode a rank-2 float32 array.
-pub fn decode_array2_f32<Frame>(
+pub fn decode_array2_f32(
     value: WireNdArray,
     field: &str,
-    frames: &[Frame],
-) -> Result<DecodedArray2<f32>>
-where
-    Frame: AsRef<[u8]>,
-{
+    frames: &[Bytes],
+) -> Result<DecodedArray2<f32>> {
     let (shape, bytes, _, endianness) =
         decode_array_metadata(value, field, frames, &[ScalarType::F32])?;
     if shape.len() != 2 {
@@ -517,6 +495,15 @@ mod tests {
             decode_array1_u32(via_aux, "ids", &framed).unwrap(),
             vec![10, 20, 30]
         );
+    }
+
+    #[test]
+    fn resolve_array_bytes_shares_the_aux_frame() {
+        let frame = Bytes::from(vec![1_u8, 2, 3, 4]);
+        let frames = vec![Bytes::new(), frame.clone()];
+        let resolved = resolve_array_bytes(WireArrayData::AuxIndex(1), "ids", &frames).unwrap();
+        // Zero-copy: the resolved payload aliases the received frame.
+        assert_eq!(resolved.as_ptr(), frame.as_ptr());
     }
 
     #[test]

@@ -72,7 +72,13 @@ impl EngineId {
     }
 
     /// Construct an engine id from the Python-compatible engine index encoding.
+    /// The identity is two bytes, so an index above [`u16::MAX`] cannot be
+    /// represented — it would alias another rank's identity.
     pub fn from_engine_index(value: u32) -> Self {
+        debug_assert!(
+            value <= u32::from(u16::MAX),
+            "engine index {value} does not fit the 2-byte engine identity"
+        );
         Self(Bytes::copy_from_slice(&(value as u16).to_le_bytes()))
     }
 }
@@ -157,9 +163,8 @@ fn unexpected_handshake(message: impl Into<String>) -> Error {
 pub async fn connect_handshake(
     handshake_address: &str,
     engine_count: usize,
-    local_host: &str,
-    local_input_address: Option<&str>,
-    local_output_address: Option<&str>,
+    local_input_address: &str,
+    local_output_address: &str,
     ready_timeout: Duration,
 ) -> Result<ConnectedTransport> {
     if engine_count == 0 {
@@ -174,7 +179,7 @@ pub async fn connect_handshake(
     // 1. Bind shared input/output sockets first so every engine receives the
     //    same data-plane addresses during handshake.
     let (input_address, mut input_socket, output_address, output_socket) =
-        bind_local_sockets(local_host, local_input_address, local_output_address).await?;
+        bind_local_sockets(local_input_address, local_output_address).await?;
     info!(%input_address, %output_address, "bound local transport sockets");
 
     // 2. Bind the shared handshake socket. All engines connect here with their
@@ -281,24 +286,17 @@ pub async fn connect_handshake(
     })
 }
 
-/// Bind the shared input (ROUTER) and output (PULL) sockets. `ipc://` is
-/// supported via explicit addresses; otherwise an ephemeral `tcp://host:0` is used.
+/// Bind the shared input (ROUTER) and output (PULL) sockets to the given
+/// addresses (`ipc://` on the same host, `tcp://` otherwise).
 async fn bind_local_sockets(
-    local_host: &str,
-    local_input_address: Option<&str>,
-    local_output_address: Option<&str>,
+    local_input_address: &str,
+    local_output_address: &str,
 ) -> Result<(String, RouterSocket, String, PullSocket)> {
     let mut input_socket = RouterSocket::new();
-    let input_bind = local_input_address
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("tcp://{local_host}:0"));
-    let input_address = input_socket.bind(&input_bind).await?.to_string();
+    let input_address = input_socket.bind(local_input_address).await?.to_string();
 
     let mut output_socket = PullSocket::new();
-    let output_bind = local_output_address
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("tcp://{local_host}:0"));
-    let output_address = output_socket.bind(&output_bind).await?.to_string();
+    let output_address = output_socket.bind(local_output_address).await?.to_string();
 
     Ok((input_address, input_socket, output_address, output_socket))
 }
@@ -490,13 +488,10 @@ mod tests {
     #[tokio::test]
     async fn bind_local_sockets_supports_ipc() {
         let ns = IpcNamespace::new().unwrap();
-        let (input_address, _in, output_address, _out) = bind_local_sockets(
-            "127.0.0.1",
-            Some(&ns.input_endpoint()),
-            Some(&ns.output_endpoint()),
-        )
-        .await
-        .unwrap();
+        let (input_address, _in, output_address, _out) =
+            bind_local_sockets(&ns.input_endpoint(), &ns.output_endpoint())
+                .await
+                .unwrap();
         assert!(input_address.starts_with("ipc://"));
         assert!(output_address.starts_with("ipc://"));
     }
@@ -512,14 +507,7 @@ mod tests {
 
         // Frontend binds + drives handshake; mock engine (index 0) connects in.
         let (transport, engine) = tokio::join!(
-            connect_handshake(
-                &handshake,
-                1,
-                "127.0.0.1",
-                Some(&input),
-                Some(&output),
-                TIMEOUT
-            ),
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
             connect_to_frontend(
                 &handshake,
                 EngineId::from_engine_index(0),
@@ -617,14 +605,7 @@ mod tests {
         );
 
         let (transport, engine) = tokio::join!(
-            connect_handshake(
-                &handshake,
-                1,
-                "127.0.0.1",
-                Some(&input),
-                Some(&output),
-                TIMEOUT
-            ),
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
             connect_to_frontend(
                 &handshake,
                 EngineId::from_engine_index(0),

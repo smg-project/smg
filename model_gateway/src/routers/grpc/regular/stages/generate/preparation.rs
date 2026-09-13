@@ -25,10 +25,10 @@ pub(crate) struct GeneratePreparationStage;
 
 #[async_trait]
 impl PipelineStage for GeneratePreparationStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         let request = ctx.generate_request_arc();
         self.prepare_generate(ctx, &request).await?;
-        Ok(None)
+        Ok(())
     }
 
     fn name(&self) -> &'static str {

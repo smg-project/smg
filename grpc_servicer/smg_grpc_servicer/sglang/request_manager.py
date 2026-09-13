@@ -239,8 +239,10 @@ class GrpcRequestManager:
 
         # Schedulers publish per-dp-rank LoadSnapshots (SHM; zmq for
         # multi-node DP). This manager fills sglang's TokenizerManager role.
+        # sglang 0.5.18 dropped the server_args parameter; the reader now
+        # derives dp_size from the process-global parallel config itself.
         self.load_snapshot_reader = create_load_snapshot_reader(
-            server_args, port_args, caller="TokenizerManager"
+            port_args, caller="TokenizerManager"
         )
 
         # Communicators for request/response patterns with scheduler

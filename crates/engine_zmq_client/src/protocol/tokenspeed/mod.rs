@@ -31,7 +31,7 @@ use crate::{
             output::{BatchTokenIDOutSlim, TokenSpeedOutput},
             request::{TokenSpeedRequestType, TokenizedGenerateReqInput},
         },
-        EngineBatch, EngineProtocol,
+        EngineBatch, EngineLoad, EngineProtocol,
     },
 };
 
@@ -99,8 +99,10 @@ impl EngineProtocol for TokenSpeedProtocol {
     }
 
     fn data_parallel_rank(_request: &Self::Request) -> Option<u32> {
-        // The TokenSpeed generate request carries no DP-rank field, so requests
-        // route to the sole engine (single-engine ZMQ). DP fan-out is future work.
+        // The TokenSpeed generate request carries no DP-rank field and needs
+        // none: rank routing is purely by ZMQ identity — the connector selects
+        // a rank and sends on that rank's socket identity. `None` means "never
+        // pinned", so every request goes through least-loaded selection.
         None
     }
 
@@ -118,13 +120,10 @@ impl EngineProtocol for TokenSpeedProtocol {
         // The abort payload is a positional msgpack array of request-id strings,
         // decoded by the engine's `decode_abort` (a `msgspec.msgpack.Decoder(
         // list[str])`) into abort requests. A single-element array aborts one rid.
-        encode_msgpack(&[request_id.to_string()])
+        encode_msgpack(&[request_id])
     }
 
-    fn encode_start_wave(
-        _wave: u32,
-        _exclude_engine_index: u32,
-    ) -> Result<Option<(Bytes, Vec<u8>)>> {
+    fn encode_start_wave(_wave: u64) -> Result<Option<(Bytes, Vec<u8>)>> {
         // TokenSpeed has no wave protocol: its scheduler never pauses a group
         // of ranks, so there is nothing to wake.
         Ok(None)
@@ -142,19 +141,29 @@ impl EngineProtocol for TokenSpeedProtocol {
         }
         let payload = frames.first().map(AsRef::as_ref).unwrap_or_default();
         let batch: BatchTokenIDOutSlim = decode_msgpack(payload)?;
+        let engine_index = batch.engine_index;
+        // `kv_total_pages == 0` marks a pre-piggyback sender (or a snapshot
+        // the engine could not take): report no load rather than fabricating
+        // an empty-scheduler signal that least-loaded selection would trust.
+        let load = (batch.kv_total_pages > 0).then(|| EngineLoad {
+            num_running: batch.num_running,
+            num_waiting: batch.num_waiting,
+            kv_cache_usage: batch.kv_active_pages as f64 / batch.kv_total_pages as f64,
+        });
         let outputs = batch.into_outputs()?;
+        // TokenSpeed has no out-of-band finish channel: every finish is carried
+        // by its own output. Reporting them here anyway keeps the batch shape
+        // self-describing for consumers that only read the finished list.
         let finished_request_ids = outputs
             .iter()
             .filter(|output| output.finish_reason.is_some())
             .map(|output| output.request_id.clone())
             .collect();
         Ok(EngineBatch {
-            // Single-engine ZMQ: TokenSpeed batches carry no engine index and
-            // no piggybacked scheduler load.
-            engine_index: 0,
+            engine_index,
             outputs,
             finished_request_ids,
-            load: None,
+            load,
             wave: None,
         })
     }
@@ -174,6 +183,11 @@ mod tests {
             cached_tokens: vec![0, 0],
             output_token_logprobs_val: vec![vec![], vec![]],
             output_token_logprobs_idx: vec![vec![], vec![]],
+            engine_index: 1,
+            num_running: 2,
+            num_waiting: 5,
+            kv_active_pages: 100,
+            kv_total_pages: 400,
         }
     }
 
@@ -183,6 +197,30 @@ mod tests {
         let decoded = TokenSpeedProtocol::decode_batch(&frames).unwrap();
         assert_eq!(decoded.outputs.len(), 2);
         assert_eq!(decoded.finished_request_ids, vec!["b".to_string()]);
+        // The batch names its producing DP rank; the connector routes in-flight
+        // release and scoring by it.
+        assert_eq!(decoded.engine_index, 1);
+        // The piggybacked snapshot surfaces as the engine-neutral load signal.
+        assert_eq!(
+            decoded.load,
+            Some(EngineLoad {
+                num_running: 2,
+                num_waiting: 5,
+                kv_cache_usage: 0.25,
+            })
+        );
+    }
+
+    #[test]
+    fn decode_batch_reports_no_load_without_a_snapshot() {
+        // kv_total_pages == 0 marks a pre-piggyback sender (or a snapshot the
+        // engine could not take): no load, not a fabricated empty scheduler.
+        let batch = BatchTokenIDOutSlim {
+            kv_total_pages: 0,
+            ..slim_batch()
+        };
+        let frames = vec![Bytes::from(encode_msgpack(&batch).unwrap())];
+        let decoded = TokenSpeedProtocol::decode_batch(&frames).unwrap();
         assert!(decoded.load.is_none());
     }
 

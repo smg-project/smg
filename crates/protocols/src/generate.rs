@@ -5,7 +5,10 @@ use serde_json::{Map, Value};
 use validator::Validate;
 
 use super::{
-    common::{default_true, deserialize_null_as_false, GenerationRequest, InputIds},
+    common::{
+        default_true, deserialize_null_as_false, is_false, CachePartition, GenerationRequest,
+        InputIds,
+    },
     sampling_params::SamplingParams,
 };
 use crate::validated::Normalizable;
@@ -88,7 +91,7 @@ pub struct GenerateRequest {
     pub log_metrics: bool,
 
     /// Return model hidden states
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub return_hidden_states: bool,
 
     /// The modalities of the image data [image, multi-images, video]
@@ -203,8 +206,23 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
 }
 
 impl GenerationRequest for GenerateRequest {
+    fn rid(&self) -> Option<&str> {
+        self.rid.as_deref()
+    }
+
     fn is_stream(&self) -> bool {
         self.stream
+    }
+
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition {
+            // vLLM's `cache_salt` is a passthrough extension on this
+            // protocol; `extra_key` is SGLang's typed classification key.
+            cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
+            extra_key: self.extra_key.as_deref(),
+            // Either name identifies the adapter the engine namespaces by.
+            lora_path: self.lora_path.as_deref().or(self.lora_id.as_deref()),
+        }
     }
 
     fn get_model(&self) -> Option<&str> {
@@ -234,6 +252,21 @@ impl GenerationRequest for GenerateRequest {
 
         // No text input found
         String::new()
+    }
+
+    fn routing_tokens(&self) -> Option<&[i32]> {
+        // Token ids win over text: they key routing on what the backend KV
+        // cache keys on. Empty ids fall back to text.
+        match &self.input_ids {
+            Some(InputIds::Single(ids)) if !ids.is_empty() => Some(ids),
+            // A batch is dispatched to a single worker; the first sequence is
+            // the best available affinity signal.
+            Some(InputIds::Batch(seqs)) => seqs
+                .first()
+                .map(Vec::as_slice)
+                .filter(|ids| !ids.is_empty()),
+            _ => None,
+        }
     }
 }
 
@@ -304,4 +337,106 @@ pub enum GenerateFinishReason {
 pub enum GenerateFinishType {
     Length,
     Stop,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req() -> GenerateRequest {
+        serde_json::from_value(serde_json::json!({"model": "m"})).expect("minimal request")
+    }
+
+    #[test]
+    fn return_hidden_states_false_is_omitted_and_absent_reads_false() {
+        let r = req();
+        let v = serde_json::to_value(&r).expect("serialize");
+        assert!(v.get("return_hidden_states").is_none());
+
+        let back: GenerateRequest = serde_json::from_value(v).expect("roundtrip");
+        assert!(!back.return_hidden_states);
+    }
+
+    #[test]
+    fn return_hidden_states_true_round_trips() {
+        let mut r = req();
+        r.return_hidden_states = true;
+        let v = serde_json::to_value(&r).expect("serialize");
+        assert_eq!(v["return_hidden_states"], true);
+
+        let back: GenerateRequest = serde_json::from_value(v).expect("roundtrip");
+        assert!(back.return_hidden_states);
+    }
+
+    #[test]
+    fn routing_tokens_from_single_input_ids() {
+        let mut r = req();
+        r.input_ids = Some(InputIds::Single(vec![1, 2, 3]));
+        assert_eq!(r.routing_tokens(), Some(&[1, 2, 3][..]));
+    }
+
+    #[test]
+    fn routing_tokens_prefer_input_ids_over_text() {
+        let mut r = req();
+        r.text = Some("hello".to_string());
+        r.input_ids = Some(InputIds::Single(vec![1, 2, 3]));
+        assert_eq!(r.routing_tokens(), Some(&[1, 2, 3][..]));
+
+        r.input_ids = Some(InputIds::Batch(vec![vec![4, 5], vec![6]]));
+        assert_eq!(r.routing_tokens(), Some(&[4, 5][..]));
+    }
+
+    #[test]
+    fn routing_tokens_none_for_empty_input_ids_with_text() {
+        let mut r = req();
+        r.text = Some("hello".to_string());
+        r.input_ids = Some(InputIds::Single(vec![]));
+        assert_eq!(r.routing_tokens(), None);
+        assert_eq!(r.extract_text_for_routing(), "hello");
+    }
+
+    #[test]
+    fn routing_tokens_from_batch_first_sequence() {
+        let mut r = req();
+        r.input_ids = Some(InputIds::Batch(vec![vec![1, 2], vec![3, 4]]));
+        assert_eq!(r.routing_tokens(), Some(&[1, 2][..]));
+    }
+
+    #[test]
+    fn routing_tokens_none_for_empty_inputs() {
+        let mut r = req();
+        r.input_ids = Some(InputIds::Batch(vec![]));
+        assert_eq!(r.routing_tokens(), None);
+
+        let mut r = req();
+        r.input_ids = Some(InputIds::Batch(vec![vec![], vec![1]]));
+        assert_eq!(r.routing_tokens(), None);
+
+        let r = req();
+        assert_eq!(r.routing_tokens(), None);
+    }
+
+    #[test]
+    fn cache_partition_uses_the_typed_extra_key_and_falls_back_to_lora_id() {
+        let request: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "extra_key": "k",
+            "lora_id": "adapter-id",
+            "cache_salt": "tenant-a"
+        }))
+        .unwrap();
+        let partition = request.cache_partition();
+        assert_eq!(partition.cache_salt, Some("tenant-a"));
+        assert_eq!(partition.extra_key, Some("k"));
+        assert_eq!(partition.lora_path, Some("adapter-id"));
+
+        let typed_path: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "lora_path": "adapter-path",
+            "lora_id": "adapter-id"
+        }))
+        .unwrap();
+        assert_eq!(typed_path.cache_partition().lora_path, Some("adapter-path"));
+        assert!(typed_path.cache_partition().cache_salt.is_none());
+    }
 }

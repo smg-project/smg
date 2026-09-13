@@ -315,16 +315,9 @@ mod tests {
         )]
         let _engine = tokio::spawn(serve(cfg, handshake.clone(), 0));
 
-        let transport = connect_handshake(
-            &handshake,
-            1,
-            "127.0.0.1",
-            Some(&input),
-            Some(&output),
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("frontend handshake");
+        let transport = connect_handshake(&handshake, 1, &input, &output, Duration::from_secs(10))
+            .await
+            .expect("frontend handshake");
         let client = EngineCoreClient::new(transport);
         assert_eq!(client.engines()[0].ready_response.data_parallel_rank, 0);
 
@@ -349,5 +342,60 @@ mod tests {
         }
         assert!(finished, "stream should reach a terminal output");
         assert_eq!(tokens.len(), 4, "canned mode emits output_tokens tokens");
+    }
+
+    /// Two mock ranks dial one socket set — the grouped-worker topology the
+    /// gateway registers for `--zmq-engine-count`. Each rank must complete its
+    /// own rank-pinned request off the shared output socket, tagging its
+    /// outputs with its own engine index.
+    #[tokio::test]
+    async fn two_ranks_share_one_socket_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (
+            endpoint("hs.sock"),
+            endpoint("in.sock"),
+            endpoint("out.sock"),
+        );
+
+        let cfg = Arc::new(test_config());
+        for rank in 0..2 {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "serve loops until the test drops its handles"
+            )]
+            let _engine = tokio::spawn(serve(cfg.clone(), handshake.clone(), rank));
+        }
+
+        let transport = connect_handshake(&handshake, 2, &input, &output, Duration::from_secs(10))
+            .await
+            .expect("frontend handshake");
+        let client = EngineCoreClient::new(transport);
+        assert_eq!(client.engines().len(), 2);
+
+        for rank in 0..2u32 {
+            let mut stream = client
+                .submit(EngineCoreRequest {
+                    request_id: format!("rank-{rank}"),
+                    prompt_token_ids: Some(vec![1, 2, 3]),
+                    data_parallel_rank: Some(rank),
+                    ..Default::default()
+                })
+                .await
+                .expect("submit");
+
+            let mut tokens = Vec::new();
+            let mut finished = false;
+            while let Some(item) = stream.next().await {
+                let output = item.expect("output ok");
+                tokens.extend(output.new_token_ids.clone());
+                if output.finished() {
+                    finished = true;
+                    break;
+                }
+            }
+            assert!(finished, "rank {rank} should reach a terminal output");
+            assert_eq!(tokens.len(), 4, "rank {rank} emits output_tokens tokens");
+        }
     }
 }

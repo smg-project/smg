@@ -136,7 +136,7 @@ pub fn fill_transparent_bg(image: &DynamicImage, config: TransparentBgConfig) ->
     let mut out = Vec::with_capacity(width as usize * height as usize * 3);
 
     for (y, row) in rgba.as_raw().chunks_exact(width as usize * 4).enumerate() {
-        for (x, px) in row.chunks_exact(4).enumerate() {
+        for (x, px) in row.as_chunks::<4>().0.iter().enumerate() {
             let bg = f32::from(config.background_at(x as u32, y as u32));
             let alpha = f32::from(px[3]) / 255.0;
             let inv = 1.0 - alpha;
@@ -334,6 +334,23 @@ pub fn to_tensor_and_normalize(
 pub fn rescale(tensor: &mut Array3<f32>, factor: f64) {
     let factor = factor as f32;
     tensor.mapv_inplace(|v| v * factor);
+}
+
+/// Python-compatible rounding (banker's rounding / round half to even).
+/// Matches Python's `round()` where 0.5 rounds to the nearest even number
+/// (`12.5 -> 12`, `13.5 -> 14`), unlike Rust's `f64::round()` which rounds
+/// half away from zero.
+#[inline]
+pub fn round_half_to_even(x: f64) -> f64 {
+    let rounded = x.round();
+    // Check if we're exactly at a .5 case
+    if (x - x.floor() - 0.5).abs() < 1e-9 {
+        // Round to nearest even
+        if rounded as i64 % 2 != 0 {
+            return rounded - 1.0;
+        }
+    }
+    rounded
 }
 
 /// Map `image` crate filter types to `fast_image_resize` algorithm.
@@ -636,7 +653,12 @@ fn pil_h_band_rgb(
             let mut blue = half;
             let source_start = source_x * 3;
             let source_end = (source_x + source_columns) * 3;
-            for (pixel, &coefficient) in row[source_start..source_end].chunks_exact(3).zip(kernel) {
+            for (pixel, &coefficient) in row[source_start..source_end]
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(kernel)
+            {
                 red += pixel[0] as i64 * coefficient;
                 green += pixel[1] as i64 * coefficient;
                 blue += pixel[2] as i64 * coefficient;

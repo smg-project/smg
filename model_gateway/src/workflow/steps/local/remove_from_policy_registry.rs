@@ -1,16 +1,55 @@
 //! Step to remove workers from policy registry.
 
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+
 use async_trait::async_trait;
-use tracing::debug;
+use tokio::sync::Semaphore;
+use tracing::{debug, error};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::workflow::data::WorkerRemovalWorkflowData;
+use crate::{
+    policies::PolicyRegistry, worker::WorkerRegistry, workflow::data::WorkerRemovalWorkflowData,
+};
+
+/// Bound CPU-heavy radix-tree purges during a fleet-wide scale-down. The
+/// worker has already left the routing registry before any task waits here.
+const MAX_CONCURRENT_CACHE_REMOVALS: usize = 4;
+static CACHE_REMOVAL_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_CACHE_REMOVALS);
 
 /// Step to remove workers from the policy registry.
 ///
 /// Removes each worker from cache-aware policies and notifies
 /// the policy registry of worker removal.
 pub struct RemoveFromPolicyRegistryStep;
+
+impl RemoveFromPolicyRegistryStep {
+    async fn remove_cache_state(
+        policy_registry: Arc<PolicyRegistry>,
+        removals: HashMap<String, HashSet<String>>,
+    ) {
+        if removals.is_empty() {
+            return;
+        }
+        let Ok(permit) = CACHE_REMOVAL_PERMITS.acquire().await else {
+            error!("Cache-removal semaphore closed");
+            return;
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            for (model_id, worker_urls) in removals {
+                policy_registry.remove_workers_from_cache_aware(&model_id, &worker_urls);
+            }
+        })
+        .await;
+
+        if let Err(error) = result {
+            error!(%error, "Cache-aware worker cleanup task failed");
+        }
+    }
+}
 
 #[async_trait]
 impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
@@ -35,30 +74,33 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
         );
 
         for worker in workers_to_remove {
-            let model_id = worker.model_id().to_string();
-            let worker_url = worker.url();
-
             // Remove from KV event monitor (stops subscription, removes from indexer)
             if let Some(ref monitor) = app_context.kv_event_monitor {
-                monitor.on_worker_removed(worker_url).await;
+                monitor.on_worker_removed(worker.url()).await;
             }
-
-            // Remove from cache-aware policy
-            app_context
-                .policy_registry
-                .remove_worker_from_cache_aware(&model_id, worker_url);
-            app_context
-                .policy_registry
-                .remove_worker_from_pd_cache_aware(worker_url);
 
             // Drop the worker's cached load report from load-aware policies
             // (power_of_two, least_load) so their caches don't leak under churn.
             app_context
                 .policy_registry
-                .remove_worker_from_load_aware(worker_url);
+                .remove_worker_from_load_aware(worker.url());
+        }
 
-            // Notify policy registry
-            app_context.policy_registry.on_worker_removed(&model_id);
+        let mut cache_removals: HashMap<String, HashSet<String>> = HashMap::new();
+        for worker in workers_to_remove {
+            for model_id in WorkerRegistry::worker_model_ids(worker) {
+                cache_removals
+                    .entry(model_id)
+                    .or_default()
+                    .insert(worker.url().to_string());
+            }
+        }
+        Self::remove_cache_state(Arc::clone(&app_context.policy_registry), cache_removals).await;
+
+        for worker in workers_to_remove {
+            app_context
+                .policy_registry
+                .on_worker_removed(worker.model_id());
         }
 
         debug!(

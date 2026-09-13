@@ -286,6 +286,8 @@ pub fn create_worker_workflow_data(
         registration_mode,
         worker_kind: None,
         connection_mode: None,
+        http2: None,
+        http_client_handle: None,
         detected_runtime_type: None,
         discovered_labels: std::collections::HashMap::new(),
         dp_info: None,

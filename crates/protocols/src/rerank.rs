@@ -53,6 +53,10 @@ pub struct RerankRequest {
 }
 
 impl GenerationRequest for RerankRequest {
+    fn rid(&self) -> Option<&str> {
+        self.rid.as_ref().and_then(StringOrArray::first)
+    }
+
     fn get_model(&self) -> Option<&str> {
         Some(&self.model)
     }

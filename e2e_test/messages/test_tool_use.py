@@ -143,21 +143,31 @@ class TestToolUseBasic:
             ],
         ) as stream:
             event_types = set()
-            input_json_deltas = []
+            input_json_deltas: dict[int, list[str]] = {}
             for event in stream:
                 event_types.add(event.type)
                 if event.type == "content_block_delta" and hasattr(event.delta, "partial_json"):
-                    input_json_deltas.append(event.delta.partial_json)
+                    # Key by block index: two tool_use blocks would otherwise
+                    # concatenate into "{...}{...}" and fail to parse.
+                    input_json_deltas.setdefault(event.index, []).append(event.delta.partial_json)
+            final_message = stream.get_final_message()
 
         assert "content_block_start" in event_types
         assert "content_block_delta" in event_types
         assert "content_block_stop" in event_types
 
-        # Concatenated partial_json should form valid JSON
-        if input_json_deltas:
-            full_json_str = "".join(input_json_deltas)
-            parsed = json.loads(full_json_str)
-            assert isinstance(parsed, dict)
+        # The weather prompt must produce a tool call (mirrors
+        # test_single_tool_call), so input_json deltas must be present:
+        # an empty list means the stream lost the tool-input deltas.
+        assert final_message.stop_reason == "tool_use"
+        assert input_json_deltas, "Expected input_json_delta events for the tool call"
+
+        # Each tool_use block's deltas must concatenate to one valid JSON object
+        for index, deltas in input_json_deltas.items():
+            parsed = json.loads("".join(deltas))
+            assert isinstance(parsed, dict), (
+                f"content block {index} input_json did not parse to a dict: {parsed!r}"
+            )
 
     def test_multiple_tools_available(self, model, api_client):
         """Test that model selects the correct tool when multiple are available."""

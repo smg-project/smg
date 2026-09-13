@@ -9,7 +9,6 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 use crate::{
     worker::{
         circuit_breaker::CircuitBreakerConfig,
-        http_client::build_worker_http_client,
         resilience::resolve_resilience,
         worker::{RuntimeType, WorkerType},
         BasicWorkerBuilder, ConnectionMode, Worker,
@@ -67,11 +66,16 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
             &config.resilience,
         );
 
-        let http_client = build_worker_http_client(&config.http_pool, &app_context.router_config)
+        // TLS negotiates the HTTP version via ALPN; only an explicit
+        // `http_pool.http2` pins it.
+        let http2 = config.http_pool.http2.unwrap_or(false);
+        let http_client = app_context
+            .worker_client_cache
+            .get(&config.http_pool, http2)
             .map_err(|e| WorkflowError::StepFailed {
-            step_id: StepId::new("create_external_workers"),
-            message: e,
-        })?;
+                step_id: StepId::new("create_external_workers"),
+                message: e,
+            })?;
 
         let (health_config, health_endpoint) = {
             let base = app_context.router_config.health_check.to_protocol_config();
@@ -106,6 +110,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
                 .runtime_type(RuntimeType::External)
                 .circuit_breaker_config(circuit_breaker_config.clone())
                 .http_client(http_client.clone())
+                .http2(http2)
                 .resilience(resolved_resilience.clone())
                 .health_config(health_config.clone())
                 .health_endpoint(&health_endpoint)
@@ -143,6 +148,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
                 .runtime_type(RuntimeType::External)
                 .circuit_breaker_config(circuit_breaker_config.clone())
                 .http_client(http_client.clone())
+                .http2(http2)
                 .resilience(resolved_resilience.clone())
                 .health_config(health_config.clone())
                 .health_endpoint(&health_endpoint)

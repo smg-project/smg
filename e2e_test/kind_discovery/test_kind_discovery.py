@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 import pytest
+import requests
 
 HERE = Path(__file__).parent
 
@@ -121,7 +122,7 @@ class TestKindDiscovery:
         )
         gateway.wait_for_count(5, "workers restored for re-added ports")
 
-    def test_readiness_flip_keeps_workers(self, gateway):
+    def test_readiness_flip_removes_and_restores_workers(self, gateway):
         toggle_engine_health("multi-engine-0", 28080, "down")
         kubectl(
             "wait",
@@ -129,9 +130,44 @@ class TestKindDiscovery:
             "pod/multi-engine-0",
             "--timeout=60s",
         )
-        for _ in range(3):
-            time.sleep(2)
-            assert gateway.worker_count() == 5, "unready pod lost workers"
+        drain_deadline = time.monotonic() + 30
+        while True:
+            multi = [
+                worker
+                for worker in gateway.workers()
+                if worker.get("labels", {}).get("smg.ai/pod-name") == "multi-engine-0"
+            ]
+            if not any(worker.get("status") == "ready" for worker in multi):
+                break
+            assert time.monotonic() < drain_deadline, (
+                f"unready pod workers remained routable: {multi}"
+            )
+            time.sleep(0.25)
+
+        response = requests.post(
+            f"{gateway.base_url}/v1/chat/completions",
+            json={
+                "model": "kind-e2e-model",
+                "messages": [{"role": "user", "content": "drain probe"}],
+            },
+            timeout=10,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["choices"][0]["message"]["content"] == "served-by-28090"
+
+        gateway.wait_for_count(1, "four workers removed while their pod is unready")
+        remaining = gateway.workers()
+        assert len(remaining) == 1
+        assert remaining[0].get("labels", {}).get("smg.ai/pod-name") == "single-engine-0"
+
+        deletion_timestamp = kubectl(
+            "get",
+            "pod/multi-engine-0",
+            "-o",
+            "jsonpath={.metadata.deletionTimestamp}",
+        ).stdout
+        assert not deletion_timestamp, "unready pod must still exist"
+
         toggle_engine_health("multi-engine-0", 28080, "up")
         kubectl(
             "wait",
@@ -139,7 +175,7 @@ class TestKindDiscovery:
             "pod/multi-engine-0",
             "--timeout=60s",
         )
-        gateway.wait_for_count(5, "workers intact after readiness recovery")
+        gateway.wait_for_count(5, "workers restored after readiness recovery")
 
     def test_gateway_restart_rebuilds_registry(self, gateway):
         gateway.restart()
@@ -164,8 +200,6 @@ class TestKindDiscovery:
         )
 
     def test_completions_route_to_discovered_workers(self, gateway):
-        import requests
-
         gateway.wait_for_count(5, "baseline before data-plane check")
         # Health promotion lags registration; wait for the first 200 before
         # asserting fan-out.
@@ -355,6 +389,8 @@ class TestKindPDDisaggregation:
                 {
                     "smg.ai/worker-ports": "29600,29601",
                     "sglang.ai/bootstrap-port": "29700,29701",
+                    "smg.ai/kv-connector": "MooncakeConnector",
+                    "smg.ai/kv-engine-id": "prefill-0,prefill-1",
                 },
                 probe_port=29600,
                 extra_labels={"role": "prefill"},
@@ -373,7 +409,11 @@ class TestKindPDDisaggregation:
                     "--model",
                     "kind-e2e-model",
                 ],
-                {"smg.ai/worker-ports": "29610,29611"},
+                {
+                    "smg.ai/worker-ports": "29610,29611",
+                    "smg.ai/kv-connector": "NixlConnector",
+                    "smg.ai/kv-engine-id": "decode-0,decode-1",
+                },
                 probe_port=29610,
                 extra_labels={"role": "decode"},
             )
@@ -404,6 +444,12 @@ class TestKindPDDisaggregation:
         assert by_port["29600"].get("bootstrap_port") == 29700
         assert by_port["29601"].get("bootstrap_port") == 29701
         assert "bootstrap_port" not in by_port["29610"]
+        assert by_port["29600"]["kv_connector"] == "MooncakeConnector"
+        assert by_port["29600"]["kv_engine_id"] == "prefill-0"
+        assert by_port["29601"]["kv_engine_id"] == "prefill-1"
+        assert by_port["29610"]["kv_connector"] == "NixlConnector"
+        assert by_port["29610"]["kv_engine_id"] == "decode-0"
+        assert by_port["29611"]["kv_engine_id"] == "decode-1"
 
         kubectl("delete", "pod", "prefill-0", "decode-0", "--grace-period=0", "--force")
         gateway.wait_for_count(0, "PD fleet unwound")

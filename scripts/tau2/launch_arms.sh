@@ -23,7 +23,7 @@ set -euo pipefail
 
 ARM="${1:?usage: launch_arms.sh <a|b|stop>}"
 
-MODEL="${TAU2_MODEL:-Qwen/Qwen3.6-27B}"
+MODEL="${TAU2_MODEL:-Qwen/Qwen3.8-27B}"
 # Load source: prefer a pre-staged local copy at $ROUTER_LOCAL_MODEL_PATH/<id>
 # (e.g. NVMe /raid/models on the Blackwell node — no download); else the HF repo
 # id, which vLLM/HF downloads into HF_HOME. The canonical served name stays

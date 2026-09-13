@@ -32,10 +32,10 @@ python -m venv ~/bfcl-env && ~/bfcl-env/bin/pip install bfcl-eval soundfile
 ~/vllm-env/bin/pip install ninja          # then ensure ~/vllm-env/bin is on PATH
 
 # teach bfcl about a model it doesn't ship a handler for yet (new SKUs)
-~/bfcl-env/bin/python register_bfcl_model.py --model-id Qwen/Qwen3.6-27B
+~/bfcl-env/bin/python register_bfcl_model.py --model-id Qwen/Qwen3.8-27B
 
-# 1) bring up both arms (here: Qwen3.6-27B, TP=2, one arm per GPU pair)
-export BFCL_MODEL=Qwen/Qwen3.6-27B VLLM_BIN=~/vllm-env/bin/vllm \
+# 1) bring up both arms (here: Qwen3.8-27B, TP=2, one arm per GPU pair)
+export BFCL_MODEL=Qwen/Qwen3.8-27B VLLM_BIN=~/vllm-env/bin/vllm \
        VLLM_PYTHON=~/vllm-env/bin/python SMG_LAUNCH="$HOME/smg/target/ci/smg launch" \
        BFCL_TP=2 BFCL_MAX_MODEL_LEN=16384 PATH=~/vllm-env/bin:$PATH
 A_URL=$(BFCL_GPU=0,1 BFCL_VLLM_TOOL_PARSER=qwen3_xml BFCL_VLLM_REASONING_PARSER=qwen3 bash launch_arm.sh a)
@@ -45,7 +45,7 @@ B_URL=$(BFCL_GPU=2,3 BFCL_SMG_TOOL_PARSER=qwen_xml  BFCL_SMG_REASONING_PARSER=qw
 ~/bfcl-env/bin/python run_ab.py \
     --baseline  "vllm=$A_URL" \
     --candidate "smg=$B_URL" \
-    --bfcl-model Qwen/Qwen3.6-27B-FC \
+    --bfcl-model Qwen/Qwen3.8-27B-FC \
     --categories simple_python,multiple,parallel,irrelevance \
     --bfcl ~/bfcl-env/bin/bfcl --project-root ~/bfcl_ab \
     --out ~/bfcl_ab.md --json-out ~/bfcl_ab.json
@@ -62,7 +62,7 @@ Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`)
 
 | model (matrix leg) | runner | TP/arm | pure-vLLM `--tool-call-parser` / `--reasoning-parser` | SMG `--tool-call-parser` / `--reasoning-parser` |
 |---|---|---|---|---|
-| Qwen3.6-27B (`qwen3.6`) | `4-gpu-h100` | 2 | `qwen3_xml` / `qwen3` | `qwen_xml` / `qwen3` |
+| Qwen3.8-27B (`qwen3.8`) | `4-gpu-h100` | 2 | `qwen3_xml` / `qwen3` | `qwen_xml` / `qwen3` |
 | gpt-oss-120b (`gpt-oss`) | `4-gpu-h100` | 2 | `openai` / — | _(none — SMG auto-routes harmony)_ / — |
 | DeepSeek-V4-Flash-0731 (`deepseek-v4`) | `blackwell` | 4 | `deepseek_v4` / `deepseek_v4` (+`--tokenizer-mode deepseek_v4 --trust-remote-code`) | `deepseek_v4` / `deepseek_v4` |
 | MiniMax-M2.7 (`minimax-m2.7`) | `blackwell` | 4 | `minimax_m2` / `minimax_m2` (+`--trust-remote-code`) | `minimax_m2` / `minimax` |
@@ -88,7 +88,7 @@ Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`)
 The nightly (`.github/workflows/nightly-bfcl.yml`) runs the A/B as a GitHub Actions
 matrix — one leg per model, `fail-fast: false`, each on its own runner:
 
-- `4-gpu-h100` — Qwen3.6-27B and gpt-oss-120b, TP=2 per arm (GPUs 0,1 + 2,3).
+- `4-gpu-h100` — Qwen3.8-27B and gpt-oss-120b, TP=2 per arm (GPUs 0,1 + 2,3).
 - `blackwell` (B200) — DeepSeek-V4-Flash-0731, MiniMax-M2.7, Kimi-K2.6 int4, TP=4 per arm
   (GPUs 0-3 + 4-7).
 

@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use llm_multimodal::{MediaContentPart, MediaPartOrder, Modality, ModelMetadata};
 use llm_tokenizer::TokenizerTrait;
 
-use super::config::MultimodalComponents;
+use super::{config::MultimodalComponents, RegistryTokenizer};
 
 /// Ordered media extracted from an API request.
 ///
@@ -105,9 +105,10 @@ pub(crate) async fn prepare_placeholder_tokens(
         .config_registry
         .get_or_load(tokenizer_id, tokenizer_source)
         .await?;
+    let registry_tokenizer = RegistryTokenizer(tokenizer);
     let metadata = ModelMetadata {
         model_id,
-        tokenizer,
+        tokenizer: &registry_tokenizer,
         config: &model_config.config,
     };
     let spec = components
@@ -119,10 +120,12 @@ pub(crate) async fn prepare_placeholder_tokens(
         .iter()
         .map(|&modality| (modality, plan.count(modality)))
         .collect::<Vec<_>>();
-    spec.validate_media_request(&metadata, &requested)
-        .map_err(|error| {
-            anyhow::anyhow!("invalid media request for model {}: {error}", spec.name())
-        })?;
+    spec.validate_media_request_with_limits(
+        &metadata,
+        &requested,
+        &components.modality_limit_overrides,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid media request for model {}: {error}", spec.name()))?;
     let mut placeholders = PlaceholderTokens::default();
     for &modality in plan.modalities() {
         let token = spec
@@ -161,9 +164,10 @@ pub(crate) async fn resolve_media_part_order(
         Ok(config) => config,
         Err(_) => return MediaPartOrder::MediaFirst,
     };
+    let registry_tokenizer = RegistryTokenizer(tokenizer);
     let metadata = ModelMetadata {
         model_id,
-        tokenizer,
+        tokenizer: &registry_tokenizer,
         config: &model_config.config,
     };
     components
@@ -227,6 +231,7 @@ mod tests {
                 url: "image".to_string(),
                 detail: None,
                 uuid: None,
+                max_long_side_pixel: None,
             },
             MediaContentPart::AudioUrl {
                 url: "audio-2".to_string(),
@@ -261,6 +266,7 @@ mod tests {
                 url: "image".to_string(),
                 detail: None,
                 uuid: None,
+                max_long_side_pixel: None,
             },
             MediaContentPart::AudioUrl {
                 url: "audio".to_string(),

@@ -799,9 +799,9 @@ impl HarmonyStreamingProcessor {
 
             match response.into_response() {
                 ProtoResponseVariant::Chunk(chunk_wrapper) => {
-                    // Track token counts for vLLM (vLLM sends deltas)
-                    // For SGLang, skip (SGLang sends cumulative values in Complete)
-                    if chunk_wrapper.is_vllm() {
+                    // Track token counts on delta streams; cumulative streams
+                    // report them in Complete instead.
+                    if chunk_wrapper.chunk_semantics().is_delta() {
                         completion_tokens += chunk_wrapper.token_ids().len() as u32;
                     }
 
@@ -1028,9 +1028,9 @@ impl HarmonyStreamingProcessor {
                     prompt_tokens = complete_wrapper.prompt_tokens();
                     // Combine decode-stream cached_tokens with any prefill cached_tokens
                     cached_tokens = cached_tokens.saturating_add(complete_wrapper.cached_tokens());
-                    // For vLLM, use accumulated count (we tracked deltas above)
-                    // For SGLang, use complete value (already cumulative)
-                    if !complete_wrapper.is_vllm() {
+                    // Delta streams keep the count accumulated above;
+                    // cumulative streams take it from Complete.
+                    if !complete_wrapper.chunk_semantics().is_delta() {
                         completion_tokens = complete_wrapper.completion_tokens();
                     }
 

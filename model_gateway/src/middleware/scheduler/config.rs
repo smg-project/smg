@@ -30,7 +30,7 @@ pub struct ClassConfig {
     /// Per-class queue depth limit.
     pub queue_size: u32,
     /// How long a queued waiter waits before the admission middleware
-    /// returns 408. Seconds at rest; converted to [`Duration`] in
+    /// sheds it with 503. Seconds at rest; converted to [`Duration`] in
     /// [`ClassRuntimeConfig`].
     pub queue_timeout_secs: u64,
     /// Head-of-queue age past which the dispatcher promotes a waiter

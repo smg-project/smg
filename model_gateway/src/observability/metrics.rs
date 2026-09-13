@@ -6,6 +6,11 @@ use dashmap::DashMap;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use once_cell::sync::Lazy;
+use smg_external_router::metrics::Metrics as RouterMetrics;
+pub use smg_external_router::metrics::{
+    bool_to_static_str, intern_model_label, intern_tool_label, metrics_labels, STREAMING_FALSE,
+    STREAMING_TRUE,
+};
 
 // Interned strings are never freed; only intern low-cardinality, server-controlled
 // labels (model IDs, worker URLs, normalized paths), never user-controlled input.
@@ -38,69 +43,9 @@ pub(crate) fn interner_size() -> usize {
     STRING_INTERNER.len()
 }
 
-/// Sentinel substituted once a bounded interner reaches its cap, so a flood of
-/// client-controlled label values (model IDs, MCP tool names) cannot mint an
-/// unbounded number of interner entries or Prometheus series.
-const BOUNDED_LABEL_SENTINEL: &str = "other";
-
-/// Max distinct client-supplied model labels retained before collapsing to the
-/// sentinel. A gateway fronts far fewer real models than this; the cap only bites
-/// on adversarial or unvalidated input.
-const MAX_MODEL_LABELS: usize = 1024;
-
-/// Max distinct client/model-controlled MCP tool-name labels.
-const MAX_TOOL_LABELS: usize = 1024;
-
-static MODEL_LABELS: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
-static TOOL_LABELS: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
-static BOUNDED_LABEL_SENTINEL_ARC: Lazy<Arc<str>> = Lazy::new(|| Arc::from(BOUNDED_LABEL_SENTINEL));
-
-/// Intern a client-controlled label with a hard cardinality cap.
-///
-/// Distinct values beyond `cap` collapse to a shared sentinel, so untrusted input
-/// (client-supplied model names, model-generated tool names) cannot grow the
-/// interner — or the metric's Prometheus series set — without bound. Unlike an LRU,
-/// admitted values are never evicted and re-admitted, which would keep minting new
-/// series in the recorder even as the map churned.
-fn intern_bounded_label(map: &DashMap<String, Arc<str>>, cap: usize, s: &str) -> Arc<str> {
-    if let Some(entry) = map.get(s) {
-        return Arc::clone(entry.value());
-    }
-    // Best-effort cap; a small concurrent overshoot is harmless.
-    if map.len() >= cap {
-        return Arc::clone(&BOUNDED_LABEL_SENTINEL_ARC);
-    }
-    map.entry(s.to_string())
-        .or_insert_with(|| Arc::from(s))
-        .clone()
-}
-
-/// Intern a client-supplied model label, bounded by [`MAX_MODEL_LABELS`].
-fn intern_model_label(model_id: &str) -> Arc<str> {
-    intern_bounded_label(&MODEL_LABELS, MAX_MODEL_LABELS, model_id)
-}
-
-/// Intern a client/model-controlled MCP tool-name label, bounded by
-/// [`MAX_TOOL_LABELS`].
-fn intern_tool_label(tool_name: &str) -> Arc<str> {
-    intern_bounded_label(&TOOL_LABELS, MAX_TOOL_LABELS, tool_name)
-}
-
 // =============================================================================
 // STATIC STRING CONSTANTS
 // =============================================================================
-
-/// Static string constants for boolean labels to avoid allocations.
-pub const STREAMING_TRUE: &str = "true";
-pub const STREAMING_FALSE: &str = "false";
-
-pub const fn bool_to_static_str(b: bool) -> &'static str {
-    if b {
-        STREAMING_TRUE
-    } else {
-        STREAMING_FALSE
-    }
-}
 
 /// Static lookup table for common HTTP status codes to avoid allocations.
 /// Returns a static string for known codes, or None for unknown codes.
@@ -182,7 +127,30 @@ impl Default for PrometheusConfig {
 /// `PrometheusBuilder::upkeep_timeout()` in `start_prometheus`.
 pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 
+/// Marks jemalloc as the final artifact's Rust global allocator.
+///
+/// Call this before [`start_prometheus`] only from a binary or extension that
+/// declares `tikv_jemallocator::Jemalloc` with `#[global_allocator]`. Keeping
+/// this registration at the artifact boundary prevents `smg` rlib consumers
+/// that use the system allocator from publishing statistics for an unused
+/// linked jemalloc instance.
+pub fn register_jemalloc_as_global_allocator() {
+    #[cfg(all(
+        feature = "jemalloc-stats",
+        not(target_env = "msvc"),
+        not(target_env = "musl")
+    ))]
+    allocator_stats::register_global_allocator();
+}
+
 pub(crate) fn init_metrics() {
+    #[cfg(all(
+        feature = "jemalloc-stats",
+        not(target_env = "msvc"),
+        not(target_env = "musl")
+    ))]
+    allocator_stats::describe();
+
     // Layer 1: HTTP metrics
     describe_counter!(
         "smg_http_requests_total",
@@ -208,6 +176,18 @@ pub(crate) fn init_metrics() {
         "smg_http_rate_limit_total",
         "Rate limiting decisions by result (allowed/rejected)"
     );
+    describe_gauge!(
+        "smg_admission_queue_depth",
+        "Requests currently parked in the admission queue"
+    );
+    describe_counter!(
+        "smg_admission_queue_rejected_total",
+        "Requests rejected at admission by reason (full/timeout)"
+    );
+    describe_gauge!(
+        "smg_admission_inflight",
+        "Requests currently holding an admission token"
+    );
 
     // Layer 2: Router metrics
     describe_counter!(
@@ -229,6 +209,14 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_router_upstream_responses_total",
         "Upstream backend HTTP responses by router_type, status_code, error_code"
+    );
+    describe_counter!(
+        "smg_router_request_buffers_released_early_bytes_total",
+        "Serialized size of request buffers freed at dispatch instead of response completion (retries disabled)"
+    );
+    describe_counter!(
+        "smg_router_request_body_path_total",
+        "Per-request body-path decisions by path (streamed/buffered) and dominant reason"
     );
 
     // Layer 2: Router inference metrics (gRPC only)
@@ -293,6 +281,10 @@ pub(crate) fn init_metrics() {
         "smg_worker_health",
         "Worker health status (1=healthy, 0=unhealthy)"
     );
+    describe_gauge!(
+        "smg_worker_http2",
+        "Whether the router speaks HTTP/2 to the worker (1=HTTP/2, 0=HTTP/1.1)"
+    );
     describe_counter!(
         "smg_worker_health_checks_total",
         "Health check results by worker_type and result"
@@ -311,8 +303,33 @@ pub(crate) fn init_metrics() {
          (panic, join_error, intern_failed)"
     );
     describe_gauge!(
+        "smg_workers_overloaded",
+        "Workers currently flagged overloaded and excluded from routing, by model"
+    );
+    describe_counter!(
+        "smg_worker_overload_shed_total",
+        "Requests shed because every worker for the model is overloaded, by stage \
+         (selection, dispatch)"
+    );
+    describe_gauge!(
         "smg_manual_policy_cache_entries",
         "Number of routing entries in manual policy cache"
+    );
+    describe_gauge!(
+        "smg_cache_tree_chars",
+        "Cache-aware string tree cached characters by model (summed across tenants)"
+    );
+    describe_gauge!(
+        "smg_cache_tree_tokens",
+        "Cache-aware token tree cached tokens by model (summed across tenants)"
+    );
+    describe_gauge!(
+        "smg_cache_tree_tenants",
+        "Cache-aware tree tenant count by model and tree (string/token)"
+    );
+    describe_gauge!(
+        "smg_cache_placement_entries",
+        "Cache-aware hash-index placement entries by model (keys with a live holder)"
     );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
@@ -457,6 +474,9 @@ pub(crate) fn init_metrics() {
     // Initialize mesh metrics
     smg_mesh::init_mesh_metrics();
 
+    // RL control plane metrics (emit only when the plane is enabled).
+    smg_rl::init_rl_metrics();
+
     // Priority scheduler metrics (no-op at scrape time unless the scheduler
     // is enabled and recording).
     use crate::middleware::scheduler::metrics as scheduler_metrics;
@@ -507,110 +527,106 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
         )
         .expect("failed to set event loop delay buckets")
         .install_recorder()
+        .inspect(|_| {
+            #[cfg(all(
+                feature = "jemalloc-stats",
+                not(target_env = "msvc"),
+                not(target_env = "musl")
+            ))]
+            allocator_stats::start_reporting();
+        })
         .expect("failed to install Prometheus recorder")
 }
 
-/// Label constants for consistent metric labeling
-pub mod metrics_labels {
-    // Router types
-    pub const ROUTER_OPENAI: &str = "openai";
-    pub const ROUTER_HTTP: &str = "http";
-    pub const ROUTER_GRPC: &str = "grpc";
+#[cfg(all(
+    feature = "jemalloc-stats",
+    not(target_env = "msvc"),
+    not(target_env = "musl")
+))]
+pub(crate) mod allocator_stats {
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    // Backend types
-    pub const BACKEND_REGULAR: &str = "regular";
-    pub const BACKEND_PD: &str = "pd";
-    pub const BACKEND_EXTERNAL: &str = "external";
-    pub const BACKEND_HARMONY: &str = "harmony";
+    use metrics::{describe_gauge, gauge};
 
-    // Connection modes
-    pub const CONNECTION_HTTP: &str = "http";
-    pub const CONNECTION_GRPC: &str = "grpc";
-    pub const CONNECTION_ZMQ: &str = "zmq";
+    static JEMALLOC_IS_GLOBAL: AtomicBool = AtomicBool::new(false);
 
-    // Endpoints
-    pub const ENDPOINT_CHAT: &str = "chat";
-    pub const ENDPOINT_GENERATE: &str = "generate";
-    pub const ENDPOINT_RESPONSES: &str = "responses";
-    pub const ENDPOINT_COMPLETIONS: &str = "completions";
-    pub const ENDPOINT_RERANK: &str = "rerank";
-    pub const ENDPOINT_EMBEDDINGS: &str = "embeddings";
-    pub const ENDPOINT_CLASSIFY: &str = "classify";
-    pub const ENDPOINT_MESSAGES: &str = "messages";
-    pub const ENDPOINT_REALTIME: &str = "realtime";
-    pub const ENDPOINT_REALTIME_SESSIONS: &str = "realtime_sessions";
-    pub const ENDPOINT_REALTIME_CLIENT_SECRETS: &str = "realtime_client_secrets";
-    pub const ENDPOINT_REALTIME_TRANSCRIPTION: &str = "realtime_transcription";
-    pub const ENDPOINT_AUDIO_TRANSCRIPTIONS: &str = "audio_transcriptions";
+    pub(super) fn register_global_allocator() {
+        JEMALLOC_IS_GLOBAL.store(true, Ordering::Release);
+    }
 
-    // Connection modes
-    pub const CONNECTION_WEBSOCKET: &str = "websocket";
-    pub const CONNECTION_WEBRTC: &str = "webrtc";
+    fn is_global_allocator() -> bool {
+        JEMALLOC_IS_GLOBAL.load(Ordering::Acquire)
+    }
 
-    // Worker types
-    pub const WORKER_REGULAR: &str = "regular";
-    pub const WORKER_PREFILL: &str = "prefill";
-    pub const WORKER_DECODE: &str = "decode";
-    pub const WORKER_ENCODE: &str = "encode";
-    pub const WORKER_HTTP: &str = "http";
-    pub const WORKER_GRPC: &str = "grpc";
+    pub(crate) fn describe() {
+        if !is_global_allocator() {
+            return;
+        }
+        describe_gauge!(
+            "smg_allocator_allocated_bytes",
+            "Bytes in live Rust allocations managed by SMG's jemalloc instance"
+        );
+        describe_gauge!(
+            "smg_allocator_active_bytes",
+            "Bytes in active pages for SMG's Rust jemalloc heap"
+        );
+        describe_gauge!(
+            "smg_allocator_resident_bytes",
+            "Upper bound on resident bytes for SMG's Rust jemalloc heap"
+        );
+        describe_gauge!(
+            "smg_allocator_metadata_bytes",
+            "Metadata bytes for SMG's Rust jemalloc instance"
+        );
+    }
 
-    // Token types
-    pub const TOKEN_INPUT: &str = "input";
-    pub const TOKEN_OUTPUT: &str = "output";
+    fn record() {
+        use tikv_jemalloc_ctl::{epoch, stats};
+        if epoch::advance().is_err() {
+            return;
+        }
+        if let Ok(v) = stats::allocated::read() {
+            gauge!("smg_allocator_allocated_bytes").set(v as f64);
+        }
+        if let Ok(v) = stats::active::read() {
+            gauge!("smg_allocator_active_bytes").set(v as f64);
+        }
+        if let Ok(v) = stats::resident::read() {
+            gauge!("smg_allocator_resident_bytes").set(v as f64);
+        }
+        if let Ok(v) = stats::metadata::read() {
+            gauge!("smg_allocator_metadata_bytes").set(v as f64);
+        }
+    }
 
-    // PD KV connector modes (smg_pd_kv_connector_mode_total)
-    pub const KV_CONNECTOR_MOONCAKE: &str = "mooncake";
-    pub const KV_CONNECTOR_NIXL: &str = "nixl";
-    pub const KV_CONNECTOR_PASSTHROUGH: &str = "passthrough";
+    /// Registration at the final-artifact boundary keeps these gauges tied to
+    /// Rust's actual global allocator.
+    pub(crate) fn start_reporting() {
+        if !is_global_allocator() {
+            return;
+        }
+        record();
+        // Plain thread: metrics must not depend on a runtime being alive.
+        let _ = std::thread::Builder::new()
+            .name("smg-allocator-stats".into())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                record();
+            });
+    }
 
-    // Storage types
-    pub const STORAGE_RESPONSE: &str = "response";
-    pub const STORAGE_CONVERSATION: &str = "conversation";
-    pub const STORAGE_CONVERSATION_ITEM: &str = "conversation_item";
-
-    // Database operations
-    pub const DB_OP_GET: &str = "get";
-    pub const DB_OP_PUT: &str = "put";
-    pub const DB_OP_DELETE: &str = "delete";
-    pub const DB_OP_LIST: &str = "list";
-
-    // Result types
-    pub const RESULT_SUCCESS: &str = "success";
-    pub const RESULT_ERROR: &str = "error";
-    pub const RESULT_TIMEOUT: &str = "timeout";
-    pub const RESULT_NOT_FOUND: &str = "not_found";
-
-    // Discovery sources
-    pub const DISCOVERY_STATIC: &str = "static";
-    pub const DISCOVERY_KUBERNETES: &str = "kubernetes";
-    pub const DISCOVERY_CONSUL: &str = "consul";
-    pub const DISCOVERY_MANUAL: &str = "manual";
-
-    // Discovery registration results
-    pub const REGISTRATION_SUCCESS: &str = "success";
-    pub const REGISTRATION_FAILED: &str = "failed";
-    pub const DEREGISTRATION_RECONCILED: &str = "reconciled";
-
-    // Rate limit results
-    pub const RATE_LIMIT_ALLOWED: &str = "allowed";
-    pub const RATE_LIMIT_REJECTED: &str = "rejected";
-
-    // Circuit breaker states
-    pub const CB_CLOSED: &str = "closed";
-    pub const CB_OPEN: &str = "open";
-    pub const CB_HALF_OPEN: &str = "half_open";
-
-    // Circuit breaker outcomes
-    pub const CB_SUCCESS: &str = "success";
-    pub const CB_FAILURE: &str = "failure";
-
-    // Router error types
-    pub const ERROR_NO_WORKERS: &str = "no_workers";
-    pub const ERROR_TIMEOUT: &str = "timeout";
-    pub const ERROR_BACKEND: &str = "backend_error";
-    pub const ERROR_VALIDATION: &str = "validation_error";
-    pub const ERROR_INTERNAL: &str = "internal_error";
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn jemalloc_stats_interface_readable() {
+            use tikv_jemalloc_ctl::{epoch, stats};
+            epoch::advance().expect("epoch advance");
+            stats::allocated::read().expect("stats.allocated readable");
+            stats::active::read().expect("stats.active readable");
+            stats::resident::read().expect("stats.resident readable");
+            stats::metadata::read().expect("stats.metadata readable");
+        }
+    }
 }
 
 /// SMG Metrics helper struct for the new layered metrics architecture.
@@ -641,6 +657,92 @@ pub struct StreamingMetricsParams<'a> {
 }
 
 impl Metrics {
+    pub fn record_router_request(
+        router_type: &'static str,
+        backend_type: &'static str,
+        connection_mode: &'static str,
+        model_id: &str,
+        endpoint: &'static str,
+        streaming: &'static str,
+    ) {
+        RouterMetrics::record_router_request(
+            router_type,
+            backend_type,
+            connection_mode,
+            model_id,
+            endpoint,
+            streaming,
+        );
+    }
+    pub fn record_router_duration(
+        router_type: &'static str,
+        backend_type: &'static str,
+        connection_mode: &'static str,
+        model_id: &str,
+        endpoint: &'static str,
+        duration: Duration,
+    ) {
+        RouterMetrics::record_router_duration(
+            router_type,
+            backend_type,
+            connection_mode,
+            model_id,
+            endpoint,
+            duration,
+        );
+    }
+    pub fn record_router_error(
+        router_type: &'static str,
+        backend_type: &'static str,
+        connection_mode: &'static str,
+        model_id: &str,
+        endpoint: &'static str,
+        error_type: &'static str,
+    ) {
+        RouterMetrics::record_router_error(
+            router_type,
+            backend_type,
+            connection_mode,
+            model_id,
+            endpoint,
+            error_type,
+        );
+    }
+    pub fn record_router_tokens(
+        router_type: &'static str,
+        backend_type: &'static str,
+        model_id: &str,
+        endpoint: &'static str,
+        token_type: &'static str,
+        count: u64,
+    ) {
+        RouterMetrics::record_router_tokens(
+            router_type,
+            backend_type,
+            model_id,
+            endpoint,
+            token_type,
+            count,
+        );
+    }
+    pub fn record_worker_retry(worker_type: &'static str, endpoint: &'static str) {
+        RouterMetrics::record_worker_retry(worker_type, endpoint);
+    }
+    pub fn record_worker_retries_exhausted(worker_type: &'static str, endpoint: &'static str) {
+        RouterMetrics::record_worker_retries_exhausted(worker_type, endpoint);
+    }
+    pub fn record_worker_retry_backoff(attempt: u32, duration: Duration) {
+        RouterMetrics::record_worker_retry_backoff(attempt, duration);
+    }
+    pub fn record_mcp_tool_call(model_id: &str, tool_name: &str, result: &'static str) {
+        RouterMetrics::record_mcp_tool_call(model_id, tool_name, result);
+    }
+    pub fn record_mcp_tool_duration(model_id: &str, tool_name: &str, duration: Duration) {
+        RouterMetrics::record_mcp_tool_duration(model_id, tool_name, duration);
+    }
+    pub fn record_mcp_tool_iteration(model_id: &str) {
+        RouterMetrics::record_mcp_tool_iteration(model_id);
+    }
     /// Record an HTTP request.
     /// Here we want a metric to directly reflect user's experience ("I am sending a request")
     /// when viewing the router as a blackbox, and is bumped immediately when the request arrives.
@@ -694,6 +796,35 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Track a request entering the admission queue.
+    pub fn record_admission_queue_entered() {
+        gauge!("smg_admission_queue_depth").increment(1.0);
+    }
+
+    /// Track a request leaving the admission queue (admitted, rejected, or cancelled).
+    pub fn record_admission_queue_exited() {
+        gauge!("smg_admission_queue_depth").decrement(1.0);
+    }
+
+    /// Record a request rejected at admission.
+    pub fn record_admission_rejected(reason: &'static str) {
+        counter!(
+            "smg_admission_queue_rejected_total",
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Track acquisition of an admission token.
+    pub fn record_admission_inflight_acquired() {
+        gauge!("smg_admission_inflight").increment(1.0);
+    }
+
+    /// Track release of an admission token.
+    pub fn record_admission_inflight_released() {
+        gauge!("smg_admission_inflight").decrement(1.0);
+    }
+
     /// Record one multimodal tensor sent over `path` ("inline"|"shm"|"remote") for `runtime`.
     pub fn record_mm_tensor(runtime: &'static str, path: &'static str, nbytes: usize) {
         counter!("smg_mm_tensors_total", "runtime" => runtime, "path" => path).increment(1);
@@ -710,78 +841,6 @@ impl Metrics {
     // Layer 2: Router metrics
     // ========================================================================
 
-    /// Record a routed request.
-    ///
-    /// Uses string interning for model_id to avoid repeated allocations.
-    ///
-    /// # Arguments
-    /// * `streaming` - Use `bool_to_static_str(request.stream)` or the constants
-    pub fn record_router_request(
-        router_type: &'static str,
-        backend_type: &'static str,
-        connection_mode: &'static str,
-        model_id: &str,
-        endpoint: &'static str,
-        streaming: &'static str,
-    ) {
-        let model = intern_model_label(model_id);
-        counter!(
-            "smg_router_requests_total",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "connection_mode" => connection_mode,
-            "model" => model,
-            "endpoint" => endpoint,
-            "streaming" => streaming
-        )
-        .increment(1);
-    }
-
-    /// Record router request duration.
-    /// Uses string interning for model_id.
-    pub fn record_router_duration(
-        router_type: &'static str,
-        backend_type: &'static str,
-        connection_mode: &'static str,
-        model_id: &str,
-        endpoint: &'static str,
-        duration: Duration,
-    ) {
-        let model = intern_model_label(model_id);
-        histogram!(
-            "smg_router_request_duration_seconds",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "connection_mode" => connection_mode,
-            "model" => model,
-            "endpoint" => endpoint
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    /// Record a router error.
-    /// Uses string interning for model_id.
-    pub fn record_router_error(
-        router_type: &'static str,
-        backend_type: &'static str,
-        connection_mode: &'static str,
-        model_id: &str,
-        endpoint: &'static str,
-        error_type: &'static str,
-    ) {
-        let model = intern_model_label(model_id);
-        counter!(
-            "smg_router_request_errors_total",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "connection_mode" => connection_mode,
-            "model" => model,
-            "endpoint" => endpoint,
-            "error_type" => error_type
-        )
-        .increment(1);
-    }
-
     /// Record pipeline stage duration (gRPC only).
     /// All labels are static, so this is very fast.
     pub fn record_router_stage_duration(
@@ -795,6 +854,31 @@ impl Metrics {
             "stage" => stage
         )
         .record(duration.as_secs_f64());
+    }
+
+    /// Record a single-shot resend after a pre-response transport failure.
+    pub fn record_upstream_send_retry(router_type: &'static str) {
+        counter!(
+            "smg_router_upstream_send_retries_total",
+            "router_type" => router_type
+        )
+        .increment(1);
+    }
+
+    /// Record one per-request body-path decision with its dominant reason.
+    pub fn record_request_body_path(path: &'static str, reason: &'static str) {
+        counter!(
+            "smg_router_request_body_path_total",
+            "path" => path,
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Record request buffers freed at dispatch (retries disabled), sized by
+    /// the serialized upstream body.
+    pub fn record_request_buffers_released_early(bytes: usize) {
+        counter!("smg_router_request_buffers_released_early_bytes_total").increment(bytes as u64);
     }
 
     /// Record upstream backend response.
@@ -856,27 +940,6 @@ impl Metrics {
             "endpoint" => endpoint
         )
         .record(duration.as_secs_f64());
-    }
-
-    /// Record tokens processed
-    pub fn record_router_tokens(
-        router_type: &'static str,
-        backend_type: &'static str,
-        model_id: &str,
-        endpoint: &'static str,
-        token_type: &'static str,
-        count: u64,
-    ) {
-        let model = intern_model_label(model_id);
-        counter!(
-            "smg_router_tokens_total",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "model" => model,
-            "endpoint" => endpoint,
-            "token_type" => token_type
-        )
-        .increment(count);
     }
 
     /// Record total generation duration.
@@ -1066,6 +1129,16 @@ impl Metrics {
         counter!("smg_pd_kv_transfer_failures_total").increment(1);
     }
 
+    /// Record a PD dispatch that had to wait for a decode admission slot.
+    pub fn record_pd_admission_wait() {
+        counter!("smg_pd_admission_waits_total").increment(1);
+    }
+
+    /// Record a PD dispatch shed because no decode slot freed in time.
+    pub fn record_pd_admission_shed() {
+        counter!("smg_pd_admission_sheds_total").increment(1);
+    }
+
     // ========================================================================
     // Layer 3: Worker metrics
     // ========================================================================
@@ -1144,6 +1217,23 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Set the count of workers a model currently has vetoed by the absolute
+    /// overload guard. Written only when a worker's flag transitions.
+    pub fn set_workers_overloaded(model_id: &str, count: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_workers_overloaded", "model" => model).set(count as f64);
+    }
+
+    /// Record a request shed because every worker for the model is overloaded.
+    /// `stage` is "selection" or "dispatch".
+    pub fn record_worker_overload_shed(stage: &'static str) {
+        counter!(
+            "smg_worker_overload_shed_total",
+            "stage" => stage
+        )
+        .increment(1);
+    }
+
     /// Record manual policy execution branch for routing decisions
     pub fn record_worker_manual_policy_branch(branch: &'static str) {
         counter!(
@@ -1156,6 +1246,39 @@ impl Metrics {
     /// Set manual policy cache entries count
     pub fn set_manual_policy_cache_entries(count: usize) {
         gauge!("smg_manual_policy_cache_entries").set(count as f64);
+    }
+
+    /// Record which source supplied the sticky routing key for a keyed request
+    pub fn record_routing_key_source(source: &'static str) {
+        counter!(
+            "smg_routing_key_source_total",
+            "source" => source
+        )
+        .increment(1);
+    }
+
+    /// Set cache-aware string-tree cached characters for a model
+    pub fn set_cache_tree_chars(model_id: &str, chars: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_cache_tree_chars", "model" => model).set(chars as f64);
+    }
+
+    /// Set cache-aware token-tree cached tokens for a model
+    pub fn set_cache_tree_tokens(model_id: &str, tokens: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_cache_tree_tokens", "model" => model).set(tokens as f64);
+    }
+
+    /// Set cache-aware tree tenant count for a model and tree kind ("string"/"token")
+    pub fn set_cache_tree_tenants(model_id: &str, tree: &'static str, count: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_cache_tree_tenants", "model" => model, "tree" => tree).set(count as f64);
+    }
+
+    /// Set cache-aware hash-index placement entry count for a model
+    pub fn set_cache_placement_entries(model_id: &str, count: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_cache_placement_entries", "model" => model).set(count as f64);
     }
 
     /// Record consistent hashing policy execution branch for routing decisions
@@ -1204,6 +1327,15 @@ impl Metrics {
             "worker" => worker_interned
         )
         .set(if healthy { 1.0 } else { 0.0 });
+    }
+
+    pub fn set_worker_http2(worker_url: &str, http2: bool) {
+        let worker_interned = intern_string(worker_url);
+        gauge!(
+            "smg_worker_http2",
+            "worker" => worker_interned
+        )
+        .set(if http2 { 1.0 } else { 0.0 });
     }
 
     /// Record a KV event subscription task failure (panic, join error, or
@@ -1279,43 +1411,6 @@ impl Metrics {
     // Layer 3: Worker resilience metrics (retry)
     // ========================================================================
 
-    /// Record retry attempt
-    pub fn record_worker_retry(worker_type: &'static str, endpoint: &'static str) {
-        counter!(
-            "smg_worker_retries_total",
-            "worker_type" => worker_type,
-            "endpoint" => endpoint
-        )
-        .increment(1);
-    }
-
-    /// Record retries exhausted
-    pub fn record_worker_retries_exhausted(worker_type: &'static str, endpoint: &'static str) {
-        counter!(
-            "smg_worker_retries_exhausted_total",
-            "worker_type" => worker_type,
-            "endpoint" => endpoint
-        )
-        .increment(1);
-    }
-
-    /// Record retry backoff duration.
-    pub fn record_worker_retry_backoff(attempt: u32, duration: Duration) {
-        let attempt_str: Cow<'static, str> = match attempt {
-            1 => Cow::Borrowed("1"),
-            2 => Cow::Borrowed("2"),
-            3 => Cow::Borrowed("3"),
-            4 => Cow::Borrowed("4"),
-            5 => Cow::Borrowed("5"),
-            _ => Cow::Owned(attempt.to_string()),
-        };
-        histogram!(
-            "smg_worker_retry_backoff_seconds",
-            "attempt" => attempt_str
-        )
-        .record(duration.as_secs_f64());
-    }
-
     // ========================================================================
     // Layer 4: Discovery metrics
     // ========================================================================
@@ -1362,44 +1457,9 @@ impl Metrics {
     // Layer 5: MCP metrics
     // ========================================================================
 
-    /// Record MCP tool call
-    pub fn record_mcp_tool_call(model_id: &str, tool_name: &str, result: &'static str) {
-        let model = intern_model_label(model_id);
-        let tool = intern_tool_label(tool_name);
-        counter!(
-            "smg_mcp_tool_calls_total",
-            "model" => model,
-            "tool_name" => tool,
-            "result" => result
-        )
-        .increment(1);
-    }
-
-    /// Record MCP tool execution duration
-    pub fn record_mcp_tool_duration(model_id: &str, tool_name: &str, duration: Duration) {
-        let model = intern_model_label(model_id);
-        let tool = intern_tool_label(tool_name);
-        histogram!(
-            "smg_mcp_tool_duration_seconds",
-            "model" => model,
-            "tool_name" => tool
-        )
-        .record(duration.as_secs_f64());
-    }
-
     /// Set active MCP servers count
     pub fn set_mcp_servers_active(count: usize) {
         gauge!("smg_mcp_servers_active").set(count as f64);
-    }
-
-    /// Record MCP tool loop iteration
-    pub fn record_mcp_tool_iteration(model_id: &str) {
-        let model = intern_model_label(model_id);
-        counter!(
-            "smg_mcp_tool_iterations_total",
-            "model" => model
-        )
-        .increment(1);
     }
 
     // ========================================================================
@@ -1634,31 +1694,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn intern_bounded_label_caps_cardinality_with_sentinel() {
-        let map: DashMap<String, Arc<str>> = DashMap::new();
-
-        let a = intern_bounded_label(&map, 2, "m1");
-        let b = intern_bounded_label(&map, 2, "m2");
-        assert_eq!(map.len(), 2);
-
-        // Repeats return the same interned Arc without growing the map.
-        let a2 = intern_bounded_label(&map, 2, "m1");
-        assert!(Arc::ptr_eq(&a, &a2));
-        assert_eq!(map.len(), 2);
-
-        // A distinct value past the cap collapses to the sentinel and does not
-        // grow the map, so no new Prometheus series is minted for it.
-        let c = intern_bounded_label(&map, 2, "m3");
-        assert_eq!(&*c, BOUNDED_LABEL_SENTINEL);
-        assert_eq!(map.len(), 2);
-
-        // Already-admitted values still resolve normally after the cap is hit.
-        let b2 = intern_bounded_label(&map, 2, "m2");
-        assert!(Arc::ptr_eq(&b, &b2));
-        assert_ne!(&*a, BOUNDED_LABEL_SENTINEL);
-    }
-
     /// Run `f` under a thread-local Prometheus recorder and return the
     /// rendered `/metrics` text — the same scrape output the :29000 endpoint
     /// serves in production.
@@ -1703,6 +1738,7 @@ mod tests {
                 cache_hit_rate: 0.25,
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let rendered = render_with_recorder(|| {
@@ -1735,6 +1771,7 @@ mod tests {
                 decode_queue_reqs: Some(4),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let rendered = render_with_recorder(|| {
@@ -1760,6 +1797,33 @@ mod tests {
             &pd_labels,
             "4",
         );
+    }
+
+    #[test]
+    fn cache_tree_setters_emit_per_model_gauges() {
+        let rendered = render_with_recorder(|| {
+            Metrics::set_cache_tree_chars("m", 120);
+            Metrics::set_cache_tree_tokens("m", 64);
+            Metrics::set_cache_tree_tenants("m", "string", 3);
+            Metrics::set_cache_tree_tenants("m", "token", 2);
+        });
+
+        assert_metric(&rendered, "smg_cache_tree_chars", &["model=\"m\""], "120");
+        assert_metric(&rendered, "smg_cache_tree_tokens", &["model=\"m\""], "64");
+        // Two tenant series (one per tree kind); series order within the
+        // family is exporter-defined, so match each line independently.
+        for (tree, value) in [("string", "3"), ("token", "2")] {
+            let label = format!("tree=\"{tree}\"");
+            assert!(
+                rendered.lines().any(|l| {
+                    l.starts_with("smg_cache_tree_tenants{")
+                        && l.contains("model=\"m\"")
+                        && l.contains(&label)
+                        && l.ends_with(&format!(" {value}"))
+                }),
+                "smg_cache_tree_tenants {tree} series missing; rendered:\n{rendered}"
+            );
+        }
     }
 
     #[test]

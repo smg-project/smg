@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import logging
 
+import openai
 import pytest
+import smg_client
 
 logger = logging.getLogger(__name__)
 
@@ -108,21 +110,43 @@ class TestEmbeddingBasic:
     def test_embedding_empty_string(self, model, api_client):
         """Test embedding with empty string input.
 
-        Some models may handle empty strings differently.
-        This test verifies the API doesn't crash on empty input.
+        Contract: an empty-string input must either be embedded successfully
+        (one embedding with the model's usual dimension) or be rejected with a
+        4xx client error. Anything else — a 5xx, a transport error, a malformed
+        success body — is a bug and must fail the test.
+
+        Note: the test has swallowed both outcomes since its introduction
+        (see #812/#834 refactors), so the behavior current engines exhibit was
+        never recorded; the GPU lanes pin it down via this two-branch assert.
         """
+
+        # Probe the model's embedding dimension with a known-good input.
+        probe = api_client.embeddings.create(model=model, input="dimension probe")
+        expected_dim = len(probe.data[0].embedding)
+        assert expected_dim > 0
 
         try:
             response = api_client.embeddings.create(
                 model=model,
                 input="",
             )
-            # If it succeeds, verify structure
-            assert len(response.data) >= 1
-            logger.info("Empty string embedding succeeded")
-        except Exception as e:
-            # Some models may reject empty strings - that's acceptable
-            logger.info("Empty string embedding rejected: %s", e)
+        except (openai.APIStatusError, smg_client.ApiError) as e:
+            # Rejection is acceptable only as a client error (4xx).
+            assert 400 <= e.status_code < 500, (
+                f"Empty string input must be rejected with a 4xx client error, "
+                f"got HTTP {e.status_code}: {e}"
+            )
+            logger.info("Empty string embedding rejected with HTTP %d", e.status_code)
+        else:
+            # Acceptance must produce exactly one well-formed embedding.
+            assert len(response.data) == 1, (
+                f"Expected exactly 1 embedding for empty string, got {len(response.data)}"
+            )
+            assert len(response.data[0].embedding) == expected_dim, (
+                f"Empty string embedding dimension {len(response.data[0].embedding)} "
+                f"differs from model dimension {expected_dim}"
+            )
+            logger.info("Empty string embedding succeeded (%d dims)", expected_dim)
 
     def test_embedding_unicode(self, model, api_client):
         """Test embedding with unicode characters.

@@ -2,9 +2,9 @@ name: Release SMG+TRTLLM Docker Image
 
 run-name: >-
   SMG+TRTLLM |
-  ${{ github.event_name == 'push' && '3-version matrix' || format('base={0}', inputs.base_image_ref || 'nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22') }} |
+  ${{ github.event_name == 'push' && '3-version matrix' || format('base={0}', inputs.base_image_ref || 'nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24') }} |
   engine=${{ inputs.trtllm_commit || 'latest' }} |
-  smg=${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.9.0' }} |
+  smg=${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.10.1' }} |
   ${{ github.event_name == 'pull_request' && 'dry-run |' || '' }}
   by @${{ github.actor }}
 
@@ -23,8 +23,8 @@ on:
   workflow_dispatch:
     inputs:
       base_image_ref:
-        description: 'Base image (e.g. nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22). Empty = build from source.'
-        default: 'nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22'
+        description: 'Base image (e.g. nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24). Empty = build from source.'
+        default: 'nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24'
         required: false
         type: string
       trtllm_repo:
@@ -44,10 +44,10 @@ on:
       smg_commit:
         description: 'SMG commit/ref ("latest" for HEAD)'
         required: false
-        default: 'v1.9.0'
+        default: 'v1.10.1'
         type: string
       tag:
-        description: 'Override image tag (e.g. v1.9.0-trtllm-1.3.0)'
+        description: 'Override image tag (e.g. v1.10.1-trtllm-1.3.0)'
         required: false
         type: string
 
@@ -60,7 +60,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        base_image: ${{ github.event_name == 'push' && fromJSON('["nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22","nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc21","nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc20"]') || fromJSON(format('["{0}"]', inputs.base_image_ref || 'nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22')) }}
+        base_image: ${{ github.event_name == 'push' && fromJSON('["nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24","nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc23","nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22"]') || fromJSON(format('["{0}"]', inputs.base_image_ref || 'nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24')) }}
     uses: ./.github/workflows/_build-engine-image.yml
     with:
       engine: trtllm
@@ -68,7 +68,7 @@ jobs:
       engine_repo: ${{ inputs.trtllm_repo }}
       engine_commit: ${{ inputs.trtllm_commit || 'latest' }}
       smg_repo: ${{ inputs.smg_repo || 'https://github.com/smg-project/smg' }}
-      smg_commit: ${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.9.0' }}
+      smg_commit: ${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.10.1' }}
       tag: ${{ inputs.tag }}
       source_build_repo: ${{ inputs.trtllm_repo }}
       source_build_ref: ${{ inputs.trtllm_commit || 'latest' }}

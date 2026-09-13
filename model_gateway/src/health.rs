@@ -65,8 +65,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     config::{RouterConfig, RoutingMode},
+    middleware::ProbeResponse,
     observability::inflight_tracker::InFlightRequestTracker,
-    worker::{event::WorkerEvent, ConnectionMode, WorkerRegistry, WorkerType},
+    worker::{event::WorkerEvent, WorkerRegistry, WorkerType},
 };
 
 /// How often the maintainer re-derives readiness from the registry even
@@ -81,11 +82,10 @@ const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 /// values the `/readiness` handler used to compute inline per probe.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReadinessSnapshot {
-    /// Per-mode worker presence: any healthy worker (IGW or single-pool
-    /// modes), or at least one healthy prefill AND one healthy decode
-    /// worker in PrefillDecode mode.
+    /// Per-mode worker presence: any healthy worker in a single-pool mode,
+    /// or at least one healthy worker for every required disaggregated role.
     pub workers_ready: bool,
-    /// Tokenizer-autoload gate: every healthy gRPC worker's tokenizer is
+    /// Tokenizer-autoload gate: every healthy gRPC/ZMQ worker's tokenizer is
     /// registered (`true` when autoload is disabled — the gateway does not
     /// manage tokenizers at all then).
     pub tokenizers_ready: bool,
@@ -156,7 +156,11 @@ impl ProbeState {
         let workers = worker_registry.get_all();
         let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
 
-        let workers_ready = if router_config.enable_igw {
+        let workers_ready = if router_config.enable_igw
+            && !matches!(
+                &router_config.mode,
+                RoutingMode::PrefillDecode { .. } | RoutingMode::EncodePrefillDecode { .. }
+            ) {
             !healthy_workers.is_empty()
         } else {
             match &router_config.mode {
@@ -189,18 +193,19 @@ impl ProbeState {
         };
 
         // A worker reports healthy (engine SERVING) as soon as its process is
-        // up, but the gateway autoloads each gRPC worker's tokenizer
+        // up, but the gateway autoloads each gRPC-pipeline worker's tokenizer
         // asynchronously afterward (`SubmitTokenizerJobStep`,
         // fire-and-forget). Until that lands, generation requests fail with
         // `tokenizer_not_found`, so `/readiness` must not report ready yet.
-        // Hold readiness until every healthy gRPC worker's tokenizer is
-        // registered. HTTP/proxy workers never autoload a local tokenizer
-        // and are exempt; when autoload is disabled the gateway does not
-        // manage tokenizers at all.
+        // Hold readiness until every healthy gRPC and ZMQ worker's tokenizer
+        // is registered — both ride the gRPC pipeline and speak tokens on the
+        // wire. HTTP/proxy workers never autoload a local tokenizer and are
+        // exempt; when autoload is disabled the gateway does not manage
+        // tokenizers at all.
         let tokenizers_ready = router_config.disable_tokenizer_autoload
             || healthy_workers
                 .iter()
-                .filter(|w| matches!(w.connection_mode(), ConnectionMode::Grpc))
+                .filter(|w| w.connection_mode().uses_grpc_pipeline())
                 .all(|w| tokenizer_registered(w.model_id()));
 
         self.readiness.store(Arc::new(ReadinessSnapshot {
@@ -220,41 +225,47 @@ impl ProbeState {
     /// during shutdown (liveness intentionally stays OK — see module docs).
     pub fn readiness_response(&self) -> Response {
         if self.inflight_tracker.is_draining() {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "status": "not ready",
-                    "reason": "draining"
-                })),
-            )
-                .into_response();
+            return mark_probe(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "status": "not ready",
+                        "reason": "draining"
+                    })),
+                )
+                    .into_response(),
+            );
         }
 
         let snapshot = self.readiness.load();
         if snapshot.workers_ready && snapshot.tokenizers_ready {
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "status": "ready",
-                    "healthy_workers": snapshot.healthy_workers,
-                    "total_workers": snapshot.total_workers
-                })),
+            mark_probe(
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "ready",
+                        "healthy_workers": snapshot.healthy_workers,
+                        "total_workers": snapshot.total_workers
+                    })),
+                )
+                    .into_response(),
             )
-                .into_response()
         } else {
             let reason = if snapshot.workers_ready {
                 "tokenizer not yet registered"
             } else {
                 "insufficient healthy workers"
             };
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "status": "not ready",
-                    "reason": reason
-                })),
+            mark_probe(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "status": "not ready",
+                        "reason": reason
+                    })),
+                )
+                    .into_response(),
             )
-                .into_response()
         }
     }
 }
@@ -263,7 +274,15 @@ impl ProbeState {
 /// deliberately stays OK while draining: the process is healthy, it is
 /// just not accepting new work.
 pub fn liveness_response() -> Response {
-    (StatusCode::OK, "OK").into_response()
+    mark_probe((StatusCode::OK, "OK").into_response())
+}
+
+/// Attach the [`ProbeResponse`] logging marker: probe statuses (503 "not
+/// ready" included) are expected states polled on a tight interval, and the
+/// HTTP logging layer demotes marked responses to DEBUG.
+fn mark_probe(mut response: Response) -> Response {
+    response.extensions_mut().insert(ProbeResponse);
+    response
 }
 
 /// Spawn the readiness maintainer: recomputes the snapshot on every
@@ -468,7 +487,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ModelCard, Worker};
+    use crate::worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker};
 
     fn worker(
         url: &str,
@@ -569,15 +588,18 @@ mod tests {
     }
 
     #[test]
-    fn pd_mode_requires_healthy_prefill_and_decode() {
+    fn pd_mode_requires_healthy_prefill_and_decode_with_igw() {
         let state = probe_state();
         let registry = WorkerRegistry::new();
-        let router_config = config(RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: None,
-        });
+        let router_config = RouterConfig {
+            enable_igw: true,
+            ..config(RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            })
+        };
 
         let prefill_id = registry
             .register(worker(
@@ -606,36 +628,32 @@ mod tests {
         recompute(&state, &registry, &router_config);
         assert!(state.readiness().workers_ready);
 
-        // Losing the prefill side flips readiness back off.
         registry.transition_status(&prefill_id, WorkerStatus::NotReady);
         recompute(&state, &registry, &router_config);
         assert!(!state.readiness().workers_ready);
     }
 
     #[test]
-    fn igw_mode_needs_any_healthy_worker_regardless_of_mode() {
+    fn igw_epd_does_not_accept_an_untyped_healthy_worker() {
         let state = probe_state();
         let registry = WorkerRegistry::new();
-        // PD mode would demand prefill+decode, but enable_igw short-circuits
-        // to "any healthy worker".
         let router_config = RouterConfig {
             enable_igw: true,
-            ..config(RoutingMode::PrefillDecode {
+            ..config(RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![],
                 prefill_urls: vec![],
                 decode_urls: vec![],
+                encode_policy: None,
                 prefill_policy: None,
                 decode_policy: None,
             })
         };
 
-        recompute(&state, &registry, &router_config);
-        assert!(!state.readiness().workers_ready);
-
         registry
             .register(http_worker("http://w1:8080", WorkerStatus::Ready))
             .unwrap();
         recompute(&state, &registry, &router_config);
-        assert!(state.readiness().workers_ready);
+        assert!(!state.readiness().workers_ready);
     }
 
     #[test]
@@ -674,6 +692,39 @@ mod tests {
         };
         state.recompute_with(&registry, &no_autoload, |_| false);
         assert!(state.readiness().tokenizers_ready);
+    }
+
+    /// ZMQ workers ride the same gRPC pipeline and the same fire-and-forget
+    /// tokenizer autoload, and their wire is token-only, so they must gate
+    /// readiness exactly like gRPC workers.
+    #[test]
+    fn zmq_workers_gate_readiness_on_tokenizer_registration() {
+        let state = probe_state();
+        let registry = WorkerRegistry::new();
+        let router_config = regular_config();
+
+        registry
+            .register(worker(
+                "ipc:///tmp/smg-z1",
+                "llama-3",
+                WorkerType::Regular,
+                ConnectionMode::Zmq,
+                WorkerStatus::Ready,
+            ))
+            .unwrap();
+
+        state.recompute_with(&registry, &router_config, |_| false);
+        let snapshot = state.readiness();
+        assert!(snapshot.workers_ready);
+        assert!(!snapshot.tokenizers_ready);
+        assert_eq!(
+            state.readiness_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        state.recompute_with(&registry, &router_config, |model_id| model_id == "llama-3");
+        assert!(state.readiness().tokenizers_ready);
+        assert_eq!(state.readiness_response().status(), StatusCode::OK);
     }
 
     #[test]
@@ -742,6 +793,32 @@ mod tests {
             StatusCode::OK,
             "liveness must stay OK while draining"
         );
+    }
+
+    /// Every probe response — ready and not-ready alike — must carry the
+    /// [`ProbeResponse`] marker, or the HTTP logging layer floods ERROR with
+    /// expected not-ready 503s on every poll (two lines per 2s in the e2e
+    /// gateway logs before this marker existed).
+    #[tokio::test]
+    async fn probe_responses_carry_the_logging_marker() {
+        let inflight_tracker = InFlightRequestTracker::new();
+        let state = ProbeState::new(inflight_tracker.clone());
+
+        // Not ready (initial snapshot), ready is irrelevant to the marker:
+        // check the 503 path, the liveness 200 path, and the draining path.
+        let not_ready = state.readiness_response();
+        assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(not_ready.extensions().get::<ProbeResponse>().is_some());
+
+        assert!(liveness_response()
+            .extensions()
+            .get::<ProbeResponse>()
+            .is_some());
+
+        inflight_tracker.begin_drain();
+        let draining = state.readiness_response();
+        assert_eq!(draining.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(draining.extensions().get::<ProbeResponse>().is_some());
     }
 
     async fn get_probe(router: &Router, path: &str) -> (StatusCode, String) {

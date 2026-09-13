@@ -1,6 +1,5 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::OnceLock};
 
-use llm_tokenizer::TokenizerTrait;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -19,6 +18,8 @@ pub enum ModelRegistryError {
     TokenNotFound { token: String },
     #[error("missing config field '{field}'")]
     MissingConfigField { field: String },
+    #[error("invalid or missing preprocessed field '{field}'")]
+    InvalidPreprocessedField { field: String },
     #[error("model spec {spec} could not encode '{text}' with the model tokenizer")]
     TextEncodingFailed { spec: &'static str, text: String },
     #[error("modality {modality} is not supported by model spec {spec}")]
@@ -42,6 +43,67 @@ pub enum ModelRegistryError {
 
 pub type RegistryResult<T> = Result<T, ModelRegistryError>;
 
+static IMAGE_MAX_COUNT_OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
+static VIDEO_MAX_COUNT_OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
+static AUDIO_MAX_COUNT_OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
+
+fn env_count_override(cache: &'static OnceLock<Option<usize>>, env_var: &str) -> Option<usize> {
+    *cache.get_or_init(|| {
+        std::env::var(env_var)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|count| *count > 0)
+    })
+}
+
+/// Deployment-wide override of a spec's per-request media-count limit.
+///
+/// The override replaces the spec's declared limit (it can raise or lower
+/// it) but never enables a modality the spec does not declare. Unset,
+/// non-numeric, or zero values are ignored.
+fn modality_limit_override(modality: Modality) -> Option<usize> {
+    match modality {
+        Modality::Image => env_count_override(&IMAGE_MAX_COUNT_OVERRIDE, "SMG_IMAGE_MAX_COUNT"),
+        Modality::Video => env_count_override(&VIDEO_MAX_COUNT_OVERRIDE, "SMG_VIDEO_MAX_COUNT"),
+        Modality::Audio => env_count_override(&AUDIO_MAX_COUNT_OVERRIDE, "SMG_AUDIO_MAX_COUNT"),
+        Modality::ImageEmbeds => None,
+    }
+}
+
+fn check_media_counts(
+    spec: &'static str,
+    limits: &HashMap<Modality, usize>,
+    requested: &[(Modality, usize)],
+    limit_override: impl Fn(Modality) -> Option<usize>,
+) -> RegistryResult<()> {
+    let mut active = Vec::with_capacity(requested.len());
+
+    for &(modality, count) in requested {
+        if count == 0 {
+            continue;
+        }
+        if active.contains(&modality) {
+            return Err(ModelRegistryError::DuplicateModality { spec, modality });
+        }
+        active.push(modality);
+
+        let Some(&limit) = limits.get(&modality) else {
+            return Err(ModelRegistryError::UnsupportedModality { spec, modality });
+        };
+        let limit = limit_override(modality).unwrap_or(limit);
+        if count > limit {
+            return Err(ModelRegistryError::ModalityLimitExceeded {
+                spec,
+                modality,
+                limit,
+                requested: count,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Ordering of media and text parts when rendering a multipart message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaPartOrder {
@@ -51,10 +113,28 @@ pub enum MediaPartOrder {
     Authored,
 }
 
+/// The tokenizer surface the registry needs: resolving placeholder and
+/// structural token ids, and encoding the short text fragments some families
+/// splice into their media wrappers (e.g. an `image {W}x{H}` header).
+///
+/// Deliberately local: callers adapt whatever tokenizer they hold to this
+/// trait, and this crate stays free of any tokenizer crate's dependency tree.
+pub trait Tokenizer: Send + Sync {
+    /// The token id for a token string, if the vocabulary knows it.
+    fn token_to_id(&self, token: &str) -> Option<u32>;
+
+    /// The token string for a token id, if the vocabulary knows it.
+    fn id_to_token(&self, id: u32) -> Option<String>;
+
+    /// Encode plain text (no special tokens) into token ids; `None` when the
+    /// text cannot be encoded.
+    fn encode_text(&self, text: &str) -> Option<Vec<u32>>;
+}
+
 /// Metadata about the current model used to derive tokenizer/config dependent fields.
 pub struct ModelMetadata<'a> {
     pub model_id: &'a str,
-    pub tokenizer: &'a dyn TokenizerTrait,
+    pub tokenizer: &'a dyn Tokenizer,
     pub config: &'a Value,
 }
 
@@ -131,44 +211,32 @@ pub trait ModelProcessorSpec: Send + Sync {
     ///
     /// Any subset of the modalities declared by [`Self::modality_limits`] is
     /// accepted. Each modality may appear once in `requested`; zero-count
-    /// entries are ignored.
+    /// entries are ignored. Per-modality limits can be overridden
+    /// deployment-wide via `SMG_IMAGE_MAX_COUNT`, `SMG_VIDEO_MAX_COUNT`, and
+    /// `SMG_AUDIO_MAX_COUNT`.
     fn validate_media_request(
         &self,
         metadata: &ModelMetadata,
         requested: &[(Modality, usize)],
     ) -> RegistryResult<()> {
+        self.validate_media_request_with_limits(metadata, requested, &HashMap::new())
+    }
+
+    /// [`Self::validate_media_request`] with caller-supplied per-modality limit
+    /// overrides; each replaces the spec limit and beats the env override.
+    fn validate_media_request_with_limits(
+        &self,
+        metadata: &ModelMetadata,
+        requested: &[(Modality, usize)],
+        limit_overrides: &HashMap<Modality, usize>,
+    ) -> RegistryResult<()> {
         let limits = self.modality_limits(metadata)?;
-        let mut active = Vec::with_capacity(requested.len());
-
-        for &(modality, count) in requested {
-            if count == 0 {
-                continue;
-            }
-            if active.contains(&modality) {
-                return Err(ModelRegistryError::DuplicateModality {
-                    spec: self.name(),
-                    modality,
-                });
-            }
-            active.push(modality);
-
-            let Some(&limit) = limits.get(&modality) else {
-                return Err(ModelRegistryError::UnsupportedModality {
-                    spec: self.name(),
-                    modality,
-                });
-            };
-            if count > limit {
-                return Err(ModelRegistryError::ModalityLimitExceeded {
-                    spec: self.name(),
-                    modality,
-                    limit,
-                    requested: count,
-                });
-            }
-        }
-
-        Ok(())
+        check_media_counts(self.name(), &limits, requested, |modality| {
+            limit_overrides
+                .get(&modality)
+                .copied()
+                .or_else(|| modality_limit_override(modality))
+        })
     }
 
     fn processor_kwargs(&self, metadata: &ModelMetadata) -> RegistryResult<Value>;
@@ -353,6 +421,109 @@ mod tests {
                 spec: "test",
                 modality: Modality::Image,
             })
+        );
+    }
+
+    #[test]
+    fn caller_limit_override_replaces_spec_limit() {
+        let tokenizer = TestTokenizer::new(&[]);
+        let config = json!({});
+        let metadata = ModelMetadata {
+            model_id: "test-model",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let overrides = HashMap::from([(Modality::Image, 5)]);
+
+        // TestSpec declares Image=2; the caller override wins in both directions.
+        assert_eq!(
+            TestSpec.validate_media_request_with_limits(
+                &metadata,
+                &[(Modality::Image, 5)],
+                &overrides
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            TestSpec.validate_media_request_with_limits(
+                &metadata,
+                &[(Modality::Image, 6)],
+                &overrides
+            ),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "test",
+                modality: Modality::Image,
+                limit: 5,
+                requested: 6,
+            })
+        );
+        // Unoverridden modalities keep the spec limit.
+        assert_eq!(
+            TestSpec.validate_media_request_with_limits(
+                &metadata,
+                &[(Modality::Audio, 2)],
+                &overrides
+            ),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "test",
+                modality: Modality::Audio,
+                limit: 1,
+                requested: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn limit_override_raises_declared_limit() {
+        let limits = HashMap::from([(Modality::Image, 2)]);
+        let raise = |modality| (modality == Modality::Image).then_some(5);
+        assert_eq!(
+            check_media_counts("test", &limits, &[(Modality::Image, 5)], raise),
+            Ok(())
+        );
+        assert_eq!(
+            check_media_counts("test", &limits, &[(Modality::Image, 6)], raise),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "test",
+                modality: Modality::Image,
+                limit: 5,
+                requested: 6,
+            })
+        );
+    }
+
+    #[test]
+    fn limit_override_does_not_enable_undeclared_modality() {
+        let limits = HashMap::from([(Modality::Image, 2)]);
+        assert_eq!(
+            check_media_counts("test", &limits, &[(Modality::Video, 1)], |_| Some(5)),
+            Err(ModelRegistryError::UnsupportedModality {
+                spec: "test",
+                modality: Modality::Video,
+            })
+        );
+    }
+
+    #[test]
+    fn env_count_override_ignores_invalid_and_zero_values() {
+        static ZERO: OnceLock<Option<usize>> = OnceLock::new();
+        static INVALID: OnceLock<Option<usize>> = OnceLock::new();
+        static UNSET: OnceLock<Option<usize>> = OnceLock::new();
+        static VALID: OnceLock<Option<usize>> = OnceLock::new();
+
+        std::env::set_var("SMG_TEST_MAX_COUNT_ZERO", "0");
+        std::env::set_var("SMG_TEST_MAX_COUNT_INVALID", "ten");
+        std::env::set_var("SMG_TEST_MAX_COUNT_VALID", "20");
+
+        assert_eq!(env_count_override(&ZERO, "SMG_TEST_MAX_COUNT_ZERO"), None);
+        assert_eq!(
+            env_count_override(&INVALID, "SMG_TEST_MAX_COUNT_INVALID"),
+            None
+        );
+        assert_eq!(env_count_override(&UNSET, "SMG_TEST_MAX_COUNT_UNSET"), None);
+        assert_eq!(
+            env_count_override(&VALID, "SMG_TEST_MAX_COUNT_VALID"),
+            Some(20)
         );
     }
 }

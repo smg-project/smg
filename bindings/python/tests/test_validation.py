@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from smg.launch_router import RouterArgs, launch_router
+from smg.router import Router
 
 
 class TestURLValidation:
@@ -314,6 +315,32 @@ class TestConfigurationValidation:
         assert args.service_discovery is True
         assert args.prefill_selector == {"app": "prefill"}
         assert args.decode_selector == {"app": "decode"}
+
+    @pytest.mark.parametrize(
+        ("epd_disaggregation", "pd_disaggregation", "expected_mode"),
+        [
+            (False, False, "Regular mode"),
+            (False, True, "PD mode"),
+            (True, False, "EPD mode"),
+        ],
+    )
+    def test_igw_preserves_disaggregated_mode_during_native_validation(
+        self, epd_disaggregation, pd_disaggregation, expected_mode
+    ):
+        args = RouterArgs(
+            service_discovery=True,
+            enable_igw=True,
+            epd_disaggregation=epd_disaggregation,
+            pd_disaggregation=pd_disaggregation,
+        )
+
+        # Empty selectors fail native validation before server startup; the
+        # mode-specific error proves IGW did not replace PD or EPD with Regular.
+        with pytest.raises(
+            ValueError,
+            match=rf"^Configuration error: Validation failed: {expected_mode} with service discovery",
+        ):
+            Router.from_args(args).start()
 
     def test_policy_validation(self):
         """Test policy configuration validation."""

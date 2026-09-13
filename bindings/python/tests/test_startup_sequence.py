@@ -199,6 +199,7 @@ class TestRouterInitialization:
                         selector=router_args.selector,
                         service_discovery_port=router_args.service_discovery_port,
                         service_discovery_namespace=router_args.service_discovery_namespace,
+                        enable_igw=router_args.enable_igw,
                     )
                 )
                 return mock_router_instance
@@ -213,11 +214,52 @@ class TestRouterInitialization:
             assert captured_args["selector"] == {"app": "worker", "env": "prod"}
             assert captured_args["service_discovery_port"] == 8080
             assert captured_args["service_discovery_namespace"] == "default"
+            assert captured_args["enable_igw"] is True
 
             # Verify router.start() was called
             mock_router_instance.start.assert_called_once()
 
             # Function returns None; ensure start was invoked
+
+    @pytest.mark.parametrize("pd_disaggregation,epd_disaggregation", [(True, False), (False, True)])
+    def test_disaggregated_service_discovery_enables_igw_without_replacing_mode(
+        self, pd_disaggregation, epd_disaggregation
+    ):
+        """Service discovery enables IGW while preserving PD/EPD flags."""
+        args = RouterArgs(
+            service_discovery=True,
+            pd_disaggregation=pd_disaggregation,
+            epd_disaggregation=epd_disaggregation,
+            encode_selector={"component": "encoder"},
+            prefill_selector={"component": "prefill"},
+            decode_selector={"component": "decoder"},
+            service_discovery_port=8080,
+            service_discovery_namespace="default",
+        )
+
+        with patch("smg.launch_router.Router") as router_mod:
+            captured_args = {}
+            mock_router_instance = MagicMock()
+
+            def fake_from_args(router_args):
+                captured_args.update(
+                    dict(
+                        pd_disaggregation=router_args.pd_disaggregation,
+                        epd_disaggregation=router_args.epd_disaggregation,
+                        enable_igw=router_args.enable_igw,
+                    )
+                )
+                return mock_router_instance
+
+            router_mod.from_args = MagicMock(side_effect=fake_from_args)
+
+            launch_router(args)
+
+            router_mod.from_args.assert_called_once()
+            assert captured_args["pd_disaggregation"] is pd_disaggregation
+            assert captured_args["epd_disaggregation"] is epd_disaggregation
+            assert captured_args["enable_igw"] is True
+            mock_router_instance.start.assert_called_once()
 
     def test_router_initialization_with_retry_config(self):
         """Test router initialization with retry configuration."""

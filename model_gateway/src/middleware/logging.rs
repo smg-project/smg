@@ -7,8 +7,11 @@
 use std::time::Duration;
 
 use axum::{extract::Request, response::Response};
-use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
-use tracing::{error, field::Empty, info, info_span, warn, Span};
+use tower_http::{
+    classify::ServerErrorsFailureClass,
+    trace::{MakeSpan, OnFailure, OnRequest, OnResponse, TraceLayer},
+};
+use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::{metrics::matched_path_label, request_id::RequestId};
@@ -16,6 +19,22 @@ use crate::observability::{
     metrics::{method_to_static_str, Metrics},
     otel_trace::extract_trace_context_http,
 };
+
+/// Response-extension marker for orchestrator probe responses (`/health`,
+/// `/readiness`, `/liveness`): every status they return — 503 "not ready"
+/// included — is an expected operational state, reported to a machine that
+/// polls on a tight interval. The handler that produces the response owns
+/// that knowledge and attaches this marker; [`ResponseLogger`] logs marked
+/// responses at DEBUG instead of flooding ERROR/INFO once per poll.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeResponse;
+
+/// The probe routes on the main listener. Request-start logging for these is
+/// demoted alongside [`ProbeResponse`] — the paths are the request-side view
+/// of the same contract.
+fn is_probe_path(path: &str) -> bool {
+    matches!(path, "/health" | "/readiness" | "/liveness")
+}
 
 /// Custom span maker that includes request ID
 #[derive(Clone, Debug)]
@@ -66,11 +85,19 @@ impl<B> OnRequest<B> for RequestLogger {
         let path = matched_path_label(request.extensions());
         Metrics::record_http_request(method, path);
 
-        // Log the request start
-        info!(
-            target: "smg::request",
-            "started processing request"
-        );
+        // Log the request start. Probe polls arrive every couple of seconds
+        // forever; keep them out of the INFO access log.
+        if is_probe_path(request.uri().path()) {
+            debug!(
+                target: "smg::request",
+                "started processing request"
+            );
+        } else {
+            info!(
+                target: "smg::request",
+                "started processing request"
+            );
+        }
     }
 }
 
@@ -90,7 +117,14 @@ impl<B> OnResponse<B> for ResponseLogger {
 
         // Log the response completion
         let _enter = span.enter();
-        if status.is_server_error() {
+        if response.extensions().get::<ProbeResponse>().is_some() {
+            // A probe's 503 means "not ready yet" — an expected state a poller
+            // reads every couple of seconds, not a server malfunction.
+            debug!(
+                target: "smg::response",
+                "finished probe request"
+            );
+        } else if status.is_server_error() {
             error!(
                 target: "smg::response",
                 "request failed with server error"
@@ -109,6 +143,34 @@ impl<B> OnResponse<B> for ResponseLogger {
     }
 }
 
+/// Failure handler that logs only what [`ResponseLogger`] cannot see.
+///
+/// The default `OnFailure` ERRORs on every 5xx *status*, duplicating the
+/// line `ResponseLogger` already emits with more span context — that pair
+/// is the double ERROR per failed request in the logs. A status is not a
+/// transport failure; the one thing `ResponseLogger` genuinely cannot
+/// observe is a body/stream error after the response head went out, so
+/// only that arm logs here.
+#[derive(Clone, Debug)]
+pub struct StreamFailureLogger;
+
+impl OnFailure<ServerErrorsFailureClass> for StreamFailureLogger {
+    fn on_failure(&mut self, failure: ServerErrorsFailureClass, _latency: Duration, span: &Span) {
+        match failure {
+            // Already logged by ResponseLogger with status + latency.
+            ServerErrorsFailureClass::StatusCode(_) => {}
+            ServerErrorsFailureClass::Error(error) => {
+                let _enter = span.enter();
+                error!(
+                    target: "smg::response",
+                    error,
+                    "response stream failed after the head was sent"
+                );
+            }
+        }
+    }
+}
+
 /// Create a configured TraceLayer for HTTP logging
 /// Note: Actual request/response logging with request IDs is done in RequestIdService
 pub fn create_logging_layer() -> TraceLayer<
@@ -116,9 +178,13 @@ pub fn create_logging_layer() -> TraceLayer<
     RequestSpan,
     RequestLogger,
     ResponseLogger,
+    tower_http::trace::DefaultOnBodyChunk,
+    tower_http::trace::DefaultOnEos,
+    StreamFailureLogger,
 > {
     TraceLayer::new_for_http()
         .make_span_with(RequestSpan)
         .on_request(RequestLogger)
         .on_response(ResponseLogger)
+        .on_failure(StreamFailureLogger)
 }

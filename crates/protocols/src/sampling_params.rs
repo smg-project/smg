@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use validator::Validate;
 
 use super::common::StringOrArray;
@@ -40,6 +41,8 @@ pub struct SamplingParams {
     pub no_stop_trim: Option<bool>,
     pub n: Option<u32>,
     pub sampling_seed: Option<u64>,
+    /// Custom parameters for engine-specific sampling behavior.
+    pub custom_params: Option<Map<String, Value>>,
 }
 
 // ============================================================================

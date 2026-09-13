@@ -127,6 +127,84 @@ Agents are welcome and useful. Three ground rules:
 
 ---
 
+## Running CI on your own runners
+
+Every self-hosted `runs-on` label in `.github/workflows/` reads from a repository
+variable with the upstream label as its fallback, e.g.
+
+```yaml
+runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+```
+
+Upstream sets none of these variables, so CI keeps using the labels above with no
+change. A fork that runs CI on its own runners only has to set the variables it
+needs (**Settings → Secrets and variables → Actions → Variables**) — no workflow
+edits, so upstream syncs stay conflict-free.
+
+| Variable | Upstream fallback | Used for |
+| --- | --- | --- |
+| `SMG_RUNNER_CPU` | `k8s-runner-cpu` | lint, build, unit tests, summaries |
+| `SMG_RUNNER_DOCKER` | `cpu-e5` | docker / engine image build and push |
+| `SMG_RUNNER_GPU` | `k8s-runner-gpu` | GPU jobs with no fixed GPU count |
+| `SMG_RUNNER_GPU_1` | `1-gpu-h100` | 1-GPU e2e jobs |
+| `SMG_RUNNER_GPU_2` | `2-gpu-h100` | 2-GPU e2e jobs |
+| `SMG_RUNNER_GPU_4` | `4-gpu-h100` | 4-GPU e2e and benchmark jobs |
+| `SMG_RUNNER_GPU_8` | `8-gpu-h200` | 8-GPU benchmark jobs |
+
+GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
+fork already has those.
+
+### Container-mode GPU runners
+
+The GPU jobs declare their container image through a variable:
+
+```yaml
+container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
+```
+
+Unset, the expression is the empty string and the job runs directly on the runner
+— what upstream does today. Forks whose GPU runners are container-only (an
+Actions Runner Controller scale set with `containerMode: kubernetes` refuses jobs
+without a `container:`) set it to a CUDA-capable image and the same jobs run
+unchanged.
+
+Only the GPU jobs carry it: they are the ones that need a CUDA toolchain, and
+keeping the seam narrow keeps the blast radius small. It can be extended to the
+CPU jobs if someone needs it.
+
+**What the image has to provide.** When the variable is set, the GPU job's steps
+run *inside* the image, so it is not enough for it to be CUDA-capable:
+
+| requirement | needed by |
+| --- | --- |
+| `bash`, `pip`, `pytest` | all four GPU jobs |
+| `python3` | `go-bindings-benchmark` |
+| a usable `docker` client with daemon access | `benchmarks`, `go-bindings-benchmark` |
+| CUDA runtime matching the engine under test | all four |
+
+A slim CUDA base image will fail during setup rather than at test time. Pin the
+image **by digest** (`repo/image@sha256:...`) rather than by tag: the value is
+read at job start, so a mutable tag silently changes the CI environment with no
+workflow change to review.
+
+### Benchmark workflows
+
+The `benchmark-*` workflows are gated so a fork does not silently burn its
+runners on them:
+
+```yaml
+if: github.repository == 'smg-project/smg' || vars.SMG_RUN_BENCHMARKS == 'true'
+```
+
+They stay off in a fork until you set `SMG_RUN_BENCHMARKS` to `true`. Only
+`benchmark-radix-tree` runs on the self-hosted CPU pool, so it also needs
+`SMG_RUNNER_CPU`; the other four are on `ubuntu-latest` and need nothing else.
+
+The `release-*`, `nightly-*` and `stale` workflows are deliberately **not**
+opt-in — a fork should not publish artifacts or manage upstream's issues.
+
+---
+
 ## Reporting security issues
 
 Please do **not** open a public issue for security vulnerabilities. Contact the

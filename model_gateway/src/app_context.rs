@@ -16,17 +16,19 @@ use tracing::debug;
 
 use crate::{
     config::RouterConfig,
-    middleware::TokenBucket,
+    middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     rate_limit::RateLimitManager,
     routers::{
-        common::{openai_bridge::FormatRegistry, realtime::RealtimeRegistry},
+        common::{
+            openai_bridge::FormatRegistry, overload, pd_admission, realtime::RealtimeRegistry,
+        },
+        gateway::Gateway,
         grpc::multimodal::MultimodalConfigRegistry,
-        router_manager::RouterManager,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    worker::{KvEventMonitor, WorkerMonitor, WorkerRegistry, WorkerService},
+    worker::{KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService},
     workflow::{JobQueue, WorkflowEngines},
 };
 
@@ -52,6 +54,11 @@ impl std::error::Error for AppContextBuildError {}
 pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
+    /// Every credential that authenticates as this gateway: the shared
+    /// `api_key` plus any per-tenant keys, derived once from `router_config`.
+    /// The serving auth layer and the `/v1/models` BYOK short-circuit both
+    /// read this set, so they cannot drift apart.
+    pub gateway_auth: AuthConfig,
     pub rate_limiter: Option<Arc<TokenBucket>>,
     pub rate_limit_manager: Option<Arc<RateLimitManager>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
@@ -60,7 +67,7 @@ pub struct AppContext {
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
-    pub router_manager: Option<Arc<RouterManager>>,
+    pub gateway: Option<Arc<Gateway>>,
     pub response_storage: Arc<dyn ResponseStorage>,
     pub conversation_storage: Arc<dyn ConversationStorage>,
     pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
@@ -73,8 +80,13 @@ pub struct AppContext {
     pub mcp_format_registry: FormatRegistry,
     pub wasm_manager: Option<Arc<WasmModuleManager>>,
     pub worker_service: Arc<WorkerService>,
+    /// Worker-directed HTTP clients, shared across workers with the same
+    /// effective connection config.
+    pub worker_client_cache: Arc<WorkerHttpClientCache>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    /// RL control plane state; `None` unless `router_config.rl.enabled`.
+    pub rl: Option<Arc<smg_rl::RlState>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
     /// Bind address for WebRTC UDP sockets (`None` = `0.0.0.0`, auto-detect).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -100,7 +112,7 @@ pub struct AppContextBuilder {
     tool_parser_factory: Option<ToolParserFactory>,
     worker_registry: Option<Arc<WorkerRegistry>>,
     policy_registry: Option<Arc<PolicyRegistry>>,
-    router_manager: Option<Arc<RouterManager>>,
+    gateway: Option<Arc<Gateway>>,
     response_storage: Option<Arc<dyn ResponseStorage>>,
     conversation_storage: Option<Arc<dyn ConversationStorage>>,
     conversation_item_storage: Option<Arc<dyn ConversationItemStorage>>,
@@ -154,7 +166,7 @@ impl AppContextBuilder {
             tool_parser_factory: None,
             worker_registry: None,
             policy_registry: None,
-            router_manager: None,
+            gateway: None,
             response_storage: None,
             conversation_storage: None,
             conversation_item_storage: None,
@@ -232,8 +244,8 @@ impl AppContextBuilder {
         self
     }
 
-    pub fn router_manager(mut self, router_manager: Option<Arc<RouterManager>>) -> Self {
-        self.router_manager = router_manager;
+    pub fn gateway(mut self, gateway: Option<Arc<Gateway>>) -> Self {
+        self.gateway = gateway;
         self
     }
 
@@ -355,7 +367,16 @@ impl AppContextBuilder {
             router_config.clone(),
         ));
 
+        let worker_client_cache = Arc::new(WorkerHttpClientCache::new(&router_config));
+        let gateway_auth = AuthConfig::with_tenant_keys(
+            router_config.api_key.clone(),
+            &router_config.tenant_api_keys,
+        );
+
+        let rl = crate::rl_adapter::build_rl_state(&worker_registry, &router_config);
+
         Ok(AppContext {
+            gateway_auth,
             client: self
                 .client
                 .ok_or(AppContextBuildError::MissingField("client"))?,
@@ -372,7 +393,7 @@ impl AppContextBuilder {
             policy_registry: self
                 .policy_registry
                 .ok_or(AppContextBuildError::MissingField("policy_registry"))?,
-            router_manager: self.router_manager,
+            gateway: self.gateway,
             response_storage: self
                 .response_storage
                 .ok_or(AppContextBuildError::MissingField("response_storage"))?,
@@ -395,8 +416,10 @@ impl AppContextBuilder {
             mcp_format_registry: self.mcp_format_registry.unwrap_or_default(),
             wasm_manager: self.wasm_manager,
             worker_service,
+            worker_client_cache,
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
+            rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
             webrtc_stun_server: self.webrtc_stun_server,
@@ -436,28 +459,25 @@ impl AppContextBuilder {
             .router_config(router_config))
     }
 
-    /// Create HTTP client with TLS/mTLS configuration
+    /// Create the shared HTTP client for upstream calls not addressed to a
+    /// registered worker (external providers, IGW model discovery, worker
+    /// classification). Worker-directed traffic uses each worker's own client
+    /// from [`WorkerHttpClientCache`].
+    ///
+    /// Uses the rustls TLS backend when TLS/mTLS is configured (client cert or
+    /// CA certs provided) for PKCS#8 key support; plain HTTP skips TLS setup.
     fn with_client(mut self, config: &RouterConfig, timeout_secs: u64) -> Result<Self, String> {
-        // FIXME: Current implementation creates a single HTTP client for all workers.
-        // This works well for single security domain deployments where all workers share
-        // the same CA and can accept the same client certificate.
-        //
-        // For multi-domain deployments (e.g., different model families with different CAs),
-        // this architecture needs significant refactoring:
-        // 1. Move client creation into worker registration workflow (per-worker clients)
-        // 2. Store client per worker in WorkerRegistry
-        // 3. Update PDRouter and other routers to fetch client from worker
-        // 4. Add per-worker TLS spec in WorkerConfigRequest
-        //
-        // Current single-domain approach is sufficient for most deployments.
-        //
-        // Use rustls TLS backend when TLS/mTLS is configured (client cert or CA certs provided).
-        // This ensures proper PKCS#8 key format support. For plain HTTP workers, use default
-        // backend to avoid unnecessary TLS initialization overhead.
         let has_tls_config = config.client_identity.is_some() || !config.ca_certificates.is_empty();
 
+        // Idle pooled connections must expire before the backend server's
+        // keep-alive closes them (vLLM/SGLang default: 5s), or checkout races
+        // the server's FIN and non-idempotent sends fail.
+        let pool_idle_timeout = match config.upstream_pool_idle_timeout_secs {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        };
         let mut client_builder = Client::builder()
-            .pool_idle_timeout(Some(Duration::from_secs(50)))
+            .pool_idle_timeout(pool_idle_timeout)
             .pool_max_idle_per_host(500)
             .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))
@@ -504,10 +524,12 @@ impl AppContextBuilder {
         self.rate_limiter = match config.max_concurrent_requests {
             n if n <= 0 => None,
             n => {
+                // No refill unless explicitly configured: the cap bounds
+                // standing concurrency, not admission rate.
                 let rate_limit_tokens = config
                     .rate_limit_tokens_per_second
-                    .filter(|&t| t >= 0)
-                    .unwrap_or(n);
+                    .filter(|&t| t > 0)
+                    .unwrap_or(0);
                 Some(Arc::new(TokenBucket::new(
                     n as usize,
                     rate_limit_tokens as usize,
@@ -552,10 +574,13 @@ impl AppContextBuilder {
 
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(PolicyRegistry::with_override(
-            config.policy.clone(),
-            config.routing_key_override.clone(),
-        )));
+        self.policy_registry = Some(Arc::new(
+            PolicyRegistry::with_override(
+                config.policy.clone(),
+                config.routing_key_override.clone(),
+            )
+            .with_pd_pairing_mode(config.pd_pairing_mode),
+        ));
         self
     }
 
@@ -598,23 +623,32 @@ impl AppContextBuilder {
 
     /// Create load monitor
     fn with_worker_monitor(mut self, config: &RouterConfig) -> Result<Self, String> {
-        let client = self
-            .client
+        let policy_registry = self
+            .policy_registry
             .as_ref()
-            .ok_or_else(|| "client must be set before load monitor".to_string())?;
-        self.worker_monitor = Some(Arc::new(WorkerMonitor::new(
+            .ok_or_else(|| "policy_registry must be set before load monitor".to_string())?
+            .clone();
+        let monitor = Arc::new(WorkerMonitor::new(
             self.worker_registry
                 .as_ref()
                 .ok_or_else(|| "worker_registry must be set before load monitor".to_string())?
                 .clone(),
-            self.policy_registry
-                .as_ref()
-                .ok_or_else(|| "policy_registry must be set before load monitor".to_string())?
-                .clone(),
-            client.clone(),
+            Arc::clone(&policy_registry),
             config.load_monitor_interval_secs,
             config.engine_metrics,
-        )));
+            config.disable_load_monitoring,
+        ));
+        // The overload shed advertises the poll interval as Retry-After — the
+        // veto cannot clear between polls.
+        overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
+        // PD dispatch waits here, not in the decode engine's queue, when the
+        // pair's running window is full.
+        pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
+        // Wire the backend load-snapshot feed into every policy that consumes
+        // it; the monitor polls every group by default, conditionally under
+        // `--disable-load-monitoring`.
+        policy_registry.set_load_receiver(Some(monitor.subscribe()));
+        self.worker_monitor = Some(monitor);
         Ok(self)
     }
 
@@ -716,12 +750,6 @@ impl AppContextBuilder {
             // and any other existing cache-aware policies.
             if let Some(ref registry) = self.policy_registry {
                 registry.set_kv_event_monitor(Some(Arc::clone(&monitor)));
-                // Wire the backend load snapshot so cache-aware policies can use
-                // the KV-usage imbalance trigger. `with_worker_monitor` ran
-                // earlier in the build chain, so this is already set.
-                if let Some(ref worker_monitor) = self.worker_monitor {
-                    registry.set_load_receiver(Some(worker_monitor.subscribe()));
-                }
             }
 
             self.kv_event_monitor = Some(monitor);
@@ -753,6 +781,84 @@ impl Default for AppContextBuilder {
 mod tests {
     use super::*;
     use crate::config::types::PolicyConfig;
+
+    /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
+    /// h2c on the same listener, mirroring a dual-protocol engine.
+    async fn spawn_echo_server() -> String {
+        let app = axum::Router::new().route("/probe", axum::routing::get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind echo server");
+        let addr = listener.local_addr().expect("echo server address");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("echo serve");
+        });
+        format!("http://{addr}/probe")
+    }
+
+    fn built_client(upstream_http2: bool) -> Client {
+        let config = RouterConfig {
+            upstream_http2,
+            ..RouterConfig::default()
+        };
+        AppContextBuilder::new()
+            .with_client(&config, 5)
+            .expect("client builds")
+            .client
+            .expect("client set")
+    }
+
+    /// `--upstream-http2` is a worker-client concern; the shared client keeps
+    /// negotiating normally (HTTP/1.1 on cleartext, ALPN on TLS).
+    #[tokio::test]
+    async fn shared_client_ignores_upstream_http2() {
+        let url = spawn_echo_server().await;
+        let resp = built_client(true)
+            .get(&url)
+            .send()
+            .await
+            .expect("h1 request");
+        assert_eq!(resp.version(), http::Version::HTTP_11);
+        assert_eq!(resp.text().await.expect("body"), "ok");
+    }
+
+    #[tokio::test]
+    async fn default_client_stays_http1() {
+        let url = spawn_echo_server().await;
+        let resp = built_client(false)
+            .get(&url)
+            .send()
+            .await
+            .expect("h1 request");
+        assert_eq!(resp.version(), http::Version::HTTP_11);
+        assert_eq!(resp.text().await.expect("body"), "ok");
+    }
+
+    #[tokio::test]
+    async fn unset_rate_limit_defaults_to_no_refill() {
+        let config = RouterConfig {
+            max_concurrent_requests: 10,
+            rate_limit_tokens_per_second: None,
+            ..RouterConfig::default()
+        };
+        let bucket = AppContextBuilder::new()
+            .maybe_rate_limiter(&config)
+            .rate_limiter
+            .expect("rate limiter should be enabled");
+
+        assert!(bucket.try_acquire(10.0).is_ok());
+        // The old fallback refilled at max_concurrent_requests per second,
+        // which would restore a token during this wait.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(bucket.try_acquire(1.0).is_err());
+
+        bucket.return_tokens_sync(1.0);
+        assert!(bucket.try_acquire(1.0).is_ok());
+    }
 
     #[tokio::test]
     async fn explicit_zero_rate_limit_disables_refill() {
@@ -795,6 +901,48 @@ mod tests {
             .is_some()
     }
 
+    /// The load-snapshot feed must be wired whenever the worker monitor is
+    /// built — without a KV-event monitor in the chain — so HTTP-only
+    /// cache-aware deployments get waiting-prefill and KV-usage data.
+    #[test]
+    fn worker_monitor_wires_load_receiver_into_policies() {
+        use crate::policies::CacheAwarePolicy;
+
+        let config = config_with_policy(PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 1000,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            overlap_decay: 1.0,
+            selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
+        });
+        let builder = AppContextBuilder::new()
+            .with_client(&config, 5)
+            .expect("client builds")
+            .with_worker_registry()
+            .with_policy_registry(&config)
+            .with_worker_monitor(&config)
+            .expect("worker monitor builds");
+
+        let policy = builder
+            .policy_registry
+            .as_ref()
+            .expect("policy registry set")
+            .get_default_policy();
+        let cache_aware = policy
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .expect("default policy is cache-aware");
+        assert!(cache_aware.has_load_receiver_for_test());
+    }
+
     /// The #1794-relevant guarantee: passthrough never starts the KV-event
     /// monitor, so single-backend gateways skip the `SubscribeKvEvents` overhead.
     #[test]
@@ -812,6 +960,11 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         }));
     }
 
@@ -830,6 +983,11 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         };
 
         let mut config = config_with_policy(PolicyConfig::Random);

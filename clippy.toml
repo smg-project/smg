@@ -28,6 +28,11 @@ future-size-threshold = 20480
 # Type complexity — flag deeply nested generics common in async tower stacks
 type-complexity-threshold = 250
 
+# HTTP routing stages intentionally use fully rendered responses as error
+# channels and untouched requests as fallback values. Preserve result_large_err
+# for every other error type while exempting those framework-defined carriers.
+large-error-ignored = ["http::request::Request", "http::response::Response"]
+
 # Enforce API discipline during refactors
 avoid-breaking-exported-api = false
 

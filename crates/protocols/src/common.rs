@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::{
+    de::{self, value::SeqAccessDeserializer, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
+use serde_json::{Map, Value};
 use validator;
 
 // ============================================================================
@@ -19,13 +22,31 @@ pub fn default_true() -> bool {
     true
 }
 
+/// Helper for `#[serde(skip_serializing_if = "is_false")]` on default-`false` flags.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes &T"
+)]
+pub fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+/// Helper for `#[serde(skip_serializing_if = "is_true")]` on default-`true` flags.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes &T"
+)]
+pub fn is_true(v: &bool) -> bool {
+    *v
+}
+
 /// Deserialize a bool that also accepts JSON `null` (mapped to `false`).
 ///
 /// Use with `#[serde(default, deserialize_with = "deserialize_null_as_false")]`
 /// on fields that the OpenAI spec defines as `Optional[bool]` defaulting to `false`.
 pub fn deserialize_null_as_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
-    D: serde::Deserializer<'de>,
+    D: Deserializer<'de>,
 {
     Option::<bool>::deserialize(deserializer).map(|opt| opt.unwrap_or(false))
 }
@@ -33,6 +54,31 @@ where
 // ============================================================================
 // GenerationRequest Trait
 // ============================================================================
+
+/// The request fields that partition a backend's prefix cache.
+///
+/// Engines namespace their prefix (KV) caches by client-supplied values: a
+/// cache salt, an extra classification key, and the LoRA adapter. Two
+/// requests that share a prompt but differ in any of these can never share
+/// cached blocks on the engine, so routing derives its cache namespace from
+/// this projection. All fields absent means the request is unpartitioned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CachePartition<'a> {
+    pub cache_salt: Option<&'a str>,
+    pub extra_key: Option<&'a str>,
+    pub lora_path: Option<&'a str>,
+}
+
+impl CachePartition<'_> {
+    /// True when no partitioning field is set. An empty string is "unset":
+    /// engines treat an empty salt or adapter as absent, so it must not
+    /// split the request off from the shared unpartitioned cache.
+    pub fn is_empty(&self) -> bool {
+        [self.cache_salt, self.extra_key, self.lora_path]
+            .iter()
+            .all(|field| field.is_none_or(str::is_empty))
+    }
+}
 
 /// Trait for unified access to generation request properties
 /// Implemented by ChatCompletionRequest, CompletionRequest, GenerateRequest,
@@ -46,6 +92,25 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
+
+    /// Token IDs for routing when the request is already tokenized.
+    /// Some(_) routes on the token radix tree instead of the decimal-string
+    /// rendering of the same IDs.
+    fn routing_tokens(&self) -> Option<&[i32]> {
+        None
+    }
+
+    /// Client-provided request id, when the protocol carries one. Routing may
+    /// derive a session-affinity key from it; a batch reports its first id.
+    fn rid(&self) -> Option<&str> {
+        None
+    }
+
+    /// The fields that partition the backend's prefix cache for this request.
+    /// Protocols without such fields are unpartitioned.
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition::default()
+    }
 }
 
 // ============================================================================
@@ -197,6 +262,10 @@ pub enum ContentPart {
     InputAudio { input_audio: InputAudio },
     #[serde(rename = "video_url")]
     VideoUrl { video_url: VideoUrl },
+    /// Pass through unknown content objects to HTTP backends.
+    /// Also matches malformed known types; gRPC backends reject this variant.
+    #[serde(untagged)]
+    Unknown(Map<String, Value>),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
@@ -204,6 +273,12 @@ pub struct ImageUrl {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>, // "auto", "low", or "high"
+    /// MiniMax-M3 extension: cap the image's long side before preprocessing.
+    ///
+    /// Must be a positive multiple of the vision patch factor (28); larger
+    /// values keep more of the image and therefore cost more prompt tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_long_side_pixel: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
@@ -222,6 +297,16 @@ pub struct InputAudio {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct VideoUrl {
     pub url: String,
+    /// MiniMax-M3 extension: frames per second to sample the clip at.
+    ///
+    /// Valid range is 0.2 to 5.0 inclusive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f64>,
+    /// MiniMax-M3 extension: cap each sampled frame's long side.
+    ///
+    /// Must be a multiple of the vision patch factor (28) within 150..=3584.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_long_side_pixel: Option<u32>,
 }
 
 // ============================================================================
@@ -266,6 +351,12 @@ pub struct StreamOptions {
     /// to normalize payload sizes. Defaults to `true` upstream when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_obfuscation: Option<bool>,
+
+    /// Additional fields not explicitly defined above (e.g. engine-specific
+    /// streaming options). Without this, the gateway silently drops them while
+    /// re-serializing the request for the backend.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 #[serde_with::skip_serializing_none]
@@ -419,7 +510,7 @@ pub struct Tool {
 /// Per the OpenAI spec, omitting `parameters` defines a function with an
 /// empty parameter list, so a missing field deserializes to an empty schema.
 fn empty_parameters_schema() -> Value {
-    Value::Object(serde_json::Map::new())
+    Value::Object(Map::new())
 }
 
 #[serde_with::skip_serializing_none]
@@ -466,13 +557,13 @@ impl Serialize for FunctionCall {
 }
 
 impl<'de> Deserialize<'de> for FunctionCall {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = Value::deserialize(deserializer)?;
         match &value {
             Value::String(s) => match s.as_str() {
                 "none" => Ok(FunctionCall::None),
                 "auto" => Ok(FunctionCall::Auto),
-                other => Err(serde::de::Error::custom(format!(
+                other => Err(de::Error::custom(format!(
                     "unknown function_call value: \"{other}\""
                 ))),
             },
@@ -480,12 +571,12 @@ impl<'de> Deserialize<'de> for FunctionCall {
                 if let Some(Value::String(name)) = map.get("name") {
                     Ok(FunctionCall::Function { name: name.clone() })
                 } else {
-                    Err(serde::de::Error::custom(
+                    Err(de::Error::custom(
                         "function_call object must have a \"name\" string field",
                     ))
                 }
             }
-            _ => Err(serde::de::Error::custom(
+            _ => Err(de::Error::custom(
                 "function_call must be a string or object",
             )),
         }
@@ -549,9 +640,10 @@ impl Usage {
 
     /// Add cached token details to this Usage
     pub fn with_cached_tokens(mut self, cached_tokens: u32) -> Self {
-        if cached_tokens > 0 {
-            self.prompt_tokens_details = Some(PromptTokenUsageInfo { cached_tokens });
-        }
+        // Calling this builder means the backend supplied cache accounting.
+        // Zero is therefore evidence of a cold miss, not absence of support,
+        // and must remain distinguishable from `prompt_tokens_details: None`.
+        self.prompt_tokens_details = Some(PromptTokenUsageInfo { cached_tokens });
         self
     }
 
@@ -648,11 +740,101 @@ pub struct ErrorDetail {
 // Input Types
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum InputIds {
     Single(Vec<i32>),
     Batch(Vec<Vec<i32>>),
+}
+
+/// Shape probe for the first `input_ids` element: it alone picks the variant,
+/// so the rest parses in place instead of through untagged-enum buffering.
+enum FirstInputId {
+    Id(i32),
+    Ids(Vec<i32>),
+}
+
+impl<'de> Deserialize<'de> for FirstInputId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FirstInputIdVisitor;
+
+        impl<'de> Visitor<'de> for FirstInputIdVisitor {
+            type Value = FirstInputId;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a token id or an array of token ids")
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                i32::try_from(v)
+                    .map(FirstInputId::Id)
+                    .map_err(|_| E::invalid_value(de::Unexpected::Signed(v), &self))
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                i32::try_from(v)
+                    .map(FirstInputId::Id)
+                    .map_err(|_| E::invalid_value(de::Unexpected::Unsigned(v), &self))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                Deserialize::deserialize(SeqAccessDeserializer::new(seq)).map(FirstInputId::Ids)
+            }
+        }
+
+        deserializer.deserialize_any(FirstInputIdVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for InputIds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct InputIdsVisitor;
+
+        impl<'de> Visitor<'de> for InputIdsVisitor {
+            type Value = InputIds;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of token ids or an array of token id arrays")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                // An empty array is Single, matching untagged first-match order.
+                let Some(first) = seq.next_element::<FirstInputId>()? else {
+                    return Ok(InputIds::Single(Vec::new()));
+                };
+                let remaining = seq.size_hint().unwrap_or(0);
+                match first {
+                    FirstInputId::Id(id) => {
+                        let mut ids = Vec::with_capacity(remaining.saturating_add(1));
+                        ids.push(id);
+                        while let Some(id) = seq.next_element()? {
+                            ids.push(id);
+                        }
+                        Ok(InputIds::Single(ids))
+                    }
+                    FirstInputId::Ids(head) => {
+                        let mut seqs = Vec::with_capacity(remaining.saturating_add(1));
+                        seqs.push(head);
+                        while let Some(ids) = seq.next_element()? {
+                            seqs.push(ids);
+                        }
+                        Ok(InputIds::Batch(seqs))
+                    }
+                }
+            }
+        }
+
+        deserializer.deserialize_seq(InputIdsVisitor)
+    }
 }
 
 /// LoRA adapter path - can be single path or batch of paths (SGLang extension)
@@ -840,6 +1022,44 @@ mod tests {
     }
 
     #[test]
+    fn stream_options_preserve_unknown_fields() {
+        let raw = json!({
+            "include_usage": true,
+            "continuous_usage_stats": true,
+            "step_usage_chunks": "all",
+            "engine_specific": {"nested": 1},
+        });
+
+        let opts: StreamOptions = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(opts.include_usage, Some(true));
+        assert_eq!(opts.continuous_usage_stats, Some(true));
+        assert_eq!(opts.other.get("step_usage_chunks"), Some(&json!("all")));
+
+        // Re-serializing must round-trip the engine-specific keys, otherwise the
+        // gateway would strip them on the way to the backend.
+        assert_eq!(serde_json::to_value(&opts).unwrap(), raw);
+    }
+
+    #[test]
+    fn stream_options_without_unknown_fields_stay_compact() {
+        let opts: StreamOptions = serde_json::from_value(json!({"include_usage": true})).unwrap();
+        assert!(opts.other.is_empty());
+        assert_eq!(
+            serde_json::to_value(&opts).unwrap(),
+            json!({"include_usage": true})
+        );
+    }
+
+    #[test]
+    fn cached_token_builder_preserves_explicit_zero() {
+        let usage = Usage::from_counts(16, 1).with_cached_tokens(0);
+        assert!(matches!(
+            usage.prompt_tokens_details,
+            Some(PromptTokenUsageInfo { cached_tokens: 0 })
+        ));
+    }
+
+    #[test]
     fn content_part_deserializes_audio_url() {
         let value = json!({
             "type": "audio_url",
@@ -856,6 +1076,49 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn content_part_round_trips_unknown_type() {
+        let value = json!({
+            "type": "vendor_special",
+            "payload": {"items": [1, "two", null], "enabled": true},
+            "vendor_option": "keep"
+        });
+        let part: ContentPart = serde_json::from_value(value.clone()).unwrap();
+
+        assert!(
+            matches!(&part, ContentPart::Unknown(fields) if fields["type"] == "vendor_special")
+        );
+        assert_eq!(serde_json::to_value(&part).unwrap(), value);
+    }
+
+    #[test]
+    fn content_part_rejects_non_objects() {
+        for value in [
+            json!(null),
+            json!(true),
+            json!(42),
+            json!("text"),
+            json!([]),
+        ] {
+            assert!(serde_json::from_value::<ContentPart>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn content_part_known_types_take_precedence_over_fallback() {
+        for value in [
+            json!({"type": "text", "text": "hello"}),
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}),
+            json!({"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}}),
+            json!({"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}),
+            json!({"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}),
+        ] {
+            let part: ContentPart = serde_json::from_value(value.clone()).unwrap();
+            assert!(!matches!(&part, ContentPart::Unknown(_)));
+            assert_eq!(serde_json::to_value(&part).unwrap(), value);
+        }
     }
 
     #[test]
@@ -906,6 +1169,51 @@ mod tests {
         assert!(ConversationRef::Id(String::new()).is_empty());
         assert!(!ConversationRef::Id("conv_1".to_string()).is_empty());
         assert!(ConversationRef::Object { id: String::new() }.is_empty());
+    }
+
+    #[test]
+    fn input_ids_deserializes_single() {
+        let ids: InputIds = serde_json::from_str("[1, -2, 3]").unwrap();
+        assert!(matches!(ids, InputIds::Single(ref v) if v == &[1, -2, 3]));
+    }
+
+    #[test]
+    fn input_ids_deserializes_batch() {
+        let ids: InputIds = serde_json::from_str("[[1, 2], [3], []]").unwrap();
+        assert!(matches!(ids, InputIds::Batch(ref v) if v == &[vec![1, 2], vec![3], vec![]]));
+    }
+
+    #[test]
+    fn input_ids_empty_array_is_single() {
+        let ids: InputIds = serde_json::from_str("[]").unwrap();
+        assert!(matches!(ids, InputIds::Single(ref v) if v.is_empty()));
+    }
+
+    #[test]
+    fn input_ids_rejects_invalid_input() {
+        for input in [
+            "[1, [2]]",
+            "[[1], 2]",
+            "[\"a\"]",
+            "[1.5]",
+            "[5000000000]",
+            "\"nope\"",
+            "null",
+            "7",
+        ] {
+            assert!(
+                serde_json::from_str::<InputIds>(input).is_err(),
+                "accepted {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_ids_round_trip() {
+        for input in [json!([1, 2, 3]), json!([[1, 2], [3]]), json!([])] {
+            let ids: InputIds = serde_json::from_value(input.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&ids).unwrap(), input);
+        }
     }
 
     #[test]

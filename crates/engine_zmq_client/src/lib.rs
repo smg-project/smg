@@ -33,12 +33,10 @@ pub mod transport;
 #[cfg(any(test, feature = "mock-engine"))]
 pub mod mock_engine;
 
+// Crate-root shortcuts for what consumers actually build against; everything
+// else stays reachable through its own module path.
 pub use connector::{
     Client, EngineCoreClient, EngineCoreStream, RequestStream, TokenSpeedClient, TokenSpeedStream,
 };
 pub use error::{Error, Result};
-pub use protocol::{EngineBatch, EngineOutput, EngineProtocol};
-pub use transport::{
-    connect_handshake, run_output_loop, send_message, ConnectedEngine, ConnectedTransport,
-    EngineId, ENGINE_CORE_DEAD_SENTINEL,
-};
+pub use transport::{connect_handshake, ConnectedEngine, EngineId, ENGINE_CORE_DEAD_SENTINEL};

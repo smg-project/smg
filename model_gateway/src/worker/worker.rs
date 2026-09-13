@@ -3,12 +3,12 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::Duration,
 };
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use axum::body::Body;
 // Re-export protocol types as the canonical types for the gateway
@@ -21,12 +21,13 @@ use openai_protocol::{
 use smg_grpc_client::common_proto;
 use tokio::{
     sync::{mpsc, OnceCell},
+    task::AbortHandle,
     time,
 };
 
 use super::{
-    event::WorkerConnected, CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult,
-    UNKNOWN_MODEL_ID,
+    event::WorkerConnected, overload::OverloadThresholds, pd_pairing::PdPairing, CircuitBreaker,
+    ResolvedResilience, WorkerError, WorkerResult, UNKNOWN_MODEL_ID,
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
@@ -36,8 +37,57 @@ use crate::{
     },
 };
 
-/// Default HTTP client timeout for worker requests (in seconds)
-pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
+/// A worker's HTTP client handle, materialized on first use.
+///
+/// Registration hands in a shared client from the worker client cache. A
+/// worker built without one whose connection mode never speaks HTTP (ZMQ:
+/// local health check, admin ops rejected up front) would otherwise pay for a
+/// connector and idle pool it can never use, so the fallback client is built
+/// only when a caller actually asks for it.
+pub struct LazyHttpClient {
+    cell: OnceLock<Arc<reqwest::Client>>,
+}
+
+impl LazyHttpClient {
+    /// Wrap an already-built client (the registration paths hand one in).
+    /// The strong handle is what keeps the client's cache entry alive.
+    pub fn ready(client: Arc<reqwest::Client>) -> Self {
+        let cell = OnceLock::new();
+        let _ = cell.set(client);
+        Self { cell }
+    }
+
+    /// Defer construction until [`Self::client`] is first called.
+    pub fn deferred() -> Self {
+        Self {
+            cell: OnceLock::new(),
+        }
+    }
+
+    /// Whether the client is still unbuilt (test-only observation of laziness).
+    #[cfg(test)]
+    pub(crate) fn cell_is_empty(&self) -> bool {
+        self.cell.get().is_none()
+    }
+
+    /// The client, building the default one on first use. The fallback sets
+    /// no total timeout: dispatch deadlines come from the router config via
+    /// the client cache, and every health/admin call site sets its own.
+    pub fn client(&self) -> &reqwest::Client {
+        self.init()
+    }
+
+    /// A strong handle to the client if one was materialized, for a
+    /// replacement worker to adopt. Never forces the lazy cell: a worker
+    /// that never spoke HTTP hands its replacement a still-deferred slot.
+    pub fn handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
+        self.cell.get().map(Arc::clone)
+    }
+
+    fn init(&self) -> &Arc<reqwest::Client> {
+        self.cell.get_or_init(|| Arc::new(reqwest::Client::new()))
+    }
+}
 
 /// Timeout for worker HTTP `flush_cache` requests. Matches the gRPC
 /// client's local flush deadline.
@@ -57,14 +107,21 @@ async fn connect_zmq_backend(
     model_id: String,
     runtime: RuntimeType,
     handshake_override: Option<String>,
+    engine_count: usize,
 ) -> WorkerResult<Arc<BackendClient>> {
-    zmq_client::connect_for_worker(&base_url, model_id, runtime, handshake_override.as_deref())
-        .await
-        .map(|client| Arc::new(BackendClient::Zmq(client)))
-        .map_err(|reason| WorkerError::ConnectionFailed {
-            url: base_url,
-            reason,
-        })
+    zmq_client::connect_for_worker(
+        &base_url,
+        model_id,
+        runtime,
+        handshake_override.as_deref(),
+        engine_count,
+    )
+    .await
+    .map(|client| Arc::new(BackendClient::Zmq(client)))
+    .map_err(|reason| WorkerError::ConnectionFailed {
+        url: base_url,
+        reason,
+    })
 }
 
 /// Default bootstrap port for PD disaggregation (used by SGLang and vLLM Mooncake)
@@ -174,6 +231,13 @@ impl WorkerRoutingKeyLoad {
 
     pub fn value(&self) -> usize {
         self.active_routing_keys.len()
+    }
+
+    /// In-flight requests for one routing key.
+    pub fn key_inflight(&self, routing_key: &str) -> usize {
+        self.active_routing_keys
+            .get(routing_key)
+            .map_or(0, |count| *count)
     }
 
     pub fn increment(&self, routing_key: &str) {
@@ -316,8 +380,36 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Decrement the load counter
     fn decrement_load(&self);
 
+    /// Claim `count` PD bootstrap rooms while the worker's claimed total
+    /// stays within `window`; a refusal claims nothing.
+    ///
+    /// The PD admission gate reserves through this rather than comparing
+    /// [`Worker::load`] to the window: a read-then-send lets two dispatches
+    /// both take the last free slot, which is exactly the over-window burst
+    /// the gate exists to prevent.
+    ///
+    /// The defaults admit unconditionally and track nothing. They exist for
+    /// implementations that carry no shared runtime (the language bindings,
+    /// test doubles): the gate only reaches a worker that reports a running
+    /// window, and any implementation that does report one must override
+    /// these three with a real claim, or the window is not enforced.
+    fn try_admit_pd(&self, _count: usize, _window: usize) -> bool {
+        true
+    }
+
+    /// Release `count` rooms claimed by [`Worker::try_admit_pd`].
+    fn release_pd(&self, _count: usize) {}
+
+    /// Rooms currently claimed on this worker.
+    fn pd_admitted(&self) -> usize {
+        0
+    }
+
     /// Get the current routing-key load cardinality.
     fn routing_key_load(&self) -> usize;
+
+    /// In-flight requests for one routing key on this worker.
+    fn routing_key_inflight(&self, routing_key: &str) -> usize;
 
     /// Increment the routing-key load tracker for an active key.
     fn increment_routing_key_load(&self, routing_key: &str);
@@ -334,21 +426,37 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Get worker-specific metadata
     fn metadata(&self) -> &WorkerMetadata;
 
+    /// The PD pairing descriptor placement compares across a prefill and a
+    /// decode.
+    fn pd_pairing(&self) -> &PdPairing {
+        &self.metadata().pd_pairing
+    }
+
     /// Worker-reported in-flight capacity, if available.
     ///
-    /// Reads the `max_running_requests` label populated by the metadata
-    /// discovery pipeline (Step 4 of the worker lifecycle). Returns
-    /// `None` when the worker hasn't reported a value or reports zero
-    /// (zero is meaningless for capacity accounting).
+    /// Reads the running-window label populated by the metadata discovery
+    /// pipeline (Step 4 of the worker lifecycle). Returns `None` when the
+    /// worker hasn't reported a value or reports zero (zero is meaningless
+    /// for capacity accounting).
+    ///
+    /// Engines spell the same window two ways — TokenSpeed and vLLM
+    /// advertise `max_num_seqs`, SGLang advertises `max_running_requests` —
+    /// and both are the count of requests the scheduler will run at once, so
+    /// both are read here rather than leaving TokenSpeed workers looking like
+    /// non-reporters. `max_num_seqs` wins when a worker reports both: it is
+    /// the authoritative name for the engines that use it, and it is the
+    /// order `smg_grpc_servicer.tokenspeed.loads::running_window` reports in,
+    /// so the label and the `GetLoads` report cannot disagree.
     ///
     /// `WorkerCapacity` uses this to derive total fleet capacity when
     /// every worker reports; falls back to a configured per-worker
-    /// estimate otherwise.
+    /// estimate otherwise. The PD admission gate uses it as the decode
+    /// leg's admission bound.
     fn max_running_requests(&self) -> Option<u16> {
-        self.metadata()
-            .spec
-            .labels
-            .get("max_running_requests")
+        let labels = &self.metadata().spec.labels;
+        labels
+            .get("max_num_seqs")
+            .or_else(|| labels.get("max_running_requests"))
             .and_then(|s| s.parse::<u16>().ok())
             .filter(|n| *n > 0)
     }
@@ -374,39 +482,75 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Record a request outcome against the circuit breaker.
     fn record_circuit_breaker_outcome(&self, success: bool);
 
-    /// Check if the worker is available (healthy + circuit closed/half-open)
+    /// Check if the worker is available (healthy + circuit closed/half-open +
+    /// not vetoed by the absolute overload guard).
     fn is_available(&self) -> bool {
-        self.is_healthy() && self.circuit_breaker_can_execute()
+        self.is_healthy() && self.circuit_breaker_can_execute() && !self.is_overloaded()
+    }
+
+    /// [`Self::is_healthy`] fused with the overload veto. For the hash policies,
+    /// which route on health alone and never consult the circuit breaker;
+    /// `BasicWorker` overrides it to read both under a single runtime guard.
+    fn is_healthy_and_eligible(&self) -> bool {
+        self.is_healthy() && !self.is_overloaded()
+    }
+
+    /// Whether the absolute overload guard currently vetoes this worker.
+    ///
+    /// Written only by the load monitor, once per ingested load report, and
+    /// always `false` while overload protection is unconfigured.
+    fn is_overloaded(&self) -> bool {
+        false
+    }
+
+    /// Set the overload veto, returning `true` when the flag actually changed.
+    ///
+    /// Route writes through [`WorkerRegistry::set_worker_overloaded`] instead of
+    /// calling this directly: the per-model counters and the
+    /// `smg_workers_overloaded` gauge move only on transitions.
+    fn set_overloaded(&self, _overloaded: bool) -> bool {
+        false
     }
 
     /// One-shot routing snapshot for the per-request O(workers) selection loops:
-    /// reads status, load and processed together so the hot path takes one
-    /// `ArcSwap` guard per backing cell per worker instead of one per accessor
-    /// (that guard traffic is a large share of routing CPU at scale). `BasicWorker`
-    /// overrides this to share the runtime guard.
+    /// reads status, load, processed and the overload veto together so the hot
+    /// path takes one `ArcSwap` guard per backing cell per worker instead of one
+    /// per accessor (that guard traffic is a large share of routing CPU at
+    /// scale). `BasicWorker` overrides this to share the runtime guard.
     fn routing_state(&self) -> RoutingState {
         RoutingState {
             healthy: self.is_healthy(),
             can_execute: self.circuit_breaker_can_execute(),
             load: self.load(),
             processed: self.processed_requests(),
+            overloaded: self.is_overloaded(),
         }
     }
 
     /// Record the outcome of a request based on the HTTP status code.
     ///
-    /// The worker decides whether the status is a CB failure using its
-    /// per-worker `retryable_status_codes` set (default: 408, 429, 5xx).
+    /// Statuses in the per-worker `capacity_status_codes` set (default: 429)
+    /// record nothing at all — neither failure nor success. Any other status
+    /// is a circuit-breaker failure when it appears in `retryable_status_codes`,
+    /// which by default leaves 408, 500, 502, 503 and 504 tripping the breaker.
+    /// 429 is in that set too, but the capacity check returns before it is read.
     /// Callers just pass the status — no need to interpret it.
     ///
     /// For transport/connection errors where no HTTP response is received,
     /// pass the status code returned to the client (e.g., 502 for a send
     /// error, 504 for a timeout).
     fn record_outcome(&self, status_code: u16) {
-        let is_failure = self
-            .resilience()
-            .retryable_status_codes
-            .contains(&status_code);
+        let resilience = self.resilience();
+        // Capacity pushback (429 by default) is a routing signal, not a
+        // worker fault: the request is retried elsewhere, but no
+        // circuit-breaker sample is recorded in either direction — opening
+        // the breaker on backpressure would amplify a load spike into
+        // unavailability, and crediting a success would close a half-open
+        // breaker on a request the worker refused.
+        if resilience.capacity_status_codes.contains(&status_code) {
+            return;
+        }
+        let is_failure = resilience.retryable_status_codes.contains(&status_code);
         self.record_circuit_breaker_outcome(!is_failure);
     }
 
@@ -415,6 +559,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Get the per-worker HTTP client.
     fn http_client(&self) -> &reqwest::Client;
+
+    /// Strong handle to the worker's HTTP client, if one was materialized.
+    /// Must not force a deferred client into existence; cache-fed workers
+    /// return the shared handle so a replacement worker keeps the cache
+    /// entry alive.
+    fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>>;
 
     // ── Metadata convenience delegates ──────────────────────────────
     //
@@ -446,6 +596,11 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().endpoint_url(route)
     }
 
+    /// Whether the router speaks HTTP/2 prior knowledge to this worker.
+    fn http2(&self) -> bool {
+        self.metadata().http2()
+    }
+
     /// Check if this worker is DP-aware.
     fn is_dp_aware(&self) -> bool {
         self.metadata().is_dp_aware()
@@ -461,12 +616,46 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().dp_size()
     }
 
+    /// The KV transfer engine id the worker's engine currently reports: the
+    /// spec's, unless a recovery re-read it (see
+    /// [`Self::refresh_kv_engine_id`]). A PD handoff must be minted for the
+    /// engine process that is there now, not the one discovered at
+    /// registration (#2491).
+    fn kv_engine_id(&self) -> Option<String> {
+        self.metadata().spec.kv_engine_id.clone()
+    }
+
+    /// Replace the engine id after a re-read. Returns `true` when it changed.
+    fn refresh_kv_engine_id(&self, _kv_engine_id: Option<String>) -> bool {
+        false
+    }
+
+    /// Whether the engine id in force has been confirmed by the engine since
+    /// the worker last recovered. `false` after a re-read that failed,
+    /// expired or returned no id, so the next probe tries again instead of
+    /// the worker serving with a possibly stale id until its next outage.
+    fn kv_engine_id_confirmed(&self) -> bool {
+        true
+    }
+
+    /// Record the outcome of a re-read (see [`Self::kv_engine_id_confirmed`]).
+    fn set_kv_engine_id_confirmed(&self, _confirmed: bool) {}
+
     /// Transform a request for DP-aware routing.
     ///
     /// When the worker has a `dp_rank`, injects `data_parallel_rank`
     /// into the request body. Otherwise returns the request unchanged.
+    ///
+    /// Any override that edits the body must also override
+    /// [`Worker::mutates_request`] to return `true`.
     fn prepare_request(&self, req: serde_json::Value) -> WorkerResult<serde_json::Value> {
         self.metadata().prepare_request(req)
+    }
+
+    /// Whether [`Worker::prepare_request`] rewrites the body. The HTTP proxy
+    /// path skips the `serde_json::Value` round-trip when this is `false`.
+    fn mutates_request(&self) -> bool {
+        self.metadata().mutates_request()
     }
 
     /// Get the model ID this worker serves.
@@ -537,6 +726,15 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     async fn reset_grpc_client(&self) -> WorkerResult<()> {
         Ok(())
     }
+
+    /// Release background work owned by this worker instance.
+    ///
+    /// Called by the registry when the worker leaves it (removal) or is
+    /// superseded by a replacement. `BasicWorker` aborts the detached ZMQ
+    /// handshake driver: it holds the handshake and data-plane socket binds
+    /// until it lands, so an orphaned driver would keep them for up to the
+    /// connect timeout and collide with a same-URL re-registration.
+    fn abort_background_tasks(&self) {}
     async fn grpc_health_check(&self) -> WorkerResult<bool>;
     /// Liveness check for a ZMQ worker. Unlike gRPC there is no health RPC on
     /// the raw wire: liveness is local (handshake completed and the engine has
@@ -712,6 +910,18 @@ pub struct WorkerMetadata {
     pub health_config: HealthCheckConfig,
     /// Health check endpoint path (internal-only, from router config).
     pub health_endpoint: String,
+    /// Effective absolute overload thresholds (per signal: `spec.overload`
+    /// override, else gateway default). Resolved once at registration; the
+    /// load monitor's ingestion predicate scores every report against these,
+    /// so nothing on a request path re-resolves them.
+    pub overload: OverloadThresholds,
+    /// Whether the router speaks HTTP/2 prior knowledge to this worker:
+    /// `spec.http_pool.http2` when declared, else negotiated at registration
+    /// under `upstream_http2`.
+    pub http2: bool,
+    /// What this worker offers a PD rendezvous partner, derived once from
+    /// the spec and its discovered labels (#2483).
+    pub pd_pairing: PdPairing,
 }
 
 impl WorkerMetadata {
@@ -741,6 +951,11 @@ impl WorkerMetadata {
         format!("{}{}", self.base_url(), route)
     }
 
+    /// Whether the router speaks HTTP/2 prior knowledge to this worker.
+    pub fn http2(&self) -> bool {
+        self.http2
+    }
+
     // ── DP awareness ────────────────────────────────────────────────
 
     /// Check if this worker is DP-aware.
@@ -756,6 +971,15 @@ impl WorkerMetadata {
     /// Get DP size if this worker is part of a DP group.
     pub fn dp_size(&self) -> Option<usize> {
         self.spec.dp_size
+    }
+
+    /// Number of ZMQ engines this worker's handshake awaits. A grouped ZMQ
+    /// worker carries `dp_size = Some(N)` with no `dp_rank` — one worker, one
+    /// socket set, N engines dialing in (the connector balances across them
+    /// and drives the wave protocol for lockstep groups). Rank-expanded DP
+    /// workers never reach ZMQ connect (rejected at registration).
+    pub fn zmq_engine_count(&self) -> usize {
+        self.spec.dp_size.unwrap_or(1).max(1)
     }
 
     /// Transform a request for DP-aware routing.
@@ -777,6 +1001,11 @@ impl WorkerMetadata {
         } else {
             Ok(req)
         }
+    }
+
+    /// True when [`Self::prepare_request`] would modify the request.
+    pub fn mutates_request(&self) -> bool {
+        self.spec.dp_rank.is_some()
     }
 
     // ── Routing priorities / model lookup ───────────────────────────
@@ -865,6 +1094,17 @@ pub struct RoutingState {
     pub load: usize,
     /// Lifetime processed-request count (min-load tie-break).
     pub processed: usize,
+    /// Absolute overload veto, set by the load monitor at ingestion time.
+    pub overloaded: bool,
+}
+
+impl RoutingState {
+    /// The full routing eligibility test. Costs nothing beyond the reads the
+    /// gather pass already performed: every field rides the one guard
+    /// [`Worker::routing_state`] took.
+    pub const fn eligible(self) -> bool {
+        self.healthy && self.can_execute && !self.overloaded
+    }
 }
 
 /// Shared mutable worker state preserved across same-URL replacements.
@@ -875,9 +1115,20 @@ pub struct WorkerRuntime {
     consecutive_successes: AtomicUsize,
     total_pending_probes: AtomicUsize,
     load_counter: AtomicUsize,
+    /// Bootstrap rooms the PD admission gate has claimed on this worker and
+    /// not yet released. Separate from `load_counter` because admission must
+    /// *claim* against the engine's running window rather than read it: two
+    /// dispatches that both saw the last free slot would both send, which is
+    /// the over-window burst the gate exists to prevent. Lives here so a
+    /// same-URL replacement inherits the rooms the engine still holds.
+    pd_admitted: AtomicUsize,
     processed_counter: AtomicUsize,
     worker_routing_key_load: WorkerRoutingKeyLoad,
     revision: AtomicU64,
+    /// Absolute overload veto. Lives here rather than in the load-snapshot map
+    /// so selection reads it under the guard it already holds, and so a
+    /// same-URL replacement inherits it with the rest of the shared runtime.
+    overloaded: AtomicBool,
 }
 
 impl WorkerRuntime {
@@ -888,9 +1139,11 @@ impl WorkerRuntime {
             consecutive_successes: AtomicUsize::new(0),
             total_pending_probes: AtomicUsize::new(0),
             load_counter: AtomicUsize::new(0),
+            pd_admitted: AtomicUsize::new(0),
             processed_counter: AtomicUsize::new(0),
             worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
             revision: AtomicU64::new(0),
+            overloaded: AtomicBool::new(false),
         }
     }
 
@@ -962,10 +1215,39 @@ impl WorkerRuntime {
             .is_ok()
     }
 
+    // ── PD admission claims ─────────────────────────────────────────
+
+    pub fn pd_admitted(&self) -> usize {
+        self.pd_admitted.load(Ordering::Relaxed)
+    }
+
+    /// Claim `count` rooms, but only while the claimed total stays within
+    /// `window`. All-or-nothing: a refusal claims nothing.
+    pub fn try_admit_pd(&self, count: usize, window: usize) -> bool {
+        self.pd_admitted
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                admitted.checked_add(count).filter(|total| *total <= window)
+            })
+            .is_ok()
+    }
+
+    /// Release `count` claimed rooms, saturating at zero.
+    pub fn release_pd(&self, count: usize) {
+        let _ = self
+            .pd_admitted
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                Some(admitted.saturating_sub(count))
+            });
+    }
+
     // ── Routing-key load ────────────────────────────────────────────
 
     pub fn routing_key_load(&self) -> usize {
         self.worker_routing_key_load.value()
+    }
+
+    pub fn routing_key_inflight(&self, routing_key: &str) -> usize {
+        self.worker_routing_key_load.key_inflight(routing_key)
     }
 
     pub fn increment_routing_key_load(&self, routing_key: &str) {
@@ -985,6 +1267,16 @@ impl WorkerRuntime {
     pub fn increment_processed(&self) {
         self.processed_counter.fetch_add(1, Ordering::Relaxed);
     }
+
+    pub fn is_overloaded(&self) -> bool {
+        self.overloaded.load(Ordering::Relaxed)
+    }
+
+    /// Returns `true` when the flag transitioned, so the caller can move the
+    /// per-model counters and gauge exactly once per edge.
+    pub fn set_overloaded(&self, overloaded: bool) -> bool {
+        self.overloaded.swap(overloaded, Ordering::Relaxed) != overloaded
+    }
 }
 
 /// Basic worker implementation
@@ -1002,6 +1294,10 @@ pub struct BasicWorker {
     /// never cancels a long (model-load) handshake. Self-clears on failure to
     /// allow a retry. Unused for HTTP/gRPC.
     pub zmq_connect_started: Arc<AtomicBool>,
+    /// Abort handle for that driver, so removing or replacing the worker
+    /// releases the sockets the in-flight handshake has bound instead of
+    /// leaving them held until it times out. `None` until a driver is spawned.
+    pub zmq_connect_abort: Arc<ArcSwapOption<AbortHandle>>,
     /// Wakes the manager the instant the ZMQ handshake completes so it can
     /// promote the worker without waiting for the next health poll. Set only
     /// for ZMQ workers built through the registration path; `None` elsewhere
@@ -1011,8 +1307,19 @@ pub struct BasicWorker {
     /// When not `Wildcard`, overrides metadata.models for routing decisions.
     /// Uses `ArcSwap` for lock-free reads on the hot path (`supports_model`).
     pub models_override: Arc<ArcSwap<WorkerModels>>,
-    /// Per-worker HTTP client with isolated connection pool.
-    pub http_client: reqwest::Client,
+    /// The KV transfer engine id in force, seeded from the spec and replaced
+    /// when a recovered engine reports a new one (see
+    /// [`Worker::refresh_kv_engine_id`]). Not shared across same-URL
+    /// replacements: a worker built from a fresh discovery starts from its
+    /// own spec, and one rebuilt by a properties update starts from that
+    /// spec's (unrefreshed) id.
+    pub kv_engine_id: ArcSwapOption<String>,
+    /// Set while a recovery re-read of the engine id has not succeeded yet
+    /// (see [`Worker::kv_engine_id_confirmed`]).
+    pub kv_engine_id_unconfirmed: AtomicBool,
+    /// Worker-directed HTTP client, shared across same-config workers, built
+    /// on first use (see [`LazyHttpClient`]).
+    pub http_client: Arc<LazyHttpClient>,
     /// Resolved resilience config (retry + circuit breaker settings).
     pub resilience: ResolvedResilience,
 }
@@ -1025,9 +1332,14 @@ impl Clone for BasicWorker {
             circuit_breaker: ArcSwap::from(self.circuit_breaker.load_full()),
             backend_client: Arc::clone(&self.backend_client),
             zmq_connect_started: Arc::clone(&self.zmq_connect_started),
+            zmq_connect_abort: Arc::clone(&self.zmq_connect_abort),
             connect_signal_tx: self.connect_signal_tx.clone(),
             models_override: Arc::clone(&self.models_override),
-            http_client: self.http_client.clone(),
+            kv_engine_id: ArcSwapOption::new(self.kv_engine_id.load_full()),
+            kv_engine_id_unconfirmed: AtomicBool::new(
+                self.kv_engine_id_unconfirmed.load(Ordering::Relaxed),
+            ),
+            http_client: Arc::clone(&self.http_client),
             resilience: self.resilience.clone(),
         }
     }
@@ -1056,6 +1368,70 @@ impl BasicWorker {
         self.runtime.load_full()
     }
 
+    /// Start the one-shot background ZMQ handshake driver for `cell` unless one
+    /// is already in flight.
+    ///
+    /// The handshake is never driven inline: it can take as long as a model
+    /// load, so any caller awaiting it (request pipeline, load monitor, health
+    /// probe) would block far past its own deadline. Callers peek the cell and
+    /// report unavailable until the driver lands.
+    fn spawn_zmq_connect_driver(&self, cell: &Arc<OnceCell<Arc<BackendClient>>>) {
+        if self.zmq_connect_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let cell = Arc::clone(cell);
+        let started = Arc::clone(&self.zmq_connect_started);
+        let base_url = self.metadata.base_url().to_string();
+        let model_id = self.metadata.model_id().to_string();
+        let url = self.metadata.spec.url.clone();
+        let runtime = self.metadata.spec.runtime_type;
+        let handshake_override = self.metadata.spec.zmq_handshake_address.clone();
+        let engine_count = self.metadata.zmq_engine_count();
+        // Capture the readiness signal and the revision at hand-off. The
+        // manager only promotes if this revision still matches, so a
+        // same-URL replacement racing the handshake is discarded.
+        let signal_tx = self.connect_signal_tx.clone();
+        let revision = self.revision();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "detached one-shot handshake driver; the OnceCell dedupes with the request path and the guard self-clears on failure to allow a retry"
+        )]
+        // Detached: only the AbortHandle is kept, so the task keeps running
+        // until it completes or the worker leaves the registry.
+        let handle = tokio::spawn(async move {
+            match cell
+                .get_or_try_init(|| {
+                    connect_zmq_backend(
+                        base_url,
+                        model_id,
+                        runtime,
+                        handshake_override,
+                        engine_count,
+                    )
+                })
+                .await
+            {
+                Ok(_) => {
+                    // Handshake landed: wake the manager to promote now
+                    // rather than on the next poll. A dropped signal (no
+                    // manager, or receiver gone) is harmless — polling
+                    // still promotes on the success threshold.
+                    if let Some(tx) = &signal_tx {
+                        let _ = tx.send(WorkerConnected { url, revision });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "ZMQ backend handshake failed for {url}: {e}; will retry on the next health probe"
+                    );
+                    started.store(false, Ordering::SeqCst);
+                }
+            }
+        });
+        self.zmq_connect_abort
+            .store(Some(Arc::new(handle.abort_handle())));
+    }
+
     fn install_shared_state_from_basic(&self, other: &BasicWorker) {
         let shared_runtime = other.shared_runtime();
         shared_runtime.bump_revision();
@@ -1068,11 +1444,58 @@ impl BasicWorker {
         if other_cb.config() == existing_cb.config() {
             self.circuit_breaker.store(other_cb);
         }
+
+        self.adopt_backend_client_from(other);
+    }
+
+    /// Adopt the replaced worker's backend-client cell so a same-URL
+    /// replacement (a metadata-only update, say) keeps talking over the
+    /// connection the old worker already established. Decisive for ZMQ: SMG
+    /// binds the sockets and the engine handshakes only at its own startup, so
+    /// a replacement starting from an empty cell would unbind the live sockets,
+    /// rebind, and wait for a HELLO that never arrives.
+    ///
+    /// `zmq_connect_started` is deliberately left cleared rather than copied:
+    /// the shared cell already dedupes a handshake in flight, and a cleared
+    /// guard lets the replacement retry (and signal under its own revision) if
+    /// that handshake fails.
+    fn adopt_backend_client_from(&self, other: &BasicWorker) {
+        // A transport or runtime change means a different wire protocol, and a
+        // replacement that arrived with its own client keeps it.
+        if self.metadata.spec.connection_mode != other.metadata.spec.connection_mode
+            || self.metadata.spec.runtime_type != other.metadata.spec.runtime_type
+            || self.backend_client.load().get().is_some()
+        {
+            return;
+        }
+        self.backend_client.store(other.backend_client.load_full());
     }
 }
 
 #[async_trait]
 impl Worker for BasicWorker {
+    fn kv_engine_id(&self) -> Option<String> {
+        self.kv_engine_id.load_full().map(|id| (*id).clone())
+    }
+
+    fn refresh_kv_engine_id(&self, kv_engine_id: Option<String>) -> bool {
+        let previous = self.kv_engine_id.load_full();
+        if previous.as_deref() == kv_engine_id.as_ref() {
+            return false;
+        }
+        self.kv_engine_id.store(kv_engine_id.map(Arc::new));
+        true
+    }
+
+    fn kv_engine_id_confirmed(&self) -> bool {
+        !self.kv_engine_id_unconfirmed.load(Ordering::Relaxed)
+    }
+
+    fn set_kv_engine_id_confirmed(&self, confirmed: bool) {
+        self.kv_engine_id_unconfirmed
+            .store(!confirmed, Ordering::Relaxed);
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1182,8 +1605,24 @@ impl Worker for BasicWorker {
         self.update_running_requests_metrics();
     }
 
+    fn try_admit_pd(&self, count: usize, window: usize) -> bool {
+        self.runtime.load().try_admit_pd(count, window)
+    }
+
+    fn release_pd(&self, count: usize) {
+        self.runtime.load().release_pd(count);
+    }
+
+    fn pd_admitted(&self) -> usize {
+        self.runtime.load().pd_admitted()
+    }
+
     fn routing_key_load(&self) -> usize {
         self.runtime.load().routing_key_load()
+    }
+
+    fn routing_key_inflight(&self, routing_key: &str) -> usize {
+        self.runtime.load().routing_key_inflight(routing_key)
     }
 
     fn increment_routing_key_load(&self, routing_key: &str) {
@@ -1214,16 +1653,39 @@ impl Worker for BasicWorker {
         self.circuit_breaker.load().can_execute()
     }
 
+    fn is_overloaded(&self) -> bool {
+        self.runtime.load().is_overloaded()
+    }
+
+    fn set_overloaded(&self, overloaded: bool) -> bool {
+        self.runtime.load().set_overloaded(overloaded)
+    }
+
+    fn is_available(&self) -> bool {
+        // Same two guards the pre-veto version took (`is_healthy` +
+        // `circuit_breaker_can_execute`): the veto rides the runtime guard.
+        let rt = self.runtime.load();
+        rt.status() == WorkerStatus::Ready
+            && !rt.is_overloaded()
+            && self.circuit_breaker.load().can_execute()
+    }
+
+    fn is_healthy_and_eligible(&self) -> bool {
+        let rt = self.runtime.load();
+        rt.status() == WorkerStatus::Ready && !rt.is_overloaded()
+    }
+
     fn routing_state(&self) -> RoutingState {
-        // One runtime guard covers status + load + processed (all live in
-        // `self.runtime`); the circuit breaker is a separate ArcSwap, so it needs
-        // its own guard.
+        // One runtime guard covers status + load + processed + the overload veto
+        // (all live in `self.runtime`); the circuit breaker is a separate
+        // ArcSwap, so it needs its own guard.
         let rt = self.runtime.load();
         RoutingState {
             healthy: rt.status() == WorkerStatus::Ready,
             can_execute: self.circuit_breaker.load().can_execute(),
             load: rt.load(),
             processed: rt.processed_requests(),
+            overloaded: rt.is_overloaded(),
         }
     }
 
@@ -1236,7 +1698,11 @@ impl Worker for BasicWorker {
     }
 
     fn http_client(&self) -> &reqwest::Client {
-        &self.http_client
+        self.http_client.client()
+    }
+
+    fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
+        self.http_client.handle_if_initialized()
     }
 
     fn supports_model(&self, model_id: &str) -> bool {
@@ -1314,21 +1780,21 @@ impl Worker for BasicWorker {
             }
             ConnectionMode::Zmq => {
                 // SMG binds the handshake + data-plane sockets; the
-                // operator-launched engine dials them. The first acquisition
-                // completes the handshake (a liveness signal in itself). The
-                // model id comes from config — EngineCore reports none on the
-                // wire (see create_worker).
-                let base_url = self.metadata.base_url().to_string();
-                let model_id = self.metadata.model_id().to_string();
-                let runtime = self.metadata.spec.runtime_type;
-                let handshake_override = self.metadata.spec.zmq_handshake_address.clone();
+                // operator-launched engine dials them. Peek only: the handshake
+                // is owned by the background driver (it can outlast any
+                // caller's deadline — see spawn_zmq_connect_driver), so fail
+                // fast instead of blocking a request or a load poll behind it.
+                // Kicking the driver off here also covers workers whose health
+                // checks are disabled, where no probe ever runs.
                 let cell = self.backend_client.load_full();
-                let client = cell
-                    .get_or_try_init(|| {
-                        connect_zmq_backend(base_url, model_id, runtime, handshake_override)
-                    })
-                    .await?;
-                Ok(Some(Arc::clone(client)))
+                if let Some(client) = cell.get() {
+                    return Ok(Some(Arc::clone(client)));
+                }
+                self.spawn_zmq_connect_driver(&cell);
+                Err(WorkerError::ConnectionFailed {
+                    url: self.metadata.spec.url.clone(),
+                    reason: "ZMQ backend handshake has not completed yet".to_string(),
+                })
             }
         }
     }
@@ -1409,49 +1875,17 @@ impl Worker for BasicWorker {
             self.zmq_connect_started.store(false, Ordering::SeqCst);
             return Ok(false);
         }
-        if !self.zmq_connect_started.swap(true, Ordering::SeqCst) {
-            let started = Arc::clone(&self.zmq_connect_started);
-            let base_url = self.metadata.base_url().to_string();
-            let model_id = self.metadata.model_id().to_string();
-            let url = self.metadata.spec.url.clone();
-            let runtime = self.metadata.spec.runtime_type;
-            let handshake_override = self.metadata.spec.zmq_handshake_address.clone();
-            // Capture the readiness signal and the revision at hand-off. The
-            // manager only promotes if this revision still matches, so a
-            // same-URL replacement racing the handshake is discarded.
-            let signal_tx = self.connect_signal_tx.clone();
-            let revision = self.revision();
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "detached one-shot handshake driver; the OnceCell dedupes with the request path and the guard self-clears on failure to allow a retry"
-            )]
-            // Detached: dropping the handle at scope end leaves the task running.
-            let _handle = tokio::spawn(async move {
-                match cell
-                    .get_or_try_init(|| {
-                        connect_zmq_backend(base_url, model_id, runtime, handshake_override)
-                    })
-                    .await
-                {
-                    Ok(_) => {
-                        // Handshake landed: wake the manager to promote now
-                        // rather than on the next poll. A dropped signal (no
-                        // manager, or receiver gone) is harmless — polling
-                        // still promotes on the success threshold.
-                        if let Some(tx) = &signal_tx {
-                            let _ = tx.send(WorkerConnected { url, revision });
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "ZMQ backend handshake failed for {url}: {e}; will retry on the next health probe"
-                        );
-                        started.store(false, Ordering::SeqCst);
-                    }
-                }
-            });
-        }
+        self.spawn_zmq_connect_driver(&cell);
         Ok(false)
+    }
+
+    fn abort_background_tasks(&self) {
+        if let Some(handle) = self.zmq_connect_abort.swap(None) {
+            handle.abort();
+            // The bound sockets are released with the cancelled future; reset
+            // the guard so any instance still sharing this state can retry.
+            self.zmq_connect_started.store(false, Ordering::SeqCst);
+        }
     }
 
     async fn http_health_check(&self) -> WorkerResult<bool> {
@@ -1459,7 +1893,7 @@ impl Worker for BasicWorker {
 
         let health_url = format!("{}{}", self.base_url(), self.metadata.health_endpoint);
 
-        let mut req = self.http_client.get(&health_url).timeout(timeout);
+        let mut req = self.http_client.client().get(&health_url).timeout(timeout);
         if let Some(api_key) = &self.metadata.spec.api_key {
             req = req.bearer_auth(api_key);
         }
@@ -1499,10 +1933,16 @@ pub struct WorkerLoadGuard {
 
 impl WorkerLoadGuard {
     pub fn new(worker: Arc<dyn Worker>, headers: Option<&http::HeaderMap>) -> Self {
+        let key = extract_routing_key(headers).map(String::from);
+        Self::with_key(worker, key.as_deref())
+    }
+
+    /// Guard keyed by the caller-resolved effective sticky key (rid-derived
+    /// wins over the header), so keyed-load accounting matches selection.
+    pub fn with_key(worker: Arc<dyn Worker>, routing_key: Option<&str>) -> Self {
         worker.increment_load();
 
-        let routing_key = extract_routing_key(headers).map(String::from);
-
+        let routing_key = routing_key.map(String::from);
         if let Some(ref key) = routing_key {
             worker.increment_routing_key_load(key);
         }
@@ -1584,6 +2024,9 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
     let metadata = worker.metadata();
     let spec = metadata.spec.clone();
     let status = worker.status();
+    // Only PD legs pair; a regular worker's descriptor would be noise.
+    let pd_pairing = matches!(spec.worker_type, WorkerType::Prefill | WorkerType::Decode)
+        .then(|| metadata.pd_pairing.key());
 
     WorkerInfo {
         id: worker.url().to_string(),
@@ -1592,6 +2035,9 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         is_healthy: status == WorkerStatus::Ready,
         status: Some(status),
         load: worker.load(),
+        http2: metadata.http2,
+        pd_pairing,
+        engine_load: None,
         job_status: None,
     }
 }
@@ -1737,6 +2183,81 @@ mod tests {
             .build();
         // Zero is meaningless for capacity; treat as "not reported".
         assert_eq!(worker.max_running_requests(), None);
+    }
+
+    #[test]
+    fn test_max_running_requests_reads_the_tokenspeed_spelling() {
+        use crate::worker::BasicWorkerBuilder;
+        // TokenSpeed advertises the same scheduler window as `max_num_seqs`;
+        // without this a TokenSpeed worker looks like a non-reporter to both
+        // fleet capacity and PD admission.
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("max_num_seqs".to_string(), "16".to_string());
+        let worker = BasicWorkerBuilder::new("grpc://w:30000")
+            .labels(labels)
+            .build();
+        assert_eq!(worker.max_running_requests(), Some(16));
+    }
+
+    #[test]
+    fn test_max_running_requests_prefers_max_num_seqs_when_both_are_reported() {
+        use crate::worker::BasicWorkerBuilder;
+        // The servicer's `running_window` resolves in the same order, so a
+        // worker reporting both spellings cannot have its discovery label
+        // disagree with its GetLoads report.
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("max_running_requests".to_string(), "256".to_string());
+        labels.insert("max_num_seqs".to_string(), "16".to_string());
+        let worker = BasicWorkerBuilder::new("grpc://w:30000")
+            .labels(labels)
+            .build();
+        assert_eq!(worker.max_running_requests(), Some(16));
+    }
+
+    #[test]
+    fn test_pd_admission_claims_are_atomic_and_bounded_by_the_window() {
+        use crate::worker::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("grpc://w:30000").build();
+
+        assert!(worker.try_admit_pd(2, 3));
+        assert_eq!(worker.pd_admitted(), 2);
+        // All-or-nothing: a refusal must leave the claim untouched.
+        assert!(!worker.try_admit_pd(2, 3));
+        assert_eq!(worker.pd_admitted(), 2);
+        assert!(worker.try_admit_pd(1, 3));
+        assert_eq!(worker.pd_admitted(), 3);
+
+        worker.release_pd(3);
+        assert_eq!(worker.pd_admitted(), 0);
+        // Releases saturate rather than wrapping to usize::MAX.
+        worker.release_pd(1);
+        assert_eq!(worker.pd_admitted(), 0);
+    }
+
+    #[test]
+    fn test_pd_admission_never_overshoots_the_window_under_real_parallelism() {
+        use std::{sync::Arc, thread};
+
+        use crate::worker::BasicWorkerBuilder;
+        // The whole point of claiming rather than reading: threads racing for
+        // the last rooms must not all win.
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://w:30000").build());
+        let window = 8;
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let worker = Arc::clone(&worker);
+                thread::spawn(move || worker.try_admit_pd(1, window))
+            })
+            .collect();
+
+        let admitted = threads
+            .into_iter()
+            .map(|handle| handle.join().expect("claim thread"))
+            .filter(|claimed| *claimed)
+            .count();
+
+        assert_eq!(admitted, window, "exactly the window's worth may claim");
+        assert_eq!(worker.pd_admitted(), window);
     }
 
     #[test]
@@ -2225,6 +2746,56 @@ mod tests {
     }
 
     #[test]
+    fn test_capacity_pushback_never_trips_circuit_breaker() {
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build();
+
+        // A storm of 429 capacity pushback must not open the breaker...
+        for _ in 0..20 {
+            worker.record_outcome(429);
+        }
+        assert!(worker.is_available());
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+
+        // ...while genuine failures still do.
+        for _ in 0..5 {
+            worker.record_outcome(500);
+        }
+        assert!(!worker.is_available());
+    }
+
+    #[test]
+    fn test_capacity_pushback_does_not_close_half_open_breaker() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 2,
+            success_threshold: 1,
+            timeout_duration: Duration::from_millis(50),
+            window_duration: Duration::from_secs(60),
+        };
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .circuit_breaker_config(config)
+            .health_config(no_health_check())
+            .build();
+
+        worker.record_outcome(500);
+        worker.record_outcome(500);
+        assert!(!worker.is_available());
+        thread::sleep(Duration::from_millis(80));
+        assert!(worker.is_available());
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+
+        // 429 records no sample: the breaker must stay half-open, not close.
+        worker.record_outcome(429);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+
+        worker.record_outcome(200);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    #[test]
     fn test_worker_with_circuit_breaker_config() {
         let config = CircuitBreakerConfig {
             failure_threshold: 2,
@@ -2353,9 +2924,12 @@ mod tests {
     #[test]
     fn test_worker_metadata_empty_models_accepts_all() {
         let metadata = WorkerMetadata {
+            pd_pairing: PdPairing::derive(&WorkerSpec::new("http://test:8080")),
             spec: Arc::new(WorkerSpec::new("http://test:8080")),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
+            overload: OverloadThresholds::default(),
+            http2: false,
         };
 
         // Empty models list should accept any model
@@ -2376,9 +2950,12 @@ mod tests {
         let mut spec = WorkerSpec::new("http://test:8080");
         spec.models = WorkerModels::from(vec![model1, model2]);
         let metadata = WorkerMetadata {
+            pd_pairing: PdPairing::derive(&spec),
             spec: Arc::new(spec),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
+            overload: OverloadThresholds::default(),
+            http2: false,
         };
 
         // Find by primary ID
@@ -2566,6 +3143,34 @@ mod tests {
         assert!(worker.has_models_discovered());
     }
 
+    #[test]
+    fn replacement_adopts_the_backend_client_only_on_a_matching_transport() {
+        // The cell object itself is the connection: sharing it is what keeps a
+        // replaced ZMQ worker talking to the engine that already handshook.
+        let build = |mode: ConnectionMode| {
+            BasicWorkerBuilder::new("ipc:///tmp/w.ipc")
+                .connection_mode(mode)
+                .health_config(no_health_check())
+                .build()
+        };
+
+        let old = build(ConnectionMode::Zmq);
+        let new = build(ConnectionMode::Zmq);
+        assert!(new.inherit_shared_state_from(&old));
+        assert!(Arc::ptr_eq(
+            &new.backend_client.load_full(),
+            &old.backend_client.load_full()
+        ));
+
+        // A transport change means a different wire protocol — no adoption.
+        let retyped = build(ConnectionMode::Http);
+        assert!(retyped.inherit_shared_state_from(&old));
+        assert!(!Arc::ptr_eq(
+            &retyped.backend_client.load_full(),
+            &old.backend_client.load_full()
+        ));
+    }
+
     /// A ZMQ client whose engine dies must be evicted by the health probe (the
     /// connection can't reconnect in place — liveness is latched), and the
     /// handshake guard reset so a later probe rebinds the sockets for a
@@ -2654,6 +3259,112 @@ mod tests {
         assert!(
             !worker.zmq_connect_started.load(Ordering::SeqCst),
             "handshake guard must reset to allow a reconnect"
+        );
+    }
+
+    /// Build a ZMQ worker whose sockets no engine will ever dial, plus the
+    /// data-plane socket path its handshake driver binds.
+    fn unattended_zmq_worker(dir: &std::path::Path) -> (BasicWorker, std::path::PathBuf) {
+        let worker = BasicWorkerBuilder::new(format!("ipc://{}", dir.join("ts0.ipc").display()))
+            .connection_mode(ConnectionMode::Zmq)
+            .health_config(no_health_check())
+            .build();
+        (worker, dir.join("ts0.ipc-in.sock"))
+    }
+
+    /// Poll `cond` until it holds, up to five seconds.
+    async fn wait_for(cond: impl Fn() -> bool) -> bool {
+        time::timeout(Duration::from_secs(5), async {
+            while !cond() {
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// The ZMQ handshake can run as long as a model load, so acquisition on a
+    /// request or load-monitor path must hand it to the background driver and
+    /// fail fast instead of awaiting it inline.
+    #[tokio::test]
+    async fn zmq_get_backend_client_hands_the_handshake_to_the_background_driver() {
+        let base = tempfile::tempdir().unwrap();
+        let (worker, input_socket) = unattended_zmq_worker(base.path());
+
+        let acquired = time::timeout(Duration::from_secs(5), worker.get_backend_client())
+            .await
+            .expect("acquisition must not await the handshake");
+        assert!(
+            matches!(acquired, Err(WorkerError::ConnectionFailed { .. })),
+            "acquisition must report the backend as not connected yet"
+        );
+        assert!(
+            worker.backend_client.load().get().is_none(),
+            "no client can be cached before the handshake lands"
+        );
+
+        let handle = worker
+            .zmq_connect_abort
+            .load_full()
+            .expect("acquisition must start the background handshake driver");
+        assert!(
+            wait_for(|| input_socket.exists()).await,
+            "driver never bound the data-plane sockets"
+        );
+        assert!(
+            !handle.is_finished(),
+            "driver must still be waiting for the engine"
+        );
+
+        // A second acquisition rides the in-flight driver instead of spawning
+        // another one (which would rebind the same sockets).
+        assert!(worker.get_backend_client().await.is_err());
+        assert!(Arc::ptr_eq(
+            &handle,
+            &worker
+                .zmq_connect_abort
+                .load_full()
+                .expect("driver still recorded")
+        ));
+
+        worker.abort_background_tasks();
+    }
+
+    /// The driver holds the ipc data-plane and TCP handshake binds until it
+    /// lands, so worker removal/replacement must abort it — otherwise a
+    /// same-URL re-registration collides with an orphan for up to the connect
+    /// timeout.
+    #[tokio::test]
+    async fn abort_background_tasks_cancels_the_zmq_handshake_driver() {
+        let base = tempfile::tempdir().unwrap();
+        let (worker, input_socket) = unattended_zmq_worker(base.path());
+
+        assert!(
+            !worker.zmq_health_check().await.unwrap(),
+            "worker is not ready until the handshake lands"
+        );
+        let handle = worker
+            .zmq_connect_abort
+            .load_full()
+            .expect("probe must start the background handshake driver");
+        assert!(
+            wait_for(|| input_socket.exists()).await,
+            "driver never bound the data-plane sockets"
+        );
+
+        worker.abort_background_tasks();
+
+        assert!(
+            wait_for(|| handle.is_finished()).await,
+            "abort must cancel the in-flight handshake"
+        );
+        assert!(
+            worker.zmq_connect_abort.load_full().is_none(),
+            "the aborted driver must not stay recorded"
+        );
+        assert!(
+            !worker.zmq_connect_started.load(Ordering::SeqCst),
+            "handshake guard must reset so a later probe can retry"
         );
     }
 }

@@ -325,8 +325,8 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
 
         let detected = match connection_mode {
             ConnectionMode::Http => {
-                let client = &app_context.client;
-                detect_http_backend(&config.url, timeout, client, config.api_key.as_deref())
+                let client = context.data.http_client("detect_backend")?;
+                detect_http_backend(&config.url, timeout, &client, config.api_key.as_deref())
                     .await
                     .map_err(|e| WorkflowError::StepFailed {
                         step_id: wfaas::StepId::new("detect_backend"),

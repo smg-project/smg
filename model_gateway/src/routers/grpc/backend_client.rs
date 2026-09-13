@@ -27,7 +27,7 @@ use crate::{
             finish_tokenspeed_request, finish_vllm_request, ProtoEmbedComplete, ProtoEmbedRequest,
             ProtoGenerateRequest, ProtoStream,
         },
-        zmq_client::{fold_tokenizer_eos_backstop, ZmqEngineClient},
+        zmq_client::{fold_tokenizer_eos_backstop, ZmqDialect, ZmqEngineClient},
         MultimodalData,
     },
     worker::RuntimeType,
@@ -40,6 +40,45 @@ pub enum BackendClient {
     Grpc(GrpcClient),
     Zmq(ZmqEngineClient),
 }
+
+/// The native request builders of both ZMQ dialects for one request kind — the
+/// only thing that differs between the ZMQ build surfaces, so the dialect
+/// dispatch itself lives once in [`build_zmq_request`]/[`build_zmq_plain_request`].
+struct ZmqBuilders<V, T> {
+    vllm: V,
+    tokenspeed: T,
+}
+
+/// A vLLM builder for a request kind carrying multimodal inputs and tool
+/// constraints (chat, messages).
+type VllmMmBuilder<B> = fn(
+    String,
+    &B,
+    String,
+    Vec<u32>,
+    Option<vllm_proto::MultimodalInputs>,
+    Option<(String, String)>,
+) -> Result<vllm_proto::GenerateRequest, String>;
+
+/// The TokenSpeed counterpart of [`VllmMmBuilder`].
+type TokenSpeedMmBuilder<B> = fn(
+    String,
+    &B,
+    String,
+    Vec<u32>,
+    Option<tokenspeed_proto::MultimodalInputs>,
+    Option<(String, String)>,
+) -> Result<tokenspeed_proto::GenerateRequest, String>;
+
+/// A vLLM builder for a request kind with neither multimodal inputs nor tool
+/// constraints (completion, plain generate); `T` is the builder's text
+/// parameter.
+type VllmPlainBuilder<B, T> =
+    fn(String, &B, T, Vec<u32>) -> Result<vllm_proto::GenerateRequest, String>;
+
+/// The TokenSpeed counterpart of [`VllmPlainBuilder`].
+type TokenSpeedPlainBuilder<B, T> =
+    fn(String, &B, T, Vec<u32>) -> Result<tokenspeed_proto::GenerateRequest, String>;
 
 impl BackendClient {
     /// Runtime type backing this client.
@@ -74,10 +113,18 @@ impl BackendClient {
         let router_stops = helpers::resolve_string_stops(request, tokenizer, token_only_wire);
         if let Self::Zmq(client) = self {
             // EngineCore has no tokenizer, so stopping at EOS is this
-            // frontend's job; TokenSpeed's scheduler stops at EOS itself.
-            if client.runtime() != RuntimeType::TokenSpeed {
-                fold_tokenizer_eos_backstop(request, tokenizer);
-            }
+            // frontend's job; TokenSpeed's scheduler stops at EOS itself, and
+            // its requests are a different proto variant — the fold's own
+            // variant match is the single dispatch point.
+            //
+            // The primary id must also ride the request's `_eos_token_id`, not
+            // just the stop set, or an EOS finish surfaces as a matched_stop
+            // token id. That field is filled from the client's own EOS set, so
+            // hand it the tokenizer's ids for the deployments where the
+            // connect-time model-dir lookup found none (the adopted set is
+            // likewise only read by the vLLM translation).
+            client.adopt_tokenizer_eos(tokenizer);
+            fold_tokenizer_eos_backstop(request, tokenizer);
         }
         router_stops
     }
@@ -229,39 +276,20 @@ impl BackendClient {
                 client.build_chat_request(request_id, body, processed_text, token_ids, options)
             }
             // A ZMQ backend speaks vLLM EngineCore or TokenSpeed directly; build
-            // the native request for its runtime, mirroring the gRPC per-engine
+            // the native request for its dialect, mirroring the gRPC per-engine
             // dispatch in `GrpcClient::build_chat_request`.
-            Self::Zmq(client) => match client.runtime() {
-                RuntimeType::TokenSpeed => {
-                    let tokenspeed_mm = zmq_tokenspeed_mm(options.multimodal_inputs)?;
-                    finish_tokenspeed_request(tokenspeed_mm, |mm| {
-                        TokenSpeedSchedulerClient::build_generate_request_from_chat(
-                            request_id,
-                            body,
-                            processed_text,
-                            token_ids,
-                            mm,
-                            options.tool_constraints,
-                        )
-                    })
-                }
-                RuntimeType::Vllm => {
-                    let vllm_mm = zmq_vllm_mm(options.multimodal_inputs)?;
-                    finish_vllm_request(vllm_mm, |mm| {
-                        VllmEngineClient::build_generate_request_from_chat(
-                            request_id,
-                            body,
-                            processed_text,
-                            token_ids,
-                            mm,
-                            options.tool_constraints,
-                        )
-                    })
-                }
-                other => Err(format!(
-                    "ZMQ backend reports unsupported runtime {other:?}; expected vLLM or TokenSpeed"
-                )),
-            },
+            Self::Zmq(client) => build_zmq_request(
+                client.dialect(),
+                request_id,
+                body,
+                processed_text,
+                token_ids,
+                options,
+                ZmqBuilders {
+                    vllm: VllmEngineClient::build_generate_request_from_chat,
+                    tokenspeed: TokenSpeedSchedulerClient::build_generate_request_from_chat,
+                },
+            ),
         }
     }
 
@@ -278,38 +306,19 @@ impl BackendClient {
                 client.build_messages_request(request_id, body, processed_text, token_ids, options)
             }
             // Mirrors the gRPC per-engine dispatch: build the request natively for
-            // the ZMQ backend's runtime (vLLM EngineCore or TokenSpeed).
-            Self::Zmq(client) => match client.runtime() {
-                RuntimeType::TokenSpeed => {
-                    let tokenspeed_mm = zmq_tokenspeed_mm(options.multimodal_inputs)?;
-                    finish_tokenspeed_request(tokenspeed_mm, |mm| {
-                        TokenSpeedSchedulerClient::build_generate_request_from_messages(
-                            request_id,
-                            body,
-                            processed_text,
-                            token_ids,
-                            mm,
-                            options.tool_constraints,
-                        )
-                    })
-                }
-                RuntimeType::Vllm => {
-                    let vllm_mm = zmq_vllm_mm(options.multimodal_inputs)?;
-                    finish_vllm_request(vllm_mm, |mm| {
-                        VllmEngineClient::build_generate_request_from_messages(
-                            request_id,
-                            body,
-                            processed_text,
-                            token_ids,
-                            mm,
-                            options.tool_constraints,
-                        )
-                    })
-                }
-                other => Err(format!(
-                    "ZMQ backend reports unsupported runtime {other:?}; expected vLLM or TokenSpeed"
-                )),
-            },
+            // the ZMQ backend's dialect (vLLM EngineCore or TokenSpeed).
+            Self::Zmq(client) => build_zmq_request(
+                client.dialect(),
+                request_id,
+                body,
+                processed_text,
+                token_ids,
+                options,
+                ZmqBuilders {
+                    vllm: VllmEngineClient::build_generate_request_from_messages,
+                    tokenspeed: TokenSpeedSchedulerClient::build_generate_request_from_messages,
+                },
+            ),
         }
     }
 
@@ -324,29 +333,17 @@ impl BackendClient {
             Self::Grpc(client) => {
                 client.build_completion_request(request_id, body, original_text, token_ids)
             }
-            Self::Zmq(client) => match client.runtime() {
-                RuntimeType::TokenSpeed => {
-                    let req = TokenSpeedSchedulerClient::build_generate_request_from_completion(
-                        request_id,
-                        body,
-                        original_text,
-                        token_ids,
-                    )?;
-                    Ok(ProtoGenerateRequest::TokenSpeed(Box::new(req)))
-                }
-                RuntimeType::Vllm => {
-                    let req = VllmEngineClient::build_generate_request_from_completion(
-                        request_id,
-                        body,
-                        original_text,
-                        token_ids,
-                    )?;
-                    Ok(ProtoGenerateRequest::Vllm(Box::new(req)))
-                }
-                other => Err(format!(
-                    "ZMQ backend reports unsupported runtime {other:?}; expected vLLM or TokenSpeed"
-                )),
-            },
+            Self::Zmq(client) => build_zmq_plain_request(
+                client.dialect(),
+                request_id,
+                body,
+                original_text,
+                token_ids,
+                ZmqBuilders {
+                    vllm: VllmEngineClient::build_generate_request_from_completion,
+                    tokenspeed: TokenSpeedSchedulerClient::build_generate_request_from_completion,
+                },
+            ),
         }
     }
 
@@ -361,30 +358,83 @@ impl BackendClient {
             Self::Grpc(client) => {
                 client.build_generate_request(request_id, body, original_text, token_ids)
             }
-            Self::Zmq(client) => match client.runtime() {
-                RuntimeType::TokenSpeed => {
-                    let req = TokenSpeedSchedulerClient::build_plain_generate_request(
-                        request_id,
-                        body,
-                        original_text,
-                        token_ids,
-                    )?;
-                    Ok(ProtoGenerateRequest::TokenSpeed(Box::new(req)))
-                }
-                RuntimeType::Vllm => {
-                    let req = VllmEngineClient::build_plain_generate_request(
-                        request_id,
-                        body,
-                        original_text,
-                        token_ids,
-                    )?;
-                    Ok(ProtoGenerateRequest::Vllm(Box::new(req)))
-                }
-                other => Err(format!(
-                    "ZMQ backend reports unsupported runtime {other:?}; expected vLLM or TokenSpeed"
-                )),
-            },
+            Self::Zmq(client) => build_zmq_plain_request(
+                client.dialect(),
+                request_id,
+                body,
+                original_text,
+                token_ids,
+                ZmqBuilders {
+                    vllm: VllmEngineClient::build_plain_generate_request,
+                    tokenspeed: TokenSpeedSchedulerClient::build_plain_generate_request,
+                },
+            ),
         }
+    }
+}
+
+/// Build a multimodal-carrying request (chat, messages) for a ZMQ backend: one
+/// dispatch over the closed [`ZmqDialect`], converting the assembled multimodal
+/// data to the dialect's proto and finishing through its SHM-cleanup wrapper.
+fn build_zmq_request<B>(
+    dialect: ZmqDialect,
+    request_id: String,
+    body: &B,
+    processed_text: String,
+    token_ids: Vec<u32>,
+    options: GenerateRequestBuildOptions,
+    builders: ZmqBuilders<VllmMmBuilder<B>, TokenSpeedMmBuilder<B>>,
+) -> Result<ProtoGenerateRequest, String> {
+    let ZmqBuilders { vllm, tokenspeed } = builders;
+    match dialect {
+        ZmqDialect::Vllm => {
+            let vllm_mm = zmq_vllm_mm(options.multimodal_inputs)?;
+            finish_vllm_request(vllm_mm, |mm| {
+                vllm(
+                    request_id,
+                    body,
+                    processed_text,
+                    token_ids,
+                    mm,
+                    options.tool_constraints,
+                )
+            })
+        }
+        ZmqDialect::TokenSpeed => {
+            let tokenspeed_mm = zmq_tokenspeed_mm(options.multimodal_inputs)?;
+            finish_tokenspeed_request(tokenspeed_mm, |mm| {
+                tokenspeed(
+                    request_id,
+                    body,
+                    processed_text,
+                    token_ids,
+                    mm,
+                    options.tool_constraints,
+                )
+            })
+        }
+    }
+}
+
+/// Build a request kind with no multimodal or tool inputs (completion, plain
+/// generate) for a ZMQ backend. `text` is the builders' shared text parameter
+/// (`String` for completion, `Option<String>` for plain generate).
+fn build_zmq_plain_request<B, T>(
+    dialect: ZmqDialect,
+    request_id: String,
+    body: &B,
+    text: T,
+    token_ids: Vec<u32>,
+    builders: ZmqBuilders<VllmPlainBuilder<B, T>, TokenSpeedPlainBuilder<B, T>>,
+) -> Result<ProtoGenerateRequest, String> {
+    let ZmqBuilders { vllm, tokenspeed } = builders;
+    match dialect {
+        ZmqDialect::Vllm => Ok(ProtoGenerateRequest::Vllm(Box::new(vllm(
+            request_id, body, text, token_ids,
+        )?))),
+        ZmqDialect::TokenSpeed => Ok(ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed(
+            request_id, body, text, token_ids,
+        )?))),
     }
 }
 

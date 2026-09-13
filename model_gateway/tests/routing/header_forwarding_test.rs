@@ -3,7 +3,7 @@
 //! Tests for header propagation through the router to workers.
 
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
@@ -302,6 +302,45 @@ mod header_forwarding_tests {
             "x-request-id should take priority"
         );
 
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_routed_worker_id_for_streaming_and_non_streaming_responses() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 19406,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+        let worker_url = ctx.app_context.worker_registry.get_all()[0]
+            .url()
+            .to_string();
+
+        for stream in [false, true] {
+            let payload = json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": stream
+            });
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()["x-smg-routed-worker-id"],
+                worker_url.as_str()
+            );
+            to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        }
         ctx.shutdown().await;
     }
 }

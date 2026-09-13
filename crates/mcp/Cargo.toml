@@ -1,6 +1,6 @@
 [package]
 name = "smg-mcp"
-version = "2.3.2"
+version = "2.3.3"
 edition = "2021"
 description = "Model Context Protocol (MCP) client implementation"
 license = "Apache-2.0"

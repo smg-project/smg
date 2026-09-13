@@ -103,17 +103,26 @@ class TestGoOAIServerBasic:
 @pytest.mark.engine("sglang")
 @pytest.mark.gpu(1)
 @pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
-@pytest.mark.xfail(
-    reason="Llama-3.2-1B-Instruct doesn't reliably support tool calling with tool_choice=required",
-    strict=False,  # Allow tests to pass if model happens to work
-)
 class TestGoOAIServerFunctionCalling:
     """Tests for function calling through Go OAI server.
 
-    Note: Function calling requires the model to support tool use.
-    The meta-llama/Llama-3.2-1B-Instruct model may not reliably support tool_choice='required'.
-    These tests are marked as xfail to allow CI to pass while still
-    testing the Go OAI server's tool calling proxy functionality.
+    Two independent reasons a tool call may not appear, and the xfail names
+    whichever applies:
+
+    1. The example server does not forward ``tools``/``tool_choice``. Its
+       request model declares both fields (``models/chat.go``) but
+       ``handlers/chat.go`` builds the downstream request field by field and
+       never copies them, so the gateway is asked to generate without tools
+       and no tool call can be produced. This is a server gap, not a model
+       one, and it is what these tests currently hit.
+    2. Once forwarding lands, ``meta-llama/Llama-3.2-1B-Instruct`` may still
+       not reliably emit a tool call under ``tool_choice='required'``.
+
+    Everything that does not depend on a tool call is asserted
+    unconditionally — response shape, that the model produced *some* output
+    (a completion swallowed by the streaming parser must fail here, not
+    xfail), and, once a call exists, streamed index math, argument
+    accumulation and JSON validity.
     """
 
     TOOLS = [
@@ -162,17 +171,38 @@ class TestGoOAIServerFunctionCalling:
             stream=False,
         )
 
+        # Structural: response shape (unconditional).
         assert response.choices is not None
+        assert len(response.choices) > 0
         tool_calls = response.choices[0].message.tool_calls
 
-        assert tool_calls is not None, "Expected tool calls"
-        assert len(tool_calls) > 0, "Expected at least one tool call"
+        if not tool_calls:
+            # No tool call is excusable; producing nothing at all is not. A
+            # completion swallowed on the way back must fail rather than hide
+            # behind the xfail below.
+            content = response.choices[0].message.content
+            assert content and content.strip(), (
+                "no tool call AND no content - the completion was swallowed"
+            )
+            pytest.xfail(
+                "no tool call: the Go example server does not forward "
+                "tools/tool_choice (handlers/chat.go), so the gateway never "
+                "sees the tool definitions"
+            )
 
+        # Structural: any parsed tool call must be well-formed (unconditional).
         tool_call = tool_calls[0]
         assert tool_call.function.name == "get_weather"
 
         args = json.loads(tool_call.function.arguments)
-        assert "location" in args
+        assert isinstance(args, dict)
+
+        # Model-dependent: argument quality.
+        if "location" not in args:
+            pytest.xfail(
+                f"Llama-3.2-1B-Instruct produced schema-incomplete arguments {args} "
+                "(known model limitation)"
+            )
         logger.info(f"Tool call: {tool_call.function.name}({args})")
 
     def test_function_calling_streaming(self, go_openai_client, go_oai_server):
@@ -191,15 +221,19 @@ class TestGoOAIServerFunctionCalling:
             stream=True,
         )
 
+        # Structural: the stream itself must be well-formed (unconditional).
         chunks = list(response_stream)
         assert len(chunks) > 0
 
-        # Reconstruct tool calls from streaming chunks
+        # Reconstruct tool calls (and content) from streaming chunks
         tool_calls_by_index = {}
+        content_parts = []
         for chunk in chunks:
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
+            if delta.content:
+                content_parts.append(delta.content)
             if delta.tool_calls:
                 for tc in delta.tool_calls:
                     idx = tc.index
@@ -213,18 +247,47 @@ class TestGoOAIServerFunctionCalling:
                     if tc.function.arguments:
                         tool_calls_by_index[idx]["arguments"] += tc.function.arguments
 
-        assert len(tool_calls_by_index) > 0, "Expected tool calls in stream"
+        if not tool_calls_by_index:
+            # The regression this suite guards against streams neither
+            # tool_call deltas nor content deltas, which is exactly the shape
+            # that would otherwise xfail silently here.
+            assert "".join(content_parts).strip(), (
+                "streamed no tool call AND no content - the completion was swallowed"
+            )
+            pytest.xfail(
+                "no streamed tool call: the Go example server does not forward "
+                "tools/tool_choice (handlers/chat.go), so the gateway never "
+                "sees the tool definitions"
+            )
 
-        # Verify first tool call
+        # Structural: index math and argument accumulation (unconditional).
+        assert 0 in tool_calls_by_index, (
+            f"Streamed tool call indices must start at 0, got {sorted(tool_calls_by_index)}"
+        )
         first_tc = tool_calls_by_index[0]
         assert first_tc["name"] == "get_weather"
 
         args = json.loads(first_tc["arguments"])
-        assert "location" in args
+        assert isinstance(args, dict)
+
+        # Model-dependent: argument quality.
+        if "location" not in args:
+            pytest.xfail(
+                f"Llama-3.2-1B-Instruct produced schema-incomplete arguments {args} "
+                "(known model limitation)"
+            )
         logger.info(f"Streamed tool call: {first_tc['name']}({args})")
 
     def test_function_calling_tool_choice_none(self, go_openai_client, go_oai_server):
-        """Test that tool_choice='none' prevents function calls."""
+        """Test that tool_choice='none' yields a text response.
+
+        The suppression half of this contract cannot be exercised through the
+        example server today: it does not forward ``tools``/``tool_choice``
+        (``handlers/chat.go``), so no tool call could appear with or without
+        ``tool_choice='none'``. What is still worth pinning - and is not
+        model-dependent - is that the request succeeds and comes back as
+        text, so nothing here may xfail.
+        """
         _, _, model_path = go_oai_server
 
         response = go_openai_client.chat.completions.create(
@@ -240,8 +303,11 @@ class TestGoOAIServerFunctionCalling:
 
         assert response.choices is not None
         # With tool_choice="none", should get text response, not tool calls
-        tool_calls = response.choices[0].message.tool_calls
-        assert tool_calls is None or len(tool_calls) == 0
+        message = response.choices[0].message
+        assert message.tool_calls is None or len(message.tool_calls) == 0
+        assert message.content and message.content.strip(), (
+            "tool_choice='none' must still return a text answer"
+        )
 
 
 @pytest.mark.engine("sglang")
@@ -631,14 +697,15 @@ class TestGoOAIServerEdgeCases:
 @pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
 @pytest.mark.xfail(
     reason="Go OAI server does not currently support n > 1 (multiple choices)",
-    strict=False,
+    strict=True,  # deterministic capability gap: XPASS must fail so the marker is removed when n>1 lands
 )
 class TestGoOAIServerMultipleChoices:
     """Tests for n parameter (multiple choices).
 
     Note: The Go OAI server currently does not support generating multiple
-    choices (n > 1). These tests are marked as xfail to document the expected
-    behavior and will pass when support is added.
+    choices (n > 1) — a deterministic server capability gap, not model
+    flakiness — so these tests are strict xfails: when support is added they
+    will XPASS and fail CI, forcing removal of the marker.
     """
 
     def test_n_parameter_non_streaming(self, go_openai_client, go_oai_server):

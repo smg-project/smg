@@ -4,7 +4,8 @@ PD disaggregation separates prefill and decode phases across different
 workers for improved throughput and resource utilization.
 
 Backends:
-- "pd_http": HTTP mode (SGLang only - vLLM does not support HTTP)
+- "pd_http": HTTP mode (SGLang parallel bootstrap dispatch; vLLM sequential
+  prefill-then-decode with kv_transfer_params relay)
 - "pd_grpc": gRPC mode (both SGLang and vLLM)
 
 Requirements:
@@ -16,7 +17,7 @@ Usage:
     # SGLang (runs both HTTP and gRPC)
     pytest e2e_test/router/test_pd_mmlu.py -v
 
-    # vLLM (runs gRPC only, HTTP skipped)
+    # vLLM (runs both HTTP and gRPC)
     E2E_RUNTIME=vllm pytest e2e_test/router/test_pd_mmlu.py -v
 """
 
@@ -27,15 +28,15 @@ from types import SimpleNamespace
 
 import pytest
 from infra import run_eval
+from infra.constants import get_runtime
 
 logger = logging.getLogger(__name__)
 
 
-@pytest.mark.engine("sglang")
+@pytest.mark.engine("sglang", "vllm")
 @pytest.mark.gpu(2)
 @pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
 @pytest.mark.e2e
-@pytest.mark.skip_for_runtime("vllm", reason="vLLM does not support HTTP mode")
 @pytest.mark.parametrize("setup_backend", ["pd_http"], indirect=True)
 class TestPDMMLUHttp:
     """MMLU evaluation tests using PD disaggregation (HTTP mode)."""
@@ -60,14 +61,24 @@ class TestPDMMLUHttp:
         logger.info("PD HTTP MMLU score: %.2f (threshold: 0.65)", metrics["score"])
 
 
-@pytest.mark.engine("sglang", "vllm")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed")
 @pytest.mark.gpu(2)
-@pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
+@pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct", tokenspeed="Qwen/Qwen3.5-9B")
 @pytest.mark.e2e
 @pytest.mark.parametrize("setup_backend", ["pd_grpc"], indirect=True)
 class TestPDMMLUGrpc:
     """MMLU evaluation tests using PD disaggregation (gRPC mode)."""
 
+    # The 0.65 floor was calibrated for Llama-3.1-8B (0.72-0.81 on the other
+    # rows). Qwen3.5-9B on TokenSpeed scores 0.59-0.64 with every request
+    # served (run 34180087896: no transfer failures, ~35s per eval), so the
+    # gap is in scoring this model's output, not in PD. Strict: the moment
+    # the floor is met the mark must come off.
+    @pytest.mark.xfail(
+        get_runtime() == "tokenspeed",
+        reason="Qwen3.5-9B MMLU scoring under the Llama-calibrated 0.65 floor; see #2463",
+        strict=True,
+    )
     def test_pd_mmlu_basic(self, setup_backend):
         """Basic MMLU evaluation with PD disaggregation."""
         backend, model, client, *_ = setup_backend

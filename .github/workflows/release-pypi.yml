@@ -64,6 +64,10 @@ jobs:
         with:
           path: smg-repo
 
+      - name: Set up QEMU for aarch64 verification
+        if: matrix.platform == 'linux' && matrix.target == 'aarch64' && matrix.manylinux == '2_28'
+        uses: docker/setup-qemu-action@v4
+
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
@@ -81,6 +85,10 @@ jobs:
         if: matrix.os == 'windows'
         run: choco install protoc -y
 
+      - name: Pin jemalloc page size for cross-built aarch64 wheels
+        if: matrix.platform == 'linux' && matrix.target == 'aarch64' && matrix.manylinux == '2_28'
+        run: echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> "$GITHUB_ENV"
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -88,8 +96,8 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist --features vendored-openssl --interpreter ${{ matrix.interpreter || '3.9 3.10 3.11 3.12 3.13 3.14' }}
-          rust-toolchain: stable
-          docker-options: -e CI -e CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc -e CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+          rust-toolchain: 1.98.0
+          docker-options: -e CI -e JEMALLOC_SYS_WITH_LG_PAGE -e CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc -e CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
           before-script-linux: |
             # Install build dependencies (perl/make for vendored OpenSSL, protoc for gRPC)
             if command -v yum &> /dev/null; then
@@ -113,6 +121,20 @@ jobs:
 
       - name: List built packages
         run: ${{ matrix.ls || 'ls -lh' }} smg-repo/bindings/python/dist/
+
+      - name: Verify aarch64 wheel allocator
+        if: matrix.platform == 'linux' && matrix.target == 'aarch64' && matrix.manylinux == '2_28'
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD/smg-repo/bindings/python/dist:/dist:ro" \
+            -e '_RJEM_MALLOC_CONF=stats_print:true,stats_print_opts:J' \
+            python:3.13-slim \
+            sh -c 'set -eu
+              wheel=$(find /dist -name "*.whl" -print -quit)
+              test -n "$wheel"
+              pip install --no-deps "$wheel" >/dev/null
+              python3 -c "from smg import smg_rs" 2>/tmp/jemalloc-stats
+              grep -F \"page\":65536 /tmp/jemalloc-stats'
 
       - name: Check packages
         run: twine check --strict smg-repo/bindings/python/dist/*
@@ -143,7 +165,7 @@ jobs:
           working-directory: smg-repo/bindings/python
           command: sdist
           args: --out dist
-          rust-toolchain: stable
+          rust-toolchain: 1.98.0
 
       - uses: actions/upload-artifact@v7
         with:

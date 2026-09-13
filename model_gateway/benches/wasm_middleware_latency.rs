@@ -33,7 +33,7 @@ impl RouterTrait for MockRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        _body: &ChatCompletionRequest,
+        _body: ChatCompletionRequest,
         _model_id: &str,
     ) -> Response<Body> {
         StatusCode::OK.into_response()
@@ -78,8 +78,8 @@ fn bench_wasm_middleware_buffering(c: &mut Criterion) {
         router: Arc::new(MockRouter),
         probe_state: ProbeState::new(context.inflight_tracker.clone()),
         context: Arc::new(context),
-        concurrency_queue_tx: None,
-        router_manager: None,
+        admission_queue: None,
+        gateway: None,
         mesh_handler: None,
         mesh_adapters: None,
     });

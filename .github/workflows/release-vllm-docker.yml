@@ -2,9 +2,9 @@ name: Release SMG+vLLM Docker Image
 
 run-name: >-
   SMG+vLLM |
-  ${{ github.event_name == 'push' && '3-version matrix' || format('base={0}', inputs.base_image_ref || 'vllm/vllm-openai:v0.26.0') }} |
+  ${{ github.event_name == 'push' && '3-version matrix' || format('base={0}', inputs.base_image_ref || 'vllm/vllm-openai:v0.27.1') }} |
   engine=${{ inputs.vllm_commit || 'latest' }} |
-  smg=${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.9.0' }} |
+  smg=${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.10.1' }} |
   ${{ github.event_name == 'pull_request' && 'dry-run |' || '' }}
   by @${{ github.actor }}
 
@@ -23,8 +23,8 @@ on:
   workflow_dispatch:
     inputs:
       base_image_ref:
-        description: 'Base image (e.g. vllm/vllm-openai:v0.26.0)'
-        default: 'vllm/vllm-openai:v0.26.0'
+        description: 'Base image (e.g. vllm/vllm-openai:v0.27.1)'
+        default: 'vllm/vllm-openai:v0.27.1'
         required: true
         type: string
       vllm_repo:
@@ -44,10 +44,10 @@ on:
       smg_commit:
         description: 'SMG commit/ref ("latest" for HEAD)'
         required: false
-        default: 'v1.9.0'
+        default: 'v1.10.1'
         type: string
       tag:
-        description: 'Override image tag (e.g. v1.9.0-vllm-v0.26.0)'
+        description: 'Override image tag (e.g. v1.10.1-vllm-v0.26.0)'
         required: false
         type: string
 
@@ -60,7 +60,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        base_image: ${{ github.event_name == 'push' && fromJSON('["vllm/vllm-openai:v0.26.0","vllm/vllm-openai:v0.25.0","vllm/vllm-openai:v0.23.0"]') || fromJSON(format('["{0}"]', inputs.base_image_ref || 'vllm/vllm-openai:v0.26.0')) }}
+        base_image: ${{ github.event_name == 'push' && fromJSON('["vllm/vllm-openai:v0.27.1","vllm/vllm-openai:v0.26.0","vllm/vllm-openai:v0.25.0"]') || fromJSON(format('["{0}"]', inputs.base_image_ref || 'vllm/vllm-openai:v0.27.1')) }}
     uses: ./.github/workflows/_build-engine-image.yml
     with:
       engine: vllm
@@ -68,7 +68,7 @@ jobs:
       engine_repo: ${{ inputs.vllm_repo }}
       engine_commit: ${{ inputs.vllm_commit || 'latest' }}
       smg_repo: ${{ inputs.smg_repo || 'https://github.com/smg-project/smg' }}
-      smg_commit: ${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.9.0' }}
+      smg_commit: ${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.10.1' }}
       tag: ${{ inputs.tag }}
       dry_run: ${{ github.event_name == 'pull_request' }}
     secrets: inherit

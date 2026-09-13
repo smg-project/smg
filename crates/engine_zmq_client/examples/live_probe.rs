@@ -51,16 +51,9 @@ async fn main() {
     let timeout = Duration::from_secs(600);
 
     eprintln!("[probe] binding sockets; waiting for engine to connect on {handshake}");
-    let transport = connect_handshake(
-        &handshake,
-        1,
-        "127.0.0.1",
-        Some(&input),
-        Some(&output),
-        timeout,
-    )
-    .await
-    .expect("handshake with engine");
+    let transport = connect_handshake(&handshake, 1, &input, &output, timeout)
+        .await
+        .expect("handshake with engine");
 
     let engine = &transport.engines[0];
     eprintln!(

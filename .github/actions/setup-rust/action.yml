@@ -14,6 +14,10 @@ runs:
       shell: bash
       run: bash scripts/ci_install_rust.sh
 
+    - name: Verify Cargo.lock
+      shell: bash
+      run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
+
     - name: Configure sccache
       uses: mozilla-actions/sccache-action@v0.0.9
       with:

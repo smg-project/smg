@@ -40,10 +40,10 @@ pub struct EngineLoad {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaveEvent {
     /// The group drained this wave and is now parked (vLLM `wave_complete`).
-    Complete(u32),
+    Complete(u64),
     /// A rank took a request for an already-drained wave and needs the rest of
     /// the group started on this one (vLLM `start_wave`).
-    Start(u32),
+    Start(u64),
 }
 
 /// A single per-request output decoded from one engine tick. Lets the
@@ -64,7 +64,10 @@ pub struct EngineBatch<O> {
     pub engine_index: u32,
     /// Per-request outputs produced in this tick.
     pub outputs: Vec<O>,
-    /// Request ids the engine reported finished out-of-band.
+    /// Request ids finished in this tick, including ones the connector could
+    /// derive from a terminal output: a protocol without an out-of-band finish
+    /// channel may list them here too. The connector unions both sources, so
+    /// the overlap is harmless.
     pub finished_request_ids: Vec<String>,
     /// Per-rank load signal, when the protocol carries it (`None` otherwise).
     pub load: Option<EngineLoad>,
@@ -112,11 +115,12 @@ pub trait EngineProtocol: Send + Sync + 'static {
     fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)>;
     /// Encode the abort payload for one request id.
     fn encode_abort(request_id: &str) -> Result<Vec<u8>>;
-    /// Encode "start `wave` on every rank but `exclude_engine_index`" (the one
-    /// already holding the request) as `(request-type frame, payload)`.
-    /// `Ok(None)` when the protocol has no wave protocol — its ranks run
-    /// independently, so there is nothing to wake.
-    fn encode_start_wave(wave: u32, exclude_engine_index: u32) -> Result<Option<(Bytes, Vec<u8>)>>;
+    /// Encode "start `wave` on every rank" as `(request-type frame, payload)`.
+    /// No rank is excluded: a rank that skips the update keeps an older wave
+    /// number, and an engine ignores any wave below its own. `Ok(None)` when
+    /// the protocol has no wave protocol — its ranks run independently, so
+    /// there is nothing to wake.
+    fn encode_start_wave(wave: u64) -> Result<Option<(Bytes, Vec<u8>)>>;
     /// Decode one output message (frame 0 plus ordered aux frames) into a batch.
     fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>>;
 }

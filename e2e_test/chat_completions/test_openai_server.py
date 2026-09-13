@@ -87,7 +87,9 @@ class TestChatCompletion:
         assert response.created
         assert response.usage.prompt_tokens > 0
         assert response.usage.completion_tokens > 0
-        assert response.usage.total_tokens > 0
+        assert response.usage.total_tokens == (
+            response.usage.prompt_tokens + response.usage.completion_tokens
+        )
 
     @pytest.mark.parametrize(
         "logprobs",
@@ -130,13 +132,16 @@ class TestChatCompletion:
         is_firsts = {}
         is_finished = {}
         finish_reason_counts = {}
+        usage_seen = False
         for response in generator:
             # Capture usage from the final chunk
             usage = response.usage
             if usage is not None:
+                usage_seen = True
                 assert usage.prompt_tokens > 0, "usage.prompt_tokens was zero"
                 assert usage.completion_tokens > 0, "usage.completion_tokens was zero"
-                assert usage.total_tokens > 0, "usage.total_tokens was zero"
+                assert usage.total_tokens == usage.prompt_tokens + usage.completion_tokens
+                assert response.choices == [], "usage chunk should carry no choices"
                 continue
 
             # Skip if no choices
@@ -161,6 +166,7 @@ class TestChatCompletion:
                     "top_logprobs count mismatch"
                 )
 
+        assert usage_seen, "stream_options.include_usage was set but no usage chunk arrived"
         for index in range(parallel_sample_num):
             assert index in finish_reason_counts, f"No finish_reason found for index {index}"
             assert finish_reason_counts[index] == 1, (

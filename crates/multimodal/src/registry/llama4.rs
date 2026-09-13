@@ -58,7 +58,9 @@ impl Llama4Spec {
         {
             if shape.len() == 2 && shape[1] == 2 && data.len() == shape[0] * 2 {
                 return data
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|chunk| (chunk[0] as usize, chunk[1] as usize))
                     .collect();
             }

@@ -143,6 +143,9 @@ impl ParserFactory {
         // appends <think> token at the beginning
         registry.register_parser("minimax", || Box::new(MiniMaxParser::new()));
 
+        // MiniMax M3: <mm:think> / </mm:think>, always_in_reasoning=false
+        registry.register_parser("minimax_m3", || Box::new(MinimaxM3Parser::new()));
+
         // uses <|START_THINKING|> / <|END_THINKING|>
         registry.register_parser("cohere_cmd", || Box::new(CohereCmdParser::new()));
 
@@ -220,6 +223,10 @@ impl ParserFactory {
         registry.register_pattern("kimi_k3", "kimi_k3");
         registry.register_pattern("kimi", "kimi"); // legacy: Kimi-K2-Instruct with unicode tokens
         registry.register_pattern("step3", "step3");
+        // M3 patterns must precede the broad `minimax` pattern (first substring
+        // match wins), so M3 IDs are not captured by the M2 `minimax` parser.
+        registry.register_pattern("minimax-m3", "minimax_m3");
+        registry.register_pattern("mm-m3", "minimax_m3");
         registry.register_pattern("minimax", "minimax");
         registry.register_pattern("minimax-m2", "minimax");
         registry.register_pattern("mm-m2", "minimax");
@@ -323,6 +330,18 @@ mod tests {
     }
 
     #[test]
+    fn test_factory_routes_dotted_qwen3_generations_to_qwen3() {
+        let factory = ParserFactory::new();
+        // The dotted generations keep <think> reasoning; the qwen3 substring
+        // pattern must keep matching their ids.
+        assert_eq!(
+            factory.create("Qwen/Qwen3.8-2.4T-A95B").model_type(),
+            "qwen3"
+        );
+        assert_eq!(factory.create("Qwen/Qwen3.6-35B-A3B").model_type(), "qwen3");
+    }
+
+    #[test]
     fn test_factory_creates_kimi() {
         let factory = ParserFactory::new();
         let parser = factory.create("kimi-chat");
@@ -390,6 +409,25 @@ mod tests {
         // Also test alternate patterns
         let mm = factory.create("mm-m2-chat");
         assert_eq!(mm.model_type(), "minimax");
+    }
+
+    #[test]
+    fn test_minimax_m3_model() {
+        let factory = ParserFactory::new();
+
+        // M3 IDs route to the M3 parser, not the broad `minimax` (M2) pattern.
+        let m3 = factory.create("MiniMaxAI/MiniMax-M3");
+        assert_eq!(m3.model_type(), "minimax_m3");
+
+        let m3_quant = factory.create("nvidia/MiniMax-M3-NVFP4");
+        assert_eq!(m3_quant.model_type(), "minimax_m3");
+
+        let m3_alt = factory.create("mm-m3-chat");
+        assert_eq!(m3_alt.model_type(), "minimax_m3");
+
+        // M2 IDs still resolve to the M2 (`minimax`) parser.
+        let m2 = factory.create("MiniMax-M2");
+        assert_eq!(m2.model_type(), "minimax");
     }
 
     #[test]

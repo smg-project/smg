@@ -121,9 +121,6 @@ target/
 # Autoenv
 .env.leave
 
-# Rust lib
-Cargo.lock
-
 # uv lock files
 uv.lock
 

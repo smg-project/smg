@@ -1,12 +1,13 @@
-//! Request context types for gRPC router pipeline
+//! Request context types for the two-phase gRPC router pipeline.
 //!
-//! This module provides the core context types that flow through the router pipeline,
-//! eliminating deep parameter passing chains and providing a single source of truth
-//! for request state.
+//! [`RequestContext`] owns the parsed request through the ingress phase;
+//! request building is its last reader and [`RequestContext::into_dispatch`]
+//! yields the request-free [`DispatchContext`] the dispatch phase runs on.
 
 use std::sync::Arc;
 
 use axum::http::HeaderMap;
+use llm_multimodal::registry::transcription::TranscriptionFamily;
 use llm_tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer, TokenizerRegistry};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
@@ -16,31 +17,39 @@ use openai_protocol::{
     generate::{GenerateRequest, GenerateResponse},
     messages::{CreateMessageRequest, Message},
     responses::ResponsesRequest,
+    transcription::{AudioFile, TranscriptionRequest},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::debug;
+use tracing::{debug, error};
 
 use super::{
     backend_client::BackendClient,
-    common::stages::{encode::EncodeDispatchPlan, RateLimitCell},
+    common::stages::{
+        encode::EncodeDispatchPlan,
+        helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask},
+        RateLimitCell,
+    },
     multimodal::{MultimodalComponents, MultimodalIntermediate},
     proto_wrapper::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
         ProtoRequest, ProtoStream,
     },
+    spec::ResponseSpec,
     utils::ParserResolver,
 };
 use crate::{
     middleware::TenantRequestMeta,
-    worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
+    policies::CacheNamespace,
+    routers::{common::pd_admission::PdAdmissionGuard, error::internal_error},
+    worker::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
 };
 
-/// Main request processing context
+/// Ingress-phase request context: owns the parsed request.
 ///
-/// This is the single source of truth for all request state as it flows
-/// through the pipeline stages. Uses Rust's type system to enforce proper
-/// stage ordering at compile time.
+/// Lives from request entry through request building, which is the terminal
+/// consumer — [`RequestContext::into_dispatch`] drops the request and yields
+/// the [`DispatchContext`] the post-build phase runs on.
 pub(crate) struct RequestContext {
     pub input: RequestInput,
     pub components: Arc<SharedComponents>,
@@ -53,11 +62,13 @@ pub(crate) struct RequestInput {
     pub headers: Option<HeaderMap>,
     /// Canonical model ID used after aliases are resolved at request entry.
     pub model_id: String,
+    /// Captured at construction so it survives the request drop at build.
+    pub streaming: bool,
     pub tenant_request_meta: Option<TenantRequestMeta>,
-    /// Shared across every retry attempt of one logical request so
-    /// `RateLimitReserveStage` reserves at most once. `None` for endpoints
-    /// that haven't opted into tenant rate limiting yet (Responses,
-    /// embeddings, classify).
+    /// Holds the reservation outcome for the whole request (settle on
+    /// success, denial check, streaming handoff). `None` for endpoints that
+    /// haven't opted into tenant rate limiting yet (Responses, embeddings,
+    /// classify).
     pub rate_limit_cell: Option<Arc<RateLimitCell>>,
 }
 
@@ -71,15 +82,22 @@ pub(crate) enum RequestType {
     Embedding(Arc<EmbeddingRequest>),
     Classify(Arc<ClassifyRequest>),
     Messages(Arc<CreateMessageRequest>),
+    /// Audio transcription: the request plus its uploaded audio. The
+    /// preparation stage turns these into a chat-shaped backend request
+    /// inside the pipeline (no chat request is synthesized before entry).
+    Transcription {
+        request: Arc<TranscriptionRequest>,
+        audio: Arc<AudioFile>,
+    },
 }
 
 impl RequestType {
     /// Overwrite the request's own `model` field.
     ///
-    /// Callers hold the request behind an `Arc` that the retry loop also
-    /// holds, so `Arc::make_mut` copies the request here. That cost is paid
-    /// only on the alias path — [`RequestContext::new`] skips this call
-    /// entirely when the client already used the canonical model ID.
+    /// `Arc::make_mut` copies the request when another handle is still
+    /// alive. That cost is paid only on the alias path —
+    /// [`RequestContext::new`] skips this call entirely when the client
+    /// already used the canonical model ID.
     fn set_model(&mut self, model_id: &str) {
         fn replace(model: &mut String, model_id: &str) {
             model.clear();
@@ -94,6 +112,9 @@ impl RequestType {
             Self::Embedding(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Classify(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Messages(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Transcription { request, .. } => {
+                replace(&mut Arc::make_mut(request).model, model_id);
+            }
         }
     }
 
@@ -107,7 +128,7 @@ impl RequestType {
             Self::Embedding(r) => r.rid.as_deref(),
             Self::Classify(r) => r.rid.as_deref(),
             Self::Messages(r) => r.rid.as_deref(),
-            Self::Responses(_) => None,
+            Self::Responses(_) | Self::Transcription { .. } => None,
         }
     }
 }
@@ -122,6 +143,7 @@ impl std::fmt::Display for RequestType {
             Self::Embedding(_) => write!(f, "Embedding"),
             Self::Classify(_) => write!(f, "Classify"),
             Self::Messages(_) => write!(f, "Messages"),
+            Self::Transcription { .. } => write!(f, "Transcription"),
         }
     }
 }
@@ -135,6 +157,7 @@ impl std::fmt::Display for FinalResponse {
             Self::Embedding(_) => write!(f, "Embedding"),
             Self::Classify(_) => write!(f, "Classify"),
             Self::Messages(_) => write!(f, "Messages"),
+            Self::Transcription { .. } => write!(f, "Transcription"),
         }
     }
 }
@@ -152,7 +175,8 @@ pub(crate) struct SharedComponents {
     pub multimodal: Option<Arc<MultimodalComponents>>,
 }
 
-/// Mutable processing state (evolves through pipeline stages)
+/// Ingress-phase state (evolves through preparation, worker selection,
+/// client acquisition, encode, and request building).
 #[derive(Default)]
 pub(crate) struct ProcessingState {
     // Stage 1: Preparation outputs
@@ -175,20 +199,109 @@ pub(crate) struct ProcessingState {
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
 
+    /// Effective sticky key (rid-derived wins, header falls back), recorded by
+    /// worker selection so load guards account keyed load identically.
+    pub sticky_key: Option<String>,
+
+    /// Selection inputs that survive the request drop, captured by worker
+    /// selection for per-attempt re-selection in the dispatch phase.
+    pub routing_snapshot: Option<RoutingSnapshot>,
+
     // Stage 3: Client acquisition outputs
     pub clients: Option<ClientSelection>,
 
-    // Stage 4: Request building outputs
-    pub execution_plan: Option<ExecutionPlan>,
-
-    // Stage 5: Dispatch metadata
-    pub dispatch: Option<DispatchMetadata>,
-
-    // Load guard for worker load tracking (created at execution stage)
-    pub load_guards: Option<LoadGuards>,
-
-    // Stage 6: Response processing state
+    // Response processing state seeded during ingress (stop decoder, router
+    // stop obligations, derived skip_special_tokens).
     pub response: ResponseState,
+}
+
+/// Worker-selection inputs that outlive the parsed request.
+#[derive(Default)]
+pub(crate) struct RoutingSnapshot {
+    /// Captured only when a configured policy actually consumes request text.
+    pub routing_text: Option<String>,
+    /// Routing-affinity token proxy (first prompt for batched completions).
+    pub token_ids: Vec<u32>,
+    /// rid-derived sticky key, derived once at first selection.
+    pub rid_key: Option<String>,
+    /// The request's cache namespace, derived once at first selection.
+    pub cache_namespace: Option<CacheNamespace>,
+}
+
+pub(crate) use crate::routers::common::placement::WireConstraint;
+
+impl WireConstraint {
+    fn of(workers: &WorkerSelection) -> Self {
+        match workers {
+            WorkerSelection::Single { worker } => Self {
+                runtime: worker.metadata().spec.runtime_type,
+                connection: *worker.connection_mode(),
+            },
+            // Disaggregated legs are gRPC-only.
+            WorkerSelection::Disaggregated { runtime_type, .. } => Self {
+                runtime: *runtime_type,
+                connection: ConnectionMode::Grpc,
+            },
+        }
+    }
+}
+
+/// Post-build request context.
+///
+/// Invariant, by construction: there is no request field here, so the
+/// dispatch phase (worker re-selection, dispatch, response processing,
+/// streaming) cannot reach the parsed request — it dropped in
+/// [`RequestContext::into_dispatch`]. `ResponseSpec` is the only
+/// request-derived input past this point.
+pub(crate) struct DispatchContext {
+    /// Canonical model ID (routing, registries).
+    pub model_id: String,
+    /// Model the response reports, captured from the request at the build
+    /// boundary.
+    pub dispatch_model: String,
+    pub streaming: bool,
+    pub headers: Option<HeaderMap>,
+    pub rate_limit_cell: Option<Arc<RateLimitCell>>,
+    pub routing: RoutingSnapshot,
+    pub wire: WireConstraint,
+    pub tokenizer: Option<Arc<dyn Tokenizer>>,
+    pub workers: Option<WorkerSelection>,
+    pub sticky_key: Option<String>,
+    pub clients: Option<ClientSelection>,
+    /// Consumed by the first dispatch; retries re-dispatch only the
+    /// prefill/decode legs against the already-running encode jobs.
+    pub encode_outputs: Option<EncodeOutputs>,
+    pub dispatch: Option<DispatchMetadata>,
+    pub load_guards: Option<LoadGuards>,
+    pub response: ResponseState,
+}
+
+impl DispatchContext {
+    /// Cached tokenizer (cheap Arc clone).
+    pub fn tokenizer_arc(&self) -> Option<Arc<dyn Tokenizer>> {
+        self.tokenizer.clone()
+    }
+}
+
+/// Everything request building hands the dispatch phase.
+pub(crate) struct BuildOutput {
+    pub plan: ExecutionPlan,
+    pub spec: ResponseSpec,
+    pub stamp: AttemptStamp,
+}
+
+/// Per-attempt plan stamping inputs, captured at build so retries reproduce
+/// exactly what a fresh build would have minted for the new attempt.
+pub(crate) struct AttemptStamp {
+    pub id: IdStamp,
+    /// Which sampling fields the client left unset; retry attempts re-apply
+    /// the newly selected worker's defaults through this mask.
+    pub sampling_mask: Option<SamplingDefaultsMask>,
+    /// Pre-default values of the masked fields, so re-application never
+    /// carries a previous attempt's worker defaults forward.
+    pub sampling_baseline: Option<SamplingBaseline>,
+    /// Mode::PrefillDecode only (mirrors the build stage's flag).
+    pub inject_pd_metadata: bool,
 }
 
 /// Per-item bootstrap rendezvous info for prefill, plus the dispatch plan that
@@ -205,7 +318,9 @@ pub(crate) struct EncodeOutputs {
     pub dispatch: EncodeDispatchPlan,
 }
 
-/// Execution shape produced by request building and consumed by request execution.
+/// Execution shape produced by request building. Retained until the retry
+/// window closes; each attempt dispatches a clone (the last moves it).
+#[derive(Clone)]
 pub(crate) enum ExecutionPlan {
     Single(ProtoRequest),
     PrefillDecode(ProtoGenerateRequest),
@@ -277,6 +392,63 @@ impl ExecutionPlan {
             },
         }
     }
+
+    /// Serialized wire size of the built request(s), for the release metric.
+    pub(crate) fn wire_len(&self) -> usize {
+        match self {
+            Self::Single(request) => request.wire_len(),
+            Self::PrefillDecode(request) | Self::EncodePrefillDecode { request } => {
+                request.wire_len()
+            }
+            Self::Batch { requests, .. } => {
+                requests.iter().map(ProtoGenerateRequest::wire_len).sum()
+            }
+        }
+    }
+
+    /// Set the engine request id on a non-batch plan. A batch plan here is a
+    /// build-stage wiring bug (its sub ids are stamped individually): fail
+    /// rather than let a retry re-dispatch the previous attempt's ids.
+    pub(crate) fn set_request_id(
+        &mut self,
+        request_id: String,
+    ) -> Result<(), axum::response::Response> {
+        match self {
+            Self::Single(ProtoRequest::Generate(request))
+            | Self::PrefillDecode(request)
+            | Self::EncodePrefillDecode { request } => {
+                request.set_request_id(request_id);
+                Ok(())
+            }
+            Self::Single(ProtoRequest::Embed(request)) => {
+                request.set_request_id(request_id);
+                Ok(())
+            }
+            Self::Batch { .. } => {
+                error!(
+                    function = "ExecutionPlan::set_request_id",
+                    "Single id stamp on a batch plan"
+                );
+                Err(internal_error(
+                    "id_stamp_plan_mismatch",
+                    "Id stamp does not match the plan shape",
+                ))
+            }
+        }
+    }
+
+    /// Every generate request in the plan, for per-attempt re-stamping.
+    pub(crate) fn generate_requests_mut(
+        &mut self,
+    ) -> impl Iterator<Item = &mut ProtoGenerateRequest> {
+        match self {
+            Self::Single(ProtoRequest::Generate(request))
+            | Self::PrefillDecode(request)
+            | Self::EncodePrefillDecode { request } => std::slice::from_mut(request).iter_mut(),
+            Self::Single(ProtoRequest::Embed(_)) => [].iter_mut(),
+            Self::Batch { requests, .. } => requests.iter_mut(),
+        }
+    }
 }
 
 /// Output from preparation stage (Step 1)
@@ -293,6 +465,18 @@ pub(crate) enum PreparationOutput {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
         tool_constraints: Option<(String, String)>,
+    },
+    /// Transcription reuses the chat backend request shape. The chat-shaped
+    /// request is synthesized here (inside the pipeline) from the family's
+    /// prompt convention, so request building reads it in place of a
+    /// client-supplied chat request; `format`/`family` flow into the
+    /// response spec.
+    Transcription {
+        token_ids: Vec<u32>,
+        processed_messages: super::ProcessedMessages,
+        chat_request: Arc<ChatCompletionRequest>,
+        format: super::spec::TranscriptionResponseFormat,
+        family: &'static dyn TranscriptionFamily,
     },
     Completion {
         /// One entry per prompt; scalar requests carry exactly one.
@@ -334,6 +518,7 @@ impl PreparationOutput {
         match self {
             Self::Chat { token_ids, .. }
             | Self::Messages { token_ids, .. }
+            | Self::Transcription { token_ids, .. }
             | Self::Generate { token_ids, .. }
             | Self::Embedding { token_ids, .. }
             | Self::Harmony { token_ids, .. } => token_ids,
@@ -362,6 +547,9 @@ impl PreparationOutput {
                 processed_messages, ..
             }
             | Self::Messages {
+                processed_messages, ..
+            }
+            | Self::Transcription {
                 processed_messages, ..
             } => Some(&processed_messages.text),
             Self::Completion {
@@ -438,30 +626,53 @@ pub(crate) enum LoadGuards {
     Batch {
         _guards: Vec<LoadGuards>,
     },
+    /// A disaggregated dispatch whose bootstrap rooms the PD admission gate
+    /// claimed before it was allowed to send. The claim rides with the guards
+    /// so it is released on every path the dispatch can end on — an early
+    /// error, a failed leg, a client disconnect, a retry, or completion.
+    Admitted {
+        _admission: PdAdmissionGuard,
+        _guards: Box<LoadGuards>,
+    },
 }
 
 impl LoadGuards {
-    pub fn new(selection: &WorkerSelection, headers: Option<&HeaderMap>) -> Self {
+    pub fn new(selection: &WorkerSelection, routing_key: Option<&str>) -> Self {
         match selection {
             WorkerSelection::Single { worker } => LoadGuards::Single {
-                _guard: WorkerLoadGuard::new(worker.clone(), headers),
+                _guard: WorkerLoadGuard::with_key(worker.clone(), routing_key),
             },
             WorkerSelection::Disaggregated {
                 prefill, decode, ..
             } => LoadGuards::Disaggregated {
-                _prefill: WorkerLoadGuard::new(prefill.clone(), headers),
-                _decode: WorkerLoadGuard::new(decode.clone(), headers),
+                _prefill: WorkerLoadGuard::with_key(prefill.clone(), routing_key),
+                _decode: WorkerLoadGuard::with_key(decode.clone(), routing_key),
             },
         }
     }
 
+    /// Bind an admission claim to the dispatch's guards, so the rooms it
+    /// reserved outlive nothing else. `None` (the engine reports no window)
+    /// returns the guards untouched.
+    pub fn admitted(admission: Option<PdAdmissionGuard>, guards: Self) -> Self {
+        match admission {
+            Some(admission) => Self::Admitted {
+                _admission: admission,
+                _guards: Box::new(guards),
+            },
+            None => guards,
+        }
+    }
+
     /// One guard set per concurrent sub-request.
-    pub fn scaled(selection: &WorkerSelection, headers: Option<&HeaderMap>, count: usize) -> Self {
+    pub fn scaled(selection: &WorkerSelection, routing_key: Option<&str>, count: usize) -> Self {
         if count <= 1 {
-            Self::new(selection, headers)
+            Self::new(selection, routing_key)
         } else {
             Self::Batch {
-                _guards: (0..count).map(|_| Self::new(selection, headers)).collect(),
+                _guards: (0..count)
+                    .map(|_| Self::new(selection, routing_key))
+                    .collect(),
             }
         }
     }
@@ -518,17 +729,111 @@ impl RequestContext {
             model_id.push_str(&canonical_model_id);
             request_type.set_model(&model_id);
         }
+        let streaming = match &request_type {
+            RequestType::Chat(req) => req.stream,
+            RequestType::Generate(req) => req.stream,
+            RequestType::Completion(req) => req.stream,
+            RequestType::Responses(req) => req.stream.unwrap_or(false),
+            RequestType::Messages(req) => req.stream.unwrap_or(false),
+            // Transcription is whole-file only; streaming is rejected in
+            // preparation by capability check, never handed off here.
+            RequestType::Transcription { .. } => false,
+            // Embeddings and classification never stream.
+            RequestType::Embedding(_) | RequestType::Classify(_) => false,
+        };
         Self {
             input: RequestInput {
                 request_type,
                 headers,
                 model_id,
+                streaming,
                 tenant_request_meta: None,
                 rate_limit_cell: None,
             },
             components,
             state: ProcessingState::default(),
         }
+    }
+
+    /// Build-boundary conversion. The parsed request is dropped inside this
+    /// function — `DispatchContext` has no field to carry it, so post-build
+    /// stages cannot read it even by mistake.
+    ///
+    /// Fails loudly when worker selection's outputs (routing snapshot, wire)
+    /// are absent: a retry context with defaulted routing inputs could
+    /// re-select a worker the retained plan cannot be dispatched to.
+    pub fn into_dispatch(self) -> Result<DispatchContext, axum::response::Response> {
+        let RequestContext {
+            input,
+            components,
+            state,
+        } = self;
+        let RequestInput {
+            request_type,
+            headers,
+            model_id,
+            streaming,
+            tenant_request_meta: _,
+            rate_limit_cell,
+        } = input;
+        // The model the response reports. `RequestContext::new` already
+        // canonicalized both the request's `model` field and `model_id`, so a
+        // request that arrived under an alias is answered under the canonical
+        // name. Native `/generate` callers may leave the field empty, so
+        // prefer the resolved id there.
+        let dispatch_model = match &request_type {
+            RequestType::Chat(req) => req.model.clone(),
+            RequestType::Completion(req) => req.model.clone(),
+            RequestType::Generate(_) => model_id.clone(),
+            RequestType::Responses(req) => req.model.clone(),
+            RequestType::Embedding(req) => req.model.clone(),
+            RequestType::Classify(req) => req.model.clone(),
+            RequestType::Messages(req) => req.model.clone(),
+            RequestType::Transcription { request, .. } => request.model.clone(),
+        };
+        drop(request_type);
+        drop(components);
+        let routing = state.routing_snapshot.ok_or_else(|| {
+            error!(
+                function = "RequestContext::into_dispatch",
+                "Routing snapshot not captured by worker selection"
+            );
+            internal_error(
+                "routing_snapshot_not_captured",
+                "Routing snapshot not captured",
+            )
+        })?;
+        let wire = state
+            .workers
+            .as_ref()
+            .map(WireConstraint::of)
+            .ok_or_else(|| {
+                error!(
+                    function = "RequestContext::into_dispatch",
+                    "Worker selection not completed"
+                );
+                internal_error(
+                    "worker_selection_not_completed",
+                    "Worker selection not completed",
+                )
+            })?;
+        Ok(DispatchContext {
+            model_id,
+            dispatch_model,
+            streaming,
+            headers,
+            rate_limit_cell,
+            routing,
+            wire,
+            tokenizer: state.tokenizer,
+            workers: state.workers,
+            sticky_key: state.sticky_key,
+            clients: state.clients,
+            encode_outputs: state.encode_outputs,
+            dispatch: None,
+            load_guards: None,
+            response: state.response,
+        })
     }
 
     /// Create context for chat completion request
@@ -539,6 +844,22 @@ impl RequestContext {
         components: Arc<SharedComponents>,
     ) -> Self {
         Self::new(RequestType::Chat(request), headers, model_id, components)
+    }
+
+    /// Create context for an audio transcription request.
+    pub fn for_transcription(
+        request: Arc<TranscriptionRequest>,
+        audio: Arc<AudioFile>,
+        headers: Option<HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        Self::new(
+            RequestType::Transcription { request, audio },
+            headers,
+            model_id,
+            components,
+        )
     }
 
     /// Create context for generate request
@@ -631,18 +952,6 @@ impl RequestContext {
         )
     }
 
-    /// Get chat request (panics if not chat)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
-    pub fn chat_request(&self) -> &ChatCompletionRequest {
-        match &self.input.request_type {
-            RequestType::Chat(req) => req.as_ref(),
-            _ => panic!("Expected chat request"),
-        }
-    }
-
     /// Get Arc clone of chat request (panics if not chat)
     #[expect(
         clippy::panic,
@@ -655,15 +964,18 @@ impl RequestContext {
         }
     }
 
-    /// Get generate request (panics if not generate)
+    /// Get Arc clones of the transcription request and its audio (panics if
+    /// not a transcription request).
     #[expect(
         clippy::panic,
         reason = "typed accessor: caller guarantees variant via RequestType construction"
     )]
-    pub fn generate_request(&self) -> &GenerateRequest {
+    pub fn transcription_input_arc(&self) -> (Arc<TranscriptionRequest>, Arc<AudioFile>) {
         match &self.input.request_type {
-            RequestType::Generate(req) => req.as_ref(),
-            _ => panic!("Expected generate request"),
+            RequestType::Transcription { request, audio } => {
+                (Arc::clone(request), Arc::clone(audio))
+            }
+            _ => panic!("Expected transcription request"),
         }
     }
 
@@ -676,22 +988,6 @@ impl RequestContext {
         match &self.input.request_type {
             RequestType::Generate(req) => Arc::clone(req),
             _ => panic!("Expected generate request"),
-        }
-    }
-
-    /// Get completion request (panics if not completion)
-    #[expect(
-        dead_code,
-        reason = "ref accessor provided for API completeness alongside Arc accessor"
-    )]
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
-    pub fn completion_request(&self) -> &CompletionRequest {
-        match &self.input.request_type {
-            RequestType::Completion(req) => req.as_ref(),
-            _ => panic!("Expected completion request"),
         }
     }
 
@@ -719,22 +1015,6 @@ impl RequestContext {
         }
     }
 
-    /// Get messages request (panics if not messages)
-    #[expect(
-        dead_code,
-        reason = "scaffolding for Messages API pipeline, wired in follow-up PR"
-    )]
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
-    pub fn messages_request(&self) -> &CreateMessageRequest {
-        match &self.input.request_type {
-            RequestType::Messages(req) => req.as_ref(),
-            _ => panic!("Expected messages request"),
-        }
-    }
-
     /// Get Arc clone of messages request (panics if not messages)
     #[expect(
         clippy::panic,
@@ -747,17 +1027,9 @@ impl RequestContext {
         }
     }
 
-    /// Check if request is streaming
+    /// Check if request is streaming (captured at construction).
     pub fn is_streaming(&self) -> bool {
-        match &self.input.request_type {
-            RequestType::Chat(req) => req.stream,
-            RequestType::Generate(req) => req.stream,
-            RequestType::Completion(req) => req.stream,
-            RequestType::Responses(req) => req.stream.unwrap_or(false),
-            RequestType::Messages(req) => req.stream.unwrap_or(false),
-            RequestType::Embedding(_) => false, // Embeddings are never streaming
-            RequestType::Classify(_) => false,  // Classification is never streaming
-        }
+        self.input.streaming
     }
 
     /// Get the cached tokenizer, cloning the Arc (cheap 8-byte clone)
@@ -974,6 +1246,11 @@ pub(crate) enum FinalResponse {
     Classify(ClassifyResponse),
     /// Messages API response
     Messages(Message),
+    /// Transcription: the decoded transcript plus its wire format.
+    Transcription {
+        text: String,
+        format: super::spec::TranscriptionResponseFormat,
+    },
 }
 
 #[cfg(test)]

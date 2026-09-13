@@ -2,9 +2,9 @@ name: Release SMG+SGLang Docker Image
 
 run-name: >-
   SMG+SGLang |
-  ${{ github.event_name == 'push' && 'base=lmsysorg/sglang:v0.5.16' || format('base={0}', inputs.base_image_ref || 'lmsysorg/sglang:v0.5.16') }} |
+  ${{ github.event_name == 'push' && 'base=lmsysorg/sglang:v0.5.18' || format('base={0}', inputs.base_image_ref || 'lmsysorg/sglang:v0.5.18') }} |
   engine=${{ inputs.sglang_commit || 'latest' }} |
-  smg=${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.9.0' }} |
+  smg=${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.10.1' }} |
   ${{ github.event_name == 'pull_request' && 'dry-run |' || '' }}
   by @${{ github.actor }}
 
@@ -23,8 +23,8 @@ on:
   workflow_dispatch:
     inputs:
       base_image_ref:
-        description: 'Base image (e.g. lmsysorg/sglang:v0.5.16)'
-        default: 'lmsysorg/sglang:v0.5.16'
+        description: 'Base image (e.g. lmsysorg/sglang:v0.5.18)'
+        default: 'lmsysorg/sglang:v0.5.18'
         required: true
         type: string
       sglang_repo:
@@ -44,10 +44,10 @@ on:
       smg_commit:
         description: 'SMG commit/ref ("latest" for HEAD)'
         required: false
-        default: 'v1.9.0'
+        default: 'v1.10.1'
         type: string
       tag:
-        description: 'Override image tag (e.g. v1.9.0-sglang-v0.5.16)'
+        description: 'Override image tag (e.g. v1.10.1-sglang-v0.5.18)'
         required: false
         type: string
 
@@ -60,7 +60,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        base_image: ${{ github.event_name == 'push' && fromJSON('["lmsysorg/sglang:v0.5.16"]') || fromJSON(format('["{0}"]', inputs.base_image_ref || 'lmsysorg/sglang:v0.5.16')) }}
+        base_image: ${{ github.event_name == 'push' && fromJSON('["lmsysorg/sglang:v0.5.18"]') || fromJSON(format('["{0}"]', inputs.base_image_ref || 'lmsysorg/sglang:v0.5.18')) }}
     uses: ./.github/workflows/_build-engine-image.yml
     with:
       engine: sglang
@@ -68,7 +68,7 @@ jobs:
       engine_repo: ${{ inputs.sglang_repo }}
       engine_commit: ${{ inputs.sglang_commit || 'latest' }}
       smg_repo: ${{ inputs.smg_repo || 'https://github.com/smg-project/smg' }}
-      smg_commit: ${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.9.0' }}
+      smg_commit: ${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'v1.10.1' }}
       tag: ${{ inputs.tag }}
       dry_run: ${{ github.event_name == 'pull_request' }}
     secrets: inherit

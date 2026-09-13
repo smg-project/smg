@@ -7,10 +7,14 @@ use std::{fmt::Debug, sync::Arc};
 
 use openai_protocol::worker::WorkerLoadResponse;
 
-use crate::worker::{HashRing, Worker};
+use crate::{
+    config::CacheIndexKind,
+    worker::{HashRing, Worker},
+};
 
 mod bucket;
 mod cache_aware;
+mod cache_namespace;
 mod consistent_hashing;
 mod dp_min_token;
 mod factory;
@@ -26,6 +30,7 @@ pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
+pub use cache_namespace::{CacheNamespace, TEXT_MARKER_LEN, TOKEN_MARKER_LEN};
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
 pub use factory::PolicyFactory;
@@ -78,6 +83,13 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that don't use load information
     }
 
+    /// Whether routing consumes backend load snapshots, pushed via
+    /// [`Self::update_loads`] or read from the monitor's watch feed. The
+    /// `WorkerMonitor` skips backend load polling while no policy needs it.
+    fn needs_backend_loads(&self) -> bool {
+        false
+    }
+
     /// Drop any cached per-worker state for a removed worker.
     ///
     /// Called when a worker leaves the registry so load-aware policies don't
@@ -98,6 +110,19 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
+/// Whether a built-in policy applies the complete [`Worker::is_available`]
+/// predicate before selecting. Other policies keep the caller-side filter.
+pub(crate) fn policy_filters_unavailable_workers(policy: &dyn LoadBalancingPolicy) -> bool {
+    let policy = policy.as_any();
+    policy.is::<RandomPolicy>()
+        || policy.is::<RoundRobinPolicy>()
+        || policy.is::<LeastLoadPolicy>()
+        || policy.is::<PowerOfTwoPolicy>()
+        || policy.is::<CacheAwarePolicy>()
+        || policy.is::<ManualPolicy>()
+        || policy.is::<PassthroughPolicy>()
+}
+
 pub trait DPRankLoadPolicy: Send + Sync + Debug {
     fn select_dp_rank(&self, worker: &dyn Worker, estimated_cost: isize) -> Option<isize>;
 }
@@ -106,7 +131,16 @@ pub trait DPRankLoadPolicy: Send + Sync + Debug {
 #[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
     pub cache_threshold: f32,
+    /// Absolute load margin for the per-request candidate gate: the selected
+    /// worker spills to least-loaded when its load exceeds the healthy-fleet
+    /// mean by this many requests AND by `balance_rel_threshold`. Requiring
+    /// both keeps the gate quiet on steady-state variance at low means
+    /// (absolute) without going blind to a deep queue at high means
+    /// (relative).
     pub balance_abs_threshold: usize,
+    /// Relative load margin (multiple of the healthy-fleet mean) for the
+    /// per-request candidate gate; fires only together with
+    /// `balance_abs_threshold`.
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,
@@ -128,6 +162,31 @@ pub struct CacheAwareConfig {
     /// shedding load off a critically-saturated engine. A safety valve, best set
     /// high (e.g. 0.9). Requires `token_usage`; `>= 1.0` disables it (default).
     pub overload_token_usage_threshold: f32,
+    /// Anti-hotspot decay for event-driven overlap credit. Each candidate's
+    /// overlap score is multiplied by `1 / (1 + overlap_decay * x)`, where `x`
+    /// is the worker's waiting-prefill backlog (backend-reported waiting
+    /// uncached tokens, in blocks, in excess of the minimum among candidates)
+    /// divided by the request's block count. The least-backlogged candidate
+    /// always keeps full credit; workers without load data are never decayed.
+    /// `0.0` disables (default). Requires backend load reporting.
+    pub overlap_decay: f32,
+    /// Randomized selection among event-driven candidates. `0.0` (default) is
+    /// exact argmax with the existing tie-breaks. Above zero, candidates are
+    /// sampled by softmax over min-max-normalized scores divided by this
+    /// temperature — scale-free (only relative position within the current
+    /// score spread matters): small values mostly follow the best candidate,
+    /// large values approach uniform.
+    pub selection_temperature: f32,
+    /// Index under-layer: `Tree` (default, radix prefix trees) or `Hash`
+    /// (TTL'd exact-match placement map over `cache_boundaries` heads; the
+    /// radix trees are neither consulted nor populated).
+    pub cache_index: CacheIndexKind,
+    /// Seconds a hash-index placement stays routable; should approximate
+    /// serving-engine cache retention.
+    pub cache_ttl_secs: u64,
+    /// Ascending token positions at which serving engines retain reusable
+    /// prefix state; the hash index keys request heads at these boundaries.
+    pub cache_boundaries: Vec<usize>,
 }
 
 impl Default for CacheAwareConfig {
@@ -143,6 +202,13 @@ impl Default for CacheAwareConfig {
             // balance e.g. 0.5 (spread) and/or overload e.g. 0.9 (ceiling).
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            // Both pressure knobs off by default: behavior is bit-identical
+            // to pre-knob selection until explicitly tuned.
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+            cache_index: CacheIndexKind::Tree,
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         }
     }
 }
@@ -164,12 +230,17 @@ impl Default for BucketConfig {
     }
 }
 
-/// Helper function to filter healthy workers and return their indices
+/// Helper function to filter routable workers and return their indices.
+///
+/// [`Worker::is_available`] folds the absolute overload veto into the health +
+/// circuit-breaker test it already performed, under the same guards and with
+/// the same short-circuit order — the veto is one more test on a word already
+/// in hand, never a second walk.
 pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usize> {
     workers
         .iter()
         .enumerate()
-        .filter(|(_, w)| w.is_healthy() && w.circuit_breaker_can_execute())
+        .filter(|(_, w)| w.is_available())
         .map(|(idx, _)| idx)
         .collect()
 }
@@ -216,12 +287,26 @@ pub struct SelectWorkerInfo<'a> {
     pub request_text: Option<&'a str>,
     /// Tokenized request for prefix-hash routing
     /// Used by PrefixHashPolicy for token-based prefix hashing
+    /// The HTTP router substitutes a valid `x-smg-routing-tokens` hint here:
+    /// the hint wins over body-derived tokens/text for selection.
     pub tokens: Option<&'a [u32]>,
     /// HTTP headers for header-based routing policies
     /// Policies can extract routing information from headers like:
     /// - X-SMG-Target-Worker: Direct routing to a specific worker by index
     /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
     pub headers: Option<&'a http::HeaderMap>,
+    /// Validated `x-smg-routing-key` hint (non-empty UTF-8, <= 128 bytes);
+    /// consistent_hashing and prefix_hash prefer it over their other keying
+    /// input.
+    pub routing_key: Option<&'a str>,
+    /// The request's cache partition (cache salt / extra key / LoRA), when
+    /// set. Cache-aware routing keys its affinity under it so requests the
+    /// engine cannot serve from the same cache never match each other.
+    pub cache_namespace: Option<CacheNamespace>,
+    /// Session key derived from the request body's `rid` (routers with typed
+    /// body access populate it); consumed by the routing-key override when
+    /// its key source includes rid.
+    pub rid_key: Option<&'a str>,
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,
@@ -317,6 +402,35 @@ mod tests {
         }
     }
 
+    /// The overload veto rides the same eligibility filter every walking policy
+    /// uses, so flagging a worker removes it everywhere at once — and clearing
+    /// the flag re-admits it.
+    #[test]
+    fn get_healthy_worker_indices_honors_the_overload_veto() {
+        let workers: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|i| {
+                Arc::new(
+                    BasicWorkerBuilder::new(format!("http://w{i}:8000"))
+                        .worker_type(WorkerType::Regular)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+
+        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
+
+        // A busy worker is still eligible: load alone is not the veto.
+        let _guard = crate::worker::WorkerLoadGuard::new(Arc::clone(&workers[1]), None);
+        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
+
+        workers[1].set_overloaded(true);
+        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 2]);
+
+        workers[1].set_overloaded(false);
+        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
+    }
+
     #[test]
     fn test_select_worker_info_leg_defaults_to_single() {
         let info = SelectWorkerInfo::default();
@@ -324,5 +438,122 @@ mod tests {
         assert_eq!(WorkerLeg::Single.routing_id_prefix(), "");
         assert_eq!(WorkerLeg::Prefill.routing_id_prefix(), "prefill:");
         assert_eq!(WorkerLeg::Decode.routing_id_prefix(), "decode:");
+    }
+
+    #[test]
+    fn only_policies_with_complete_availability_checks_skip_prefiltering() {
+        for name in [
+            "random",
+            "round_robin",
+            "least_load",
+            "power_of_two",
+            "cache_aware",
+            "manual",
+            "passthrough",
+        ] {
+            let policy = PolicyFactory::create_by_name(name).unwrap();
+            assert!(
+                policy_filters_unavailable_workers(policy.as_ref()),
+                "{name}"
+            );
+        }
+
+        for name in ["bucket", "consistent_hashing", "prefix_hash"] {
+            let policy = PolicyFactory::create_by_name(name).unwrap();
+            assert!(
+                !policy_filters_unavailable_workers(policy.as_ref()),
+                "{name}"
+            );
+        }
+    }
+
+    /// The allowlist above is only sound if every listed policy actually
+    /// applies the complete `is_available()` predicate itself: callers skip
+    /// the pre-filter for them. Two scenarios pin the two halves:
+    /// the overload veto (shared with the weaker `is_healthy_and_eligible`
+    /// predicate) and an open circuit breaker — the one signal that
+    /// separates the full predicate from the weak one, so a policy that
+    /// regresses to the weak predicate fails here.
+    #[test]
+    fn allowlisted_policies_reject_unavailable_workers() {
+        use std::{sync::Arc, time::Duration};
+
+        use openai_protocol::worker::WorkerStatus;
+
+        use crate::worker::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, Worker};
+
+        fn worker(url: &str) -> Arc<dyn Worker> {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .circuit_breaker_config(CircuitBreakerConfig {
+                        failure_threshold: 1,
+                        success_threshold: 1,
+                        timeout_duration: Duration::from_secs(600),
+                        window_duration: Duration::from_secs(600),
+                    })
+                    .build(),
+            );
+            worker.set_status(WorkerStatus::Ready);
+            worker
+        }
+
+        fn overloaded(url: &str) -> Arc<dyn Worker> {
+            let worker = worker(url);
+            worker.set_overloaded(true);
+            worker
+        }
+
+        fn breaker_open(url: &str) -> Arc<dyn Worker> {
+            let worker = worker(url);
+            worker.record_outcome(500);
+            assert!(!worker.is_available(), "breaker must be open");
+            assert!(
+                worker.is_healthy_and_eligible(),
+                "the weak predicate must still accept it — that contrast is \
+                 what this scenario tests"
+            );
+            worker
+        }
+
+        for name in [
+            "random",
+            "round_robin",
+            "least_load",
+            "power_of_two",
+            "cache_aware",
+            "manual",
+            "passthrough",
+        ] {
+            let policy = PolicyFactory::create_by_name(name).unwrap();
+
+            // Every worker vetoed or circuit-broken: the policy must come up
+            // empty on its own.
+            for unavailable in [
+                [overloaded("http://a:1"), overloaded("http://b:1")],
+                [breaker_open("http://a:1"), breaker_open("http://b:1")],
+            ] {
+                assert_eq!(
+                    policy.select_worker(&unavailable, &SelectWorkerInfo::default()),
+                    None,
+                    "{name} selected an unavailable worker"
+                );
+            }
+
+            // Mixed pools: the selection must exist and land on the
+            // available worker.
+            for mixed in [
+                [worker("http://a:1"), overloaded("http://b:1")],
+                [worker("http://a:1"), breaker_open("http://b:1")],
+            ] {
+                for _ in 0..16 {
+                    let idx = policy
+                        .select_worker(&mixed, &SelectWorkerInfo::default())
+                        .unwrap_or_else(|| {
+                            panic!("{name} found no worker despite an available one")
+                        });
+                    assert_eq!(idx, 0, "{name} selected the unavailable worker");
+                }
+            }
+        }
     }
 }

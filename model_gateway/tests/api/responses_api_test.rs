@@ -11,7 +11,8 @@ use openai_protocol::{
 };
 use smg::{
     config::RouterConfig,
-    routers::{conversations, RouterFactory},
+    endpoints::conversations,
+    routers::RouterFactory,
     tenant::{RouteRequestMeta, TenantKey},
 };
 
@@ -124,7 +125,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
 
     let tenant_meta = test_tenant_meta();
     let resp = router
-        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .route_responses(None, &tenant_meta, req.clone(), req.model.as_str())
         .await;
 
     assert_eq!(resp.status(), StatusCode::OK);
@@ -345,7 +346,12 @@ async fn test_non_streaming_mcp_e2e_accepts_forwardable_request_headers() {
 
     let tenant_meta = test_tenant_meta();
     let resp = router
-        .route_responses(Some(&headers), &tenant_meta, &req, req.model.as_str())
+        .route_responses(
+            Some(&headers),
+            &tenant_meta,
+            req.clone(),
+            req.model.as_str(),
+        )
         .await;
 
     assert_eq!(resp.status(), StatusCode::OK);
@@ -469,7 +475,7 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
 
     let tenant_meta = test_tenant_meta();
     let resp = router
-        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .route_responses(None, &tenant_meta, req.clone(), req.model.as_str())
         .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -603,7 +609,7 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
 
     let tenant_meta = test_tenant_meta();
     let resp = router
-        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .route_responses(None, &tenant_meta, req.clone(), req.model.as_str())
         .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -738,7 +744,7 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
 
     let tenant_meta = test_tenant_meta();
     let resp1 = router
-        .route_responses(None, &tenant_meta, &req1, req1.model.as_str())
+        .route_responses(None, &tenant_meta, req1.clone(), req1.model.as_str())
         .await;
     assert_eq!(resp1.status(), StatusCode::OK);
 
@@ -793,7 +799,7 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
 
     let tenant_meta = test_tenant_meta();
     let resp2 = router
-        .route_responses(None, &tenant_meta, &req2, req2.model.as_str())
+        .route_responses(None, &tenant_meta, req2.clone(), req2.model.as_str())
         .await;
     assert_eq!(resp2.status(), StatusCode::OK);
 
@@ -917,7 +923,7 @@ async fn test_final_response_hides_internal_mcp_error_details() {
 
     let tenant_meta = test_tenant_meta();
     let resp = router
-        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .route_responses(None, &tenant_meta, req.clone(), req.model.as_str())
         .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -1206,6 +1212,21 @@ fn test_reasoning_param_default() {
     assert!(matches!(parsed.effort, Some(ReasoningEffort::Medium)));
 }
 
+/// Every OpenAI `reasoning.effort` tier deserializes at the request boundary.
+#[test]
+fn test_reasoning_effort_accepts_every_openai_tier() {
+    for tier in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5",
+            "input": "hi",
+            "reasoning": { "effort": tier }
+        }))
+        .unwrap();
+        let effort = request.reasoning.and_then(|r| r.effort);
+        assert_eq!(effort.map(ReasoningEffort::as_str), Some(tier));
+    }
+}
+
 #[test]
 fn test_json_serialization() {
     let request = ResponsesRequest {
@@ -1369,7 +1390,7 @@ async fn test_multi_turn_loop_with_mcp() {
     // Execute the request (this should trigger the multi-turn loop)
     let tenant_meta = test_tenant_meta();
     let response = router
-        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .route_responses(None, &tenant_meta, req.clone(), req.model.as_str())
         .await;
 
     // Check status
@@ -1531,7 +1552,7 @@ async fn test_max_tool_calls_limit() {
 
     let tenant_meta = test_tenant_meta();
     let response = router
-        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .route_responses(None, &tenant_meta, req.clone(), req.model.as_str())
         .await;
     assert_eq!(response.status(), StatusCode::OK);
 
@@ -1721,7 +1742,7 @@ async fn test_streaming_with_mcp_tool_calls() {
 
     let tenant_meta = test_tenant_meta();
     let response = router
-        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .route_responses(None, &tenant_meta, req.clone(), req.model.as_str())
         .await;
 
     // Verify streaming response
@@ -2009,7 +2030,7 @@ async fn test_streaming_multi_turn_with_mcp() {
 
     let tenant_meta = test_tenant_meta();
     let response = router
-        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .route_responses(None, &tenant_meta, req.clone(), req.model.as_str())
         .await;
     assert_eq!(response.status(), StatusCode::OK);
 
