@@ -433,7 +433,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn known_model_without_workers_returns_capacity_429() {
+    async fn known_model_without_workers_returns_unavailable_503() {
         let registry = WorkerRegistry::new();
         registry.remember_model("m");
 
@@ -445,7 +445,7 @@ mod tests {
             .await
             .expect_err("known model with no workers must be rejected");
 
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

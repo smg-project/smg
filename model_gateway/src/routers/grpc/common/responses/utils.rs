@@ -284,13 +284,11 @@ mod tests {
 
         let response = validate_worker_availability(&registry, "model-alias")
             .expect("alias must stop resolving with no workers behind it");
-        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
-        assert!(response
-            .headers()
-            .get(http::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .is_some_and(|seconds| seconds >= 1));
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !response.headers().contains_key(http::header::RETRY_AFTER),
+            "a drained pool is unavailability, which advertises no pacing interval"
+        );
     }
     #[test]
     fn namespace_function_identity_roundtrips_and_preserves_literal_names() {
