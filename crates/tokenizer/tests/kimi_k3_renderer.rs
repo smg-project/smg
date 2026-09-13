@@ -11,11 +11,15 @@
 use std::{collections::HashMap, fs};
 
 use llm_tokenizer::{
-    chat_template::ChatTemplateParams, encoders::kimi_k3_xtml::apply_kimi_k3_xtml,
-    traits::Tokenizer as TokenizerTrait, TiktokenTokenizer,
+    chat_template::ChatTemplateParams,
+    encoders::kimi_k3_xtml::apply_kimi_k3_xtml,
+    traits::{Encoder, PromptEncoding, Tokenizer as TokenizerTrait},
+    TiktokenTokenizer,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
+
+mod common;
 
 const MIN_TIKTOKEN_MODEL: &str = "aGVsbG8= 0\n";
 
@@ -217,4 +221,83 @@ fn tokenizer_loads_and_renders_k3_without_chat_template() {
         rendered.ends_with(&fixture_text("plain_user_thinking")),
         "the directive is the only addition: {rendered}"
     );
+}
+
+/// Token-id parity with the checkpoint's own `apply_chat_template(tokenize=True)`
+/// (`build_chat_segments` + `_encode_chat_segments`), recorded in
+/// `tests/fixtures/kimi_k3/k3_render_ids_fixtures.json` from
+/// `nvidia/Kimi-K3-NVFP4` (the same tokenizer files as `moonshotai/Kimi-K3`)
+/// and reproduced under transformers 4.57.6 and 5.16.1.
+///
+/// The real `tiktoken.model` and `tokenizer_config.json` are fetched once
+/// into `.tokenizer_cache/kimi_k3/`; `KIMI_K3_MODEL_DIR` points at a local
+/// checkpoint directory instead.
+#[test]
+fn segment_encoding_matches_vendor_token_ids() {
+    let model_dir = common::ensure_kimi_k3_cached();
+    let tok = TiktokenTokenizer::from_dir(&model_dir).expect("K3 tokenizer should load");
+
+    let raw = fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/kimi_k3/k3_render_ids_fixtures.json"),
+    )
+    .expect("k3 id fixtures must exist");
+    let cases: Value = serde_json::from_str(&raw).expect("fixtures must be valid JSON");
+
+    // Cases where a flat encode of the rendered text cannot reproduce the
+    // reference ids: marker strings inside message text become control ids,
+    // and BPE merges across attribute-piece boundaries (`=".hidden`).
+    const FLAT_DIFFERS: &[&str] = &[
+        "injected_markers",
+        "tool_call_round_trip",
+        "punctuation_attribute_value",
+    ];
+
+    for (name, case) in cases.as_object().expect("fixture root is an object") {
+        let messages = case["messages"].as_array().expect("messages").clone();
+        let tools: Option<Vec<Value>> = case["tools"].as_array().cloned();
+        let expected: Vec<u32> = case["ids"]
+            .as_array()
+            .expect("ids")
+            .iter()
+            .map(|v| v.as_u64().expect("id") as u32)
+            .collect();
+        let params = || ChatTemplateParams {
+            add_generation_prompt: true,
+            tools: tools.as_deref(),
+            ..Default::default()
+        };
+
+        let flat = tok
+            .apply_chat_template(&messages, params())
+            .expect("flat render");
+        let rendered = tok
+            .apply_chat_template_with_encoding(&messages, params(), None)
+            .expect("render should succeed");
+        assert_eq!(
+            rendered.text, flat,
+            "case {name}: text is the flat rendering"
+        );
+        assert_eq!(
+            rendered.text,
+            case["text"].as_str().expect("text"),
+            "case {name}: text differs from the reference"
+        );
+        let PromptEncoding::Deferred(job) = rendered.encoding else {
+            panic!("case {name}: K3 must defer its encode");
+        };
+        let ids = job.run().expect("deferred encode should succeed");
+        assert_eq!(
+            ids.token_ids(),
+            &expected[..],
+            "case {name}: deferred encoding differs from the reference"
+        );
+
+        let flat_ids = tok.encode(&flat, false).expect("flat encode");
+        assert_eq!(
+            flat_ids.token_ids() != &expected[..],
+            FLAT_DIFFERS.contains(&name.as_str()),
+            "case {name}: flat encoding parity unexpected"
+        );
+    }
 }

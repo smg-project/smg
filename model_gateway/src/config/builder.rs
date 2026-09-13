@@ -5,8 +5,8 @@ use smg_mcp::McpConfig;
 
 use super::{
     CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig,
-    RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+    HealthCheckConfig, HistoryBackend, MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig,
+    PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
     TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
@@ -263,6 +263,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn pd_admission_wait_secs(mut self, secs: u64) -> Self {
+        self.config.pd_admission_wait_secs = secs;
+        self
+    }
+
     pub fn disable_load_monitoring(mut self, disabled: bool) -> Self {
         self.config.disable_load_monitoring = disabled;
         self
@@ -307,6 +312,12 @@ impl RouterConfigBuilder {
     /// Global minimum multimodal tensor size (bytes) before SHM transport is used.
     pub fn multimodal_shm_min_bytes(mut self, bytes: Option<usize>) -> Self {
         self.config.multimodal_shm_min_bytes = bytes;
+        self
+    }
+
+    /// Per-request image-count limit replacing each model spec's built-in limit.
+    pub fn mm_per_request_image_limit(mut self, limit: Option<usize>) -> Self {
+        self.config.mm_per_request_image_limit = limit;
         self
     }
 
@@ -657,6 +668,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn pd_pairing_mode(mut self, mode: PdPairingMode) -> Self {
+        self.config.pd_pairing_mode = mode;
+        self
+    }
+
     /// Inverse of disable_retries field
     pub fn retries(mut self, enable: bool) -> Self {
         self.config.disable_retries = !enable;
@@ -671,6 +687,11 @@ impl RouterConfigBuilder {
 
     pub fn igw(mut self, enable: bool) -> Self {
         self.config.enable_igw = enable;
+        self
+    }
+
+    pub fn rl(mut self, rl: smg_rl::RlConfig) -> Self {
+        self.config.rl = rl;
         self
     }
 

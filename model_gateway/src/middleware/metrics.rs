@@ -280,9 +280,9 @@ mod tests {
             routers::error::HEADER_X_SMG_ERROR_CODE,
         };
 
-        // Simulates a backend minting a fresh X-SMG-Error-Code per response
-        // (rebuilt responses preserve upstream headers). Only gateway-set
-        // codes may become metric labels, so the interner must stay flat.
+        // Simulates a handler returning a fresh X-SMG-Error-Code per response.
+        // Only gateway-set codes may become metric labels, so the interner
+        // must stay flat.
         let app = Router::new()
             .route(
                 "/echo/{id}",

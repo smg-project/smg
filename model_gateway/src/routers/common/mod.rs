@@ -18,6 +18,11 @@
 //!   session registry) shared by the OpenAI and HTTP routers
 //! - [`overload`] — shed responses for the absolute worker-overload
 //!   guard, shared by the HTTP and gRPC selection paths
+//! - [`pd_admission`] — the disaggregated dispatch's admission gate: never
+//!   post more bootstrap rooms to a pair than its decode engine can admit
+//! - [`placement`] — policy-driven worker placement over the routing
+//!   pools (single worker and prefill/decode pairs), the one sequence the
+//!   HTTP and gRPC families used to each carry a copy of
 //! - [`worker_selection`] — per-request worker-selection helpers used
 //!   by every routing path (regular, PD, fallback, external provider)
 //! - [`request_lease`] — dispatch-phase owner of a request's parsed
@@ -27,20 +32,23 @@
 //!   used by every router for transport-level retries. Has zero
 //!   coupling to the `Worker` trait — it lived in `worker/` for
 //!   historical reasons before this extraction.
+//! - [`sglang_fields`] — the SGLang-only request fields the HTTP proxy
+//!   strips at their defaults and the provider transformers drop outright
 //! - [`sse`] — shared SSE codec (encoder + decoder) for streaming
 //!   responses to clients and parsing upstream SSE byte streams
 
 pub mod body_policy;
-pub mod header_utils;
+pub use smg_external_router::header_utils;
 pub(crate) mod kv_transfer;
-pub mod mcp_utils;
-pub mod openai_bridge;
+pub use smg_external_router::{mcp_utils, openai_bridge};
 pub mod overload;
-pub mod persistence_utils;
-pub mod realtime;
+pub mod pd_admission;
+pub use smg_external_router::persistence_utils;
+pub(crate) mod placement;
+pub use smg_external_router::realtime;
 pub mod request_lease;
-pub mod retry;
-pub mod sse;
+pub(crate) use smg_external_router::sglang_fields;
+pub use smg_external_router::{retry, sse};
 pub mod worker_selection;
 
 /// Threshold above which upstream request bodies are sent as one-shot

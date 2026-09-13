@@ -454,7 +454,7 @@ struct Router {
     health_check_interval_secs: u64,
     health_check_endpoint: String,
     disable_health_check: bool,
-    remove_unhealthy_workers: bool,
+    remove_unhealthy_workers: Option<bool>,
     enable_igw: bool,
     queue_size: usize,
     queue_timeout_secs: u64,
@@ -507,8 +507,7 @@ struct Router {
     worker_startup_delay: u64,
     worker_ports_annotation: String,
     /// DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped).
-    /// Appended last: positional constructor compatibility (see the field
-    /// ordering rule on this struct's signature).
+    /// Positional slot preserved; new constructor arguments belong at the signature tail.
     zmq_engine_count: Option<usize>,
     overlap_decay: f32,
     selection_temperature: f32,
@@ -526,6 +525,15 @@ struct Router {
     worker_overload_protection: bool,
     disable_load_monitoring: bool,
     max_buffered_request_bytes: u64,
+    kv_connector_annotation: String,
+    kv_engine_id_annotation: String,
+    mm_per_request_image_limit: Option<usize>,
+    pd_admission_wait_secs: u64,
+    /// New parameters MUST be appended here (not inserted mid-list) to avoid
+    /// breaking external Python callers that pass `_Router(...)` positionally.
+    enable_rl: bool,
+    rl_control_timeout_secs: u64,
+    rl_fanout_concurrency: usize,
 }
 
 impl Router {
@@ -660,11 +668,9 @@ impl Router {
             })
         };
 
-        let mode = if self.enable_igw {
-            RoutingMode::Regular {
-                worker_urls: vec![],
-            }
-        } else if matches!(self.backend, BackendType::Openai) {
+        // IGW does not override backend or disaggregated modes; IGW-only keeps
+        // the Python binding's existing empty startup-worker behavior.
+        let mode = if matches!(self.backend, BackendType::Openai) {
             RoutingMode::OpenAI {
                 worker_urls: self.worker_urls.clone(),
             }
@@ -710,7 +716,11 @@ impl Router {
             }
         } else {
             RoutingMode::Regular {
-                worker_urls: self.worker_urls.clone(),
+                worker_urls: if self.enable_igw {
+                    vec![]
+                } else {
+                    self.worker_urls.clone()
+                },
             }
         };
 
@@ -728,6 +738,8 @@ impl Router {
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
                 worker_ports_annotation: self.worker_ports_annotation.clone(),
+                kv_connector_annotation: self.kv_connector_annotation.clone(),
+                kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
                 router_selector: self.router_selector.clone(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source: self.model_id_from.clone(),
@@ -842,6 +854,7 @@ impl Router {
             .worker_overload_protection(self.worker_overload_protection)
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -866,7 +879,12 @@ impl Router {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
                 disable_health_check: self.disable_health_check,
-                remove_unhealthy_workers: self.remove_unhealthy_workers,
+                // Explicit setting wins; otherwise recovery-by-removal follows
+                // service discovery, which is what re-adds a removed worker.
+                remove_unhealthy_workers: config::resolve_worker_auto_recovery(
+                    self.remove_unhealthy_workers,
+                    self.service_discovery,
+                ),
                 drain_settle_secs: self.drain_settle_secs,
             })
             .tokenizer_cache(config::TokenizerCacheConfig {
@@ -910,6 +928,7 @@ impl Router {
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
+            .mm_per_request_image_limit(self.mm_per_request_image_limit)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval_secs,
@@ -921,6 +940,11 @@ impl Router {
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .igw(self.enable_igw)
+            .rl(smg_rl::RlConfig {
+                enabled: self.enable_rl,
+                control_timeout_secs: self.rl_control_timeout_secs,
+                fanout_concurrency: self.rl_fanout_concurrency,
+            })
             .maybe_client_cert_and_key(
                 self.client_cert_path.as_ref(),
                 self.client_key_path.as_ref(),
@@ -1009,7 +1033,7 @@ impl Router {
         health_check_interval_secs = 60,
         health_check_endpoint = String::from("/health"),
         disable_health_check = false,
-        remove_unhealthy_workers = false,
+        remove_unhealthy_workers = None,
         enable_igw = false,
         queue_size = 100,
         queue_timeout_secs = 60,
@@ -1083,6 +1107,16 @@ impl Router {
         worker_overload_protection = false,
         disable_load_monitoring = false,
         max_buffered_request_bytes = 1_048_576,
+        kv_connector_annotation = String::from("smg.ai/kv-connector"),
+        kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
+        mm_per_request_image_limit = None,
+        pd_admission_wait_secs = 30,
+        // Appended last (not inserted mid-list) so every pre-existing
+        // positional argument keeps its index for callers that construct
+        // `_Router(...)` positionally. See the struct-field note above.
+        enable_rl = false,
+        rl_control_timeout_secs = 600,
+        rl_fanout_concurrency = 32,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1160,7 +1194,7 @@ impl Router {
         health_check_interval_secs: u64,
         health_check_endpoint: String,
         disable_health_check: bool,
-        remove_unhealthy_workers: bool,
+        remove_unhealthy_workers: Option<bool>,
         enable_igw: bool,
         queue_size: usize,
         queue_timeout_secs: u64,
@@ -1233,6 +1267,15 @@ impl Router {
         worker_overload_protection: bool,
         disable_load_monitoring: bool,
         max_buffered_request_bytes: u64,
+        kv_connector_annotation: String,
+        kv_engine_id_annotation: String,
+        mm_per_request_image_limit: Option<usize>,
+        pd_admission_wait_secs: u64,
+        // Appended last to match the `#[pyo3(signature)]` order above and
+        // preserve positional-argument compatibility.
+        enable_rl: bool,
+        rl_control_timeout_secs: u64,
+        rl_fanout_concurrency: usize,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1397,6 +1440,13 @@ impl Router {
             worker_overload_protection,
             disable_load_monitoring,
             max_buffered_request_bytes,
+            kv_connector_annotation,
+            kv_engine_id_annotation,
+            mm_per_request_image_limit,
+            pd_admission_wait_secs,
+            enable_rl,
+            rl_control_timeout_secs,
+            rl_fanout_concurrency,
         })
     }
 
@@ -1436,6 +1486,8 @@ impl Router {
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
                 worker_ports_annotation: self.worker_ports_annotation.clone(),
+                kv_connector_annotation: self.kv_connector_annotation.clone(),
+                kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
                 router_selector: self.router_selector.clone(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source,

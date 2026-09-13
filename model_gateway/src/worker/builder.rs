@@ -17,7 +17,10 @@ use super::{
         WorkerType,
     },
 };
-use crate::{observability::metrics::Metrics, routers::grpc::backend_client::BackendClient};
+use crate::{
+    observability::metrics::Metrics, routers::grpc::backend_client::BackendClient,
+    worker::pd_pairing::PdPairing,
+};
 
 /// Builder for creating BasicWorker instances with fluent API.
 ///
@@ -33,6 +36,8 @@ pub struct BasicWorkerBuilder {
     backend_client: Option<BackendClient>,
     /// Pre-built worker-directed HTTP client (if not set, a default is created).
     http_client: Option<Arc<reqwest::Client>>,
+    /// Whether `http_client` speaks HTTP/2 prior knowledge.
+    http2: bool,
     /// Resolved resilience config (if not set, defaults are used).
     resilience: Option<ResolvedResilience>,
     /// Initial lifecycle status. If unset, defaults to `Pending` for
@@ -58,6 +63,7 @@ impl BasicWorkerBuilder {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             backend_client: None,
             http_client: None,
+            http2: false,
             resilience: None,
             initial_status: None,
             connect_signal_tx: None,
@@ -74,6 +80,7 @@ impl BasicWorkerBuilder {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             backend_client: None,
             http_client: None,
+            http2: false,
             resilience: None,
             initial_status: None,
             connect_signal_tx: None,
@@ -92,6 +99,7 @@ impl BasicWorkerBuilder {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             backend_client: None,
             http_client: None,
+            http2: false,
             resilience: None,
             initial_status: None,
             connect_signal_tx: None,
@@ -203,6 +211,12 @@ impl BasicWorkerBuilder {
         self
     }
 
+    /// Record that the worker's HTTP client speaks HTTP/2 prior knowledge.
+    pub fn http2(mut self, http2: bool) -> Self {
+        self.http2 = http2;
+        self
+    }
+
     /// Set the resolved resilience config.
     pub fn resilience(mut self, resilience: ResolvedResilience) -> Self {
         self.resilience = Some(resilience);
@@ -308,9 +322,11 @@ impl BasicWorkerBuilder {
 
         let metadata = WorkerMetadata {
             overload: OverloadThresholds::resolve(&self.spec.overload, self.overload_defaults),
+            pd_pairing: PdPairing::derive(&self.spec),
             spec: Arc::new(self.spec),
             health_config,
             health_endpoint: self.health_endpoint,
+            http2: self.http2,
         };
 
         // OnceCell for lock-free client access after initialization; ArcSwap so
@@ -337,6 +353,7 @@ impl BasicWorkerBuilder {
                     WorkerStatus::Pending
                 });
         Metrics::set_worker_health(&metadata.spec.url, initial_status == WorkerStatus::Ready);
+        Metrics::set_worker_http2(&metadata.spec.url, metadata.http2);
 
         let http_client = Arc::new(match self.http_client {
             Some(client) => LazyHttpClient::ready(client),
@@ -346,6 +363,8 @@ impl BasicWorkerBuilder {
         let resilience = self.resilience.unwrap_or_default();
 
         BasicWorker {
+            kv_engine_id: ArcSwapOption::new(metadata.spec.kv_engine_id.clone().map(Arc::new)),
+            kv_engine_id_unconfirmed: AtomicBool::new(false),
             runtime: ArcSwap::from_pointee(WorkerRuntime::new(&metadata.spec.url, initial_status)),
             circuit_breaker: ArcSwap::from_pointee(CircuitBreaker::with_config_and_label(
                 self.circuit_breaker_config,

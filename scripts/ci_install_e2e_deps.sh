@@ -4,22 +4,25 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RETRY="bash ${SCRIPT_DIR}/ci_retry.sh"
+
 # Activate venv if it exists
 if [ -f ".venv/bin/activate" ]; then
     source .venv/bin/activate
 fi
 
 echo "Installing e2e test dependencies..."
-python3 -m pip install e2e_test/
+$RETRY 3 10 python3 -m pip install e2e_test/
 
 # Install SmgClient (pure Python client for cross-SDK parity testing)
 echo "Installing smg-client..."
-python3 -m pip install clients/python/
+$RETRY 3 10 python3 -m pip install clients/python/
 
 # Install any extra dependencies passed as arguments
 if [ $# -gt 0 ]; then
     echo "Installing extra dependencies: $@"
-    python3 -m pip --no-cache-dir install --upgrade "$@"
+    $RETRY 3 10 python3 -m pip --no-cache-dir install --upgrade "$@"
 fi
 
 # Pin the grpcio generated-code companions to the protobuf-6 stable line.
@@ -36,6 +39,6 @@ fi
 # whatever engine/extra-dep installs selected. (grpcio core has no generated
 # protobuf, so it is left at the engine-selected version.) Drop the cap once the
 # stack moves to a protobuf 7 runtime.
-python3 -m pip install "grpcio-health-checking==1.81.*" "grpcio-reflection==1.81.*"
+$RETRY 3 10 python3 -m pip install "grpcio-health-checking==1.81.*" "grpcio-reflection==1.81.*"
 
 echo "E2E test dependencies installed"

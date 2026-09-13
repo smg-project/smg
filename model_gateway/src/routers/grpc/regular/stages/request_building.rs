@@ -8,8 +8,8 @@ use super::{chat::ChatRequestBuildingStage, generate::GenerateRequestBuildingSta
 use crate::routers::{
     error as grpc_error,
     grpc::{
-        common::stages::PipelineStage,
-        context::{ExecutionPlanKind, RequestContext, RequestType},
+        common::stages::BuildStage,
+        context::{BuildOutput, ExecutionPlanKind, RequestContext, RequestType},
     },
 };
 
@@ -33,14 +33,14 @@ impl ChatGenerateRequestBuildingStage {
 }
 
 #[async_trait]
-impl PipelineStage for ChatGenerateRequestBuildingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+impl BuildStage for ChatGenerateRequestBuildingStage {
+    async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         match &ctx.input.request_type {
-            RequestType::Chat(_) => self.chat_stage.execute(ctx).await,
-            RequestType::Generate(_) => self.generate_stage.execute(ctx).await,
+            RequestType::Chat(_) => self.chat_stage.build(ctx).await,
+            RequestType::Generate(_) => self.generate_stage.build(ctx).await,
             request_type => {
                 error!(
-                    function = "ChatGenerateRequestBuildingStage::execute",
+                    function = "ChatGenerateRequestBuildingStage::build",
                     request_type = %request_type,
                     "{request_type} should not reach this stage"
                 );

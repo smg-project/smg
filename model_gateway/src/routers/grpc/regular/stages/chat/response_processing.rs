@@ -12,9 +12,10 @@ use tracing::error;
 use crate::routers::{
     error,
     grpc::{
-        common::stages::{helpers, PipelineStage, RateLimitCell},
-        context::{FinalResponse, RequestContext},
+        common::stages::{helpers, ProcessStage, RateLimitCell},
+        context::{DispatchContext, FinalResponse},
         regular::{processor, streaming},
+        spec::ResponseSpec,
     },
 };
 
@@ -37,27 +38,29 @@ impl ChatResponseProcessingStage {
 }
 
 #[async_trait]
-impl PipelineStage for ChatResponseProcessingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        self.process_chat_response(ctx).await
-    }
-
-    fn name(&self) -> &'static str {
-        "ChatResponseProcessing"
-    }
-}
-
-impl ChatResponseProcessingStage {
-    async fn process_chat_response(
+impl ProcessStage for ChatResponseProcessingStage {
+    async fn process(
         &self,
-        ctx: &mut RequestContext,
+        ctx: &mut DispatchContext,
+        spec: ResponseSpec,
     ) -> Result<Option<Response>, Response> {
-        let is_streaming = ctx.is_streaming();
+        let ResponseSpec::Chat(chat_request) = spec else {
+            error!(
+                function = "ChatResponseProcessingStage::process",
+                "Wrong response spec"
+            );
+            return Err(error::internal_error(
+                "wrong_response_spec",
+                "Wrong response spec",
+            ));
+        };
+
+        let is_streaming = ctx.streaming;
 
         // Extract execution result
-        let execution_result = ctx.state.response.execution_result.take().ok_or_else(|| {
+        let execution_result = ctx.response.execution_result.take().ok_or_else(|| {
             error!(
-                function = "ChatResponseProcessingStage::execute",
+                function = "ChatResponseProcessingStage::process",
                 "No execution result"
             );
             error::internal_error("no_execution_result", "No execution result")
@@ -65,12 +68,11 @@ impl ChatResponseProcessingStage {
 
         // Get dispatch metadata (needed by both streaming and non-streaming)
         let dispatch = ctx
-            .state
             .dispatch
             .as_ref()
             .ok_or_else(|| {
                 error!(
-                    function = "ChatResponseProcessingStage::execute",
+                    function = "ChatResponseProcessingStage::process",
                     "Dispatch metadata not set"
                 );
                 error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
@@ -80,7 +82,7 @@ impl ChatResponseProcessingStage {
         // Get cached tokenizer (resolved once in preparation stage)
         let tokenizer = ctx.tokenizer_arc().ok_or_else(|| {
             error!(
-                function = "ChatResponseProcessingStage::process_chat_response",
+                function = "ChatResponseProcessingStage::process",
                 "Tokenizer not cached in context"
             );
             error::internal_error(
@@ -92,28 +94,27 @@ impl ChatResponseProcessingStage {
         if is_streaming {
             // Read derived skip_special_tokens (set in preparation, survives request_building .take())
             let skip_special_tokens = ctx
-                .state
                 .response
                 .skip_special_tokens
-                .unwrap_or_else(|| ctx.chat_request().skip_special_tokens);
+                .unwrap_or(chat_request.skip_special_tokens);
 
             // Reserved (if tenant rate limiting is enabled): settled with real
             // usage inside the streaming processor on success, or abandoned
             // via the attached ReservationAttachment's Drop below on early
             // disconnect/error.
             let reservation = ctx
-                .input
                 .rate_limit_cell
                 .as_deref()
                 .and_then(RateLimitCell::take_for_streaming_handoff);
 
-            // Streaming: Use StreamingProcessor and return SSE response
+            // Streaming: Use StreamingProcessor and return SSE response. The
+            // stream task consumes the spec, never the parsed request.
             let response = self
                 .streaming_processor
                 .clone()
                 .process_streaming_response(
                     execution_result,
-                    ctx.chat_request_arc(), // Cheap Arc clone (8 bytes)
+                    *chat_request,
                     dispatch,
                     tokenizer,
                     skip_special_tokens,
@@ -123,23 +124,18 @@ impl ChatResponseProcessingStage {
 
             // Attach load guards (and the reservation's disconnect/error
             // safety net) to the response body for proper RAII lifecycle.
-            let response = helpers::attach_response_guards(
-                response,
-                ctx.state.load_guards.take(),
-                reservation,
-            );
+            let response =
+                helpers::attach_response_guards(response, ctx.load_guards.take(), reservation);
 
             return Ok(Some(response));
         }
 
         // Non-streaming: Delegate to ResponseProcessor
-        let request_logprobs = ctx.chat_request().logprobs;
+        let request_logprobs = chat_request.logprobs;
 
-        let chat_request = ctx.chat_request_arc();
-
-        let stop_decoder = ctx.state.response.stop_decoder.as_mut().ok_or_else(|| {
+        let stop_decoder = ctx.response.stop_decoder.as_mut().ok_or_else(|| {
             error!(
-                function = "ChatResponseProcessingStage::execute",
+                function = "ChatResponseProcessingStage::process",
                 "Stop decoder not initialized"
             );
             error::internal_error(
@@ -152,7 +148,7 @@ impl ChatResponseProcessingStage {
             .processor
             .process_non_streaming_chat_response(
                 execution_result,
-                chat_request,
+                *chat_request,
                 dispatch,
                 tokenizer,
                 stop_decoder,
@@ -161,8 +157,12 @@ impl ChatResponseProcessingStage {
             .await?;
 
         // Store the final response
-        ctx.state.response.final_response = Some(FinalResponse::Chat(response));
+        ctx.response.final_response = Some(FinalResponse::Chat(response));
 
         Ok(None)
+    }
+
+    fn name(&self) -> &'static str {
+        "ChatResponseProcessing"
     }
 }

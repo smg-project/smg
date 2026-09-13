@@ -5,6 +5,7 @@
 //!
 //! # Supported Models
 //!
+//! - **GLM-5.3-Flash** (`glm53_flash`): Aspect-preserving aligned-canvas image/video preprocessing
 //! - **LLaVA 1.5** (`llava`): CLIP-based preprocessing with configurable aspect ratio
 //! - **LLaVA-NeXT** (`llava`): Multi-crop anyres processing
 //! - **Qwen2-VL** (`qwen2_vl`): Dynamic resolution with smart resizing
@@ -20,11 +21,13 @@
 //! - **LLaMA 4 Vision** (`llama4_vision`): Tile-based processing with 336x336 tiles and global tile
 //! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
 
+pub mod glm53_flash;
 pub mod inkling;
 pub mod kimi_k25;
 pub mod kimi_k3;
 pub mod llama4_vision;
 pub mod llava;
+pub mod minimax_m3;
 pub mod moonvit;
 pub mod phi3_vision;
 pub mod phi4_vision;
@@ -34,11 +37,13 @@ pub mod qwen3_omni_vision;
 pub mod qwen3_vl;
 pub mod qwen_vl_base;
 
+pub use glm53_flash::Glm53FlashProcessor;
 pub use inkling::InklingImageProcessor;
 pub use kimi_k25::KimiK25Processor;
 pub use kimi_k3::KimiK3Processor;
 pub use llama4_vision::Llama4VisionProcessor;
 pub use llava::{ImageAspectRatio, LlavaNextProcessor, LlavaProcessor};
+pub use minimax_m3::MiniMaxM3VisionProcessor;
 pub use phi3_vision::Phi3VisionProcessor;
 pub use phi4_vision::Phi4VisionProcessor;
 pub use pixtral::PixtralProcessor;

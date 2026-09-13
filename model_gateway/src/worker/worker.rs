@@ -26,8 +26,8 @@ use tokio::{
 };
 
 use super::{
-    event::WorkerConnected, overload::OverloadThresholds, CircuitBreaker, ResolvedResilience,
-    WorkerError, WorkerResult, UNKNOWN_MODEL_ID,
+    event::WorkerConnected, overload::OverloadThresholds, pd_pairing::PdPairing, CircuitBreaker,
+    ResolvedResilience, WorkerError, WorkerResult, UNKNOWN_MODEL_ID,
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
@@ -36,9 +36,6 @@ use crate::{
         grpc::{backend_client::BackendClient, client::GrpcClient, zmq_client},
     },
 };
-
-/// Default HTTP client timeout for worker requests (in seconds)
-pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
 
 /// A worker's HTTP client handle, materialized on first use.
 ///
@@ -73,7 +70,9 @@ impl LazyHttpClient {
         self.cell.get().is_none()
     }
 
-    /// The client, building the default one on first use.
+    /// The client, building the default one on first use. The fallback sets
+    /// no total timeout: dispatch deadlines come from the router config via
+    /// the client cache, and every health/admin call site sets its own.
     pub fn client(&self) -> &reqwest::Client {
         self.init()
     }
@@ -86,22 +85,7 @@ impl LazyHttpClient {
     }
 
     fn init(&self) -> &Arc<reqwest::Client> {
-        self.cell.get_or_init(|| {
-            Arc::new(
-                reqwest::Client::builder()
-                    .timeout(Duration::from_secs(DEFAULT_WORKER_HTTP_TIMEOUT_SECS))
-                    .pool_max_idle_per_host(8)
-                    .build()
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            error = %e,
-                            "failed to build the default per-worker HTTP client; \
-                             falling back to reqwest defaults (no request timeout)"
-                        );
-                        reqwest::Client::new()
-                    }),
-            )
-        })
+        self.cell.get_or_init(|| Arc::new(reqwest::Client::new()))
     }
 }
 
@@ -396,6 +380,31 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Decrement the load counter
     fn decrement_load(&self);
 
+    /// Claim `count` PD bootstrap rooms while the worker's claimed total
+    /// stays within `window`; a refusal claims nothing.
+    ///
+    /// The PD admission gate reserves through this rather than comparing
+    /// [`Worker::load`] to the window: a read-then-send lets two dispatches
+    /// both take the last free slot, which is exactly the over-window burst
+    /// the gate exists to prevent.
+    ///
+    /// The defaults admit unconditionally and track nothing. They exist for
+    /// implementations that carry no shared runtime (the language bindings,
+    /// test doubles): the gate only reaches a worker that reports a running
+    /// window, and any implementation that does report one must override
+    /// these three with a real claim, or the window is not enforced.
+    fn try_admit_pd(&self, _count: usize, _window: usize) -> bool {
+        true
+    }
+
+    /// Release `count` rooms claimed by [`Worker::try_admit_pd`].
+    fn release_pd(&self, _count: usize) {}
+
+    /// Rooms currently claimed on this worker.
+    fn pd_admitted(&self) -> usize {
+        0
+    }
+
     /// Get the current routing-key load cardinality.
     fn routing_key_load(&self) -> usize;
 
@@ -417,21 +426,37 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Get worker-specific metadata
     fn metadata(&self) -> &WorkerMetadata;
 
+    /// The PD pairing descriptor placement compares across a prefill and a
+    /// decode.
+    fn pd_pairing(&self) -> &PdPairing {
+        &self.metadata().pd_pairing
+    }
+
     /// Worker-reported in-flight capacity, if available.
     ///
-    /// Reads the `max_running_requests` label populated by the metadata
-    /// discovery pipeline (Step 4 of the worker lifecycle). Returns
-    /// `None` when the worker hasn't reported a value or reports zero
-    /// (zero is meaningless for capacity accounting).
+    /// Reads the running-window label populated by the metadata discovery
+    /// pipeline (Step 4 of the worker lifecycle). Returns `None` when the
+    /// worker hasn't reported a value or reports zero (zero is meaningless
+    /// for capacity accounting).
+    ///
+    /// Engines spell the same window two ways — TokenSpeed and vLLM
+    /// advertise `max_num_seqs`, SGLang advertises `max_running_requests` —
+    /// and both are the count of requests the scheduler will run at once, so
+    /// both are read here rather than leaving TokenSpeed workers looking like
+    /// non-reporters. `max_num_seqs` wins when a worker reports both: it is
+    /// the authoritative name for the engines that use it, and it is the
+    /// order `smg_grpc_servicer.tokenspeed.loads::running_window` reports in,
+    /// so the label and the `GetLoads` report cannot disagree.
     ///
     /// `WorkerCapacity` uses this to derive total fleet capacity when
     /// every worker reports; falls back to a configured per-worker
-    /// estimate otherwise.
+    /// estimate otherwise. The PD admission gate uses it as the decode
+    /// leg's admission bound.
     fn max_running_requests(&self) -> Option<u16> {
-        self.metadata()
-            .spec
-            .labels
-            .get("max_running_requests")
+        let labels = &self.metadata().spec.labels;
+        labels
+            .get("max_num_seqs")
+            .or_else(|| labels.get("max_running_requests"))
             .and_then(|s| s.parse::<u16>().ok())
             .filter(|n| *n > 0)
     }
@@ -571,6 +596,11 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().endpoint_url(route)
     }
 
+    /// Whether the router speaks HTTP/2 prior knowledge to this worker.
+    fn http2(&self) -> bool {
+        self.metadata().http2()
+    }
+
     /// Check if this worker is DP-aware.
     fn is_dp_aware(&self) -> bool {
         self.metadata().is_dp_aware()
@@ -585,6 +615,31 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     fn dp_size(&self) -> Option<usize> {
         self.metadata().dp_size()
     }
+
+    /// The KV transfer engine id the worker's engine currently reports: the
+    /// spec's, unless a recovery re-read it (see
+    /// [`Self::refresh_kv_engine_id`]). A PD handoff must be minted for the
+    /// engine process that is there now, not the one discovered at
+    /// registration (#2491).
+    fn kv_engine_id(&self) -> Option<String> {
+        self.metadata().spec.kv_engine_id.clone()
+    }
+
+    /// Replace the engine id after a re-read. Returns `true` when it changed.
+    fn refresh_kv_engine_id(&self, _kv_engine_id: Option<String>) -> bool {
+        false
+    }
+
+    /// Whether the engine id in force has been confirmed by the engine since
+    /// the worker last recovered. `false` after a re-read that failed,
+    /// expired or returned no id, so the next probe tries again instead of
+    /// the worker serving with a possibly stale id until its next outage.
+    fn kv_engine_id_confirmed(&self) -> bool {
+        true
+    }
+
+    /// Record the outcome of a re-read (see [`Self::kv_engine_id_confirmed`]).
+    fn set_kv_engine_id_confirmed(&self, _confirmed: bool) {}
 
     /// Transform a request for DP-aware routing.
     ///
@@ -860,6 +915,13 @@ pub struct WorkerMetadata {
     /// load monitor's ingestion predicate scores every report against these,
     /// so nothing on a request path re-resolves them.
     pub overload: OverloadThresholds,
+    /// Whether the router speaks HTTP/2 prior knowledge to this worker:
+    /// `spec.http_pool.http2` when declared, else negotiated at registration
+    /// under `upstream_http2`.
+    pub http2: bool,
+    /// What this worker offers a PD rendezvous partner, derived once from
+    /// the spec and its discovered labels (#2483).
+    pub pd_pairing: PdPairing,
 }
 
 impl WorkerMetadata {
@@ -887,6 +949,11 @@ impl WorkerMetadata {
     /// Compose an endpoint URL for a specific route.
     pub fn endpoint_url(&self, route: &str) -> String {
         format!("{}{}", self.base_url(), route)
+    }
+
+    /// Whether the router speaks HTTP/2 prior knowledge to this worker.
+    pub fn http2(&self) -> bool {
+        self.http2
     }
 
     // ── DP awareness ────────────────────────────────────────────────
@@ -1048,6 +1115,13 @@ pub struct WorkerRuntime {
     consecutive_successes: AtomicUsize,
     total_pending_probes: AtomicUsize,
     load_counter: AtomicUsize,
+    /// Bootstrap rooms the PD admission gate has claimed on this worker and
+    /// not yet released. Separate from `load_counter` because admission must
+    /// *claim* against the engine's running window rather than read it: two
+    /// dispatches that both saw the last free slot would both send, which is
+    /// the over-window burst the gate exists to prevent. Lives here so a
+    /// same-URL replacement inherits the rooms the engine still holds.
+    pd_admitted: AtomicUsize,
     processed_counter: AtomicUsize,
     worker_routing_key_load: WorkerRoutingKeyLoad,
     revision: AtomicU64,
@@ -1065,6 +1139,7 @@ impl WorkerRuntime {
             consecutive_successes: AtomicUsize::new(0),
             total_pending_probes: AtomicUsize::new(0),
             load_counter: AtomicUsize::new(0),
+            pd_admitted: AtomicUsize::new(0),
             processed_counter: AtomicUsize::new(0),
             worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
             revision: AtomicU64::new(0),
@@ -1140,6 +1215,31 @@ impl WorkerRuntime {
             .is_ok()
     }
 
+    // ── PD admission claims ─────────────────────────────────────────
+
+    pub fn pd_admitted(&self) -> usize {
+        self.pd_admitted.load(Ordering::Relaxed)
+    }
+
+    /// Claim `count` rooms, but only while the claimed total stays within
+    /// `window`. All-or-nothing: a refusal claims nothing.
+    pub fn try_admit_pd(&self, count: usize, window: usize) -> bool {
+        self.pd_admitted
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                admitted.checked_add(count).filter(|total| *total <= window)
+            })
+            .is_ok()
+    }
+
+    /// Release `count` claimed rooms, saturating at zero.
+    pub fn release_pd(&self, count: usize) {
+        let _ = self
+            .pd_admitted
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                Some(admitted.saturating_sub(count))
+            });
+    }
+
     // ── Routing-key load ────────────────────────────────────────────
 
     pub fn routing_key_load(&self) -> usize {
@@ -1207,6 +1307,16 @@ pub struct BasicWorker {
     /// When not `Wildcard`, overrides metadata.models for routing decisions.
     /// Uses `ArcSwap` for lock-free reads on the hot path (`supports_model`).
     pub models_override: Arc<ArcSwap<WorkerModels>>,
+    /// The KV transfer engine id in force, seeded from the spec and replaced
+    /// when a recovered engine reports a new one (see
+    /// [`Worker::refresh_kv_engine_id`]). Not shared across same-URL
+    /// replacements: a worker built from a fresh discovery starts from its
+    /// own spec, and one rebuilt by a properties update starts from that
+    /// spec's (unrefreshed) id.
+    pub kv_engine_id: ArcSwapOption<String>,
+    /// Set while a recovery re-read of the engine id has not succeeded yet
+    /// (see [`Worker::kv_engine_id_confirmed`]).
+    pub kv_engine_id_unconfirmed: AtomicBool,
     /// Worker-directed HTTP client, shared across same-config workers, built
     /// on first use (see [`LazyHttpClient`]).
     pub http_client: Arc<LazyHttpClient>,
@@ -1225,6 +1335,10 @@ impl Clone for BasicWorker {
             zmq_connect_abort: Arc::clone(&self.zmq_connect_abort),
             connect_signal_tx: self.connect_signal_tx.clone(),
             models_override: Arc::clone(&self.models_override),
+            kv_engine_id: ArcSwapOption::new(self.kv_engine_id.load_full()),
+            kv_engine_id_unconfirmed: AtomicBool::new(
+                self.kv_engine_id_unconfirmed.load(Ordering::Relaxed),
+            ),
             http_client: Arc::clone(&self.http_client),
             resilience: self.resilience.clone(),
         }
@@ -1360,6 +1474,28 @@ impl BasicWorker {
 
 #[async_trait]
 impl Worker for BasicWorker {
+    fn kv_engine_id(&self) -> Option<String> {
+        self.kv_engine_id.load_full().map(|id| (*id).clone())
+    }
+
+    fn refresh_kv_engine_id(&self, kv_engine_id: Option<String>) -> bool {
+        let previous = self.kv_engine_id.load_full();
+        if previous.as_deref() == kv_engine_id.as_ref() {
+            return false;
+        }
+        self.kv_engine_id.store(kv_engine_id.map(Arc::new));
+        true
+    }
+
+    fn kv_engine_id_confirmed(&self) -> bool {
+        !self.kv_engine_id_unconfirmed.load(Ordering::Relaxed)
+    }
+
+    fn set_kv_engine_id_confirmed(&self, confirmed: bool) {
+        self.kv_engine_id_unconfirmed
+            .store(!confirmed, Ordering::Relaxed);
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1467,6 +1603,18 @@ impl Worker for BasicWorker {
             );
         }
         self.update_running_requests_metrics();
+    }
+
+    fn try_admit_pd(&self, count: usize, window: usize) -> bool {
+        self.runtime.load().try_admit_pd(count, window)
+    }
+
+    fn release_pd(&self, count: usize) {
+        self.runtime.load().release_pd(count);
+    }
+
+    fn pd_admitted(&self) -> usize {
+        self.runtime.load().pd_admitted()
     }
 
     fn routing_key_load(&self) -> usize {
@@ -1876,6 +2024,9 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
     let metadata = worker.metadata();
     let spec = metadata.spec.clone();
     let status = worker.status();
+    // Only PD legs pair; a regular worker's descriptor would be noise.
+    let pd_pairing = matches!(spec.worker_type, WorkerType::Prefill | WorkerType::Decode)
+        .then(|| metadata.pd_pairing.key());
 
     WorkerInfo {
         id: worker.url().to_string(),
@@ -1884,6 +2035,9 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         is_healthy: status == WorkerStatus::Ready,
         status: Some(status),
         load: worker.load(),
+        http2: metadata.http2,
+        pd_pairing,
+        engine_load: None,
         job_status: None,
     }
 }
@@ -2029,6 +2183,81 @@ mod tests {
             .build();
         // Zero is meaningless for capacity; treat as "not reported".
         assert_eq!(worker.max_running_requests(), None);
+    }
+
+    #[test]
+    fn test_max_running_requests_reads_the_tokenspeed_spelling() {
+        use crate::worker::BasicWorkerBuilder;
+        // TokenSpeed advertises the same scheduler window as `max_num_seqs`;
+        // without this a TokenSpeed worker looks like a non-reporter to both
+        // fleet capacity and PD admission.
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("max_num_seqs".to_string(), "16".to_string());
+        let worker = BasicWorkerBuilder::new("grpc://w:30000")
+            .labels(labels)
+            .build();
+        assert_eq!(worker.max_running_requests(), Some(16));
+    }
+
+    #[test]
+    fn test_max_running_requests_prefers_max_num_seqs_when_both_are_reported() {
+        use crate::worker::BasicWorkerBuilder;
+        // The servicer's `running_window` resolves in the same order, so a
+        // worker reporting both spellings cannot have its discovery label
+        // disagree with its GetLoads report.
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("max_running_requests".to_string(), "256".to_string());
+        labels.insert("max_num_seqs".to_string(), "16".to_string());
+        let worker = BasicWorkerBuilder::new("grpc://w:30000")
+            .labels(labels)
+            .build();
+        assert_eq!(worker.max_running_requests(), Some(16));
+    }
+
+    #[test]
+    fn test_pd_admission_claims_are_atomic_and_bounded_by_the_window() {
+        use crate::worker::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("grpc://w:30000").build();
+
+        assert!(worker.try_admit_pd(2, 3));
+        assert_eq!(worker.pd_admitted(), 2);
+        // All-or-nothing: a refusal must leave the claim untouched.
+        assert!(!worker.try_admit_pd(2, 3));
+        assert_eq!(worker.pd_admitted(), 2);
+        assert!(worker.try_admit_pd(1, 3));
+        assert_eq!(worker.pd_admitted(), 3);
+
+        worker.release_pd(3);
+        assert_eq!(worker.pd_admitted(), 0);
+        // Releases saturate rather than wrapping to usize::MAX.
+        worker.release_pd(1);
+        assert_eq!(worker.pd_admitted(), 0);
+    }
+
+    #[test]
+    fn test_pd_admission_never_overshoots_the_window_under_real_parallelism() {
+        use std::{sync::Arc, thread};
+
+        use crate::worker::BasicWorkerBuilder;
+        // The whole point of claiming rather than reading: threads racing for
+        // the last rooms must not all win.
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://w:30000").build());
+        let window = 8;
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let worker = Arc::clone(&worker);
+                thread::spawn(move || worker.try_admit_pd(1, window))
+            })
+            .collect();
+
+        let admitted = threads
+            .into_iter()
+            .map(|handle| handle.join().expect("claim thread"))
+            .filter(|claimed| *claimed)
+            .count();
+
+        assert_eq!(admitted, window, "exactly the window's worth may claim");
+        assert_eq!(worker.pd_admitted(), window);
     }
 
     #[test]
@@ -2695,10 +2924,12 @@ mod tests {
     #[test]
     fn test_worker_metadata_empty_models_accepts_all() {
         let metadata = WorkerMetadata {
+            pd_pairing: PdPairing::derive(&WorkerSpec::new("http://test:8080")),
             spec: Arc::new(WorkerSpec::new("http://test:8080")),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
             overload: OverloadThresholds::default(),
+            http2: false,
         };
 
         // Empty models list should accept any model
@@ -2719,10 +2950,12 @@ mod tests {
         let mut spec = WorkerSpec::new("http://test:8080");
         spec.models = WorkerModels::from(vec![model1, model2]);
         let metadata = WorkerMetadata {
+            pd_pairing: PdPairing::derive(&spec),
             spec: Arc::new(spec),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
             overload: OverloadThresholds::default(),
+            http2: false,
         };
 
         // Find by primary ID

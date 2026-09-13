@@ -145,7 +145,7 @@ pub(super) async fn execute_tool_loop(
     params: &ResponsesCallContext,
     mcp_servers: Vec<McpServerBinding>,
 ) -> Result<ResponsesResponse, Response> {
-    let mut state = ToolLoopState::new(original_request.input.clone());
+    let mut state = ToolLoopState::new(original_request);
 
     // Configuration: max iterations as safety limit
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);

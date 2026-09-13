@@ -1040,7 +1040,7 @@ fn test_validate_input_items_structure() {
         input: ResponseInput::Items(vec![ResponseInputOutputItem::FunctionCallOutput {
             id: None,
             call_id: "call_123".to_string(),
-            output: "result".to_string(),
+            output: "result".to_string().into(),
             status: None,
         }]),
         ..Default::default()

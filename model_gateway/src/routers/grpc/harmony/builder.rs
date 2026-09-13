@@ -28,7 +28,10 @@ use serde_json::json;
 use tracing::{debug, trace, warn};
 
 use super::types::HarmonyBuildOutput;
-use crate::routers::grpc::{proto_wrapper::ProtoOutputLogProbs, utils};
+use crate::routers::grpc::{
+    common::responses::utils::extract_tools_from_response_tools,
+    proto_wrapper::ProtoOutputLogProbs, utils,
+};
 
 /// Global Harmony encoding (lazy-initialized)
 static HARMONY_ENCODING: OnceLock<HarmonyEncoding> = OnceLock::new();
@@ -150,6 +153,11 @@ trait ToolLike {
 
     /// Convert to ToolDescription
     fn to_tool_description(&self) -> Option<ToolDescription>;
+
+    /// Expand grouped tools into individual model-visible declarations.
+    fn to_tool_descriptions(&self) -> Vec<ToolDescription> {
+        self.to_tool_description().into_iter().collect()
+    }
 }
 
 /// Implement ToolLike for Chat Completion Tool
@@ -193,8 +201,21 @@ impl ToolLike for ResponseTool {
         // dispatch. See [`BUILTIN_TOOLS`] above.
         matches!(
             self,
-            ResponseTool::Function(_) | ResponseTool::ImageGeneration(_)
+            ResponseTool::Function(_)
+                | ResponseTool::Namespace(_)
+                | ResponseTool::ImageGeneration(_)
         )
+    }
+
+    fn to_tool_descriptions(&self) -> Vec<ToolDescription> {
+        if matches!(self, ResponseTool::Namespace(_)) {
+            extract_tools_from_response_tools(Some(std::slice::from_ref(self)))
+                .iter()
+                .filter_map(ToolLike::to_tool_description)
+                .collect()
+        } else {
+            self.to_tool_description().into_iter().collect()
+        }
     }
 
     fn to_tool_description(&self) -> Option<ToolDescription> {
@@ -286,6 +307,26 @@ fn has_custom_tools(tool_types: &[&str]) -> bool {
 /// registration).
 pub(crate) struct HarmonyBuilder;
 
+/// Harmony knows only low/medium/high; the outer OpenAI tiers clamp inward.
+fn harmony_reasoning_effort(effort: ResponsesReasoningEffort) -> ReasoningEffort {
+    match effort {
+        ResponsesReasoningEffort::None
+        | ResponsesReasoningEffort::Minimal
+        | ResponsesReasoningEffort::Low => ReasoningEffort::Low,
+        ResponsesReasoningEffort::Medium => ReasoningEffort::Medium,
+        ResponsesReasoningEffort::High
+        | ResponsesReasoningEffort::Xhigh
+        | ResponsesReasoningEffort::Max => ReasoningEffort::High,
+    }
+}
+
+/// Chat carries the tier as a free-form string; unknown values keep the
+/// medium default.
+fn harmony_reasoning_effort_from_str(effort: &str) -> ReasoningEffort {
+    ResponsesReasoningEffort::parse(effort)
+        .map_or(ReasoningEffort::Medium, harmony_reasoning_effort)
+}
+
 impl HarmonyBuilder {
     /// Create a new Harmony builder
     pub fn new() -> Self {
@@ -305,6 +346,7 @@ impl HarmonyBuilder {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<HarmonyBuildOutput, String> {
+        utils::validate_chat_content_parts(&request.messages)?;
         reject_chat_audio(&request.messages)?;
         let encoding = try_harmony_encoding()?;
 
@@ -444,14 +486,7 @@ impl HarmonyBuilder {
         let reasoning_effort = request
             .reasoning_effort
             .as_deref()
-            .map(|effort| match effort {
-                "high" => ReasoningEffort::High,
-                "medium" => ReasoningEffort::Medium,
-                "low" => ReasoningEffort::Low,
-                // Harmony does not support minimal reasoning effort
-                "minimal" => ReasoningEffort::Low,
-                _ => ReasoningEffort::Medium,
-            });
+            .map(harmony_reasoning_effort_from_str);
 
         let has_tools = request.tools.is_some();
         self.build_system_message(reasoning_effort, has_tools)
@@ -470,13 +505,8 @@ impl HarmonyBuilder {
         let reasoning_effort = request
             .reasoning
             .as_ref()
-            .and_then(|r| r.effort.as_ref())
-            .map(|effort| match effort {
-                ResponsesReasoningEffort::High => ReasoningEffort::High,
-                ResponsesReasoningEffort::Medium => ReasoningEffort::Medium,
-                ResponsesReasoningEffort::Low => ReasoningEffort::Low,
-                ResponsesReasoningEffort::Minimal => ReasoningEffort::Low,
-            });
+            .and_then(|r| r.effort)
+            .map(harmony_reasoning_effort);
 
         self.build_system_message(reasoning_effort, with_custom_tools)
     }
@@ -530,7 +560,7 @@ impl HarmonyBuilder {
         let tool_descriptions: Vec<ToolDescription> = tools
             .iter()
             .filter(|t| t.is_custom())
-            .filter_map(|t| t.to_tool_description())
+            .flat_map(|t| t.to_tool_descriptions())
             .filter(|td| seen_names.insert(td.name.clone()))
             .collect();
 
@@ -734,10 +764,15 @@ impl HarmonyBuilder {
             // Function tool call (with optional output)
             ResponseInputOutputItem::FunctionToolCall {
                 name,
+                namespace,
                 arguments,
                 output,
                 ..
             } => {
+                let name = match namespace {
+                    Some(namespace) => format!("{namespace}.{name}"),
+                    None => name.clone(),
+                };
                 // If there's an output, this represents the tool result
                 // Otherwise, it's the tool call itself
                 if let Some(output_str) = output {
@@ -799,8 +834,12 @@ impl HarmonyBuilder {
                         ResponseInputOutputItem::FunctionToolCall {
                             call_id: item_call_id,
                             name,
+                            namespace,
                             ..
-                        } if item_call_id == call_id => Some(name.clone()),
+                        } if item_call_id == call_id => Some(match namespace {
+                            Some(namespace) => format!("{namespace}.{name}"),
+                            None => name.clone(),
+                        }),
                         _ => None,
                     })
                     .ok_or_else(|| format!("No function call found for call_id: {call_id}"))?;
@@ -815,7 +854,7 @@ impl HarmonyBuilder {
                     },
                     recipient: Some("assistant".to_string()),
                     content: vec![Content::Text(TextContent {
-                        text: output.clone(),
+                        text: output.to_text_only()?,
                     })],
                     channel: None,
                     content_type: None,
@@ -953,7 +992,7 @@ impl HarmonyBuilder {
 
         for msg in messages {
             match msg {
-                ChatMessage::System { content, name } => {
+                ChatMessage::System { content, name, .. } => {
                     // System messages stay as-is
                     let harmony_msg = HarmonyMessage {
                         author: Author {
@@ -1211,6 +1250,22 @@ mod tests {
     };
 
     use super::*;
+    use crate::routers::grpc::common::responses::utils::namespace_test_request;
+
+    #[test]
+    fn build_from_chat_rejects_unknown_content_parts_before_loading_encoding() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-oss-120b",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "vendor_media", "payload": "media_1"}]
+            }]
+        }))
+        .unwrap();
+        let error = HarmonyBuilder::new().build_from_chat(&request).unwrap_err();
+        assert!(error.contains("vendor_media"));
+        assert!(error.contains("gRPC"));
+    }
 
     #[test]
     fn chat_audio_is_explicitly_rejected() {
@@ -1444,5 +1499,49 @@ mod tests {
              function-tools namespace; found {occurrences} occurrences. \
              Decoded prompt:\n{decoded}",
         );
+    }
+
+    #[test]
+    fn harmony_effort_clamps_outer_openai_tiers_inward() {
+        use ResponsesReasoningEffort as Tier;
+
+        for (tier, expected) in [
+            (Tier::None, ReasoningEffort::Low),
+            (Tier::Minimal, ReasoningEffort::Low),
+            (Tier::Low, ReasoningEffort::Low),
+            (Tier::Medium, ReasoningEffort::Medium),
+            (Tier::High, ReasoningEffort::High),
+            (Tier::Xhigh, ReasoningEffort::High),
+            (Tier::Max, ReasoningEffort::High),
+        ] {
+            assert_eq!(harmony_reasoning_effort(tier), expected, "{tier:?}");
+            assert_eq!(
+                harmony_reasoning_effort_from_str(tier.as_str()),
+                expected,
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn harmony_effort_from_unknown_string_stays_medium() {
+        assert_eq!(
+            harmony_reasoning_effort_from_str("bogus"),
+            ReasoningEffort::Medium
+        );
+    }
+    #[test]
+    fn namespace_only_request_advertises_qualified_functions() {
+        let request: ResponsesRequest = namespace_test_request();
+        let output = HarmonyBuilder::new()
+            .build_from_responses(&request)
+            .unwrap();
+        let decoded = try_harmony_encoding()
+            .unwrap()
+            .tokenizer()
+            .decode_utf8(&output.input_ids)
+            .unwrap();
+        assert!(decoded.contains("type weather.lookup = ("), "{decoded}");
+        assert!(decoded.contains("type travel.lookup = ("), "{decoded}");
     }
 }

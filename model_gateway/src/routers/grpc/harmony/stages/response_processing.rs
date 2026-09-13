@@ -10,23 +10,17 @@ use super::super::{HarmonyResponseProcessor, HarmonyStreamingProcessor};
 use crate::routers::{
     error,
     grpc::{
-        common::stages::{helpers, PipelineStage, RateLimitCell},
-        context::{FinalResponse, RequestContext, RequestType},
+        common::stages::{helpers, ProcessStage, RateLimitCell},
+        context::{DispatchContext, FinalResponse},
+        spec::{HarmonyResponseSpec, ResponseSpec},
     },
 };
-
-/// String `stop` sequences the ROUTER must enforce, as reported by the
-/// backend client during request building (its residual obligation: strings
-/// the engine will never match). Empty for engines that match server-side —
-/// no transport inspection here.
-fn router_stop_strings(ctx: &RequestContext) -> Vec<String> {
-    ctx.state.response.router_stop_obligations.clone()
-}
 
 /// Harmony Response Processing stage: Parse and format Harmony responses
 ///
 /// Takes output tokens from execution and parses them using HarmonyParserAdapter
 /// to extract analysis, tool calls, and final response text from Harmony channels.
+/// The Harmony spec owns its request handle — the one deliberate post-build reader.
 pub(crate) struct HarmonyResponseProcessingStage {
     processor: HarmonyResponseProcessor,
     streaming_processor: Arc<HarmonyStreamingProcessor>,
@@ -49,27 +43,46 @@ impl Default for HarmonyResponseProcessingStage {
 }
 
 #[async_trait]
-impl PipelineStage for HarmonyResponseProcessingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        let is_streaming = ctx.is_streaming();
+impl ProcessStage for HarmonyResponseProcessingStage {
+    async fn process(
+        &self,
+        ctx: &mut DispatchContext,
+        spec: ResponseSpec,
+    ) -> Result<Option<Response>, Response> {
+        let ResponseSpec::Harmony(harmony_spec) = spec else {
+            error!(
+                function = "HarmonyResponseProcessingStage::process",
+                "Wrong response spec"
+            );
+            return Err(error::internal_error(
+                "wrong_response_spec",
+                "Wrong response spec",
+            ));
+        };
 
-        // Check request type to determine which processor method to call
-        match &ctx.input.request_type {
-            RequestType::Chat(_) => {
+        let is_streaming = ctx.streaming;
+
+        // String `stop` sequences the ROUTER must enforce, as reported by the
+        // backend client during request building (its residual obligation:
+        // strings the engine will never match). Empty for engines that match
+        // server-side.
+        let router_stops = ctx.response.router_stop_obligations.clone();
+
+        match harmony_spec {
+            HarmonyResponseSpec::Chat(chat_request) => {
                 // Get execution result (output tokens from model)
-                let execution_result =
-                    ctx.state.response.execution_result.take().ok_or_else(|| {
-                        error!(
-                            function = "HarmonyResponseProcessingStage::execute",
-                            request_type = "Chat",
-                            "No execution result available"
-                        );
-                        error::internal_error("no_execution_result", "No execution result")
-                    })?;
-
-                let dispatch = ctx.state.dispatch.as_ref().cloned().ok_or_else(|| {
+                let execution_result = ctx.response.execution_result.take().ok_or_else(|| {
                     error!(
-                        function = "HarmonyResponseProcessingStage::execute",
+                        function = "HarmonyResponseProcessingStage::process",
+                        request_type = "Chat",
+                        "No execution result available"
+                    );
+                    error::internal_error("no_execution_result", "No execution result")
+                })?;
+
+                let dispatch = ctx.dispatch.as_ref().cloned().ok_or_else(|| {
+                    error!(
+                        function = "HarmonyResponseProcessingStage::process",
                         request_type = "Chat",
                         "Dispatch metadata not set"
                     );
@@ -84,7 +97,6 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                     // ReservationAttachment's Drop below on early
                     // disconnect/error.
                     let reservation = ctx
-                        .input
                         .rate_limit_cell
                         .as_deref()
                         .and_then(RateLimitCell::take_for_streaming_handoff);
@@ -94,9 +106,9 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                         .clone()
                         .process_streaming_chat_response(
                             execution_result,
-                            ctx.chat_request_arc(),
+                            chat_request,
                             dispatch,
-                            router_stop_strings(ctx),
+                            router_stops,
                             reservation.clone(),
                         )
                         .await;
@@ -106,7 +118,7 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                     // proper RAII lifecycle.
                     let response = helpers::attach_response_guards(
                         response,
-                        ctx.state.load_guards.take(),
+                        ctx.load_guards.take(),
                         reservation,
                     );
 
@@ -114,22 +126,20 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                 }
 
                 // For non-streaming, delegate to Harmony response processor to build ChatCompletionResponse
-                let chat_request = ctx.chat_request_arc();
-                let stops = router_stop_strings(ctx);
                 let response = self
                     .processor
                     .process_non_streaming_chat_response(
                         execution_result,
                         chat_request,
                         dispatch,
-                        &stops,
+                        &router_stops,
                     )
                     .await?;
 
-                ctx.state.response.final_response = Some(FinalResponse::Chat(response));
+                ctx.response.final_response = Some(FinalResponse::Chat(response));
                 Ok(None)
             }
-            RequestType::Responses(_) => {
+            HarmonyResponseSpec::Responses(responses_request) => {
                 // For streaming Responses API, leave execution_result in context
                 // for external streaming processor (serve_harmony_responses_stream)
                 if is_streaming {
@@ -138,48 +148,31 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                 }
 
                 // For non-streaming, process normally
-                let execution_result =
-                    ctx.state.response.execution_result.take().ok_or_else(|| {
-                        error!(
-                            function = "HarmonyResponseProcessingStage::execute",
-                            request_type = "Responses",
-                            "No execution result available"
-                        );
-                        error::internal_error("no_execution_result", "No execution result")
-                    })?;
-
-                let dispatch = ctx.state.dispatch.as_ref().cloned().ok_or_else(|| {
+                let execution_result = ctx.response.execution_result.take().ok_or_else(|| {
                     error!(
-                        function = "HarmonyResponseProcessingStage::execute",
+                        function = "HarmonyResponseProcessingStage::process",
+                        request_type = "Responses",
+                        "No execution result available"
+                    );
+                    error::internal_error("no_execution_result", "No execution result")
+                })?;
+
+                let dispatch = ctx.dispatch.as_ref().cloned().ok_or_else(|| {
+                    error!(
+                        function = "HarmonyResponseProcessingStage::process",
                         request_type = "Responses",
                         "Dispatch metadata not set"
                     );
                     error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
                 })?;
 
-                let responses_request = ctx.responses_request_arc();
                 let iteration_result = self
                     .processor
                     .process_responses_iteration(execution_result, responses_request, dispatch)
                     .await?;
 
-                ctx.state.response.responses_iteration_result = Some(iteration_result);
+                ctx.response.responses_iteration_result = Some(iteration_result);
                 Ok(None)
-            }
-            request_type @ (RequestType::Generate(_)
-            | RequestType::Completion(_)
-            | RequestType::Embedding(_)
-            | RequestType::Classify(_)
-            | RequestType::Messages(_)) => {
-                error!(
-                    function = "HarmonyResponseProcessingStage::execute",
-                    request_type = %request_type,
-                    "{request_type} request type not supported in Harmony pipeline"
-                );
-                Err(error::internal_error(
-                    "not_supported_in_harmony",
-                    format!("{request_type} requests not supported in Harmony pipeline"),
-                ))
             }
         }
     }

@@ -121,6 +121,8 @@ pub struct ResponsesFunctionToolChoice {
     #[serde(rename = "type")]
     pub tool_type: FunctionToolChoiceTag,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for ResponsesFunctionToolChoice {
@@ -141,6 +143,8 @@ impl<'de> Deserialize<'de> for ResponsesFunctionToolChoice {
             name: Option<String>,
             #[serde(default)]
             function: Option<FunctionChoice>,
+            #[serde(default)]
+            namespace: Option<String>,
         }
 
         let helper = Helper::deserialize(deserializer)?;
@@ -155,6 +159,7 @@ impl<'de> Deserialize<'de> for ResponsesFunctionToolChoice {
         Ok(Self {
             tool_type: helper.tool_type,
             name,
+            namespace: helper.namespace,
         })
     }
 }
@@ -312,7 +317,10 @@ impl ResponsesToolChoice {
             Self::Function(payload) => ChatToolChoice::Function {
                 tool_type: "function".to_string(),
                 function: FunctionChoice {
-                    name: payload.name.clone(),
+                    name: match &payload.namespace {
+                        Some(namespace) => format!("{namespace}.{}", payload.name),
+                        None => payload.name.clone(),
+                    },
                 },
             },
             Self::AllowedTools { mode, tools, .. } => ChatToolChoice::AllowedTools {
@@ -1184,6 +1192,8 @@ pub struct WebSearchPreviewTool {
 #[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WebSearchTool {
+    /// Whether the tool may fetch live external sources rather than cached results.
+    pub external_web_access: Option<bool>,
     /// Optional domain allowlist applied to candidate sources.
     pub filters: Option<WebSearchFilters>,
     /// Search-result context token budget. Spec enum: `"default" | "unlimited"`.
@@ -1528,13 +1538,47 @@ fn default_reasoning_effort() -> Option<ReasoningEffort> {
     Some(ReasoningEffort::Medium)
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+/// OpenAI `reasoning.effort` tiers, lowest to highest. `none` turns reasoning
+/// off; it is distinct from an absent field, which defaults to `medium`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    None,
     Minimal,
     Low,
     Medium,
     High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    /// The wire value, which is also the Chat `reasoning_effort` string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// Parse a wire value; `None` for anything outside the OpenAI tiers.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1555,6 +1599,35 @@ pub enum ReasoningSummary {
 pub enum StringOrContentParts {
     String(String),
     Array(Vec<ResponseContentPart>),
+}
+
+impl StringOrContentParts {
+    /// Project tool output into a text-only backend without silently losing media.
+    pub fn to_text_only(&self) -> Result<String, String> {
+        match self {
+            Self::String(text) => Ok(text.clone()),
+            Self::Array(parts) => {
+                let mut text = String::new();
+                for part in parts {
+                    match part {
+                        ResponseContentPart::InputText { text: part }
+                        | ResponseContentPart::OutputText { text: part, .. } => text.push_str(part),
+                        _ => return Err(
+                            "Multimodal function output is not supported by this text-only backend"
+                                .to_string(),
+                        ),
+                    }
+                }
+                Ok(text)
+            }
+        }
+    }
+}
+
+impl From<String> for StringOrContentParts {
+    fn from(text: String) -> Self {
+        Self::String(text)
+    }
 }
 
 /// Phase label for assistant messages in the Responses API.
@@ -1610,6 +1683,8 @@ pub enum ResponseInputOutputItem {
         id: Option<String>,
         call_id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
         arguments: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<String>,
@@ -1621,7 +1696,7 @@ pub enum ResponseInputOutputItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         call_id: String,
-        output: String,
+        output: StringOrContentParts,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
@@ -2220,6 +2295,8 @@ pub enum ResponseOutputItem {
         id: Option<String>,
         call_id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
         arguments: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
@@ -3313,12 +3390,21 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
 
     // Validate tool references exist
     match tool_choice {
-        ResponsesToolChoice::Function(_) => {
+        ResponsesToolChoice::Function(choice) => {
             // Accessor goes through `function_name()` so we stay agnostic to
             // the underlying wire shape (flat vs. legacy nested) — both are
             // normalized at deserialize time.
             if let Some(name) = tool_choice.function_name() {
-                if !function_tool_names.contains(&name) {
+                let found = tools.iter().any(|tool| match (tool, choice.namespace.as_deref()) {
+                    (ResponseTool::Function(function), None) => function.function.name == name,
+                    (ResponseTool::Namespace(namespace), Some(selected_namespace)) => {
+                        namespace.name == selected_namespace && namespace.tools.iter().any(|member| {
+                            matches!(member, NamespaceTool::Function(function) if function.function.name == name)
+                        })
+                    }
+                    _ => false,
+                });
+                if !found {
                     let mut e = ValidationError::new("tool_choice_function_not_found");
                     e.message = Some(
                         format!(
@@ -3487,13 +3573,7 @@ fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), ValidationE
         ResponseInputOutputItem::Reasoning { .. } => {
             // Reasoning content can be empty - no validation needed
         }
-        ResponseInputOutputItem::FunctionCallOutput { output, .. } => {
-            if output.is_empty() {
-                let mut e = ValidationError::new("function_output_empty");
-                e.message = Some("Function call output cannot be empty".into());
-                return Err(e);
-            }
-        }
+        ResponseInputOutputItem::FunctionCallOutput { .. } => {}
         ResponseInputOutputItem::FunctionToolCall { .. } => {}
         ResponseInputOutputItem::McpApprovalRequest { .. } => {}
         ResponseInputOutputItem::McpApprovalResponse { .. } => {}
@@ -3927,6 +4007,7 @@ impl ResponseOutputItem {
             id: Some(id),
             call_id,
             name,
+            namespace: None,
             arguments,
             output,
             status,
@@ -3974,5 +4055,44 @@ mod tests {
             let serde_tag = serialized.get("type").and_then(|v| v.as_str()).unwrap();
             assert_eq!(tool.as_str(), serde_tag);
         }
+    }
+
+    const REASONING_EFFORT_TIERS: [ReasoningEffort; 7] = [
+        ReasoningEffort::None,
+        ReasoningEffort::Minimal,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::Xhigh,
+        ReasoningEffort::Max,
+    ];
+
+    /// `as_str`/`parse` must agree with the serde tag: the Chat pipeline
+    /// receives the string form, and drift would change a tier in transit.
+    #[test]
+    fn reasoning_effort_str_forms_match_serde_tag() {
+        for effort in REASONING_EFFORT_TIERS {
+            let tag = serde_json::to_value(effort).unwrap();
+            assert_eq!(tag, Value::String(effort.as_str().to_string()));
+            assert_eq!(ReasoningEffort::parse(effort.as_str()), Some(effort));
+            assert_eq!(
+                serde_json::from_value::<ReasoningEffort>(tag).unwrap(),
+                effort
+            );
+        }
+        assert_eq!(ReasoningEffort::parse("bogus"), None);
+    }
+
+    /// Every OpenAI tier deserializes inside `reasoning`; an absent effort
+    /// still defaults to medium.
+    #[test]
+    fn reasoning_param_accepts_every_openai_tier() {
+        for tier in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            let param: ResponseReasoningParam =
+                serde_json::from_value(serde_json::json!({ "effort": tier })).unwrap();
+            assert_eq!(param.effort.map(ReasoningEffort::as_str), Some(tier));
+        }
+        let param: ResponseReasoningParam = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(param.effort, Some(ReasoningEffort::Medium));
     }
 }

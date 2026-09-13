@@ -781,7 +781,15 @@ async fn same_url_pod_replacement_reregisters_with_new_uid() {
     let app_context = test_context().await;
     let (_engine, port) = start_mock_engine().await;
 
-    fake.apply_pod(worker_pod("stable-0", "uid-gen1", &port.to_string(), true));
+    let mut first = worker_pod("stable-0", "uid-gen1", &port.to_string(), true);
+    first.metadata.annotations.as_mut().unwrap().extend([
+        (
+            "smg.ai/kv-connector".to_string(),
+            "NixlConnector".to_string(),
+        ),
+        ("smg.ai/kv-engine-id".to_string(), "engine-gen1".to_string()),
+    ]);
+    fake.apply_pod(first);
     let handle = start_service_discovery_with_client(
         fake.client(),
         discovery_config(),
@@ -796,12 +804,38 @@ async fn same_url_pod_replacement_reregisters_with_new_uid() {
         "first generation registered",
     )
     .await;
+    let first = app_context.worker_registry.get_all().pop().unwrap();
+    assert_eq!(
+        first.metadata().spec.kv_connector.as_deref(),
+        Some("NixlConnector")
+    );
+    assert_eq!(
+        first.metadata().spec.kv_engine_id.as_deref(),
+        Some("engine-gen1")
+    );
 
     // Stable-IP restart: same name and URL, new uid.
     fake.delete_pod("stable-0");
-    fake.apply_pod(worker_pod("stable-0", "uid-gen2", &port.to_string(), true));
+    let mut replacement = worker_pod("stable-0", "uid-gen2", &port.to_string(), true);
+    replacement.metadata.annotations.as_mut().unwrap().extend([
+        (
+            "smg.ai/kv-connector".to_string(),
+            "MooncakeConnector".to_string(),
+        ),
+        ("smg.ai/kv-engine-id".to_string(), "engine-gen2".to_string()),
+    ]);
+    fake.apply_pod(replacement);
 
     wait_for_pod_uid(&app_context, port, "uid-gen2", "replacement re-registered").await;
+    let replacement = app_context.worker_registry.get_all().pop().unwrap();
+    assert_eq!(
+        replacement.metadata().spec.kv_connector.as_deref(),
+        Some("MooncakeConnector")
+    );
+    assert_eq!(
+        replacement.metadata().spec.kv_engine_id.as_deref(),
+        Some("engine-gen2")
+    );
 
     handle.abort();
 }

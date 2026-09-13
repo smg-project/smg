@@ -43,8 +43,8 @@ class BenchmarkResult:
             self.output_throughput_mean,
         )
 
-    def validate(self, thresholds: dict) -> None:
-        """Validate metrics against thresholds."""
+    def threshold_misses(self, thresholds: dict) -> list[str]:
+        """Return one line per metric outside its threshold; empty when all pass."""
         checks = [
             ("ttft_mean_max", self.ttft_mean, "<=", "TTFT"),
             ("e2e_latency_mean_max", self.e2e_latency_mean, "<=", "E2E latency"),
@@ -61,14 +61,16 @@ class BenchmarkResult:
                 "Output throughput",
             ),
         ]
+        misses: list[str] = []
         for key, value, op, name in checks:
             if key not in thresholds:
                 continue
             threshold = thresholds[key]
             if op == "<=" and value > threshold:
-                raise AssertionError(f"{name}: {value:.2f} > {threshold}")
+                misses.append(f"{name}: {value:.2f} > {threshold}")
             if op == ">=" and value < threshold:
-                raise AssertionError(f"{name}: {value:.2f} < {threshold}")
+                misses.append(f"{name}: {value:.2f} < {threshold}")
+        return misses
 
 
 @dataclass

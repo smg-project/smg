@@ -786,3 +786,35 @@ mod qwen_mapping_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod minimax_mapping_tests {
+    use crate::factory::ParserFactory;
+
+    #[test]
+    fn test_minimax_m3_model_mappings() {
+        let factory = ParserFactory::new();
+        let registry = factory.registry();
+
+        for model in [
+            "MiniMaxAI/MiniMax-M3",
+            "nvidia/MiniMax-M3-NVFP4",
+            "minimax-m3",
+            "mm-m3-chat",
+        ] {
+            assert_eq!(
+                registry.resolve_model_to_parser(model),
+                Some("minimax_m3".to_string()),
+                "{model} should resolve to minimax_m3"
+            );
+        }
+
+        for model in ["MiniMaxAI/MiniMax-M2", "MiniMax-M2", "minimax-text-01"] {
+            assert_eq!(
+                registry.resolve_model_to_parser(model),
+                Some("minimax_m2".to_string()),
+                "{model} should resolve to minimax_m2"
+            );
+        }
+    }
+}

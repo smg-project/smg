@@ -96,6 +96,141 @@ def kill_process_tree(pid: int, sig: int = signal.SIGTERM) -> None:
         logger.warning("Failed to kill process tree for PID %d: %s", pid, e)
 
 
+def live_process_group_members(pgid: int, proc_root: str = "/proc") -> list[int]:
+    """PIDs still running in ``pgid``, ignoring zombies that await reaping.
+
+    Reads ``proc_root`` (``/proc`` on Linux). Elsewhere it falls back to
+    probing the group with signal 0, which cannot tell a zombie from a live
+    process.
+    """
+    if not os.path.isdir(proc_root):
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return []
+        except PermissionError:
+            pass
+        return [pgid]
+    members: list[int] = []
+    for name in os.listdir(proc_root):
+        if not name.isdigit():
+            continue
+        try:
+            with open(
+                os.path.join(proc_root, name, "stat"), encoding="utf-8", errors="replace"
+            ) as f:
+                stat = f.read()
+        except OSError:
+            continue
+        # ``pid (comm) state ppid pgrp ...``: comm may contain spaces or
+        # parentheses, so split after the last closing parenthesis.
+        fields = stat.rpartition(")")[2].split()
+        if len(fields) < 3:
+            continue
+        state, pgrp = fields[0], fields[2]
+        if state != "Z" and pgrp == str(pgid):
+            members.append(int(name))
+    return members
+
+
+def wait_for_process_group_exit(pgid: int, timeout: float, kill_after: float) -> list[int]:
+    """Block until every live member of ``pgid`` has exited.
+
+    Sends SIGKILL to the whole group once ``kill_after`` seconds pass without
+    it emptying, then keeps waiting until ``timeout``. Returns the PIDs still
+    alive at the deadline (empty on success).
+    """
+    start = time.monotonic()
+    killed = False
+    while True:
+        members = live_process_group_members(pgid)
+        elapsed = time.monotonic() - start
+        if not members or elapsed >= timeout:
+            return members
+        if not killed and elapsed >= kill_after:
+            logger.warning(
+                "Process group %d still has %s alive after %.0fs; sending SIGKILL",
+                pgid,
+                members,
+                elapsed,
+            )
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            killed = True
+        time.sleep(0.2)
+
+
+def gpu_memory_used_mib(gpu_ids: list[int]) -> dict[int, int] | None:
+    """Used memory per GPU index via ``nvidia-smi``; ``None`` when unavailable."""
+    if not gpu_ids:
+        return {}
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used",
+                "--format=csv,noheader,nounits",
+                "-i",
+                ",".join(str(g) for g in gpu_ids),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    used: dict[int, int] = {}
+    for line in out.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            used[int(parts[0])] = int(parts[1])
+        except ValueError:
+            continue
+    return used
+
+
+def wait_for_gpu_memory_release(
+    gpu_ids: list[int],
+    baseline: dict[int, int],
+    timeout: float,
+    slack_mib: int = 2048,
+) -> dict[int, int] | None:
+    """Wait until each GPU's used memory is back within ``slack_mib`` of ``baseline``.
+
+    An engine's child processes release their CUDA contexts after the launcher
+    exits; a replacement started on the same GPU before that reads the old
+    allocation as its own shortfall and dies on its startup memory check.
+    Returns the GPUs still above the threshold (empty on success), or ``None``
+    when ``nvidia-smi`` is unavailable. Gives up before ``timeout`` once that
+    set has held the same values for 5 s: a region another live process still
+    maps never drains, so a static figure is the answer, not a wait.
+    """
+    deadline = time.monotonic() + timeout
+    last_over: dict[int, int] | None = None
+    last_change = time.monotonic()
+    while True:
+        used = gpu_memory_used_mib(gpu_ids)
+        if used is None:
+            return None
+        over = {gpu: mib for gpu, mib in used.items() if mib > baseline.get(gpu, 0) + slack_mib}
+        now = time.monotonic()
+        if not over or now >= deadline:
+            return over
+        # A region that another live process still maps (a decode holding a
+        # dead prefill's KV) never drains; a teardown in progress shrinks the
+        # figure every second. Give up once it has sat still for 5 s.
+        if over != last_over:
+            last_over, last_change = over, now
+        elif now - last_change >= 5.0:
+            return over
+        time.sleep(0.5)
+
+
 def terminate_process(proc: subprocess.Popen, timeout: float = 30) -> None:
     """Gracefully terminate a process, kill if needed.
 

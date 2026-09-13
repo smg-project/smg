@@ -73,7 +73,7 @@ fn configured_endpoint(
         .keep_alive_while_idle(true)
         .tcp_keepalive(Some(Duration::from_secs(60)))
         .tcp_nodelay(true)
-        .http2_adaptive_window(true)
+        .http2_adaptive_window(false)
         // 16MB stream window, 32MB connection window — sized for the
         // typical inference response (multi-MB tokenized payloads +
         // streaming chunks) without head-of-line blocking.

@@ -259,7 +259,7 @@ mod tests {
     use super::*;
     use crate::{
         app_context::AppContext, config::RouterConfig, health::ProbeState,
-        policies::PolicyRegistry, routers::router_manager::RouterManager, worker::WorkerRegistry,
+        policies::PolicyRegistry, routers::gateway::Gateway, worker::WorkerRegistry,
     };
 
     fn test_app_state(
@@ -288,14 +288,11 @@ mod tests {
                 .unwrap(),
         );
         Arc::new(AppState {
-            router: Arc::new(RouterManager::new(
-                context.worker_registry.clone(),
-                context.client.clone(),
-            )),
+            router: Arc::new(Gateway::new(context.worker_registry.clone())),
             probe_state: ProbeState::new(context.inflight_tracker.clone()),
             context,
             admission_queue,
-            router_manager: None,
+            gateway: None,
             mesh_handler: None,
             mesh_adapters: None,
         })

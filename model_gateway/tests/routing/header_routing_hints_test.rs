@@ -290,7 +290,13 @@ mod header_routing_hints_tests {
             );
         }
 
-        // A different hinted prefix is free to learn its own worker.
+        // A different hinted prefix is free to learn its own worker. An
+        // unseen prefix has zero overlap with every worker, and equal-score
+        // ties break RANDOMLY by design (anti-herding), so with all loads
+        // equal this pick would land back on `first` one time in three. Give
+        // the first prefix's worker real load so "goes to min-load" is a
+        // deterministic claim instead of a coin flip.
+        workers[first].increment_load();
         let other: Vec<u32> = (500u32..532).collect();
         let other_info = SelectWorkerInfo {
             tokens: Some(&other),

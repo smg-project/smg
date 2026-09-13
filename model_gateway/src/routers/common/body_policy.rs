@@ -22,6 +22,7 @@ pub(crate) enum BodyPath {
 pub(crate) const BODY_PATH_STREAMED: &str = "streamed";
 pub(crate) const BODY_PATH_BUFFERED: &str = "buffered";
 
+pub(crate) const REASON_ROUTING_KEY_OVERRIDE: &str = "routing_key_override";
 pub(crate) const REASON_POLICY_NEEDS_TEXT: &str = "policy_needs_text";
 pub(crate) const REASON_MODEL_AMBIGUOUS: &str = "model_ambiguous";
 pub(crate) const REASON_WORKER_MUTATES_BODY: &str = "worker_mutates_body";
@@ -35,6 +36,7 @@ pub(crate) const REASON_PURE_FORWARD: &str = "pure_forward";
 
 /// Per-request inputs, gathered by the caller before the body arrives.
 pub(crate) struct BodyPathInputs {
+    pub routing_key_override: bool,
     pub policy_needs_text: bool,
     pub model_ambiguous: bool,
     pub worker_mutates_body: bool,
@@ -45,14 +47,18 @@ pub(crate) struct BodyPathInputs {
 }
 
 /// Decide the request body path before the body arrives. Buffer when
-/// something must read the body here: a text-routing policy without a valid
-/// hint-header waiver, a registry serving more than one model (content-blind
-/// selection could land the request on the wrong model's worker), a
-/// body-mutating worker, a WASM request hook, or a missing/invalid
-/// Content-Length. Otherwise, with router retries enabled, buffer up to
+/// something must read the body here: routing-key override (body `rid` wins
+/// over any header key), a text-routing policy without a valid hint-header
+/// waiver, a registry serving more than one model (content-blind selection
+/// could land the request on the wrong model's worker), a body-mutating
+/// worker, a WASM request hook, or a missing/invalid Content-Length.
+/// Otherwise, with router retries enabled, buffer up to
 /// `max_buffered_request_bytes` to keep the request replayable — a larger
 /// body streams and forfeits router retries. Otherwise stream, at any size.
 pub(crate) fn decide_body_path(inputs: &BodyPathInputs) -> BodyPath {
+    if inputs.routing_key_override {
+        return BodyPath::Buffer(REASON_ROUTING_KEY_OVERRIDE);
+    }
     if inputs.policy_needs_text {
         return BodyPath::Buffer(REASON_POLICY_NEEDS_TEXT);
     }
@@ -83,6 +89,7 @@ mod tests {
 
     fn eligible(content_length: u64) -> BodyPathInputs {
         BodyPathInputs {
+            routing_key_override: false,
             policy_needs_text: false,
             model_ambiguous: false,
             worker_mutates_body: false,
@@ -96,6 +103,7 @@ mod tests {
     #[test]
     fn hard_buffer_reasons_apply_in_first_match_order() {
         let all = BodyPathInputs {
+            routing_key_override: true,
             policy_needs_text: true,
             model_ambiguous: true,
             worker_mutates_body: true,
@@ -105,10 +113,17 @@ mod tests {
         };
         assert_eq!(
             decide_body_path(&all),
-            BodyPath::Buffer(REASON_POLICY_NEEDS_TEXT)
+            BodyPath::Buffer(REASON_ROUTING_KEY_OVERRIDE)
         );
 
         for (inputs, reason) in [
+            (
+                BodyPathInputs {
+                    routing_key_override: true,
+                    ..eligible(64)
+                },
+                REASON_ROUTING_KEY_OVERRIDE,
+            ),
             (
                 BodyPathInputs {
                     policy_needs_text: true,

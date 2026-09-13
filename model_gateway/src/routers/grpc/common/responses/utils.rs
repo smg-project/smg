@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::response::Response;
 use openai_protocol::{
     common::Tool,
-    responses::{ResponseTool, ResponsesRequest, ResponsesResponse},
+    responses::{NamespaceTool, ResponseTool, ResponsesRequest, ResponsesResponse},
 };
 use serde_json::to_value;
 use smg_data_connector::{
@@ -135,14 +135,72 @@ pub(crate) fn extract_tools_from_response_tools(
 
     tools
         .iter()
-        .filter_map(|rt| match rt {
-            ResponseTool::Function(ft) => Some(Tool {
+        .flat_map(|tool| match tool {
+            ResponseTool::Function(ft) => vec![Tool {
                 tool_type: "function".to_string(),
                 function: ft.function.clone(),
-            }),
-            _ => None,
+            }],
+            ResponseTool::Namespace(namespace) => namespace
+                .tools
+                .iter()
+                .filter_map(|member| {
+                    let NamespaceTool::Function(ft) = member else {
+                        return None;
+                    };
+                    let mut function = ft.function.clone();
+                    function.name = format!("{}.{}", namespace.name, function.name);
+                    Some(Tool {
+                        tool_type: "function".to_string(),
+                        function,
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
         })
         .collect()
+}
+
+/// Recover structured identity only for a declared namespace member.
+/// Literal top-level names (including dots) take precedence over namespace matches.
+pub(crate) fn resolve_function_identity(
+    tools: Option<&[ResponseTool]>,
+    name: &str,
+) -> (String, Option<String>) {
+    let tools = tools.unwrap_or_default();
+    if !tools
+        .iter()
+        .any(|tool| matches!(tool, ResponseTool::Function(ft) if ft.function.name == name))
+    {
+        for tool in tools {
+            if let ResponseTool::Namespace(namespace) = tool {
+                for member in &namespace.tools {
+                    if let NamespaceTool::Function(ft) = member {
+                        if name == format!("{}.{}", namespace.name, ft.function.name) {
+                            return (ft.function.name.clone(), Some(namespace.name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (name.to_string(), None)
+}
+
+/// Synthetic same-name members used by namespace routing regression tests.
+#[cfg(test)]
+pub(crate) fn namespace_test_request() -> ResponsesRequest {
+    serde_json::from_value(serde_json::json!({
+        "model": "test-model",
+        "input": "Check the weather",
+        "tools": [
+            {"type": "namespace", "name": "weather", "description": "Weather tools", "tools": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object", "properties": {}}}
+            ]},
+            {"type": "namespace", "name": "travel", "description": "Travel tools", "tools": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object", "properties": {}}}
+            ]}
+        ]
+    })).unwrap()
 }
 
 /// Persist response to storage if store=true
@@ -220,5 +278,39 @@ mod tests {
         let response = validate_worker_availability(&registry, "model-alias")
             .expect("alias must stop resolving with no workers behind it");
         assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+    }
+    #[test]
+    fn namespace_function_identity_roundtrips_and_preserves_literal_names() {
+        let mut request: ResponsesRequest = namespace_test_request();
+        let tools = extract_tools_from_response_tools(request.tools.as_deref());
+        assert_eq!(
+            tools
+                .iter()
+                .map(|t| t.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["weather.lookup", "travel.lookup"]
+        );
+        for namespace in ["weather", "travel"] {
+            assert_eq!(
+                resolve_function_identity(request.tools.as_deref(), &format!("{namespace}.lookup")),
+                ("lookup".into(), Some(namespace.into()))
+            );
+        }
+        for name in ["lookup", "unknown.lookup"] {
+            assert_eq!(
+                resolve_function_identity(request.tools.as_deref(), name),
+                (name.into(), None)
+            );
+        }
+        request.tools.as_mut().unwrap().push(
+            serde_json::from_value(
+                serde_json::json!({"type":"function","name":"weather.lookup","parameters":{}}),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            resolve_function_identity(request.tools.as_deref(), "weather.lookup"),
+            ("weather.lookup".into(), None)
+        );
     }
 }

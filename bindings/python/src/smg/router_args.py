@@ -136,7 +136,10 @@ class RouterArgs:
     health_check_interval_secs: int = 60
     health_check_endpoint: str = "/health"
     disable_health_check: bool = False
-    remove_unhealthy_workers: bool = False
+    # None = follow service_discovery: recovery works by removal + discovery
+    # re-registration, so it defaults on exactly when discovery can complete
+    # the loop (resolved by the Rust core).
+    remove_unhealthy_workers: bool | None = None
     # Circuit breaker configuration
     cb_failure_threshold: int = 10
     cb_success_threshold: int = 3
@@ -244,6 +247,16 @@ class RouterArgs:
     # Most bytes the router may buffer for a request it holds only to keep
     # it retryable; larger eligible requests stream and forfeit router retries
     max_buffered_request_bytes: int = 1048576
+    kv_connector_annotation: str = "smg.ai/kv-connector"
+    kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
+    # Per-request image-count limit replacing model spec limits; None keeps spec limits
+    mm_per_request_image_limit: int | None = None
+    # Seconds a PD dispatch waits for a slot in the decode engine's running
+    # window before shedding; 0 sheds immediately
+    pd_admission_wait_secs: int = 30
+    enable_rl: bool = False  # Mount the RL control plane under /v1/rl
+    rl_control_timeout_secs: int = 600  # Timeout for one proxied engine control call
+    rl_fanout_concurrency: int = 32  # Max concurrent engine calls in one fan-out
 
     @staticmethod
     def add_cli_args(
@@ -323,6 +336,9 @@ class RouterArgs:
         auth_group = parser.add_argument_group(
             "Control Plane Authentication", "API key and JWT/OIDC authentication"
         )
+        rl_group = parser.add_argument_group(
+            "RL Control Plane", "Worker discovery and engine-route passthrough for RL training"
+        )
 
         if use_router_prefix:
             parser.add_argument(
@@ -370,8 +386,8 @@ class RouterArgs:
             help=(
                 "Speak HTTP/2 to workers via prior knowledge (h2c on cleartext),"
                 " multiplexing every request to a worker over one connection."
-                " Requires every HTTP worker to serve HTTP/2 without an upgrade"
-                " handshake."
+                " Negotiated per worker at registration: a worker that does not"
+                " answer HTTP/2 stays on HTTP/1.1."
             ),
         )
         worker_group.add_argument(
@@ -722,6 +738,18 @@ class RouterArgs:
             ),
         )
         routing_group.add_argument(
+            f"--{prefix}pd-admission-wait-secs",
+            type=int,
+            default=RouterArgs.pd_admission_wait_secs,
+            help=(
+                "Seconds a prefill/decode dispatch waits for a free slot in"
+                " the decode engine's running window before shedding with 503"
+                " worker_overload_protection_shed. Keep it well under the"
+                " engine's bootstrap deadline. 0 sheds immediately; engines"
+                " that report no running window are never gated"
+            ),
+        )
+        routing_group.add_argument(
             f"--{prefix}stream-body-stall-timeout-secs",
             type=int,
             default=RouterArgs.stream_body_stall_timeout_secs,
@@ -767,6 +795,23 @@ class RouterArgs:
             f"--{prefix}enable-igw",
             action="store_true",
             help="Enable IGW (Inference-Gateway) mode for multi-model support",
+        )
+        rl_group.add_argument(
+            f"--{prefix}enable-rl",
+            action="store_true",
+            help="Mount the RL control plane under /v1/rl (discovery, passthrough, fan-out)",
+        )
+        rl_group.add_argument(
+            f"--{prefix}rl-control-timeout-secs",
+            type=int,
+            default=RouterArgs.rl_control_timeout_secs,
+            help="Total timeout for one proxied engine control call (default: 600)",
+        )
+        rl_group.add_argument(
+            f"--{prefix}rl-fanout-concurrency",
+            type=int,
+            default=RouterArgs.rl_fanout_concurrency,
+            help="Maximum concurrent engine calls in one fan-out (default: 32)",
         )
 
         # PD/EPD-specific arguments
@@ -874,6 +919,16 @@ class RouterArgs:
             default=RouterArgs.multimodal_shm_min_bytes,
             help="Minimum multimodal tensor size (bytes) before the SHM transport is used",
         )
+        parser.add_argument(
+            f"--{prefix}mm-per-request-image-limit",
+            type=int,
+            default=RouterArgs.mm_per_request_image_limit,
+            help=(
+                "Per-request image-count limit applied to every model, replacing the"
+                " model spec's built-in limit (e.g. to match the engine's"
+                " --limit-mm-per-prompt). Must be >= 1; unset keeps spec limits."
+            ),
+        )
 
         # Logging configuration
         logging_group.add_argument(
@@ -925,6 +980,18 @@ class RouterArgs:
                 "Kubernetes namespace to watch for pods. If not provided, watches all namespaces"
                 " (requires cluster-wide permissions)"
             ),
+        )
+        k8s_group.add_argument(
+            f"--{prefix}kv-connector-annotation",
+            type=str,
+            default=RouterArgs.kv_connector_annotation,
+            help="vLLM KV connector Pod annotation (default: smg.ai/kv-connector)",
+        )
+        k8s_group.add_argument(
+            f"--{prefix}kv-engine-id-annotation",
+            type=str,
+            default=RouterArgs.kv_engine_id_annotation,
+            help="Per-worker KV engine ID Pod annotation (default: smg.ai/kv-engine-id)",
         )
         k8s_group.add_argument(
             f"--{prefix}encode-selector",
@@ -1206,12 +1273,15 @@ class RouterArgs:
         health_group.add_argument(
             f"--{prefix}remove-unhealthy-workers",
             f"--{prefix}worker-auto-recovery",
-            action="store_true",
+            action=argparse.BooleanOptionalAction,
             default=RouterArgs.remove_unhealthy_workers,
             help=(
                 "Let workers recover after prolonged failure: unhealthy workers"
                 " are removed so service discovery re-registers and re-probes"
-                " them once their engine returns"
+                " them once their engine returns. Defaults to the"
+                " service-discovery setting (recovery-by-removal needs"
+                " discovery to re-add the worker); use the --no- form to keep"
+                " it off under discovery"
             ),
         )
         # Tokenizer configuration

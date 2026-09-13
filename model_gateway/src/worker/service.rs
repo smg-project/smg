@@ -17,6 +17,7 @@ use tracing::warn;
 
 use crate::{
     config::{validate_worker_url, RouterConfig},
+    routers::provider_support,
     worker::{registry::WorkerId, worker::worker_to_info, WorkerRegistry, WorkerType},
     workflow::{Job, JobQueue, WorkerRegistrationMode},
 };
@@ -42,6 +43,12 @@ pub enum WorkerServiceError {
     BadRequest { message: String },
     /// Worker with this URL already exists (duplicate POST)
     Conflict { url: String, worker_id: WorkerId },
+    /// The spec targets a provider whose router this build does not carry
+    ProviderNotCompiled {
+        url: String,
+        family: &'static str,
+        feature: &'static str,
+    },
     /// Job queue not initialized
     QueueNotInitialized,
     /// Failed to submit job to queue
@@ -55,6 +62,7 @@ impl WorkerServiceError {
             Self::InvalidId { .. } => "BAD_REQUEST",
             Self::BadRequest { .. } => "BAD_REQUEST",
             Self::Conflict { .. } => "WORKER_ALREADY_EXISTS",
+            Self::ProviderNotCompiled { .. } => "PROVIDER_NOT_COMPILED",
             Self::QueueNotInitialized => "INTERNAL_SERVER_ERROR",
             Self::QueueSubmitFailed { .. } => "INTERNAL_SERVER_ERROR",
         }
@@ -66,6 +74,7 @@ impl WorkerServiceError {
             Self::InvalidId { .. } => StatusCode::BAD_REQUEST,
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Conflict { .. } => StatusCode::CONFLICT,
+            Self::ProviderNotCompiled { .. } => StatusCode::BAD_REQUEST,
             Self::QueueNotInitialized => StatusCode::INTERNAL_SERVER_ERROR,
             Self::QueueSubmitFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -91,6 +100,15 @@ impl std::fmt::Display for WorkerServiceError {
                     Use PUT /workers/{id} to replace or PATCH /workers/{id} to update."
                 )
             }
+            Self::ProviderNotCompiled {
+                url,
+                family,
+                feature,
+            } => write!(
+                f,
+                "Worker '{url}' targets the {family} provider, but this build carries no \
+                 {family} router; rebuild with the `{feature}` Cargo feature to admit it."
+            ),
             Self::QueueNotInitialized => write!(f, "Job queue not initialized"),
             Self::QueueSubmitFailed { message } => write!(f, "{message}"),
         }
@@ -267,6 +285,7 @@ impl WorkerService {
         config: WorkerSpec,
     ) -> Result<CreateWorkerResult, WorkerServiceError> {
         validate_worker_url_request(&config.url)?;
+        Self::require_provider_router(&config)?;
 
         if self.router_config.api_key.is_some() && config.api_key.is_none() {
             warn!(
@@ -308,6 +327,21 @@ impl WorkerService {
         })
     }
 
+    /// A worker that targets a provider is reachable only through that
+    /// provider's router, which exists only in a build that compiled it in.
+    /// Admitting one otherwise would leave it routable by nothing, so refuse
+    /// here rather than after the 202, inside the background workflow.
+    fn require_provider_router(config: &WorkerSpec) -> Result<(), WorkerServiceError> {
+        match provider_support::missing_router(config) {
+            Some(missing) => Err(WorkerServiceError::ProviderNotCompiled {
+                url: config.url.clone(),
+                family: missing.label,
+                feature: missing.feature,
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Replace a worker by ID (full replace, re-runs registration workflow)
     pub async fn replace_worker(
         &self,
@@ -323,6 +357,7 @@ impl WorkerService {
                     worker_id: worker_id_raw.to_string(),
                 })?;
         let url = existing.url().to_string();
+        Self::require_provider_router(&config)?;
 
         // A data-parallel router expands one spec into one worker per rank,
         // each registered under a rank-suffixed URL. Re-running registration

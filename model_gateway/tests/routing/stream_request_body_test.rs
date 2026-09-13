@@ -274,6 +274,73 @@ async fn retries_disabled_streams_a_small_body() {
 }
 
 #[tokio::test]
+async fn routing_key_override_buffers_and_prefers_body_rid() {
+    let (url_a, captured_a) = spawn_capture_worker().await;
+    let (url_b, captured_b) = spawn_capture_worker().await;
+
+    let mut config = base_config(64 * 1024 * 1024);
+    config.disable_retries = true;
+    config.policy = PolicyConfig::RoundRobin;
+    config.routing_key_override.enabled = true;
+    config.health_check.disable_health_check = true;
+    let ctx = AppTestContext::new_with_config(config, vec![]).await;
+    for url in [&url_a, &url_b] {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .models(vec![ModelCard::new("mock-model")])
+                .health_config(openai_protocol::worker::HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        ctx.app_context.worker_registry.register(worker);
+    }
+    let app = ctx.create_app();
+
+    for (rid, header_key) in [("conv_t1", "request-1"), ("conv_t2", "request-2")] {
+        let payload = serde_json::to_vec(&json!({
+            "input_ids": [1, 2, 3],
+            "stream": false,
+            "rid": rid,
+        }))
+        .unwrap();
+        let mut req =
+            chunked_json_request("/generate", payload.clone(), Some(payload.len() as u64));
+        req.headers_mut()
+            .insert("x-smg-routing-key", header_key.parse().unwrap());
+        req.headers_mut()
+            .insert("x-smg-routing-tokens", "1,2,3".parse().unwrap());
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let captured_a = captured_a.lock().await;
+    let captured_b = captured_b.lock().await;
+    assert!(
+        matches!((captured_a.len(), captured_b.len()), (2, 0) | (0, 2)),
+        "body rid must override distinct per-request header keys"
+    );
+    for ((headers, body), rid) in captured_a
+        .iter()
+        .chain(captured_b.iter())
+        .zip(["conv_t1", "conv_t2"])
+    {
+        assert!(
+            headers.get(CONTENT_LENGTH).is_some(),
+            "routing-key override must use the buffered typed path"
+        );
+        let body: Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(body["rid"].as_str(), Some(rid));
+        assert_eq!(body["input_ids"], json!([1, 2, 3]));
+    }
+    drop(captured_a);
+    drop(captured_b);
+    ctx.shutdown().await;
+}
+
+#[tokio::test]
 async fn default_config_buffers_small_and_streams_past_one_mib() {
     let (app, captured, ctx) =
         streaming_app_with_config(least_load_policy(), base_config(64 * 1024 * 1024)).await;

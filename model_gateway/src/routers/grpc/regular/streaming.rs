@@ -16,16 +16,15 @@ use llm_tokenizer::{
     traits::Tokenizer,
 };
 use openai_protocol::{
-    chat::{ChatCompletionRequest, ChatCompletionStreamResponse},
+    chat::ChatCompletionStreamResponse,
     common::{
         ChatLogProbs, FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice,
         ToolChoiceValue, Usage,
     },
-    completion::{CompletionRequest, CompletionStreamChoice, CompletionStreamResponse},
-    generate::GenerateRequest,
+    completion::{CompletionStreamChoice, CompletionStreamResponse},
     messages::{
-        self, ContentBlock, ContentBlockDelta, CreateMessageRequest, Message, MessageDelta,
-        MessageDeltaUsage, MessageStreamEvent,
+        self, ContentBlock, ContentBlockDelta, Message, MessageDelta, MessageDeltaUsage,
+        MessageStreamEvent,
     },
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
@@ -42,6 +41,10 @@ use crate::{
             common::{response_formatting::CompletionTokenTracker, responses::build_sse_response},
             context,
             proto_wrapper::{ProtoResponseVariant, ProtoStream},
+            spec::{
+                ChatResponseSpec, CompletionResponseSpec, GenerateResponseSpec,
+                MessagesResponseSpec,
+            },
             utils,
             utils::message_utils,
         },
@@ -123,7 +126,7 @@ impl StreamingProcessor {
     pub async fn process_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
-        chat_request: Arc<ChatCompletionRequest>,
+        chat_request: ChatResponseSpec,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         skip_special_tokens: bool,
@@ -238,7 +241,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
-        original_request: Arc<ChatCompletionRequest>,
+        original_request: ChatResponseSpec,
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
@@ -265,7 +268,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
-        original_request: Arc<ChatCompletionRequest>,
+        original_request: ChatResponseSpec,
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
@@ -278,7 +281,7 @@ impl StreamingProcessor {
         let separate_reasoning = original_request.separate_reasoning;
         let tool_choice = &original_request.tool_choice;
         let tools = &original_request.tools;
-        let history_tool_calls_count = utils::get_history_tool_calls_count(&original_request);
+        let history_tool_calls_count = original_request.history_tool_calls_count;
         let stream_options = &original_request.stream_options;
 
         // Phase 1: Initialize state tracking (per-index for n>1 support)
@@ -750,7 +753,7 @@ impl StreamingProcessor {
             // produce one for every expected `n>1` choice has only partial
             // usage -- settling with that would understate the real cost.
             // Keep the reserved amount as final instead.
-            let expected_choices = original_request.n.unwrap_or(1).max(1);
+            let expected_choices = original_request.expected_choices;
             if (prompt_tokens.len() as u32) < expected_choices {
                 handle.close_reserved_only().await;
             } else {
@@ -785,7 +788,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
-        original_request: Arc<ChatCompletionRequest>,
+        original_request: ChatResponseSpec,
         tx: &SseSender,
         pd_timing: context::PdTiming,
         reservation: Option<Arc<SharedReservationHandle>>,
@@ -840,7 +843,7 @@ impl StreamingProcessor {
     pub async fn process_streaming_generate(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
-        generate_request: Arc<GenerateRequest>,
+        generate_request: GenerateResponseSpec,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         reservation: Option<Arc<SharedReservationHandle>>,
@@ -855,15 +858,10 @@ impl StreamingProcessor {
                 .weight_version
                 .clone()
                 .unwrap_or_else(|| "default".to_string()),
-            return_logprob: generate_request.return_logprob.unwrap_or(false),
+            return_logprob: generate_request.return_logprob,
             backend_type: self.backend_type,
             model: dispatch.model.clone(),
-            expected_choices: generate_request
-                .sampling_params
-                .as_ref()
-                .and_then(|p| p.n)
-                .unwrap_or(1)
-                .max(1),
+            expected_choices: generate_request.expected_choices,
         };
 
         // Spawn background task based on execution mode
@@ -1738,7 +1736,7 @@ impl StreamingProcessor {
     pub async fn process_messages_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
-        messages_request: Arc<CreateMessageRequest>,
+        messages_request: MessagesResponseSpec,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         skip_special_tokens: bool,
@@ -1867,7 +1865,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
-        original_request: Arc<CreateMessageRequest>,
+        original_request: MessagesResponseSpec,
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
@@ -1880,7 +1878,7 @@ impl StreamingProcessor {
         let request_id = &dispatch.request_id;
         let model = &dispatch.model;
 
-        let has_tools = original_request.tools.is_some();
+        let has_tools = original_request.has_tools;
 
         // Content block state machine
         let mut current_block_index: u32 = 0;
@@ -1990,15 +1988,10 @@ impl StreamingProcessor {
                 Some(messages::ToolChoice::Tool { .. })
             );
 
-        let history_tool_calls_count =
-            message_utils::get_history_tool_calls_count_messages(&original_request);
+        let history_tool_calls_count = original_request.history_tool_calls_count;
 
-        // Pre-convert Messages tools to Chat tools for parser reuse (done once upfront)
-        let chat_tools: Vec<Tool> = original_request
-            .tools
-            .as_deref()
-            .map(message_utils::extract_chat_tools)
-            .unwrap_or_default();
+        // Messages tools pre-converted to Chat tools for parser reuse
+        let chat_tools: &[Tool] = &original_request.chat_tools;
 
         // Create fresh streaming tool parser (not pooled — streaming parsers maintain state)
         let mut streaming_tool_parser: Option<Box<dyn ToolParser>> =
@@ -2222,7 +2215,7 @@ impl StreamingProcessor {
                     }
                 } else if let Some(ref mut parser) = streaming_tool_parser {
                     // Regular/required tool choice: use incremental parser
-                    match parser.parse_incremental(&normal_text, &chat_tools).await {
+                    match parser.parse_incremental(&normal_text, chat_tools).await {
                         Ok(StreamingParseResult {
                             normal_text: text,
                             calls,
@@ -2583,7 +2576,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
-        original_request: Arc<CreateMessageRequest>,
+        original_request: MessagesResponseSpec,
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
@@ -2629,7 +2622,7 @@ impl StreamingProcessor {
     pub async fn process_completion_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
-        completion_request: Arc<CompletionRequest>,
+        completion_request: CompletionResponseSpec,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         reservation: Option<Arc<SharedReservationHandle>>,
@@ -2652,20 +2645,13 @@ impl StreamingProcessor {
         )]
         tokio::spawn(async move {
             let start_time = Instant::now();
-            let choices_per_prompt = completion_request.n.unwrap_or(1).max(1);
+            let choices_per_prompt = completion_request.choices_per_prompt;
             let echo = completion_request.echo;
-            let include_usage = completion_request
-                .stream_options
-                .as_ref()
-                .and_then(|opts| opts.include_usage)
-                .unwrap_or(false);
-            let prompt_texts: Vec<&str> = match &completion_request.prompt {
-                StringOrArray::String(text) => vec![text.as_str()],
-                StringOrArray::Array(texts) => texts.iter().map(String::as_str).collect(),
-            };
+            let include_usage = completion_request.include_usage;
 
             // Fail-fast: the first stream error cancels the remaining units
             // (their streams abort on drop) and fails the whole request.
+            let completion_request = &completion_request;
             let outcomes =
                 try_join_all(units.into_iter().enumerate().map(|(prompt_index, unit)| {
                     let stop_params = (
@@ -2677,9 +2663,18 @@ impl StreamingProcessor {
                     );
                     let dispatch = dispatch.clone();
                     let tokenizer = tokenizer.clone();
-                    let completion_request = completion_request.clone();
                     let prompt_text = if echo {
-                        prompt_texts.get(prompt_index).copied().unwrap_or_default()
+                        match completion_request.prompt_texts.get(prompt_index) {
+                            Some(text) => text.as_str(),
+                            None => {
+                                warn!(
+                                    prompt_index,
+                                    prompt_texts_len = completion_request.prompt_texts.len(),
+                                    "echo requested but no prompt text for this prompt index"
+                                );
+                                ""
+                            }
+                        }
                     } else {
                         ""
                     };
@@ -2851,7 +2846,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
-        completion_request: Arc<CompletionRequest>,
+        completion_request: &CompletionResponseSpec,
         prompt_text: &str,
         index_offset: u32,
         tx: &SseSender,
@@ -2865,8 +2860,6 @@ impl StreamingProcessor {
 
         let echo = completion_request.echo;
         let suffix = completion_request.suffix.as_deref();
-        // TODO: wire per-token logprob streaming when backend support is available
-        let _request_logprobs = completion_request.logprobs.is_some();
 
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
@@ -3142,7 +3135,7 @@ impl StreamingProcessor {
         // via a `Complete` message. A clean EOF partway through this unit's
         // `n>1` choices (some completed, others didn't) must not be treated
         // as full usage.
-        let expected_choices = completion_request.n.unwrap_or(1).max(1);
+        let expected_choices = completion_request.choices_per_prompt;
         let saw_complete = completed_indices.len() as u32 >= expected_choices;
 
         Ok(CompletionStreamOutcome {
@@ -3165,7 +3158,7 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
-        original_request: Arc<CompletionRequest>,
+        original_request: &CompletionResponseSpec,
         prompt_text: &str,
         index_offset: u32,
         tx: &SseSender,

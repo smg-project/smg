@@ -1,7 +1,7 @@
 //! Response processing stage for the chat + generate pipeline
 //!
 //! Dispatches to ChatResponseProcessingStage or GenerateResponseProcessingStage
-//! based on request type.
+//! based on the response spec.
 
 use std::sync::Arc;
 
@@ -13,9 +13,10 @@ use super::{chat::ChatResponseProcessingStage, generate::GenerateResponseProcess
 use crate::routers::{
     error,
     grpc::{
-        common::stages::PipelineStage,
-        context::{RequestContext, RequestType},
+        common::stages::ProcessStage,
+        context::DispatchContext,
         regular::{processor, streaming},
+        spec::ResponseSpec,
     },
 };
 
@@ -41,20 +42,24 @@ impl ChatGenerateResponseProcessingStage {
 }
 
 #[async_trait]
-impl PipelineStage for ChatGenerateResponseProcessingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        match &ctx.input.request_type {
-            RequestType::Chat(_) => self.chat_stage.execute(ctx).await,
-            RequestType::Generate(_) => self.generate_stage.execute(ctx).await,
-            request_type => {
+impl ProcessStage for ChatGenerateResponseProcessingStage {
+    async fn process(
+        &self,
+        ctx: &mut DispatchContext,
+        spec: ResponseSpec,
+    ) -> Result<Option<Response>, Response> {
+        // Dispatch on the spec: the only request-derived signal post-build.
+        match spec {
+            ResponseSpec::Chat(_) => self.chat_stage.process(ctx, spec).await,
+            ResponseSpec::Generate(_) => self.generate_stage.process(ctx, spec).await,
+            _ => {
                 error!(
-                    function = "ChatGenerateResponseProcessingStage::execute",
-                    request_type = %request_type,
-                    "{request_type} should not reach this stage"
+                    function = "ChatGenerateResponseProcessingStage::process",
+                    "response spec should not reach this stage"
                 );
                 Err(error::internal_error(
                     "wrong_pipeline",
-                    format!("{request_type} should use its dedicated pipeline"),
+                    "response spec should use its dedicated pipeline",
                 ))
             }
         }
