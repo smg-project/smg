@@ -9,7 +9,6 @@ import asyncio
 import hashlib
 import itertools
 import json
-import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from datetime import datetime, timezone
@@ -40,6 +39,7 @@ from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
 from smg_grpc_servicer import mm_shm
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
+from smg_grpc_servicer.vllm import attach_vllm_logging
 from smg_grpc_servicer.vllm.admin import flush_cache
 from smg_grpc_servicer.vllm.errors import grpc_code_for
 from smg_grpc_servicer.vllm.kv_events import (
@@ -55,12 +55,9 @@ from smg_grpc_servicer.vllm.kv_transfer import (
 )
 from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
-    DEFAULT_MAX_INFLIGHT,
-    ENV_MAX_INFLIGHT,
     ENV_PROCESSOR,
     MmProcessorUnavailable,
     build_mm_processor,
-    env_int,
 )
 from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, mm_identity_cache_salt
 
@@ -68,6 +65,7 @@ from ..pd_pairing import pairing_protocol_from_env
 from .mm_keys import modality_key, primary_encoder_key
 
 logger = init_logger(__name__)
+attach_vllm_logging()
 SAMPLING_DEFAULT_KEYS = (
     "temperature",
     "top_p",
@@ -174,8 +172,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         self._kv_events_config = resolve_kv_events_config(async_llm)
         # Worker-side media processing (media_refs); None keeps refs rejected.
         self._mm_processor = build_mm_processor(async_llm)
-        self._mm_inflight = asyncio.Semaphore(
-            env_int(os.environ, ENV_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT)
+        self._mm_inflight = (
+            asyncio.Semaphore(self._mm_processor.max_inflight)
+            if self._mm_processor is not None
+            else None
         )
         logger.info(
             "VllmEngineServicer initialized (mm_processor=%s)",

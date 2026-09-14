@@ -102,12 +102,3 @@ class TestSchemes:
         items = [media_refs.MediaRefItem("image", "file:///models/a.png")]
         with pytest.raises(ValueError, match="allowed-local-media-path"):
             media_refs.validate_schemes(items, {"http", "https", "data"})
-
-
-def test_group_urls_by_modality_keeps_order():
-    items = [
-        media_refs.MediaRefItem("image", "u1"),
-        media_refs.MediaRefItem("video", "v1"),
-        media_refs.MediaRefItem("image", "u2"),
-    ]
-    assert media_refs.group_urls_by_modality(items) == {"image": ["u1", "u2"], "video": ["v1"]}

@@ -66,11 +66,3 @@ def validate_schemes(items: Iterable[MediaRefItem], accepted: set[str]) -> None:
                 f"worker (accepted: {','.join(sorted(accepted))}); file:// requires "
                 "--allowed-local-media-path"
             )
-
-
-def group_urls_by_modality(items: Iterable[MediaRefItem]) -> dict[str, list[str]]:
-    """Group URLs per modality, preserving prompt order within each modality."""
-    grouped: dict[str, list[str]] = {}
-    for item in items:
-        grouped.setdefault(item.modality, []).append(item.url)
-    return grouped
