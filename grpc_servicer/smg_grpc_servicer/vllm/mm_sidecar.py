@@ -36,6 +36,7 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
     failure,
     resolve_namespace,
 )
+from smg_grpc_servicer.vllm.media_refs import advertised_schemes, parse_scheme_list, url_scheme
 
 logger = logging.getLogger("smg_grpc_servicer.vllm.mm_sidecar")
 
@@ -71,22 +72,37 @@ def config_fingerprint(vllm_config) -> Fingerprint:
     )
 
 
-def _url_scheme(url: str) -> str:
-    scheme, sep, _ = url.partition(":")
-    return scheme.lower() if sep else ""
+# Codes come from exception types where vLLM offers one. The two substring
+# checks pin message wording from vLLM 0.27: connector.py's allowed-domain
+# rejection ("... domain ...") and processing/context.py's per-prompt limit
+# ("At most N ..."); test_vllm_mm_sidecar.py holds the wording.
+def classify_fetch_error(exc: BaseException) -> str:
+    if isinstance(exc, ValueError) and "domain" in str(exc).lower():
+        return "domain_not_allowed"
+    return "fetch_failed"
+
+
+def classify_process_error(exc: BaseException) -> str:
+    if isinstance(exc, RuntimeError):
+        return "placeholder_mismatch"
+    if isinstance(exc, ValueError):
+        return "limit_exceeded" if "at most" in str(exc).lower() else "decode_failed"
+    return "processor_error"
 
 
 class Sidecar:
     def __init__(self, vllm_config, renderer, client, *, namespace: str | None, concurrency: int):
-        from vllm import envs
+        from vllm import TokensPrompt, envs
         from vllm.multimodal.media.connector import MEDIA_CONNECTOR_REGISTRY
         from vllm.transformers_utils.processor import get_video_processor_cls_name
-
-        from smg_grpc_servicer.vllm.media_refs import advertised_schemes, parse_scheme_list
+        from vllm.v1.serial_utils import MsgpackEncoder
 
         model_config = vllm_config.model_config
         mm_config = model_config.get_multimodal_config()
         self._renderer = renderer
+        self._tokens_prompt = TokensPrompt
+        # All tensors inline: one buffer per kwargs item.
+        self._encoder = MsgpackEncoder(size_threshold=2**62)
         self._client = client
         self._concurrency = max(1, concurrency)
         self._fingerprint = config_fingerprint(vllm_config)
@@ -108,10 +124,10 @@ class Sidecar:
 
     async def run(self) -> None:
         logger.info(
-            "media sidecar serving %s under %s (concurrency=%d)",
-            self._fingerprint.model,
+            "media sidecar serving under %s (concurrency=%d) fingerprint=%s",
             self._keys.prefix,
             self._concurrency,
+            self._fingerprint.to_hello(),
         )
         tasks = [asyncio.create_task(self._heartbeat())]
         tasks += [asyncio.create_task(self._worker(i)) for i in range(self._concurrency)]
@@ -130,8 +146,11 @@ class Sidecar:
         }
         while True:
             try:
-                await self._client.hset(self._keys.hello, mapping=mapping)
-                await self._client.expire(self._keys.hello, HELLO_TTL_S)
+                # One transaction: a hello can never outlive its TTL.
+                pipe = self._client.pipeline(transaction=True)
+                pipe.hset(self._keys.hello, mapping=mapping)
+                pipe.expire(self._keys.hello, HELLO_TTL_S)
+                await pipe.execute()
             except Exception as e:  # noqa: BLE001 - keep advertising through redis blips
                 logger.warning("hello refresh failed: %s", e)
             await asyncio.sleep(HELLO_REFRESH_S)
@@ -152,11 +171,17 @@ class Sidecar:
             except Exception as e:  # noqa: BLE001 - a malformed job has no result key to answer on
                 logger.error("worker %d: undecodable job dropped: %s", index, e)
                 continue
-            result = await self.handle(job)
+            try:
+                result = await self.handle(job)
+            except Exception as e:  # noqa: BLE001 - one bad job must not kill the worker
+                logger.exception("worker %d: job %s failed", index, job.job_id)
+                result = failure(job.job_id, "processor_error", repr(e))
             try:
                 key = self._keys.result(job.job_id)
-                await self._client.lpush(key, encode_result(result))
-                await self._client.expire(key, RESULT_TTL_S)
+                pipe = self._client.pipeline(transaction=True)
+                pipe.lpush(key, encode_result(result))
+                pipe.expire(key, RESULT_TTL_S)
+                await pipe.execute()
             except Exception as e:  # noqa: BLE001 - the servicer times out and retries
                 logger.warning("worker %d: result push failed for %s: %s", index, job.job_id, e)
 
@@ -171,7 +196,7 @@ class Sidecar:
 
         multi_modal_data: dict[str, list] = {}
         for index, item in enumerate(job.items):
-            scheme = _url_scheme(item.url)
+            scheme = url_scheme(item.url)
             if scheme not in self._accepted:
                 return failure(
                     job.job_id,
@@ -180,18 +205,12 @@ class Sidecar:
                 )
             try:
                 media = await self._fetch(item.modality, item.url)
-            except ValueError as e:
-                code = "domain_not_allowed" if "domain" in str(e).lower() else "fetch_failed"
-                return failure(job.job_id, code, f"item {index}: {e}")
-            except Exception as e:  # noqa: BLE001 - network/decoder errors are client-visible
-                return failure(job.job_id, "fetch_failed", f"item {index}: {e}")
+            except Exception as e:  # noqa: BLE001 - fetch failures are client-visible codes
+                return failure(job.job_id, classify_fetch_error(e), f"item {index}: {e}")
             multi_modal_data.setdefault(item.modality, []).append(media)
         fetched = time.time()
 
-        from vllm import TokensPrompt
-        from vllm.v1.serial_utils import MsgpackEncoder
-
-        prompt = TokensPrompt(
+        prompt = self._tokens_prompt(
             prompt_token_ids=list(job.prompt_token_ids), multi_modal_data=multi_modal_data
         )
         if job.prompt:
@@ -200,17 +219,14 @@ class Sidecar:
             engine_input = await self._renderer.process_for_engine_async(
                 prompt, arrival_time=0.0, skip_mm_cache=True
             )
-        except RuntimeError as e:
-            return failure(job.job_id, "placeholder_mismatch", str(e))
-        except ValueError as e:
-            code = "limit_exceeded" if "at most" in str(e).lower() else "decode_failed"
+        except Exception as e:  # noqa: BLE001 - classified into a result code
+            code = classify_process_error(e)
+            if code == "processor_error":
+                logger.exception("processing failed for job %s", job.job_id)
             return failure(job.job_id, code, str(e))
-        except Exception as e:  # noqa: BLE001 - processor bugs are retryable elsewhere
-            logger.exception("processing failed for job %s", job.job_id)
-            return failure(job.job_id, "processor_error", str(e))
         processed = time.time()
 
-        encoder = MsgpackEncoder(size_threshold=2**62)
+        encoder = self._encoder
         mm_kwargs: dict[str, list[bytes]] = {}
         for modality, items in engine_input["mm_kwargs"].items():
             blobs = []

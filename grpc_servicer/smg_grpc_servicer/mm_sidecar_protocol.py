@@ -59,10 +59,9 @@ class Fingerprint(msgspec.Struct, frozen=True):
     mm_processor_kwargs: str
 
     def namespace(self) -> str:
-        digest = hashlib.sha256(
-            f"{self.model}|{self.vllm_version}|{self.dtype}".encode()
-        ).hexdigest()
-        return digest[:16]
+        """Key namespace: fleets that would fail `mismatches` never share keys."""
+        joined = "|".join(getattr(self, name) for name in self.__struct_fields__)
+        return hashlib.sha256(joined.encode()).hexdigest()[:16]
 
     def mismatches(self, other: Fingerprint) -> list[str]:
         return [

@@ -23,13 +23,15 @@ def fingerprint(**overrides) -> proto.Fingerprint:
 
 
 class TestFingerprint:
-    def test_namespace_is_deterministic_and_dtype_sensitive(self):
+    def test_namespace_covers_every_fingerprint_field(self):
         a = fingerprint().namespace()
         assert a == fingerprint().namespace()
         assert len(a) == 16
+        # Fleets that would fail the fingerprint check never share keys.
         assert a != fingerprint(dtype="torch.float16").namespace()
-        # Kwargs are not part of the namespace; they are checked by fingerprint.
-        assert a == fingerprint(media_io_kwargs='{"video":{"num_frames":8}}').namespace()
+        assert a != fingerprint(video_backend="decord").namespace()
+        assert a != fingerprint(media_io_kwargs='{"video":{"num_frames":8}}').namespace()
+        assert a != fingerprint(mm_processor_kwargs='{"max_pixels":1}').namespace()
 
     def test_override_wins(self):
         assert proto.resolve_namespace(fingerprint(), " prod-a ") == "prod-a"
