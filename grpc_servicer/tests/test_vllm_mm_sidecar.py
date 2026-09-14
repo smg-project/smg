@@ -194,10 +194,21 @@ class TestFingerprintDerivation:
         pytest.importorskip("vllm")
         from vllm.config import MultiModalConfig
 
-        unset = mm_processor.resolved_mm_limits(MultiModalConfig())
+        # The derivation drops entries equal to one probed unset default, which
+        # is only right while that default is uniform across the options classes
+        # and an unknown key resolves to it instead of raising.
+        cfg = MultiModalConfig()
+        modalities = ("image", "video", "audio")
+        assert {m: cfg.get_limit_per_prompt(m) for m in modalities} == dict.fromkeys(
+            modalities, 999
+        )
+        assert cfg.get_limit_per_prompt(mm_processor._UNSET_MODALITY) == 999
+        unset = mm_processor.resolved_mm_limits(cfg)
         assert unset == {"*": {"count": 999}}
-        explicit = MultiModalConfig(limit_per_prompt={"image": 999})
-        assert mm_processor.resolved_mm_limits(explicit) == unset
+        for modality in modalities:
+            for spelled_out in (999, {}):
+                explicit = MultiModalConfig(limit_per_prompt={modality: spelled_out})
+                assert mm_processor.resolved_mm_limits(explicit) == unset, (modality, spelled_out)
         resolved = mm_processor.resolved_mm_limits(
             MultiModalConfig(limit_per_prompt={"image": 8, "video": {"count": 2, "num_frames": 16}})
         )
