@@ -318,6 +318,15 @@ pub trait ModelProcessorSpec: Send + Sync {
     fn keep_on_cpu_keys_for(&self, _modality: Modality) -> Vec<String> {
         self.keep_on_cpu_keys()
     }
+
+    /// The engine-side name of the primary encoder input for one modality,
+    /// when it is not the HF-conventional `pixel_values` / `audio_features`
+    /// (DeepSeek-V4.1's forward pops `patches`). `None` keeps the default
+    /// name; adapters that build the engine request consult this before
+    /// naming the tensor.
+    fn encoder_input_key_for(&self, _modality: Modality) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]

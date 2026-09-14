@@ -1,0 +1,329 @@
+{
+  "cases": [
+    {
+      "fnv1a_bf16": "15f8a6c52b8c7031",
+      "fnv1a_f32": "c28ede2f7103cd17",
+      "fnv1a_types_i64": "7604dfcc4a243286",
+      "height": 48,
+      "llm_grid": [
+        12,
+        15
+      ],
+      "name": "synthetic_64x48",
+      "num_tokens": 194,
+      "shape": [
+        1530,
+        3,
+        14,
+        14
+      ],
+      "source": {
+        "seed": 0
+      },
+      "vit_grid": [
+        34,
+        45
+      ],
+      "width": 64
+    },
+    {
+      "fnv1a_bf16": "c7d556db00ba0885",
+      "fnv1a_f32": "f50ee61b0a2ee7e9",
+      "fnv1a_types_i64": "6797b47948a227e5",
+      "height": 100,
+      "llm_grid": [
+        13,
+        13
+      ],
+      "name": "synthetic_100x100",
+      "num_tokens": 184,
+      "shape": [
+        1521,
+        3,
+        14,
+        14
+      ],
+      "source": {
+        "seed": 3
+      },
+      "vit_grid": [
+        39,
+        39
+      ],
+      "width": 100
+    },
+    {
+      "fnv1a_bf16": "4edd2858c4f8b1c5",
+      "fnv1a_f32": "e483361b4184ab35",
+      "fnv1a_types_i64": "8e29adceab7c1386",
+      "height": 480,
+      "llm_grid": [
+        12,
+        16
+      ],
+      "name": "synthetic_640x480",
+      "num_tokens": 206,
+      "shape": [
+        1610,
+        3,
+        14,
+        14
+      ],
+      "source": {
+        "seed": 7
+      },
+      "vit_grid": [
+        35,
+        46
+      ],
+      "width": 640
+    },
+    {
+      "fnv1a_bf16": "6b1d59daafd4e254",
+      "fnv1a_f32": "2ed977d1eac66602",
+      "fnv1a_types_i64": "7c53a8f98d7618e5",
+      "height": 768,
+      "llm_grid": [
+        19,
+        25
+      ],
+      "name": "synthetic_1024x768",
+      "num_tokens": 496,
+      "shape": [
+        4070,
+        3,
+        14,
+        14
+      ],
+      "source": {
+        "seed": 11
+      },
+      "vit_grid": [
+        55,
+        74
+      ],
+      "width": 1024
+    },
+    {
+      "fnv1a_bf16": "d662cd805f271d15",
+      "fnv1a_f32": "2321e6a98ee53590",
+      "fnv1a_types_i64": "7d128881fb5a0b65",
+      "height": 1080,
+      "llm_grid": [
+        23,
+        41
+      ],
+      "name": "synthetic_1920x1080",
+      "num_tokens": 968,
+      "shape": [
+        8418,
+        3,
+        14,
+        14
+      ],
+      "source": {
+        "seed": 17
+      },
+      "vit_grid": [
+        69,
+        122
+      ],
+      "width": 1920
+    },
+    {
+      "fnv1a_bf16": "159abb1f30fbca52",
+      "fnv1a_f32": "5aa97a892baed9a1",
+      "fnv1a_types_i64": "726a5d987f210064",
+      "height": 3000,
+      "llm_grid": [
+        27,
+        36
+      ],
+      "name": "synthetic_4000x3000",
+      "num_tokens": 1001,
+      "shape": [
+        8748,
+        3,
+        14,
+        14
+      ],
+      "source": {
+        "seed": 23
+      },
+      "vit_grid": [
+        81,
+        108
+      ],
+      "width": 4000
+    },
+    {
+      "fnv1a_bf16": "94ff3bbde3b9a76c",
+      "fnv1a_f32": "80d333445a44ee05",
+      "fnv1a_types_i64": "6741c6b405b16724",
+      "height": 1000,
+      "llm_grid": [
+        11,
+        88
+      ],
+      "name": "synthetic_8000x1000",
+      "num_tokens": 981,
+      "shape": [
+        8712,
+        3,
+        14,
+        14
+      ],
+      "source": {
+        "seed": 29
+      },
+      "vit_grid": [
+        33,
+        264
+      ],
+      "width": 8000
+    },
+    {
+      "fnv1a_bf16": "f59246454f479f80",
+      "fnv1a_f32": "aae6057819a10db4",
+      "fnv1a_types_i64": "e028f3f891f7ac64",
+      "height": 900,
+      "llm_grid": [
+        55,
+        4
+      ],
+      "name": "synthetic_50x900",
+      "num_tokens": 277,
+      "shape": [
+        1650,
+        3,
+        14,
+        14
+      ],
+      "source": {
+        "seed": 31
+      },
+      "vit_grid": [
+        165,
+        10
+      ],
+      "width": 50
+    },
+    {
+      "fnv1a_bf16": "23b2da6dacc33d90",
+      "fnv1a_f32": "67fc98b0e642c015",
+      "fnv1a_types_i64": "5316ab6b51435e86",
+      "height": 56,
+      "llm_grid": [
+        16,
+        12
+      ],
+      "name": "synthetic_41x56",
+      "num_tokens": 210,
+      "shape": [
+        1564,
+        3,
+        14,
+        14
+      ],
+      "source": {
+        "seed": 37
+      },
+      "vit_grid": [
+        46,
+        34
+      ],
+      "width": 41
+    },
+    {
+      "fnv1a_bf16": "1571666e0c2af807",
+      "fnv1a_f32": "395a74f5c7e1cf6d",
+      "fnv1a_types_i64": "e8b12c389b5b8b86",
+      "height": 351,
+      "llm_grid": [
+        46,
+        4
+      ],
+      "name": "synthetic_28x351",
+      "num_tokens": 232,
+      "shape": [
+        1518,
+        3,
+        14,
+        14
+      ],
+      "source": {
+        "seed": 41
+      },
+      "vit_grid": [
+        138,
+        11
+      ],
+      "width": 28
+    },
+    {
+      "fnv1a_bf16": "33178882c6a93e22",
+      "fnv1a_f32": "2f012ba982722d5b",
+      "fnv1a_types_i64": "08de9c7bc0a97525",
+      "height": 701,
+      "llm_grid": [
+        17,
+        25
+      ],
+      "name": "carrots",
+      "num_tokens": 444,
+      "shape": [
+        3774,
+        3,
+        14,
+        14
+      ],
+      "source": {
+        "file": "deepseek_v41_carrots.png"
+      },
+      "vit_grid": [
+        51,
+        74
+      ],
+      "width": 1024
+    },
+    {
+      "fnv1a_bf16": "d58b3de404db8589",
+      "fnv1a_f32": "4ef6802c1e664c2a",
+      "fnv1a_types_i64": "de5e04324d7197a4",
+      "height": 308,
+      "llm_grid": [
+        11,
+        16
+      ],
+      "name": "corn",
+      "num_tokens": 189,
+      "shape": [
+        1551,
+        3,
+        14,
+        14
+      ],
+      "source": {
+        "file": "deepseek_v41_corn.png"
+      },
+      "vit_grid": [
+        33,
+        47
+      ],
+      "width": 450
+    }
+  ],
+  "generator": "generate_deepseek_v41_preprocess_fingerprints.py",
+  "numpy": "2.5.3",
+  "pillow": "12.3.0",
+  "reference": "inference/image_processor.py of deepseek-ai/DeepSeek-V4.1-Flash",
+  "reference_sha256": "482759e3bcc4e9bb5ee582b244cc563f5d0e163d8b48dda91ebb7106e62f9272",
+  "torch": "2.14.0",
+  "vision_config": {
+    "vision_downsample_ratio": 3,
+    "vision_max_n_token": 1024,
+    "vision_max_wh_ratio": null,
+    "vision_min_pixels": 295936,
+    "vision_patch_size": 14
+  }
+}
