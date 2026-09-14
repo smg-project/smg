@@ -666,6 +666,32 @@ jobs:
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
+  # Worker-side media processing: the vLLM gRPC worker fetches and
+  # preprocesses media itself (SMG_VLLM_MM_PROCESSOR=inprocess) and the
+  # gateway, left in auto mode, forwards media references. Same multimodal
+  # cases as the chat lane plus the processing-location assertion.
+  e2e-1gpu-chat-mm-worker:
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && (needs.detect-changes.outputs.common == 'true'
+                  || needs.detect-changes.outputs.chat-completions == 'true')))
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
+      timeout: 28
+      test_timeout: 20
+      test_dirs: e2e_test/chat_completions/test_multimodal.py
+      mm_processing: worker
+      min_selected: 5 # the 6 Qwen3-VL cases on 1 GPU (Llama-4 Scout is a 4-GPU class)
+    secrets: inherit
+
   e2e-1gpu-chat-zmq:
     name: e2e-1gpu-chat-zmq (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
@@ -951,6 +977,30 @@ jobs:
       min_selected: ${{ matrix.min_selected }}
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+    secrets: inherit
+
+  # PD legs both advertise worker-side processing; the M-RoPE class takes the
+  # worker path and the Phi-3.5 class must stay on the router path.
+  e2e-2gpu-pd-mm-worker:
+    needs: [e2e-1gpu-chat-mm-worker, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.e2e-1gpu-chat-mm-worker.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && (needs.detect-changes.outputs.common == 'true'
+                  || needs.detect-changes.outputs.chat-completions == 'true')))
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: "2"
+      runner: ${{ vars.SMG_RUNNER_GPU_2 || '2-gpu-h100' }}
+      timeout: 40
+      test_timeout: 34
+      test_dirs: e2e_test/router/test_pd_multimodal.py
+      mm_processing: worker
+      min_selected: 3 # the 3 PD multimodal cases
     secrets: inherit
 
   # === 4 GPU ===
@@ -1394,7 +1444,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -1452,6 +1502,7 @@ jobs:
                 "${{ needs.python-unit-tests.result }}" == "failure" || \
                 "${{ needs.unit-tests.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat.result }}" == "failure" || \
+                "${{ needs.e2e-1gpu-chat-mm-worker.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat-zmq.result }}" == "failure" || \
                 "${{ needs.e2e-2gpu-chat-zmq-dp.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-completions.result }}" == "failure" || \
@@ -1460,6 +1511,7 @@ jobs:
                 "${{ needs.e2e-1gpu-gateway.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-responses.result }}" == "failure" || \
                 "${{ needs.e2e-2gpu-pd.result }}" == "failure" || \
+                "${{ needs.e2e-2gpu-pd-mm-worker.result }}" == "failure" || \
                 "${{ needs.e2e-4gpu-chat.result }}" == "failure" || \
                 "${{ needs.e2e-4gpu-gateway.result }}" == "failure" || \
                 "${{ needs.e2e-4gpu-epd.result }}" == "failure" || \

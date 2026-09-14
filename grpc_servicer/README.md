@@ -58,6 +58,18 @@ Related knobs: `SMG_VLLM_MM_MAX_INFLIGHT` (default 64) bounds concurrent media
 jobs; `SMG_VLLM_MM_MAX_ITEMS` (default 16) caps references per request;
 `SMG_VLLM_MM_MAX_ITEM_BYTES` (default 32 MiB) caps inline `data:` payloads.
 
+On the router side, `SMG_MM_PROCESSING` selects `auto` (default: forward when
+the model's spec opts in and every registered worker of the model advertises
+`mm_processor`), `router` (always preprocess) or `worker` (strict: 400 when a
+request cannot be forwarded); the outcome is counted in
+`smg_mm_processing_total{model,mode,reason}`. On the worker path the router
+never expands placeholders, so routing decisions that weigh the prompt's token
+count (cache-aware policies, load estimates) see one token per media item where
+the worker will schedule the full placeholder run. The `E2E_MM_PROCESSING=worker`
+e2e lanes run the multimodal suites in this mode, and
+`crates/multimodal/scripts/check_worker_anchor_parity.py` checks that a spec's
+anchor is the token vLLM expands.
+
 ### MLX
 
 ```bash

@@ -21,8 +21,10 @@ from .constants import (
     ENV_SHOW_WORKER_LOGS,
     HEALTH_CHECK_INTERVAL,
     LAUNCH_STAGGER_DELAY,
+    MM_PROCESSING_WORKER,
     ConnectionMode,
     WorkerType,
+    get_mm_processing,
     get_runtime,
     get_zmq_engine_count,
     sglang_transfer_backend,
@@ -544,6 +546,15 @@ class Worker:
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpu_ids))
+
+        if (
+            self.engine == "vllm"
+            and self.mode == ConnectionMode.GRPC
+            and get_mm_processing() == MM_PROCESSING_WORKER
+        ):
+            # The worker advertises mm_processor and the gateway, left in auto
+            # mode, forwards media references instead of preprocessed tensors.
+            env["SMG_VLLM_MM_PROCESSOR"] = "inprocess"
 
         if self.engine == "tokenspeed" and self.worker_type in (
             WorkerType.ENCODE,

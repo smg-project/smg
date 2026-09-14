@@ -233,8 +233,8 @@ impl PipelineStage for WorkerSelectionStage {
         };
 
         // Reject an unsupported (backend, modality) combination now that the
-        // runtime is known, before request building fetches/preprocesses media
-        // only to fail deep in assembly. The prefill leg builds the request in
+        // runtime is known, before request building assembles the payload only
+        // to fail deep in assembly. The prefill leg builds the request in
         // disaggregated mode, so its runtime is the one that must support the
         // request's modalities.
         if let Some(intermediate) = intermediate {
