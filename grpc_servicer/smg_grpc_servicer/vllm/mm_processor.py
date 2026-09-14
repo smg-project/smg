@@ -35,6 +35,7 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
     Keys,
     decode_result,
     encode_job,
+    hello_field,
     hello_schemes,
     resolve_namespace,
 )
@@ -244,12 +245,20 @@ class InProcessMediaProcessor:
         raise ValueError(f"unsupported media modality {item.modality!r}")
 
 
-def engine_fingerprint(engine) -> Fingerprint:
-    """What the sidecar must match to process media for this engine."""
+MM_LIMIT_MODALITIES = ("image", "video", "audio")
+
+
+def resolved_mm_limits(mm_config) -> dict[str, int]:
+    """Per-modality prompt limits as vLLM resolves them (999 when unset), so
+    equivalent spellings of --limit-mm-per-prompt match."""
+    return {modality: mm_config.get_limit_per_prompt(modality) for modality in MM_LIMIT_MODALITIES}
+
+
+def fingerprint_from_model_config(model_config) -> Fingerprint:
+    """The one derivation the worker and the sidecar share."""
     import vllm
     from vllm import envs
 
-    model_config = engine.model_config
     mm_config = model_config.get_multimodal_config()
     return Fingerprint(
         model=model_config.model,
@@ -260,8 +269,13 @@ def engine_fingerprint(engine) -> Fingerprint:
         mm_processor_kwargs=json.dumps(
             mm_config.mm_processor_kwargs or {}, sort_keys=True, default=str
         ),
-        limit_per_prompt=json.dumps(mm_config.limit_per_prompt or {}, sort_keys=True, default=str),
+        limit_per_prompt=json.dumps(resolved_mm_limits(mm_config), sort_keys=True),
     )
+
+
+def engine_fingerprint(engine) -> Fingerprint:
+    """What the sidecar must match to process media for this engine."""
+    return fingerprint_from_model_config(engine.model_config)
 
 
 def _cast_floats(data, dtype):
@@ -320,6 +334,12 @@ class RedisMediaProcessor:
             hello = await self._client.hgetall(self._keys.hello)
         except Exception as e:  # noqa: BLE001 - any transport failure means "not advertised"
             self._log_probe_once("redis unreachable: %s", e)
+            return False
+        schema = hello_field(hello, "schema") if hello else ""
+        if hello and schema != str(SCHEMA_VERSION):
+            self._log_probe_once(
+                "sidecar speaks protocol v%s, worker speaks v%s", schema or "?", SCHEMA_VERSION
+            )
             return False
         remote = Fingerprint.from_hello(hello) if hello else None
         if remote is None:
