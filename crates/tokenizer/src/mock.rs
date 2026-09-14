@@ -81,6 +81,16 @@ impl MockTokenizer {
     /// Make `apply_chat_template_with_encoding` return `ids` as a deferred
     /// encode, the way a renderer whose ids are not a function of its text
     /// does. The rendered text is unchanged.
+    /// Extend the vocabulary, so a test can decode chosen ids into exact
+    /// text (a whole tool-call JSON as one token, say) and encode it back.
+    pub fn with_tokens(mut self, tokens: &[(&str, u32)]) -> Self {
+        for (token, id) in tokens {
+            self.vocab.insert((*token).to_string(), *id);
+            self.reverse_vocab.insert(*id, (*token).to_string());
+        }
+        self
+    }
+
     pub fn with_deferred_chat_ids(mut self, ids: Vec<u32>) -> Self {
         self.deferred_chat_ids = Some(ids);
         self
