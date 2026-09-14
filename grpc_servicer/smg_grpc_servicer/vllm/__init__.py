@@ -1,17 +1,32 @@
-"""vLLM gRPC servicers -- VllmEngine proto service and standard health check."""
+"""vLLM gRPC servicers -- VllmEngine proto service and standard health check.
+
+The servicer classes import vLLM and load on first attribute access, so the
+engine-free submodules (media_refs, mm_processor) import without it.
+"""
 
 import logging
 
-from smg_grpc_servicer.vllm.health_servicer import VllmHealthServicer
-from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
+__all__ = ["VllmEngineServicer", "VllmHealthServicer", "attach_vllm_logging"]
 
-# Attach the top-level ``smg_grpc_servicer`` logger to the vllm logging
-# hierarchy so that INFO/DEBUG messages from any submodule use the same
-# handlers and format as native vllm loggers.
-_vllm_logger = logging.getLogger("vllm")
-_pkg_logger = logging.getLogger("smg_grpc_servicer")
-_pkg_logger.handlers = list(_vllm_logger.handlers)
-_pkg_logger.setLevel(_vllm_logger.level)
-_pkg_logger.propagate = False
 
-__all__ = ["VllmEngineServicer", "VllmHealthServicer"]
+def attach_vllm_logging() -> None:
+    """Route this package's logs through vLLM's handlers, once vLLM configured them."""
+    vllm_logger = logging.getLogger("vllm")
+    if not vllm_logger.handlers:
+        return
+    pkg_logger = logging.getLogger("smg_grpc_servicer")
+    pkg_logger.handlers = list(vllm_logger.handlers)
+    pkg_logger.setLevel(vllm_logger.level)
+    pkg_logger.propagate = False
+
+
+def __getattr__(name: str):
+    if name == "VllmEngineServicer":
+        from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
+
+        return VllmEngineServicer
+    if name == "VllmHealthServicer":
+        from smg_grpc_servicer.vllm.health_servicer import VllmHealthServicer
+
+        return VllmHealthServicer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

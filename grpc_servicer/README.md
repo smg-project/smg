@@ -36,6 +36,28 @@ pip install smg-grpc-servicer[sglang]
 vllm serve meta-llama/Llama-2-7b-hf --grpc
 ```
 
+#### Worker-side multimodal processing (media refs)
+
+By default the smg router fetches and preprocesses images itself and sends
+pixel tensors. A vLLM gRPC worker can instead accept media references (URLs)
+and run vLLM's own multimodal processor:
+
+```bash
+SMG_VLLM_MM_PROCESSOR=inprocess vllm serve Qwen/Qwen3-VL-8B-Instruct --grpc \
+    --allowed-media-domains example.com
+```
+
+The worker then advertises `mm_processor=inprocess` and `mm_media_ref_schemes`
+through `GetServerInfo`; a router with media-reference support forwards
+`media_refs` only to workers that advertise, and a router without it ignores the
+labels and keeps sending preprocessed tensors. vLLM's `--allowed-media-domains`,
+`--allowed-local-media-path`, `--media-io-kwargs`, `--limit-mm-per-prompt` and
+`VLLM_*_FETCH_TIMEOUT` govern fetching on the worker; without
+`--allowed-media-domains` the worker fetches from any host the router forwards.
+Related knobs: `SMG_VLLM_MM_MAX_INFLIGHT` (default 64) bounds concurrent media
+jobs; `SMG_VLLM_MM_MAX_ITEMS` (default 16) caps references per request;
+`SMG_VLLM_MM_MAX_ITEM_BYTES` (default 32 MiB) caps inline `data:` payloads.
+
 ### MLX
 
 ```bash
