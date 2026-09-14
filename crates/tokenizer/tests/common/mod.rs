@@ -170,29 +170,46 @@ const DEEPSEEK_V41_CACHE_DIR: &str = ".tokenizer_cache/deepseek_v41";
 /// Downloads one DeepSeek-V4.1 tokenizer file from `base` into `dir/file`,
 /// mirroring the Kimi-K3 helper's approach: write to a `.part` file and
 /// rename into place, so a failed write never leaves a short file that a
-/// later run would trust. Returns `false` (instead of panicking) on any
-/// failure so the caller can fall back to `None` when offline.
-#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+/// later run would trust. Only a transport failure (no connection, TLS,
+/// timeout) returns `false` so the caller can skip when offline; a reachable
+/// but wrong response (non-success status, short body) or an unwritable
+/// cache panics with the reason, so a moved or gated file fails loudly
+/// instead of silently disabling the parity gate.
+#[expect(
+    clippy::print_stdout,
+    clippy::panic,
+    reason = "test helper — diagnostics and loud failures are intentional"
+)]
 fn download_deepseek_v41_file(base: &str, dir: &Path, file: &str, min_bytes: usize) -> bool {
     println!("Downloading DeepSeek-V4.1 {file} from HuggingFace...");
     let client = reqwest::blocking::Client::new();
-    let Ok(response) = client.get(format!("{base}/{file}")).send() else {
-        return false;
+    let url = format!("{base}/{file}");
+    let response = match client.get(&url).send() {
+        Ok(response) => response,
+        Err(error) => {
+            println!("DeepSeek-V4.1 download skipped (transport error): {error}");
+            return false;
+        }
     };
-    if !response.status().is_success() {
-        return false;
-    }
-    let Ok(content) = response.bytes() else {
-        return false;
-    };
-    if content.len() < min_bytes {
-        return false;
-    }
+    let status = response.status();
+    assert!(
+        status.is_success(),
+        "DeepSeek-V4.1 {file} download failed: HTTP {status} from {url}"
+    );
+    let content = response
+        .bytes()
+        .unwrap_or_else(|error| panic!("DeepSeek-V4.1 {file} download body error: {error}"));
+    assert!(
+        content.len() >= min_bytes,
+        "DeepSeek-V4.1 {file} download is {} bytes, expected at least {min_bytes}",
+        content.len()
+    );
     let part = dir.join(format!("{file}.part"));
-    if fs::write(&part, &content).is_err() {
-        return false;
-    }
-    fs::rename(&part, dir.join(file)).is_ok()
+    fs::write(&part, &content)
+        .unwrap_or_else(|error| panic!("cannot write {}: {error}", part.display()));
+    fs::rename(&part, dir.join(file))
+        .unwrap_or_else(|error| panic!("cannot rename {}: {error}", part.display()));
+    true
 }
 
 /// A directory holding the DeepSeek-V4.1-Flash tokenizer files

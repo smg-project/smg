@@ -581,9 +581,11 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             // V4.1 wants message parts preserved (OpenAI wire format) so the
             // gateway passes `image_url`/`image` parts through as a list
             // instead of flattening to a string; the encoder turns each part
-            // into a placeholder in authored order. V3.2/V4 have no native
-            // opinion here and fall back to whatever the (usually absent)
-            // Jinja template reports.
+            // into a placeholder at its position. Part *order* is still the
+            // gateway's media-part order (the V4.1 multimodal spec declares
+            // `Authored`; without a spec the gateway moves media first).
+            // V3.2/V4 have no native opinion here and fall back to whatever
+            // the (usually absent) Jinja template reports.
             Renderer::DeepseekV41 => ChatTemplateContentFormat::OpenAI,
             Renderer::Jinja | Renderer::DeepseekV32 | Renderer::DeepseekV4(_) => {
                 self.chat_template.content_format()
@@ -923,6 +925,11 @@ fn apply_deepseek_v41(
     messages: &[serde_json::Value],
     params: &ChatTemplateParams,
 ) -> Result<String> {
+    // `template_kwargs["response_format"]` is deliberately not attached to a
+    // message: vLLM Python never renders V4.1's `## Response Format:` block
+    // (structured output is enforced by the constraint), so the gateway's
+    // projected kwarg is ignored here too. The encoder still renders a
+    // per-message `response_format` for direct callers.
     let owned = inject_tools_into_first_system_message(messages, params.tools);
     let mut msgs: Vec<serde_json::Value> = owned.unwrap_or_else(|| messages.to_vec());
 
@@ -968,6 +975,9 @@ fn apply_deepseek_v41(
 
     // `add_generation_prompt: false` with a trailing assistant message reaches
     // the encoder as `wo_eos` on that message: no EOS, no generation header.
+    // That is the only shape wired: with any other trailing role the flag is
+    // ignored and the generation header is appended (V3.2/V4 ignore the flag
+    // entirely).
     let continues_final_assistant_message = !params.add_generation_prompt
         && msgs
             .last()

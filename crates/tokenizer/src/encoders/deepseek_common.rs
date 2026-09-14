@@ -346,6 +346,29 @@ mod tests {
         invoke: " invoke",
         parameter: " parameter",
     };
+    const V4_TAGS: DsmlTags = DsmlTags {
+        invoke: "invoke",
+        parameter: "parameter",
+    };
+
+    /// The helper is shared with V4: these are the three input shapes whose
+    /// V4 output changed when it started mirroring the reference (they used
+    /// to render an empty parameter list).
+    #[test]
+    fn v4_non_object_arguments_render_one_parameter_like_the_reference() {
+        assert_eq!(
+            encode_arguments_to_dsml(&Value::Null, &V4_TAGS),
+            "<｜DSML｜parameter name=\"arguments\" string=\"false\">null</｜DSML｜parameter>"
+        );
+        assert_eq!(
+            encode_arguments_to_dsml(&json!([1, 2]), &V4_TAGS),
+            "<｜DSML｜parameter name=\"arguments\" string=\"false\">[1, 2]</｜DSML｜parameter>"
+        );
+        assert_eq!(
+            encode_arguments_to_dsml(&json!("\"{\\\"a\\\": 1}\""), &V4_TAGS),
+            "<｜DSML｜parameter name=\"a\" string=\"false\">1</｜DSML｜parameter>"
+        );
+    }
 
     #[test]
     fn object_arguments_render_one_parameter_per_key() {
