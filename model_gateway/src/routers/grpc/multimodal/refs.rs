@@ -174,8 +174,8 @@ pub(crate) fn resolve_mm_processing(
     let (resolved, reason) = match components.processing {
         MmProcessingMode::Router => (MmProcessing::Router, "config"),
         MmProcessingMode::Worker => {
-            if !plan.is_forwardable() {
-                return Err(MmRefsError::HintUnsupported);
+            if let Some(blocker) = refs_blocker(plan) {
+                return Err(blocker);
             }
             ensure_worker_expandable(plan, placeholders)?;
             (MmProcessing::Worker, "config")
@@ -238,8 +238,9 @@ fn log_transition(
     }
 }
 
-/// Post-selection check: every leg must accept references and the primary
-/// worker must fetch every URL scheme in the plan.
+/// Post-selection check: every leg must accept references, and every URL
+/// scheme in the plan must be one every leg that advertised schemes fetches
+/// (both PD legs process the same references).
 pub(crate) fn ensure_selection_supports_media_refs(
     workers: &WorkerSelection,
     plan: &MediaPlan,
@@ -247,23 +248,26 @@ pub(crate) fn ensure_selection_supports_media_refs(
     let legs: Vec<&dyn Worker> = match workers {
         WorkerSelection::Single { worker } => vec![worker.as_ref()],
         WorkerSelection::Disaggregated {
-            encode_assignments: Some(_),
-            ..
-        } => return Err(MmRefsError::EncodeNotSupported),
-        WorkerSelection::Disaggregated {
             prefill, decode, ..
         } => vec![prefill.as_ref(), decode.as_ref()],
     };
     if !legs.iter().all(|leg| worker_accepts_media_refs(*leg)) {
         return Err(MmRefsError::WorkerNotCapable);
     }
-    let Some(primary) = legs.first() else {
-        return Err(MmRefsError::WorkerNotCapable);
-    };
-    let accepted = worker_media_ref_schemes(*primary);
-    if accepted.is_empty() {
-        return Ok(());
+    let mut accepted: Option<HashSet<String>> = None;
+    for leg in &legs {
+        let schemes = worker_media_ref_schemes(*leg);
+        if schemes.is_empty() {
+            continue;
+        }
+        accepted = Some(match accepted {
+            Some(current) => current.intersection(&schemes).cloned().collect(),
+            None => schemes,
+        });
     }
+    let Some(accepted) = accepted else {
+        return Ok(());
+    };
     for part in plan.parts() {
         let Some(url) = part_url(part) else {
             continue;
@@ -318,40 +322,55 @@ fn data_url_payload_bytes(url: &str) -> Option<usize> {
     })
 }
 
+/// Classify one part as a forwardable reference: its modality, URL and the
+/// router's byte cap for inline payloads.
+fn forwardable_ref(
+    part: &MediaContentPart,
+) -> Result<(common::Modality, &str, usize), MmRefsError> {
+    match part {
+        MediaContentPart::ImageUrl {
+            url,
+            max_long_side_pixel: None,
+            ..
+        } => Ok((common::Modality::Image, url, media::image_max_input_bytes())),
+        MediaContentPart::VideoUrl {
+            url,
+            fps: None,
+            max_long_side_pixel: None,
+            ..
+        } => Ok((common::Modality::Video, url, media::video_max_input_bytes())),
+        MediaContentPart::ImageUrl { .. } | MediaContentPart::VideoUrl { .. } => {
+            Err(MmRefsError::HintUnsupported)
+        }
+        MediaContentPart::ImageData { .. } => {
+            Err(MmRefsError::UnsupportedPart("inline image bytes"))
+        }
+        MediaContentPart::VideoData { .. } => {
+            Err(MmRefsError::UnsupportedPart("inline video bytes"))
+        }
+        MediaContentPart::AudioUrl { .. } | MediaContentPart::AudioData { .. } => {
+            Err(MmRefsError::UnsupportedPart("audio"))
+        }
+        MediaContentPart::ImageEmbeds { .. } => {
+            Err(MmRefsError::UnsupportedPart("image embeddings"))
+        }
+        MediaContentPart::Text { .. } => Err(MmRefsError::UnsupportedPart("text")),
+    }
+}
+
+/// The first reason this plan cannot be forwarded, if any.
+pub(crate) fn refs_blocker(plan: &MediaPlan) -> Option<MmRefsError> {
+    plan.parts()
+        .iter()
+        .find_map(|part| forwardable_ref(part).err())
+}
+
 /// Build the wire payload from the plan, in authored (prompt) order.
 pub(crate) fn assemble_media_refs(plan: MediaPlan) -> Result<vllm::MediaRefs, MmRefsError> {
     let mut items = Vec::with_capacity(plan.parts().len());
-    for (index, part) in plan.into_parts().into_iter().enumerate() {
-        let (modality, url, limit) = match part {
-            MediaContentPart::ImageUrl {
-                url,
-                max_long_side_pixel: None,
-                ..
-            } => (common::Modality::Image, url, media::image_max_input_bytes()),
-            MediaContentPart::VideoUrl {
-                url,
-                fps: None,
-                max_long_side_pixel: None,
-                ..
-            } => (common::Modality::Video, url, media::video_max_input_bytes()),
-            MediaContentPart::ImageUrl { .. } | MediaContentPart::VideoUrl { .. } => {
-                return Err(MmRefsError::HintUnsupported)
-            }
-            MediaContentPart::ImageData { .. } => {
-                return Err(MmRefsError::UnsupportedPart("inline image bytes"))
-            }
-            MediaContentPart::VideoData { .. } => {
-                return Err(MmRefsError::UnsupportedPart("inline video bytes"))
-            }
-            MediaContentPart::AudioUrl { .. } | MediaContentPart::AudioData { .. } => {
-                return Err(MmRefsError::UnsupportedPart("audio"))
-            }
-            MediaContentPart::ImageEmbeds { .. } => {
-                return Err(MmRefsError::UnsupportedPart("image embeddings"))
-            }
-            MediaContentPart::Text { .. } => return Err(MmRefsError::UnsupportedPart("text")),
-        };
-        if let Some(bytes) = data_url_payload_bytes(&url) {
+    for (index, part) in plan.parts().iter().enumerate() {
+        let (modality, url, limit) = forwardable_ref(part)?;
+        if let Some(bytes) = data_url_payload_bytes(url) {
             if bytes > limit {
                 return Err(MmRefsError::RefTooLarge {
                     index,
@@ -362,7 +381,7 @@ pub(crate) fn assemble_media_refs(plan: MediaPlan) -> Result<vllm::MediaRefs, Mm
         }
         items.push(vllm::MediaRef {
             modality: modality as i32,
-            url,
+            url: url.to_string(),
         });
     }
     Ok(vllm::MediaRefs { items })
@@ -646,6 +665,22 @@ mod tests {
         )
         .expect_err("hints are refused");
         assert_eq!(err.code(), "multimodal_hint_unsupported_in_worker_mode");
+
+        let inline = plan(vec![MediaContentPart::ImageData {
+            data: vec![0, 1, 2],
+            mime_type: None,
+            uuid: None,
+            detail: None,
+        }]);
+        let err = resolve_mm_processing(
+            &components,
+            &registry,
+            MODEL,
+            &inline,
+            &expandable_placeholders(),
+        )
+        .expect_err("inline bytes are refused by name");
+        assert_eq!(err, MmRefsError::UnsupportedPart("inline image bytes"));
     }
 
     #[test]
@@ -690,15 +725,50 @@ mod tests {
             Err(MmRefsError::WorkerNotCapable)
         );
 
-        let epd = WorkerSelection::Disaggregated {
-            encode_assignments: Some(vec![]),
-            prefill: capable("grpc://127.0.0.1:9604"),
+        // Both legs fetch: the accepted schemes are the intersection of what
+        // each advertising leg fetches.
+        let file_prefill = worker(
+            "grpc://127.0.0.1:9604",
+            RuntimeType::Vllm,
+            ConnectionMode::Grpc,
+            &[
+                (MM_PROCESSOR_LABEL, "inprocess"),
+                (MM_MEDIA_REF_SCHEMES_LABEL, "http,https,data,file"),
+            ],
+        );
+        let mixed = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: file_prefill,
             decode: capable("grpc://127.0.0.1:9605"),
             runtime_type: RuntimeType::Vllm,
         };
+        ensure_selection_supports_media_refs(&mixed, &plan_https).expect("https on both legs");
         assert_eq!(
-            ensure_selection_supports_media_refs(&epd, &plan_https),
-            Err(MmRefsError::EncodeNotSupported)
+            ensure_selection_supports_media_refs(&mixed, &file_plan),
+            Err(MmRefsError::SchemeNotAccepted {
+                scheme: "file".to_string(),
+                accepted: "data,http,https".to_string(),
+            })
+        );
+
+        // A leg that advertises no schemes leaves the other leg's set in force.
+        let silent_decode = worker(
+            "grpc://127.0.0.1:9606",
+            RuntimeType::Vllm,
+            ConnectionMode::Grpc,
+            &[(MM_PROCESSOR_LABEL, "inprocess")],
+        );
+        let half = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: capable("grpc://127.0.0.1:9607"),
+            decode: silent_decode,
+            runtime_type: RuntimeType::Vllm,
+        };
+        assert_eq!(
+            ensure_selection_supports_media_refs(&half, &file_plan)
+                .expect_err("prefill's set still applies")
+                .code(),
+            "media_ref_scheme_not_accepted"
         );
     }
 

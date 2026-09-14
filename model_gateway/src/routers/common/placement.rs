@@ -37,8 +37,9 @@ use crate::{
 pub(crate) struct WireConstraint {
     pub runtime: RuntimeType,
     pub connection: ConnectionMode,
-    /// The plan carries media references: candidates must advertise
-    /// worker-side multimodal processing.
+    /// The retained plan carries media references. Placement pins only the
+    /// runtime and transport; the gRPC selection helpers derive their
+    /// candidate predicate from this flag.
     pub requires_media_refs: bool,
 }
 
@@ -152,20 +153,7 @@ pub(crate) fn select_single(
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
     let candidates = candidates(registry, model_id, pool, wire);
-    let filtered;
-    let candidates: &[Arc<dyn Worker>] = match inputs.candidate_filter {
-        Some(accepts) => {
-            filtered = candidates
-                .as_slice()
-                .iter()
-                .filter(|w| accepts(w.as_ref()))
-                .cloned()
-                .collect::<Vec<_>>();
-            &filtered
-        }
-        None => candidates.as_slice(),
-    };
-    select_from(registry, policies, model_id, candidates, inputs)
+    select_from(registry, policies, model_id, candidates.as_slice(), inputs)
 }
 
 /// [`select_single`] over an explicit candidate slice: the entry for a caller
@@ -179,6 +167,21 @@ pub(crate) fn select_from(
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
     let policy = policies.get_policy_or_default(model_id);
+
+    // The per-request predicate applies to every entry point, so a caller
+    // that sets it can never dispatch to a worker it rejects.
+    let accepted;
+    let candidates: &[Arc<dyn Worker>] = match inputs.candidate_filter {
+        Some(accepts) => {
+            accepted = candidates
+                .iter()
+                .filter(|w| accepts(w.as_ref()))
+                .cloned()
+                .collect::<Vec<_>>();
+            &accepted
+        }
+        None => candidates,
+    };
 
     // Most policies already apply the complete availability predicate. Give
     // them the shared snapshot directly instead of cloning every available

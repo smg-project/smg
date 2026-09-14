@@ -14,7 +14,10 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
-        common::placement::{self, PairFailure, PlacementFailure, PlacementInputs},
+        common::{
+            placement::{self, PairFailure, PlacementFailure, PlacementInputs},
+            retry::mark_non_retryable,
+        },
         error,
         grpc::{
             context::{
@@ -173,6 +176,12 @@ impl PipelineStage for WorkerSelectionStage {
                 }
             }
             WorkerSelectionMode::EncodePrefillDecode => {
+                // Encode workers never process references: refuse strict
+                // worker mode here rather than silently bypass the encode fleet.
+                if media_refs {
+                    let err = multimodal::MmRefsError::EncodeNotSupported;
+                    return Err(error::bad_request(err.code(), err.to_string()));
+                }
                 let encode_item_hashes = match encode_item_hashes(intermediate) {
                     Ok(hashes) => hashes,
                     Err(err) => {
@@ -278,6 +287,7 @@ impl WorkerSelectionStage {
         let cache_namespace = ctx.routing.cache_namespace;
         let headers = ctx.headers.as_ref();
         let model_id = ctx.model_id.as_str();
+        // The retained wire carries the media-refs pin; the helpers derive it.
         let wire = Some(ctx.wire);
 
         let workers = match self.mode {
@@ -290,7 +300,7 @@ impl WorkerSelectionStage {
                     rid_key,
                     cache_namespace,
                     wire,
-                    ctx.wire.requires_media_refs,
+                    false,
                 ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
@@ -298,7 +308,7 @@ impl WorkerSelectionStage {
                             model_id,
                             &[WorkerType::Regular],
                             wire,
-                            ctx.wire.requires_media_refs,
+                            false,
                         ))
                     }
                 }
@@ -312,7 +322,7 @@ impl WorkerSelectionStage {
                     rid_key,
                     cache_namespace,
                     wire,
-                    ctx.wire.requires_media_refs,
+                    false,
                 ) {
                     Ok((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
@@ -363,8 +373,9 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
         media_refs: bool,
     ) -> Response {
+        let media_refs = media_refs || wire.is_some_and(|w| w.requires_media_refs);
         if media_refs {
-            return self.media_refs_shed(model_id);
+            return self.media_refs_failure(model_id, legs, wire);
         }
         let mut unavailable = false;
         for leg in legs {
@@ -409,22 +420,75 @@ impl WorkerSelectionStage {
         error::model_not_found(model_id)
     }
 
-    /// No available worker advertises worker-side multimodal processing, so
-    /// a request carrying media references cannot be placed.
+    /// Selection failure for a request carrying media references, judged
+    /// from the capability-filtered pool: an absent model stays 404, an
+    /// overloaded capable pool keeps its shed, and only a leg with candidates
+    /// but no capable one is the capability shed.
+    fn media_refs_failure(
+        &self,
+        model_id: &str,
+        legs: &[WorkerType],
+        wire: Option<WireConstraint>,
+    ) -> Response {
+        let mut unavailable = false;
+        for leg in legs {
+            let pool = match leg {
+                WorkerType::Regular => RoutingPool::GrpcPipelineRegular,
+                WorkerType::Prefill => RoutingPool::GrpcPrefill,
+                WorkerType::Decode => RoutingPool::GrpcDecode,
+                WorkerType::Encode => RoutingPool::GrpcEncode,
+            };
+            let candidates = placement::candidates(&self.worker_registry, model_id, pool, wire);
+            let candidates = candidates.as_slice();
+            if candidates.is_empty() {
+                continue;
+            }
+            let capable: Vec<Arc<dyn Worker>> = candidates
+                .iter()
+                .filter(|w| accepts_media_refs(w.as_ref()))
+                .cloned()
+                .collect();
+            if capable.is_empty() {
+                return self.media_refs_shed(model_id);
+            }
+            match placement::failure_from(&capable, model_id) {
+                PlacementFailure::AllOverloaded(shed) => return shed,
+                PlacementFailure::Unavailable
+                | PlacementFailure::PolicyDeclined(_)
+                | PlacementFailure::NoCompatiblePair { .. } => unavailable = true,
+                PlacementFailure::NoCandidates => {}
+            }
+        }
+        if unavailable {
+            return self.workers_unavailable(model_id);
+        }
+        error!(
+            function = "WorkerSelectionStage::execute",
+            mode = ?self.mode,
+            model_id = %model_id,
+            "No worker serves model"
+        );
+        error::model_not_found(model_id)
+    }
+
+    /// Workers serve the model but none advertises worker-side multimodal
+    /// processing. Terminal: capability cannot change within a retry window.
     fn media_refs_shed(&self, model_id: &str) -> Response {
         error!(
             function = "WorkerSelectionStage::execute",
             mode = ?self.mode,
             model_id = %model_id,
-            "No available worker advertising worker-side multimodal processing"
+            "No worker advertising worker-side multimodal processing"
         );
-        error::service_unavailable(
+        let mut response = error::service_unavailable(
             "no_media_ref_capable_worker",
             format!(
-                "model {model_id} has no available vLLM gRPC worker advertising mm_processor; set \
+                "model {model_id} has vLLM gRPC workers but none advertises mm_processor; set \
                  SMG_VLLM_MM_PROCESSOR on the workers or SMG_MM_PROCESSING=router on the router"
             ),
-        )
+        );
+        mark_non_retryable(&mut response);
+        response
     }
 
     /// Workers serve the model but none can take the request right now
@@ -527,6 +591,7 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
         media_refs: bool,
     ) -> Option<Arc<dyn Worker>> {
+        let media_refs = media_refs || wire.is_some_and(|w| w.requires_media_refs);
         // The gRPC router serves both gRPC and direct-ZMQ workers, so the pool
         // accepts either transport (not HTTP). A retry pins the retained wire.
         placement::select_single(
@@ -575,6 +640,7 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
         media_refs: bool,
     ) -> Result<PdWorkerPair, Response> {
+        let media_refs = media_refs || wire.is_some_and(|w| w.requires_media_refs);
         // Both legs derive from ONE membership snapshot: separate pool
         // lookups could straddle a concurrent replacement and pair workers
         // that never coexisted. The pools are strictly gRPC (a ZMQ leg would
@@ -600,13 +666,19 @@ impl WorkerSelectionStage {
                 candidate_filter: media_refs.then_some(accepts_media_refs),
             },
         )
-        .map_err(|failure| match failure.verdict {
-            // Both legs must advertise worker-side processing; an emptied leg
-            // is the refs shed, not a generic unavailability.
-            PlacementFailure::NoCandidates | PlacementFailure::Unavailable if media_refs => {
+        .map_err(|failure| {
+            // Both legs must advertise worker-side processing: a failing leg
+            // with no capable worker is the capability shed; anything else
+            // keeps its own verdict.
+            let leg_pool = match failure.leg {
+                WorkerLeg::Prefill => &pairs.prefill_pool,
+                _ => &pairs.decode_pool,
+            };
+            if media_refs && !leg_pool.iter().any(|w| accepts_media_refs(w.as_ref())) {
                 self.media_refs_shed(model_id)
+            } else {
+                self.pair_failure(model_id, *failure)
             }
-            _ => self.pair_failure(model_id, *failure),
         })?;
         Ok((pair.prefill, pair.decode, pair.runtime))
     }
@@ -1840,6 +1912,67 @@ mod tests {
             error::extract_error_code_from_response(&response),
             "no_media_ref_capable_worker"
         );
+        assert!(
+            !is_retryable_response(&response),
+            "capability cannot change inside a retry window"
+        );
+        // The wire pin alone carries the media-refs fact on retries.
+        let wire = WireConstraint {
+            runtime: RuntimeType::Vllm,
+            connection: ConnectionMode::Grpc,
+            requires_media_refs: true,
+        };
+        assert!(stage
+            .select_single_worker(model_id, None, None, None, None, None, Some(wire), false)
+            .is_none());
+        let response = stage.selection_failure(model_id, &[WorkerType::Regular], Some(wire), false);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "no_media_ref_capable_worker"
+        );
+
+        // An absent model stays a 404 even in worker mode.
+        let response = stage.selection_failure("no-such-model", &[WorkerType::Regular], None, true);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Capable but overloaded workers keep the overload shed: its code,
+    /// Retry-After and non-retryable marking survive worker mode.
+    #[test]
+    fn media_refs_overloaded_capable_workers_keep_the_overload_shed() {
+        let model_id = "test-model-media-refs-overload";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let mut workers = Vec::new();
+        for i in 0..2 {
+            let worker = vllm_grpc_worker(
+                &format!("grpc://127.0.0.1:{}", 8740 + i),
+                model_id,
+                WorkerType::Regular,
+                true,
+            );
+            worker_registry.register(Arc::clone(&worker)).unwrap();
+            workers.push(worker);
+        }
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::clone(&policy_registry),
+            WorkerSelectionMode::Regular,
+        );
+        for worker in &workers {
+            worker_registry.set_worker_overloaded(worker, true);
+        }
+        assert!(stage
+            .select_single_worker(model_id, None, None, None, None, None, None, true)
+            .is_none());
+        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, true);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(
+            error::extract_error_code_from_response(&response),
+            "no_media_ref_capable_worker"
+        );
+        assert!(response.headers().contains_key("retry-after"));
+        assert!(!is_retryable_response(&response));
     }
 
     /// Both PD legs process the references, so both must advertise.
