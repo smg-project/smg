@@ -162,3 +162,90 @@ pub fn ensure_kimi_k3_cached() -> PathBuf {
 
     cache_dir
 }
+
+const DEEPSEEK_V41_REPO: &str =
+    "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/main";
+const DEEPSEEK_V41_CACHE_DIR: &str = ".tokenizer_cache/deepseek_v41";
+
+/// Downloads one DeepSeek-V4.1 tokenizer file from `base` into `dir/file`,
+/// mirroring the Kimi-K3 helper's approach: write to a `.part` file and
+/// rename into place, so a failed write never leaves a short file that a
+/// later run would trust. Returns `false` (instead of panicking) on any
+/// failure so the caller can fall back to `None` when offline.
+#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+fn download_deepseek_v41_file(
+    base: &str,
+    dir: &std::path::Path,
+    file: &str,
+    min_bytes: usize,
+) -> bool {
+    println!("Downloading DeepSeek-V4.1 {file} from HuggingFace...");
+    let client = reqwest::blocking::Client::new();
+    let Ok(response) = client.get(format!("{base}/{file}")).send() else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let Ok(content) = response.bytes() else {
+        return false;
+    };
+    if content.len() < min_bytes {
+        return false;
+    }
+    let part = dir.join(format!("{file}.part"));
+    if fs::write(&part, &content).is_err() {
+        return false;
+    }
+    fs::rename(&part, dir.join(file)).is_ok()
+}
+
+/// A directory holding the DeepSeek-V4.1-Flash tokenizer files
+/// (`tokenizer.json`, `tokenizer_config.json`) plus a minimal `config.json`
+/// naming the architecture so renderer detection selects DeepSeek-V4.1.
+///
+/// `DEEPSEEK_V41_MODEL_DIR` points at a full checkpoint directory and skips
+/// the download; otherwise the two tokenizer files are fetched once from the
+/// public repository into `.tokenizer_cache/deepseek_v41/`. Returns `None`
+/// when offline (or the repository is unreachable) and no override is set.
+#[expect(clippy::unwrap_used, reason = "test helper — panics are intentional")]
+pub fn ensure_deepseek_v41_cached() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("DEEPSEEK_V41_MODEL_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+
+    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
+    let _guard = mutex.lock().unwrap();
+
+    let cache_dir = PathBuf::from(DEEPSEEK_V41_CACHE_DIR);
+    if !cache_dir.exists() {
+        fs::create_dir_all(&cache_dir).ok()?;
+    }
+
+    for (file, min_bytes) in [
+        ("tokenizer.json", 1_000_000),
+        ("tokenizer_config.json", 500),
+    ] {
+        let path = cache_dir.join(file);
+        if path.exists() {
+            continue;
+        }
+        if !download_deepseek_v41_file(DEEPSEEK_V41_REPO, &cache_dir, file, min_bytes) {
+            return None;
+        }
+    }
+
+    // Renderer detection reads `config.json::architectures`; the tokenizer
+    // needs nothing else from the checkpoint, plus `image_token_id` for the
+    // V4.1 image placeholder.
+    let config_path = cache_dir.join("config.json");
+    if !config_path.exists() {
+        fs::write(
+            &config_path,
+            r#"{"architectures":["DeepseekV41ForCausalLM"],"model_type":"deepseek_v41","image_token_id":129264}"#,
+        )
+        .ok()?;
+    }
+
+    Some(cache_dir)
+}
