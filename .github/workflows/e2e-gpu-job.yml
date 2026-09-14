@@ -168,6 +168,12 @@ jobs:
           pip install wheel/*.whl
           bash scripts/ci_install_e2e_deps.sh ${{ inputs.extra_deps }}
 
+      # The servicer's vLLM-gated unit tests (importorskip("vllm")) only meet a
+      # real vLLM here; the CPU unit-test job skips them.
+      - name: Run vLLM-gated servicer unit tests
+        if: inputs.engine == 'vllm'
+        run: pytest -q grpc_servicer/tests -p no:cacheprovider
+
       - name: Setup Oracle
         if: inputs.setup_agentic_deps
         run: |
