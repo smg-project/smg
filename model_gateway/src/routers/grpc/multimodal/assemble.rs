@@ -36,6 +36,7 @@ use crate::{
         proto_wrapper::{
             cleanup_tokenspeed_items_encoder_shm, SglangMultimodalData, TensorBytes,
             TokenSpeedModality, TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
+            TokenSpeedTensorStorage,
             TokenSpeedTensor, TrtllmMultimodalData, VllmMultimodalData,
         },
         MultimodalData,
@@ -798,6 +799,139 @@ mod tests {
         cleanup_tokenspeed_items_encoder_shm(&data.items, None);
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn deepseek_v4_assembly_preserves_complete_item_tensors() {
+        use llm_multimodal::{
+            vision::{processors::deepseek_v4::DeepseekV4Processor, VisionPreProcessor},
+            ModelMetadata, ModelRegistry,
+        };
+
+        let tokenizer = llm_tokenizer::MockTokenizer::new();
+        let tokenizer = super::super::RegistryTokenizer(&tokenizer);
+        let config = serde_json::json!({"model_type": "deepseek_v4", "vision_n_layers": 1});
+        let metadata = ModelMetadata {
+            model_id: "deepseek-v4-vision",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let registry = ModelRegistry::new();
+        let spec = registry.lookup(&metadata).unwrap();
+        let images = [
+            image::DynamicImage::new_rgb8(84, 84),
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                126,
+                42,
+                image::Rgb([255, 255, 255]),
+            )),
+        ];
+        let processor_config =
+            serde_json::from_value(serde_json::json!({"vision_min_pixels": 0})).unwrap();
+        let preprocessed = DeepseekV4Processor
+            .preprocess(&images, &processor_config)
+            .unwrap();
+        let bindings = [(0, 13), (14, 11)]
+            .into_iter()
+            .enumerate()
+            .map(|(item_index, (offset, length))| {
+                let range = PlaceholderRange { offset, length };
+                PromptBinding {
+                    item_index,
+                    prompt_ordinal: item_index,
+                    structural: range.clone(),
+                    patches: vec![range],
+                }
+            })
+            .collect();
+        let intermediate = PrecomputedMultimodalIntermediate {
+            preprocessed,
+            media: MediaBatch::Images(
+                images
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, image)| {
+                        Arc::new(ImageFrame::new(
+                            image,
+                            bytes::Bytes::new(),
+                            ImageDetail::Auto,
+                            llm_multimodal::ImageSource::InlineBytes,
+                            format!("image-{i}"),
+                        ))
+                    })
+                    .collect(),
+            ),
+            bindings,
+            placeholder_token_id: Some(129264),
+            field_layouts: spec.encoder_field_layouts_for(Modality::Image),
+            keep_on_cpu_keys: spec.keep_on_cpu_keys(),
+        };
+        let assembled = assemble_tokenspeed_with_options(
+            &intermediate,
+            TokenSpeedAssemblyOptions {
+                shm_enabled: false,
+                shm_min_bytes: 0,
+                encoder_input_dtype: "float32".to_string(),
+                skip_pixel_values: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(assembled.items.len(), 2);
+        for (index, item) in assembled.items.iter().enumerate() {
+            let (patches, perm) = if index == 0 {
+                (36, vec![0, 2, 1, 3])
+            } else {
+                (27, vec![0, 1, 2])
+            };
+            assert_eq!(item.encoder_input.shape, vec![patches, 3, 14, 14]);
+            assert_eq!(
+                item.encoder_input.nbytes(),
+                patches as usize * 3 * 14 * 14 * 4
+            );
+            let TokenSpeedTensorStorage::Inline(data) = &item.encoder_input.storage else {
+                panic!("expected inline tensor");
+            };
+            let pixel = if index == 0 { -1.0f32 } else { 1.0f32 };
+            assert!(data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|v| f32::from_le_bytes(*v) == pixel));
+            let decode = |name: &str| {
+                item.model_specific_tensors[name]
+                    .data
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|v| i64::from_le_bytes(*v))
+                    .collect::<Vec<_>>()
+            };
+            // Tensor descriptors must ride along, not just raw bytes: the
+            // engine's receiver slices by shape and dtype.
+            for name in ["types", "perm", "types_lengths", "patch_counts", "perm_lengths"] {
+                let tensor = &item.model_specific_tensors[name];
+                assert_eq!(tensor.dtype, "int64", "{name} dtype");
+                assert!(
+                    !tensor.shape.is_empty(),
+                    "{name} shape must be populated"
+                );
+            }
+            assert_eq!(decode("perm"), perm);
+            let types = decode("types");
+            assert_eq!(types.len(), 13);
+            assert_eq!(&types[..4], &[1, 1, 1, 0]);
+            assert_eq!(types.last(), Some(&4));
+            assert_eq!(decode("types_lengths"), vec![13]);
+            assert_eq!(decode("patch_counts"), vec![patches as i64]);
+            assert_eq!(decode("perm_lengths"), vec![perm.len() as i64]);
+            assert_eq!(item.placeholder_token_id, Some(129264));
+        }
+        assert_eq!(assembled.items[0].mm_placeholders, vec![(0, 13)]);
+        assert_eq!(assembled.items[1].mm_placeholders, vec![(14, 11)]);
+        assert_ne!(
+            assembled.items[0].content_hash,
+            assembled.items[1].content_hash
+        );
     }
 
     #[test]

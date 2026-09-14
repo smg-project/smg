@@ -318,6 +318,19 @@ pub trait ModelProcessorSpec: Send + Sync {
     fn keep_on_cpu_keys_for(&self, _modality: Modality) -> Vec<String> {
         self.keep_on_cpu_keys()
     }
+
+    /// Token alignment of expanded replacement blocks, if the model requires
+    /// them to start at an index divisible by `alignment`.
+    ///
+    /// Specs that return `Some(n)` must pad each replacement's head with
+    /// `n - 1` neutral tokens; the replacement layer trims
+    /// `block_start % n` of them so the block's payload lands on an aligned
+    /// index (DeepSeek V4's aligner compression, e.g., needs IMAGE data at a
+    /// multiple of 4). Engines consuming the trimmed block must apply the
+    /// same trim to their per-item layouts.
+    fn replacement_alignment(&self) -> Option<u32> {
+        None
+    }
 }
 
 #[cfg(test)]

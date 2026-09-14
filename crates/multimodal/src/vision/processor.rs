@@ -206,6 +206,7 @@ impl VisionProcessorRegistry {
     /// - `qwen3.5` / `qwen3_5` -> Qwen3VLProcessor (Qwen3.5 reuses Qwen3-VL preprocessing)
     /// - `qwen4_exp` / `qwen4-exp` -> Qwen3VLProcessor (same vision tower as Qwen3.5)
     /// - `phi-3-vision` -> Phi3VisionProcessor (HD transform with 336x336 tiles)
+    /// - `deepseek_v4` -> DeepseekV4Processor (aligner-grid resize + N-layout sentinels)
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
 
@@ -227,6 +228,16 @@ impl VisionProcessorRegistry {
         registry.register(
             "llava-next",
             Box::new(super::processors::LlavaNextProcessor::new()),
+        );
+
+        // DeepSeek V4 Flash Vision (model_type deepseek_v4 with a vision tower).
+        registry.register(
+            "deepseek_v4",
+            Box::new(super::processors::DeepseekV4Processor),
+        );
+        registry.register(
+            "deepseek-v4",
+            Box::new(super::processors::DeepseekV4Processor),
         );
         registry.register(
             "llava_next",

@@ -31,6 +31,7 @@ struct PreparedMultimodalPart {
     prompt_replacements: Vec<PromptReplacement>,
     search_token_id: Option<u32>,
     placeholder_token_id: Option<u32>,
+    alignment: Option<u32>,
     field_layouts: EncoderFieldLayouts,
     keep_on_cpu_keys: Vec<String>,
 }
@@ -260,6 +261,7 @@ pub(crate) async fn process_multimodal_plan(
             prompt_replacements,
             search_token_id,
             placeholder_token_id,
+            alignment: spec.replacement_alignment(),
             field_layouts: spec.encoder_field_layouts_for(modality),
             keep_on_cpu_keys: spec.keep_on_cpu_keys_for(modality),
         });
@@ -274,6 +276,7 @@ pub(crate) async fn process_multimodal_plan(
             modality: part.media.modality(),
             search_token_id: part.search_token_id,
             placeholder_token_id: part.placeholder_token_id,
+            alignment: part.alignment,
             replacements: &part.prompt_replacements,
         })
         .collect::<Vec<_>>();
@@ -531,6 +534,11 @@ struct ModalityExpansion<'a> {
     modality: Modality,
     search_token_id: Option<u32>,
     placeholder_token_id: Option<u32>,
+    /// Block alignment declared by the spec (see
+    /// `ModelProcessorSpec::replacement_alignment`): `block_start % n`
+    /// leading tokens are trimmed from each replacement so its payload
+    /// starts at an aligned index.
+    alignment: Option<u32>,
     replacements: &'a [PromptReplacement],
 }
 
@@ -607,6 +615,18 @@ fn expand_tokens_for_modalities(
                 })
                 .collect::<Result<Vec<_>>>()?;
             let offset = expanded.len();
+            // Alignment trim: drop up to `alignment - 1` leading tokens so
+            // the block payload starts at an index divisible by `alignment`.
+            let trim = match expansion.alignment {
+                Some(a) => offset % a as usize,
+                None => 0,
+            };
+            anyhow::ensure!(
+                replacement_tokens.len() > trim,
+                "Aligned replacement {item_index} for {} is too short to trim {trim} tokens",
+                expansion.modality
+            );
+            let replacement_tokens = &replacement_tokens[trim..];
             let length = replacement_tokens.len();
             let patches = if let Some(feature_ranges) = &replacement.feature_ranges {
                 explicit_feature_ranges(offset, length, feature_ranges).with_context(|| {
@@ -616,9 +636,9 @@ fn expand_tokens_for_modalities(
                     )
                 })?
             } else {
-                patch_ranges(offset, &replacement_tokens, expansion.placeholder_token_id)
+                patch_ranges(offset, replacement_tokens, expansion.placeholder_token_id)
             };
-            expanded.extend(replacement_tokens);
+            expanded.extend_from_slice(replacement_tokens);
             let prefix = replacement.structural_prefix.min(offset);
             bindings[idx].push(PromptBinding {
                 item_index,
@@ -765,6 +785,7 @@ mod tests {
             modality: Modality::Image,
             search_token_id: Some(100),
             placeholder_token_id: None,
+            alignment: None,
             replacements: &replacements,
         };
         let result = expand_tokens_for_modalities(&token_ids, &[expansion]).unwrap();
@@ -796,6 +817,7 @@ mod tests {
             modality: Modality::Video,
             search_token_id: Some(100),
             placeholder_token_id: None,
+            alignment: None,
             replacements: &replacements,
         };
         let result = expand_tokens_for_modalities(&token_ids, &[expansion]).unwrap();
@@ -815,6 +837,7 @@ mod tests {
             modality: Modality::Image,
             search_token_id: None,
             placeholder_token_id: None,
+            alignment: None,
             replacements: &replacements,
         };
         let result = expand_tokens_for_modalities(&token_ids, &[expansion]).unwrap();
@@ -847,6 +870,7 @@ mod tests {
             modality: Modality::Image,
             search_token_id: Some(100),
             placeholder_token_id: None,
+            alignment: None,
             replacements: &replacements,
         };
         let result = expand_tokens_for_modalities(&token_ids, &[expansion]).unwrap();
@@ -876,6 +900,7 @@ mod tests {
             modality: Modality::Image,
             search_token_id: Some(100),
             placeholder_token_id: Some(92),
+            alignment: None,
             replacements: &replacements,
         };
         let result = expand_tokens_for_modalities(&token_ids, &[expansion]).unwrap();
@@ -904,6 +929,7 @@ mod tests {
             modality: Modality::Image,
             search_token_id: Some(200005),
             placeholder_token_id: Some(200005),
+            alignment: None,
             replacements: &replacements,
         };
 
@@ -928,6 +954,7 @@ mod tests {
             modality: Modality::Image,
             search_token_id: Some(100),
             placeholder_token_id: Some(50),
+            alignment: None,
             replacements: &replacements,
         };
 
@@ -960,6 +987,7 @@ mod tests {
             modality: Modality::Audio,
             search_token_id: Some(audio_anchor),
             placeholder_token_id: Some(audio_placeholder),
+            alignment: None,
             replacements: &replacements,
         };
         let result = expand_tokens_for_modalities(&token_ids, &[expansion]).unwrap();
@@ -1033,12 +1061,14 @@ mod tests {
                 modality: Modality::Image,
                 search_token_id: Some(image_anchor),
                 placeholder_token_id: Some(image_placeholder),
+                alignment: None,
                 replacements: &image_replacements,
             },
             ModalityExpansion {
                 modality: Modality::Audio,
                 search_token_id: Some(audio_anchor),
                 placeholder_token_id: Some(audio_placeholder),
+                alignment: None,
                 replacements: &audio_replacements,
             },
         ];
@@ -1102,18 +1132,21 @@ mod tests {
                 modality: Modality::Image,
                 search_token_id: Some(100),
                 placeholder_token_id: Some(101),
+                alignment: None,
                 replacements: &image_replacements,
             },
             ModalityExpansion {
                 modality: Modality::Video,
                 search_token_id: Some(200),
                 placeholder_token_id: Some(201),
+                alignment: None,
                 replacements: &video_replacements,
             },
             ModalityExpansion {
                 modality: Modality::Audio,
                 search_token_id: Some(300),
                 placeholder_token_id: Some(301),
+                alignment: None,
                 replacements: &audio_replacements,
             },
         ];
@@ -1152,6 +1185,7 @@ mod tests {
             modality: Modality::Image,
             search_token_id: Some(100),
             placeholder_token_id: None,
+            alignment: None,
             replacements: &replacements,
         };
         let error = expand_tokens_for_modalities(&token_ids, &[expansion]).unwrap_err();
@@ -1172,6 +1206,7 @@ mod tests {
             modality: Modality::Image,
             search_token_id: Some(100),
             placeholder_token_id: None,
+            alignment: None,
             replacements: &replacements,
         };
         let error = expand_tokens_for_modalities(&[1, 2, 3], &[expansion]).unwrap_err();
@@ -1199,12 +1234,14 @@ mod tests {
                 modality: Modality::Image,
                 search_token_id: Some(100),
                 placeholder_token_id: Some(50),
+                alignment: None,
                 replacements: &image_replacements,
             },
             ModalityExpansion {
                 modality: Modality::Audio,
                 search_token_id: Some(100),
                 placeholder_token_id: Some(60),
+                alignment: None,
                 replacements: &audio_replacements,
             },
         ];
@@ -1227,9 +1264,149 @@ mod tests {
             modality: Modality::Image,
             search_token_id: Some(100),
             placeholder_token_id: Some(50),
+            alignment: None,
             replacements: &replacements,
         };
         let error = expand_tokens_for_modalities(&[100], &[expansion]).unwrap_err();
         assert!(error.to_string().contains("Invalid negative token ID"));
+    }
+
+    #[test]
+    fn test_alignment_trims_leading_pads_to_block_position() {
+        // Replacement carries 3 leading pads (ids 9) + START(10) + payload.
+        let tokens = vec![9, 9, 9, 10, 11, 12];
+        let replacements = vec![PromptReplacement::sequence(
+            Modality::Image,
+            "<image>",
+            tokens.clone(),
+        )];
+
+        let expansion = ModalityExpansion {
+            modality: Modality::Image,
+            search_token_id: Some(100),
+            placeholder_token_id: None,
+            alignment: Some(4),
+            replacements: &replacements,
+        };
+
+        // Anchor at offset 5 → trim 5 % 4 = 1 leading pad; the payload then
+        // starts at 5 + 2 + 1 = 8 (divisible by 4).
+        let result = expand_tokens_for_modalities(&[1, 2, 3, 4, 5, 100], &[expansion]).unwrap();
+        assert_eq!(result.token_ids, vec![1, 2, 3, 4, 5, 9, 9, 10, 11, 12]);
+        assert_eq!(
+            result.bindings[0][0].structural,
+            PlaceholderRange {
+                offset: 5,
+                length: 5
+            }
+        );
+    }
+
+    #[test]
+    fn test_alignment_zero_trim_keeps_full_block() {
+        let replacements = vec![PromptReplacement::sequence(
+            Modality::Image,
+            "<image>",
+            vec![9, 9, 9, 10, 11],
+        )];
+        let expansion = ModalityExpansion {
+            modality: Modality::Image,
+            search_token_id: Some(100),
+            placeholder_token_id: None,
+            alignment: Some(4),
+            replacements: &replacements,
+        };
+        // Anchor at offset 8 (divisible by 4) → no trim.
+        let result =
+            expand_tokens_for_modalities(&[1, 2, 3, 4, 5, 6, 7, 8, 100], &[expansion]).unwrap();
+        assert_eq!(
+            result.token_ids,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 10, 11]
+        );
+    }
+
+    #[test]
+    fn deepseek_v4_png_blocks_expand_at_global_offsets() {
+        use std::io::Cursor;
+
+        use llm_multimodal::{
+            vision::{processors::deepseek_v4::DeepseekV4Processor, VisionPreProcessor},
+            ModelRegistry, ModelSpecificValue, Tokenizer,
+        };
+
+        struct ImageTokenizer;
+        impl Tokenizer for ImageTokenizer {
+            fn token_to_id(&self, token: &str) -> Option<u32> {
+                (token == "<｜deepseek_image｜>").then_some(129264)
+            }
+            fn id_to_token(&self, id: u32) -> Option<String> {
+                (id == 129264).then(|| "<｜deepseek_image｜>".to_string())
+            }
+            fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
+                None
+            }
+        }
+        let config = serde_json::json!({"model_type": "deepseek_v4", "vision_n_layers": 1});
+        let metadata = ModelMetadata {
+            model_id: "deepseek-v4-vision",
+            tokenizer: &ImageTokenizer,
+            config: &config,
+        };
+        let registry = ModelRegistry::new();
+        let spec = registry.lookup(&metadata).unwrap();
+        let mut images = Vec::new();
+        for (width, height, color) in [(84, 84, [0, 127, 255]), (126, 42, [255, 0, 127])] {
+            let original = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                width,
+                height,
+                image::Rgb(color),
+            ));
+            let mut png = Cursor::new(Vec::new());
+            original
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            images.push(image::load_from_memory(png.get_ref()).unwrap());
+        }
+        let processor_config =
+            serde_json::from_value(serde_json::json!({"vision_min_pixels": 0})).unwrap();
+        let preprocessed = DeepseekV4Processor
+            .preprocess(&images, &processor_config)
+            .unwrap();
+        let replacements = spec.prompt_replacements(&metadata, &preprocessed).unwrap();
+        let ModelSpecificValue::IntTensor { data: types, .. } =
+            &preprocessed.model_specific["types"]
+        else {
+            panic!("missing types");
+        };
+        // Every possible first-block alignment; the second uses the expanded
+        // position, which differs from its original prompt anchor position.
+        for prefix_len in 0..4 {
+            let mut input_ids = vec![7; prefix_len];
+            input_ids.extend([129264, 8, 129264, 9]);
+            let expansion = ModalityExpansion {
+                modality: Modality::Image,
+                search_token_id: Some(129264),
+                placeholder_token_id: Some(129264),
+                alignment: spec.replacement_alignment(),
+                replacements: &replacements,
+            };
+            let result = expand_tokens_for_modalities(&input_ids, &[expansion]).unwrap();
+            assert_eq!(result.bindings[0].len(), 2);
+            assert_eq!(result.bindings[0][0].structural.offset, prefix_len);
+            assert_eq!(result.bindings[0][1].structural.offset, 14);
+            assert_eq!(result.token_ids.last(), Some(&9));
+            for (item, binding) in result.bindings[0].iter().enumerate() {
+                let range = &binding.structural;
+                assert_eq!(binding.patches, vec![range.clone()]);
+                assert_eq!(range.length, 13 - range.offset % 4);
+                assert!(result.token_ids[range.offset..range.offset + range.length]
+                    .iter()
+                    .all(|&id| id == 129264));
+                let aligned_types = &types[item * 13 + range.offset % 4..(item + 1) * 13];
+                assert_eq!(aligned_types.len(), range.length);
+                let first_image = aligned_types.iter().position(|&t| t == 2).unwrap();
+                assert_eq!((range.offset + first_image) % 4, 0);
+            }
+        }
     }
 }

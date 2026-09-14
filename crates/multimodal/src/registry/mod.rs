@@ -1,3 +1,4 @@
+mod deepseek_v4;
 mod glm53_flash;
 mod inkling;
 mod kimi_k25;
@@ -13,6 +14,7 @@ mod qwen_vl;
 mod traits;
 pub mod transcription;
 
+use deepseek_v4::DeepseekV4Spec;
 use glm53_flash::Glm53FlashSpec;
 use inkling::InklingSpec;
 use kimi_k25::KimiK25VisionSpec;
@@ -42,6 +44,7 @@ impl ModelRegistry {
             specs: vec![
                 LazySpec::new(|| Box::new(Glm53FlashSpec)),
                 LazySpec::new(|| Box::new(InklingSpec)),
+                LazySpec::new(|| Box::new(DeepseekV4Spec)),
                 // Kimi-K3 must be registered before Kimi-K2.5: the two families
                 // share a transport layout but not a prompt shape.
                 LazySpec::new(|| Box::new(KimiK3VisionSpec)),
