@@ -48,12 +48,15 @@ SMG_VLLM_MM_PROCESSOR=inprocess vllm serve Qwen/Qwen3-VL-8B-Instruct --grpc \
 ```
 
 The worker then advertises `mm_processor=inprocess` and `mm_media_ref_schemes`
-through `GetServerInfo`; the router forwards `media_refs` only to workers that
-advertise. vLLM's `--allowed-media-domains`, `--allowed-local-media-path`,
-`--media-io-kwargs`, `--limit-mm-per-prompt` and `VLLM_*_FETCH_TIMEOUT` govern
-fetching on the worker. Related knobs: `SMG_VLLM_MM_MAX_INFLIGHT` (default 64)
-bounds concurrent media jobs; `SMG_VLLM_MM_MAX_ITEM_BYTES` (default 32 MiB) caps
-inline `data:` payloads.
+through `GetServerInfo`; a router with media-reference support forwards
+`media_refs` only to workers that advertise, and a router without it ignores the
+labels and keeps sending preprocessed tensors. vLLM's `--allowed-media-domains`,
+`--allowed-local-media-path`, `--media-io-kwargs`, `--limit-mm-per-prompt` and
+`VLLM_*_FETCH_TIMEOUT` govern fetching on the worker; without
+`--allowed-media-domains` the worker fetches from any host the router forwards.
+Related knobs: `SMG_VLLM_MM_MAX_INFLIGHT` (default 64) bounds concurrent media
+jobs; `SMG_VLLM_MM_MAX_ITEMS` (default 16) caps references per request;
+`SMG_VLLM_MM_MAX_ITEM_BYTES` (default 32 MiB) caps inline `data:` payloads.
 
 ### MLX
 

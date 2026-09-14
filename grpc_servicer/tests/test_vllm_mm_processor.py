@@ -76,6 +76,19 @@ class TestItemBytes:
             mm_processor.enforce_item_bytes(items, 5)
 
 
+class TestItemCount:
+    def test_within_cap_passes(self):
+        items = [_Item("image", f"https://a/{i}.png") for i in range(3)]
+        mm_processor.enforce_item_count(items, 3)
+
+    def test_over_cap_is_rejected(self):
+        items = [_Item("image", f"https://a/{i}.png") for i in range(4)]
+        with pytest.raises(
+            ValueError, match="4 items, above the 3-item cap \\(SMG_VLLM_MM_MAX_ITEMS\\)"
+        ):
+            mm_processor.enforce_item_count(items, 3)
+
+
 class TestBuildProcessor:
     class _ModelConfig:
         def __init__(self, multimodal: bool):
@@ -109,6 +122,11 @@ class TestBuildProcessor:
     def test_invalid_inflight_is_rejected_when_on(self):
         env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_INFLIGHT": "0"}
         with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_INFLIGHT"):
+            mm_processor.build_mm_processor(self._Engine(), env=env)
+
+    def test_invalid_item_count_is_rejected_when_on(self):
+        env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_ITEMS": "-1"}
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEMS"):
             mm_processor.build_mm_processor(self._Engine(), env=env)
 
 
@@ -194,6 +212,61 @@ class TestFetchErrorClassification:
         p = self.processor(asyncio.CancelledError())
         with pytest.raises(asyncio.CancelledError):
             run(p._fetch(0, _Item("image", "https://a/1.png")))
+
+
+class TestProcess:
+    """The engine-free half of process(): caps run before any fetch, and vLLM's
+    placeholder validation error is the client's."""
+
+    class _Connector:
+        def __init__(self):
+            self.fetched: list[str] = []
+
+        async def fetch_image_async(self, url):
+            self.fetched.append(url)
+            return object()
+
+    class _Renderer:
+        def __init__(self, exc=None):
+            self.exc = exc
+            self.calls: list[dict] = []
+
+        async def process_for_engine_async(self, prompt, *, arrival_time, skip_mm_cache):
+            self.calls.append(prompt)
+            if self.exc is not None:
+                raise self.exc
+            return {"prompt": prompt, "skip_mm_cache": skip_mm_cache}
+
+    def processor(self, renderer, *, max_items=16):
+        p = mm_processor.InProcessMediaProcessor.__new__(mm_processor.InProcessMediaProcessor)
+        p._engine = type("E", (), {"renderer": renderer})()
+        p._connector = self._Connector()
+        p._video_processor = None
+        p._max_item_bytes = mm_processor.DEFAULT_MAX_ITEM_BYTES
+        p._max_items = max_items
+        return p
+
+    def test_item_cap_rejects_before_any_fetch(self):
+        p = self.processor(self._Renderer(), max_items=1)
+        items = [_Item("image", "https://a/1.png"), _Item("image", "https://a/2.png")]
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEMS"):
+            run(p.process([1, 2, 3], None, items, 0.0))
+        assert p._connector.fetched == []
+
+    def test_fetched_media_reaches_the_renderer_uncached(self):
+        renderer = self._Renderer()
+        p = self.processor(renderer)
+        out = run(p.process([1, 2, 3], "hi", [_Item("image", "https://a/1.png")], 0.0))
+        assert p._connector.fetched == ["https://a/1.png"]
+        assert out["skip_mm_cache"] is True
+        assert renderer.calls[0]["prompt"] == "hi"
+        assert renderer.calls[0]["prompt_token_ids"] == [1, 2, 3]
+        assert len(renderer.calls[0]["multi_modal_data"]["image"]) == 1
+
+    def test_placeholder_validation_is_a_client_error(self):
+        p = self.processor(self._Renderer(RuntimeError("Expected 1 image placeholders, found 0")))
+        with pytest.raises(ValueError, match="multimodal placeholder validation failed: Expected"):
+            run(p.process([1, 2, 3], None, [_Item("image", "https://a/1.png")], 0.0))
 
 
 class TestServicerWiring:
