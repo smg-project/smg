@@ -891,7 +891,7 @@ mod tests {
 
         let doc: Value = serde_json::from_str(FIXTURES).unwrap();
         let cases = doc["cases"].as_array().unwrap();
-        assert_eq!(cases.len(), 27, "fixture case count");
+        assert_eq!(cases.len(), 29, "fixture case count");
 
         for case in cases {
             let name = case["name"].as_str().unwrap();

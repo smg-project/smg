@@ -1,15 +1,26 @@
 # crates/tokenizer/scripts/generate_deepseek_v41_fixtures.py
-"""Record DeepSeek-V4.1 render fixtures from the reference encoder.
+"""Record DeepSeek-V4.1 render fixtures from the reference encoders.
 
-Oracle: oracle/deepseek_v41_encoding.py (HF encoding.py @ 517ef625df, the
-revision vLLM and SGLang ported). The effort tiers are overridden to the
-engine table (spec D1). Token ids come from the real tokenizer.json.
+Oracle `hf` (the default): oracle/deepseek_v41_encoding.py (HF encoding.py @
+517ef625df, the revision vLLM and SGLang ported). The effort tiers are
+overridden to the engine table (spec D1). Token ids come from the real
+tokenizer.json.
+
+Oracle `vllm_python`: vLLM's port of that encoder, imported from the clone at
+VLLM_REPO_DIR (never vendored) and named in the fixture with the clone's HEAD
+commit. It records the shapes the HF encoder cannot render, today a developer
+message it keeps (vLLM and SGLang render it as a user turn; the HF encoder has
+no developer branch). Without VLLM_REPO_DIR those cases keep their recorded
+text and a warning says so. Its cases take string content only: vLLM flattens
+content parts in its tokenizer wrapper, not in the encoder.
 
 Usage: generate_deepseek_v41_fixtures.py <checkpoint>/encoding/tests <checkpoint>/tokenizer.json
 """
 
 import hashlib
+import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -24,12 +35,73 @@ enc.DEFAULT_REASONING_EFFORT = "high"
 HF_TESTS = Path(sys.argv[1])  # .../DeepSeek-V4.1-Flash/encoding/tests
 TOKENIZER = Path(sys.argv[2])  # .../DeepSeek-V4.1-Flash/tokenizer.json
 OUT = Path(__file__).parents[1] / "tests" / "fixtures" / "deepseek_v41"
+RENDER_FIXTURES = OUT / "render_fixtures.json"
+
+# Repo-relative path of vLLM's encoder inside the clone at VLLM_REPO_DIR.
+VLLM_SOURCE = "vllm/tokenizers/deepseek_v41_encoding.py"
 
 # The content-part spellings vLLM's `_normalize_messages` accepts. The reference
 # encoder knows only `text` and `image_url`/`image`; a part in any other spelling
 # would silently vanish from its prompt.
 TEXT_PART_TYPES = ("text", "input_text", "output_text")
 IMAGE_PART_TYPES = ("image_url", "input_image", "image_pil")
+
+
+def read_head_commit(repo):
+    """The clone's HEAD commit, read from its .git files rather than a git
+    subprocess: a plain clone keeps HEAD and refs under .git/, a linked
+    worktree points at them through `gitdir:` and `commondir`."""
+    git_dir = repo / ".git"
+    if git_dir.is_file():
+        git_dir = (repo / git_dir.read_text().split(":", 1)[1].strip()).resolve()
+    head = (git_dir / "HEAD").read_text().strip()
+    if not head.startswith("ref: "):
+        return head
+    ref = head.removeprefix("ref: ")
+    common = git_dir / "commondir"
+    ref_dir = (git_dir / common.read_text().strip()).resolve() if common.exists() else git_dir
+    loose = ref_dir / ref
+    if loose.exists():
+        return loose.read_text().strip()
+    for line in (ref_dir / "packed-refs").read_text().splitlines():
+        if line.endswith(" " + ref):
+            return line.split()[0]
+    raise ValueError(f"cannot resolve {ref} under {ref_dir}")
+
+
+def load_vllm_encoder():
+    """vLLM's encoder module and the clone's HEAD commit, or (None, None) with
+    a warning when VLLM_REPO_DIR is unset. Its effort table must already be
+    the engine table: the Rust renderer's tiers follow vLLM (spec D1), so a
+    change there is a decision to make, not something to record quietly."""
+    repo = os.environ.get("VLLM_REPO_DIR")
+    if not repo:
+        print(
+            "warning: VLLM_REPO_DIR unset; vllm_python cases keep their recorded text",
+            file=sys.stderr,
+        )
+        return None, None
+    repo = Path(repo)
+    spec = importlib.util.spec_from_file_location("vllm_deepseek_v41_encoding", repo / VLLM_SOURCE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if (
+        module.REASONING_EFFORT_MAPPINGS != ENGINE_TIERS
+        or module.DEFAULT_REASONING_EFFORT != "high"
+    ):
+        raise ValueError(
+            f"{VLLM_SOURCE} no longer uses the engine effort table {ENGINE_TIERS} with default "
+            "'high'; revisit spec D1 and the Rust ReasoningEffort::budget table before recording"
+        )
+    return module, read_head_commit(repo)
+
+
+VLLM, VLLM_REVISION = load_vllm_encoder()
+RECORDED = {}
+if VLLM is None and RENDER_FIXTURES.exists():
+    previous = json.loads(RENDER_FIXTURES.read_text())
+    RECORDED = {c["name"]: c["text"] for c in previous["cases"] if c["oracle"] == "vllm_python"}
+    VLLM_REVISION = previous["vllm_revision"]
 
 
 def load_hf_case(path):
@@ -81,6 +153,25 @@ def attach_tools(msgs, tools):
     system["tools"] = tools
 
 
+def encode(oracle, name, msgs, thinking_mode, drop_thinking, reasoning_effort):
+    if oracle == "hf":
+        module = enc
+    elif oracle == "vllm_python":
+        if VLLM is None:
+            if name not in RECORDED:
+                raise SystemExit(f"{name}: never recorded and VLLM_REPO_DIR is unset")
+            return RECORDED[name]
+        module = VLLM
+    else:
+        raise ValueError(f"{name}: unknown oracle {oracle!r}")
+    return module.encode_messages(
+        msgs,
+        thinking_mode=thinking_mode,
+        drop_thinking=drop_thinking,
+        reasoning_effort=reasoning_effort,
+    )
+
+
 def case(
     name,
     messages,
@@ -89,20 +180,17 @@ def case(
     reasoning_effort=None,
     drop_thinking=True,
     continue_final_message=False,
+    oracle="hf",
 ):
     msgs = oracle_messages(messages)
     if tools:
         attach_tools(msgs, tools)
     if continue_final_message:
         msgs[-1]["wo_eos"] = True
-    text = enc.encode_messages(
-        msgs,
-        thinking_mode=thinking_mode,
-        drop_thinking=drop_thinking,
-        reasoning_effort=reasoning_effort,
-    )
+    text = encode(oracle, name, msgs, thinking_mode, drop_thinking, reasoning_effort)
     return {
         "name": name,
+        "oracle": oracle,
         "messages": messages,
         "tools": tools,
         "thinking_mode": thinking_mode,
@@ -285,10 +373,9 @@ cases += [
         tools=[{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}],
         thinking_mode="thinking",
     ),
-    # A developer message before the last user turn is dropped by drop_thinking.
-    # (The reference encoder cannot render one it keeps: its render_message
-    # has no developer branch, unlike vLLM's port, which this checkpoint's
-    # renderer follows; so no chat-mode or with-tools developer case here.)
+    # A developer message before the last user turn is dropped by drop_thinking,
+    # which is the only developer shape the HF encoder can render; the kept
+    # shapes are recorded from vLLM's port at the end of this list.
     case("developer_then_user_thinking", DEVELOPER_THEN_USER, thinking_mode="thinking"),
     case(
         "two_user_turns",
@@ -410,16 +497,30 @@ cases += [
         ],
         thinking_mode="thinking",
     ),
+    # A kept developer message (chat mode; thinking with tools, where
+    # drop_thinking is off) renders as a <｜User｜> turn in vLLM and SGLang;
+    # the HF encoder raises on it, so vLLM's port records these two. With
+    # tools, D4 puts them on a synthesised leading system message.
+    case("developer_then_user_chat", DEVELOPER_THEN_USER, oracle="vllm_python"),
+    case(
+        "developer_with_tools",
+        DEVELOPER_THEN_USER,
+        tools=LOOKUP_TOOL,
+        thinking_mode="thinking",
+        oracle="vllm_python",
+    ),
 ]
 
 tok = Tokenizer.from_file(str(TOKENIZER))
 sha = hashlib.sha256(TOKENIZER.read_bytes()).hexdigest()
 OUT.mkdir(parents=True, exist_ok=True)
-(OUT / "render_fixtures.json").write_text(
+RENDER_FIXTURES.write_text(
     json.dumps(
         {
             "source": "deepseek-ai/DeepSeek-V4.1-Flash encoding/encoding.py",
             "revision": "517ef625df",
+            "vllm_source": VLLM_SOURCE,
+            "vllm_revision": VLLM_REVISION,
             "effort_tiers": ENGINE_TIERS,
             "cases": cases,
         },

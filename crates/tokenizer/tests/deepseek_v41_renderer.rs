@@ -2,11 +2,13 @@
 //!
 //! Every case in `tests/fixtures/deepseek_v41/render_fixtures.json` is a
 //! request `scripts/generate_deepseek_v41_fixtures.py` fed the checkpoint's
-//! `encoding/encoding.py` (`deepseek-ai/DeepSeek-V4.1-Flash`) and the text it
-//! produced. Rendering it through `HuggingFaceTokenizer` must reproduce that
-//! text byte-for-byte, and the flat encode of the text must reproduce the ids
-//! in `render_ids_fixtures.json`, recorded with the checkpoint's
-//! `tokenizer.json` (its sha256 is in the fixture).
+//! `encoding/encoding.py` (`deepseek-ai/DeepSeek-V4.1-Flash`) — or, for the
+//! shapes that encoder cannot render, vLLM's port of it — and the text it
+//! produced; each case names its oracle. Rendering it through
+//! `HuggingFaceTokenizer` must reproduce that text byte-for-byte, and the flat
+//! encode of the text must reproduce the ids in `render_ids_fixtures.json`,
+//! recorded with the checkpoint's `tokenizer.json` (its sha256 is in the
+//! fixture).
 //!
 //! The real tokenizer comes from `DEEPSEEK_V41_MODEL_DIR` or a one-time
 //! download into `.tokenizer_cache/deepseek_v41/`; with neither available the
@@ -35,6 +37,16 @@ enum ThinkingMode {
     Chat,
 }
 
+/// Which encoder recorded a case's text: the checkpoint's own `encoding.py`
+/// (`hf`) or vLLM's port (`vllm_python`), used for the shapes the reference
+/// cannot render, such as a developer message it keeps.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Oracle {
+    Hf,
+    VllmPython,
+}
+
 /// One reference case: the request the generator fed the encoder and the
 /// text it produced. Unknown fields are rejected so a regenerated fixture
 /// carrying a new knob fails here instead of rendering with it ignored.
@@ -42,6 +54,7 @@ enum ThinkingMode {
 #[serde(deny_unknown_fields)]
 struct Case {
     name: String,
+    oracle: Oracle,
     messages: Vec<Value>,
     /// `null` or an OpenAI tool list.
     tools: Option<Vec<Value>>,
@@ -162,7 +175,8 @@ fn deepseek_v41_render_text_matches_reference_fixtures_and_vendor_token_ids() {
         let rendered = render(&kwargs);
         assert_eq!(
             rendered.text, case.text,
-            "case {name}: text differs from the reference encoder"
+            "case {name}: text differs from the reference encoder (oracle {:?})",
+            case.oracle
         );
         assert!(
             matches!(rendered.encoding, PromptEncoding::FromText),

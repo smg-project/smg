@@ -1,6 +1,8 @@
 {
  "source": "deepseek-ai/DeepSeek-V4.1-Flash encoding/encoding.py",
  "revision": "517ef625df",
+ "vllm_source": "vllm/tokenizers/deepseek_v41_encoding.py",
+ "vllm_revision": "ea723c81c3ea26425cb69503a5d5e90822a04a45",
  "effort_tiers": {
   "low": 25,
   "high": 50,
@@ -10,6 +12,7 @@
  "cases": [
   {
    "name": "hf_1",
+   "oracle": "hf",
    "messages": [
     {
      "role": "system",
@@ -104,6 +107,7 @@
   },
   {
    "name": "hf_2",
+   "oracle": "hf",
    "messages": [
     {
      "role": "system",
@@ -137,6 +141,7 @@
   },
   {
    "name": "hf_3",
+   "oracle": "hf",
    "messages": [
     {
      "role": "system",
@@ -258,6 +263,7 @@
   },
   {
    "name": "hf_4",
+   "oracle": "hf",
    "messages": [
     {
      "role": "system",
@@ -295,6 +301,7 @@
   },
   {
    "name": "hf_5",
+   "oracle": "hf",
    "messages": [
     {
      "role": "system",
@@ -339,6 +346,7 @@
   },
   {
    "name": "chat_no_system",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -354,6 +362,7 @@
   },
   {
    "name": "thinking_default_effort",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -369,6 +378,7 @@
   },
   {
    "name": "thinking_low",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -384,6 +394,7 @@
   },
   {
    "name": "thinking_int_42",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -399,6 +410,7 @@
   },
   {
    "name": "thinking_history_dropped",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -423,6 +435,7 @@
   },
   {
    "name": "thinking_history_kept",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -447,6 +460,7 @@
   },
   {
    "name": "mid_system",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -474,6 +488,7 @@
   },
   {
    "name": "two_images",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -514,6 +529,7 @@
   },
   {
    "name": "tool_results_sorted",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -581,6 +597,7 @@
   },
   {
    "name": "continue_final_message",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -601,6 +618,7 @@
   },
   {
    "name": "assistant_tool_call_false_string_args",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -645,6 +663,7 @@
   },
   {
    "name": "developer_then_user_thinking",
+   "oracle": "hf",
    "messages": [
     {
      "role": "developer",
@@ -664,6 +683,7 @@
   },
   {
    "name": "two_user_turns",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -683,6 +703,7 @@
   },
   {
    "name": "image_only_part",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -705,6 +726,7 @@
   },
   {
    "name": "empty_text_and_image_parts",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -735,6 +757,7 @@
   },
   {
    "name": "input_image_and_image_pil_spellings",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -762,6 +785,7 @@
   },
   {
    "name": "tool_results_unknown_id",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -834,6 +858,7 @@
   },
   {
    "name": "thinking_trailing_assistant",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -854,6 +879,7 @@
   },
   {
    "name": "assistant_tool_call_array_string_args",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -898,6 +924,7 @@
   },
   {
    "name": "assistant_tool_call_double_encoded_args",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -942,6 +969,7 @@
   },
   {
    "name": "mid_system_with_tools",
+   "oracle": "hf",
    "messages": [
     {
      "role": "user",
@@ -988,6 +1016,7 @@
   },
   {
    "name": "response_format_on_system",
+   "oracle": "hf",
    "messages": [
     {
      "role": "system",
@@ -1015,6 +1044,65 @@
    "drop_thinking": true,
    "continue_final_message": false,
    "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\nAnswer in JSON.\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{\"type\": \"object\", \"properties\": {\"answer\": {\"type\": \"string\"}}, \"required\": [\"answer\"]}<｜User｜>q<｜Assistant｜><think>"
+  },
+  {
+   "name": "developer_then_user_chat",
+   "oracle": "vllm_python",
+   "messages": [
+    {
+     "role": "developer",
+     "content": "Follow the policy."
+    },
+    {
+     "role": "user",
+     "content": "Question?"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "chat",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Follow the policy.<｜User｜>Question?<｜Assistant｜></think>"
+  },
+  {
+   "name": "developer_with_tools",
+   "oracle": "vllm_python",
+   "messages": [
+    {
+     "role": "developer",
+     "content": "Follow the policy."
+    },
+    {
+     "role": "user",
+     "content": "Question?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "lookup",
+      "description": "Look up",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ],
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"lookup\", \"description\": \"Look up\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Follow the policy.<｜User｜>Question?<｜Assistant｜><think>"
   }
  ]
 }
