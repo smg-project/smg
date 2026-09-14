@@ -67,7 +67,8 @@ class FakeRedis:
             return None
         job = proto.decode_job(self.pushed[-1][1])
         result = self.responder(job)
-        return (key.encode(), proto.encode_result(result))
+        payload = result if isinstance(result, bytes) else proto.encode_result(result)
+        return (key.encode(), payload)
 
     async def expire(self, key, seconds):
         self.expired[key] = seconds
@@ -81,6 +82,7 @@ def fingerprint(**overrides):
         "video_backend": "opencv",
         "media_io_kwargs": "{}",
         "mm_processor_kwargs": "{}",
+        "limit_per_prompt": "{}",
     }
     values.update(overrides)
     return proto.Fingerprint(**values)
@@ -98,7 +100,7 @@ def run(coro):
 
 def ok_result(job, **extra):
     return proto.JobResult(
-        v=proto.SCHEMA_VERSION,
+        v=extra.pop("v", proto.SCHEMA_VERSION),
         job_id=job.job_id,
         ok=True,
         fingerprint=extra.pop("fingerprint", fingerprint()),
@@ -175,6 +177,16 @@ class TestSubmitAndWait:
         with pytest.raises(mm_processor.MmProcessorUnavailable, match="expired"):
             run(processor(client)._submit_and_wait(self.job()))
 
+    def test_undecodable_result_is_retryable(self):
+        client = FakeRedis(responder=lambda job: b"\xc1not-a-result")
+        with pytest.raises(mm_processor.MmProcessorUnavailable, match="undecodable result"):
+            run(processor(client)._submit_and_wait(self.job()))
+
+    def test_result_schema_version_mismatch_is_retryable(self):
+        client = FakeRedis(responder=lambda job: ok_result(job, v=proto.SCHEMA_VERSION + 1))
+        with pytest.raises(mm_processor.MmProcessorUnavailable, match="result schema v2"):
+            run(processor(client)._submit_and_wait(self.job()))
+
     def test_result_fingerprint_mismatch_is_unavailable(self):
         client = FakeRedis(
             responder=lambda job: ok_result(job, fingerprint=fingerprint(vllm_version="0.1"))
@@ -216,6 +228,16 @@ class TestProcess:
         items = [_Item("image", "data:image/png;base64,AAAAAAAAAAAA")]
         with pytest.raises(ValueError, match="above the 4-byte cap"):
             run(p.process([1], None, items, 0.0))
+        assert client.pushed == []
+
+
+class TestItemCap:
+    def test_process_caps_item_count_before_queueing(self):
+        client = FakeRedis(responder=ok_result)
+        p = processor(client, max_items=1)
+        items = [_Item("image", "https://a/1.png"), _Item("image", "https://a/2.png")]
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEMS"):
+            run(p.process([1, 2, 3], None, items, 0.0))
         assert client.pushed == []
 
 

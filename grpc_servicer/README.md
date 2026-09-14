@@ -70,10 +70,11 @@ SMG_VLLM_MM_PROCESSOR=redis SMG_VLLM_MM_REDIS_URL=redis://127.0.0.1:6379/0 \
 ```
 
 The sidecar and the worker must agree on model, vLLM version, dtype, video
-backend and media/processor kwargs (the key namespace is derived from all of
-them): the worker advertises `mm_processor=redis` only while a sidecar with a
-matching fingerprint keeps its `hello` key alive, and rejects results that
-disagree. Jobs and results travel over Redis lists under
+backend, media/processor kwargs and `--limit-mm-per-prompt` (pass the flag to
+both processes; the sidecar's limit is the one that applies, and the key
+namespace is derived from all of these): the worker advertises
+`mm_processor=redis` only while a sidecar with a matching fingerprint keeps its
+`hello` key alive, and rejects results that disagree. Jobs and results travel over Redis lists under
 `smg:mm:v1:{namespace}`; results carry full tensors keyed by a per-attempt job
 id and expire after 120 s. Knobs: `SMG_VLLM_MM_SIDECAR_TIMEOUT_MS` (30000),
 `SMG_VLLM_MM_SIDECAR_MAX_QUEUE` (256, fail fast when the queue is deeper),

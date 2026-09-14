@@ -57,6 +57,8 @@ class Fingerprint(msgspec.Struct, frozen=True):
     video_backend: str
     media_io_kwargs: str
     mm_processor_kwargs: str
+    # The sidecar's limit is the only one applied on the redis path.
+    limit_per_prompt: str
 
     def namespace(self) -> str:
         """Key namespace: fleets that would fail `mismatches` never share keys."""
