@@ -354,6 +354,39 @@ def wait_for_workers_ready(
     )
 
 
+def detect_rdma_fabric_devices() -> list[str]:
+    """RDMA devices attached to the cluster fabric, as UCX device specs.
+
+    A GPU host exposes two kinds of mlx5 device: the cluster-fabric NICs that
+    carry RDMA traffic, and the ones backing ordinary VM networking. UCX
+    enumerates both and picks whichever sits closest to the GPU, so a worker
+    whose nearest device is a VM NIC fails: either at enumeration, when that
+    NIC has no RoCE GIDs, or later on the first transfer, when it has GIDs but
+    cannot route RDMA. Which workers are hit depends on GPU-to-NIC affinity,
+    so the same job passes on one topology and fails on another.
+
+    The fabric NICs are named ``rdma*`` by the host's network configuration,
+    which is what distinguishes them here. Returns an empty list when no such
+    device exists, so callers leave UCX to its own defaults off-cluster.
+    """
+    ib_root = "/sys/class/infiniband"
+    devices: list[str] = []
+    try:
+        names = sorted(os.listdir(ib_root))
+    except OSError:
+        return devices
+
+    for name in names:
+        net_dir = os.path.join(ib_root, name, "device", "net")
+        try:
+            netdevs = os.listdir(net_dir)
+        except OSError:
+            continue
+        if any(netdev.startswith("rdma") for netdev in netdevs):
+            devices.append(f"{name}:1")
+    return devices
+
+
 def detect_ib_device() -> str | None:
     """Detect first active InfiniBand device (e.g., mlx5_0).
 
