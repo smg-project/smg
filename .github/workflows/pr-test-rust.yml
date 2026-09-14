@@ -257,9 +257,11 @@ jobs:
           rm -f crates/grpc_client/python/smg_grpc_proto/proto
           mkdir -p crates/grpc_client/python/smg_grpc_proto/proto
           cp crates/grpc_client/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
-          # msgspec gates the sidecar protocol and fake-redis tests; only the
-          # importorskip("vllm") cases stay skipped here (see the vLLM e2e lane).
-          pip install ./crates/grpc_client/python msgspec
+          # msgspec and pydantic gate the sidecar-protocol, fake-redis and
+          # limit-options tests. Modules gated on zmq or vllm still skip here
+          # (-rs lists them): the zmq ones import engine servicers that need
+          # torch, and the vllm cases run on the vLLM e2e lane.
+          pip install ./crates/grpc_client/python msgspec pydantic
           pytest -q grpc_servicer/tests -rs
 
       # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
