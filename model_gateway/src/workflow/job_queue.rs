@@ -386,7 +386,6 @@ impl JobQueue {
 
                 let workflow_data = create_worker_removal_workflow_data(
                     url.to_string(),
-                    context.router_config.dp_aware,
                     *expected_revision,
                     Arc::clone(context),
                 );

@@ -295,6 +295,15 @@ impl ReasoningParser for MinimaxM3Parser {
         Ok(self.parse_stream_buffer())
     }
 
+    fn flush(&mut self) -> Result<ParserResult, ParseError> {
+        let text = std::mem::take(&mut self.buffer);
+        Ok(if self.is_in_reasoning() {
+            ParserResult::reasoning(text)
+        } else {
+            ParserResult::normal(text)
+        })
+    }
+
     fn reset(&mut self) {
         self.state = StreamingState::BeforeReasoning;
         self.buffer.clear();

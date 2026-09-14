@@ -15,7 +15,8 @@ use super::{
 };
 use crate::{
     builders::{ChatCompletionResponseBuilder, ChatCompletionStreamResponseBuilder},
-    ext::kimi::KimiSystemExt,
+    ext::kimi::{DeclaredTools, KimiAssistantExt, KimiDeveloperExt, KimiSystemExt, KimiUserExt},
+    profile::ProviderProfile,
     validated::Normalizable,
 };
 
@@ -40,6 +41,9 @@ pub enum ChatMessage {
     User {
         content: MessageContent,
         name: Option<String>,
+        #[serde(flatten)]
+        #[schemars(skip)]
+        ext: KimiUserExt,
     },
     #[serde(rename = "assistant")]
     Assistant {
@@ -48,6 +52,9 @@ pub enum ChatMessage {
         tool_calls: Option<Vec<ToolCall>>,
         /// Reasoning content for O1-style models (SGLang extension)
         reasoning_content: Option<String>,
+        #[serde(flatten)]
+        #[schemars(skip)]
+        ext: KimiAssistantExt,
     },
     #[serde(rename = "tool")]
     Tool {
@@ -59,7 +66,15 @@ pub enum ChatMessage {
     #[serde(rename = "developer")]
     Developer {
         content: MessageContent,
-        tools: Option<Vec<Tool>>,
+        name: Option<String>,
+        #[serde(flatten)]
+        ext: KimiDeveloperExt,
+    },
+    /// MiniMax extension: top-priority instruction message, above system.
+    /// Normalized to a system message for dispatch; rejected by other profiles.
+    #[serde(rename = "root")]
+    Root {
+        content: MessageContent,
         name: Option<String>,
     },
 }
@@ -480,12 +495,28 @@ fn validate_chat_cross_parameters(
 
     // 7. Validate tool_choice requires tools — except "none" and "auto", which are valid without tools
     if let Some(ref tool_choice) = req.tool_choice {
-        // Dynamic tools on system messages count as tools (Kimi K3)
-        let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty())
-            || req.messages.iter().any(|m| {
-                matches!(m, ChatMessage::System { ext, .. }
-                    if ext.tools.as_ref().is_some_and(|t| !t.is_empty()))
-            });
+        // The effective tool set: request-level tools plus the dynamic tools
+        // declared on system and developer messages (Kimi K3). Both the
+        // "are there tools" decision and the named-choice checks below use
+        // it, so a name is resolved against everything the model will see.
+        let dynamic_tools = || {
+            req.messages.iter().flat_map(|m| match m {
+                ChatMessage::System { ext, .. } => ext
+                    .tools
+                    .as_ref()
+                    .and_then(DeclaredTools::typed)
+                    .unwrap_or_default(),
+                ChatMessage::Developer { ext, .. } => ext
+                    .tools
+                    .as_ref()
+                    .and_then(DeclaredTools::typed)
+                    .unwrap_or_default(),
+                _ => &[],
+            })
+        };
+        // Lazy on purpose: most tool traffic only needs the emptiness check.
+        let effective_tools = || req.tools.iter().flatten().chain(dynamic_tools());
+        let has_tools = effective_tools().next().is_some();
 
         let requires_tools = !matches!(
             tool_choice,
@@ -499,11 +530,11 @@ fn validate_chat_cross_parameters(
         }
 
         // Additional validation when tools are present
-        if let Some(tools) = req.tools.as_ref().filter(|t| !t.is_empty()) {
+        if has_tools {
             match tool_choice {
                 ToolChoice::Function { function, .. } => {
                     // Validate that the specified function name exists in tools
-                    let function_exists = tools.iter().any(|tool| {
+                    let function_exists = effective_tools().any(|tool| {
                         tool.tool_type == "function" && tool.function.name == function.name
                     });
 
@@ -539,7 +570,7 @@ fn validate_chat_cross_parameters(
                         match tool_ref {
                             ToolReference::Function { name } => {
                                 // Validate that the function exists in tools array
-                                let tool_exists = tools.iter().any(|tool| {
+                                let tool_exists = effective_tools().any(|tool| {
                                     tool.tool_type == "function" && tool.function.name == *name
                                 });
 
@@ -578,6 +609,9 @@ fn validate_chat_cross_parameters(
         }
     }
 
+    // 8. Provider-profile contract rules, selected from the model id
+    ProviderProfile::for_model(&req.model).validate_chat(req)?;
+
     Ok(())
 }
 
@@ -586,11 +620,17 @@ fn validate_chat_cross_parameters(
 // ============================================================================
 
 impl Normalizable for ChatCompletionRequest {
-    /// Normalize the request by applying migrations and defaults:
-    /// 1. Migrate deprecated fields to their replacements
-    /// 2. Clear deprecated fields and log warnings
-    /// 3. Apply OpenAI defaults for tool_choice
+    /// Normalize the request:
+    /// 1. Apply the profile's rewrites to the request as the client sent it,
+    ///    before any migration: drop message extensions that belong to another
+    ///    provider's profile and fold MiniMax `root` into the leading system
+    ///    message (see [`ProviderProfile::normalize_chat`])
+    /// 2. Migrate deprecated fields to their replacements
+    /// 3. Clear deprecated fields and log warnings
+    /// 4. Apply OpenAI defaults for tool_choice
     fn normalize(&mut self) {
+        ProviderProfile::for_model(&self.model).normalize_chat(self);
+
         // Migrate deprecated max_tokens → max_completion_tokens
         #[expect(deprecated)]
         if self.max_completion_tokens.is_none() && self.max_tokens.is_some() {
@@ -682,7 +722,8 @@ impl GenerationRequest for ChatCompletionRequest {
                 ChatMessage::System { content, .. }
                 | ChatMessage::User { content, .. }
                 | ChatMessage::Tool { content, .. }
-                | ChatMessage::Developer { content, .. } => {
+                | ChatMessage::Developer { content, .. }
+                | ChatMessage::Root { content, .. } => {
                     if has_content && content.has_text() {
                         buffer.push(' ');
                     }

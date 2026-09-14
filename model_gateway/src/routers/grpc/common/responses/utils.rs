@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use openai_protocol::{
     common::Tool,
-    responses::{NamespaceTool, ResponseTool, ResponsesRequest, ResponsesResponse},
+    responses::{CustomTool, NamespaceTool, ResponseTool, ResponsesRequest, ResponsesResponse},
 };
 use serde_json::to_value;
 use smg_data_connector::{
@@ -126,6 +127,9 @@ pub(crate) fn validate_worker_availability(
 ///
 /// - **Regular router**: Extracts function tools during the initial conversion from
 ///   ResponsesRequest to ChatCompletionRequest. MCP tools are merged later by the tool loop.
+///
+/// Custom tools (`{"type": "custom"}`) are downgraded to function tools with a
+/// single `input: string` parameter; `chat_to_responses` maps the calls back.
 pub(crate) fn extract_tools_from_response_tools(
     response_tools: Option<&[ResponseTool]>,
 ) -> Vec<Tool> {
@@ -140,24 +144,102 @@ pub(crate) fn extract_tools_from_response_tools(
                 tool_type: "function".to_string(),
                 function: ft.function.clone(),
             }],
+            ResponseTool::Custom(ct) => vec![Tool {
+                tool_type: "function".to_string(),
+                function: custom_tool_as_function(ct),
+            }],
             ResponseTool::Namespace(namespace) => namespace
                 .tools
                 .iter()
-                .filter_map(|member| {
-                    let NamespaceTool::Function(ft) = member else {
-                        return None;
+                .map(|member| {
+                    let mut function = match member {
+                        NamespaceTool::Function(ft) => ft.function.clone(),
+                        NamespaceTool::Custom(ct) => custom_tool_as_function(ct),
                     };
-                    let mut function = ft.function.clone();
                     function.name = format!("{}.{}", namespace.name, function.name);
-                    Some(Tool {
+                    Tool {
                         tool_type: "function".to_string(),
                         function,
-                    })
+                    }
                 })
                 .collect(),
             _ => Vec::new(),
         })
         .collect()
+}
+
+/// Downgrade a Responses custom tool to a chat function tool whose single
+/// `input` string parameter carries the free-form payload.
+pub(crate) fn custom_tool_as_function(ct: &CustomTool) -> openai_protocol::common::Function {
+    openai_protocol::common::Function {
+        name: ct.name.clone(),
+        description: ct.description.clone(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "input": {
+                    "type": "string",
+                    "description": "The raw payload to pass to this custom tool."
+                }
+            },
+            "required": ["input"],
+            "additionalProperties": false
+        }),
+        strict: Some(false),
+    }
+}
+
+/// Recover a custom tool's raw `input` from the `{"input": "..."}` arguments
+/// of its downgraded function call.
+pub(crate) fn custom_tool_input(arguments: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|v| v.get("input")?.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// Collect the names of all declared custom tools (top-level and namespaced),
+/// used to map function-shaped calls back to `custom_tool_call` items.
+pub(crate) fn custom_tool_names(
+    response_tools: Option<&[ResponseTool]>,
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let Some(tools) = response_tools else {
+        return names;
+    };
+    for tool in tools {
+        match tool {
+            ResponseTool::Custom(ct) => {
+                names.insert(ct.name.clone());
+            }
+            ResponseTool::Namespace(namespace) => {
+                for member in &namespace.tools {
+                    if let NamespaceTool::Custom(ct) = member {
+                        names.insert(format!("{}.{}", namespace.name, ct.name));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// Version tag for the opaque `reasoning.encrypted_content` payload.
+const REASONING_BLOB_PREFIX: &str = "smg-reasoning-v1.";
+
+/// Encode reasoning text as the opaque `encrypted_content` blob a `store=false`
+/// client hands back on its next turn. The gateway is stateless, so the blob
+/// carries the text itself (version-tagged base64): opaque, not confidential.
+pub(crate) fn encode_reasoning_content(text: &str) -> String {
+    format!("{REASONING_BLOB_PREFIX}{}", BASE64_STANDARD.encode(text))
+}
+
+/// Recover reasoning text from a blob produced by [`encode_reasoning_content`].
+/// Blobs from other producers yield `None`.
+pub(crate) fn decode_reasoning_content(blob: &str) -> Option<String> {
+    let payload = blob.strip_prefix(REASONING_BLOB_PREFIX)?;
+    String::from_utf8(BASE64_STANDARD.decode(payload).ok()?).ok()
 }
 
 /// Recover structured identity only for a declared namespace member.

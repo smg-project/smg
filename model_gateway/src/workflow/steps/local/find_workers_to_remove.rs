@@ -13,14 +13,13 @@ use crate::workflow::data::{WorkerList, WorkerRemovalWorkflowData};
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkerRemovalRequest {
     pub url: String,
-    pub dp_aware: bool,
     pub expected_revision: Option<u64>,
 }
 
 /// Step to find workers to remove based on URL.
 ///
-/// For DP-aware workers, finds all workers with matching URL prefix.
-/// For regular workers, finds the single worker with exact URL match.
+/// Uses registered URLs and DP base URLs, independent of the gateway's
+/// current DP setting. Backends need not be reachable during removal.
 pub struct FindWorkersToRemoveStep;
 
 #[async_trait]
@@ -37,7 +36,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
 
         let mut workers_to_remove =
-            find_workers_by_url(&app_context.worker_registry, &request.url, request.dp_aware);
+            find_workers_by_url(&app_context.worker_registry, &request.url, true);
 
         if let Some(expected_revision) = request.expected_revision {
             workers_to_remove.retain(|worker| worker.revision() == expected_revision);
@@ -54,14 +53,9 @@ impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
                 return Ok(StepResult::Success);
             }
         } else if workers_to_remove.is_empty() {
-            let error_msg = if request.dp_aware {
-                format!("No workers found with prefix {}@", request.url)
-            } else {
-                format!("Worker {} not found", request.url)
-            };
             return Err(WorkflowError::StepFailed {
                 step_id: StepId::new("find_workers_to_remove"),
-                message: error_msg,
+                message: format!("Worker {} not found", request.url),
             });
         }
 

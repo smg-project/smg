@@ -41,22 +41,32 @@ use crate::{
     workflow::data::{WorkerRemovalWorkflowData, WorkerUpdateWorkflowData},
 };
 
-/// Find workers by URL, supporting both DP-aware (prefix match) and regular (exact match) modes.
+/// Find workers by their registered URL, optionally including a backend's DP ranks.
 ///
-/// For DP-aware workers, finds all workers with URL prefix `{url}@`.
-/// For regular workers, finds the single worker with exact URL match.
+/// When including DP ranks, a base URL selects its plain registration and
+/// expanded ranks. A rank URL selects only that rank. Scheme-less discovery
+/// addresses match the address part; an explicit scheme must match exactly.
 pub(crate) fn find_workers_by_url(
     registry: &WorkerRegistry,
     url: &str,
-    dp_aware: bool,
+    include_dp_ranks: bool,
 ) -> Vec<Arc<dyn Worker>> {
-    if dp_aware {
-        let worker_url_prefix = format!("{url}@");
+    if include_dp_ranks {
+        let has_scheme = url.contains("://");
+        let matches_url = |registered: &str| {
+            let candidate = if has_scheme {
+                registered
+            } else {
+                registered
+                    .split_once("://")
+                    .map_or(registered, |(_, address)| address)
+            };
+            candidate == url
+        };
         registry
             .get_all()
-            .iter()
-            .filter(|worker| worker.url().starts_with(&worker_url_prefix))
-            .cloned()
+            .into_iter()
+            .filter(|worker| matches_url(worker.url()) || matches_url(worker.base_url()))
             .collect()
     } else {
         match registry.get_by_url(url) {
@@ -197,14 +207,12 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
 /// Helper to create initial workflow data for worker removal
 pub fn create_worker_removal_workflow_data(
     url: String,
-    dp_aware: bool,
     expected_revision: Option<u64>,
     app_context: Arc<AppContext>,
 ) -> WorkerRemovalWorkflowData {
     WorkerRemovalWorkflowData {
         config: WorkerRemovalRequest {
             url,
-            dp_aware,
             expected_revision,
         },
         workers_to_remove: None,
@@ -230,6 +238,96 @@ pub fn create_worker_update_workflow_data(
         app_context: Some(app_context),
         workers_to_update: None,
         updated_workers: None,
+    }
+}
+
+#[cfg(test)]
+mod dp_removal_tests {
+    use super::*;
+    use crate::worker::BasicWorkerBuilder;
+
+    fn register(registry: &WorkerRegistry, base: &str, rank: Option<usize>) {
+        let builder = BasicWorkerBuilder::new(base);
+        let builder = match rank {
+            Some(rank) => builder.dp_config(rank, 2),
+            None => builder,
+        };
+        registry.register(Arc::new(builder.build())).unwrap();
+    }
+
+    fn urls(registry: &WorkerRegistry, url: &str) -> Vec<String> {
+        let mut urls: Vec<_> = find_workers_by_url(registry, url, true)
+            .iter()
+            .map(|worker| worker.url().to_string())
+            .collect();
+        urls.sort_unstable();
+        urls
+    }
+
+    #[test]
+    fn base_url_matches_plain_and_expanded_registrations() {
+        for scheme in ["http", "https", "grpc", "grpcs", "ipc"] {
+            let registry = WorkerRegistry::new();
+            let base = format!("{scheme}://worker:3000");
+            register(&registry, &base, None);
+            register(&registry, &base, Some(0));
+            register(&registry, &base, Some(1));
+            register(&registry, &format!("{base}0"), None);
+            register(&registry, &format!("{base}/other"), Some(0));
+
+            let expected = vec![base.clone(), format!("{base}@0"), format!("{base}@1")];
+            assert_eq!(urls(&registry, &base), expected);
+            assert_eq!(urls(&registry, "worker:3000"), expected);
+        }
+    }
+
+    #[test]
+    fn rank_url_selects_only_that_registered_rank() {
+        let registry = WorkerRegistry::new();
+        register(&registry, "http://worker:3000", None);
+        register(&registry, "http://worker:3000", Some(0));
+        register(&registry, "http://worker:3000", Some(1));
+        for query in ["http://worker:3000@1", "worker:3000@1"] {
+            assert_eq!(urls(&registry, query), vec!["http://worker:3000@1"]);
+        }
+        assert!(urls(&registry, "worker:3000@2").is_empty());
+    }
+
+    #[test]
+    fn explicit_scheme_preserves_other_protocol_registrations() {
+        let registry = WorkerRegistry::new();
+        register(&registry, "http://worker:3000", None);
+        register(&registry, "grpc://worker:3000", Some(0));
+        register(&registry, "https://worker:3000", Some(0));
+        assert_eq!(
+            urls(&registry, "http://worker:3000"),
+            vec!["http://worker:3000"]
+        );
+        assert_eq!(
+            urls(&registry, "worker:3000"),
+            vec![
+                "grpc://worker:3000@0",
+                "http://worker:3000",
+                "https://worker:3000@0",
+            ]
+        );
+    }
+
+    #[test]
+    fn rank_matching_uses_metadata_not_an_at_sign_prefix() {
+        let registry = WorkerRegistry::new();
+        register(&registry, "http://user@worker:3000", Some(0));
+        register(&registry, "ipc:///tmp/worker@socket", None);
+        assert!(urls(&registry, "http://user").is_empty());
+        assert!(urls(&registry, "ipc:///tmp/worker").is_empty());
+        assert_eq!(
+            urls(&registry, "http://user@worker:3000"),
+            vec!["http://user@worker:3000@0"]
+        );
+        assert_eq!(
+            urls(&registry, "ipc:///tmp/worker@socket"),
+            vec!["ipc:///tmp/worker@socket"]
+        );
     }
 }
 

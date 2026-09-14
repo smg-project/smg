@@ -192,14 +192,7 @@ impl KimiK3Parser {
     /// Strips the response-open prefix, removes complete response-close and
     /// message-close markers, then holds back any partial marker suffix.
     ///
-    /// The held-back partial-marker suffix is intentionally never force-flushed:
-    /// the [`ReasoningParser`] trait has no finalize/end-of-stream hook, and the
-    /// only bytes ever withheld are a proper prefix of a control marker (e.g.
-    /// `<|clo`). A complete generation always ends on a whole marker, so nothing
-    /// is lost in practice; a stream truncated mid-marker-prefix is already
-    /// incomplete output, and dropping that dangling fragment is preferable to
-    /// leaking a partial control token as content.
-    fn content_ready_to_emit(&self, text: &str) -> String {
+    fn content_ready_to_emit(&self, text: &str, final_chunk: bool) -> String {
         // Strip the response-open marker as a prefix (first occurrence only).
         // In the K3 grammar the response channel opens exactly once and its
         // opening marker is a prefix of the content tail, so a slice from its
@@ -218,8 +211,11 @@ impl KimiK3Parser {
         let text = self.message_open_re.replace_all(&text, "");
         let text = self.message_close_re.replace_all(&text, "");
 
-        // Hold back any partial marker suffix (see the fn-level note above:
-        // withheld only while it could still complete into a control marker).
+        if final_chunk {
+            return text.into_owned();
+        }
+
+        // Hold a possible marker prefix until the next chunk or EOF.
         let text_str: &str = &text;
         let overlap = Self::compute_overlap(
             text_str,
@@ -321,7 +317,7 @@ impl ReasoningParser for KimiK3Parser {
         if self.reason_phase_ended {
             // Content phase: emit new content from the post-think tail.
             let content_tail = &self.buffer[self.content_tail_start..];
-            let current_safe = self.content_ready_to_emit(content_tail);
+            let current_safe = self.content_ready_to_emit(content_tail, false);
             // Invariant: `emitted_content` is always a prefix of `current_safe`;
             // on the impossible mismatch, emit nothing rather than double-emit.
             let new_content = if current_safe.starts_with(self.emitted_content.as_str()) {
@@ -370,7 +366,7 @@ impl ReasoningParser for KimiK3Parser {
 
             // Initial content delta (safe prefix of the content tail).
             let content_tail = &self.buffer[content_start..];
-            let content_safe = self.content_ready_to_emit(content_tail);
+            let content_safe = self.content_ready_to_emit(content_tail, false);
             self.emitted_content.clone_from(&content_safe);
 
             Ok(ParserResult {
@@ -396,6 +392,33 @@ impl ReasoningParser for KimiK3Parser {
                 reasoning_text: reasoning_delta,
             })
         }
+    }
+
+    fn flush(&mut self) -> Result<ParserResult, ParseError> {
+        if self.buffer.is_empty() {
+            return Ok(ParserResult::default());
+        }
+        let result = if self.reason_phase_ended {
+            let content = self.content_ready_to_emit(&self.buffer[self.content_tail_start..], true);
+            ParserResult::normal(
+                content
+                    .strip_prefix(&self.emitted_content)
+                    .unwrap_or("")
+                    .to_owned(),
+            )
+        } else if self.in_reasoning {
+            let start = self.think_open_re.find(&self.buffer).map_or(0, |m| m.end());
+            let text = &self.buffer[start..];
+            ParserResult::reasoning(
+                text.strip_prefix(&self.emitted_reasoning)
+                    .unwrap_or("")
+                    .to_owned(),
+            )
+        } else {
+            ParserResult::normal(self.buffer.clone())
+        };
+        self.buffer.clear();
+        Ok(result)
     }
 
     fn reset(&mut self) {

@@ -25,8 +25,9 @@ use openai_protocol::{
     },
     common::{FunctionCallResponse, ToolCall, Usage, UsageInfo},
     responses::{
-        ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
-        ResponsesRequest, ResponsesResponse, ResponsesUsage,
+        IncompleteDetails, IncompleteReason, ResponseContentPart, ResponseOutputItem,
+        ResponseReasoningContent, ResponseStatus, ResponsesRequest, ResponsesResponse,
+        ResponsesUsage,
     },
 };
 use serde_json::{json, Value};
@@ -412,12 +413,21 @@ impl StreamingResponseAccumulator {
             item
         }));
 
-        // Determine final status
-        let status = match self.finish_reason.as_deref() {
-            Some("stop") | Some("length") => ResponseStatus::Completed,
-            Some("tool_calls") => ResponseStatus::InProgress,
-            Some("failed") | Some("error") => ResponseStatus::Failed,
-            _ => ResponseStatus::Completed,
+        // Determine final status. A `length` finish is a max_output_tokens
+        // truncation, reported as status=incomplete with incomplete_details,
+        // matching the non-streaming conversion and the streamed terminal
+        // event.
+        let (status, incomplete_details) = match self.finish_reason.as_deref() {
+            Some("stop") => (ResponseStatus::Completed, None),
+            Some("length") => (
+                ResponseStatus::Incomplete,
+                Some(IncompleteDetails {
+                    reason: IncompleteReason::MaxOutputTokens,
+                }),
+            ),
+            Some("tool_calls") => (ResponseStatus::InProgress, None),
+            Some("failed") | Some("error") => (ResponseStatus::Failed, None),
+            _ => (ResponseStatus::Completed, None),
         };
 
         // Convert usage
@@ -435,13 +445,16 @@ impl StreamingResponseAccumulator {
             ResponsesUsage::Modern(usage_info.to_response_usage())
         });
 
-        ResponsesResponse::builder(&self.response_id, &self.model)
+        let mut builder = ResponsesResponse::builder(&self.response_id, &self.model)
             .copy_from_request(&self.original_request)
             .created_at(self.created_at)
             .status(status)
             .output(output)
-            .maybe_usage(usage)
-            .build()
+            .maybe_usage(usage);
+        if let Some(details) = incomplete_details {
+            builder = builder.incomplete_details(details);
+        }
+        builder.build()
     }
 }
 

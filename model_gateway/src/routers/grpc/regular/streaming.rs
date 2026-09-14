@@ -393,16 +393,26 @@ impl StreamingProcessor {
         }
 
         // Phase 2: Main streaming loop
-        while let Some(response) = grpc_stream.next().await {
-            let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
+        let mut final_indices: Option<Vec<u32>> = None;
+        loop {
+            let response = if final_indices.is_none() {
+                grpc_stream
+                    .next()
+                    .await
+                    .transpose()
+                    .map_err(|e| format!("Stream error: {}", e.message()))?
+            } else {
+                None
+            };
+            let final_chunk = response.is_none();
 
             // Text the stop decoder produced for this response, if any. Per-chunk
             // text and the end-of-stream flush both funnel into the shared emission
             // below, so neither can reach the client without being parsed.
-            let pending: Option<(u32, String, Option<ChatLogProbs>)> = match gen_response
-                .into_response()
+            let pending: Option<(u32, String, Option<ChatLogProbs>)> = match response
+                .map(|response| response.into_response())
             {
-                ProtoResponseVariant::Chunk(chunk) => {
+                Some(ProtoResponseVariant::Chunk(chunk)) => {
                     // Track TTFT immediately on first chunk received from backend
                     if first_token_time.is_none() {
                         first_token_time = Some(Instant::now());
@@ -477,7 +487,7 @@ impl StreamingProcessor {
 
                     Some((index, chunk_text, choice_logprobs))
                 }
-                ProtoResponseVariant::Complete(complete) => {
+                Some(ProtoResponseVariant::Complete(complete)) => {
                     let index = complete.index();
 
                     // Release whatever the stop decoder still holds. It only ever
@@ -511,7 +521,14 @@ impl StreamingProcessor {
                     // Don't break - continue reading all Complete messages for n>1
                     flushed.map(|text| (index, text, None))
                 }
-                ProtoResponseVariant::None => continue,
+                Some(ProtoResponseVariant::None) => continue,
+                None => {
+                    // Route each parser's EOF text through the same tool and content path.
+                    let indices = final_indices
+                        .get_or_insert_with(|| reasoning_parsers.keys().copied().collect());
+                    let Some(index) = indices.pop() else { break };
+                    Some((index, String::new(), None))
+                }
             };
 
             let Some((index, text, choice_logprobs)) = pending else {
@@ -543,7 +560,7 @@ impl StreamingProcessor {
             let in_reasoning = if separate_reasoning && reasoning_parser_available {
                 let (normal_text, reasoning_chunk, in_reasoning) = self
                     .process_reasoning_stream(
-                        &delta,
+                        (!final_chunk).then_some(delta.as_str()),
                         index,
                         &mut reasoning_parsers,
                         thinking_override,
@@ -566,6 +583,10 @@ impl StreamingProcessor {
             } else {
                 false
             };
+
+            if final_chunk && delta.is_empty() {
+                continue;
+            }
 
             // Tool call handling
             let tool_choice_enabled =
@@ -1387,10 +1408,11 @@ impl StreamingProcessor {
     }
 
     /// Helper: Process reasoning content in streaming mode
+    /// `None` marks EOF and releases the parser's held text.
     #[expect(clippy::too_many_arguments)]
     async fn process_reasoning_stream(
         &self,
-        delta: &str,
+        delta: Option<&str>,
         index: u32,
         reasoning_parsers: &mut HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
         thinking_override: bool,
@@ -1428,7 +1450,10 @@ impl StreamingProcessor {
         if let Some(pooled_parser) = reasoning_parsers.get(&index) {
             let (parse_result, in_reasoning) = {
                 let mut parser = pooled_parser.lock().await;
-                let result = parser.parse_reasoning_streaming_incremental(delta);
+                let result = match delta {
+                    Some(text) => parser.parse_reasoning_streaming_incremental(text),
+                    None => parser.flush(),
+                };
                 let in_reasoning = parser.is_in_reasoning();
                 (result, in_reasoning)
             };
@@ -1457,7 +1482,7 @@ impl StreamingProcessor {
             }
         }
 
-        (delta.to_string(), None, false)
+        (delta.unwrap_or_default().to_string(), None, false)
     }
 
     /// Helper: Process specific function case - emit tool call deltas with arguments
@@ -1687,10 +1712,11 @@ impl StreamingProcessor {
     /// Process reasoning content in Messages streaming mode (n=1 only).
     ///
     /// Returns `(normal_text, reasoning_text, in_reasoning)`.
+    /// `None` marks EOF and releases the parser's held text.
     /// Caller handles SSE event emission.
     async fn process_messages_reasoning(
         &self,
-        delta: &str,
+        delta: Option<&str>,
         reasoning_parser: &mut Option<Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
         thinking_override: bool,
         think_in_prefill: bool,
@@ -1718,7 +1744,10 @@ impl StreamingProcessor {
         if let Some(ref parser_arc) = reasoning_parser {
             let (parse_result, in_reasoning) = {
                 let mut parser = parser_arc.lock().await;
-                let result = parser.parse_reasoning_streaming_incremental(delta);
+                let result = match delta {
+                    Some(text) => parser.parse_reasoning_streaming_incremental(text),
+                    None => parser.flush(),
+                };
                 let in_reasoning = parser.is_in_reasoning();
                 (result, in_reasoning)
             };
@@ -1735,7 +1764,7 @@ impl StreamingProcessor {
             }
         }
 
-        (delta.to_string(), String::new(), false)
+        (delta.unwrap_or_default().to_string(), String::new(), false)
     }
 
     /// Process streaming Messages API response and return SSE response.
@@ -2036,14 +2065,20 @@ impl StreamingProcessor {
         .await?;
 
         // Phase 2: Main streaming loop
-        while let Some(response) = grpc_stream.next().await {
-            let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
+        let mut final_chunk = false;
+        while !final_chunk {
+            let response = grpc_stream
+                .next()
+                .await
+                .transpose()
+                .map_err(|e| format!("Stream error: {}", e.message()))?;
+            final_chunk = response.is_none();
 
             // Text the stop decoder produced for this response, if any. Per-chunk
             // text and the end-of-stream flush both funnel into the shared emission
             // below, so neither can reach the client without being parsed.
-            let pending: Option<String> = match gen_response.into_response() {
-                ProtoResponseVariant::Chunk(chunk) => {
+            let pending: Option<String> = match response.map(|response| response.into_response()) {
+                Some(ProtoResponseVariant::Chunk(chunk)) => {
                     if first_token_time.is_none() {
                         first_token_time = Some(Instant::now());
                     }
@@ -2077,7 +2112,7 @@ impl StreamingProcessor {
 
                     Some(chunk_text)
                 }
-                ProtoResponseVariant::Complete(complete) => {
+                Some(ProtoResponseVariant::Complete(complete)) => {
                     // Release whatever the stop decoder still holds. It only ever
                     // retains a partial stop-sequence match, and it is routed through
                     // the same parsers as every other chunk rather than straight out.
@@ -2097,7 +2132,9 @@ impl StreamingProcessor {
                     }
                     flushed
                 }
-                ProtoResponseVariant::None => continue,
+                Some(ProtoResponseVariant::None) => continue,
+                None if reasoning_parser.is_some() => Some(String::new()),
+                None => break,
             };
 
             let Some(chunk_text) = pending else {
@@ -2107,7 +2144,7 @@ impl StreamingProcessor {
             // Apply reasoning parser
             let (normal_text, reasoning_chunk_text, in_reasoning) = if reasoning_parser_available {
                 self.process_messages_reasoning(
-                    &chunk_text,
+                    (!final_chunk).then_some(chunk_text.as_str()),
                     &mut reasoning_parser,
                     thinking_override,
                     think_in_prefill,
@@ -2147,6 +2184,10 @@ impl StreamingProcessor {
                     },
                 )
                 .await?;
+            }
+
+            if final_chunk && normal_text.is_empty() {
+                continue;
             }
 
             // Transition: reasoning ended, close thinking block
@@ -3284,6 +3325,9 @@ impl StreamingProcessor {
         }
     }
 }
+
+#[cfg(test)]
+mod eof_tests;
 
 #[cfg(test)]
 mod tests {

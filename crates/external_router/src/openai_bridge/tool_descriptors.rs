@@ -323,6 +323,9 @@ fn is_client_visible_output_item(
         ResponseOutputItem::FunctionToolCall { name, .. } => {
             !session.should_hide_function_call_like(name, user_function_names)
         }
+        // Custom tool calls are user-declared (never MCP-hosted), so they are
+        // always client-visible.
+        ResponseOutputItem::CustomToolCall { .. } => true,
         ResponseOutputItem::WebSearchCall { .. }
         | ResponseOutputItem::CodeInterpreterCall { .. }
         | ResponseOutputItem::FileSearchCall { .. }

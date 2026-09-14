@@ -48,6 +48,10 @@ impl ReasoningParser for Step3Parser {
         self.base.parse_reasoning_streaming_incremental(text)
     }
 
+    fn flush(&mut self) -> Result<ParserResult, ParseError> {
+        self.base.flush()
+    }
+
     fn reset(&mut self) {
         self.base.reset();
     }

@@ -143,6 +143,15 @@ impl ReasoningParser for BaseReasoningParser {
         }
     }
 
+    fn flush(&mut self) -> Result<ParserResult, ParseError> {
+        let text = std::mem::take(&mut self.buffer);
+        Ok(if self.in_reasoning {
+            ParserResult::reasoning(text)
+        } else {
+            ParserResult::normal(text)
+        })
+    }
+
     fn reset(&mut self) {
         self.in_reasoning = self.config.always_in_reasoning;
         self.buffer.clear();

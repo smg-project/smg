@@ -1245,7 +1245,7 @@ fn responses_tool_choice_to_chat_projection() {
     }
 
     // Responses-only variants collapse onto Chat's `auto` — there is no
-    // spec-valid Chat projection for hosted / mcp / custom / apply_patch / shell.
+    // spec-valid Chat projection for hosted / mcp / apply_patch / shell.
     for variant in [
         ResponsesToolChoice::Types {
             tool_type: BuiltInToolChoiceType::FileSearch,
@@ -1254,10 +1254,6 @@ fn responses_tool_choice_to_chat_projection() {
             tool_type: McpToolChoiceTag::Mcp,
             server_label: "s".into(),
             name: None,
-        },
-        ResponsesToolChoice::Custom {
-            tool_type: CustomToolChoiceTag::Custom,
-            name: "c".into(),
         },
         ResponsesToolChoice::ApplyPatch {
             tool_type: ApplyPatchToolChoiceTag::ApplyPatch,
@@ -1271,6 +1267,17 @@ fn responses_tool_choice_to_chat_projection() {
             ChatToolChoice::Value(ChatToolChoiceValue::Auto)
         ));
     }
+
+    // The regular router downgrades custom tools to function tools, so the
+    // chat projection pins the choice by name to keep the forcing semantics.
+    assert!(matches!(
+        ResponsesToolChoice::Custom {
+            tool_type: CustomToolChoiceTag::Custom,
+            name: "c".into(),
+        }
+        .to_chat_tool_choice(),
+        ChatToolChoice::Function { function, .. } if function.name == "c"
+    ));
 }
 
 /// The Default impl is `Options(Auto)`.
