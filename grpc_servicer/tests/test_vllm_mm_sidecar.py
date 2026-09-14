@@ -4,13 +4,15 @@ Run with: pytest grpc_servicer/tests/test_vllm_mm_sidecar.py
 """
 
 import asyncio
+import sys
 import time
+import types
 
 import pytest
 
 pytest.importorskip("msgspec")
 from smg_grpc_servicer import mm_sidecar_protocol as proto  # noqa: E402
-from smg_grpc_servicer.vllm import mm_sidecar  # noqa: E402
+from smg_grpc_servicer.vllm import mm_processor, mm_sidecar  # noqa: E402
 
 
 class FakePipeline:
@@ -62,6 +64,58 @@ def fingerprint():
         mm_processor_kwargs="{}",
         limit_per_prompt="{}",
     )
+
+
+class _MmConfig:
+    def __init__(self, limit_per_prompt):
+        self.limit_per_prompt = limit_per_prompt
+        self.media_io_kwargs = {"video": {"num_frames": 8}}
+        self.mm_processor_kwargs = None
+
+    def get_limit_per_prompt(self, modality):
+        # Mirrors vLLM: 999 when unset, otherwise the validated options' count.
+        value = self.limit_per_prompt.get(modality, 999)
+        return value["count"] if isinstance(value, dict) else value
+
+
+class _ModelConfig:
+    def __init__(self, limit_per_prompt):
+        self.model = "m"
+        self.dtype = "torch.bfloat16"
+        self._mm = _MmConfig(limit_per_prompt)
+
+    def get_multimodal_config(self):
+        return self._mm
+
+
+def _fake_vllm(monkeypatch):
+    fake = types.ModuleType("vllm")
+    fake.__version__ = "0.27.1"
+    fake.envs = types.SimpleNamespace(VLLM_VIDEO_LOADER_BACKEND="opencv")
+    monkeypatch.setitem(sys.modules, "vllm", fake)
+
+
+class TestFingerprintDerivation:
+    def test_worker_and_sidecar_derive_the_same_fingerprint(self, monkeypatch):
+        _fake_vllm(monkeypatch)
+        engine = types.SimpleNamespace(model_config=_ModelConfig({"image": 8}))
+        vllm_config = types.SimpleNamespace(model_config=_ModelConfig({"image": 8}))
+        worker = mm_processor.engine_fingerprint(engine)
+        assert worker == mm_sidecar.config_fingerprint(vllm_config)
+        assert worker.limit_per_prompt == '{"audio": 999, "image": 8, "video": 999}'
+
+    def test_equivalent_limit_spellings_share_a_namespace(self, monkeypatch):
+        _fake_vllm(monkeypatch)
+        explicit = mm_processor.fingerprint_from_model_config(_ModelConfig({"image": 999}))
+        implicit = mm_processor.fingerprint_from_model_config(_ModelConfig({}))
+        nested = mm_processor.fingerprint_from_model_config(
+            _ModelConfig({"image": {"count": 999, "max_pixels": 4}})
+        )
+        assert explicit == implicit == nested
+        assert (
+            explicit.namespace()
+            != mm_processor.fingerprint_from_model_config(_ModelConfig({"image": 8})).namespace()
+        )
 
 
 def sidecar(client):

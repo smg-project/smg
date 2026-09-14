@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import time
 
@@ -37,6 +36,7 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
     resolve_namespace,
 )
 from smg_grpc_servicer.vllm.media_refs import advertised_schemes, parse_scheme_list, url_scheme
+from smg_grpc_servicer.vllm.mm_processor import fingerprint_from_model_config
 
 logger = logging.getLogger("smg_grpc_servicer.vllm.mm_sidecar")
 
@@ -55,22 +55,7 @@ def build_config(args: argparse.Namespace):
 
 
 def config_fingerprint(vllm_config) -> Fingerprint:
-    import vllm
-    from vllm import envs
-
-    model_config = vllm_config.model_config
-    mm_config = model_config.get_multimodal_config()
-    return Fingerprint(
-        model=model_config.model,
-        vllm_version=vllm.__version__,
-        dtype=str(model_config.dtype),
-        video_backend=envs.VLLM_VIDEO_LOADER_BACKEND,
-        media_io_kwargs=json.dumps(mm_config.media_io_kwargs or {}, sort_keys=True, default=str),
-        mm_processor_kwargs=json.dumps(
-            mm_config.mm_processor_kwargs or {}, sort_keys=True, default=str
-        ),
-        limit_per_prompt=json.dumps(mm_config.limit_per_prompt or {}, sort_keys=True, default=str),
-    )
+    return fingerprint_from_model_config(vllm_config.model_config)
 
 
 # Codes come from exception types where vLLM offers one. The two substring

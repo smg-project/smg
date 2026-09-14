@@ -121,10 +121,21 @@ class TestProbe:
 
     def test_fingerprint_mismatch_is_not_advertised(self):
         hello = {k.encode(): v.encode() for k, v in fingerprint(dtype="x").to_hello().items()}
+        hello[b"schema"] = str(proto.SCHEMA_VERSION).encode()
+        assert run(processor(FakeRedis(hello=hello)).probe()) is False
+
+    def test_protocol_schema_skew_is_not_advertised(self):
+        hello = {k.encode(): v.encode() for k, v in fingerprint().to_hello().items()}
+        hello[b"schema"] = str(proto.SCHEMA_VERSION + 1).encode()
+        assert run(processor(FakeRedis(hello=hello)).probe()) is False
+
+    def test_hello_without_schema_is_not_advertised(self):
+        hello = {k.encode(): v.encode() for k, v in fingerprint().to_hello().items()}
         assert run(processor(FakeRedis(hello=hello)).probe()) is False
 
     def test_matching_hello_advertises_and_adopts_schemes(self):
         hello = {k.encode(): v.encode() for k, v in fingerprint().to_hello().items()}
+        hello[b"schema"] = str(proto.SCHEMA_VERSION).encode()
         hello[b"schemes"] = b"http,https,data,file"
         p = processor(FakeRedis(hello=hello))
         assert run(p.probe()) is True

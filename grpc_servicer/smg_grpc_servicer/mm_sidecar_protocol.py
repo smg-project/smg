@@ -86,11 +86,15 @@ def _text(value: bytes | str) -> str:
     return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
 
 
-def hello_schemes(mapping: Mapping[bytes | str, bytes | str]) -> str:
+def hello_field(mapping: Mapping[bytes | str, bytes | str], name: str) -> str:
     for key, value in mapping.items():
-        if _text(key) == "schemes":
+        if _text(key) == name:
             return _text(value)
     return ""
+
+
+def hello_schemes(mapping: Mapping[bytes | str, bytes | str]) -> str:
+    return hello_field(mapping, "schemes")
 
 
 def resolve_namespace(fingerprint: Fingerprint, override: str | None) -> str:
