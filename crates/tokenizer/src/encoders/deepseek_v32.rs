@@ -5,6 +5,12 @@ use std::fmt::Write as _;
 use serde_json::{json, Value};
 use thiserror::Error;
 
+// `find_last_user_index` is byte-for-byte identical to the V4-family copy;
+// shared via `deepseek_common` rather than duplicated a third time. V3.2's
+// other tool/drop-thinking helpers are genuinely different algorithms (not
+// just a naming coincidence) and are intentionally kept local to this file.
+use super::deepseek_common::find_last_user_index;
+
 /// Mode for thinking/reasoning rendering.
 ///
 /// Mirrors the Python `thinking_mode` parameter, which only accepts `"chat"`
@@ -211,18 +217,6 @@ fn encode_arguments_to_dsml(tool_call: &Value) -> Result<String, DsEncodingError
 fn render_tools(tools: &[Value]) -> String {
     let schemas: Vec<String> = tools.iter().map(to_json).collect();
     render_tools_template(&schemas.join("\n"))
-}
-
-/// Mirrors `find_last_user_index`: returns `None` if no user/developer
-/// message exists (Python returns -1).
-fn find_last_user_index(messages: &[Value]) -> Option<usize> {
-    for idx in (0..messages.len()).rev() {
-        let role = messages[idx].get("role").and_then(|v| v.as_str());
-        if matches!(role, Some("user") | Some("developer")) {
-            return Some(idx);
-        }
-    }
-    None
 }
 
 /// Returns `true` when `index >= last_user_idx` in the Python sense, treating
