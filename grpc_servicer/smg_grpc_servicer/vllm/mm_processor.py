@@ -9,9 +9,10 @@ imported lazily inside the backends.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,8 @@ VALID_MODES = (MODE_OFF, MODE_INPROCESS, MODE_REDIS)
 
 DEFAULT_MAX_INFLIGHT = 64
 DEFAULT_MAX_ITEM_BYTES = 32 * 1024 * 1024
+# First vLLM release with renderer.process_for_engine_async(skip_mm_cache=).
+MIN_VLLM_VERSION = "0.20.0"
 
 
 class MmProcessorUnavailable(Exception):
@@ -73,12 +76,53 @@ def enforce_item_bytes(items: Sequence[Any], max_bytes: int) -> None:
             )
 
 
+async def _fetch_all(coros: Sequence[Awaitable[Any]]) -> list[Any]:
+    """Await all fetches; on the first failure cancel and reap the rest.
+
+    A bare gather leaves siblings running after one raises, outside the
+    in-flight bound. Outer cancellation still propagates to every task.
+    """
+    tasks = [asyncio.ensure_future(coro) for coro in coros]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+def _require_inprocess_apis(engine) -> None:
+    """Fail at construction, naming the fix, when vLLM lacks the APIs used here."""
+    try:
+        import vllm
+        from vllm.multimodal.media.connector import MEDIA_CONNECTOR_REGISTRY  # noqa: F401
+        from vllm.transformers_utils.processor import (  # noqa: F401
+            get_video_processor_cls_name,
+        )
+    except ImportError as e:
+        raise ValueError(f"{ENV_PROCESSOR}=inprocess needs vllm>={MIN_VLLM_VERSION} ({e})") from e
+    process = getattr(getattr(engine, "renderer", None), "process_for_engine_async", None)
+    if process is None or "skip_mm_cache" not in inspect.signature(process).parameters:
+        raise ValueError(
+            f"{ENV_PROCESSOR}=inprocess needs vllm>={MIN_VLLM_VERSION} "
+            f"(installed {vllm.__version__}: renderer.process_for_engine_async lacks skip_mm_cache)"
+        )
+
+
 class InProcessMediaProcessor:
     """Fetch with vLLM's MediaConnector and process with the engine's own renderer."""
 
     name = MODE_INPROCESS
 
-    def __init__(self, engine, *, max_item_bytes: int = DEFAULT_MAX_ITEM_BYTES) -> None:
+    def __init__(
+        self,
+        engine,
+        *,
+        max_item_bytes: int = DEFAULT_MAX_ITEM_BYTES,
+        max_inflight: int = DEFAULT_MAX_INFLIGHT,
+    ) -> None:
+        _require_inprocess_apis(engine)
         from vllm import envs
         from vllm.multimodal.media.connector import MEDIA_CONNECTOR_REGISTRY
         from vllm.transformers_utils.processor import get_video_processor_cls_name
@@ -89,6 +133,7 @@ class InProcessMediaProcessor:
         mm_config = model_config.get_multimodal_config()
         self._engine = engine
         self._max_item_bytes = max_item_bytes
+        self.max_inflight = max_inflight
         # Same construction as vLLM's OpenAI frontend, so the engine-level
         # allowlists and media_io_kwargs apply to refs fetched here.
         self._connector = MEDIA_CONNECTOR_REGISTRY.load(
@@ -120,7 +165,7 @@ class InProcessMediaProcessor:
         from vllm import TokensPrompt
 
         enforce_item_bytes(items, self._max_item_bytes)
-        fetched = await asyncio.gather(*(self._fetch(item) for item in items))
+        fetched = await _fetch_all([self._fetch(index, item) for index, item in enumerate(items)])
         multi_modal_data: dict[str, list[Any]] = {}
         for item, media in zip(items, fetched):
             multi_modal_data.setdefault(item.modality, []).append(media)
@@ -134,13 +179,20 @@ class InProcessMediaProcessor:
             prompt, arrival_time=arrival_time, skip_mm_cache=True
         )
 
-    async def _fetch(self, item):
-        if item.modality == "image":
-            return await self._connector.fetch_image_async(item.url)
-        if item.modality == "video":
-            return await self._connector.fetch_video_async(
-                item.url, video_processor=self._video_processor
-            )
+    async def _fetch(self, index: int, item):
+        """Fetch one item; every fetch failure is the caller's (a terminal 400)."""
+        try:
+            if item.modality == "image":
+                return await self._connector.fetch_image_async(item.url)
+            if item.modality == "video":
+                return await self._connector.fetch_video_async(
+                    item.url, video_processor=self._video_processor
+                )
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.warning("media_refs[%d]: fetch failed for %s: %s", index, item.modality, e)
+            raise ValueError(f"media_refs[{index}]: fetch failed: {e}") from e
         raise ValueError(f"unsupported media modality {item.modality!r}")
 
 
@@ -154,6 +206,9 @@ def build_mm_processor(engine, *, env: Mapping[str, str] = os.environ):
         logger.warning("%s=%s ignored: the served model is not multimodal", ENV_PROCESSOR, mode)
         return None
     max_item_bytes = env_int(env, ENV_MAX_ITEM_BYTES, DEFAULT_MAX_ITEM_BYTES)
+    max_inflight = env_int(env, ENV_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT)
     if mode == MODE_INPROCESS:
-        return InProcessMediaProcessor(engine, max_item_bytes=max_item_bytes)
+        return InProcessMediaProcessor(
+            engine, max_item_bytes=max_item_bytes, max_inflight=max_inflight
+        )
     raise ValueError(f"{ENV_PROCESSOR}={mode} is not available in this servicer build")

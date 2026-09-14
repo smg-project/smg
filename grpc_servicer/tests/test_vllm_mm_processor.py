@@ -3,6 +3,7 @@
 Run with: pytest grpc_servicer/tests/test_vllm_mm_processor.py
 """
 
+import asyncio
 import importlib.util
 import sys
 from dataclasses import dataclass
@@ -100,6 +101,99 @@ class TestBuildProcessor:
         env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_ITEM_BYTES": "0"}
         with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEM_BYTES"):
             mm_processor.build_mm_processor(self._Engine(), env=env)
+
+    def test_inflight_knob_is_ignored_while_off(self):
+        env = {"SMG_VLLM_MM_MAX_INFLIGHT": "sixty-four"}
+        assert mm_processor.build_mm_processor(self._Engine(), env=env) is None
+
+    def test_invalid_inflight_is_rejected_when_on(self):
+        env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_INFLIGHT": "0"}
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_INFLIGHT"):
+            mm_processor.build_mm_processor(self._Engine(), env=env)
+
+
+def run(coro):
+    return asyncio.new_event_loop().run_until_complete(coro)
+
+
+class TestFetchAll:
+    def test_returns_results_in_order(self):
+        async def value(v, delay):
+            await asyncio.sleep(delay)
+            return v
+
+        assert run(mm_processor._fetch_all([value("a", 0.02), value("b", 0.0)])) == ["a", "b"]
+
+    def test_first_failure_cancels_siblings(self):
+        state = {"slow_cancelled": False, "slow_finished": False}
+
+        async def slow():
+            try:
+                await asyncio.sleep(5)
+                state["slow_finished"] = True
+            except asyncio.CancelledError:
+                state["slow_cancelled"] = True
+                raise
+
+        async def bad():
+            await asyncio.sleep(0)
+            raise ValueError("boom")
+
+        with pytest.raises(ValueError, match="boom"):
+            run(mm_processor._fetch_all([slow(), bad()]))
+        assert state["slow_cancelled"] and not state["slow_finished"]
+
+    def test_outer_cancellation_reaches_the_fetches(self):
+        state = {"cancelled": False}
+
+        async def slow():
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                state["cancelled"] = True
+                raise
+
+        async def scenario():
+            outer = asyncio.ensure_future(mm_processor._fetch_all([slow()]))
+            await asyncio.sleep(0.01)
+            outer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await outer
+
+        run(scenario())
+        assert state["cancelled"]
+
+
+class TestFetchErrorClassification:
+    class _Connector:
+        def __init__(self, exc):
+            self.exc = exc
+
+        async def fetch_image_async(self, url):
+            raise self.exc
+
+    def processor(self, exc):
+        p = mm_processor.InProcessMediaProcessor.__new__(mm_processor.InProcessMediaProcessor)
+        p._connector = self._Connector(exc)
+        p._video_processor = None
+        return p
+
+    def test_transport_failures_become_client_errors(self):
+        p = self.processor(TimeoutError("image fetch timed out"))
+        with pytest.raises(
+            ValueError, match="media_refs\\[3\\]: fetch failed: image fetch timed out"
+        ):
+            run(p._fetch(3, _Item("image", "https://a/1.png")))
+
+    def test_value_errors_pass_through(self):
+        p = self.processor(ValueError("domain not allowed"))
+        with pytest.raises(ValueError, match="^domain not allowed$"):
+            run(p._fetch(0, _Item("image", "https://a/1.png")))
+
+    def test_cancellation_is_not_swallowed(self):
+        p = self.processor(asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            run(p._fetch(0, _Item("image", "https://a/1.png")))
 
 
 class TestServicerWiring:
