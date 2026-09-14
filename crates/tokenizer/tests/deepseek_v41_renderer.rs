@@ -92,13 +92,16 @@ fn template_kwargs(case: &Case) -> HashMap<String, Value> {
 
 /// Byte-level and token-id parity with the reference encoder, case by case:
 /// the rendered text equals the fixture text, the renderer reports a flat
-/// encode, and encoding that text yields the recorded ids.
+/// encode, and encoding that text yields the recorded ids. Thinking-mode
+/// cases with a native effort name render again without the `thinking`
+/// kwarg, and `thinking_int_42` again with the budget as the string the
+/// gateway forwards; both must reproduce the text.
 #[test]
 #[expect(
     clippy::print_stderr,
     reason = "the skip notice is test diagnostic output"
 )]
-fn render_text_matches_reference_fixtures_and_vendor_token_ids() {
+fn deepseek_v41_render_text_matches_reference_fixtures_and_vendor_token_ids() {
     let fixtures: Fixtures = serde_json::from_str(RENDER_FIXTURES)
         .expect("render_fixtures.json must match the Case schema");
     let id_fixtures: IdFixtures = serde_json::from_str(RENDER_IDS_FIXTURES)
@@ -131,22 +134,32 @@ fn render_text_matches_reference_fixtures_and_vendor_token_ids() {
     )
     .expect("DeepSeek-V4.1 tokenizer should load");
 
+    let mut effort_name_second_renders = 0;
+    let mut string_budget_second_render = false;
     for (case, expected) in fixtures.cases.iter().zip(&id_fixtures.cases) {
         let name = &case.name;
         let kwargs = template_kwargs(case);
-        let params = ChatTemplateParams {
-            // The continuation case keeps its final assistant message and asks
-            // for no generation header, the way the gateway renders
-            // `continue_final_message`; every other case appends the header.
-            add_generation_prompt: !case.continue_final_message,
-            tools: case.tools.as_deref(),
-            template_kwargs: Some(&kwargs),
-            ..Default::default()
+        let render = |kwargs: &HashMap<String, Value>| {
+            let params = ChatTemplateParams {
+                // A case recorded with `wo_eos` on its final assistant message
+                // renders through `add_generation_prompt: false`, which the
+                // shim maps to `wo_eos` when the last message is an assistant
+                // turn (no EOS, no generation header). The gateway does not
+                // send that yet: it renders `continue_final_message` by
+                // popping the trailing assistant message and appending its
+                // content after the generation header; routing it through
+                // `add_generation_prompt: false` is a follow-up. Every other
+                // case appends the header.
+                add_generation_prompt: !case.continue_final_message,
+                tools: case.tools.as_deref(),
+                template_kwargs: Some(kwargs),
+                ..Default::default()
+            };
+            tok.apply_chat_template_with_encoding(&case.messages, params, None)
+                .unwrap_or_else(|e| panic!("case {name}: render failed: {e}"))
         };
 
-        let rendered = tok
-            .apply_chat_template_with_encoding(&case.messages, params, None)
-            .unwrap_or_else(|e| panic!("case {name}: render failed: {e}"));
+        let rendered = render(&kwargs);
         assert_eq!(
             rendered.text, case.text,
             "case {name}: text differs from the reference encoder"
@@ -156,6 +169,36 @@ fn render_text_matches_reference_fixtures_and_vendor_token_ids() {
             "case {name}: the V4.1 renderer encodes from its text, got {:?}",
             rendered.encoding
         );
+
+        // A native effort name alone switches thinking on: the same request
+        // without the `thinking` kwarg must render the same text.
+        let native_effort_name = case
+            .reasoning_effort
+            .as_ref()
+            .and_then(Value::as_str)
+            .is_some_and(|effort| tok.native_reasoning_effort_values().contains(&effort));
+        if native_effort_name && matches!(case.thinking_mode, ThinkingMode::Thinking) {
+            let mut without_toggle = kwargs.clone();
+            without_toggle.remove("thinking");
+            assert_eq!(
+                render(&without_toggle).text,
+                case.text,
+                "case {name}: a native effort name alone must switch thinking on"
+            );
+            effort_name_second_renders += 1;
+        }
+        // The gateway forwards a top-level integer budget as the string
+        // "42"; the shim restores the number before parsing it.
+        if name == "thinking_int_42" {
+            let mut string_budget = kwargs.clone();
+            string_budget.insert("reasoning_effort".to_string(), json!("42"));
+            assert_eq!(
+                render(&string_budget).text,
+                case.text,
+                "case {name}: the gateway's string form of the budget must render the same text"
+            );
+            string_budget_second_render = true;
+        }
 
         let encoded = tok
             .encode(&rendered.text, false)
@@ -167,4 +210,12 @@ fn render_text_matches_reference_fixtures_and_vendor_token_ids() {
             id_fixtures.tokenizer_sha256
         );
     }
+    assert!(
+        effort_name_second_renders > 0,
+        "no thinking-mode case with a native effort name was rendered without the thinking kwarg"
+    );
+    assert!(
+        string_budget_second_render,
+        "the thinking_int_42 case was not rendered with the string budget"
+    );
 }
