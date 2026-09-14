@@ -59,6 +59,10 @@ SYNTHETIC_CASES = [
     ("synthetic_4000x3000", 4000, 3000, 23),
     ("synthetic_8000x1000", 8000, 1000, 29),
     ("synthetic_50x900", 50, 900, 31),
+    # Sizes whose contain edge lands a hair below .5 (Python round() goes
+    # down; an epsilon tie test would go up).
+    ("synthetic_41x56", 41, 56, 37),
+    ("synthetic_28x351", 28, 351, 41),
 ]
 
 # PNG fixtures (converted from the checkpoint's inference/examples/images).
@@ -89,7 +93,7 @@ def seeded_image(width: int, height: int, seed: int) -> Image.Image:
     b = (x + y * 2) % 256
     rgb = np.stack([r, g, b], axis=-1).astype(np.uint32)
     rgb = ((rgb + seed) % 256).astype(np.uint8)
-    return Image.fromarray(rgb, mode="RGB")
+    return Image.fromarray(rgb)
 
 
 def png_bytes(image: Image.Image) -> bytes:

@@ -101,7 +101,7 @@ fn preprocess_matches_the_reference_fingerprints() {
         "unexpected reference {}",
         document.reference
     );
-    assert!(document.cases.len() >= 10, "expected the recorded case set");
+    assert!(document.cases.len() >= 12, "expected the recorded case set");
 
     let processor = DeepseekV41Processor::new();
     let config = PreProcessorConfig::default();

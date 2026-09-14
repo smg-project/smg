@@ -174,9 +174,12 @@ mod tests {
         let tokenizer = TestTokenizer::new(&[]);
         let config = json!({"model_type": "deepseek_v41", "image_token_id": IMAGE_TOKEN_ID});
         assert!(DeepseekV41VisionSpec.matches(&metadata(&tokenizer, &config)));
-        assert!(crate::VisionProcessorRegistry::with_defaults()
-            .find("/models/local-checkpoint", Some("deepseek_v41"))
-            .is_some());
+        assert_eq!(
+            crate::VisionProcessorRegistry::with_defaults()
+                .find("/models/local-checkpoint", Some("deepseek_v41"))
+                .map(|processor| processor.model_name()),
+            Some("deepseek_v41")
+        );
         for model_id in ["deepseek-ai/DeepSeek-V4.1-Flash", "DEEPSEEK_V41-local"] {
             let neutral = json!({});
             let by_id = ModelMetadata {

@@ -209,6 +209,58 @@
       "width": 50
     },
     {
+      "fnv1a_bf16": "23b2da6dacc33d90",
+      "fnv1a_f32": "67fc98b0e642c015",
+      "fnv1a_types_i64": "5316ab6b51435e86",
+      "height": 56,
+      "llm_grid": [
+        16,
+        12
+      ],
+      "name": "synthetic_41x56",
+      "num_tokens": 210,
+      "shape": [
+        1564,
+        3,
+        14,
+        14
+      ],
+      "source": {
+        "seed": 37
+      },
+      "vit_grid": [
+        46,
+        34
+      ],
+      "width": 41
+    },
+    {
+      "fnv1a_bf16": "1571666e0c2af807",
+      "fnv1a_f32": "395a74f5c7e1cf6d",
+      "fnv1a_types_i64": "e8b12c389b5b8b86",
+      "height": 351,
+      "llm_grid": [
+        46,
+        4
+      ],
+      "name": "synthetic_28x351",
+      "num_tokens": 232,
+      "shape": [
+        1518,
+        3,
+        14,
+        14
+      ],
+      "source": {
+        "seed": 41
+      },
+      "vit_grid": [
+        138,
+        11
+      ],
+      "width": 28
+    },
+    {
       "fnv1a_bf16": "33178882c6a93e22",
       "fnv1a_f32": "2f012ba982722d5b",
       "fnv1a_types_i64": "08de9c7bc0a97525",

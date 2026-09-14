@@ -40,6 +40,9 @@ const PAD_COLOR: Rgb<u8> = Rgb([127, 127, 127]);
 const DEFAULT_PATCH_SIZE: usize = 14;
 const DEFAULT_DOWNSAMPLE_RATIO: usize = 3;
 const DEFAULT_MAX_NUM_TOKENS: usize = 1024;
+/// The geometry needs a start, an end, and at least one row of one token: a
+/// configured `max_image_tokens` below this would underflow the budget maths.
+const MIN_MAX_NUM_TOKENS: usize = 4;
 const DEFAULT_MIN_PIXELS: usize = 295936;
 
 /// Resize plan for one image: ViT patch grid, LLM token grid, and the target
@@ -182,7 +185,8 @@ impl DeepseekV41Processor {
                 .unwrap_or(DEFAULT_DOWNSAMPLE_RATIO),
             max_n_token: config
                 .get_extra("max_image_tokens")
-                .unwrap_or(DEFAULT_MAX_NUM_TOKENS),
+                .unwrap_or(DEFAULT_MAX_NUM_TOKENS)
+                .max(MIN_MAX_NUM_TOKENS),
             min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
             max_wh_ratio: config.get_extra("max_wh_ratio"),
         }
@@ -254,7 +258,7 @@ impl DeepseekV41Processor {
             Some(max_wh_ratio) if f64::from(width) >= max_wh_ratio * f64::from(height) => {
                 resize_bicubic_pil_rgb(rgb.as_raw(), width, height, out_w, out_h)?
             }
-            _ => pad_to_size_pil(&DynamicImage::ImageRgb8(rgb), out_w, out_h, PAD_COLOR).to_rgb8(),
+            _ => pad_to_size_pil(&DynamicImage::ImageRgb8(rgb), out_w, out_h, PAD_COLOR)?.to_rgb8(),
         };
         Ok((self.patchify(&transformed, &plan), plan))
     }
@@ -478,6 +482,27 @@ mod tests {
 
         assert!(processor.calculate_num_tokens(4000, 4000, &config) <= 320);
         assert!(processor.calculate_num_tokens(4000, 4000, &PreProcessorConfig::default()) > 320);
+        // A budget below the geometry's minimum is floored instead of
+        // underflowing the resize maths.
+        let tiny: PreProcessorConfig =
+            serde_json::from_value(serde_json::json!({"max_image_tokens": 1})).unwrap();
+        assert_eq!(processor.calculate_num_tokens(4000, 4000, &tiny), 4);
+    }
+
+    #[test]
+    fn extreme_aspect_images_error_instead_of_panicking() {
+        let processor = DeepseekV41Processor::new();
+        let config = PreProcessorConfig::default();
+        let tall = DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 50_000, Rgb([0, 0, 0])));
+        assert!(matches!(
+            processor.preprocess(std::slice::from_ref(&tall), &config),
+            Err(TransformError::ShapeError(_))
+        ));
+        let wide = DynamicImage::ImageRgb8(RgbImage::from_pixel(100_000, 1, Rgb([0, 0, 0])));
+        assert!(matches!(
+            processor.preprocess(std::slice::from_ref(&wide), &config),
+            Err(TransformError::ShapeError(_))
+        ));
     }
 
     #[test]
