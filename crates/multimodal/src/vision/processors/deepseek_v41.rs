@@ -258,7 +258,11 @@ impl DeepseekV41Processor {
         let plan = self.plan_image_grid(width, height);
         let (out_w, out_h) = (plan.best_width as u32, plan.best_height as u32);
         let transformed = match self.max_wh_ratio {
-            // Pillow's `Image.resize` defaults to BICUBIC.
+            // The reference stretches with `>=` here while `plan_image_grid`
+            // clamps the width with `>`, so at exactly
+            // `width == max_wh_ratio * height` the width is kept and the
+            // image is stretched rather than padded. Pillow's `Image.resize`
+            // defaults to BICUBIC.
             Some(max_wh_ratio) if f64::from(width) >= max_wh_ratio * f64::from(height) => {
                 resize_bicubic_pil_rgb(rgb.as_raw(), width, height, out_w, out_h)?
             }
@@ -475,6 +479,51 @@ mod tests {
                 IMAGE_NEW_LINE,
                 IMAGE_END,
             ]
+        );
+    }
+
+    /// `max_wh_ratio` (absent from the checkpoint, so no golden covers it)
+    /// selects the reference's stretch arm with `>=` while the plan clamps
+    /// with `>`: at and above the ratio a solid image fills every patch (a
+    /// contain-fit would leave gray pad rows); below it the pad arm runs.
+    #[test]
+    fn max_wh_ratio_selects_the_stretch_arm_like_the_reference() {
+        let config: PreProcessorConfig =
+            serde_json::from_value(serde_json::json!({"max_wh_ratio": 2.0})).unwrap();
+        let processor = DeepseekV41Processor::new().with_preprocessor_config(&config);
+        let unbounded = DeepseekV41Processor::new();
+        assert_eq!(processor.max_wh_ratio, Some(2.0));
+
+        // Wider than the ratio: the plan clamps the width first; exactly the
+        // ratio: not clamped.
+        assert!(
+            processor.plan_image_grid(300, 100).best_width
+                < unbounded.plan_image_grid(300, 100).best_width
+        );
+        assert_eq!(
+            processor.plan_image_grid(200, 100).best_width,
+            unbounded.plan_image_grid(200, 100).best_width
+        );
+
+        let white = Rgb([255, 255, 255]);
+        let fill_values = |w: u32, h: u32| -> Vec<f32> {
+            let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(w, h, white));
+            let out = processor
+                .preprocess(std::slice::from_ref(&image), &config)
+                .unwrap();
+            out.encoder_input.iter().copied().collect()
+        };
+        for (w, h) in [(300, 100), (200, 100)] {
+            assert!(
+                fill_values(w, h).iter().all(|v| (v - 1.0).abs() < 1e-6),
+                "{w}x{h} must be stretched, not padded"
+            );
+        }
+        // 160x100 is below the ratio and its best box is not exactly 1.6:1,
+        // so the contain-fit pads gray columns.
+        assert!(
+            fill_values(160, 100).iter().any(|v| *v < 0.5),
+            "160x100 must be padded, not stretched"
         );
     }
 

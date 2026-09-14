@@ -944,6 +944,11 @@ pub fn resize_bicubic_pil_rgb(
             data.len()
         )));
     }
+    if out_w == 0 || out_h == 0 {
+        return Err(TransformError::ShapeError(format!(
+            "PIL bicubic RGB target {out_w}x{out_h} must be non-empty"
+        )));
+    }
     let output = resize_pil_bytes(
         data,
         width,
@@ -995,7 +1000,9 @@ fn resize_pil_bytes(
     let (in_w, in_h, out_w, out_h) = (in_w as usize, in_h as usize, out_w as usize, out_h as usize);
     if out_w == 0 || out_h == 0 {
         // A zero-sized target has no pixels; the band resamplers would panic
-        // on a zero chunk size. Callers validate dimensions (Pillow raises).
+        // on a zero chunk size. The fallible entry points
+        // (`resize_bicubic_pil_rgb`, `pad_to_size_pil`) reject it up front;
+        // the infallible ones are only called with planned, non-zero sizes.
         Vec::new()
     } else if in_w == out_w && in_h == out_h {
         data.to_vec()
@@ -1446,6 +1453,17 @@ mod tests {
 
     /// `resize_bicubic_pil_rgb` rejects a buffer whose length doesn't match the
     /// declared dimensions rather than reading out of bounds.
+    #[test]
+    fn resize_bicubic_pil_rgb_rejects_an_empty_target() {
+        let data = vec![0u8; 2 * 2 * 3];
+        for (out_w, out_h) in [(0, 480), (480, 0)] {
+            assert!(matches!(
+                resize_bicubic_pil_rgb(&data, 2, 2, out_w, out_h),
+                Err(TransformError::ShapeError(_))
+            ));
+        }
+    }
+
     #[test]
     fn resize_bicubic_pil_rgb_rejects_wrong_length() {
         assert!(
