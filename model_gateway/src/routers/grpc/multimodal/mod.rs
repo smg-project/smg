@@ -76,7 +76,7 @@ pub(crate) use plan::{
 pub(crate) use process::process_multimodal_plan;
 pub(crate) use refs::{
     assemble_media_refs, ensure_selection_supports_media_refs, resolve_mm_processing,
-    worker_accepts_media_refs, MmProcessing,
+    worker_accepts_media_refs, MmProcessing, MmRefsError,
 };
 pub(crate) use transport::{init_mm_transport_defaults, mm_rdma_exporter};
 
