@@ -667,14 +667,17 @@ impl WorkerSelectionStage {
             },
         )
         .map_err(|failure| {
-            // Both legs must advertise worker-side processing: a failing leg
-            // with no capable worker is the capability shed; anything else
-            // keeps its own verdict.
+            // Both legs must advertise worker-side processing: a populated
+            // failing leg with no capable worker is the capability shed; an
+            // empty leg or anything else keeps its own verdict.
             let leg_pool = match failure.leg {
                 WorkerLeg::Prefill => &pairs.prefill_pool,
                 _ => &pairs.decode_pool,
             };
-            if media_refs && !leg_pool.iter().any(|w| accepts_media_refs(w.as_ref())) {
+            if media_refs
+                && !leg_pool.is_empty()
+                && !leg_pool.iter().any(|w| accepts_media_refs(w.as_ref()))
+            {
                 self.media_refs_shed(model_id)
             } else {
                 self.pair_failure(model_id, *failure)
@@ -1976,6 +1979,41 @@ mod tests {
     }
 
     /// Both PD legs process the references, so both must advertise.
+    /// A leg with no members is "no worker serves the model", not a capability
+    /// shed: the PD path judges emptiness before capability, like the single path.
+    #[test]
+    fn media_refs_pd_selection_empty_leg_keeps_its_own_verdict() {
+        let model_id = "test-model-media-refs-pd-empty-leg";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry
+            .register(vllm_grpc_worker(
+                "grpc://127.0.0.1:8740",
+                model_id,
+                WorkerType::Decode,
+                true,
+            ))
+            .unwrap();
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        policy_registry
+            .set_prefill_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        policy_registry
+            .set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::clone(&policy_registry),
+            WorkerSelectionMode::PrefillDecode,
+        );
+
+        let response = stage
+            .select_pd_pair(model_id, None, None, None, None, None, None, true)
+            .expect_err("no prefill worker at all");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_ne!(
+            error::extract_error_code_from_response(&response),
+            "no_media_ref_capable_worker"
+        );
+    }
+
     #[test]
     fn media_refs_pd_selection_requires_both_legs() {
         let model_id = "test-model-media-refs-pd";
