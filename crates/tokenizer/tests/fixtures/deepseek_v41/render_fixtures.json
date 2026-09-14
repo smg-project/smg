@@ -1,0 +1,1108 @@
+{
+ "source": "deepseek-ai/DeepSeek-V4.1-Flash encoding/encoding.py",
+ "revision": "517ef625df",
+ "vllm_source": "vllm/tokenizers/deepseek_v41_encoding.py",
+ "vllm_revision": "ea723c81c3ea26425cb69503a5d5e90822a04a45",
+ "effort_tiers": {
+  "low": 25,
+  "high": 50,
+  "xhigh": 75,
+  "max": 100
+ },
+ "cases": [
+  {
+   "name": "hf_1",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather like in Beijing?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The user wants the weather in Beijing. I should call get_weather.",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"location\": \"Beijing\", \"unit\": \"celsius\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_0",
+     "content": "{\"temperature\": 22, \"condition\": \"sunny\", \"humidity\": 45}"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "Got the weather data. Let me format a nice response.",
+     "content": "The weather in Beijing is currently sunny with a temperature of 22°C and 45% humidity."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a specific location",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "location": {
+         "type": "string",
+         "description": "The city name"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ],
+         "description": "Temperature unit"
+        }
+       },
+       "required": [
+        "location"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the web for information",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string",
+         "description": "Search query"
+        },
+        "num_results": {
+         "type": "integer",
+         "description": "Number of results to return"
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ],
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\nYou are a helpful assistant.\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a specific location\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"The city name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"description\": \"Temperature unit\"}}, \"required\": [\"location\"]}}\n{\"name\": \"search\", \"description\": \"Search the web for information\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"Search query\"}, \"num_results\": {\"type\": \"integer\", \"description\": \"Number of results to return\"}}, \"required\": [\"query\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>What's the weather like in Beijing?<｜Assistant｜><think>The user wants the weather in Beijing. I should call get_weather.</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"location\" string=\"true\">Beijing</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"unit\" string=\"true\">celsius</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>{\"temperature\": 22, \"condition\": \"sunny\", \"humidity\": 45}</tool_result><｜Assistant｜><think>Got the weather data. Let me format a nice response.</think>The weather in Beijing is currently sunny with a temperature of 22°C and 45% humidity.<｜end▁of▁sentence｜>"
+  },
+  {
+   "name": "hf_2",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The user said hello, I should greet back.",
+     "content": "Hi there! How can I help you?"
+    },
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The user asks about the capital of France. It is Paris.",
+     "content": "The capital of France is Paris."
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "chat",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>You are a helpful assistant.<｜User｜>Hello<｜Assistant｜></think>Hi there! How can I help you?<｜end▁of▁sentence｜><｜User｜>What is the capital of France?<｜Assistant｜></think>The capital of France is Paris.<｜end▁of▁sentence｜>"
+  },
+  {
+   "name": "hf_3",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "system",
+     "content": "该助手为DeepSeek，由深度求索公司创造。"
+    },
+    {
+     "role": "latest_reminder",
+     "content": "2026-02-21,星期六,广州,App,中文"
+    },
+    {
+     "role": "system",
+     "content": "CITATION FORMAT: 【{cursor_id}†L{start_line_id}(-L{end_line_id})?】",
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "search",
+        "description": "Web search. Split multiple queries with '||'.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "queries": {
+           "type": "string",
+           "description": "query1||query2"
+          }
+         },
+         "required": [
+          "queries"
+         ],
+         "additionalProperties": false
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "open",
+        "description": "Batch open IDs (format 【{id}†...】) or URLs.",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "open_list": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "id": {
+              "description": "ID or URL",
+              "anyOf": [
+               {
+                "type": "integer"
+               },
+               {
+                "type": "string"
+               }
+              ],
+              "default": -1
+             },
+             "loc": {
+              "type": "integer",
+              "description": "Start line",
+              "default": -1
+             },
+             "num_lines": {
+              "type": "integer",
+              "description": "",
+              "default": -1
+             }
+            },
+            "additionalProperties": false
+           },
+           "description": ""
+          }
+         },
+         "required": [
+          "open_list"
+         ],
+         "additionalProperties": false
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "小柴胡冲剂和布洛芬能一起吃吗？"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "用户想知道小柴胡冲剂和布洛芬能否一起服用。",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "search",
+        "arguments": "{\"queries\": \"小柴胡冲剂 布洛芬 相互作用 一起吃\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "[0]"
+    },
+    {
+     "role": "assistant",
+     "content": "请及时就医。",
+     "reasoning_content": "现在开始组织回答。",
+     "tool_calls": []
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "chat",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>该助手为DeepSeek，由深度求索公司创造。<｜latest_reminder｜>2026-02-21,星期六,广州,App,中文<｜System｜>CITATION FORMAT: 【{cursor_id}†L{start_line_id}(-L{end_line_id})?】\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"search\", \"description\": \"Web search. Split multiple queries with '||'.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"queries\": {\"type\": \"string\", \"description\": \"query1||query2\"}}, \"required\": [\"queries\"], \"additionalProperties\": false}}\n{\"name\": \"open\", \"description\": \"Batch open IDs (format 【{id}†...】) or URLs.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"open_list\": {\"type\": \"array\", \"items\": {\"type\": \"object\", \"properties\": {\"id\": {\"description\": \"ID or URL\", \"anyOf\": [{\"type\": \"integer\"}, {\"type\": \"string\"}], \"default\": -1}, \"loc\": {\"type\": \"integer\", \"description\": \"Start line\", \"default\": -1}, \"num_lines\": {\"type\": \"integer\", \"description\": \"\", \"default\": -1}}, \"additionalProperties\": false}, \"description\": \"\"}}, \"required\": [\"open_list\"], \"additionalProperties\": false}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>小柴胡冲剂和布洛芬能一起吃吗？<｜Assistant｜></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"search\">\n<｜DSML｜ parameter name=\"queries\" string=\"true\">小柴胡冲剂 布洛芬 相互作用 一起吃</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>[0]</tool_result><｜Assistant｜></think>请及时就医。<｜end▁of▁sentence｜>"
+  },
+  {
+   "name": "hf_4",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "system",
+     "content": "该助手为DeepSeek-V3，由深度求索公司创造。\n今天是2025年10月17日，星期五。"
+    },
+    {
+     "role": "latest_reminder",
+     "content": "2024-11-15,上海市,App,中文"
+    },
+    {
+     "role": "user",
+     "content": "热海大滚锅是世界著名温泉吗"
+    },
+    {
+     "role": "assistant",
+     "content": "热海大滚锅在中国乃至全球的地热奇观中占有重要地位，但“世界著名”的称号更侧重于它作为独特的地质现象和旅游景点。",
+     "mask": 1
+    },
+    {
+     "role": "user",
+     "content": "世界著名温泉有哪些",
+     "task": "action"
+    },
+    {
+     "role": "assistant",
+     "content": "Search"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "chat",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>该助手为DeepSeek-V3，由深度求索公司创造。\n今天是2025年10月17日，星期五。<｜latest_reminder｜>2024-11-15,上海市,App,中文<｜User｜>热海大滚锅是世界著名温泉吗<｜Assistant｜></think>热海大滚锅在中国乃至全球的地热奇观中占有重要地位，但“世界著名”的称号更侧重于它作为独特的地质现象和旅游景点。<｜end▁of▁sentence｜><｜User｜>世界著名温泉有哪些<｜Assistant｜></think><｜action｜>Search<｜end▁of▁sentence｜>"
+  },
+  {
+   "name": "hf_5",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful vision assistant."
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "请按“第一张、第二张”的顺序回答：第一张图"
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "examples/images/carrots.jpeg"
+       }
+      },
+      {
+       "type": "text",
+       "text": "和第二张图"
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "examples/images/corn.jpeg"
+       }
+      },
+      {
+       "type": "text",
+       "text": "中分别是什么食材？它们通常食用的部位分别是什么？"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": "max",
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 100 (range 1-100, the higher the value, the more thorough the reasoning)\n\nYou are a helpful vision assistant.<｜User｜>请按“第一张、第二张”的顺序回答：第一张图\n\n<｜deepseek_image｜>\n\n和第二张图\n\n<｜deepseek_image｜>\n\n中分别是什么食材？它们通常食用的部位分别是什么？<｜Assistant｜><think>"
+  },
+  {
+   "name": "chat_no_system",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "chat",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>q<｜Assistant｜></think>"
+  },
+  {
+   "name": "thinking_default_effort",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>"
+  },
+  {
+   "name": "thinking_low",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": "low",
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 25 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>"
+  },
+  {
+   "name": "thinking_int_42",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": 42,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 42 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>"
+  },
+  {
+   "name": "thinking_history_dropped",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q1"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "r1",
+     "content": "a1"
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜><｜User｜>q2<｜Assistant｜><think>"
+  },
+  {
+   "name": "thinking_history_kept",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q1"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "r1",
+     "content": "a1"
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": false,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q1<｜Assistant｜><think>r1</think>a1<｜end▁of▁sentence｜><｜User｜>q2<｜Assistant｜><think>"
+  },
+  {
+   "name": "mid_system",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q1"
+    },
+    {
+     "role": "assistant",
+     "content": "a1"
+    },
+    {
+     "role": "system",
+     "content": "MID"
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜><｜System｜>MID<｜User｜>q2<｜Assistant｜><think>"
+  },
+  {
+   "name": "two_images",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "first"
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "data:image/png;base64,AA=="
+       }
+      },
+      {
+       "type": "text",
+       "text": "second"
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "data:image/png;base64,AA=="
+       }
+      },
+      {
+       "type": "text",
+       "text": "compare"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "chat",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>first\n\n<｜deepseek_image｜>\n\nsecond\n\n<｜deepseek_image｜>\n\ncompare<｜Assistant｜></think>"
+  },
+  {
+   "name": "tool_results_sorted",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": "question"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "reason",
+     "content": "summary",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "lookup",
+        "arguments": "{\"query\": \"first\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "lookup",
+        "arguments": "{\"query\": \"second\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "second result"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "first result"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "lookup",
+      "description": "Look up",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ],
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"lookup\", \"description\": \"Look up\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>question<｜Assistant｜><think>reason</think>summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">first</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">second</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>first result</tool_result>\n\n<tool_result>second result</tool_result><｜Assistant｜><think>"
+  },
+  {
+   "name": "continue_final_message",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "r",
+     "content": "Sure,"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": true,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>r</think>Sure,"
+  },
+  {
+   "name": "assistant_tool_call_false_string_args",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "f",
+        "arguments": "{\"n\": 3, \"ok\": true, \"obj\": {\"temp\": \"C\"}, \"s\": \"raw <x>\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": "done"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "f",
+      "parameters": {
+       "type": "object"
+      }
+     }
+    }
+   ],
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"f\", \"parameters\": {\"type\": \"object\"}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>q<｜Assistant｜><think></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"n\" string=\"false\">3</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"ok\" string=\"false\">true</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"obj\" string=\"false\">{\"temp\": \"C\"}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"s\" string=\"true\">raw <x></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>done</tool_result><｜Assistant｜><think>"
+  },
+  {
+   "name": "developer_then_user_thinking",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "developer",
+     "content": "Follow the policy."
+    },
+    {
+     "role": "user",
+     "content": "Question?"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Question?<｜Assistant｜><think>"
+  },
+  {
+   "name": "two_user_turns",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": "first"
+    },
+    {
+     "role": "user",
+     "content": "second"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>first\n\nsecond<｜Assistant｜><think>"
+  },
+  {
+   "name": "image_only_part",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "https://example.com/a.png"
+       }
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "chat",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜><｜deepseek_image｜><｜Assistant｜></think>"
+  },
+  {
+   "name": "empty_text_and_image_parts",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": ""
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "https://example.com/a.png"
+       }
+      },
+      {
+       "type": "text",
+       "text": "describe"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "chat",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>\n\n<｜deepseek_image｜>\n\ndescribe<｜Assistant｜></think>"
+  },
+  {
+   "name": "input_image_and_image_pil_spellings",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "input_image",
+       "image_url": "https://example.com/a.png"
+      },
+      {
+       "type": "text",
+       "text": "which is brighter?"
+      },
+      {
+       "type": "image_pil"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "chat",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜><｜deepseek_image｜>\n\nwhich is brighter?\n\n<｜deepseek_image｜><｜Assistant｜></think>"
+  },
+  {
+   "name": "tool_results_unknown_id",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": "question"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "reason",
+     "content": "summary",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "lookup",
+        "arguments": "{\"query\": \"first\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "lookup",
+        "arguments": "{\"query\": \"second\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "second result"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_x",
+     "content": "unknown result"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "first result"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "lookup",
+      "description": "Look up",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ],
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"lookup\", \"description\": \"Look up\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>question<｜Assistant｜><think>reason</think>summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">first</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">second</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>unknown result</tool_result>\n\n<tool_result>first result</tool_result>\n\n<tool_result>second result</tool_result><｜Assistant｜><think>"
+  },
+  {
+   "name": "thinking_trailing_assistant",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "r",
+     "content": "Sure,"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>r</think>Sure,<｜end▁of▁sentence｜>"
+  },
+  {
+   "name": "assistant_tool_call_array_string_args",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "f",
+        "arguments": "[1, 2]"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": "done"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "f",
+      "parameters": {
+       "type": "object"
+      }
+     }
+    }
+   ],
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"f\", \"parameters\": {\"type\": \"object\"}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>q<｜Assistant｜><think></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"arguments\" string=\"true\">[1, 2]</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>done</tool_result><｜Assistant｜><think>"
+  },
+  {
+   "name": "assistant_tool_call_double_encoded_args",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "f",
+        "arguments": "\"{\\\"a\\\": 1}\""
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": "done"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "f",
+      "parameters": {
+       "type": "object"
+      }
+     }
+    }
+   ],
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"f\", \"parameters\": {\"type\": \"object\"}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>q<｜Assistant｜><think></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"a\" string=\"false\">1</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>done</tool_result><｜Assistant｜><think>"
+  },
+  {
+   "name": "mid_system_with_tools",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q1"
+    },
+    {
+     "role": "assistant",
+     "content": "a1"
+    },
+    {
+     "role": "system",
+     "content": "Mid-conversation update."
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "lookup",
+      "description": "Look up",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ],
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q1<｜Assistant｜><think></think>a1<｜end▁of▁sentence｜><｜System｜>Mid-conversation update.\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"lookup\", \"description\": \"Look up\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>q2<｜Assistant｜><think>"
+  },
+  {
+   "name": "response_format_on_system",
+   "oracle": "hf",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Answer in JSON.",
+     "response_format": {
+      "type": "object",
+      "properties": {
+       "answer": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "answer"
+      ]
+     }
+    },
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\nAnswer in JSON.\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{\"type\": \"object\", \"properties\": {\"answer\": {\"type\": \"string\"}}, \"required\": [\"answer\"]}<｜User｜>q<｜Assistant｜><think>"
+  },
+  {
+   "name": "developer_then_user_chat",
+   "oracle": "vllm_python",
+   "messages": [
+    {
+     "role": "developer",
+     "content": "Follow the policy."
+    },
+    {
+     "role": "user",
+     "content": "Question?"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "chat",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>Follow the policy.<｜User｜>Question?<｜Assistant｜></think>"
+  },
+  {
+   "name": "developer_with_tools",
+   "oracle": "vllm_python",
+   "messages": [
+    {
+     "role": "developer",
+     "content": "Follow the policy."
+    },
+    {
+     "role": "user",
+     "content": "Question?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "lookup",
+      "description": "Look up",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ],
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"lookup\", \"description\": \"Look up\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Follow the policy.<｜User｜>Question?<｜Assistant｜><think>"
+  }
+ ]
+}

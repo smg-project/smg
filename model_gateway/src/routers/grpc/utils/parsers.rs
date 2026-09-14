@@ -153,10 +153,14 @@ pub(crate) fn extract_thinking_from_kwargs(
     }
 }
 
-/// Report `Some(true)` when the renderer will enter thinking mode because of
-/// a native reasoning-effort value, so the reasoning parser is armed
-/// consistently with the rendered prompt. Mirrors the template-kwargs merge:
-/// an explicit kwargs entry wins over the top-level `reasoning_effort` field.
+/// The thinking preference implied by `reasoning_effort` for a renderer
+/// with native effort values, so the reasoning parser is armed consistently
+/// with the rendered prompt: `Some(true)` for a native value (the renderer
+/// enters thinking mode), `Some(false)` for `"none"` (the renderer's thinking
+/// switch, which turns thinking off and short-circuits the generic
+/// `reasoning_effort` fallback in `resolve_thinking_pref`), `None` otherwise.
+/// Mirrors the template-kwargs merge: an explicit kwargs entry wins over the
+/// top-level `reasoning_effort` field.
 fn extract_template_effort_thinking(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
@@ -170,6 +174,12 @@ fn extract_template_effort_thinking(
         .and_then(|k| k.get("reasoning_effort"))
         .and_then(Value::as_str)
         .or(reasoning_effort)?;
+    // `"none"` is the renderer's thinking switch, not an effort level: it
+    // renders chat mode wherever it arrives (kwargs or top-level), so the
+    // parser must be disarmed the same way.
+    if effort == "none" {
+        return Some(false);
+    }
     native_values.contains(&effort).then_some(true)
 }
 
@@ -340,6 +350,27 @@ mod tests {
         assert_eq!(resolve_thinking_pref(None, None, Some("none")), Some(false));
         assert_eq!(resolve_thinking_pref(None, None, Some("high")), None);
         assert_eq!(resolve_thinking_pref(None, None, None), None);
+    }
+
+    /// A kwargs `reasoning_effort` of `"none"` renders chat mode for native
+    /// renderers, so it must disarm the parser too — even when the top-level
+    /// field names a native level (the kwargs entry wins in the merge).
+    #[test]
+    fn kwargs_none_disarms_like_the_renderer() {
+        let tok = T(llm_tokenizer::MockTokenizer::new());
+        let none_kw = std::collections::HashMap::from([(
+            "reasoning_effort".to_string(),
+            Value::String("none".to_string()),
+        )]);
+        assert_eq!(
+            extract_template_effort_thinking(Some(&none_kw), Some("high"), &tok),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_user_thinking(Some(&none_kw), Some("high"), &tok),
+            Some(false)
+        );
+        assert_eq!(resolve_user_thinking(None, Some("none"), &tok), Some(false));
     }
 
     use llm_tokenizer::traits::{Encoder, Encoding};
