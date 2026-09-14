@@ -327,6 +327,11 @@ impl ParserFactory {
         registry.register_parser("deepseek31", || Box::new(DeepSeek31Parser::new()));
         registry.register_parser("deepseek32", || Box::new(DeepSeekDsmlParser::v32()));
         registry.register_parser("deepseek_v4", || Box::new(DeepSeekDsmlParser::v4()));
+        registry.register_parser_with_structural_tag(
+            "deepseek_v41",
+            || Box::new(DeepSeekDsmlParser::v41()),
+            DeepSeekDsmlParser::build_v41_structural_tag,
+        );
         registry.register_parser("glm45_moe", || Box::new(Glm4MoeParser::glm45()));
         registry.register_parser("glm47_moe", || Box::new(Glm4MoeParser::glm47()));
         registry.register_parser("step3", || Box::new(Step3Parser::new()));
@@ -421,6 +426,10 @@ impl ParserFactory {
         // V4 DSML format (outer block: tool_calls — same parser as V3.2, different block name)
         registry.map_model("deepseek-v4*", "deepseek_v4");
         registry.map_model("deepseek-ai/DeepSeek-V4*", "deepseek_v4");
+        // V4.1 DSML format (spaced tags); its stems are longer than V4's, so they win
+        registry.map_model("deepseek-v4.1*", "deepseek_v41");
+        registry.map_model("deepseek_v41*", "deepseek_v41");
+        registry.map_model("deepseek-ai/DeepSeek-V4.1*", "deepseek_v41");
         registry.map_model("deepseek-*", "pythonic");
 
         // GLM models
