@@ -7,6 +7,7 @@ import asyncio
 import sys
 import time
 import types
+from dataclasses import dataclass
 
 import pytest
 
@@ -66,6 +67,23 @@ def fingerprint():
     )
 
 
+# Shaped like vLLM's validated limit_per_prompt values (pydantic dataclasses).
+@dataclass
+class _BaseOptions:
+    count: int = 999
+
+
+@dataclass
+class _ImageOptions(_BaseOptions):
+    width: int | None = None
+    height: int | None = None
+
+
+@dataclass
+class _VideoOptions(_BaseOptions):
+    num_frames: int | None = None
+
+
 class _MmConfig:
     def __init__(self, limit_per_prompt):
         self.limit_per_prompt = limit_per_prompt
@@ -73,9 +91,8 @@ class _MmConfig:
         self.mm_processor_kwargs = None
 
     def get_limit_per_prompt(self, modality):
-        # Mirrors vLLM: 999 when unset, otherwise the validated options' count.
-        value = self.limit_per_prompt.get(modality, 999)
-        return value["count"] if isinstance(value, dict) else value
+        options = self.limit_per_prompt.get(modality)
+        return 999 if options is None else options.count
 
 
 class _ModelConfig:
@@ -98,24 +115,53 @@ def _fake_vllm(monkeypatch):
 class TestFingerprintDerivation:
     def test_worker_and_sidecar_derive_the_same_fingerprint(self, monkeypatch):
         _fake_vllm(monkeypatch)
-        engine = types.SimpleNamespace(model_config=_ModelConfig({"image": 8}))
-        vllm_config = types.SimpleNamespace(model_config=_ModelConfig({"image": 8}))
+        limits = {"image": _ImageOptions(count=8)}
+        engine = types.SimpleNamespace(model_config=_ModelConfig(limits))
+        vllm_config = types.SimpleNamespace(model_config=_ModelConfig(limits))
         worker = mm_processor.engine_fingerprint(engine)
         assert worker == mm_sidecar.config_fingerprint(vllm_config)
-        assert worker.limit_per_prompt == '{"audio": 999, "image": 8, "video": 999}'
+        assert worker.limit_per_prompt == (
+            '{"audio": {"count": 999}, "image": {"count": 8}, "video": {"count": 999}}'
+        )
 
     def test_equivalent_limit_spellings_share_a_namespace(self, monkeypatch):
         _fake_vllm(monkeypatch)
-        explicit = mm_processor.fingerprint_from_model_config(_ModelConfig({"image": 999}))
+        explicit = mm_processor.fingerprint_from_model_config(
+            _ModelConfig({"image": _ImageOptions(count=999)})
+        )
         implicit = mm_processor.fingerprint_from_model_config(_ModelConfig({}))
-        nested = mm_processor.fingerprint_from_model_config(
-            _ModelConfig({"image": {"count": 999, "max_pixels": 4}})
+        assert explicit == implicit
+        skewed = mm_processor.fingerprint_from_model_config(
+            _ModelConfig({"image": _ImageOptions(count=8)})
         )
-        assert explicit == implicit == nested
-        assert (
-            explicit.namespace()
-            != mm_processor.fingerprint_from_model_config(_ModelConfig({"image": 8})).namespace()
+        assert explicit.namespace() != skewed.namespace()
+
+    def test_sibling_options_and_extra_modalities_stay_in_the_fingerprint(self):
+        limits = {
+            "video": _VideoOptions(count=2, num_frames=16),
+            "image": _ImageOptions(count=8, width=4),
+            "point_cloud": _BaseOptions(count=1),
+        }
+        assert mm_processor.resolved_mm_limits(_MmConfig(limits)) == {
+            "audio": {"count": 999},
+            "image": {"count": 8, "width": 4},
+            "point_cloud": {"count": 1},
+            "video": {"count": 2, "num_frames": 16},
+        }
+
+    def test_resolved_limits_match_vllm(self):
+        pytest.importorskip("vllm")
+        from vllm.config import MultiModalConfig
+
+        unset = mm_processor.resolved_mm_limits(MultiModalConfig())
+        assert unset == {"audio": {"count": 999}, "image": {"count": 999}, "video": {"count": 999}}
+        explicit = MultiModalConfig(limit_per_prompt={"image": 999})
+        assert mm_processor.resolved_mm_limits(explicit) == unset
+        resolved = mm_processor.resolved_mm_limits(
+            MultiModalConfig(limit_per_prompt={"image": 8, "video": {"count": 2, "num_frames": 16}})
         )
+        assert resolved["image"] == {"count": 8}
+        assert resolved["video"] == {"count": 2, "num_frames": 16}
 
 
 def sidecar(client):
