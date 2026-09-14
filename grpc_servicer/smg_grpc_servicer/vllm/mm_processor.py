@@ -38,6 +38,11 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
     hello_schemes,
     resolve_namespace,
 )
+from smg_grpc_servicer.vllm.media_refs import (
+    BASE_SCHEMES,
+    advertised_schemes,
+    parse_scheme_list,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -162,8 +167,6 @@ class InProcessMediaProcessor:
         from vllm.multimodal.media.connector import MEDIA_CONNECTOR_REGISTRY
         from vllm.transformers_utils.processor import get_video_processor_cls_name
 
-        from smg_grpc_servicer.vllm.media_refs import advertised_schemes, parse_scheme_list
-
         model_config = engine.model_config
         mm_config = model_config.get_multimodal_config()
         self._engine = engine
@@ -271,10 +274,6 @@ def _cast_floats(data, dtype):
     return data
 
 
-def _parse_schemes(value: str) -> set[str]:
-    return {scheme.strip().lower() for scheme in value.split(",") if scheme.strip()}
-
-
 class RedisMediaProcessor:
     """Hand jobs to a media-processing sidecar over Redis lists.
 
@@ -308,8 +307,8 @@ class RedisMediaProcessor:
         self._client = client if client is not None else _redis_client(redis_url)
         self._probe_logged = False
         # Until the sidecar says otherwise, assume the default fetch schemes.
-        self.schemes = "http,https,data"
-        self.accepted_schemes = _parse_schemes(self.schemes)
+        self.schemes = ",".join(BASE_SCHEMES)
+        self.accepted_schemes = parse_scheme_list(self.schemes)
         logger.info("Redis media sidecar keys under %s", self._keys.prefix)
 
     async def probe(self) -> bool:
@@ -335,7 +334,7 @@ class RedisMediaProcessor:
         schemes = hello_schemes(hello)
         if schemes:
             self.schemes = schemes
-            self.accepted_schemes = _parse_schemes(schemes)
+            self.accepted_schemes = parse_scheme_list(schemes)
         self._probe_logged = False
         return True
 
@@ -451,7 +450,13 @@ class RedisMediaProcessor:
 
 
 def _redis_client(redis_url: str):
-    import redis.asyncio as redis_asyncio
+    try:
+        import redis.asyncio as redis_asyncio
+    except ImportError as e:
+        raise ValueError(
+            f"{ENV_PROCESSOR}=redis requires the redis client: "
+            "pip install smg-grpc-servicer[vllm,vllm-redis]"
+        ) from e
 
     return redis_asyncio.from_url(redis_url, decode_responses=False, socket_connect_timeout=1.0)
 

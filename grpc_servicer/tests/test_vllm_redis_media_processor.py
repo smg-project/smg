@@ -31,6 +31,7 @@ class _Item:
 class _ModelConfig:
     dtype = "bf16"
     is_multimodal_model = True
+    allowed_local_media_path = ""
 
 
 class _Engine:
@@ -216,6 +217,14 @@ class TestProcess:
         with pytest.raises(ValueError, match="above the 4-byte cap"):
             run(p.process([1], None, items, 0.0))
         assert client.pushed == []
+
+
+class TestRedisClientImport:
+    def test_missing_client_names_the_extra(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "redis", None)
+        monkeypatch.setitem(sys.modules, "redis.asyncio", None)
+        with pytest.raises(ValueError, match=r"vllm,vllm-redis"):
+            mm_processor._redis_client("redis://127.0.0.1:6379/0")
 
 
 class TestBuild:
