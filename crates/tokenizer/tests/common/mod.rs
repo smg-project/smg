@@ -3,7 +3,7 @@
 
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
 
@@ -173,12 +173,7 @@ const DEEPSEEK_V41_CACHE_DIR: &str = ".tokenizer_cache/deepseek_v41";
 /// later run would trust. Returns `false` (instead of panicking) on any
 /// failure so the caller can fall back to `None` when offline.
 #[expect(clippy::print_stdout, reason = "test diagnostic output")]
-fn download_deepseek_v41_file(
-    base: &str,
-    dir: &std::path::Path,
-    file: &str,
-    min_bytes: usize,
-) -> bool {
+fn download_deepseek_v41_file(base: &str, dir: &Path, file: &str, min_bytes: usize) -> bool {
     println!("Downloading DeepSeek-V4.1 {file} from HuggingFace...");
     let client = reqwest::blocking::Client::new();
     let Ok(response) = client.get(format!("{base}/{file}")).send() else {

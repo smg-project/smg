@@ -1,6 +1,8 @@
 target-version = "py312"
 line-length = 100
-# Vendored DeepSeek-V4.1 reference encoder (fixture oracle) stays byte-identical to upstream for diffing; force-exclude keeps it excluded when pre-commit passes paths explicitly.
+# The vendored DeepSeek-V4.1 reference encoder (fixture oracle) stays byte-identical to
+# upstream for diffing; force-exclude keeps it excluded when pre-commit passes paths
+# explicitly.
 extend-exclude = ["crates/tokenizer/scripts/oracle"]
 force-exclude = true
 

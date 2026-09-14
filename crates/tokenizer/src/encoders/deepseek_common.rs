@@ -8,9 +8,11 @@
 //! leading space). This module holds exactly that shared behaviour so it is
 //! implemented, and tested, once.
 //!
-//! V3.2 is intentionally *not* wired through this module: its tool-message
-//! handling and drop-thinking role set are genuinely different algorithms
-//! that merely happen to share some function names, not the same logic.
+//! V3.2 is intentionally *not* wired through this module beyond the two index
+//! predicates it shares (`find_last_user_index`, `at_or_after_last_user`): its
+//! tool-message handling and drop-thinking role set are genuinely different
+//! algorithms that merely happen to share some function names, not the same
+//! logic.
 
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -81,9 +83,8 @@ pub(super) fn find_last_user_index(messages: &[Value]) -> Option<usize> {
 /// Returns `true` when `index >= last_user_idx` in the Python sense, treating
 /// the "no user message" case (-1) as: every non-negative index satisfies it.
 ///
-/// Used by [`drop_thinking_messages`] here and by the V4.1 renderer's
-/// `render_message` (V4 and V3.2 predate this module and still carry their own
-/// copies).
+/// Used by [`drop_thinking_messages`] here and by every DeepSeek renderer's
+/// `render_message` (V3.2, V4 and V4.1).
 pub(super) fn at_or_after_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
     match last_user_idx {
         Some(idx) => index >= idx,

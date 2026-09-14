@@ -5,11 +5,12 @@ use std::fmt::Write as _;
 use serde_json::{json, Value};
 use thiserror::Error;
 
-// `find_last_user_index` is byte-for-byte identical to the V4-family copy;
-// shared via `deepseek_common` rather than duplicated a third time. V3.2's
-// other tool/drop-thinking helpers are genuinely different algorithms (not
-// just a naming coincidence) and are intentionally kept local to this file.
-use super::deepseek_common::find_last_user_index;
+// `find_last_user_index` and `at_or_after_last_user` are byte-for-byte
+// identical to the V4-family copies; shared via `deepseek_common` rather than
+// duplicated a third time. V3.2's other tool/drop-thinking helpers are
+// genuinely different algorithms (not just a naming coincidence) and are
+// intentionally kept local to this file.
+use super::deepseek_common::{at_or_after_last_user, find_last_user_index};
 
 /// Mode for thinking/reasoning rendering.
 ///
@@ -217,15 +218,6 @@ fn encode_arguments_to_dsml(tool_call: &Value) -> Result<String, DsEncodingError
 fn render_tools(tools: &[Value]) -> String {
     let schemas: Vec<String> = tools.iter().map(to_json).collect();
     render_tools_template(&schemas.join("\n"))
-}
-
-/// Returns `true` when `index >= last_user_idx` in the Python sense, treating
-/// the "no user message" case (-1) as: every non-negative index satisfies it.
-fn at_or_after_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
-    match last_user_idx {
-        Some(idx) => index >= idx,
-        None => true,
-    }
 }
 
 /// Returns `true` when `index > last_user_idx` in the Python sense.

@@ -16,8 +16,8 @@ pub use super::deepseek_common::DsEncodingError;
 // identical to the upcoming V4.1 renderer except for the tag strings; see
 // `deepseek_common` for the shared implementation and its own doc comments.
 use super::deepseek_common::{
-    drop_thinking_messages, encode_arguments_to_dsml, find_last_user_index, merge_tool_messages,
-    sort_tool_results_by_call_order, DsmlTags,
+    at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml, find_last_user_index,
+    merge_tool_messages, sort_tool_results_by_call_order, DsmlTags,
 };
 // Reuse the public ThinkingMode enum from the V3.2 module to keep the
 // "thinking" / "chat" mode invariant identical across DeepSeek versions.
@@ -219,12 +219,6 @@ fn tool_calls_from_openai_format(tool_calls: &[Value]) -> Vec<Value> {
 fn render_tools(tools: &[Value]) -> String {
     let schemas: Vec<String> = tools.iter().map(to_json).collect();
     render_tools_template(&schemas.join("\n"))
-}
-fn at_or_after_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
-    match last_user_idx {
-        Some(idx) => index >= idx,
-        None => true,
-    }
 }
 fn after_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
     match last_user_idx {
