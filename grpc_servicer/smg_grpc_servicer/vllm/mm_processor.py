@@ -9,6 +9,7 @@ imported lazily inside the backends.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import json
 import logging
@@ -248,10 +249,30 @@ class InProcessMediaProcessor:
 MM_LIMIT_MODALITIES = ("image", "video", "audio")
 
 
-def resolved_mm_limits(mm_config) -> dict[str, int]:
-    """Per-modality prompt limits as vLLM resolves them (999 when unset), so
-    equivalent spellings of --limit-mm-per-prompt match."""
-    return {modality: mm_config.get_limit_per_prompt(modality) for modality in MM_LIMIT_MODALITIES}
+def _limit_options(options) -> dict[str, Any]:
+    """A validated per-modality limit as a comparable dict, unset fields dropped."""
+    if dataclasses.is_dataclass(options) and not isinstance(options, type):
+        data = dataclasses.asdict(options)
+    elif isinstance(options, Mapping):
+        data = dict(options)
+    else:  # legacy count-only form
+        data = {"count": options}
+    return {key: value for key, value in data.items() if value is not None}
+
+
+def resolved_mm_limits(mm_config) -> dict[str, dict[str, Any]]:
+    """Per-modality prompt limits as vLLM validated them: the effective count
+    (get_limit_per_prompt, 999 when unset) plus any sibling options, over the
+    standard modalities and every configured key, so equivalent spellings of
+    --limit-mm-per-prompt match and a real skew still fails closed."""
+    configured = getattr(mm_config, "limit_per_prompt", None) or {}
+    limits: dict[str, dict[str, Any]] = {}
+    for modality in sorted({*MM_LIMIT_MODALITIES, *configured}):
+        options = configured.get(modality)
+        extra = _limit_options(options) if options is not None else {}
+        extra.pop("count", None)
+        limits[modality] = {"count": mm_config.get_limit_per_prompt(modality), **extra}
+    return limits
 
 
 def fingerprint_from_model_config(model_config) -> Fingerprint:
@@ -269,7 +290,7 @@ def fingerprint_from_model_config(model_config) -> Fingerprint:
         mm_processor_kwargs=json.dumps(
             mm_config.mm_processor_kwargs or {}, sort_keys=True, default=str
         ),
-        limit_per_prompt=json.dumps(resolved_mm_limits(mm_config), sort_keys=True),
+        limit_per_prompt=json.dumps(resolved_mm_limits(mm_config), sort_keys=True, default=str),
     )
 
 
