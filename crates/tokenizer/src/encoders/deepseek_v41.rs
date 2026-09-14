@@ -246,7 +246,10 @@ fn has_tools(msg: &Value) -> bool {
 // The image payloads themselves are not collected here — SMG's multimodal path
 // carries them separately, the prompt only needs the marker.
 
-/// Mirrors `process_image_messages` (prompt text only).
+/// Mirrors vLLM's `_normalize_messages` flattening plus the HF
+/// `_validate_no_image_sp_tokens` check (see the header comment above): list
+/// content collapses to the text V4.1 encodes, and no text may carry the image
+/// placeholder.
 fn process_image_messages(messages: &[Value]) -> Result<Vec<Value>, DsEncodingError> {
     let mut processed: Vec<Value> = Vec::with_capacity(messages.len());
     for msg in messages {

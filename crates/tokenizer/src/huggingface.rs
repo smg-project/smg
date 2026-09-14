@@ -597,8 +597,10 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             // kwarg, default off. The Jinja processor has no knowledge of
             // the native encoder so we must report it directly.
             Renderer::DeepseekV32 | Renderer::DeepseekV4(_) => ThinkingToggle::DefaultOff,
-            // V4.1 defaults thinking ON: only `reasoning_effort: "none"` or an
-            // explicit `thinking`/`enable_thinking: false` turns it off.
+            // V4.1 defaults thinking ON: `reasoning_effort: "none"` or an
+            // explicit `thinking: false` turns it off. vLLM's `enable_thinking`
+            // alias is deliberately ignored by the shim until the gateway
+            // learns it (see `explicit_thinking_v41`).
             Renderer::DeepseekV41 => ThinkingToggle::DefaultOn,
             Renderer::Jinja => self.chat_template.thinking_toggle(),
         }
@@ -884,8 +886,19 @@ fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_j
 
 /// DeepSeek V4.1 chat-template shim. Order: attach tools to the first system
 /// message (vLLM's rule) -> resolve `reasoning_effort` -> resolve the
-/// thinking mode -> `drop_thinking` -> stamp `wo_eos` for
-/// `continue_final_message` -> encode.
+/// thinking mode -> `drop_thinking` -> stamp `wo_eos` on a trailing assistant
+/// message when `add_generation_prompt` is false -> encode.
+///
+/// `add_generation_prompt: false` with a trailing assistant message is the
+/// encoder's `wo_eos` route (no EOS, no generation header). The gateway does
+/// not send it yet: it renders `continue_final_message` by popping the
+/// trailing assistant message and appending its content after the generation
+/// header; routing that through this shim is a follow-up.
+///
+/// The shim reads the merged template kwargs, so an explicit
+/// `chat_template_kwargs.reasoning_effort` wins over the projected top-level
+/// `reasoning_effort` (SMG's global contract; vLLM prefers the top-level
+/// field — a divergence only on contradictory requests).
 ///
 /// The thinking mode mirrors the gateway's parser-arming precedence
 /// (`resolve_thinking_pref` in `model_gateway/src/routers/grpc/utils/parsers.rs`)
@@ -953,8 +966,8 @@ fn apply_deepseek_v41(
 
     let drop_thinking = boolean_kwarg_v41(params, "drop_thinking")?.unwrap_or(true);
 
-    // `continue_final_message` reaches the encoder as `wo_eos` on the final
-    // assistant message: no EOS, no generation header appended.
+    // `add_generation_prompt: false` with a trailing assistant message reaches
+    // the encoder as `wo_eos` on that message: no EOS, no generation header.
     let continues_final_assistant_message = !params.add_generation_prompt
         && msgs
             .last()
