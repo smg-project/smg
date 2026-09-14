@@ -840,37 +840,66 @@ fn inject_tools_into_first_system_message(
     Some(owned)
 }
 
-/// V4.1's explicit thinking toggle. Unlike V3.2/V4 (which only consult
-/// `template_kwargs["thinking"]` via [`explicit_thinking`], silently ignoring
-/// the wrong type), V4.1 also accepts `enable_thinking`: a present value that
-/// isn't a JSON boolean is an error, and the two keys must agree when both are
-/// present. A JSON `null` is treated the same as an absent key.
+/// V4.1's explicit thinking toggle: `template_kwargs["thinking"]`, the key
+/// this tokenizer reports through `thinking_key_name()` and therefore the only
+/// key the gateway consults when it arms the reasoning parser. Unlike
+/// V3.2/V4's [`explicit_thinking`], which silently ignores a wrongly typed
+/// value, a present value that isn't a JSON boolean is an error; a JSON `null`
+/// counts as absent.
+///
+/// vLLM's `enable_thinking` alias is deliberately NOT read here: the gateway
+/// does not know the alias yet, so honouring it would render chat mode while
+/// the parser stays armed. Re-enable it together with the gateway-side change
+/// (Task 17) so both sides learn the alias at once.
 fn explicit_thinking_v41(params: &ChatTemplateParams) -> Result<Option<bool>> {
-    let toggle = |key: &str| -> Result<Option<bool>> {
-        match params.template_kwargs.and_then(|k| k.get(key)) {
-            None | Some(serde_json::Value::Null) => Ok(None),
-            Some(serde_json::Value::Bool(value)) => Ok(Some(*value)),
-            Some(other) => Err(Error::msg(format!(
-                "DeepSeek V4.1: template_kwargs[\"{key}\"] must be a boolean, got {other}"
-            ))),
-        }
-    };
-    let thinking = toggle("thinking")?;
-    let enable_thinking = toggle("enable_thinking")?;
-    match (thinking, enable_thinking) {
-        (Some(a), Some(b)) if a != b => Err(Error::msg(
-            "DeepSeek V4.1: template_kwargs \"thinking\" and \"enable_thinking\" disagree",
-        )),
-        (Some(a), _) | (None, Some(a)) => Ok(Some(a)),
-        (None, None) => Ok(None),
+    match params.template_kwargs.and_then(|k| k.get("thinking")) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(value)) => Ok(Some(*value)),
+        Some(other) => Err(Error::msg(format!(
+            "DeepSeek V4.1: template_kwargs[\"thinking\"] must be a boolean, got {other}"
+        ))),
     }
 }
 
+/// The gateway deserialises a top-level JSON number (`"reasoning_effort": 42`)
+/// into the string `"42"` before forwarding it as a template kwarg. Restore
+/// the number so [`deepseek_v41::parse_reasoning_effort`] sees the integer
+/// budget the client sent. Every other value passes through untouched: an
+/// out-of-range integer is rejected there with the same message a JSON number
+/// gets.
+fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_json::Value> {
+    value
+        .as_str()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(serde_json::Value::from)
+}
+
 /// DeepSeek V4.1 chat-template shim. Order: attach tools to the first system
-/// message (vLLM's rule) -> resolve the explicit thinking toggle -> resolve
-/// `reasoning_effort` (the string `"none"` forces chat mode even over an
-/// explicit `thinking: true`, mirroring vLLM) -> `drop_thinking` -> stamp
-/// `wo_eos` for `continue_final_message` -> encode.
+/// message (vLLM's rule) -> resolve `reasoning_effort` -> resolve the
+/// thinking mode -> `drop_thinking` -> stamp `wo_eos` for
+/// `continue_final_message` -> encode.
+///
+/// The thinking mode mirrors the gateway's parser-arming precedence
+/// (`resolve_thinking_pref` in `model_gateway/src/routers/grpc/utils/parsers.rs`)
+/// so the rendered prompt and the arming decision agree on every request
+/// shape:
+/// 1. an explicit `template_kwargs["thinking"]` boolean decides;
+/// 2. else the `reasoning_effort` kwarg: `"none"` switches thinking off, a
+///    native effort name (`low`/`high`/`xhigh`/`max`) switches it on, and an
+///    integer budget has no opinion;
+/// 3. else `params.thinking` (the gateway's projection of the top-level
+///    `reasoning_effort`: `Some(false)` for `none`/`minimal`);
+/// 4. else on ([`ThinkingToggle::DefaultOn`]).
+///
+/// Deliberate divergence from vLLM's Python: there `reasoning_effort: "none"`
+/// forces chat mode even over an explicit `thinking: true`. Here the explicit
+/// toggle wins, because the gateway arms the reasoning parser from the
+/// explicit toggle first, and rendering chat mode for that contradictory input
+/// would have the armed parser swallow the whole answer as reasoning. `"none"`
+/// still never reaches `parse_reasoning_effort` (which rejects it) and leaves
+/// the effort unset, so a thinking-mode prompt carries the default budget.
 fn apply_deepseek_v41(
     messages: &[serde_json::Value],
     params: &ChatTemplateParams,
@@ -878,29 +907,39 @@ fn apply_deepseek_v41(
     let owned = inject_tools_into_first_system_message(messages, params.tools);
     let mut msgs: Vec<serde_json::Value> = owned.unwrap_or_else(|| messages.to_vec());
 
-    let thinking_on = explicit_thinking_v41(params)?
-        .or(params.thinking)
-        .unwrap_or(true);
-
-    let reasoning_effort_kwarg = params
+    let effort_kwarg = params
         .template_kwargs
         .and_then(|k| k.get("reasoning_effort"));
-    // The string "none" means "thinking off", not an effort level; it is
-    // rejected by `parse_reasoning_effort` itself, so it must be special-cased
-    // here before calling it.
-    let effort_is_none =
-        matches!(reasoning_effort_kwarg, Some(serde_json::Value::String(s)) if s == "none");
+    let effort_name = effort_kwarg.and_then(serde_json::Value::as_str);
+    // `"none"` is a thinking switch, not an effort level.
+    let effort_is_none = effort_name == Some("none");
     let reasoning_effort = if effort_is_none {
         None
     } else {
-        reasoning_effort_kwarg
+        let restored = effort_kwarg.and_then(restore_integer_reasoning_effort);
+        restored
+            .as_ref()
+            .or(effort_kwarg)
             .map(deepseek_v41::parse_reasoning_effort)
             .transpose()
             .map_err(|e| Error::msg(format!("DeepSeek V4.1 reasoning_effort invalid: {e}")))?
             .flatten()
     };
-    // `reasoning_effort: "none"` wins even over an explicit `thinking: true`.
-    let thinking_mode = if !effort_is_none && thinking_on {
+    // The effort kwarg's opinion on the mode (step 2 above). Only the names
+    // advertised through `native_reasoning_effort_values()` switch thinking
+    // on: exactly the set the gateway treats as arming the parser.
+    let effort_mode = if effort_is_none {
+        Some(false)
+    } else {
+        effort_name
+            .is_some_and(|name| deepseek_v41::NATIVE_EFFORT_VALUES.contains(&name))
+            .then_some(true)
+    };
+    let thinking_on = explicit_thinking_v41(params)?
+        .or(effort_mode)
+        .or(params.thinking)
+        .unwrap_or(true);
+    let thinking_mode = if thinking_on {
         deepseek_v32::ThinkingMode::Thinking
     } else {
         deepseek_v32::ThinkingMode::Chat

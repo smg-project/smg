@@ -31,15 +31,16 @@ mod tests {
         }
     }"#;
     fn write_dir(architectures: Option<&[&str]>) -> (TempDir, String) {
-        write_model_dir(None, architectures, None)
+        write_model_dir(None, architectures, None, None)
     }
 
     /// Build a model dir (optionally named, under the temp root) with the
-    /// minimal tokenizer, an optional V4-style config, and an optional
-    /// shipped Python encoder.
+    /// minimal tokenizer, an optional config (`architectures` and/or
+    /// `model_type`), and an optional shipped Python encoder.
     fn write_model_dir(
         model_name: Option<&str>,
         architectures: Option<&[&str]>,
+        model_type: Option<&str>,
         encoder_source: Option<&str>,
     ) -> (TempDir, String) {
         let temp = TempDir::new().unwrap();
@@ -53,8 +54,15 @@ mod tests {
         };
         let tok_path = model_dir.join("tokenizer.json");
         fs::write(&tok_path, MIN_TOKENIZER_JSON).unwrap();
-        if let Some(archs) = architectures {
-            let body = json!({ "architectures": archs }).to_string();
+        if architectures.is_some() || model_type.is_some() {
+            let mut config = serde_json::Map::new();
+            if let Some(archs) = architectures {
+                config.insert("architectures".to_string(), json!(archs));
+            }
+            if let Some(model_type) = model_type {
+                config.insert("model_type".to_string(), json!(model_type));
+            }
+            let body = serde_json::Value::Object(config).to_string();
             fs::write(model_dir.join("config.json"), body).unwrap();
         }
         if let Some(source) = encoder_source {
@@ -336,6 +344,7 @@ mod tests {
         write_model_dir(
             Some(model_name),
             Some(&["DeepseekV4ForCausalLM"]),
+            None,
             encoder_source,
         )
     }
@@ -430,6 +439,38 @@ mod tests {
     // DeepSeek V4.1
     // -----------------------------------------------------------------------
 
+    const V41_BOS: &str = "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>";
+    const V41_EOS: &str = "<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>";
+    /// The system header carrying the default budget (thinking mode only).
+    const V41_DEFAULT_EFFORT_HEADER: &str = "<\u{FF5C}System\u{FF5C}>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+    /// Tail of a single-user-turn prompt in thinking mode.
+    const V41_THINKING_TAIL: &str = "<\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}><think>";
+    /// Tail of a single-user-turn prompt in chat mode.
+    const V41_CHAT_TAIL: &str = "<\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}></think>";
+
+    fn v41_tokenizer() -> (TempDir, HuggingFaceTokenizer) {
+        let (tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        (tmp, tokenizer)
+    }
+
+    /// Render the single user turn `q` with a generation prompt.
+    fn render_v41_turn(
+        tokenizer: &HuggingFaceTokenizer,
+        kwargs: Option<&HashMap<String, serde_json::Value>>,
+        thinking: Option<bool>,
+    ) -> anyhow::Result<String> {
+        tokenizer.apply_chat_template(
+            &[json!({"role": "user", "content": "q"})],
+            ChatTemplateParams {
+                add_generation_prompt: true,
+                template_kwargs: kwargs,
+                thinking,
+                ..Default::default()
+            },
+        )
+    }
+
     #[test]
     fn v41_architecture_selects_the_v41_renderer_with_thinking_on_by_default() {
         let (_tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
@@ -460,6 +501,29 @@ mod tests {
     }
 
     #[test]
+    fn v41_model_type_alone_selects_the_v41_renderer() {
+        // Some checkpoints identify themselves only through `model_type`,
+        // with an unrelated `architectures` entry.
+        let (_tmp, tok) = write_model_dir(
+            None,
+            Some(&["LlamaForCausalLM"]),
+            Some("deepseek_v41"),
+            None,
+        );
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        assert_eq!(tokenizer.thinking_toggle(), ThinkingToggle::DefaultOn);
+        assert_eq!(
+            tokenizer.thinking_key_name(),
+            Some(ThinkingKeyName::Thinking)
+        );
+        let out = render_v41_turn(&tokenizer, None, None).unwrap();
+        assert_eq!(
+            out,
+            format!("{V41_BOS}{V41_DEFAULT_EFFORT_HEADER}{V41_THINKING_TAIL}")
+        );
+    }
+
+    #[test]
     fn v41_reasoning_effort_none_disables_thinking_and_bad_values_error() {
         let (_tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
         let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
@@ -476,44 +540,128 @@ mod tests {
                 },
             )
             .unwrap();
+        // Chat mode, and no effort line at all.
         assert_eq!(
             off,
             "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}></think>"
         );
 
         let medium_kwargs = HashMap::from([("reasoning_effort".to_string(), json!("medium"))]);
-        let result = tokenizer.apply_chat_template(
-            &messages,
-            ChatTemplateParams {
-                add_generation_prompt: true,
-                template_kwargs: Some(&medium_kwargs),
-                ..Default::default()
-            },
-        );
-        assert!(
-            result.is_err(),
-            "expected an error for reasoning_effort=medium"
-        );
+        let err = tokenizer
+            .apply_chat_template(
+                &messages,
+                ChatTemplateParams {
+                    add_generation_prompt: true,
+                    template_kwargs: Some(&medium_kwargs),
+                    ..Default::default()
+                },
+            )
+            .expect_err("expected an error for reasoning_effort=medium")
+            .to_string();
+        assert!(err.contains("Invalid reasoning effort"), "{err}");
     }
 
     #[test]
-    fn v41_conflicting_thinking_toggles_error() {
-        let (_tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
-        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+    fn v41_integer_effort_strings_are_restored_to_budgets() {
+        // The gateway deserialises a top-level `"reasoning_effort": 42` into
+        // the string "42" before forwarding it as a template kwarg; the shim
+        // must hand `parse_reasoning_effort` the integer budget again.
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let kw = HashMap::from([("reasoning_effort".to_string(), json!("42"))]);
+        let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
+        assert!(out.contains("Reasoning Effort: 42 (range"), "{out}");
+        assert!(out.ends_with(V41_THINKING_TAIL), "{out}");
+        // Out-of-range integers are still rejected by `parse_reasoning_effort`.
+        for bad in ["0", "101"] {
+            let kw = HashMap::from([("reasoning_effort".to_string(), json!(bad))]);
+            let err = render_v41_turn(&tokenizer, Some(&kw), None)
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("Invalid reasoning effort"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn v41_explicit_thinking_true_overrides_reasoning_effort_none() {
+        // Deliberate divergence from vLLM Python, where "none" forces chat
+        // mode: the gateway arms the reasoning parser from the explicit toggle
+        // first, so the prompt must enter thinking mode as well. "none"
+        // carries no effort level, so the default budget is rendered.
+        let (_tmp, tokenizer) = v41_tokenizer();
         let kw = HashMap::from([
+            ("reasoning_effort".to_string(), json!("none")),
             ("thinking".to_string(), json!(true)),
-            ("enable_thinking".to_string(), json!(false)),
         ]);
-        let params = ChatTemplateParams {
-            add_generation_prompt: true,
-            template_kwargs: Some(&kw),
-            ..Default::default()
+        let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
+        assert!(out.ends_with(V41_THINKING_TAIL), "{out}");
+        assert!(out.contains("Reasoning Effort: 50 (range"), "{out}");
+    }
+
+    #[test]
+    fn v41_enable_thinking_alone_is_ignored_until_the_gateway_learns_the_alias() {
+        // The gateway reads only the key this tokenizer reports
+        // (`thinking_key_name() == Thinking`), so `enable_thinking: false`
+        // must not switch the prompt to chat mode while the parser stays
+        // armed. vLLM's `enable_thinking` alias is scheduled for the
+        // gateway-side task (Task 17); re-enable it in the shim together with
+        // that change.
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let kw = HashMap::from([("enable_thinking".to_string(), json!(false))]);
+        let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
+        assert!(out.ends_with(V41_THINKING_TAIL), "{out}");
+    }
+
+    #[test]
+    fn v41_non_boolean_thinking_kwarg_errors() {
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let kw = HashMap::from([("thinking".to_string(), json!("yes"))]);
+        let err = render_v41_turn(&tokenizer, Some(&kw), None)
+            .expect_err("a non-boolean thinking kwarg must error")
+            .to_string();
+        assert!(err.contains("must be a boolean"), "{err}");
+        // The message names the key and the offending value.
+        assert!(err.contains("thinking") && err.contains("yes"), "{err}");
+    }
+
+    #[test]
+    fn v41_params_thinking_false_renders_chat_mode() {
+        // The gateway projects a top-level `reasoning_effort` of
+        // `none`/`minimal` onto `params.thinking = Some(false)`.
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let out = render_v41_turn(&tokenizer, None, Some(false)).unwrap();
+        assert_eq!(out, format!("{V41_BOS}{V41_CHAT_TAIL}"));
+    }
+
+    #[test]
+    fn v41_drop_thinking_false_keeps_historical_reasoning() {
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let messages = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "reasoning_content": "r1", "content": "a1"}),
+            json!({"role": "user", "content": "q2"}),
+        ];
+        let render = |kwargs: Option<&HashMap<String, serde_json::Value>>| {
+            tokenizer
+                .apply_chat_template(
+                    &messages,
+                    ChatTemplateParams {
+                        add_generation_prompt: true,
+                        template_kwargs: kwargs,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
         };
-        let result =
-            tokenizer.apply_chat_template(&[json!({"role": "user", "content": "q"})], params);
-        assert!(
-            result.is_err(),
-            "conflicting thinking/enable_thinking must error"
+        // Default (`drop_thinking: true`): reasoning before the last user
+        // turn is dropped.
+        assert!(!render(None).contains("r1"));
+        let kw = HashMap::from([("drop_thinking".to_string(), json!(false))]);
+        let out = render(Some(&kw));
+        assert_eq!(
+            out,
+            format!(
+                "{V41_BOS}{V41_DEFAULT_EFFORT_HEADER}<\u{FF5C}User\u{FF5C}>q1<\u{FF5C}Assistant\u{FF5C}><think>r1</think>a1{V41_EOS}<\u{FF5C}User\u{FF5C}>q2<\u{FF5C}Assistant\u{FF5C}><think>"
+            )
         );
     }
 
@@ -598,30 +746,6 @@ mod tests {
         assert_eq!(
             tokenizer4.chat_template_content_format(),
             ChatTemplateContentFormat::String
-        );
-    }
-
-    #[test]
-    fn v41_reasoning_effort_none_overrides_explicit_thinking_true() {
-        let (_tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
-        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
-        let kw = HashMap::from([
-            ("reasoning_effort".to_string(), json!("none")),
-            ("thinking".to_string(), json!(true)),
-        ]);
-        let out = tokenizer
-            .apply_chat_template(
-                &[json!({"role": "user", "content": "q"})],
-                ChatTemplateParams {
-                    add_generation_prompt: true,
-                    template_kwargs: Some(&kw),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            out,
-            "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}></think>"
         );
     }
 }
