@@ -219,8 +219,14 @@ fn download_deepseek_v41_file(base: &str, dir: &Path, file: &str, min_bytes: usi
 /// `DEEPSEEK_V41_MODEL_DIR` points at a full checkpoint directory and skips
 /// the download; otherwise the two tokenizer files are fetched once from the
 /// public repository into `.tokenizer_cache/deepseek_v41/`. Returns `None`
-/// when offline (or the repository is unreachable) and no override is set.
-#[expect(clippy::unwrap_used, reason = "test helper — panics are intentional")]
+/// only when offline (the repository is unreachable) and no override is set;
+/// a local failure (unwritable cache directory or file) panics so the parity
+/// gate cannot be skipped silently.
+#[expect(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "test helper — panics are intentional"
+)]
 pub fn ensure_deepseek_v41_cached() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("DEEPSEEK_V41_MODEL_DIR") {
         return Some(PathBuf::from(dir));
@@ -231,7 +237,8 @@ pub fn ensure_deepseek_v41_cached() -> Option<PathBuf> {
 
     let cache_dir = PathBuf::from(DEEPSEEK_V41_CACHE_DIR);
     if !cache_dir.exists() {
-        fs::create_dir_all(&cache_dir).ok()?;
+        fs::create_dir_all(&cache_dir)
+            .unwrap_or_else(|error| panic!("cannot create {}: {error}", cache_dir.display()));
     }
 
     for (file, min_bytes) in [
@@ -256,7 +263,7 @@ pub fn ensure_deepseek_v41_cached() -> Option<PathBuf> {
             &config_path,
             r#"{"architectures":["DeepseekV41ForCausalLM"],"model_type":"deepseek_v41","image_token_id":129264}"#,
         )
-        .ok()?;
+        .unwrap_or_else(|error| panic!("cannot write {}: {error}", config_path.display()));
     }
 
     Some(cache_dir)
