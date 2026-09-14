@@ -42,8 +42,10 @@ tonic-prost-build = "0.14.6"
 prost-build = "0.14.4"
 
 [dev-dependencies]
+# Raw HTTP/2 peer for the channel window / data-frame budget tests.
+h2 = "0.4.19"
 hyper-util = { version = "0.1", features = ["tokio"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 # Mock-server harness for the abort-on-drop behavioral tests.
 tokio-stream = { version = "0.1", features = ["net"] }
 tower = { version = "0.5", default-features = false }
