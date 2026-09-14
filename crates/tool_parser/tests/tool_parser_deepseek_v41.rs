@@ -222,6 +222,42 @@ async fn streaming_forwards_unknown_tool_names() {
 }
 
 #[tokio::test]
+async fn streaming_keeps_leading_whitespace_in_string_values_and_never_slices_mid_char() {
+    // A `string="true"` value that starts with a newline and continues with
+    // multi-byte text: the partial value must not be trimmed, or the delta
+    // offsets land inside a character once the value completes.
+    let text = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"c\" string=\"true\">\n杭州市</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    let (_, calls) = DeepSeekDsmlParser::v41()
+        .parse_complete(text)
+        .await
+        .unwrap();
+    assert_eq!(calls[0].function.arguments, "{\"c\": \"\\n杭州市\"}");
+    for chunk_chars in [1usize, 2, 5, 1000] {
+        let (content, streamed) = stream(text, chunk_chars).await;
+        assert_eq!(content, "", "chunk {chunk_chars}");
+        assert_eq!(
+            streamed,
+            vec![(Some("f".to_string()), "{\"c\": \"\\n杭州市\"}".to_string())],
+            "chunk {chunk_chars}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn end_of_stream_flushes_held_back_content_but_not_tool_syntax() {
+    let mut parser = DeepSeekDsmlParser::v41();
+    let first = parser.parse_incremental("Hi\n", &[]).await.unwrap();
+    assert_eq!(first.normal_text, "Hi");
+    assert_eq!(parser.take_unstreamed_normal_text(), "\n");
+    assert_eq!(parser.take_unstreamed_normal_text(), "");
+
+    let mut parser = DeepSeekDsmlParser::v41();
+    parser.parse_incremental(TWO_CALLS, &[]).await.unwrap();
+    parser.parse_incremental("\ntrailing", &[]).await.unwrap();
+    assert_eq!(parser.take_unstreamed_normal_text(), "");
+}
+
+#[tokio::test]
 async fn reset_clears_the_tool_section_state() {
     let mut parser = DeepSeekDsmlParser::v41();
     parser.parse_incremental(TWO_CALLS, &[]).await.unwrap();
@@ -242,6 +278,7 @@ fn factory_maps_v41_names_ahead_of_v4_and_registers_a_structural_tag() {
         "deepseek-ai/DeepSeek-V4.1-Flash",
         "deepseek-v4.1-flash",
         "DeepSeek_V41",
+        "deepseek-v41-flash",
     ] {
         let parser = registry.create_for_model(model).unwrap();
         let (_, calls) = tokio::runtime::Runtime::new()

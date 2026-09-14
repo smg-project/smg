@@ -296,8 +296,10 @@ impl DeepSeekDsmlParser {
         let trimmed = invoke_content.trim();
 
         // Direct JSON path (also the shape SGLang's grammar emits under a
-        // structural-tag constraint). The text is the arguments object; it
-        // is passed through untouched so streaming deltas stay consistent.
+        // structural-tag constraint). The text is the arguments object and is
+        // passed through as written — a compact body stays compact rather
+        // than being re-spaced like DSML parameters — so streaming deltas stay
+        // consistent (SGLang does the same).
         if trimmed.starts_with('{') {
             if allow_partial {
                 // `strip_dsml_trailing` handles partial `</｜DSML｜invoke>` prefixes
@@ -354,18 +356,21 @@ impl DeepSeekDsmlParser {
                 // handles `</｜DSML｜parameter>` prefixes, so a truncated turn
                 // with `value<EOS>` would otherwise stream EOS as arg bytes.
                 let value = cap.get(3).map_or("", |m| m.as_str()).replace(EOS_TOKEN, "");
-                let value = value.trim();
 
                 // Only add if we have actual content and this param isn't already
-                // complete. A `string="false"` value is held back until its text
-                // parses as JSON: emitting an unfinished `[1, true, nul` as a raw
-                // string would start the delta stream with a quote the finished
-                // array never has, corrupting every later delta.
+                // complete. A `string="true"` value is taken raw, exactly as the
+                // complete path takes it: trimming a partial value would make the
+                // streamed bytes diverge from the finished value and the delta
+                // offsets slice it mid-character. A `string="false"` value is
+                // held back until its text parses as JSON: emitting an unfinished
+                // `[1, true, nul` as a raw string would start the delta stream
+                // with a quote the finished array never has, corrupting every
+                // later delta.
                 if !value.is_empty() && !params.contains_key(name) {
                     let json_value = if is_string == "true" {
-                        Some(Value::String(value.to_string()))
+                        Some(Value::String(value.clone()))
                     } else {
-                        serde_json::from_str(value).ok()
+                        serde_json::from_str(value.trim()).ok()
                     };
                     if let Some(json_value) = json_value {
                         params.insert(name.to_string(), json_value);
@@ -566,7 +571,7 @@ impl DeepSeekDsmlParser {
 
             let argument_diff = if is_complete {
                 if sent_len < current_args.len() {
-                    Some(current_args[sent_len..].to_string())
+                    Some(current_args.get(sent_len..).unwrap_or_default().to_string())
                 } else {
                     Some(String::new())
                 }
@@ -576,7 +581,7 @@ impl DeepSeekDsmlParser {
                 } else {
                     let prefix = helpers::find_common_prefix(prev, &current_args);
                     if prefix.len() > sent_len {
-                        Some(prefix[sent_len..].to_string())
+                        Some(prefix.get(sent_len..).unwrap_or_default().to_string())
                     } else {
                         None
                     }
@@ -585,7 +590,7 @@ impl DeepSeekDsmlParser {
                 // First partial chunk — no prev_args yet, emit from sent_len.
                 // Skip empty "{}" to avoid corrupting the delta stream when the
                 // buffer ends right after <invoke> with no parameter content yet.
-                Some(current_args[sent_len..].to_string())
+                Some(current_args.get(sent_len..).unwrap_or_default().to_string())
             } else {
                 None
             };
@@ -822,6 +827,20 @@ impl ToolParser for DeepSeekDsmlParser {
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
+    }
+
+    fn take_unstreamed_normal_text(&mut self) -> String {
+        // V4.1 holds back a suffix that could still become the separator plus
+        // a tool opener (V3.2/V4 hold `<`/`</` prefixes). At end of stream it
+        // is real text when no tool section ever opened, and tool syntax
+        // otherwise (the remaining arguments come from
+        // `get_unstreamed_tool_args`).
+        if self.in_tool_section {
+            self.buffer.clear();
+            return String::new();
+        }
+        helpers::take_unstreamed_normal_text(&mut self.buffer, self.current_tool_id)
+            .replace(EOS_TOKEN, "")
     }
 
     fn reset(&mut self) {

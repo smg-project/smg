@@ -429,6 +429,7 @@ impl ParserFactory {
         // V4.1 DSML format (spaced tags); its stems are longer than V4's, so they win
         registry.map_model("deepseek-v4.1*", "deepseek_v41");
         registry.map_model("deepseek_v41*", "deepseek_v41");
+        registry.map_model("deepseek-v41*", "deepseek_v41");
         registry.map_model("deepseek-ai/DeepSeek-V4.1*", "deepseek_v41");
         registry.map_model("deepseek-*", "pythonic");
 
