@@ -840,40 +840,46 @@ fn inject_tools_into_first_system_message(
     Some(owned)
 }
 
+/// A V4.1 boolean template kwarg (`thinking`, `drop_thinking`): `None` when
+/// absent or JSON `null`; a present value that isn't a JSON boolean is an
+/// error naming the key and the value. Unlike V3.2/V4's [`explicit_thinking`],
+/// which silently ignores a wrongly typed value.
+fn boolean_kwarg_v41(params: &ChatTemplateParams, key: &str) -> Result<Option<bool>> {
+    match params.template_kwargs.and_then(|k| k.get(key)) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(value)) => Ok(Some(*value)),
+        Some(other) => Err(Error::msg(format!(
+            "DeepSeek V4.1: template_kwargs[\"{key}\"] must be a boolean, got {other}"
+        ))),
+    }
+}
+
 /// V4.1's explicit thinking toggle: `template_kwargs["thinking"]`, the key
 /// this tokenizer reports through `thinking_key_name()` and therefore the only
-/// key the gateway consults when it arms the reasoning parser. Unlike
-/// V3.2/V4's [`explicit_thinking`], which silently ignores a wrongly typed
-/// value, a present value that isn't a JSON boolean is an error; a JSON `null`
-/// counts as absent.
+/// key the gateway consults when it arms the reasoning parser. Read with the
+/// strict [`boolean_kwarg_v41`] rule.
 ///
 /// vLLM's `enable_thinking` alias is deliberately NOT read here: the gateway
 /// does not know the alias yet, so honouring it would render chat mode while
 /// the parser stays armed. Re-enable it together with the gateway-side change
 /// (Task 17) so both sides learn the alias at once.
 fn explicit_thinking_v41(params: &ChatTemplateParams) -> Result<Option<bool>> {
-    match params.template_kwargs.and_then(|k| k.get("thinking")) {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::Bool(value)) => Ok(Some(*value)),
-        Some(other) => Err(Error::msg(format!(
-            "DeepSeek V4.1: template_kwargs[\"thinking\"] must be a boolean, got {other}"
-        ))),
-    }
+    boolean_kwarg_v41(params, "thinking")
 }
 
 /// The gateway deserialises a top-level JSON number (`"reasoning_effort": 42`)
 /// into the string `"42"` before forwarding it as a template kwarg. Restore
 /// the number so [`deepseek_v41::parse_reasoning_effort`] sees the integer
-/// budget the client sent. Every other value passes through untouched: an
-/// out-of-range integer is rejected there with the same message a JSON number
-/// gets.
+/// budget the client sent. Only that exact form, a non-empty string of ASCII
+/// digits, is restored: a signed or padded `"+42"` / `" 42 "` passes through
+/// untouched and is rejected there as the string it is, and an out-of-range
+/// `"101"` is restored and rejected there with the message a JSON number gets.
 fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_json::Value> {
-    value
-        .as_str()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(serde_json::Value::from)
+    let digits = value.as_str()?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok().map(serde_json::Value::from)
 }
 
 /// DeepSeek V4.1 chat-template shim. Order: attach tools to the first system
@@ -945,11 +951,7 @@ fn apply_deepseek_v41(
         deepseek_v32::ThinkingMode::Chat
     };
 
-    let drop_thinking = params
-        .template_kwargs
-        .and_then(|k| k.get("drop_thinking"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
+    let drop_thinking = boolean_kwarg_v41(params, "drop_thinking")?.unwrap_or(true);
 
     // `continue_final_message` reaches the encoder as `wo_eos` on the final
     // assistant message: no EOS, no generation header appended.

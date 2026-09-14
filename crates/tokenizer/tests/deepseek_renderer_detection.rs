@@ -579,6 +579,20 @@ mod tests {
                 .to_string();
             assert!(err.contains("Invalid reasoning effort"), "{bad}: {err}");
         }
+        // Only the gateway's exact form, ASCII digits, is restored: a sign or
+        // surrounding whitespace is not an integer budget and reaches the
+        // strict parser as the string it is.
+        for bad in ["+42", " 42 "] {
+            let kw = HashMap::from([("reasoning_effort".to_string(), json!(bad))]);
+            let err = render_v41_turn(&tokenizer, Some(&kw), None)
+                .expect_err(bad)
+                .to_string();
+            assert_eq!(
+                err,
+                format!("DeepSeek V4.1 reasoning_effort invalid: Invalid reasoning effort `{bad}`: expected an integer within [1, 100] or one of low, high, xhigh, max"),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -621,6 +635,26 @@ mod tests {
         assert!(err.contains("must be a boolean"), "{err}");
         // The message names the key and the offending value.
         assert!(err.contains("thinking") && err.contains("yes"), "{err}");
+    }
+
+    #[test]
+    fn v41_non_boolean_drop_thinking_kwarg_errors() {
+        // Same rule as `thinking`: present but not a JSON boolean is an error
+        // naming the key and the value; JSON null counts as absent.
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let kw = HashMap::from([("drop_thinking".to_string(), json!("false"))]);
+        let err = render_v41_turn(&tokenizer, Some(&kw), None)
+            .expect_err("a non-boolean drop_thinking kwarg must error")
+            .to_string();
+        assert_eq!(
+            err,
+            "DeepSeek V4.1: template_kwargs[\"drop_thinking\"] must be a boolean, got \"false\""
+        );
+        let kw = HashMap::from([("drop_thinking".to_string(), serde_json::Value::Null)]);
+        assert_eq!(
+            render_v41_turn(&tokenizer, Some(&kw), None).unwrap(),
+            format!("{V41_BOS}{V41_DEFAULT_EFFORT_HEADER}{V41_THINKING_TAIL}")
+        );
     }
 
     #[test]
