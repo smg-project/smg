@@ -188,6 +188,13 @@ impl ReasoningParser for DeepSeekV41Parser {
         Ok(self.drain(false))
     }
 
+    fn flush(&mut self) -> Result<ParserResult, ParseError> {
+        // Whatever is still held back can no longer become a marker: emit it
+        // to the current state's side. The buffer is empty afterwards, so a
+        // repeated call returns nothing.
+        Ok(self.drain(true))
+    }
+
     fn reset(&mut self) {
         self.state = State::Content;
         self.buffer.clear();

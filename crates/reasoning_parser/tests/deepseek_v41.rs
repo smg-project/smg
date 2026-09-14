@@ -296,3 +296,28 @@ fn a_marker_prefix_that_diverges_late_stays_reasoning_text() {
     assert_eq!(reasoning, "I think <｜DSML｜ calm");
     assert_eq!(normal, "x");
 }
+
+#[test]
+fn flush_emits_the_held_back_tail_once() {
+    let mut parser = armed();
+    let first = parser
+        .parse_reasoning_streaming_incremental("held <｜DSML｜ ca")
+        .unwrap();
+    assert_eq!(first.reasoning_text, "held ");
+    assert_eq!(
+        parser.flush().unwrap(),
+        reasoning_parser::ParserResult::reasoning("<｜DSML｜ ca".to_string())
+    );
+    assert!(parser.flush().unwrap().is_empty());
+
+    let mut parser = unarmed();
+    parser
+        .parse_reasoning_streaming_incremental("answer </thi")
+        .unwrap();
+    assert_eq!(
+        parser.flush().unwrap(),
+        reasoning_parser::ParserResult::normal("</thi".to_string())
+    );
+    parser.reset();
+    assert!(parser.flush().unwrap().is_empty());
+}
