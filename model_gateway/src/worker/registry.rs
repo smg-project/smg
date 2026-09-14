@@ -27,6 +27,7 @@ use openai_protocol::worker::WorkerStatus;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
+use super::pd_pair_health;
 use crate::{
     config::types::RetryConfig,
     observability::metrics::Metrics,
@@ -1642,6 +1643,7 @@ impl WorkerRegistry {
         };
         if let Some((_, worker)) = removed {
             self.url_to_id.remove(worker.url());
+            pd_pair_health::forget(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
             self.worker_origins.remove(worker_id);

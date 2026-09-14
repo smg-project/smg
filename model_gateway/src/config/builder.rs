@@ -268,6 +268,16 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn pd_pair_quarantine_failures(mut self, failures: u32) -> Self {
+        self.config.pd_pair_quarantine_failures = failures;
+        self
+    }
+
+    pub fn pd_pair_quarantine_secs(mut self, secs: u64) -> Self {
+        self.config.pd_pair_quarantine_secs = secs;
+        self
+    }
+
     pub fn disable_load_monitoring(mut self, disabled: bool) -> Self {
         self.config.disable_load_monitoring = disabled;
         self
