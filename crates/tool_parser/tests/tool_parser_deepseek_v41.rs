@@ -148,7 +148,7 @@ async fn orphan_invoke_without_a_block_is_a_call_and_text_after_the_section_is_d
 
 #[tokio::test]
 async fn streaming_yields_identical_calls_at_every_chunk_size() {
-    for chunk_chars in [1usize, 7, 10_000] {
+    for chunk_chars in [1usize, 2, 3, 5, 7, 11, 13, 17, 23, 31, 47, 10_000] {
         let (content, calls) = stream(TWO_CALLS, chunk_chars).await;
         assert_eq!(content, "Checking.", "chunk {chunk_chars}");
         assert_eq!(
@@ -243,6 +243,50 @@ async fn streaming_keeps_leading_whitespace_in_string_values_and_never_slices_mi
     }
 }
 
+/// A `string="false"` number parses at every length, so a chunk boundary
+/// inside it must not stream the shorter number as final: the first partial
+/// snapshot is diffed against the empty object like every later one.
+#[tokio::test]
+async fn a_number_split_across_chunks_is_streamed_once() {
+    let text = concat!(
+        "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n",
+        "<｜DSML｜ parameter name=\"n\" string=\"false\">123</｜DSML｜ parameter>\n",
+        "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+    );
+    let split = text.find("123").unwrap() + 2;
+    let mut parser = DeepSeekDsmlParser::v41();
+    let mut args = String::new();
+    for chunk in [&text[..split], &text[split..]] {
+        for item in parser.parse_incremental(chunk, &[]).await.unwrap().calls {
+            args.push_str(&item.parameters);
+        }
+    }
+    assert_eq!(args, r#"{"n": 123}"#);
+}
+
+/// A turn truncated inside an invoke: the streamed prefix plus the
+/// end-of-stream remainder from `get_unstreamed_tool_args` is the parser's
+/// last snapshot, so the client's arguments close.
+#[tokio::test]
+async fn truncated_invoke_remainder_closes_the_streamed_arguments() {
+    let mut parser = DeepSeekDsmlParser::v41();
+    let mut args = String::new();
+    for chunk in [
+        "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n",
+        "<｜DSML｜ parameter name=\"city\" string=\"true\">杭",
+        "州",
+    ] {
+        for item in parser.parse_incremental(chunk, &[]).await.unwrap().calls {
+            args.push_str(&item.parameters);
+        }
+    }
+    for item in parser.get_unstreamed_tool_args().unwrap_or_default() {
+        args.push_str(&item.parameters);
+    }
+    assert_eq!(args, r#"{"city": "杭州"}"#);
+    assert_eq!(parser.take_unstreamed_normal_text(), "");
+}
+
 #[tokio::test]
 async fn end_of_stream_flushes_held_back_content_but_not_tool_syntax() {
     let mut parser = DeepSeekDsmlParser::v41();
@@ -276,6 +320,7 @@ fn factory_maps_v41_names_ahead_of_v4_and_registers_a_structural_tag() {
     assert!(!registry.has_structural_tag("deepseek_v4"));
     for model in [
         "deepseek-ai/DeepSeek-V4.1-Flash",
+        "deepseek-ai/DeepSeek-V41-Flash",
         "deepseek-v4.1-flash",
         "DeepSeek_V41",
         "deepseek-v41-flash",

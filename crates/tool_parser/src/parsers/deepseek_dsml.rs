@@ -560,14 +560,21 @@ impl DeepSeekDsmlParser {
                 .map(|s| s.len())
                 .unwrap_or(0);
 
-            let prev_args = if tool_id < self.prev_tool_call_arr.len() {
-                self.prev_tool_call_arr[tool_id]
-                    .get("arguments")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            } else {
-                None
-            };
+            // The snapshot the previous pass streamed against; before any
+            // pass it is the empty object, so the first partial snapshot is
+            // diffed like every later one and only the prefix two consecutive
+            // snapshots agree on is streamed. Emitting a first snapshot whole
+            // would send its closing brace and a still-growing value (a
+            // `string="false"` number, a `string="true"` body) ahead of bytes
+            // that later snapshots change, and the completion delta would then
+            // append a tail that no longer lines up with what was sent.
+            let prev_args = self
+                .prev_tool_call_arr
+                .get(tool_id)
+                .and_then(|prev| prev.get("arguments"))
+                .and_then(Value::as_str)
+                .unwrap_or("{}")
+                .to_string();
 
             let argument_diff = if is_complete {
                 if sent_len < current_args.len() {
@@ -575,24 +582,15 @@ impl DeepSeekDsmlParser {
                 } else {
                     Some(String::new())
                 }
-            } else if let Some(prev) = &prev_args {
-                if current_args == *prev {
-                    None
-                } else {
-                    let prefix = helpers::find_common_prefix(prev, &current_args);
-                    if prefix.len() > sent_len {
-                        Some(prefix.get(sent_len..).unwrap_or_default().to_string())
-                    } else {
-                        None
-                    }
-                }
-            } else if sent_len < current_args.len() && current_args != "{}" {
-                // First partial chunk — no prev_args yet, emit from sent_len.
-                // Skip empty "{}" to avoid corrupting the delta stream when the
-                // buffer ends right after <invoke> with no parameter content yet.
-                Some(current_args.get(sent_len..).unwrap_or_default().to_string())
-            } else {
+            } else if current_args == prev_args {
                 None
+            } else {
+                let prefix = helpers::find_common_prefix(&prev_args, &current_args);
+                if prefix.len() > sent_len {
+                    Some(prefix.get(sent_len..).unwrap_or_default().to_string())
+                } else {
+                    None
+                }
             };
 
             if let Some(diff) = argument_diff {
@@ -826,16 +824,33 @@ impl ToolParser for DeepSeekDsmlParser {
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
-        helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
+        // The tracked snapshot is the exact argument string the deltas were
+        // diffed against, so it is compared verbatim; the shared helper would
+        // re-serialise it as a quoted JSON string and never match.
+        let tool_index = self.prev_tool_call_arr.len().checked_sub(1)?;
+        let snapshot = self.prev_tool_call_arr[tool_index]
+            .get("arguments")?
+            .as_str()?;
+        let streamed = self.streamed_args_for_tool.get(tool_index)?;
+        let remaining = snapshot.strip_prefix(streamed.as_str())?;
+        (!remaining.is_empty()).then(|| {
+            vec![ToolCallItem {
+                tool_index,
+                name: None,
+                parameters: remaining.to_string(),
+            }]
+        })
     }
 
     fn take_unstreamed_normal_text(&mut self) -> String {
         // V4.1 holds back a suffix that could still become the separator plus
-        // a tool opener (V3.2/V4 hold `<`/`</` prefixes). At end of stream it
-        // is real text when no tool section ever opened, and tool syntax
-        // otherwise (the remaining arguments come from
+        // a tool opener; V3.2/V4 hold `<`/`</` prefixes and, once the DSML
+        // sentinel has arrived, everything from it on. At end of stream the
+        // held text is content when no tool syntax ever started, and is
+        // dropped otherwise: a truncated opener or invoke is not content (the
+        // remaining arguments of a truncated invoke come from
         // `get_unstreamed_tool_args`).
-        if self.in_tool_section {
+        if self.in_tool_section || self.buffer.contains("<｜DSML｜") {
             self.buffer.clear();
             return String::new();
         }

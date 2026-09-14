@@ -791,6 +791,27 @@ async fn test_deepseek_v4_streaming_holds_back_unparsed_false_values() {
     assert_eq!(args, r#"{"flags":[1,true,null]}"#);
 }
 
+/// End of stream right after the block opener: the opener is tool syntax,
+/// not content, so nothing is flushed; a held-back `<` with no sentinel is.
+#[tokio::test]
+async fn test_deepseek_v4_end_of_stream_drops_a_truncated_opener() {
+    let tools = create_test_tools();
+    let mut parser = DeepSeekDsmlParser::v4();
+    let first = parser.parse_incremental("Hello ", &tools).await.unwrap();
+    assert_eq!(first.normal_text, "Hello ");
+    let second = parser
+        .parse_incremental("<｜DSML｜tool_calls>", &tools)
+        .await
+        .unwrap();
+    assert_eq!(second.normal_text, "");
+    assert!(second.calls.is_empty());
+    assert_eq!(parser.take_unstreamed_normal_text(), "");
+
+    let mut parser = DeepSeekDsmlParser::v4();
+    parser.parse_incremental("a <", &tools).await.unwrap();
+    assert_eq!(parser.take_unstreamed_normal_text(), "a <");
+}
+
 /// Shared streaming fix: a `string="true"` value starting with a newline and
 /// continuing with multi-byte text is taken raw, so the delta offsets never
 /// slice a character (the previous trim made the finished value diverge from

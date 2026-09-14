@@ -431,6 +431,9 @@ impl ParserFactory {
         registry.map_model("deepseek_v41*", "deepseek_v41");
         registry.map_model("deepseek-v41*", "deepseek_v41");
         registry.map_model("deepseek-ai/DeepSeek-V4.1*", "deepseek_v41");
+        // Longest matching stem wins: without this the org-prefixed dot-less
+        // spelling would resolve through `deepseek-ai/DeepSeek-V4*` to V4.
+        registry.map_model("deepseek-ai/DeepSeek-V41*", "deepseek_v41");
         registry.map_model("deepseek-*", "pythonic");
 
         // GLM models
