@@ -15,7 +15,9 @@
 //! the tool parser; vLLM's tool states never return to content or reasoning,
 //! so think markers after a tool block are not interpreted. Only the full
 //! spaced marker counts: a bare `<｜DSML｜` (SGLang's cut point) or V4's
-//! unspaced spelling is ordinary text. Text is emitted verbatim — no
+//! unspaced spelling is ordinary text, and so is a block-less
+//! `<｜DSML｜ invoke ...>` (vLLM's content-state invoke transition only
+//! concerns the tool parser downstream). Text is emitted verbatim — no
 //! whitespace trimming. Streaming holds back a buffer suffix that could still
 //! grow into a marker of the current state and emits everything before it.
 

@@ -3,9 +3,10 @@
 //! transitions of vLLM's `deepseek_v4` parser engine (inherited unchanged by
 //! its `deepseek_v41` configuration, which only swaps in the spaced marker).
 
-use reasoning_parser::{ParseError, ParserFactory, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE};
-
-const TOOL_BLOCK_START: &str = "<｜DSML｜ calls>";
+use reasoning_parser::{
+    parsers::deepseek_v41::TOOL_BLOCK_START, ParseError, ParserFactory, ReasoningParser,
+    DEFAULT_MAX_BUFFER_SIZE,
+};
 
 /// A chat-mode parser: the constructor state, nothing armed.
 fn unarmed() -> Box<dyn ReasoningParser> {
@@ -213,7 +214,7 @@ fn think_markers_after_a_tool_block_are_not_interpreted() {
 
 #[test]
 fn streaming_reproduces_the_one_shot_split_at_every_chunk_size() {
-    let cases: [(bool, &str); 6] = [
+    let cases: [(bool, &str); 7] = [
         (true, "Let me think</think>Answer with <｜DSML｜ inside content"),
         (
             true,
@@ -223,6 +224,7 @@ fn streaming_reproduces_the_one_shot_split_at_every_chunk_size() {
         (true, "</think>12"),
         (false, "x<think>r</think>y"),
         (false, "Answer <｜DSML｜ calls>tail</think>z"),
+        (true, "I think <｜DSML｜ calm</think>x"),
     ];
     for (arm, text) in cases {
         let make = || if arm { armed() } else { unarmed() };
@@ -280,4 +282,17 @@ fn buffer_overflow_is_an_error_on_both_paths() {
         parser.parse_reasoning_streaming_incremental(&oversized),
         Err(ParseError::BufferOverflow(size)) if size == DEFAULT_MAX_BUFFER_SIZE + 2
     ));
+}
+
+#[test]
+fn a_marker_prefix_that_diverges_late_stays_reasoning_text() {
+    // `<｜DSML｜ cal` could still become the tool marker; once the next byte
+    // diverges it is reasoning text, and `</think>` ends the block as usual.
+    let (reasoning, normal) = split(
+        armed()
+            .detect_and_parse_reasoning("I think <｜DSML｜ calm</think>x")
+            .unwrap(),
+    );
+    assert_eq!(reasoning, "I think <｜DSML｜ calm");
+    assert_eq!(normal, "x");
 }
