@@ -36,6 +36,27 @@ pip install smg-grpc-servicer[sglang]
 vllm serve meta-llama/Llama-2-7b-hf --grpc
 ```
 
+#### DP load reporting
+
+`GetLoads` reports cached scheduler statistics for each managed global DP rank;
+the optional `dp_rank` filter includes rank zero. Keep vLLM stats logging enabled:
+missing snapshots are omitted rather than reported as idle. The gateway scopes
+each virtual DP worker's load to its own rank, not the backend-wide average.
+
+`max_total_num_tokens` uses vLLM's profiled **per-engine**
+`kv_cache_size_tokens`. `num_used_tokens` is the rounded-up occupied KV-token
+equivalent (`token_usage * capacity`), not pending prompt tokens. Older vLLM
+versions without this capacity field retain ratio-only reporting (absolute
+fields remain zero). Deferred/skipped waiting requests are included in queue
+depth. Optional sections other than core are still best-effort; no extra
+scheduler RPC is issued.
+
+Rollout requires updating both the gateway binary and `smg-grpc-servicer`
+inside the vLLM image. With DP4, verify four distinct ranks in unfiltered
+`GetLoads` and one matching rank per `@0`–`@3` worker in the gateway's
+`/get_loads`. This fixes telemetry attribution; throughput/latency improvements
+require workload testing.
+
 ### MLX
 
 ```bash
