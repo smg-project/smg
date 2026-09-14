@@ -5,7 +5,9 @@ mod tests {
     use std::{collections::HashMap, fs};
 
     use llm_tokenizer::{
-        chat_template::{ChatTemplateParams, ThinkingKeyName, ThinkingToggle},
+        chat_template::{
+            ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+        },
         huggingface::HuggingFaceTokenizer,
         TokenizerTrait,
     };
@@ -422,5 +424,204 @@ mod tests {
             .unwrap();
         assert!(out.ends_with("</think>"), "{out}");
         assert!(!out.contains("Reasoning Effort:"), "{out}");
+    }
+
+    // -----------------------------------------------------------------------
+    // DeepSeek V4.1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn v41_architecture_selects_the_v41_renderer_with_thinking_on_by_default() {
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        assert_eq!(tokenizer.thinking_toggle(), ThinkingToggle::DefaultOn);
+        assert_eq!(
+            tokenizer.native_reasoning_effort_values(),
+            &["low", "high", "xhigh", "max"]
+        );
+        assert!(tokenizer.think_in_prefill());
+        let out = tokenizer
+            .apply_chat_template(
+                &[json!({"role": "user", "content": "q"})],
+                ChatTemplateParams {
+                    add_generation_prompt: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            out.starts_with("<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}System\u{FF5C}>Reasoning Effort: 50 (range"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with("<\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}><think>"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn v41_reasoning_effort_none_disables_thinking_and_bad_values_error() {
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![json!({"role": "user", "content": "q"})];
+
+        let none_kwargs = HashMap::from([("reasoning_effort".to_string(), json!("none"))]);
+        let off = tokenizer
+            .apply_chat_template(
+                &messages,
+                ChatTemplateParams {
+                    add_generation_prompt: true,
+                    template_kwargs: Some(&none_kwargs),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            off,
+            "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}></think>"
+        );
+
+        let medium_kwargs = HashMap::from([("reasoning_effort".to_string(), json!("medium"))]);
+        let result = tokenizer.apply_chat_template(
+            &messages,
+            ChatTemplateParams {
+                add_generation_prompt: true,
+                template_kwargs: Some(&medium_kwargs),
+                ..Default::default()
+            },
+        );
+        assert!(
+            result.is_err(),
+            "expected an error for reasoning_effort=medium"
+        );
+    }
+
+    #[test]
+    fn v41_conflicting_thinking_toggles_error() {
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let kw = HashMap::from([
+            ("thinking".to_string(), json!(true)),
+            ("enable_thinking".to_string(), json!(false)),
+        ]);
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            template_kwargs: Some(&kw),
+            ..Default::default()
+        };
+        let result =
+            tokenizer.apply_chat_template(&[json!({"role": "user", "content": "q"})], params);
+        assert!(
+            result.is_err(),
+            "conflicting thinking/enable_thinking must error"
+        );
+    }
+
+    #[test]
+    fn v41_tools_attach_to_a_mid_conversation_system_message() {
+        // vLLM's V4.1 rule: tools attach to the FIRST system message wherever
+        // it is, even when the conversation opens with a user turn — unlike
+        // V3.2/V4, which only rewrite a *leading* system/developer message.
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+            json!({"role": "system", "content": "S"}),
+            json!({"role": "user", "content": "q"}),
+        ];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"]
+                }
+            }
+        })];
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        let out = tokenizer.apply_chat_template(&messages, params).unwrap();
+        assert!(out.contains("get_weather"), "tool name missing: {out}");
+        // Tools must land on the existing mid-conversation system message's
+        // own content, not on a synthesized leading one.
+        assert!(
+            out.contains("S\n\n## Tools"),
+            "tools not attached to the mid-conversation system message: {out}"
+        );
+        assert_eq!(out.matches("## Tools").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn v41_add_generation_prompt_false_continues_the_final_assistant_message() {
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let messages = vec![
+            json!({"role": "user", "content": "q"}),
+            json!({"role": "assistant", "reasoning_content": "r", "content": "Sure,"}),
+        ];
+        let out = tokenizer
+            .apply_chat_template(
+                &messages,
+                ChatTemplateParams {
+                    add_generation_prompt: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Thinking mode (default ON), reasoning kept (the assistant turn is
+        // after the last user turn), and no trailing EOS since
+        // `add_generation_prompt: false` continues the final message.
+        assert_eq!(
+            out,
+            "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}System\u{FF5C}>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}><think>r</think>Sure,"
+        );
+    }
+
+    #[test]
+    fn v41_chat_template_content_format_is_openai_v4_stays_string() {
+        let (_tmp, tok41) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
+        let tokenizer41 = HuggingFaceTokenizer::from_file(&tok41).unwrap();
+        assert_eq!(
+            tokenizer41.chat_template_content_format(),
+            ChatTemplateContentFormat::OpenAI
+        );
+
+        let (_tmp, tok4) = write_dir(Some(&["DeepseekV4ForCausalLM"]));
+        let tokenizer4 = HuggingFaceTokenizer::from_file(&tok4).unwrap();
+        assert_eq!(
+            tokenizer4.chat_template_content_format(),
+            ChatTemplateContentFormat::String
+        );
+    }
+
+    #[test]
+    fn v41_reasoning_effort_none_overrides_explicit_thinking_true() {
+        let (_tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
+        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        let kw = HashMap::from([
+            ("reasoning_effort".to_string(), json!("none")),
+            ("thinking".to_string(), json!(true)),
+        ]);
+        let out = tokenizer
+            .apply_chat_template(
+                &[json!({"role": "user", "content": "q"})],
+                ChatTemplateParams {
+                    add_generation_prompt: true,
+                    template_kwargs: Some(&kw),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}></think>"
+        );
     }
 }
