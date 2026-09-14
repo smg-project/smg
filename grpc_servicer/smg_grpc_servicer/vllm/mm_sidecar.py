@@ -69,6 +69,7 @@ def config_fingerprint(vllm_config) -> Fingerprint:
         mm_processor_kwargs=json.dumps(
             mm_config.mm_processor_kwargs or {}, sort_keys=True, default=str
         ),
+        limit_per_prompt=json.dumps(mm_config.limit_per_prompt or {}, sort_keys=True, default=str),
     )
 
 

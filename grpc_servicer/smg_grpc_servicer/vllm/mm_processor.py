@@ -260,6 +260,7 @@ def engine_fingerprint(engine) -> Fingerprint:
         mm_processor_kwargs=json.dumps(
             mm_config.mm_processor_kwargs or {}, sort_keys=True, default=str
         ),
+        limit_per_prompt=json.dumps(mm_config.limit_per_prompt or {}, sort_keys=True, default=str),
     )
 
 
@@ -295,6 +296,7 @@ class RedisMediaProcessor:
         namespace: str | None = None,
         max_item_bytes: int = DEFAULT_MAX_ITEM_BYTES,
         max_inflight: int = DEFAULT_MAX_INFLIGHT,
+        max_items: int = DEFAULT_MAX_ITEMS,
         client=None,
     ) -> None:
         self._engine = engine
@@ -302,6 +304,7 @@ class RedisMediaProcessor:
         self._timeout_ms = timeout_ms
         self._max_queue = max_queue
         self._max_item_bytes = max_item_bytes
+        self._max_items = max_items
         self.max_inflight = max_inflight
         self._keys = Keys.for_namespace(resolve_namespace(fingerprint, namespace))
         self._client = client if client is not None else _redis_client(redis_url)
@@ -320,7 +323,13 @@ class RedisMediaProcessor:
             return False
         remote = Fingerprint.from_hello(hello) if hello else None
         if remote is None:
-            self._log_probe_once("no sidecar hello at %s", self._keys.hello)
+            # A sidecar built for any other fingerprint lives under another
+            # namespace, so this is the message every disagreement produces.
+            self._log_probe_once(
+                "no sidecar hello at %s (worker fingerprint=%s)",
+                self._keys.hello,
+                self._fingerprint.to_hello(),
+            )
             return False
         mismatches = self._fingerprint.mismatches(remote)
         if mismatches:
@@ -352,6 +361,7 @@ class RedisMediaProcessor:
         *,
         request_id: str = "",
     ):
+        enforce_item_count(items, self._max_items)
         enforce_item_bytes(items, self._max_item_bytes)
         now_ms = int(time.time() * 1000)
         job = Job(
@@ -389,7 +399,14 @@ class RedisMediaProcessor:
                 f"sidecar_timeout: no result for job {job.job_id} within {self._timeout_ms} ms"
             )
         _, raw = popped
-        result = decode_result(raw)
+        try:
+            result = decode_result(raw)
+        except Exception as e:  # noqa: BLE001 - an undecodable result means "try another worker"
+            raise MmProcessorUnavailable(f"sidecar_protocol: undecodable result: {e}") from e
+        if result.v != SCHEMA_VERSION:
+            raise MmProcessorUnavailable(
+                f"sidecar_protocol: result schema v{result.v}, worker speaks v{SCHEMA_VERSION}"
+            )
         if result.job_id != job.job_id:
             raise MmProcessorUnavailable(
                 f"sidecar_protocol: result for job {result.job_id} on key of {job.job_id}"
@@ -486,4 +503,5 @@ def build_mm_processor(engine, *, env: Mapping[str, str] = os.environ):
         namespace=env.get(ENV_NAMESPACE),
         max_item_bytes=max_item_bytes,
         max_inflight=max_inflight,
+        max_items=max_items,
     )

@@ -17,6 +17,7 @@ def fingerprint(**overrides) -> proto.Fingerprint:
         "video_backend": "opencv",
         "media_io_kwargs": "{}",
         "mm_processor_kwargs": "{}",
+        "limit_per_prompt": "{}",
     }
     values.update(overrides)
     return proto.Fingerprint(**values)
@@ -32,6 +33,7 @@ class TestFingerprint:
         assert a != fingerprint(video_backend="decord").namespace()
         assert a != fingerprint(media_io_kwargs='{"video":{"num_frames":8}}').namespace()
         assert a != fingerprint(mm_processor_kwargs='{"max_pixels":1}').namespace()
+        assert a != fingerprint(limit_per_prompt='{"image":8}').namespace()
 
     def test_override_wins(self):
         assert proto.resolve_namespace(fingerprint(), " prod-a ") == "prod-a"

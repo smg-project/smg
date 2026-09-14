@@ -60,6 +60,7 @@ def fingerprint():
         video_backend="opencv",
         media_io_kwargs="{}",
         mm_processor_kwargs="{}",
+        limit_per_prompt="{}",
     )
 
 
