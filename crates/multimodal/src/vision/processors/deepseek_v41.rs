@@ -178,11 +178,15 @@ impl DeepseekV41Processor {
     /// `preprocessor_config.json`; overrides use the `vision_config` field
     /// names from `config.json`.
     pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
+        // Every geometry input is floored at 1: a zero from a malformed
+        // config would divide by zero (patch) or saturate the grid
+        // (downsample) instead of producing a request error later.
         Self {
-            patch_size: config.get_patch_size(DEFAULT_PATCH_SIZE),
+            patch_size: config.get_patch_size(DEFAULT_PATCH_SIZE).max(1),
             downsample_ratio: config
                 .get_extra("downsample_ratio")
-                .unwrap_or(DEFAULT_DOWNSAMPLE_RATIO),
+                .unwrap_or(DEFAULT_DOWNSAMPLE_RATIO)
+                .max(1),
             max_n_token: config
                 .get_extra("max_image_tokens")
                 .unwrap_or(DEFAULT_MAX_NUM_TOKENS)

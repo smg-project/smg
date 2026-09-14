@@ -15,9 +15,14 @@ use llm_multimodal::vision::{
 };
 use serde::Deserialize;
 
+/// SHA-256 of the reference `inference/image_processor.py` the fixtures were
+/// recorded from; a regeneration against a different file fails here.
+const REFERENCE_SHA256: &str = "482759e3bcc4e9bb5ee582b244cc563f5d0e163d8b48dda91ebb7106e62f9272";
+
 #[derive(Deserialize)]
 struct GoldenDocument {
     reference: String,
+    reference_sha256: String,
     cases: Vec<GoldenCase>,
 }
 
@@ -100,6 +105,10 @@ fn preprocess_matches_the_reference_fingerprints() {
         document.reference.contains("image_processor.py"),
         "unexpected reference {}",
         document.reference
+    );
+    assert_eq!(
+        document.reference_sha256, REFERENCE_SHA256,
+        "golden fixtures were generated from an unexpected reference"
     );
     assert!(document.cases.len() >= 12, "expected the recorded case set");
 
