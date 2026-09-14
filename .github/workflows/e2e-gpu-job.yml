@@ -84,6 +84,11 @@ on:
         type: string
         default: ""
         description: "Prebuilt TokenSpeed carrier image to extract onto the runner (resolved by detect-changes); empty = build from source"
+      servicer_unit_tests:
+        required: false
+        type: boolean
+        default: false
+        description: "Also run grpc_servicer/tests here, where the importorskip('vllm') cases meet a real vLLM; set on one vLLM lane"
 
 jobs:
   run:
@@ -169,10 +174,12 @@ jobs:
           bash scripts/ci_install_e2e_deps.sh ${{ inputs.extra_deps }}
 
       # The servicer's vLLM-gated unit tests (importorskip("vllm")) only meet a
-      # real vLLM here; the CPU unit-test job skips them.
+      # real vLLM here; the CPU unit-test job skips them. One lane opts in.
       - name: Run vLLM-gated servicer unit tests
-        if: inputs.engine == 'vllm'
-        run: pytest -q grpc_servicer/tests -p no:cacheprovider
+        if: inputs.servicer_unit_tests
+        run: |
+          python3 -c "import vllm, msgspec"  # the gates these tests importorskip on
+          pytest -q grpc_servicer/tests -p no:cacheprovider -rs
 
       - name: Setup Oracle
         if: inputs.setup_agentic_deps
