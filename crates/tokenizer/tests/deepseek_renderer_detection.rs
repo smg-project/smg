@@ -11,6 +11,7 @@ mod tests {
         huggingface::HuggingFaceTokenizer,
         TokenizerTrait,
     };
+    use openai_protocol::common::{Function, Tool};
     use serde_json::json;
     use tempfile::TempDir;
     /// A minimal tokenizer.json that loads cleanly. The only requirement is that
@@ -738,6 +739,55 @@ mod tests {
             "tools not attached to the mid-conversation system message: {out}"
         );
         assert_eq!(out.matches("## Tools").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn v41_typed_function_without_optional_fields_renders_like_raw_json() {
+        // D5: `openai_protocol::common::Function` skips its absent optional
+        // fields (`description`, `strict`) when serialised, so a typed tool
+        // reaches the schema block with the same bytes as the raw JSON a
+        // client sends without those keys.
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let parameters = json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"]
+        });
+        let typed = serde_json::to_value(Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "lookup".to_string(),
+                description: None,
+                parameters: parameters.clone(),
+                strict: None,
+            },
+        })
+        .unwrap();
+        let raw = json!({
+            "type": "function",
+            "function": { "name": "lookup", "parameters": parameters }
+        });
+        let render = |tool: serde_json::Value| {
+            let tools = [tool];
+            tokenizer
+                .apply_chat_template(
+                    &[json!({"role": "user", "content": "q"})],
+                    ChatTemplateParams {
+                        add_generation_prompt: true,
+                        tools: Some(&tools),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        let from_typed = render(typed);
+        assert_eq!(from_typed, render(raw));
+        assert!(
+            from_typed.contains(
+                "\n\n{\"name\": \"lookup\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}\n\n"
+            ),
+            "{from_typed}"
+        );
     }
 
     #[test]

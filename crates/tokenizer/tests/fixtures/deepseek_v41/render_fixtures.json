@@ -642,6 +642,379 @@
    "drop_thinking": true,
    "continue_final_message": false,
    "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"f\", \"parameters\": {\"type\": \"object\"}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>q<｜Assistant｜><think></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"n\" string=\"false\">3</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"ok\" string=\"false\">true</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"obj\" string=\"false\">{\"temp\": \"C\"}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"s\" string=\"true\">raw <x></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>done</tool_result><｜Assistant｜><think>"
+  },
+  {
+   "name": "developer_then_user_thinking",
+   "messages": [
+    {
+     "role": "developer",
+     "content": "Follow the policy."
+    },
+    {
+     "role": "user",
+     "content": "Question?"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Question?<｜Assistant｜><think>"
+  },
+  {
+   "name": "two_user_turns",
+   "messages": [
+    {
+     "role": "user",
+     "content": "first"
+    },
+    {
+     "role": "user",
+     "content": "second"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>first\n\nsecond<｜Assistant｜><think>"
+  },
+  {
+   "name": "image_only_part",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "https://example.com/a.png"
+       }
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "chat",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜><｜deepseek_image｜><｜Assistant｜></think>"
+  },
+  {
+   "name": "empty_text_and_image_parts",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": ""
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "https://example.com/a.png"
+       }
+      },
+      {
+       "type": "text",
+       "text": "describe"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "chat",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜>\n\n<｜deepseek_image｜>\n\ndescribe<｜Assistant｜></think>"
+  },
+  {
+   "name": "input_image_and_image_pil_spellings",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "input_image",
+       "image_url": "https://example.com/a.png"
+      },
+      {
+       "type": "text",
+       "text": "which is brighter?"
+      },
+      {
+       "type": "image_pil"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "chat",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜User｜><｜deepseek_image｜>\n\nwhich is brighter?\n\n<｜deepseek_image｜><｜Assistant｜></think>"
+  },
+  {
+   "name": "tool_results_unknown_id",
+   "messages": [
+    {
+     "role": "user",
+     "content": "question"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "reason",
+     "content": "summary",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "lookup",
+        "arguments": "{\"query\": \"first\"}"
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "lookup",
+        "arguments": "{\"query\": \"second\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "second result"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_x",
+     "content": "unknown result"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "first result"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "lookup",
+      "description": "Look up",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ],
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"lookup\", \"description\": \"Look up\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>question<｜Assistant｜><think>reason</think>summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">first</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">second</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>unknown result</tool_result>\n\n<tool_result>first result</tool_result>\n\n<tool_result>second result</tool_result><｜Assistant｜><think>"
+  },
+  {
+   "name": "thinking_trailing_assistant",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "r",
+     "content": "Sure,"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>r</think>Sure,<｜end▁of▁sentence｜>"
+  },
+  {
+   "name": "assistant_tool_call_array_string_args",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "f",
+        "arguments": "[1, 2]"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": "done"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "f",
+      "parameters": {
+       "type": "object"
+      }
+     }
+    }
+   ],
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"f\", \"parameters\": {\"type\": \"object\"}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>q<｜Assistant｜><think></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"arguments\" string=\"true\">[1, 2]</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>done</tool_result><｜Assistant｜><think>"
+  },
+  {
+   "name": "assistant_tool_call_double_encoded_args",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "f",
+        "arguments": "\"{\\\"a\\\": 1}\""
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": "done"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "f",
+      "parameters": {
+       "type": "object"
+      }
+     }
+    }
+   ],
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"f\", \"parameters\": {\"type\": \"object\"}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>q<｜Assistant｜><think></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"a\" string=\"false\">1</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>done</tool_result><｜Assistant｜><think>"
+  },
+  {
+   "name": "mid_system_with_tools",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q1"
+    },
+    {
+     "role": "assistant",
+     "content": "a1"
+    },
+    {
+     "role": "system",
+     "content": "Mid-conversation update."
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "lookup",
+      "description": "Look up",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ],
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q1<｜Assistant｜><think></think>a1<｜end▁of▁sentence｜><｜System｜>Mid-conversation update.\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"lookup\", \"description\": \"Look up\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>q2<｜Assistant｜><think>"
+  },
+  {
+   "name": "response_format_on_system",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Answer in JSON.",
+     "response_format": {
+      "type": "object",
+      "properties": {
+       "answer": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "answer"
+      ]
+     }
+    },
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\nAnswer in JSON.\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{\"type\": \"object\", \"properties\": {\"answer\": {\"type\": \"string\"}}, \"required\": [\"answer\"]}<｜User｜>q<｜Assistant｜><think>"
   }
  ]
 }

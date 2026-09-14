@@ -888,19 +888,24 @@ mod tests {
 
         let doc: Value = serde_json::from_str(FIXTURES).unwrap();
         let cases = doc["cases"].as_array().unwrap();
-        assert_eq!(cases.len(), 16, "fixture case count");
+        assert_eq!(cases.len(), 27, "fixture case count");
 
         for case in cases {
             let name = case["name"].as_str().unwrap();
             let mut messages: Vec<Value> = case["messages"].as_array().unwrap().clone();
 
-            // The generator attaches the request's tools to the first system
-            // message, inserting an empty one when there is none up front.
+            // Rule D4, as the generator and the shim's
+            // `inject_tools_into_first_system_message` apply it: the request's
+            // tools land on the first system message wherever it sits; without
+            // one, an empty system message is inserted up front and carries
+            // them.
             if let Some(tools) = case.get("tools").filter(|t| !t.is_null()) {
-                if messages.first().map(|m| &m["role"]) != Some(&json!("system")) {
+                let system_index = messages.iter().position(|m| m["role"] == json!("system"));
+                let index = system_index.unwrap_or_else(|| {
                     messages.insert(0, json!({ "role": "system", "content": "" }));
-                }
-                messages[0]["tools"] = tools.clone();
+                    0
+                });
+                messages[index]["tools"] = tools.clone();
             }
             // `continue_final_message` was recorded as `wo_eos` on the last message.
             if case["continue_final_message"].as_bool().unwrap_or(false) {
