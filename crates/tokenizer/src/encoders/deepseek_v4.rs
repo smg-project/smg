@@ -395,7 +395,7 @@ fn render_message(
                 for tc in tcs {
                     let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let arguments = tc.get("arguments").unwrap_or(&Value::Null);
-                    let args = encode_arguments_to_dsml(arguments, &DSML_TAGS)?;
+                    let args = encode_arguments_to_dsml(arguments, &DSML_TAGS);
                     tc_list.push(format!(
                         "<{DSML_TOKEN}{invoke} name=\"{name}\">\n{args}\n</{DSML_TOKEN}{invoke}>",
                         invoke = DSML_TAGS.invoke,

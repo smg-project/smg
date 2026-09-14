@@ -274,48 +274,53 @@ pub(super) fn drop_thinking_messages(
 }
 
 /// Encode a single tool call's `arguments` value into `<DSML_TOKEN><parameter>`
-/// blocks.
+/// blocks, mirroring the reference `encode_arguments_to_dsml` (HF
+/// `encoding.py`, identical in vLLM's port).
 ///
 /// `arguments` may arrive as a JSON *string* (raw OpenAI tool_calls) or as an
-/// already-parsed object — `model_gateway`'s `process_tool_call_arguments`
-/// converts the string into a dict before the chat template runs. Reading only
-/// `as_str()` silently dropped object-form args, which erased every historical
-/// tool call's parameters in multi-turn prompts.
-///
-/// When `arguments` is a string that fails to JSON-parse, the V4-family
-/// upstream wraps the raw string in `{"arguments": <raw>}` instead of erroring
-/// (unlike V3.2, which propagates a parse error) — callers that have no
-/// `arguments` at all should pass `&Value::Null`, which falls into the same
-/// "not an object" fallback as any other non-object payload.
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "V4 never errors here, but the V4.1 renderer landing next reuses this signature for a dialect that does"
-)]
-pub(super) fn encode_arguments_to_dsml(
-    arguments: &Value,
-    tags: &DsmlTags,
-) -> Result<String, DsEncodingError> {
-    let parsed: Value = match arguments {
-        Value::String(s) => serde_json::from_str(s).unwrap_or_else(|_| json!({ "arguments": s })),
-        v if v.is_object() => v.clone(),
-        _ => json!({}),
+/// already-parsed value — `model_gateway`'s `process_tool_call_arguments`
+/// parses the client's string before the chat template runs, so an object
+/// arrives as an object and any other payload (array, number, bool, null) as
+/// that value. A string is JSON-parsed at most twice (tolerating a
+/// double-encoded object), stopping at the first non-string result or the
+/// first parse failure. Whatever is then not an object — an unparsable
+/// string, a parsed or pre-parsed non-object, `Value::Null` for a call with no
+/// `arguments` at all — renders as the single parameter `arguments` holding
+/// the ORIGINAL value: `string="true"` with the raw text when it was a string,
+/// otherwise `string="false"` with its JSON. Never errors (unlike V3.2, which
+/// propagates a parse error).
+pub(super) fn encode_arguments_to_dsml(arguments: &Value, tags: &DsmlTags) -> String {
+    let mut parsed = arguments.clone();
+    // Tolerate JSON strings, including double-encoded ones.
+    for _ in 0..2 {
+        let Value::String(text) = &parsed else {
+            break;
+        };
+        match serde_json::from_str::<Value>(text) {
+            Ok(value) => parsed = value,
+            Err(_) => break,
+        }
+    }
+    // The fallback wraps the ORIGINAL `arguments`, not the parsed value.
+    let parameters: Vec<(&str, &Value)> = match parsed.as_object() {
+        Some(object) => object
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
+            .collect(),
+        None => vec![("arguments", arguments)],
     };
-    let obj = match parsed.as_object() {
-        Some(obj) => obj,
-        None => return Ok(String::new()),
-    };
-    let mut parts = Vec::with_capacity(obj.len());
-    for (k, v) in obj {
-        let (is_str, value_str) = match v {
-            Value::String(s) => ("true", s.clone()),
+    let mut parts = Vec::with_capacity(parameters.len());
+    for (key, value) in parameters {
+        let (is_str, value_str) = match value {
+            Value::String(text) => ("true", text.clone()),
             other => ("false", to_json(other)),
         };
         parts.push(format!(
-            "<{DSML_TOKEN}{p} name=\"{k}\" string=\"{is_str}\">{value_str}</{DSML_TOKEN}{p}>",
+            "<{DSML_TOKEN}{p} name=\"{key}\" string=\"{is_str}\">{value_str}</{DSML_TOKEN}{p}>",
             p = tags.parameter,
         ));
     }
-    Ok(parts.join("\n"))
+    parts.join("\n")
 }
 
 // Python's `to_json` is `json.dumps(value, ensure_ascii=False)`: spaced
@@ -325,4 +330,107 @@ pub(super) fn encode_arguments_to_dsml(
 // `encode_arguments_to_dsml`'s exclusive use.
 fn to_json(value: &Value) -> String {
     crate::json_dumps::to_string(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    /// V4.1's dialect (a leading space on both tags), the one the fixture
+    /// cases `assistant_tool_call_array_string_args` and
+    /// `assistant_tool_call_double_encoded_args` record end to end.
+    const V41_TAGS: DsmlTags = DsmlTags {
+        invoke: " invoke",
+        parameter: " parameter",
+    };
+
+    #[test]
+    fn object_arguments_render_one_parameter_per_key() {
+        assert_eq!(
+            encode_arguments_to_dsml(&json!({"n": 3, "s": "raw <x>"}), &V41_TAGS),
+            "<｜DSML｜ parameter name=\"n\" string=\"false\">3</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"s\" string=\"true\">raw <x></｜DSML｜ parameter>"
+        );
+    }
+
+    #[test]
+    fn string_arguments_that_parse_to_an_object_render_its_keys() {
+        assert_eq!(
+            encode_arguments_to_dsml(&json!("{\"a\": 1}"), &V41_TAGS),
+            "<｜DSML｜ parameter name=\"a\" string=\"false\">1</｜DSML｜ parameter>"
+        );
+    }
+
+    #[test]
+    fn raw_string_arguments_that_parse_to_an_array_wrap_the_raw_string() {
+        // The reference wraps the ORIGINAL value: the client's raw string is
+        // one string parameter, not the array it parses to.
+        assert_eq!(
+            encode_arguments_to_dsml(&json!("[1, 2]"), &V41_TAGS),
+            "<｜DSML｜ parameter name=\"arguments\" string=\"true\">[1, 2]</｜DSML｜ parameter>"
+        );
+    }
+
+    #[test]
+    fn gateway_parsed_array_arguments_wrap_the_array_as_json() {
+        // `process_tool_call_arguments` has already parsed the client's
+        // `"[1, 2]"`, so the renderer receives the array itself.
+        assert_eq!(
+            encode_arguments_to_dsml(&json!([1, 2]), &V41_TAGS),
+            "<｜DSML｜ parameter name=\"arguments\" string=\"false\">[1, 2]</｜DSML｜ parameter>"
+        );
+    }
+
+    #[test]
+    fn number_and_bool_arguments_wrap_the_value_as_json() {
+        assert_eq!(
+            encode_arguments_to_dsml(&json!(42), &V41_TAGS),
+            "<｜DSML｜ parameter name=\"arguments\" string=\"false\">42</｜DSML｜ parameter>"
+        );
+        assert_eq!(
+            encode_arguments_to_dsml(&json!(true), &V41_TAGS),
+            "<｜DSML｜ parameter name=\"arguments\" string=\"false\">true</｜DSML｜ parameter>"
+        );
+    }
+
+    #[test]
+    fn null_arguments_wrap_null_as_json() {
+        assert_eq!(
+            encode_arguments_to_dsml(&Value::Null, &V41_TAGS),
+            "<｜DSML｜ parameter name=\"arguments\" string=\"false\">null</｜DSML｜ parameter>"
+        );
+    }
+
+    #[test]
+    fn double_encoded_string_arguments_are_parsed_twice() {
+        // The JSON string `"{\"a\": 1}"`: the first parse yields the text
+        // `{"a": 1}`, the second the object.
+        assert_eq!(
+            encode_arguments_to_dsml(&json!("\"{\\\"a\\\": 1}\""), &V41_TAGS),
+            "<｜DSML｜ parameter name=\"a\" string=\"false\">1</｜DSML｜ parameter>"
+        );
+    }
+
+    #[test]
+    fn triple_encoded_string_arguments_stop_after_two_parses() {
+        // Encoding the object's text twice gives the double-encoded string
+        // above; a third time is one level too many for the reference, so the
+        // ORIGINAL text is wrapped verbatim.
+        let twice = serde_json::to_string("{\"a\": 1}").unwrap();
+        assert_eq!(twice, "\"{\\\"a\\\": 1}\"");
+        let thrice = serde_json::to_string(&twice).unwrap();
+        assert_eq!(
+            encode_arguments_to_dsml(&Value::String(thrice.clone()), &V41_TAGS),
+            format!("<｜DSML｜ parameter name=\"arguments\" string=\"true\">{thrice}</｜DSML｜ parameter>")
+        );
+    }
+
+    #[test]
+    fn unparsable_string_arguments_are_wrapped_verbatim() {
+        assert_eq!(
+            encode_arguments_to_dsml(&json!("{oops"), &V41_TAGS),
+            "<｜DSML｜ parameter name=\"arguments\" string=\"true\">{oops</｜DSML｜ parameter>"
+        );
+    }
 }
