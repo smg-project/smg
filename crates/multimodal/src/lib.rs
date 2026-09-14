@@ -18,7 +18,10 @@ pub use error::{MediaConnectorError, MultiModalError, MultiModalResult, Transfor
 pub use media::{
     ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSource, VideoFetchConfig,
 };
-pub use registry::{MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer};
+pub use registry::{
+    MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer,
+    DEEPSEEK_V41_IMAGE_PLACEHOLDER,
+};
 pub use tracker::{AsyncMultiModalTracker, TrackerOutput};
 pub use types::{
     AudioClip, AudioSource, EncoderFieldLayouts, FieldLayout, ImageDetail, ImageFrame, ImageSize,
@@ -27,6 +30,6 @@ pub use types::{
 };
 // Re-export vision processing components
 pub use vision::{
-    LlavaNextProcessor, LlavaProcessor, PreProcessorConfig, VisionPreProcessor,
-    VisionProcessorRegistry,
+    DeepseekV41Processor, LlavaNextProcessor, LlavaProcessor, PreProcessorConfig,
+    VisionPreProcessor, VisionProcessorRegistry,
 };
