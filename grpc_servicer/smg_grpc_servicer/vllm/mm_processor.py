@@ -246,32 +246,47 @@ class InProcessMediaProcessor:
         raise ValueError(f"unsupported media modality {item.modality!r}")
 
 
-MM_LIMIT_MODALITIES = ("image", "video", "audio")
+# A modality name vLLM never configures: its resolved count is the unset default.
+_UNSET_MODALITY = "__unset__"
 
 
 def _limit_options(options) -> dict[str, Any]:
-    """A validated per-modality limit as a comparable dict, unset fields dropped."""
+    """A validated per-modality limit as a comparable dict, unset fields dropped.
+
+    Unknown shapes are hashed by their attributes, never reduced to a count:
+    the two ends must fail closed rather than falsely match.
+    """
     if dataclasses.is_dataclass(options) and not isinstance(options, type):
         data = dataclasses.asdict(options)
     elif isinstance(options, Mapping):
         data = dict(options)
-    else:  # legacy count-only form
+    elif isinstance(options, int):  # legacy count-only form
         data = {"count": options}
+    elif hasattr(options, "model_dump"):  # a pydantic model
+        data = dict(options.model_dump())
+    elif hasattr(options, "__dict__"):
+        logger.warning("limit_per_prompt value of type %s: hashing its attributes", type(options))
+        data = dict(vars(options))
+    else:
+        raise TypeError(f"unsupported limit_per_prompt value: {options!r}")
     return {key: value for key, value in data.items() if value is not None}
 
 
 def resolved_mm_limits(mm_config) -> dict[str, dict[str, Any]]:
-    """Per-modality prompt limits as vLLM validated them: the effective count
-    (get_limit_per_prompt, 999 when unset) plus any sibling options, over the
-    standard modalities and every configured key, so equivalent spellings of
-    --limit-mm-per-prompt match and a real skew still fails closed."""
+    """Per-modality prompt limits as vLLM validated them: the unset default under
+    "*", then each configured modality's effective count (get_limit_per_prompt)
+    plus its sibling options, omitting entries that only spell out the default,
+    so equivalent --limit-mm-per-prompt spellings match and a real skew fails
+    closed."""
+    unset = {"count": mm_config.get_limit_per_prompt(_UNSET_MODALITY)}
+    limits: dict[str, dict[str, Any]] = {"*": unset}
     configured = getattr(mm_config, "limit_per_prompt", None) or {}
-    limits: dict[str, dict[str, Any]] = {}
-    for modality in sorted({*MM_LIMIT_MODALITIES, *configured}):
-        options = configured.get(modality)
-        extra = _limit_options(options) if options is not None else {}
+    for modality in sorted(configured):
+        extra = _limit_options(configured[modality])
         extra.pop("count", None)
-        limits[modality] = {"count": mm_config.get_limit_per_prompt(modality), **extra}
+        entry = {"count": mm_config.get_limit_per_prompt(modality), **extra}
+        if entry != unset:
+            limits[modality] = entry
     return limits
 
 

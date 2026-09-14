@@ -120,21 +120,24 @@ class TestFingerprintDerivation:
         vllm_config = types.SimpleNamespace(model_config=_ModelConfig(limits))
         worker = mm_processor.engine_fingerprint(engine)
         assert worker == mm_sidecar.config_fingerprint(vllm_config)
-        assert worker.limit_per_prompt == (
-            '{"audio": {"count": 999}, "image": {"count": 8}, "video": {"count": 999}}'
-        )
+        assert worker.limit_per_prompt == '{"*": {"count": 999}, "image": {"count": 8}}'
 
     def test_equivalent_limit_spellings_share_a_namespace(self, monkeypatch):
         _fake_vllm(monkeypatch)
-        explicit = mm_processor.fingerprint_from_model_config(
-            _ModelConfig({"image": _ImageOptions(count=999)})
-        )
         implicit = mm_processor.fingerprint_from_model_config(_ModelConfig({}))
-        assert explicit == implicit
-        skewed = mm_processor.fingerprint_from_model_config(
-            _ModelConfig({"image": _ImageOptions(count=8)})
-        )
-        assert explicit.namespace() != skewed.namespace()
+        for spelled_out in (
+            {"image": _ImageOptions(count=999)},
+            {"point_cloud": _BaseOptions(count=999)},
+            {"video": _VideoOptions(count=999), "audio": _BaseOptions()},
+        ):
+            assert mm_processor.fingerprint_from_model_config(_ModelConfig(spelled_out)) == implicit
+        for skewed in (
+            {"image": _ImageOptions(count=8)},
+            {"image": _ImageOptions(count=999, width=4)},
+            {"point_cloud": _BaseOptions(count=2)},
+        ):
+            fp = mm_processor.fingerprint_from_model_config(_ModelConfig(skewed))
+            assert fp.namespace() != implicit.namespace(), skewed
 
     def test_sibling_options_and_extra_modalities_stay_in_the_fingerprint(self):
         limits = {
@@ -143,9 +146,47 @@ class TestFingerprintDerivation:
             "point_cloud": _BaseOptions(count=1),
         }
         assert mm_processor.resolved_mm_limits(_MmConfig(limits)) == {
-            "audio": {"count": 999},
+            "*": {"count": 999},
             "image": {"count": 8, "width": 4},
             "point_cloud": {"count": 1},
+            "video": {"count": 2, "num_frames": 16},
+        }
+
+    def test_unknown_limit_shapes_are_loud_not_lossy(self):
+        class _Model:
+            def __init__(self):
+                self.count = 2
+                self.num_frames = 16
+
+            def model_dump(self):
+                return {"count": self.count, "num_frames": self.num_frames}
+
+        assert mm_processor._limit_options(_Model()) == {"count": 2, "num_frames": 16}
+        plain = types.SimpleNamespace(count=2, num_frames=16, width=None)
+        assert mm_processor._limit_options(plain) == {"count": 2, "num_frames": 16}
+        assert mm_processor._limit_options(7) == {"count": 7}
+        assert mm_processor._limit_options({"count": 3, "length": 9}) == {"count": 3, "length": 9}
+        with pytest.raises(TypeError, match="unsupported limit_per_prompt value"):
+            mm_processor._limit_options(object())
+
+    def test_pydantic_dataclass_options_resolve_like_vllm(self):
+        # vLLM's *DummyOptions are pydantic dataclasses; mirror the decorator so the
+        # is_dataclass/asdict path runs without vLLM installed.
+        pydantic = pytest.importorskip("pydantic")
+        from pydantic.dataclasses import dataclass as pydantic_dataclass
+
+        @pydantic_dataclass
+        class _Base:
+            count: int = pydantic.Field(999, ge=0)
+
+        @pydantic_dataclass(config=pydantic.ConfigDict(extra="forbid"))
+        class _Video(_Base):
+            num_frames: int | None = pydantic.Field(None, gt=0)
+            width: int | None = pydantic.Field(None, gt=0)
+
+        cfg = _MmConfig({"video": _Video(count=2, num_frames=16), "image": _Base(count=999)})
+        assert mm_processor.resolved_mm_limits(cfg) == {
+            "*": {"count": 999},
             "video": {"count": 2, "num_frames": 16},
         }
 
@@ -154,7 +195,7 @@ class TestFingerprintDerivation:
         from vllm.config import MultiModalConfig
 
         unset = mm_processor.resolved_mm_limits(MultiModalConfig())
-        assert unset == {"audio": {"count": 999}, "image": {"count": 999}, "video": {"count": 999}}
+        assert unset == {"*": {"count": 999}}
         explicit = MultiModalConfig(limit_per_prompt={"image": 999})
         assert mm_processor.resolved_mm_limits(explicit) == unset
         resolved = mm_processor.resolved_mm_limits(
