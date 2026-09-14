@@ -53,10 +53,21 @@ pub enum DsEncodingError {
         "Invalid task `{0}`. Valid tasks are: action, query, authority, domain, title, read_url"
     )]
     InvalidTask(String),
+    // --- V4.1 only -----------------------------------------------------
+    #[error("Message text contains the image special token `<｜deepseek_image｜>`; images must be sent as image content parts")]
+    PlaceholderInText,
+    #[error("Invalid reasoning effort `{0}`: expected an integer within [1, 100] or one of low, high, xhigh, max")]
+    InvalidReasoningEffort(String),
+    #[error("Unsupported content part type `{0}`: only text and image parts are supported")]
+    UnsupportedContentPart(String),
 }
 
-/// Mirrors `find_last_user_index`: returns `None` if no user/developer
+/// Mirrors V4's `find_last_user_index`: returns `None` if no user/developer
 /// message exists (Python returns -1).
+///
+/// V4.1 widens this definition (a mid-conversation system message also counts)
+/// and therefore keeps its own version; only the "is this index at or after
+/// the last user turn" predicate below is shared.
 pub(super) fn find_last_user_index(messages: &[Value]) -> Option<usize> {
     for idx in (0..messages.len()).rev() {
         let role = messages[idx].get("role").and_then(|v| v.as_str());
@@ -70,9 +81,10 @@ pub(super) fn find_last_user_index(messages: &[Value]) -> Option<usize> {
 /// Returns `true` when `index >= last_user_idx` in the Python sense, treating
 /// the "no user message" case (-1) as: every non-negative index satisfies it.
 ///
-/// Used only by [`drop_thinking_messages`] here; `render_message` in each
-/// renderer keeps its own copy for its own (unrelated) thinking-token logic.
-fn at_or_after_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
+/// Used by [`drop_thinking_messages`] here and by the V4.1 renderer's
+/// `render_message` (V4 and V3.2 predate this module and still carry their own
+/// copies).
+pub(super) fn at_or_after_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
     match last_user_idx {
         Some(idx) => index >= idx,
         None => true,
@@ -230,11 +242,14 @@ pub(super) fn sort_tool_results_by_call_order(messages: Vec<Value>) -> Vec<Value
 /// Drop reasoning_content from earlier assistant turns and remove non-essential
 /// developer messages before the last user.
 ///
-/// Takes `&[Value]` and recomputes `last_user_idx` internally (rather than
-/// accepting it as a parameter) to match the V4 renderer's existing call
-/// sites exactly — a pure move, not a signature change.
-pub(super) fn drop_thinking_messages(messages: &[Value]) -> Vec<Value> {
-    let last_user_idx = find_last_user_index(messages);
+/// `last_user_idx` is passed in rather than recomputed because the two
+/// revisions disagree on what the "last user turn" is: V4 counts only
+/// user/developer messages ([`find_last_user_index`]), while V4.1 also counts
+/// mid-conversation system messages. The filtering itself is identical.
+pub(super) fn drop_thinking_messages(
+    messages: &[Value],
+    last_user_idx: Option<usize>,
+) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::with_capacity(messages.len());
     for (idx, msg) in messages.iter().enumerate() {
         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");

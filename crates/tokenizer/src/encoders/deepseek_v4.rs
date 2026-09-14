@@ -515,7 +515,8 @@ pub fn encode_messages(
         effective_drop_thinking = false;
     }
     if thinking_mode == ThinkingMode::Thinking && effective_drop_thinking {
-        full_messages = drop_thinking_messages(&full_messages);
+        let last_user_idx = find_last_user_index(&full_messages);
+        full_messages = drop_thinking_messages(&full_messages, last_user_idx);
     }
     for idx in 0..full_messages.len() {
         prompt.push_str(&render_message(
