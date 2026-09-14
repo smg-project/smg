@@ -257,8 +257,10 @@ jobs:
           rm -f crates/grpc_client/python/smg_grpc_proto/proto
           mkdir -p crates/grpc_client/python/smg_grpc_proto/proto
           cp crates/grpc_client/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
-          pip install ./crates/grpc_client/python
-          pytest -q grpc_servicer/tests
+          # msgspec gates the sidecar protocol and fake-redis tests; only the
+          # importorskip("vllm") cases stay skipped here (see the vLLM e2e lane).
+          pip install ./crates/grpc_client/python msgspec
+          pytest -q grpc_servicer/tests -rs
 
       # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
       # ZMQ/EPD command builders, ZMQ-lane collection filter). --noconftest keeps
