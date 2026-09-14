@@ -241,17 +241,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 items = parse_media_refs(request.media_refs)
                 validate_schemes(items, self._mm_processor.accepted_schemes)
                 async with self._mm_inflight:
-                    try:
-                        prompt = await self._mm_processor.process(
-                            list(request.tokenized.input_ids),
-                            request.tokenized.original_text or None,
-                            items,
-                            arrival_time,
-                        )
-                    except RuntimeError as e:
-                        # vLLM's placeholder validation: anchor/count mismatch is
-                        # a terminal client error, not something to retry.
-                        raise ValueError(f"multimodal placeholder validation failed: {e}") from e
+                    prompt = await self._mm_processor.process(
+                        list(request.tokenized.input_ids),
+                        request.tokenized.original_text or None,
+                        items,
+                        arrival_time,
+                    )
             elif has_preprocessed_mm and input_type == "tokenized":
                 # A pixel-less payload (PD decode leg) is only decodable with
                 # remote KV: a local recompute would schedule the vision
