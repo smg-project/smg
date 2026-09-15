@@ -7,7 +7,10 @@ use std::{
 use axum::{
     body::{to_bytes, Body},
     extract::{Request, State},
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        HeaderMap, HeaderValue, Method, StatusCode,
+    },
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -22,6 +25,7 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::CreateMessageRequest,
+    profile::ProviderProfile,
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
         RealtimeTranscriptionSessionCreateRequest,
@@ -62,6 +66,7 @@ use crate::{
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, is_retryable_status, RetryExecutor},
             sse::SSE_CHANNEL_BUFFER,
+            sse_rechunk::SseRechunker,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
@@ -90,6 +95,18 @@ const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 const STREAMED_BODY_STALLED: &str = "request_body_stalled";
 const STREAMED_BODY_TOO_LARGE: &str = "request_body_too_large";
 const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
+
+/// Pending re-chunked payload is flushed after this much upstream silence,
+/// so packet sizing never holds a slow stream's first token.
+const RECHUNK_IDLE_FLUSH: Duration = Duration::from_millis(250);
+
+/// How a worker response body is relayed to the client. Re-chunking exists
+/// on this regular HTTP relay only; the PD and gRPC relays do not apply it.
+#[derive(Clone, Copy)]
+struct StreamRelayMode {
+    is_stream: bool,
+    rechunk: bool,
+}
 
 /// Regular router that uses injected load balancing policies
 pub struct Router {
@@ -482,7 +499,7 @@ impl Router {
         response
     }
 
-    async fn route_typed_request_once<T: serde::Serialize>(
+    async fn route_typed_request_once<T: GenerationRequest + serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
         lease: &RequestLease<T>,
@@ -549,6 +566,15 @@ impl Router {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
+        // The profile comes from the model the client asked for, as request
+        // validation selects it, not from the alias-resolved id.
+        let rechunk = is_stream
+            && route == "/v1/chat/completions"
+            && lease.with_view(|view| {
+                view.request.get_model().is_some_and(|model| {
+                    ProviderProfile::for_model(model) == ProviderProfile::Minimax
+                })
+            });
         let response = match lease.serialize_with(|view| {
             serialize_request_body(view.request, canonical_model, worker.as_ref(), raw_body_len)
         }) {
@@ -557,12 +583,13 @@ impl Router {
                 // the lease frees the parsed request and its routing
                 // derivatives now when retries are disabled.
                 lease.release_dispatch();
+                let mode = StreamRelayMode { is_stream, rechunk };
                 self.send_serialized_request(
                     headers,
                     body,
                     route,
                     worker.as_ref(),
-                    is_stream,
+                    mode,
                     load_guard,
                 )
                 .await
@@ -1141,7 +1168,7 @@ impl Router {
         body: Bytes,
         route: &'static str,
         worker: &dyn Worker,
-        is_stream: bool,
+        mode: StreamRelayMode,
         load_guard: WorkerLoadGuard,
     ) -> Response {
         let api_key = worker.api_key().cloned();
@@ -1175,20 +1202,23 @@ impl Router {
             }
         };
 
-        self.forward_worker_response(res, is_stream, worker.url(), load_guard)
+        self.forward_worker_response(res, mode, worker.url(), load_guard)
             .await
     }
 
     /// Relay a worker response to the client. A streaming response flows
     /// through a bounded channel with the load guard attached to the body; a
-    /// buffered response is read capped at the ingress payload limit.
+    /// buffered response is read capped at the ingress payload limit. With
+    /// `rechunk`, SSE delta payloads are re-sliced to the provider's
+    /// packet-size contract.
     async fn forward_worker_response(
         &self,
         res: reqwest::Response,
-        is_stream: bool,
+        mode: StreamRelayMode,
         worker_url: &str,
         load_guard: WorkerLoadGuard,
     ) -> Response {
+        let StreamRelayMode { is_stream, rechunk } = mode;
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -1201,6 +1231,21 @@ impl Router {
                     .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
             }
 
+            // The same rule as the header synthesis above: a successful
+            // stream with no content-type is relayed as SSE.
+            let upstream_sse = match res
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+            {
+                Some(ct) => ct.starts_with("text/event-stream"),
+                None => status.is_success(),
+            };
+            let mut rechunker = (rechunk && upstream_sse).then(SseRechunker::new);
+            if rechunker.is_some() {
+                // Re-chunking changes the body length.
+                response_headers.remove(CONTENT_LENGTH);
+            }
             let stream = res.bytes_stream();
             // Bounded channel applies backpressure: a slow client makes the
             // relay await on `send` instead of buffering the whole response.
@@ -1213,23 +1258,55 @@ impl Router {
             )]
             tokio::spawn(async move {
                 let mut stream = stream;
+                // One timer, reset per chunk, instead of a fresh sleep per token.
+                let idle = tokio::time::sleep(RECHUNK_IDLE_FLUSH);
+                tokio::pin!(idle);
                 loop {
                     tokio::select! {
-                        chunk = stream.next() => match chunk {
-                            // Same as the regular relay: an empty upstream chunk must
-                            // not become an empty h2 DATA frame toward the client.
-                            Some(Ok(bytes)) if bytes.is_empty() => {}
-                            Some(Ok(bytes)) => {
-                                if tx.send(Ok(bytes)).await.is_err() {
+                        chunk = stream.next() => {
+                            if rechunker.is_some() {
+                                idle.as_mut().reset(tokio::time::Instant::now() + RECHUNK_IDLE_FLUSH);
+                            }
+                            match chunk {
+                                // Same as the regular relay: an empty upstream chunk must
+                                // not become an empty h2 DATA frame toward the client.
+                                Some(Ok(bytes)) if bytes.is_empty() => {}
+                                Some(Ok(bytes)) => {
+                                    let bytes = match rechunker.as_mut() {
+                                        Some(r) => r.feed(&bytes),
+                                        None => bytes,
+                                    };
+                                    if !bytes.is_empty() && tx.send(Ok(bytes)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    if let Some(tail) = rechunker.as_mut().map(SseRechunker::finish) {
+                                        if !tail.is_empty() {
+                                            let _ = tx.send(Ok(tail)).await;
+                                        }
+                                    }
+                                    let _ = tx.send(Err(format!("Stream error: {e}"))).await;
+                                    break;
+                                }
+                                None => {
+                                    if let Some(tail) = rechunker.as_mut().map(SseRechunker::finish) {
+                                        if !tail.is_empty() {
+                                            let _ = tx.send(Ok(tail)).await;
+                                        }
+                                    }
                                     break;
                                 }
                             }
-                            Some(Err(e)) => {
-                                let _ = tx.send(Err(format!("Stream error: {e}"))).await;
-                                break;
-                            }
-                            None => break,
                         },
+                        () = &mut idle, if rechunker.as_ref().is_some_and(SseRechunker::has_pending) => {
+                            idle.as_mut().reset(tokio::time::Instant::now() + RECHUNK_IDLE_FLUSH);
+                            if let Some(tail) = rechunker.as_mut().map(SseRechunker::flush_pending) {
+                                if !tail.is_empty() && tx.send(Ok(tail)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
                         // Client gone with no chunk in flight (long prefill,
                         // stalled upstream): break so the reqwest stream drops,
                         // closing the upstream connection and letting the
@@ -1371,8 +1448,16 @@ impl Router {
             .get(CONTENT_TYPE)
             .and_then(|ct| ct.to_str().ok())
             .is_some_and(|ct| ct.starts_with("text/event-stream"));
-        self.forward_worker_response(res, is_stream, worker.url(), load_guard)
-            .await
+        self.forward_worker_response(
+            res,
+            StreamRelayMode {
+                is_stream,
+                rechunk: false,
+            },
+            worker.url(),
+            load_guard,
+        )
+        .await
     }
 
     /// Build the public rerank response.
