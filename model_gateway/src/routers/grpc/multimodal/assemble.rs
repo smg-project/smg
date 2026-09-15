@@ -100,13 +100,9 @@ async fn assemble_multimodal_data_impl(
                     )
                 })
                 .collect::<Vec<_>>();
-            let batches = intermediate.into_batches();
-            let pending = tokio::task::spawn_blocking(move || {
-                assemble_tokenspeed_batches(&batches, options).map(PendingTokenSpeedAssembly::new)
-            })
-            .await
-            .context("TokenSpeed multimodal assembly task failed")??;
-            Ok(MultimodalData::TokenSpeed(pending.into_inner()?))
+            Ok(MultimodalData::TokenSpeed(
+                spawn_tokenspeed_assembly(intermediate, options).await?,
+            ))
         }
         BackendClient::Grpc(GrpcClient::Mlx(_)) => {
             anyhow::bail!("MLX does not support multimodal inputs")
@@ -141,20 +137,34 @@ async fn assemble_multimodal_data_impl(
                         )
                     })
                     .collect::<Vec<_>>();
-                let batches = intermediate.into_batches();
-                let pending = tokio::task::spawn_blocking(move || {
-                    assemble_tokenspeed_batches(&batches, options)
-                        .map(PendingTokenSpeedAssembly::new)
-                })
-                .await
-                .context("TokenSpeed multimodal assembly task failed")??;
-                Ok(MultimodalData::TokenSpeed(pending.into_inner()?))
+                Ok(MultimodalData::TokenSpeed(
+                    spawn_tokenspeed_assembly(intermediate, options).await?,
+                ))
             }
             runtime => anyhow::bail!(
                 "multimodal inputs are not supported over the {runtime} ZMQ backend yet"
             ),
         },
     }
+}
+
+/// Run TokenSpeed batch assembly on a blocking thread, guarding SHM output.
+///
+/// Both the gRPC and ZMQ TokenSpeed arms share this sequence; the
+/// [`PendingTokenSpeedAssembly`] guard is what unlinks `/dev/shm` segments if
+/// the request future is cancelled mid-assembly, so the dance must stay
+/// identical for every caller.
+async fn spawn_tokenspeed_assembly(
+    intermediate: MultimodalIntermediate,
+    options: Vec<TokenSpeedAssemblyOptions>,
+) -> Result<TokenSpeedMultimodalData> {
+    let batches = intermediate.into_batches();
+    let pending = tokio::task::spawn_blocking(move || {
+        assemble_tokenspeed_batches(&batches, options).map(PendingTokenSpeedAssembly::new)
+    })
+    .await
+    .context("TokenSpeed multimodal assembly task failed")??;
+    pending.into_inner()
 }
 
 /// Owns SHM-backed assembly output until the awaiting task accepts it.
@@ -1101,10 +1111,13 @@ mod tests {
             assert_eq!(item.model_specific_tensors["vit_grid"].shape, vec![1, 3]);
             assert_eq!(item.model_specific_tensors["llm_grid"].shape, vec![1, 3]);
             assert_eq!(item.model_specific_tensors["types"].shape, vec![3]);
-            // Grid/type metadata must keep an integer wire dtype; casting it to
-            // the encoder dtype would corrupt the values. (Side tensors are
+            // Grid/type metadata must keep the exact integer wire dtype that
+            // `model_specific_to_tensor_bytes` assigns to `UintTensor`; casting
+            // to the encoder dtype would corrupt the values. (Side tensors are
             // `TensorBytes` — always inline by construction.)
-            assert_ne!(item.model_specific_tensors["vit_grid"].dtype, "bfloat16");
+            for key in ["vit_grid", "llm_grid", "types"] {
+                assert_eq!(item.model_specific_tensors[key].dtype, "uint32", "{key}");
+            }
         }
     }
 

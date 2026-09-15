@@ -11,7 +11,8 @@ use serde::{
 };
 
 use crate::protocol::tokenspeed::{
-    drain_trailing, expect_tag, next_field, sampling::SamplingParams,
+    drain_trailing, expect_tag, multimodal::TokenSpeedWireMmInputs, next_field,
+    sampling::SamplingParams,
 };
 
 /// The msgspec tag for [`TokenizedGenerateReqInput`] (element 0 on the wire).
@@ -83,6 +84,15 @@ pub struct TokenizedGenerateReqInput {
     pub token_ids_logprob: Option<Vec<u32>>,
     /// Whether to stream outputs incrementally.
     pub stream: bool,
+    /// Original tokenizer-valid prompt ids, pre pad-substitution (wire index
+    /// 21). The engine detokenizes from these; the scheduler uses `input_ids`.
+    /// Required whenever `multimodal_inputs` is set.
+    pub input_ids_unpadded: Option<Vec<u32>>,
+    /// Multimodal payload (wire index 22). When set, `input_ids` must already
+    /// carry the pad-substituted placeholder ranges — the msgpack transport
+    /// bypasses the engine's `InputProcessor`, which does that rewriting on
+    /// other paths.
+    pub multimodal_inputs: Option<TokenSpeedWireMmInputs>,
 }
 
 impl Default for TokenizedGenerateReqInput {
@@ -100,13 +110,22 @@ impl Default for TokenizedGenerateReqInput {
             top_logprobs_num: 0,
             token_ids_logprob: None,
             stream: false,
+            input_ids_unpadded: None,
+            multimodal_inputs: None,
         }
     }
 }
 
 impl Serialize for TokenizedGenerateReqInput {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut tuple = serializer.serialize_tuple(11)?;
+        const NIL: Option<()> = None;
+        // Text requests keep the historical 11-element prefix. Multimodal
+        // requests must reach wire index 22 (`multimodal_inputs`), emitting
+        // the engine's declared defaults for the unmodeled fields between
+        // `stream` (10) and `input_ids_unpadded` (21); msgspec fills fields
+        // after the last emitted element from defaults either way.
+        let multimodal = self.multimodal_inputs.is_some() || self.input_ids_unpadded.is_some();
+        let mut tuple = serializer.serialize_tuple(if multimodal { 23 } else { 11 })?;
         tuple.serialize_element(TOKENIZED_GENERATE_REQ_INPUT_TAG)?;
         tuple.serialize_element(&self.rid)?;
         tuple.serialize_element(&self.http_worker_ipc)?;
@@ -118,6 +137,20 @@ impl Serialize for TokenizedGenerateReqInput {
         tuple.serialize_element(&self.top_logprobs_num)?;
         tuple.serialize_element(&self.token_ids_logprob)?;
         tuple.serialize_element(&self.stream)?;
+        if multimodal {
+            tuple.serialize_element(&NIL)?; // input_embeds
+            tuple.serialize_element(&NIL)?; // session_params
+            tuple.serialize_element(&NIL)?; // custom_logit_processor
+            tuple.serialize_element(&false)?; // return_hidden_states
+            tuple.serialize_element(&0.0f64)?; // created_time
+            tuple.serialize_element(&NIL)?; // bootstrap_host
+            tuple.serialize_element(&NIL)?; // bootstrap_port
+            tuple.serialize_element(&NIL)?; // bootstrap_room
+            tuple.serialize_element(&NIL)?; // input_multi_ids
+            tuple.serialize_element(&NIL)?; // input_extra_infos
+            tuple.serialize_element(&self.input_ids_unpadded)?;
+            tuple.serialize_element(&self.multimodal_inputs)?;
+        }
         tuple.end()
     }
 }
@@ -146,6 +179,10 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                     top_logprobs_num: next_field(&mut seq, "top_logprobs_num")?,
                     token_ids_logprob: next_field(&mut seq, "token_ids_logprob")?,
                     stream: next_field(&mut seq, "stream")?,
+                    // Send-only fields: the decoder models the text prefix and
+                    // drains everything after `stream`.
+                    input_ids_unpadded: None,
+                    multimodal_inputs: None,
                 };
                 drain_trailing(&mut seq)?;
                 Ok(request)
@@ -281,6 +318,91 @@ mod tests {
         let from_vector: TokenizedGenerateReqInput =
             decode_msgpack(&python_request_bytes()).unwrap();
         assert_eq!(roundtripped, from_vector);
+    }
+
+    /// A multimodal request must reach wire index 22 (`multimodal_inputs`),
+    /// emitting the engine's declared defaults for the unmodeled fields in
+    /// between; a text request keeps the 11-element prefix (previous test).
+    #[test]
+    fn mm_request_emits_wire_arity_through_multimodal_inputs() {
+        use std::collections::BTreeMap;
+
+        use crate::{
+            codec::tensor::WireTensor,
+            protocol::tokenspeed::multimodal::{
+                mm_pad_value, TokenSpeedWireMmInputs, TokenSpeedWireMmItem, TokenSpeedWireModality,
+            },
+        };
+
+        let pad = mm_pad_value(TokenSpeedWireModality::Image, 0xDEAD_BEEF);
+        let mut model_specific_data = BTreeMap::new();
+        model_specific_data.insert(
+            "vit_grid".to_string(),
+            WireTensor::from_raw(
+                "uint32",
+                vec![1, 3],
+                vec![1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0],
+            ),
+        );
+        let mut request = vector_request();
+        request.rid = "mm-1".to_string();
+        request.input_ids = vec![10, pad, pad, pad, 50];
+        request.input_ids_unpadded = Some(vec![10, 20, 30, 40, 50]);
+        request.multimodal_inputs = Some(TokenSpeedWireMmInputs {
+            mm_items: vec![TokenSpeedWireMmItem {
+                modality: TokenSpeedWireModality::Image,
+                hash: 0xDEAD_BEEF,
+                pad_value: pad,
+                offsets: vec![(1, 3)],
+                feature: WireTensor::from_raw("bfloat16", vec![3, 2], (0u8..12).collect()),
+                model_specific_data,
+            }],
+            im_token_id: Some(9),
+            video_token_id: None,
+        });
+
+        let encoded = encode_msgpack(&request).unwrap();
+
+        // Pinned cross-language vector: these exact bytes were decoded
+        // field-for-field by TokenSpeed's own `MsgpackDecoder` (msgspec
+        // 0.21.1, tokenspeed eaf66b5b) — including tensor dtypes/values and
+        // `set_pad_value()` independently reproducing `pad_value`.
+        const TS_MM_VECTOR: &str =
+            "dc0017b9546f6b656e697a656447656e6572617465526571496e707574a46d6d2d31c0c0950\
+             ace09811a46ce09811a46ce09811a4632dc001d08c09102cb3fe0000000000000cb3feccccc\
+             cccccccdce40000000cb0000000000000000cb0000000000000000cb0000000000000000cb3\
+             ff000000000000000c0c0c0c0c2c3c3c2c0c0c0c02ac0019000c3c3ff00c0c3c0c0c0c2cb00\
+             00000000000000c0c0c0c0c0950a141e283297919a01cedeadbeefce09811a469192010393a\
+             862666c6f61743136920302c70c03000102030405060708090a0bc081a87669745f67726964\
+             93a675696e743332920103c70c03010000000200000003000000c0c0c009c0c0c0c0c0";
+        let hex: String = encoded.iter().map(|b| format!("{b:02x}")).collect();
+        let pinned: String = TS_MM_VECTOR
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(hex, pinned);
+
+        let Value::Array(array) = decode_value(&encoded).unwrap() else {
+            panic!("expected positional array");
+        };
+        assert_eq!(array.len(), 23);
+        assert_eq!(array[0], Value::from(TOKENIZED_GENERATE_REQ_INPUT_TAG));
+        // Unmodeled fields between `stream` (10) and `input_ids_unpadded` (21)
+        // carry the engine defaults.
+        for nil_index in [11usize, 12, 13, 16, 17, 18, 19, 20] {
+            assert_eq!(array[nil_index], Value::Nil, "index {nil_index}");
+        }
+        assert_eq!(array[14], Value::from(false)); // return_hidden_states
+        assert_eq!(array[15], Value::from(0.0f64)); // created_time
+        assert!(matches!(&array[21], Value::Array(ids) if ids.len() == 5));
+        assert!(matches!(&array[22], Value::Array(mm) if mm.len() == 7));
+
+        // SMG never receives requests: the decoder models the text prefix and
+        // drains the multimodal tail.
+        let decoded: TokenizedGenerateReqInput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(decoded.input_ids, request.input_ids);
+        assert_eq!(decoded.input_ids_unpadded, None);
+        assert_eq!(decoded.multimodal_inputs, None);
     }
 
     #[test]
