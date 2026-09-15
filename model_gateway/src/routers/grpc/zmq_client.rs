@@ -48,6 +48,7 @@ use futures::{stream::SelectAll, Stream, StreamExt};
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use smg_grpc_client::{common_proto as common, tokenspeed_proto, vllm_proto as vllm};
+use tracing::warn;
 
 use crate::{
     routers::grpc::{
@@ -1411,12 +1412,14 @@ fn translate_tokenspeed_multimodal(
     for item in mm.items {
         // The proto and engine modality enums disagree (proto: AUDIO=2,
         // VIDEO=3; engine: VIDEO=2, AUDIO=3) — translate, never pass through.
-        // Unspecified is treated as image, matching the proto's convention.
+        // Unknown values are rejected, mirroring the gRPC servicer's
+        // `_modality_from_proto`.
         let modality = match item.modality() {
+            common::Modality::Image => TokenSpeedWireModality::Image,
             common::Modality::Video => TokenSpeedWireModality::Video,
             common::Modality::Audio => TokenSpeedWireModality::Audio,
-            common::Modality::Image | common::Modality::Unspecified => {
-                TokenSpeedWireModality::Image
+            common::Modality::Unspecified => {
+                return Err("multimodal item carried an unspecified modality".to_string());
             }
         };
         if item.content_hash.is_empty() {
@@ -1474,6 +1477,19 @@ fn translate_tokenspeed_multimodal(
         for (name, tensor) in item.model_specific_tensors {
             model_specific_data.insert(name, wire_tensor_tokenspeed(tensor)?);
         }
+        // Nothing on the msgpack path computes `mrope_positions` (the engine's
+        // InputProcessor is bypassed), and shipping nil silently degrades
+        // image grounding to 1-D positions. For the known MRoPE families the
+        // grid tensors are the tell: fail loudly rather than succeed wrong.
+        for key in ["image_grid_thw", "video_grid_thw"] {
+            if model_specific_data.contains_key(key) {
+                return Err(format!(
+                    "multimodal item carries {key:?}: MRoPE position tensors are not \
+                     derivable over the TokenSpeed ZMQ wire yet; use the gRPC transport \
+                     for this model"
+                ));
+            }
+        }
         mm_items.push(TokenSpeedWireMmItem {
             modality,
             hash,
@@ -1483,6 +1499,16 @@ fn translate_tokenspeed_multimodal(
             model_specific_data,
         });
     }
+    // Surface the position-tensor gap in the gateway's own logs (once per
+    // process): models outside the gated MRoPE families still receive no
+    // mrope_positions on this wire.
+    static MROPE_POSITIONS_NOTE: std::sync::Once = std::sync::Once::new();
+    MROPE_POSITIONS_NOTE.call_once(|| {
+        warn!(
+            "TokenSpeed ZMQ multimodal requests carry no mrope_positions; models that \
+             require them fall back to 1-D positions engine-side"
+        );
+    });
     Ok((
         unpadded,
         TokenSpeedWireMmInputs {
@@ -2906,18 +2932,20 @@ mod tests {
             encoder_input: Some(tokenspeed_proto::TensorData {
                 shape: vec![2, 4],
                 dtype: "bfloat16".to_string(),
-                payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(
-                    vec![0u8; 16],
-                )),
+                payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(vec![
+                    0u8;
+                    16
+                ])),
             }),
             model_specific_tensors: [(
                 "vit_grid".to_string(),
                 tokenspeed_proto::TensorData {
                     shape: vec![1, 3],
                     dtype: "uint32".to_string(),
-                    payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(
-                        vec![0u8; 12],
-                    )),
+                    payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(vec![
+                        0u8;
+                        12
+                    ])),
                 },
             )]
             .into(),
@@ -2986,6 +3014,35 @@ mod tests {
         assert!(translate_request_tokenspeed(req)
             .unwrap_err()
             .contains("byte length"));
+
+        // Unspecified modality is rejected, mirroring the gRPC servicer.
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        let mut item = ts_mm_item(b"12345678", 0, 1);
+        item.modality = common::Modality::Unspecified as i32;
+        req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
+        assert!(translate_request_tokenspeed(req)
+            .unwrap_err()
+            .contains("modality"));
+
+        // Known MRoPE families fail loudly: nothing derives mrope_positions
+        // on this wire, and 1-D fallback would silently degrade grounding.
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        let mut item = ts_mm_item(b"12345678", 0, 1);
+        item.model_specific_tensors.insert(
+            "image_grid_thw".to_string(),
+            tokenspeed_proto::TensorData {
+                shape: vec![1, 3],
+                dtype: "uint32".to_string(),
+                payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(vec![
+                    0u8;
+                    12
+                ])),
+            },
+        );
+        req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
+        assert!(translate_request_tokenspeed(req)
+            .unwrap_err()
+            .contains("MRoPE"));
     }
 
     #[test]

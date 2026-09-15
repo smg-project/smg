@@ -8,8 +8,10 @@
 // it would derive must arrive precomputed: `pad_value` (via [`mm_pad_value`]),
 // pad-substituted `input_ids` (the placeholder ranges overwritten with the pad
 // value), and the original ids in `input_ids_unpadded`. MRoPE position tensors
-// are not computed by anything on this wire yet; models that need them fall
-// back to 1-D positions engine-side.
+// are not computed by anything on this wire yet: the translate rejects the
+// known MRoPE families (items carrying `image_grid_thw`/`video_grid_thw`)
+// rather than let them silently degrade to 1-D positions, and warns once for
+// the rest.
 
 use std::collections::BTreeMap;
 
