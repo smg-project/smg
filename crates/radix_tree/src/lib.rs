@@ -396,6 +396,36 @@ pub struct OverlapScratch {
     lineages: Vec<u64>,
     /// Chain core: the matched path as (chain, from, to) segments.
     segments: Vec<(u32, u32, u32)>,
+    /// [`RadixTree::coverage`]: per holder slot, index+1 of that
+    /// holder's open run in the answer buffer (0 = none), and the
+    /// slots touched by this query so the map is reset in O(touched).
+    last_run: Vec<u32>,
+    touched: Vec<u32>,
+}
+
+/// One maximal covered run of a holder on one chain lineage, as
+/// [`RadixTree::runs`] reports it for snapshots: the keys held at
+/// `[start, end)` in position order, and the content path from
+/// position 0 through `end` (the uncovered head included), which places
+/// the run on another tree without a parent key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HolderRun {
+    pub start: u32,
+    pub end: u32,
+    pub keys: Vec<BlockKey>,
+    pub path: Vec<ContentHash>,
+}
+
+/// One covered run of the query path for one holder (§6b): the holder
+/// holds every position in `[start, end)` of the query, and no position
+/// at `start - 1` or `end` (runs are maximal). A query's runs come out
+/// sorted by (holder, start), so a holder's runs are adjacent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverageRun {
+    pub holder: HolderId,
+    pub start: u32,
+    pub end: u32,
+    pub total_blocks: u64,
 }
 
 pub struct FlatTree {
