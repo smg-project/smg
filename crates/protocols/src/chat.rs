@@ -50,7 +50,9 @@ pub enum ChatMessage {
         content: Option<MessageContent>,
         name: Option<String>,
         tool_calls: Option<Vec<ToolCall>>,
-        /// Reasoning content for O1-style models (SGLang extension)
+        /// Reasoning content for O1-style models (SGLang extension); vLLM's
+        /// `reasoning` spelling is accepted on input.
+        #[serde(alias = "reasoning")]
         reasoning_content: Option<String>,
         #[serde(flatten)]
         #[schemars(skip)]

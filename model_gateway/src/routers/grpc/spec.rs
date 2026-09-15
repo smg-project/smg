@@ -10,6 +10,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use llm_multimodal::registry::transcription::TranscriptionFamily;
+use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{StreamOptions, StringOrArray, Tool, ToolChoice},
@@ -62,6 +63,8 @@ pub(crate) struct ChatResponseSpec {
     pub stream_options: Option<StreamOptions>,
     pub chat_template_kwargs: Option<HashMap<String, Value>>,
     pub reasoning_effort: Option<String>,
+    /// `continue_final_message` on a trailing assistant message.
+    pub continues_final_assistant: bool,
     /// `n`, normalized.
     pub expected_choices: u32,
     pub logprobs: bool,
@@ -83,6 +86,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             stream_options: request.stream_options.clone(),
             chat_template_kwargs: request.chat_template_kwargs.clone(),
             reasoning_effort: request.reasoning_effort.clone(),
+            continues_final_assistant: utils::continues_final_assistant(request),
             expected_choices: request.n.unwrap_or(1).max(1),
             logprobs: request.logprobs,
             stop: request.stop.clone(),
@@ -91,6 +95,19 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             ignore_eos: request.ignore_eos,
             skip_special_tokens: request.skip_special_tokens,
         }
+    }
+}
+
+impl ChatResponseSpec {
+    /// Whether the reasoning parser starts in reasoning mode for this
+    /// request (see [`utils::reasoning_starts_in_prefill`]).
+    pub(crate) fn reasoning_starts_in_prefill(&self, tokenizer: &dyn Tokenizer) -> bool {
+        utils::reasoning_starts_in_prefill(
+            self.chat_template_kwargs.as_ref(),
+            self.reasoning_effort.as_deref(),
+            self.continues_final_assistant,
+            tokenizer,
+        )
     }
 }
 

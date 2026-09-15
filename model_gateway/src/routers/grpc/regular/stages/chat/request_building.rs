@@ -103,14 +103,7 @@ pub(crate) async fn build_chat_backed_plan(
     };
 
     let require_reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
-        utils::should_mark_reasoning_started(
-            utils::resolve_user_thinking(
-                chat_request.chat_template_kwargs.as_ref(),
-                chat_request.reasoning_effort.as_deref(),
-                tokenizer.as_ref(),
-            ),
-            tokenizer.as_ref(),
-        )
+        utils::chat_reasoning_starts_in_prefill(chat_request, tokenizer.as_ref())
     });
 
     let mut proto_request = builder_client

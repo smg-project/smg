@@ -65,8 +65,11 @@ pub fn process_messages(
         transformed_messages.insert(0, json!({"role": "system", "content": system_text}));
     }
 
-    // Step 3: Process tool call arguments in assistant messages (reuse from chat_utils)
-    chat_utils::process_tool_call_arguments(&mut transformed_messages)?;
+    // Step 3: Process tool call arguments in assistant messages (reuse from
+    // chat_utils), unless the renderer parses them itself as written.
+    if !tokenizer.renderer_capabilities().raw_tool_call_arguments {
+        chat_utils::process_tool_call_arguments(&mut transformed_messages)?;
+    }
 
     // Step 4: Serialize tools to JSON values for template processing
     let tools_json: Option<Vec<Value>> = chat_tools

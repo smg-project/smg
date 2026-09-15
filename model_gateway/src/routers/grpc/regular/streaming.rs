@@ -339,14 +339,7 @@ impl StreamingProcessor {
         // If the template supports a thinking toggle and the user enabled it,
         // the template injected `<think>` in the prefill — parsers should start
         // in reasoning mode.
-        let thinking_override = utils::should_mark_reasoning_started(
-            utils::resolve_user_thinking(
-                original_request.chat_template_kwargs.as_ref(),
-                original_request.reasoning_effort.as_deref(),
-                tokenizer.as_ref(),
-            ),
-            tokenizer.as_ref(),
-        );
+        let thinking_override = original_request.reasoning_starts_in_prefill(tokenizer.as_ref());
         let think_in_prefill = tokenizer.think_in_prefill();
 
         // Check if JSON schema constraint was used (specific function or required mode)

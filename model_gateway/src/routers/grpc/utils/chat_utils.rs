@@ -553,8 +553,13 @@ pub(crate) fn process_chat_messages_with_placeholders(
             media_order,
         )?;
 
-        // Process tool call arguments in assistant messages
-        process_tool_call_arguments(&mut transformed_messages)?;
+        // Process tool call arguments in assistant messages. Renderers that
+        // parse `arguments` strings themselves with the reference's tolerance
+        // (DeepSeek-V4.1) get them as written; every other template gets the
+        // parsed object the Transformers docs expect.
+        if !tokenizer.renderer_capabilities().raw_tool_call_arguments {
+            process_tool_call_arguments(&mut transformed_messages)?;
+        }
 
         // Convert tools to JSON values for template processing
         let tools_json: Option<Vec<Value>> = request
@@ -577,8 +582,24 @@ pub(crate) fn process_chat_messages_with_placeholders(
             Some(&combined_template_kwargs)
         };
 
+        let continues_final_assistant = request.continue_final_message
+            && transformed_messages
+                .last()
+                .and_then(|msg| msg.get("role"))
+                .and_then(|v| v.as_str())
+                == Some("assistant");
+        // Renderers that continue a trailing assistant message natively
+        // (DeepSeek-V4.1: rendered without EOS and without a generation
+        // header) keep the message and are called without a generation
+        // prompt; other templates get the message popped and its content
+        // appended after the generation prompt as a prefix.
+        let native_continuation = continues_final_assistant
+            && tokenizer
+                .renderer_capabilities()
+                .native_assistant_continuation;
+
         let params = ChatTemplateParams {
-            add_generation_prompt: true,
+            add_generation_prompt: !native_continuation,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
             // Project OpenAI `reasoning_effort` (none/minimal) onto the model's
@@ -591,15 +612,10 @@ pub(crate) fn process_chat_messages_with_placeholders(
         };
 
         // Handle assistant prefix for continue_final_message
-        let assistant_prefix = if request.continue_final_message
-            && !transformed_messages.is_empty()
-            && transformed_messages
-                .last()
-                .and_then(|msg| msg.get("role"))
-                .and_then(|v| v.as_str())
-                == Some("assistant")
-        {
-            // Pop the last message to handle it separately — guarded by !is_empty() check above
+        let assistant_prefix = if continues_final_assistant && !native_continuation {
+            // Pop the last message to render it as the prefix. A trailing
+            // assistant role implies a non-empty list, so the `else` arm is
+            // only defensive.
             let Some(last_msg) = transformed_messages.pop() else {
                 return Ok((
                     ProcessedMessages {
@@ -1736,6 +1752,109 @@ mod tests {
                 .encode(&processed.text, false)
                 .unwrap()
                 .token_ids()
+        );
+    }
+
+    // --- renderer-capability gates on the render path ------------------------
+
+    /// Render `request` through a mock that declares `capabilities` and
+    /// hands back the message list it received as JSON, so both gates are
+    /// observable without a checkpoint: which messages reach the template,
+    /// whether a generation prompt was requested, and whether tool-call
+    /// `arguments` arrive as written.
+    fn render_with(
+        capabilities: llm_tokenizer::traits::RendererCapabilities,
+        request: &ChatCompletionRequest,
+    ) -> Value {
+        let tokenizer = llm_tokenizer::MockTokenizer::new()
+            .with_renderer_capabilities(capabilities)
+            .with_json_chat_template();
+        let (processed, _) = process_chat_messages_with_placeholders(
+            request,
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        // The default `apply_chat_template_with_encoding` appends the
+        // assistant prefix after the rendered text, so a prefill that was
+        // popped shows up as a suffix on the JSON document.
+        let split = processed.text.rfind('}').unwrap() + 1;
+        let (rendered, suffix) = processed.text.split_at(split);
+        let mut value: Value = serde_json::from_str(rendered).unwrap();
+        value["assistant_prefix"] = json!(suffix);
+        value
+    }
+
+    const NATIVE_CONTINUATION: llm_tokenizer::traits::RendererCapabilities =
+        llm_tokenizer::traits::RendererCapabilities {
+            enable_thinking_alias: false,
+            native_assistant_continuation: true,
+            raw_tool_call_arguments: false,
+        };
+    const RAW_ARGUMENTS: llm_tokenizer::traits::RendererCapabilities =
+        llm_tokenizer::traits::RendererCapabilities {
+            enable_thinking_alias: false,
+            native_assistant_continuation: false,
+            raw_tool_call_arguments: true,
+        };
+
+    /// Without the capability the trailing assistant message is popped and its
+    /// content is appended after a generation prompt; with it the message
+    /// stays in the list and no generation prompt is requested (the renderer
+    /// continues the turn itself).
+    #[test]
+    fn native_continuation_keeps_the_trailing_assistant_message_instead_of_prefixing_it() {
+        let request = prefill_request();
+
+        let default = render_with(Default::default(), &request);
+        assert_eq!(default["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(default["messages"][0]["role"], "user");
+        assert_eq!(default["add_generation_prompt"], json!(true));
+        assert_eq!(default["assistant_prefix"], json!("Sure"));
+
+        let native = render_with(NATIVE_CONTINUATION, &request);
+        assert_eq!(native["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(native["messages"][1]["role"], "assistant");
+        assert_eq!(native["messages"][1]["content"], "Sure");
+        assert_eq!(native["add_generation_prompt"], json!(false));
+        assert_eq!(native["assistant_prefix"], json!(""));
+    }
+
+    /// Without the capability a tool call's `arguments` string is parsed into
+    /// an object before rendering (what Transformers templates expect); with
+    /// it the string reaches the renderer as written, so a native renderer can
+    /// apply the reference's own tolerance.
+    #[test]
+    fn raw_tool_call_arguments_reach_the_renderer_as_written() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{\"city\": \"Hangzhou\"}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+            ]
+        }))
+        .unwrap();
+
+        let parsed = render_with(Default::default(), &request);
+        assert_eq!(
+            parsed["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            json!({"city": "Hangzhou"})
+        );
+
+        let raw = render_with(RAW_ARGUMENTS, &request);
+        assert_eq!(
+            raw["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            json!("{\"city\": \"Hangzhou\"}")
         );
     }
 
