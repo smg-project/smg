@@ -26,6 +26,8 @@ tree.store(w, Some(parent_key), &more)?;           // extend it
 tree.remove(w, &[key]);                            // event-feed eviction
 tree.truncate_tail(w, keep);                       // prefix-closed capacity cut
 tree.evict_oldest(w, keep);                        // least-recently-stored chains first
+tree.coverage(&chain_hashes, &mut scratch, &mut runs); // every holder's covered runs along the query
+let runs = tree.runs(w);                            // the holder's runs per lineage, with their content paths (snapshots)
 tree.clear(w);                                     // epoch bump
 tree.retire_holder(w);                             // frees everything, id recycled
 

@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    lineage_root, lineage_step, BlockKey, Config, ContentHash, HolderId, Overlap, OverlapScratch,
-    SetInterner, SetRef, Stats, StoreError, StoreOutcome,
+    lineage_root, lineage_step, BlockKey, Config, ContentHash, CoverageRun, HolderId, HolderRun,
+    Overlap, OverlapScratch, SetInterner, SetRef, Stats, StoreError, StoreOutcome,
 };
 
 /// One trie chain: contiguous contents/keys stored ONCE, shared by
@@ -808,13 +808,11 @@ impl RadixTree {
 
     // ---- reads ----
 
-    pub fn overlap(
-        &self,
-        chain_query: &[ContentHash],
-        scratch: &mut OverlapScratch,
-        out: &mut Vec<Overlap>,
-    ) {
-        out.clear();
+    /// The trie descent shared by `overlap` and `coverage`: the query's
+    /// matched path as (chain, from, to) segments, empty when nothing
+    /// matches from position 0.
+    fn match_path(&self, chain_query: &[ContentHash], segments: &mut Vec<(u32, u32, u32)>) {
+        segments.clear();
         if chain_query.is_empty() {
             return;
         }
@@ -829,7 +827,6 @@ impl RadixTree {
         // Walk the trie along the query, collecting the matched path
         // as (chain, from, to) segments into the caller-owned scratch
         // (no per-query heap once warm — the alloc gate holds this).
-        let segments = &mut scratch.segments;
         segments.clear();
         let mut chain = root;
         let mut pos = 0u32;
@@ -874,9 +871,20 @@ impl RadixTree {
                 None => break,
             }
         }
-        if segments.is_empty() {
+    }
+
+    pub fn overlap(
+        &self,
+        chain_query: &[ContentHash],
+        scratch: &mut OverlapScratch,
+        out: &mut Vec<Overlap>,
+    ) {
+        out.clear();
+        self.match_path(chain_query, &mut scratch.segments);
+        if scratch.segments.is_empty() {
             return;
         }
+        let segments = &scratch.segments;
         // Merge holder runs along the matched path (same active-set
         // logic as the flat walk, but over spans — few per segment).
         let active = &mut scratch.active;
@@ -961,6 +969,103 @@ impl RadixTree {
         for &h in active.iter() {
             push_answer3(&self.slots, h, depth, out);
         }
+    }
+
+    /// A holder's coverage as maximal runs per chain lineage, each with
+    /// its keys in position order and the full content path from
+    /// position 0 through the run's end (held or not). This is what a
+    /// snapshot needs to rebuild the holder on another tree at the
+    /// same positions: a run that starts past 0 is placed by its path,
+    /// not by a parent key the holder may no longer hold. Two runs at
+    /// the same positions on different lineages are two runs. Cost is
+    /// linear in the holder's blocks plus its chains times their depth;
+    /// a cold path. Runs come sorted by start, end and first key, for
+    /// deterministic output.
+    pub fn runs(&self, id: HolderId) -> Vec<HolderRun> {
+        let Some(state) = self.live(id) else {
+            return Vec::new();
+        };
+        let holder = id.parts().0;
+        let mut pos_key: FxHashMap<(u32, u32), BlockKey> = FxHashMap::default();
+        pos_key.reserve(state.keys.len());
+        for (&k, &(c, p)) in &state.keys {
+            pos_key.insert((c, p), k);
+        }
+        let mut prefix_cache: FxHashMap<u32, Vec<ContentHash>> = FxHashMap::default();
+        let mut out = Vec::new();
+        for &c in state.chains.keys() {
+            let cd = &self.chains[c as usize];
+            // Contents [0, base_pos) along this chain's ancestry.
+            let prefix = prefix_cache.entry(c).or_insert_with(|| {
+                let mut prefix = Vec::with_capacity(cd.base_pos as usize);
+                let mut cur = cd.parent;
+                while let Some((pc, fork_pos)) = cur {
+                    let pd = &self.chains[pc as usize];
+                    for p in (pd.base_pos..=fork_pos).rev() {
+                        prefix.push(pd.content_at(p));
+                    }
+                    cur = pd.parent;
+                }
+                prefix.reverse();
+                prefix
+            });
+            let mut run: Option<(u32, u32)> = None;
+            let flush = |run: &mut Option<(u32, u32)>, out: &mut Vec<HolderRun>| {
+                if let Some((start, end)) = run.take() {
+                    let mut path = prefix.clone();
+                    path.extend((cd.base_pos..end).map(|p| cd.content_at(p)));
+                    out.push(HolderRun {
+                        start,
+                        end,
+                        keys: (start..end).map(|p| pos_key[&(c, p)]).collect(),
+                        path,
+                    });
+                }
+            };
+            for s in &cd.spans {
+                if s.holders.binary_search(&holder).is_err() {
+                    flush(&mut run, &mut out);
+                    continue;
+                }
+                match run {
+                    Some((_, end)) if end == s.start => {
+                        run = Some((run.expect("some").0, s.start + s.len))
+                    }
+                    _ => {
+                        flush(&mut run, &mut out);
+                        run = Some((s.start, s.start + s.len));
+                    }
+                }
+            }
+            flush(&mut run, &mut out);
+        }
+        out.sort_by(|a, b| (a.start, a.end, a.keys.first()).cmp(&(b.start, b.end, b.keys.first())));
+        out
+    }
+
+    /// The content path from position 0 through the position at which
+    /// `holder` holds `key` — every position's content along that
+    /// chain lineage, held or not. A snapshot of a holder whose coverage
+    /// has holes needs the uncovered head of each run to place the run
+    /// at the same positions on another tree; the holder's own keys
+    /// cannot supply it (a hole has no key). O(depth); cold path.
+    pub fn path_contents(&self, id: HolderId, key: BlockKey) -> Option<Vec<ContentHash>> {
+        let state = self.live(id)?;
+        let &(chain, pos) = state.keys.get(&key)?;
+        let mut out = Vec::with_capacity(pos as usize + 1);
+        let mut cur = Some((chain, pos));
+        while let Some((c, upto)) = cur {
+            let cd = &self.chains[c as usize];
+            // This chain's contents from its base through `upto`,
+            // pushed in reverse; the whole path is reversed at the end.
+            for p in (cd.base_pos..=upto).rev() {
+                out.push(cd.content_at(p));
+            }
+            cur = cd.parent;
+        }
+        out.reverse();
+        debug_assert_eq!(out.len(), pos as usize + 1);
+        Some(out)
     }
 
     pub fn enumerate(
@@ -1619,6 +1724,79 @@ enum PosSet {
 enum Placed {
     Applied,
     Duplicate,
+}
+
+impl RadixTree {
+    /// §6b coverage: every holder's covered runs along the query path,
+    /// not just the consecutive depth from position 0. A holder whose
+    /// coverage has holes (an engine that evicts a window's tail, or
+    /// keeps only checkpoint positions) is reported as several runs;
+    /// `overlap` would report it as depth 0 or the first run only. The
+    /// walk is the same trie descent as `overlap`; the merge is per
+    /// span × holder instead of the active-set intersection, so the
+    /// cost is O(covered positions' span count × holders per span).
+    /// `out` is cleared and left sorted by (holder, start).
+    pub fn coverage(
+        &self,
+        chain_query: &[ContentHash],
+        scratch: &mut OverlapScratch,
+        out: &mut Vec<CoverageRun>,
+    ) {
+        out.clear();
+        self.match_path(chain_query, &mut scratch.segments);
+        if scratch.segments.is_empty() {
+            return;
+        }
+        let last_run = &mut scratch.last_run;
+        let touched = &mut scratch.touched;
+        if last_run.len() < self.slots.len() {
+            last_run.resize(self.slots.len(), 0);
+        }
+        for &(c, from, to) in &scratch.segments {
+            let cd = &self.chains[c as usize];
+            let mut p = from;
+            while p < to {
+                let Some(i) = cd.span_index(p) else {
+                    // Uncovered position: skip to the next span start.
+                    let next = cd.spans.partition_point(|s| s.start <= p);
+                    match cd.spans.get(next) {
+                        Some(s) if s.start < to => p = s.start,
+                        _ => break,
+                    }
+                    continue;
+                };
+                let s = &cd.spans[i];
+                let run_end = (s.start + s.len).min(to);
+                for &h in s.holders.iter() {
+                    let slot = h as usize;
+                    let open = last_run[slot];
+                    if open != 0 && out[(open - 1) as usize].end == p {
+                        out[(open - 1) as usize].end = run_end;
+                    } else {
+                        let Some(state) = self.slots[slot].state.as_ref() else {
+                            continue;
+                        };
+                        if open == 0 {
+                            touched.push(h);
+                        }
+                        out.push(CoverageRun {
+                            holder: HolderId::assemble(h, self.slots[slot].generation),
+                            start: p,
+                            end: run_end,
+                            total_blocks: state.keys.len() as u64,
+                        });
+                        last_run[slot] = out.len() as u32;
+                    }
+                }
+                p = run_end;
+            }
+        }
+        for &h in touched.iter() {
+            last_run[h as usize] = 0;
+        }
+        touched.clear();
+        out.sort_unstable_by_key(|r| (r.holder.index, r.start));
+    }
 }
 
 fn push_answer3(slots: &[Slot3], holder: u32, depth: u32, out: &mut Vec<Overlap>) {
