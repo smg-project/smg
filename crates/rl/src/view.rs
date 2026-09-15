@@ -57,6 +57,13 @@ pub trait RlWorkerView: Send + Sync {
     fn list(&self) -> Vec<RlWorkerInfo>;
     /// One worker by registry UUID.
     fn get(&self, id: &str) -> Option<RlWorkerInfo>;
+
+    /// Requests currently in flight on the engine at `base_url` (all DP
+    /// ranks). Used for the mixed-version accounting metric; the default
+    /// reports none.
+    fn inflight(&self, _base_url: &str) -> usize {
+        0
+    }
 }
 
 #[cfg(test)]

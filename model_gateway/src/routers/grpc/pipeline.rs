@@ -22,6 +22,7 @@ use openai_protocol::{
     messages::CreateMessageRequest,
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
+use smg_rl::RlState;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::error;
 
@@ -64,7 +65,10 @@ use crate::{
     policies::PolicyRegistry,
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
-        common::retry::{is_retryable_response, BackoffCalculator},
+        common::{
+            header_utils,
+            retry::{is_retryable_response, BackoffCalculator},
+        },
         error,
     },
     worker::WorkerRegistry,
@@ -100,11 +104,15 @@ pub(crate) struct PipelineDeps {
     /// `None` when tenant rate limiting is disabled; read only by the
     /// endpoints that insert `RateLimitReserveStage` (chat/messages/completion/harmony).
     rate_limit_manager: Option<Arc<RateLimitManager>>,
+    /// RL control plane state; `None` unless `--enable-rl`. Read per attempt
+    /// for the routed engine's live weight version.
+    rl: Option<Arc<RlState>>,
 }
 
 impl PipelineDeps {
     /// Full deps for the chat/messages/harmony endpoints, which consume the
     /// configured parser factories/overrides.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
@@ -113,6 +121,7 @@ impl PipelineDeps {
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
+        rl: Option<Arc<RlState>>,
     ) -> Self {
         Self {
             worker_registry,
@@ -122,6 +131,7 @@ impl PipelineDeps {
             configured_tool_parser,
             configured_reasoning_parser,
             rate_limit_manager,
+            rl,
         }
     }
 
@@ -131,6 +141,7 @@ impl PipelineDeps {
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
+        rl: Option<Arc<RlState>>,
     ) -> Self {
         Self {
             worker_registry,
@@ -140,6 +151,7 @@ impl PipelineDeps {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             rate_limit_manager,
+            rl,
         }
     }
 
@@ -204,6 +216,7 @@ impl PipelineDeps {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             rate_limit_manager: None,
+            rl: None,
         }
     }
 }
@@ -231,6 +244,8 @@ pub(crate) struct RequestPipeline {
     backend_type: &'static str,
     /// Disaggregation mode, for per-leg retry metric labels.
     mode: Mode,
+    /// RL control plane state; `None` unless `--enable-rl`.
+    rl: Option<Arc<RlState>>,
 }
 
 /// Outcome of one full pipeline run.
@@ -393,6 +408,7 @@ impl RequestPipeline {
             stages: Arc::new(stages),
             backend_type: backend,
             mode,
+            rl: deps.rl.clone(),
         })
     }
 
@@ -493,6 +509,7 @@ impl RequestPipeline {
             &attempt_plan,
             &dctx.dispatch_model,
             dctx.workers.as_ref(),
+            self.rl.as_deref(),
         ));
 
         execute_plan(dctx, attempt_plan).await?;
@@ -588,7 +605,7 @@ impl RequestPipeline {
                             attempt_start.elapsed(),
                         );
                     }
-                    return Ok(RunOutcome::Early(response));
+                    return Ok(RunOutcome::Early(Self::stamp_routed(&dctx, response)));
                 }
                 Ok(None) => return Ok(RunOutcome::Final(dctx, attempt_start)),
                 Err(response) => response,
@@ -628,6 +645,21 @@ impl RequestPipeline {
             tokio::time::sleep(delay).await;
             attempt = next_attempt;
         }
+    }
+
+    /// Stamp the worker that served this attempt (the single worker, or the
+    /// decode leg of a disaggregated pair -- the same choice
+    /// `prepare_dispatch_metadata` makes). The routed-worker extension is what
+    /// the RL middleware keys on to add `x-smg-weight-version`.
+    fn stamp_routed(dctx: &DispatchContext, mut response: Response) -> Response {
+        if let Some(workers) = dctx.workers.as_ref() {
+            let worker = match workers {
+                WorkerSelection::Single { worker } => worker,
+                WorkerSelection::Disaggregated { decode, .. } => decode,
+            };
+            header_utils::stamp_routed_worker(&mut response, worker.url());
+        }
+        response
     }
 
     fn record_error(&self, endpoint: Option<&'static str>, model: &str, response: &Response) {
@@ -774,7 +806,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::stamp_routed(&dctx, axum::Json(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_chat",
@@ -821,7 +853,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::stamp_routed(&dctx, axum::Json(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_generate",
@@ -865,7 +897,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::stamp_routed(&dctx, axum::Json(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_completion",
@@ -908,7 +940,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::stamp_routed(&dctx, axum::Json(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_messages",
@@ -941,7 +973,7 @@ impl RequestPipeline {
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Embedding(response)) => {
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::stamp_routed(&dctx, axum::Json(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_embeddings",
@@ -978,7 +1010,10 @@ impl RequestPipeline {
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Transcription { text, format }) => {
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    super::regular::stages::transcription::render(format, text)
+                    Self::stamp_routed(
+                        &dctx,
+                        super::regular::stages::transcription::render(format, text),
+                    )
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_transcription",
@@ -1013,7 +1048,7 @@ impl RequestPipeline {
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Classify(response)) => {
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::stamp_routed(&dctx, axum::Json(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_classify",
@@ -1354,7 +1389,7 @@ mod alias_pipeline_tests {
             .unwrap();
 
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        let deps = PipelineDeps::pair(worker_registry.clone(), policy_registry, None);
+        let deps = PipelineDeps::pair(worker_registry.clone(), policy_registry, None, None);
         let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
         let components = Arc::new(SharedComponents {
             tokenizer_registry,
@@ -1763,6 +1798,7 @@ mod request_release_tests {
         let deps = PipelineDeps::pair(
             worker_registry.clone(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
             None,
         );
         RequestPipeline::build(Endpoint::Completion, mode, &deps).expect("completion pipeline")

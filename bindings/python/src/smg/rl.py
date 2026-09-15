@@ -11,6 +11,10 @@ SGLang requires a JSON body on `pause_generation` and `continue_generation`
 Only HTTP workers can be proxied. A gRPC or ZMQ worker matched by a selector is
 reported in `failed[]` as `unsupported_connection_mode`, which makes `fanout`
 raise `FanoutError` unless `allow_partial=True`.
+
+`set_fleet_version` (like `set_version`) records a version SMG did not observe
+itself; it is a local table write, never an engine call. Every response SMG
+serves for a versioned engine carries `x-smg-weight-version`.
 """
 
 from __future__ import annotations
@@ -54,12 +58,15 @@ class Worker:
     weight_version: str | None
     labels: dict[str, str] = field(default_factory=dict)
     capabilities: dict[str, Any] = field(default_factory=dict)
+    control: str = "active"
+    version_source: str | None = None
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> Worker:
         kwargs = {k: d.get(k) for k in cls.__dataclass_fields__}
         kwargs["labels"] = d.get("labels") or {}
         kwargs["capabilities"] = d.get("capabilities") or {}
+        kwargs["control"] = d.get("control") or "active"
         return cls(**kwargs)  # type: ignore[arg-type]
 
 
@@ -176,6 +183,39 @@ class RL:
         status, payload = self._request("GET", f"/v1/rl/workers/{worker_id}")
         _raise_for(status, payload)
         return Worker.from_json(payload)
+
+    def set_version(self, worker_id: str, weight_version: str) -> Worker:
+        """Record the weight version one engine holds (SMG-local; no engine call)."""
+        status, payload = self._request(
+            "POST", f"/v1/rl/workers/{worker_id}/version", {"weight_version": str(weight_version)}
+        )
+        _raise_for(status, payload)
+        return Worker.from_json(payload)
+
+    def set_fleet_version(self, weight_version: str, *, selector: str) -> list[Worker]:
+        status, payload = self._request(
+            "POST",
+            "/v1/rl/version",
+            {"weight_version": str(weight_version)},
+            {"selector": selector},
+        )
+        _raise_for(status, payload)
+        return [Worker.from_json(w) for w in payload.get("workers", [])]
+
+    def set_state(self, worker_id: str, control: str) -> Worker:
+        """Mark one engine active, paused, or asleep for routing (SMG-local)."""
+        status, payload = self._request(
+            "POST", f"/v1/rl/workers/{worker_id}/state", {"control": control}
+        )
+        _raise_for(status, payload)
+        return Worker.from_json(payload)
+
+    def set_fleet_state(self, control: str, *, selector: str) -> list[Worker]:
+        status, payload = self._request(
+            "POST", "/v1/rl/state", {"control": control}, {"selector": selector}
+        )
+        _raise_for(status, payload)
+        return [Worker.from_json(w) for w in payload.get("workers", [])]
 
     def call(
         self,

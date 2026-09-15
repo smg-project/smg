@@ -257,6 +257,7 @@ class RouterArgs:
     enable_rl: bool = False  # Mount the RL control plane under /v1/rl
     rl_control_timeout_secs: int = 600  # Timeout for one proxied engine control call
     rl_fanout_concurrency: int = 32  # Max concurrent engine calls in one fan-out
+    rl_version_policy: str = "any"  # any | latest-only | min-version:<v> | max-staleness:<k>
 
     @staticmethod
     def add_cli_args(
@@ -812,6 +813,16 @@ class RouterArgs:
             type=int,
             default=RouterArgs.rl_fanout_concurrency,
             help="Maximum concurrent engine calls in one fan-out (default: 32)",
+        )
+        rl_group.add_argument(
+            f"--{prefix}rl-version-policy",
+            type=str,
+            default=RouterArgs.rl_version_policy,
+            help=(
+                "Which engines a request may be routed to, judged against the model's newest "
+                "known weight version: any | latest-only | min-version:<v> | max-staleness:<k> "
+                "(default: any). Per-request override: the x-smg-version-policy header."
+            ),
         )
 
         # PD/EPD-specific arguments

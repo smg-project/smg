@@ -85,3 +85,87 @@ class TestRlControlPlaneDisabled:
         resp = httpx.get(f"{gateway.base_url}/v1/rl/workers", timeout=TIMEOUT)
         assert resp.status_code == 404
         assert resp.content == b""
+
+
+@pytest.mark.engine("sglang")
+@pytest.mark.gpu(1)
+@pytest.mark.e2e
+@pytest.mark.gateway(
+    policy="round_robin",
+    extra_args=[
+        "--enable-rl",
+        "--rl-version-policy",
+        "latest-only",
+        "--retry-max-retries",
+        "3",
+        "--retry-initial-backoff-ms",
+        "50",
+        "--retry-max-backoff-ms",
+        "200",
+    ],
+)
+@pytest.mark.parametrize("setup_backend", ["http"], indirect=True)
+class TestRlVersionRouting:
+    def _chat(self, gateway, model, **kwargs):
+        return httpx.post(
+            f"{gateway.base_url}/v1/chat/completions",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "max_tokens": 4,
+            },
+            timeout=TIMEOUT,
+            **kwargs,
+        )
+
+    def test_responses_are_stamped_and_follow_a_refit(self, setup_backend):
+        _backend, model, _client, gateway = setup_backend
+        # Fans out update_weight_version. There is no fallback here: if the
+        # engine in the harness is an older SGLang that 404s on this RPC,
+        # switch this call to update_weights_from_disk with model_path=model
+        # and a weight_version field (mirrors examples/rl/refit_from_disk.py).
+        resp = httpx.post(
+            f"{gateway.base_url}/v1/rl/engine/update_weight_version",
+            params={"selector": "engine=sglang"},
+            json={"new_version": "7", "abort_all_requests": False},
+            timeout=TIMEOUT,
+        )
+        assert resp.status_code == 200, resp.text
+        resp = self._chat(gateway, model)
+        assert resp.status_code == 200, resp.text
+        assert resp.headers.get("x-smg-weight-version") == "7"
+        assert resp.headers.get("x-smg-routed-worker-id")
+        rows = httpx.get(f"{gateway.base_url}/v1/rl/workers", timeout=TIMEOUT).json()["workers"]
+        assert {w["weight_version"] for w in rows} == {"7"}
+        assert {w["version_source"] for w in rows} == {"passthrough"}
+        assert {w["control"] for w in rows} == {"active"}
+
+    def test_a_paused_engine_is_not_routed(self, setup_backend):
+        _backend, model, _client, gateway = setup_backend
+        pause = httpx.post(
+            f"{gateway.base_url}/v1/rl/engine/pause_generation",
+            params={"selector": "engine=sglang"},
+            json={},
+            timeout=TIMEOUT,
+        )
+        assert pause.status_code == 200, pause.text
+        try:
+            resp = self._chat(gateway, model)
+            assert resp.status_code == 503, resp.text
+            assert resp.headers.get("x-smg-routed-worker-id") is None
+        finally:
+            resume = httpx.post(
+                f"{gateway.base_url}/v1/rl/engine/continue_generation",
+                params={"selector": "engine=sglang"},
+                json={},
+                timeout=TIMEOUT,
+            )
+            assert resume.status_code == 200, resume.text
+        resp = self._chat(gateway, model)
+        assert resp.status_code == 200, resp.text
+
+    def test_invalid_policy_header_is_rejected(self, setup_backend):
+        _backend, model, _client, gateway = setup_backend
+        resp = self._chat(gateway, model, headers={"x-smg-version-policy": "freshest"})
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "invalid_version_policy"

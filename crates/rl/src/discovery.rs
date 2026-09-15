@@ -9,10 +9,18 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use openai_protocol::rl::{RlWorkerEntry, RlWorkersResponse, RL_PROTOCOL_VERSION};
+use openai_protocol::rl::{
+    RlControlState, RlVersionSource, RlWorkerEntry, RlWorkersResponse, RL_PROTOCOL_VERSION,
+};
 use serde::Serialize;
 
-use crate::{capability::capabilities_for, error::RlError, state::RlState, view::RlWorkerInfo};
+use crate::{
+    capability::capabilities_for,
+    error::RlError,
+    state::RlState,
+    table::RlTable,
+    view::{RlWorkerInfo, RlWorkerView},
+};
 
 /// Serialize an enum through serde to get its canonical wire string.
 pub(crate) fn enum_str<T: Serialize>(v: &T) -> String {
@@ -74,8 +82,28 @@ pub fn collapse(workers: Vec<RlWorkerInfo>) -> Vec<(RlWorkerInfo, usize)> {
     rows
 }
 
+/// The version routing uses for `info`'s engine: the table's entry when there
+/// is one (an unversioned entry is `None`), else the registration label.
+fn table_version(
+    table: &RlTable,
+    info: &RlWorkerInfo,
+) -> (Option<String>, Option<RlVersionSource>, RlControlState) {
+    match table.get(&info.base_url) {
+        Some(state) => (
+            state.version.as_ref().map(|v| v.as_str().to_string()),
+            state.version_source.map(Into::into),
+            state.control.into(),
+        ),
+        None => (
+            info.labels.get("weight_version").cloned(),
+            None,
+            RlControlState::Active,
+        ),
+    }
+}
+
 /// Labels plus synthetic keys, for selector matching. Synthetic keys shadow.
-pub fn merged_labels(info: &RlWorkerInfo) -> HashMap<String, String> {
+pub fn merged_labels(table: &RlTable, info: &RlWorkerInfo) -> HashMap<String, String> {
     let mut m = info.labels.clone();
     m.insert("id".to_string(), info.id.clone());
     m.insert("url".to_string(), info.url.clone());
@@ -88,17 +116,32 @@ pub fn merged_labels(info: &RlWorkerInfo) -> HashMap<String, String> {
         enum_str(&info.connection_mode),
     );
     m.insert("health".to_string(), enum_str(&info.status));
-    if let Some(v) = info.labels.get("weight_version") {
-        m.insert("weight_version".to_string(), v.clone());
+    let (weight_version, _, control) = table_version(table, info);
+    if let Some(v) = weight_version {
+        m.insert("weight_version".to_string(), v);
     }
+    m.insert("control".to_string(), enum_str(&control));
     if let Some(v) = info.labels.get("role") {
         m.insert("role".to_string(), v.clone());
     }
     m
 }
 
+/// DP ranks that share `info`'s engine (1 for a non-DP worker).
+pub fn dp_ranks(view: &dyn RlWorkerView, info: &RlWorkerInfo) -> usize {
+    if !info.is_dp_aware {
+        return 1;
+    }
+    view.list()
+        .iter()
+        .filter(|other| other.is_dp_aware && other.base_url == info.base_url)
+        .count()
+        .max(1)
+}
+
 /// One row of `GET /workers` for `info`, with `dp_ranks` collapsed into it.
-pub fn entry(info: &RlWorkerInfo, dp_ranks: usize) -> RlWorkerEntry {
+pub fn entry(table: &RlTable, info: &RlWorkerInfo, dp_ranks: usize) -> RlWorkerEntry {
+    let (weight_version, version_source, control) = table_version(table, info);
     RlWorkerEntry {
         id: info.id.clone(),
         url: info.url.clone(),
@@ -114,7 +157,9 @@ pub fn entry(info: &RlWorkerInfo, dp_ranks: usize) -> RlWorkerEntry {
         dp_ranks,
         role: info.labels.get("role").cloned(),
         health: enum_str(&info.status),
-        weight_version: info.labels.get("weight_version").cloned(),
+        weight_version,
+        version_source,
+        control,
         labels: info.labels.clone(),
         capabilities: capabilities_for(info.runtime, &info.labels),
     }
@@ -123,7 +168,7 @@ pub fn entry(info: &RlWorkerInfo, dp_ranks: usize) -> RlWorkerEntry {
 pub(crate) async fn list_workers(State(state): State<Arc<RlState>>) -> Response {
     let workers: Vec<RlWorkerEntry> = collapse(state.view.list())
         .iter()
-        .map(|(w, n)| entry(w, *n))
+        .map(|(w, n)| entry(&state.table, w, *n))
         .collect();
     let total = workers.len();
     (
@@ -143,18 +188,8 @@ pub(crate) async fn get_worker(
 ) -> Response {
     match state.view.get(&id) {
         Some(w) => {
-            let ranks = if w.is_dp_aware {
-                state
-                    .view
-                    .list()
-                    .iter()
-                    .filter(|other| other.is_dp_aware && other.base_url == w.base_url)
-                    .count()
-                    .max(1)
-            } else {
-                1
-            };
-            (StatusCode::OK, Json(entry(&w, ranks))).into_response()
+            let ranks = dp_ranks(state.view.as_ref(), &w);
+            (StatusCode::OK, Json(entry(&state.table, &w, ranks))).into_response()
         }
         None => RlError::WorkerNotFound(id).into_response(),
     }
@@ -173,7 +208,9 @@ mod tests {
     use crate::{
         config::RlConfig,
         state::RlState,
+        table::{ControlState, NoopEvictionSink, VersionSource},
         testing::{worker, FakeView},
+        version::Version,
     };
 
     fn state(workers: Vec<RlWorkerInfo>) -> Arc<RlState> {
@@ -240,15 +277,48 @@ mod tests {
         let mut w = worker("w1", "http://a:1", RuntimeType::Vllm);
         w.labels.insert("engine".to_string(), "spoofed".to_string());
         w.labels.insert("role".to_string(), "reward".to_string());
-        let m = merged_labels(&w);
+        let table = RlTable::new(Arc::new(NoopEvictionSink));
+        let m = merged_labels(&table, &w);
         assert_eq!(m["engine"], "vllm");
         assert_eq!(m["id"], "w1");
         assert_eq!(m["url"], "http://a:1");
         assert_eq!(m["model"], "mock-model");
         assert_eq!(m["health"], "ready");
         assert_eq!(m["weight_version"], "default");
+        assert_eq!(m["control"], "active");
         assert_eq!(m["role"], "reward");
         assert_eq!(m["tp_size"], "1");
+    }
+
+    #[test]
+    fn table_version_and_control_win_over_labels() {
+        let table = RlTable::new(Arc::new(NoopEvictionSink));
+        let mut w = worker("w1", "http://a:1", RuntimeType::Vllm);
+        table.set_version(
+            "http://a:1",
+            &w.model_id,
+            Version::parse("9"),
+            VersionSource::Api,
+        );
+        table.set_control("http://a:1", &w.model_id, ControlState::Paused);
+
+        let e = entry(&table, &w, 1);
+        assert_eq!(e.weight_version.as_deref(), Some("9"));
+        assert_eq!(e.version_source, Some(RlVersionSource::Api));
+        assert_eq!(e.control, RlControlState::Paused);
+
+        let m = merged_labels(&table, &w);
+        assert_eq!(m["weight_version"], "9");
+        assert_eq!(m["control"], "paused");
+
+        // A seeded-but-unversioned engine reports weight_version as null,
+        // not the label, once it has a table entry.
+        w.id = "w2".to_string();
+        w.url = "http://b:1".to_string();
+        w.base_url = "http://b:1".to_string();
+        table.seed("http://b:1", &w.model_id, None);
+        let e2 = entry(&table, &w, 1);
+        assert_eq!(e2.weight_version, None);
     }
 
     #[tokio::test]

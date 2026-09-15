@@ -110,6 +110,21 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
+/// Narrows the candidate set before the sticky override and the policy run.
+/// Installed once on the [`PolicyRegistry`] (the RL control plane uses it to
+/// drop paused, asleep, or too-stale engines); every policy-driven selection
+/// path goes through it.
+pub trait CandidateFilter: Send + Sync {
+    /// Indices into `workers` that stay eligible; `None` when every candidate
+    /// is eligible (the allocation-free path). An empty vector makes the
+    /// selection fail, which callers already treat as "no available worker".
+    fn eligible(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        headers: Option<&http::HeaderMap>,
+    ) -> Option<Vec<usize>>;
+}
+
 /// Whether a built-in policy applies the complete [`Worker::is_available`]
 /// predicate before selecting. Other policies keep the caller-side filter.
 pub(crate) fn policy_filters_unavailable_workers(policy: &dyn LoadBalancingPolicy) -> bool {

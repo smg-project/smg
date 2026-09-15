@@ -21,20 +21,33 @@ use crate::{
     proxy::{call_worker, ProxyRequest},
     selector::Selector,
     state::RlState,
+    table::RlTable,
     view::{RlWorkerInfo, RlWorkerView},
 };
 
 #[derive(Deserialize)]
 pub(crate) struct FanoutQuery {
-    selector: Option<String>,
+    pub(crate) selector: Option<String>,
+}
+
+/// The `selector` query parameter, required and non-empty.
+pub(crate) fn parse_selector(selector: Option<String>) -> Result<Selector, RlError> {
+    match selector.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => Selector::parse(s),
+        _ => Err(RlError::SelectorRequired),
+    }
 }
 
 /// DP-collapsed workers matching `selector`, sorted by base URL.
-pub fn resolve_targets(view: &dyn RlWorkerView, selector: &Selector) -> Vec<RlWorkerInfo> {
+pub fn resolve_targets(
+    view: &dyn RlWorkerView,
+    table: &RlTable,
+    selector: &Selector,
+) -> Vec<RlWorkerInfo> {
     collapse(view.list())
         .into_iter()
         .map(|(w, _)| w)
-        .filter(|w| selector.matches(&merged_labels(w)))
+        .filter(|w| selector.matches(&merged_labels(table, w)))
         .collect()
 }
 
@@ -116,19 +129,16 @@ pub(crate) async fn fanout_handler(
     body: Bytes,
 ) -> Response {
     let started = Instant::now();
-    let selector = match selector.as_deref().map(str::trim) {
-        Some(s) if !s.is_empty() => match Selector::parse(s) {
-            Ok(sel) => sel,
-            Err(e) => return e.into_response(),
-        },
-        _ => return RlError::SelectorRequired.into_response(),
+    let selector = match parse_selector(selector) {
+        Ok(sel) => sel,
+        Err(e) => return e.into_response(),
     };
     let req =
         match ProxyRequest::from_parts(method, &raw_path, raw_query.as_deref(), &headers, body) {
             Ok(r) => r,
             Err(e) => return e.into_response(),
         };
-    let targets = resolve_targets(state.view.as_ref(), &selector);
+    let targets = resolve_targets(state.view.as_ref(), &state.table, &selector);
     if targets.is_empty() {
         record_fanout("no_match", started.elapsed());
         return RlError::NoWorkersMatch(selector.source().to_string()).into_response();
@@ -173,6 +183,7 @@ mod tests {
             enabled: true,
             control_timeout_secs: 5,
             fanout_concurrency: concurrency,
+            ..RlConfig::default()
         };
         Arc::new(RlState::new(Arc::new(FakeView(workers)), cfg))
     }
@@ -217,6 +228,28 @@ mod tests {
             None,
             "selector stripped from engine query"
         );
+    }
+
+    #[tokio::test]
+    async fn a_fanned_out_refit_records_the_version_on_every_target() {
+        let e1 = FakeEngine::start(StatusCode::OK, json!({}), 0).await;
+        let e2 = FakeEngine::start(StatusCode::OK, json!({}), 0).await;
+        let state = state(
+            vec![
+                worker("w1", &e1.url, RuntimeType::Sglang),
+                worker("w2", &e2.url, RuntimeType::Sglang),
+            ],
+            8,
+        );
+        let app = crate::router::<()>(Arc::clone(&state));
+        let req = Request::post("/engine/update_weight_version?selector=engine%3Dsglang")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"new_version": "9"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.table().version_of(&e1.url).unwrap().as_str(), "9");
+        assert_eq!(state.table().version_of(&e2.url).unwrap().as_str(), "9");
     }
 
     #[tokio::test]

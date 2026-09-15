@@ -373,7 +373,11 @@ impl AppContextBuilder {
             &router_config.tenant_api_keys,
         );
 
-        let rl = crate::rl_adapter::build_rl_state(&worker_registry, &router_config);
+        let policy_registry = self
+            .policy_registry
+            .ok_or(AppContextBuildError::MissingField("policy_registry"))?;
+        let rl =
+            crate::rl_adapter::build_rl_state(&worker_registry, &policy_registry, &router_config);
 
         Ok(AppContext {
             gateway_auth,
@@ -390,9 +394,7 @@ impl AppContextBuilder {
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
-            policy_registry: self
-                .policy_registry
-                .ok_or(AppContextBuildError::MissingField("policy_registry"))?,
+            policy_registry,
             gateway: self.gateway,
             response_storage: self
                 .response_storage

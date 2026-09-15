@@ -17,6 +17,7 @@ name = "smg_rl"
 [dependencies]
 openai-protocol.workspace = true
 axum = { workspace = true, features = ["macros"] }
+dashmap.workspace = true
 http.workspace = true
 reqwest = { workspace = true, features = ["rustls", "json", "http2"] }
 serde = { workspace = true, features = ["derive"] }
@@ -31,6 +32,11 @@ metrics = "0.24.6"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+criterion = { version = "0.8" }
+
+[[bench]]
+name = "filter"
+harness = false
 
 [lints]
 workspace = true

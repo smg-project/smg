@@ -26,6 +26,8 @@ WORKER = {
     "role": None,
     "health": "ready",
     "weight_version": "7",
+    "version_source": "api",
+    "control": "active",
     "labels": {"tp_size": "1"},
     "capabilities": {
         "source": "static",
@@ -91,6 +93,32 @@ def test_workers_and_worker(stub):
     assert ws[0].capabilities["pause_modes"] == ["abort"]
     assert rl.worker("w1").weight_version == "7"
     assert _Stub.seen[0]["auth"] == "Bearer k"
+
+
+def test_set_version_and_state_post_bodies(stub):
+    _Stub.stub_responses["/v1/rl/workers/w1/version"] = (200, WORKER)
+    rl = RL(stub)
+    w = rl.set_version("w1", "42")
+    assert _Stub.seen[-1]["body"] == {"weight_version": "42"}
+    assert w.control == "active" and w.version_source == "api"
+
+
+def test_fleet_forms_send_the_selector(stub):
+    _Stub.stub_responses["/v1/rl/state"] = (
+        200,
+        {"protocol_version": 1, "workers": [WORKER], "total": 1},
+    )
+    rl = RL(stub)
+    workers = rl.set_fleet_state("paused", selector="engine=sglang")
+    assert _Stub.seen[-1]["query"] == {"selector": ["engine=sglang"]}
+    assert len(workers) == 1 and workers[0].id == "w1"
+
+
+def test_worker_from_json_defaults_control():
+    d = dict(WORKER)
+    del d["control"]
+    w = Worker.from_json(d)
+    assert w.control == "active"
 
 
 def test_call_sends_method_params_body(stub):

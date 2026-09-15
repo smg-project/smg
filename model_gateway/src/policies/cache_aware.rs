@@ -680,6 +680,65 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// The worker's engine flushed its cache (a weight refit): forget what the
+    /// trees and hash placements hold for it, keep it as a tenant by re-seeding
+    /// the roots the way [`Self::add_worker`] does, and leave the load scorer
+    /// alone. Unlike [`Self::remove_worker_by_url`] the worker is not going
+    /// away, so its backend report and since-poll dispatch credit stay valid.
+    pub fn reset_worker_cache(&self, worker: &dyn Worker) {
+        let url = worker.url();
+        let tenant: TenantId = Arc::from(url);
+        let tree_key = normalize_model_key(worker.model_id());
+        if let Some(tree) = self.string_trees.get(tree_key) {
+            tree.remove_tenant_all(&tenant);
+            tree.insert_text("", url);
+        }
+        if let Some(tree) = self.token_trees.get(tree_key) {
+            tree.remove_tenant_all(&tenant);
+            tree.insert_tokens(&[], url);
+        }
+        // Hash mode (`cache_index = hash`) keeps no trees, so dropping the
+        // worker's placement holders is the whole reset there.
+        let placement_maps: Vec<Arc<PlacementMap>> = self
+            .placement_index
+            .iter()
+            .map(|model| Arc::clone(model.value()))
+            .collect();
+        for placements in placement_maps {
+            placements.retain(|_, holders| {
+                holders.retain(|h| h.worker_url != url);
+                !holders.is_empty()
+            });
+        }
+    }
+
+    /// Test-only insert into one model's string tree, creating the tree when
+    /// the model has none yet (as the worker-add paths do).
+    #[cfg(test)]
+    pub(crate) fn insert_text_for_test(&self, model_id: &str, text: &str, tenant: &str) {
+        let tree_key = normalize_model_key(model_id).to_string();
+        let tree = self
+            .string_trees
+            .entry(tree_key)
+            .or_insert_with(|| Arc::new(Tree::new()));
+        tree.insert_text(text, tenant);
+    }
+
+    /// Test-only view of how much of `text` one model's string tree still
+    /// matches for `tenant`; empty when the model has no string tree.
+    #[cfg(test)]
+    pub(crate) fn string_prefix_for_tenant(
+        &self,
+        model_id: &str,
+        text: &str,
+        tenant: &str,
+    ) -> String {
+        self.string_trees
+            .get(normalize_model_key(model_id))
+            .map(|tree| tree.prefix_match_tenant(text, tenant))
+            .unwrap_or_default()
+    }
+
     /// Remove several workers from one model. Tree cleanup remains precise per
     /// tenant, while hash-placement state is scanned only once for the batch.
     pub(crate) fn remove_workers_from_model(&self, model_id: &str, worker_urls: &HashSet<String>) {
@@ -3525,6 +3584,77 @@ mod tests {
     }
 
     #[test]
+    fn reset_worker_cache_forgets_entries_but_keeps_the_tenant_and_its_load() {
+        // A weight refit flushes the engine's KV cache: the trees must forget
+        // everything the worker held, keep it as a tenant so it can repopulate,
+        // and leave the load scorer's view of it untouched.
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        let model = normalize_model_key(workers[0].model_id()).to_string();
+        let refit = workers[0].url();
+        let neighbor = workers[1].url();
+
+        let long = "the quick brown fox jumps over the lazy dog ".repeat(4);
+        policy.insert_text_for_test(&model, &long, refit);
+        policy.insert_text_for_test(&model, "keep me around", neighbor);
+        let token_tree = Arc::clone(policy.token_trees.get(&model).unwrap().value());
+        let tokens: Vec<u32> = (0..32).collect();
+        token_tree.insert_tokens(&tokens, refit);
+        // Give w1 live scorer state: a backend report plus the since-poll
+        // dispatch credit from one request. w2 carries a heavy queue, so the
+        // pick is w1 whether or not its cached prefix is consulted.
+        update_expected_wait_loads(&policy, &workers, &[0, 10_000]);
+        assert_eq!(
+            policy.select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&long),
+                    ..Default::default()
+                },
+            ),
+            Some(0)
+        );
+
+        assert_eq!(policy.string_prefix_for_tenant(&model, &long, refit), long);
+        let load_before = policy.load_scorer.load_state_for_test(refit);
+        assert!(
+            load_before.0 && load_before.2 > 0,
+            "precondition: the scorer holds w1's report and its dispatch credit"
+        );
+
+        policy.reset_worker_cache(workers[0].as_ref());
+
+        assert_eq!(
+            policy.string_prefix_for_tenant(&model, &long, refit),
+            "",
+            "a flushed worker must match nothing it held before"
+        );
+        assert!(
+            !token_tree.get_tenant_token_counts().contains_key(refit),
+            "the token tree must forget the flushed worker's sequences"
+        );
+        // The string root is re-seeded, so the worker stays a tenant and can
+        // repopulate. (The token re-seed mirrors `add_worker`, whose empty
+        // insert is a no-op below one page, so no token tenant entry either
+        // way.)
+        let string_tree = Arc::clone(policy.string_trees.get(&model).unwrap().value());
+        assert!(string_tree.get_tenant_char_count().contains_key(refit));
+        // Only the flushed worker is affected.
+        assert_eq!(
+            policy.string_prefix_for_tenant(&model, "keep me around", neighbor),
+            "keep me around"
+        );
+        // Unlike removal, the scorer's report and dispatch credit survive.
+        assert_eq!(policy.load_scorer.load_state_for_test(refit), load_before);
+        policy.remove_worker_by_url(refit);
+        assert!(
+            !policy.load_scorer.load_state_for_test(refit).0,
+            "contrast: removing the worker does drop its load state"
+        );
+    }
+
+    #[test]
     fn test_remove_workers_from_model_does_not_mutate_other_models() {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             eviction_interval_secs: 0,
@@ -4983,6 +5113,34 @@ mod tests {
 
         assert_eq!(route_tokens(&policy, &workers, &cached), 0);
         assert_only_final_worker_credited(&policy, &workers, 0, 16);
+    }
+
+    #[test]
+    fn reset_worker_cache_drops_hash_placements_only_for_that_worker() {
+        // Hash mode keeps no trees, so dropping the flushed worker's
+        // placements is the whole reset there.
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let model = normalize_model_key(workers[0].model_id());
+        let refit: Vec<u32> = (0..16).collect();
+        let kept: Vec<u32> = (100..116).collect();
+        policy.record_placement(model, None, &refit, &[16], workers[0].url(), Instant::now());
+        policy.record_placement(model, None, &kept, &[16], workers[1].url(), Instant::now());
+
+        policy.reset_worker_cache(workers[0].as_ref());
+
+        let placements = Arc::clone(policy.placement_index.get(model).unwrap().value());
+        let holders: Vec<String> = placements
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .map(|holder| holder.worker_url.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(holders, vec![workers[1].url().to_string()]);
     }
 
     #[test]

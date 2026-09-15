@@ -8,6 +8,10 @@ RL control plane for the Shepherd Model Gateway. Enabled with `--enable-rl`.
 | `GET /v1/rl/workers/{id}` | one worker |
 | `GET\|POST /v1/rl/workers/{id}/engine/{path}` | proxy one engine-native route to one worker |
 | `GET\|POST /v1/rl/engine/{path}?selector=...` | the same call fanned out to every matching worker |
+| `POST /v1/rl/workers/{id}/version` | record the weight version one worker holds (SMG-local; no engine call) |
+| `POST /v1/rl/workers/{id}/state` | mark one worker `active`, `paused`, or `asleep` for routing (SMG-local) |
+| `POST /v1/rl/version?selector=...` | the version write fanned out to every matching worker |
+| `POST /v1/rl/state?selector=...` | the state write fanned out to every matching worker |
 
 Response bodies are the `openai_protocol::rl` types (`RlWorkersResponse`,
 `RlWorkerEntry`, `RlCallOutcome`, `RlFanoutResponse`), registered in
@@ -19,8 +23,40 @@ reported in `failed[]` as `unsupported_connection_mode` (HTTP 422 on the per-wor
 route), so a fan-out over a mixed fleet answers 207 and `smg.rl.RL.fanout` raises
 `FanoutError` unless `allow_partial=True`.
 
-Flags: `--enable-rl`, `--rl-control-timeout-secs` (600), `--rl-fanout-concurrency` (32).
+Every error answers `{"error": <code>, "message": ...}` with a stable code:
+`invalid_body` (400, a malformed or absent JSON body), `invalid_version` (400,
+a `weight_version` that is empty, over 128 bytes, or not printable ASCII),
+`invalid_version_policy` (400), `invalid_engine_path` (400),
+`selector_required` / `invalid_selector` / `no_workers_match` (400),
+`worker_not_found` (404), `unsupported_connection_mode` (422),
+`upstream_unreachable` (502), and `upstream_timeout` (504).
+
+Flags: `--enable-rl`, `--rl-control-timeout-secs` (600), `--rl-fanout-concurrency` (32),
+`--rl-version-policy` (any).
 Recommended RL launch profile: `--enable-rl --disable-health-check --disable-circuit-breaker --request-timeout-secs 14400`.
+
+## Versions and control state
+
+SMG keeps a side table of `(weight_version, control_state)` per engine, keyed
+by base URL (DP ranks share an entry). Three sources feed it, last write wins:
+the refit and pause/sleep calls proxied through `/v1/rl` (`version_source:
+passthrough`), the explicit API above (`version_source: api`), and the
+`weight_version` registration label at discovery time (`version_source:
+registration`; SGLang's `default` placeholder seeds as unversioned). `GET
+/v1/rl/workers` reports the table's current view: `weight_version` (`null`
+when unversioned), `version_source` (`null` when unversioned), and `control`
+(`active`, `paused`, or `asleep`).
+
+With `--enable-rl`, a worker the table shows `paused` or `asleep` is never
+selected for inference; `--rl-version-policy` (`any`, `latest-only`,
+`min-version:<v>`, `max-staleness:<k>`, or the per-request
+`x-smg-version-policy` header) further narrows the candidates by version
+against the model's known maximum.
+
+Two response headers carry the table's view of what served a request:
+`x-smg-weight-version` on every response from a versioned engine, and
+`x-smg-mixed-version: true` on a buffered `/generate` response whose tokens
+spanned two versions.
 
 ## Python client
 
