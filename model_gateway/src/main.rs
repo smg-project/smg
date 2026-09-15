@@ -19,6 +19,7 @@ use smg::{
         RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
         TokenizerCacheConfig, TraceConfig,
     },
+    mesh_discovery::MeshDiscoveryConfig,
     observability::{
         metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
         otel_trace::{is_otel_enabled, shutdown_otel},
@@ -1967,27 +1968,17 @@ impl CliArgs {
 
     fn to_server_config(&self, router_config: RouterConfig) -> ConfigResult<ServerConfig> {
         let service_discovery_config = if self.service_discovery {
-            // Get router discovery config from router_config.discovery if available
-            let (
-                router_selector,
-                router_mesh_port_annotation,
-                kv_connector_annotation,
-                kv_engine_id_annotation,
-            ) = router_config
+            let (kv_connector_annotation, kv_engine_id_annotation) = router_config
                 .discovery
                 .as_ref()
                 .map(|d| {
                     (
-                        d.router_selector.clone(),
-                        d.router_mesh_port_annotation.clone(),
                         d.kv_connector_annotation.clone(),
                         d.kv_engine_id_annotation.clone(),
                     )
                 })
                 .unwrap_or_else(|| {
                     (
-                        HashMap::new(),
-                        "sglang.ai/mesh-port".to_string(),
                         self.kv_connector_annotation.clone(),
                         self.kv_engine_id_annotation.clone(),
                     )
@@ -2025,13 +2016,25 @@ impl CliArgs {
                 worker_ports_annotation: "smg.ai/worker-ports".to_string(),
                 kv_connector_annotation,
                 kv_engine_id_annotation,
-                router_selector,
-                router_mesh_port_annotation,
                 model_id_source,
             })
         } else {
             None
         };
+
+        // Mesh-router discovery now has its own task and lifetime, but its
+        // configuration still arrives inside `discovery`, so it stays reachable
+        // only under `--service-discovery`. Moving it onto its own config
+        // surface lands with the tagged provider configuration.
+        let mesh_discovery_config = router_config
+            .discovery
+            .as_ref()
+            .map(|d| MeshDiscoveryConfig {
+                namespace: d.namespace.clone(),
+                router_selector: d.router_selector.clone(),
+                router_mesh_port_annotation: d.router_mesh_port_annotation.clone(),
+            })
+            .filter(MeshDiscoveryConfig::is_enabled);
 
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port,
@@ -2067,6 +2070,7 @@ impl CliArgs {
             log_level: Some(self.log_level.clone()),
             log_json: self.log_json,
             service_discovery_config,
+            mesh_discovery_config,
             prometheus_config,
             request_timeout_secs: self.request_timeout_secs,
             request_id_headers: if self.request_id_headers.is_empty() {
@@ -2445,6 +2449,49 @@ mod tests {
         .to_router_config(vec![], vec![])
         .unwrap();
         assert_eq!(format!("{canonical:?}"), format!("{aliased:?}"));
+    }
+
+    /// Mesh-router discovery has its own task and lifetime, but is still
+    /// configured through `discovery`, which only `--service-discovery`
+    /// populates. `--router-selector` alone therefore still does nothing; it
+    /// gains its own config surface with the tagged provider configuration.
+    #[test]
+    fn router_selector_alone_does_not_yet_configure_mesh_discovery() {
+        let cli = cli_args_from(&["--router-selector", "role=router"]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(router.discovery.is_none());
+
+        let server = cli.to_server_config(router).unwrap();
+        assert!(server.service_discovery_config.is_none());
+        assert!(server.mesh_discovery_config.is_none());
+    }
+
+    #[test]
+    fn mesh_discovery_is_absent_without_a_router_selector() {
+        let cli = cli_args_from(&["--service-discovery", "--selector", "app=worker"]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let server = cli.to_server_config(router).unwrap();
+        assert!(server.service_discovery_config.is_some());
+        assert!(server.mesh_discovery_config.is_none());
+    }
+
+    /// The router selector reaches the new independent mesh task unchanged.
+    #[test]
+    fn service_discovery_router_selector_reaches_mesh_discovery() {
+        let cli = cli_args_from(&[
+            "--service-discovery",
+            "--selector",
+            "app=worker",
+            "--router-selector",
+            "role=router",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let server = cli.to_server_config(router).unwrap();
+        let mesh = server.mesh_discovery_config.expect("mesh discovery config");
+        assert_eq!(
+            mesh.router_selector.get("role").map(String::as_str),
+            Some("router")
+        );
     }
 
     #[test]

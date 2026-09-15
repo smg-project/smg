@@ -1488,9 +1488,20 @@ impl Router {
                 worker_ports_annotation: self.worker_ports_annotation.clone(),
                 kv_connector_annotation: self.kv_connector_annotation.clone(),
                 kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
+                model_id_source,
+            })
+        } else {
+            None
+        };
+
+        // Mesh-router discovery now has its own task and lifetime, but stays
+        // gated on the legacy service-discovery flag until it gains its own
+        // config surface with the tagged provider configuration.
+        let mesh_discovery_config = if self.service_discovery && !self.router_selector.is_empty() {
+            Some(mesh_discovery::MeshDiscoveryConfig {
+                namespace: self.service_discovery_namespace.clone(),
                 router_selector: self.router_selector.clone(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
-                model_id_source,
             })
         } else {
             None
@@ -1522,6 +1533,7 @@ impl Router {
                 log_level: self.log_level.clone(),
                 log_json: self.log_json,
                 service_discovery_config,
+                mesh_discovery_config,
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),

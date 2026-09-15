@@ -16,7 +16,7 @@ Test-only files that the mount also touches, none of them a new surface:
 `model_gateway/tests/rl_control_plane_test.rs` (gateway-level `/v1/rl` tests),
 `model_gateway/tests/common/mock_worker.rs` (engine-native RL routes on the
 mock), and the three `#[cfg(test)]` `AppContext { .. }` literals in
-`src/service_discovery.rs`, `src/workflow/steps/local/drain_workers.rs`, and
+`src/service_discovery/testing.rs`, `src/workflow/steps/local/drain_workers.rs`, and
 `src/workflow/steps/local/update_worker_properties.rs`, which gain `rl: None`
 because the struct grew a field. The gateway-level test relies on
 `TestRouterConfig` disabling health checks, so the mock stopped mid-test
