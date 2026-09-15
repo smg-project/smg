@@ -27,6 +27,7 @@ import logging
 import openai
 import pytest
 import smg_client
+from infra.constants import is_tokenspeed
 
 logger = logging.getLogger(__name__)
 
@@ -102,8 +103,11 @@ class TestPDResponsesGrpc:
 
     def test_streaming_response(self, model, api_client):
         """Test streaming response."""
+        # Qwen3.5 thinks by default and can spend all 50 tokens on reasoning.
+        # This test requires answer text and a completed response.
+        kwargs = {"reasoning": {"effort": "none"}} if is_tokenspeed() else {}
         resp = api_client.responses.create(
-            model=model, input="Count to 5", stream=True, max_output_tokens=50
+            model=model, input="Count to 5", stream=True, max_output_tokens=50, **kwargs
         )
 
         events = list(resp)
