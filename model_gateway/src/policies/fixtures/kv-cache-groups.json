@@ -1,0 +1,8147 @@
+{
+ "source": "smg-project/smg PR #2497 fixture vllm-group-cache.json (vLLM 56d001faf0f53c72fcedbbdd77e5418f68fe7494 native lookup expectations)",
+ "cases": [
+  {
+   "name": "full_contiguous",
+   "request_tokens": 17,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      12,
+      16
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 16,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "full_leading_gap",
+   "request_tokens": 17,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      8,
+      12,
+      16
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "full_interior_gap",
+   "request_tokens": 17,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      12,
+      16
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 4,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "request_minus_one",
+   "request_tokens": 16,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      12,
+      16
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 12,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "same_hash_two_groups_missing_required",
+   "request_tokens": 17,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      12,
+      16
+     ],
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "same_hash_two_groups_intersection",
+   "request_tokens": 17,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      12,
+      16
+     ],
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      8
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 8,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "swa_window_one_no_entries",
+   "request_tokens": 33,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [],
+     "window": 1,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "swa_window_one_one_entry",
+   "request_tokens": 33,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      32
+     ],
+     "window": 1,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 32,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "swa_old_prefix_absent",
+   "request_tokens": 33,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      24,
+      28,
+      32
+     ],
+     "window": 9,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 32,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "swa_short_tail",
+   "request_tokens": 33,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      32
+     ],
+     "window": 9,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "swa_broken_tail",
+   "request_tokens": 33,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      24,
+      32
+     ],
+     "window": 9,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "swa_short_initial_prefix",
+   "request_tokens": 33,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      8
+     ],
+     "window": 17,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 8,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "swa_multiple_candidates",
+   "request_tokens": 33,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      8,
+      12,
+      16,
+      28
+     ],
+     "window": 9,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 16,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "mamba_sparse",
+   "request_tokens": 41,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      24,
+      40
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 40,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "mamba_later_cannot_restore_earlier",
+   "request_tokens": 33,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      40
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "joint_8k_6k_10k_scaled",
+   "request_tokens": 41,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      12,
+      16,
+      20,
+      24,
+      28,
+      32
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      24,
+      40
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 24,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "mamba_request_boundary",
+   "request_tokens": 40,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      24,
+      40
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 24,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "three_group_fixed_point",
+   "request_tokens": 41,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      12,
+      16,
+      20,
+      24,
+      28,
+      32,
+      36,
+      40
+     ],
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      12,
+      16,
+      28,
+      32
+     ],
+     "window": 9,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      16,
+      24,
+      40
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 16,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "mixed_blocks_alignment",
+   "request_tokens": 49,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      8,
+      16,
+      24,
+      32,
+      40,
+      48
+     ],
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 12,
+     "cached": [
+      12,
+      24,
+      36
+     ],
+     "window": 13,
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 24,
+   "alignment_tokens": 24,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "partial_full_extension",
+   "request_tokens": 15,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      8,
+      12
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      12
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 12,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "partial_sparse_mamba",
+   "request_tokens": 15,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      8,
+      12
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      6,
+      10
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 10,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "full_downward_closed_no_partial_alias",
+   "request_tokens": 9,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      8
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      6
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 6,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "short_request_cannot_use_later_full_block",
+   "request_tokens": 7,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      8
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      6
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "partial_gate_swa_large_block",
+   "request_tokens": 17,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      8,
+      14
+     ],
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      12,
+      16
+     ],
+     "window": 5,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      14
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "partial_gate_swa_hash_block",
+   "request_tokens": 17,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      8,
+      14
+     ],
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      10,
+      12,
+      14
+     ],
+     "window": 5,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      14
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 14,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "equal_full_specs_different_partial_aliases",
+   "request_tokens": 9,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      6
+     ],
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      4
+     ],
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      4
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "different_full_specs_sequential_bound",
+   "request_tokens": 9,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      6
+     ],
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      8
+     ],
+     "num_kv_heads": 2,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      6
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "different_full_specs_different_partial_aliases",
+   "request_tokens": 9,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      6
+     ],
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      4
+     ],
+     "num_kv_heads": 2,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      4
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 4,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "partial_mamba_request_minus_one",
+   "request_tokens": 14,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      8,
+      12
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      12,
+      14
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 12,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_000",
+   "request_tokens": 12,
+   "hash_unit": 8,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      8,
+      16,
+      48,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 8,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_001",
+   "request_tokens": 5,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      4,
+      10,
+      12,
+      14,
+      16,
+      22,
+      24,
+      34,
+      38,
+      46,
+      48,
+      50,
+      52,
+      56,
+      62
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      2,
+      10,
+      14,
+      18,
+      22,
+      26,
+      30,
+      32,
+      34,
+      42,
+      44,
+      64
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 2,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_002",
+   "request_tokens": 60,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      8,
+      32,
+      40,
+      56,
+      64
+     ],
+     "window": 9,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      4,
+      6,
+      12,
+      14,
+      16,
+      22,
+      24,
+      26,
+      34,
+      40,
+      42,
+      46,
+      48,
+      52,
+      54,
+      56,
+      58,
+      62,
+      64
+     ],
+     "window": 3,
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 56,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_003",
+   "request_tokens": 2,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      16,
+      32,
+      36,
+      40,
+      44,
+      48,
+      60
+     ],
+     "window": 5,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_004",
+   "request_tokens": 14,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      12,
+      16,
+      20,
+      36,
+      40,
+      48,
+      56
+     ],
+     "window": 9,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      24,
+      32,
+      40,
+      48,
+      64
+     ],
+     "window": 9,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      4,
+      8,
+      10,
+      14,
+      16,
+      18,
+      22,
+      24,
+      26,
+      30,
+      34,
+      46,
+      54,
+      56,
+      58,
+      60
+     ],
+     "id": 2
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      2,
+      10,
+      18,
+      20,
+      38,
+      40,
+      42,
+      44,
+      52,
+      56,
+      60,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_005",
+   "request_tokens": 63,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      2,
+      6,
+      12,
+      18,
+      20,
+      22,
+      24,
+      28,
+      32,
+      34,
+      40,
+      46,
+      50,
+      52,
+      56
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      4,
+      6,
+      8,
+      10,
+      24,
+      32,
+      38,
+      40,
+      46,
+      48,
+      54,
+      56,
+      62
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 56,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_006",
+   "request_tokens": 45,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      12,
+      16,
+      20,
+      24,
+      40,
+      44,
+      48,
+      52,
+      56
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 4,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_007",
+   "request_tokens": 4,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      4,
+      10,
+      12,
+      20,
+      22,
+      26,
+      28,
+      30,
+      34,
+      38,
+      46,
+      48,
+      50,
+      56
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      16,
+      24,
+      48,
+      56,
+      64
+     ],
+     "window": 9,
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      4,
+      12,
+      16,
+      24,
+      28,
+      30,
+      34,
+      38,
+      40,
+      42,
+      50,
+      54,
+      62,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 2
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      8,
+      10,
+      20,
+      22,
+      24,
+      28,
+      40,
+      44,
+      54,
+      56,
+      58
+     ],
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_008",
+   "request_tokens": 60,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      8,
+      12,
+      16,
+      20,
+      24,
+      40,
+      52,
+      56,
+      60,
+      64
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 56,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_009",
+   "request_tokens": 32,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      26,
+      30,
+      36,
+      38,
+      44,
+      50,
+      56,
+      60,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      4,
+      8,
+      16,
+      18,
+      20,
+      22,
+      24,
+      26,
+      28,
+      32,
+      36,
+      38,
+      42,
+      44,
+      46,
+      48,
+      50,
+      58,
+      62,
+      64
+     ],
+     "window": 17,
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_010",
+   "request_tokens": 24,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      4,
+      8,
+      12,
+      14,
+      20,
+      22,
+      26,
+      28,
+      30,
+      34,
+      38,
+      40,
+      42,
+      44,
+      50,
+      58,
+      60,
+      62
+     ],
+     "window": 1,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      2,
+      6,
+      14,
+      16,
+      20,
+      30,
+      32,
+      34,
+      42,
+      46,
+      48,
+      50,
+      52,
+      54,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    },
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      12,
+      16,
+      20,
+      28,
+      32,
+      40,
+      48
+     ],
+     "window": 17,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_011",
+   "request_tokens": 22,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      12,
+      20,
+      24,
+      28,
+      44,
+      52,
+      60,
+      64
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 20,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_012",
+   "request_tokens": 2,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      12,
+      20,
+      48,
+      60,
+      64
+     ],
+     "window": 17,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      2,
+      4,
+      6,
+      10,
+      16,
+      32,
+      36,
+      40,
+      44,
+      58,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      6,
+      8,
+      12,
+      16,
+      18,
+      32,
+      40,
+      44,
+      46,
+      62
+     ],
+     "num_kv_heads": 2,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_013",
+   "request_tokens": 64,
+   "hash_unit": 8,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      16,
+      24,
+      40,
+      56,
+      64
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 56,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_014",
+   "request_tokens": 25,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      4,
+      10,
+      14,
+      16,
+      18,
+      20,
+      26,
+      36,
+      42,
+      46,
+      50,
+      52,
+      54,
+      56,
+      58,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      6,
+      8,
+      12,
+      14,
+      16,
+      20,
+      28,
+      30,
+      34,
+      38,
+      40,
+      44,
+      46,
+      48,
+      52,
+      54,
+      60
+     ],
+     "window": 5,
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_015",
+   "request_tokens": 60,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      4,
+      8,
+      10,
+      26,
+      28,
+      34,
+      36,
+      46,
+      52,
+      58,
+      60,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      6,
+      14,
+      16,
+      22,
+      28,
+      30,
+      32,
+      36,
+      38,
+      40,
+      42,
+      44,
+      46,
+      48,
+      50,
+      58,
+      60
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_016",
+   "request_tokens": 29,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      4,
+      20,
+      22,
+      24,
+      26,
+      28,
+      30,
+      32,
+      36,
+      38,
+      40,
+      44,
+      54
+     ],
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      4,
+      8,
+      10,
+      12,
+      14,
+      18,
+      20,
+      24,
+      28,
+      30,
+      34,
+      38,
+      40,
+      50,
+      52,
+      56,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 1
+    },
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      12,
+      24,
+      28,
+      40,
+      52,
+      56,
+      60,
+      64
+     ],
+     "window": 5,
+     "id": 2
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      4,
+      12,
+      26,
+      28,
+      30,
+      32,
+      34,
+      44,
+      56
+     ],
+     "num_kv_heads": 2,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_017",
+   "request_tokens": 15,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      4,
+      6,
+      8,
+      10,
+      24,
+      32,
+      38,
+      40,
+      44,
+      60,
+      64
+     ],
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      6,
+      16,
+      18,
+      20,
+      32,
+      54,
+      56,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      2,
+      6,
+      8,
+      12,
+      14,
+      16,
+      18,
+      20,
+      22,
+      24,
+      26,
+      28,
+      38,
+      52,
+      56,
+      58,
+      62
+     ],
+     "num_kv_heads": 2,
+     "id": 2
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      16,
+      56,
+      64
+     ],
+     "window": 17,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_018",
+   "request_tokens": 45,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      4,
+      8,
+      12,
+      20,
+      24,
+      26,
+      28,
+      34,
+      36,
+      46,
+      48,
+      54,
+      60,
+      62,
+      64
+     ],
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      4,
+      6,
+      8,
+      14,
+      18,
+      20,
+      24,
+      26,
+      30,
+      36,
+      38,
+      40,
+      44,
+      50,
+      54,
+      56,
+      58
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      2,
+      16,
+      20,
+      22,
+      24,
+      26,
+      30,
+      34,
+      36,
+      42,
+      50,
+      52,
+      54,
+      58,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_019",
+   "request_tokens": 30,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      8,
+      12,
+      16,
+      26,
+      38,
+      40,
+      42,
+      44,
+      48,
+      50,
+      52,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      14,
+      16,
+      20,
+      22,
+      36,
+      42,
+      44,
+      50,
+      52,
+      54,
+      56,
+      58,
+      62
+     ],
+     "num_kv_heads": 2,
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_020",
+   "request_tokens": 36,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      2,
+      6,
+      8,
+      12,
+      14,
+      24,
+      26,
+      30,
+      32,
+      38,
+      42,
+      44,
+      50,
+      52,
+      56,
+      62,
+      64
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      4,
+      6,
+      14,
+      20,
+      28,
+      32,
+      34,
+      50,
+      54,
+      60,
+      64
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 32,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_021",
+   "request_tokens": 58,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      24,
+      32,
+      64
+     ],
+     "window": 3,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 32,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_022",
+   "request_tokens": 7,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      8,
+      16,
+      24,
+      56,
+      64
+     ],
+     "window": 17,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      6,
+      10,
+      14,
+      16,
+      20,
+      22,
+      30,
+      32,
+      38,
+      42,
+      48,
+      52,
+      54,
+      56,
+      60,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_023",
+   "request_tokens": 38,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      10,
+      14,
+      18,
+      20,
+      22,
+      26,
+      28,
+      38,
+      46,
+      50,
+      58,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      4,
+      10,
+      12,
+      28,
+      30,
+      34,
+      44,
+      48,
+      50,
+      52,
+      56,
+      58,
+      60,
+      62
+     ],
+     "num_kv_heads": 2,
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      2,
+      6,
+      8,
+      10,
+      14,
+      24,
+      30,
+      32,
+      42,
+      46,
+      50,
+      56,
+      60
+     ],
+     "num_kv_heads": 1,
+     "id": 2
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      12,
+      26,
+      32,
+      42,
+      44,
+      50,
+      58,
+      60
+     ],
+     "num_kv_heads": 1,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_024",
+   "request_tokens": 27,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      2,
+      4,
+      6,
+      14,
+      16,
+      18,
+      20,
+      26,
+      30,
+      32,
+      36,
+      40,
+      52,
+      54,
+      56
+     ],
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      10,
+      16,
+      18,
+      22,
+      26,
+      28,
+      30,
+      34,
+      36,
+      40,
+      42,
+      44,
+      46,
+      48,
+      54,
+      58,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    },
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      12,
+      20,
+      28,
+      32,
+      52,
+      56,
+      60,
+      64
+     ],
+     "window": 17,
+     "id": 2
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      6,
+      10,
+      18,
+      24,
+      26,
+      32,
+      36,
+      38,
+      40,
+      44,
+      52,
+      54,
+      56,
+      60,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_025",
+   "request_tokens": 19,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      8,
+      10,
+      16,
+      18,
+      20,
+      28,
+      30,
+      32,
+      34,
+      36,
+      38,
+      40,
+      44,
+      48,
+      54,
+      60
+     ],
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      16,
+      32,
+      40,
+      64
+     ],
+     "window": 3,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      2,
+      8,
+      20,
+      22,
+      26,
+      30,
+      46,
+      60,
+      64
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_026",
+   "request_tokens": 34,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      6,
+      12,
+      14,
+      22,
+      24,
+      30,
+      32,
+      34,
+      38,
+      40,
+      44,
+      46,
+      48,
+      52,
+      60
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 6,
+   "alignment_tokens": 2,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_027",
+   "request_tokens": 47,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      24,
+      56
+     ],
+     "window": 9,
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      4,
+      8,
+      20,
+      30,
+      32,
+      38,
+      42,
+      52,
+      54
+     ],
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      4,
+      6,
+      14,
+      16,
+      22,
+      28,
+      30,
+      42,
+      44,
+      46,
+      48,
+      52,
+      60
+     ],
+     "id": 2
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      2,
+      6,
+      12,
+      20,
+      24,
+      26,
+      28,
+      30,
+      40,
+      42,
+      44,
+      46,
+      50,
+      64
+     ],
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_028",
+   "request_tokens": 22,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      16,
+      20,
+      24,
+      32,
+      40,
+      56,
+      64
+     ],
+     "window": 1,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 20,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_029",
+   "request_tokens": 42,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      4,
+      12,
+      32,
+      36,
+      44,
+      52,
+      60
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 36,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_030",
+   "request_tokens": 17,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      10,
+      14,
+      18,
+      22,
+      26,
+      28,
+      36,
+      38,
+      42,
+      46,
+      48,
+      50,
+      52,
+      54,
+      58,
+      60,
+      64
+     ],
+     "window": 1,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      20,
+      24,
+      28,
+      36,
+      60
+     ],
+     "window": 9,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      6,
+      8,
+      14,
+      18,
+      24,
+      30,
+      38,
+      46,
+      50,
+      52,
+      54,
+      60
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_031",
+   "request_tokens": 49,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      2,
+      10,
+      12,
+      16,
+      18,
+      20,
+      24,
+      26,
+      28,
+      34,
+      38,
+      40,
+      44,
+      48,
+      50,
+      54,
+      60,
+      64
+     ],
+     "window": 17,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      16,
+      20,
+      22,
+      26,
+      28,
+      36,
+      38,
+      42,
+      46,
+      56,
+      60
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_032",
+   "request_tokens": 11,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      2,
+      10,
+      16,
+      18,
+      20,
+      24,
+      36,
+      38,
+      42,
+      44,
+      50,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 2,
+   "alignment_tokens": 2,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_033",
+   "request_tokens": 39,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      6,
+      8,
+      10,
+      24,
+      26,
+      32,
+      34,
+      36,
+      42,
+      52,
+      56,
+      60,
+      62
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      4,
+      6,
+      10,
+      16,
+      22,
+      28,
+      32,
+      36,
+      38,
+      42,
+      44,
+      50,
+      56,
+      58,
+      60,
+      62
+     ],
+     "num_kv_heads": 2,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      4,
+      16,
+      18,
+      20,
+      22,
+      28,
+      40,
+      42,
+      46,
+      50,
+      60,
+      62
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_034",
+   "request_tokens": 28,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      6,
+      10,
+      26,
+      28,
+      32,
+      34,
+      44,
+      46,
+      56,
+      62
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_035",
+   "request_tokens": 21,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      12,
+      16,
+      20,
+      24,
+      26,
+      32,
+      34,
+      36,
+      38,
+      42,
+      50,
+      52,
+      54,
+      56,
+      58,
+      60,
+      62
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      4,
+      6,
+      12,
+      14,
+      20,
+      24,
+      30,
+      32,
+      36,
+      40,
+      42,
+      46,
+      48,
+      50,
+      52,
+      54,
+      58,
+      62
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 20,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_036",
+   "request_tokens": 45,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      8,
+      12,
+      16,
+      28,
+      30,
+      34,
+      56,
+      60,
+      62
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      8,
+      24,
+      40,
+      56,
+      64
+     ],
+     "window": 5,
+     "id": 1
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      2,
+      6,
+      8,
+      18,
+      20,
+      22,
+      28,
+      32,
+      44,
+      48,
+      50,
+      52,
+      62
+     ],
+     "window": 5,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_037",
+   "request_tokens": 35,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      4,
+      12,
+      16,
+      20,
+      22,
+      28,
+      34,
+      36,
+      38,
+      46,
+      48,
+      50,
+      60,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      8,
+      12,
+      18,
+      26,
+      32,
+      34,
+      38,
+      42,
+      44,
+      48,
+      50,
+      52,
+      54,
+      60,
+      62
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_038",
+   "request_tokens": 5,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      6,
+      12,
+      24,
+      30,
+      32,
+      36,
+      38,
+      42,
+      46,
+      48,
+      58,
+      62
+     ],
+     "window": 17,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_039",
+   "request_tokens": 32,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      6,
+      10,
+      12,
+      20,
+      30,
+      34,
+      36,
+      42,
+      44,
+      54,
+      58,
+      60
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 30,
+   "alignment_tokens": 2,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_040",
+   "request_tokens": 28,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      6,
+      10,
+      12,
+      18,
+      22,
+      24,
+      26,
+      32,
+      34,
+      42,
+      44,
+      56,
+      60
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      6,
+      10,
+      12,
+      14,
+      16,
+      18,
+      20,
+      22,
+      26,
+      28,
+      30,
+      34,
+      36,
+      38,
+      40,
+      44,
+      50,
+      54,
+      56,
+      62
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_041",
+   "request_tokens": 30,
+   "hash_unit": 8,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      24,
+      40,
+      56
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_042",
+   "request_tokens": 60,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      6,
+      8,
+      12,
+      14,
+      26,
+      32,
+      40,
+      46,
+      48,
+      50,
+      58,
+      60,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      4,
+      6,
+      10,
+      18,
+      24,
+      28,
+      34,
+      38,
+      42,
+      44,
+      46,
+      52,
+      54,
+      58
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      6,
+      8,
+      12,
+      16,
+      18,
+      24,
+      28,
+      30,
+      32,
+      36,
+      40,
+      46,
+      48,
+      52,
+      54,
+      58,
+      62
+     ],
+     "num_kv_heads": 2,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_043",
+   "request_tokens": 13,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      6,
+      16,
+      18,
+      24,
+      28,
+      36,
+      38,
+      40,
+      42,
+      44,
+      46,
+      48,
+      62
+     ],
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      12,
+      26,
+      28,
+      36,
+      38,
+      40,
+      46,
+      50,
+      54,
+      58,
+      60
+     ],
+     "window": 3,
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 4,
+   "alignment_tokens": 2,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_044",
+   "request_tokens": 44,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      6,
+      10,
+      12,
+      20,
+      26,
+      28,
+      42,
+      46,
+      48,
+      60,
+      62
+     ],
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      8,
+      24,
+      56
+     ],
+     "window": 5,
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      2,
+      6,
+      10,
+      18,
+      20,
+      28,
+      40,
+      42,
+      46,
+      52,
+      58,
+      60,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_045",
+   "request_tokens": 50,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      2,
+      10,
+      12,
+      22,
+      26,
+      28,
+      34,
+      44,
+      46,
+      48,
+      56,
+      58
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      4,
+      6,
+      12,
+      18,
+      22,
+      28,
+      32,
+      34,
+      38,
+      40,
+      42,
+      44,
+      46,
+      54,
+      64
+     ],
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      4,
+      8,
+      12,
+      16,
+      18,
+      20,
+      24,
+      26,
+      32,
+      34,
+      40,
+      42,
+      52,
+      54,
+      56,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 22,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_046",
+   "request_tokens": 29,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      4,
+      16,
+      18,
+      20,
+      28,
+      32,
+      38,
+      46,
+      52,
+      56,
+      58,
+      62
+     ],
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      8,
+      10,
+      14,
+      16,
+      18,
+      30,
+      32,
+      40,
+      48,
+      52,
+      56,
+      58,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      8,
+      10,
+      14,
+      24,
+      26,
+      28,
+      32,
+      34,
+      36,
+      40,
+      42,
+      48,
+      50,
+      62,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 2
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      12,
+      22,
+      24,
+      36,
+      40,
+      42,
+      46,
+      48,
+      50,
+      52,
+      54,
+      58
+     ],
+     "num_kv_heads": 1,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_047",
+   "request_tokens": 63,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      6,
+      20,
+      30,
+      32,
+      34,
+      38,
+      40,
+      42,
+      46,
+      48,
+      54,
+      56,
+      58,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      4,
+      12,
+      16,
+      26,
+      28,
+      34,
+      38,
+      40,
+      42,
+      46,
+      50,
+      56,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 1
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      4,
+      6,
+      8,
+      16,
+      18,
+      24,
+      26,
+      30,
+      32,
+      34,
+      38,
+      40,
+      44,
+      46,
+      48,
+      56,
+      62
+     ],
+     "window": 1,
+     "id": 2
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      8,
+      10,
+      22,
+      24,
+      34,
+      36,
+      60,
+      62,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_048",
+   "request_tokens": 14,
+   "hash_unit": 8,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      8,
+      32,
+      40,
+      56
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 8,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_049",
+   "request_tokens": 28,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      12,
+      14,
+      18,
+      20,
+      24,
+      26,
+      28,
+      32,
+      34,
+      44,
+      48,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      14,
+      16,
+      18,
+      20,
+      26,
+      32,
+      38,
+      48,
+      56,
+      58
+     ],
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      8,
+      12,
+      14,
+      16,
+      18,
+      20,
+      22,
+      26,
+      32,
+      34,
+      36,
+      38,
+      42,
+      44,
+      46,
+      54,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 2
+    },
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      8,
+      16,
+      20,
+      28,
+      32,
+      36,
+      44,
+      52,
+      56,
+      60
+     ],
+     "window": 5,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_050",
+   "request_tokens": 7,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      16,
+      24,
+      40
+     ],
+     "window": 9,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      4,
+      10,
+      12,
+      14,
+      18,
+      20,
+      22,
+      30,
+      36,
+      40,
+      48,
+      50,
+      54,
+      58,
+      60,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      16,
+      32
+     ],
+     "window": 9,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_051",
+   "request_tokens": 45,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      2,
+      8,
+      16,
+      20,
+      24,
+      26,
+      28,
+      36,
+      48,
+      50,
+      54,
+      58
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      2,
+      14,
+      16,
+      18,
+      20,
+      24,
+      26,
+      28,
+      30,
+      34,
+      46,
+      48,
+      50,
+      58,
+      60,
+      64
+     ],
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      4,
+      10,
+      12,
+      22,
+      24,
+      26,
+      32,
+      34,
+      38,
+      42,
+      50,
+      52,
+      54,
+      58,
+      60,
+      64
+     ],
+     "id": 2
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      4,
+      6,
+      20,
+      26,
+      28,
+      32,
+      34,
+      38,
+      48,
+      50,
+      54,
+      62
+     ],
+     "window": 3,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 26,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_052",
+   "request_tokens": 7,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      8,
+      14,
+      16,
+      20,
+      22,
+      24,
+      28,
+      30,
+      34,
+      36,
+      40,
+      44,
+      48,
+      56,
+      64
+     ],
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      2,
+      12,
+      14,
+      16,
+      18,
+      22,
+      24,
+      28,
+      34,
+      36,
+      38,
+      42,
+      52,
+      54,
+      58,
+      60
+     ],
+     "window": 9,
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_053",
+   "request_tokens": 51,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      6,
+      16,
+      20,
+      28,
+      38,
+      44,
+      50,
+      54,
+      56,
+      58
+     ],
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      48,
+      64
+     ],
+     "window": 17,
+     "id": 1
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      6,
+      10,
+      14,
+      16,
+      20,
+      28,
+      30,
+      32,
+      34,
+      40,
+      44,
+      50,
+      52,
+      56,
+      60
+     ],
+     "window": 17,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_054",
+   "request_tokens": 34,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      20,
+      24,
+      28,
+      36,
+      40,
+      44,
+      48,
+      56
+     ],
+     "window": 17,
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      8,
+      10,
+      16,
+      20,
+      22,
+      26,
+      50,
+      52,
+      56,
+      62,
+      64
+     ],
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      6,
+      10,
+      12,
+      14,
+      20,
+      26,
+      34,
+      38,
+      40,
+      42,
+      48,
+      50,
+      56,
+      60,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_055",
+   "request_tokens": 53,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      4,
+      6,
+      10,
+      12,
+      16,
+      20,
+      40,
+      42,
+      44,
+      46,
+      50,
+      52,
+      54
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      16,
+      24,
+      32,
+      40,
+      48,
+      56,
+      64
+     ],
+     "window": 9,
+     "id": 1
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      16,
+      32,
+      64
+     ],
+     "window": 1,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_056",
+   "request_tokens": 29,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      4,
+      10,
+      20,
+      22,
+      28,
+      34,
+      38,
+      40,
+      44,
+      48,
+      56,
+      58,
+      60,
+      62
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      6,
+      8,
+      12,
+      14,
+      16,
+      20,
+      22,
+      30,
+      32,
+      34,
+      36,
+      38,
+      40,
+      42,
+      52,
+      54,
+      56
+     ],
+     "window": 5,
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      14,
+      16,
+      20,
+      22,
+      26,
+      32,
+      44,
+      46,
+      50,
+      54,
+      60,
+      62,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 2
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      40,
+      64
+     ],
+     "window": 1,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_057",
+   "request_tokens": 52,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      6,
+      8,
+      18,
+      34,
+      36,
+      38,
+      40,
+      44,
+      48,
+      52
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      6,
+      18,
+      22,
+      26,
+      28,
+      30,
+      34,
+      36,
+      38,
+      42,
+      46,
+      48,
+      54,
+      56,
+      60
+     ],
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      4,
+      6,
+      8,
+      12,
+      20,
+      22,
+      32,
+      36,
+      40,
+      44,
+      46,
+      48,
+      50,
+      52,
+      54,
+      62
+     ],
+     "id": 2
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      2,
+      8,
+      10,
+      12,
+      14,
+      16,
+      18,
+      24,
+      28,
+      32,
+      34,
+      36,
+      38,
+      50,
+      52,
+      62,
+      64
+     ],
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 36,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_058",
+   "request_tokens": 43,
+   "hash_unit": 8,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      8,
+      16,
+      24,
+      40,
+      48,
+      56
+     ],
+     "window": 3,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 40,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_059",
+   "request_tokens": 20,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      12,
+      24,
+      32,
+      40,
+      44,
+      52,
+      56,
+      64
+     ],
+     "window": 17,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      2,
+      6,
+      8,
+      10,
+      12,
+      14,
+      18,
+      22,
+      26,
+      30,
+      32,
+      34,
+      36,
+      38,
+      42,
+      50,
+      52,
+      62,
+      64
+     ],
+     "window": 9,
+     "id": 1
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      48,
+      56,
+      64
+     ],
+     "window": 1,
+     "id": 2
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      10,
+      20,
+      22,
+      26,
+      28,
+      30,
+      32,
+      40,
+      42,
+      44,
+      46,
+      50,
+      56,
+      58,
+      62
+     ],
+     "num_kv_heads": 1,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_060",
+   "request_tokens": 41,
+   "hash_unit": 8,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      8,
+      16,
+      24,
+      32,
+      48,
+      56
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 32,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_061",
+   "request_tokens": 35,
+   "hash_unit": 8,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      24,
+      48,
+      56
+     ],
+     "window": 5,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 24,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_062",
+   "request_tokens": 61,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      20,
+      28,
+      52,
+      64
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 52,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_063",
+   "request_tokens": 16,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      12,
+      22,
+      38,
+      40,
+      42,
+      48,
+      50,
+      56
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      14,
+      18,
+      24,
+      34,
+      36,
+      38,
+      40,
+      46,
+      48,
+      50,
+      54,
+      56,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      10,
+      16,
+      18,
+      22,
+      34,
+      38,
+      44,
+      50,
+      60,
+      64
+     ],
+     "id": 2
+    },
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      12,
+      16,
+      20,
+      44,
+      48,
+      52,
+      60
+     ],
+     "window": 9,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_064",
+   "request_tokens": 56,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      8,
+      12,
+      32,
+      40,
+      44,
+      48
+     ],
+     "window": 17,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_065",
+   "request_tokens": 64,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      2,
+      10,
+      16,
+      20,
+      26,
+      28,
+      30,
+      34,
+      40,
+      42,
+      46,
+      48,
+      52,
+      54,
+      56,
+      60,
+      62,
+      64
+     ],
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      12,
+      14,
+      18,
+      20,
+      28,
+      30,
+      32,
+      36,
+      38,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      4,
+      10,
+      14,
+      18,
+      20,
+      28,
+      30,
+      34,
+      36,
+      38,
+      40,
+      48,
+      52,
+      58,
+      60,
+      62
+     ],
+     "id": 2
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      24,
+      32,
+      48
+     ],
+     "window": 9,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_066",
+   "request_tokens": 57,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      6,
+      10,
+      12,
+      14,
+      16,
+      20,
+      22,
+      28,
+      32,
+      34,
+      44,
+      46,
+      50,
+      52,
+      54,
+      58,
+      64
+     ],
+     "window": 9,
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      4,
+      6,
+      8,
+      10,
+      12,
+      16,
+      18,
+      24,
+      26,
+      28,
+      32,
+      34,
+      36,
+      48,
+      52,
+      54,
+      62
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 16,
+   "alignment_tokens": 2,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_067",
+   "request_tokens": 44,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      24,
+      40,
+      44,
+      52
+     ],
+     "window": 9,
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      4,
+      6,
+      14,
+      20,
+      28,
+      36,
+      48,
+      56,
+      64
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_068",
+   "request_tokens": 50,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      10,
+      12,
+      16,
+      20,
+      22,
+      24,
+      26,
+      28,
+      30,
+      32,
+      36,
+      42,
+      52,
+      58
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_069",
+   "request_tokens": 62,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      10,
+      14,
+      18,
+      22,
+      24,
+      30,
+      34,
+      36,
+      38,
+      46,
+      50,
+      56,
+      60
+     ],
+     "window": 9,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_070",
+   "request_tokens": 52,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      14,
+      16,
+      18,
+      22,
+      30,
+      32,
+      34,
+      36,
+      38,
+      42,
+      44,
+      48,
+      52,
+      58,
+      60,
+      62
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      20,
+      24,
+      32,
+      36,
+      44,
+      56
+     ],
+     "window": 17,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      8,
+      10,
+      12,
+      14,
+      16,
+      18,
+      22,
+      26,
+      30,
+      34,
+      40,
+      42,
+      44,
+      48,
+      52
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_071",
+   "request_tokens": 55,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      2,
+      12,
+      14,
+      26,
+      28,
+      30,
+      32,
+      34,
+      46,
+      48,
+      52,
+      54,
+      56,
+      60,
+      62,
+      64
+     ],
+     "window": 17,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 2,
+   "alignment_tokens": 2,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_072",
+   "request_tokens": 50,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      16,
+      48,
+      64
+     ],
+     "window": 5,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      8,
+      24,
+      32,
+      48,
+      56
+     ],
+     "window": 9,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      14,
+      18,
+      20,
+      24,
+      28,
+      34,
+      42,
+      46,
+      50
+     ],
+     "id": 2
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      4,
+      10,
+      14,
+      16,
+      36,
+      46,
+      48,
+      52,
+      56,
+      58,
+      60,
+      62
+     ],
+     "num_kv_heads": 2,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_073",
+   "request_tokens": 33,
+   "hash_unit": 8,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      8,
+      16,
+      48,
+      56
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 16,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_074",
+   "request_tokens": 4,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      24,
+      56
+     ],
+     "window": 5,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      28,
+      32,
+      48,
+      56
+     ],
+     "window": 9,
+     "id": 1
+    },
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      28,
+      36,
+      40,
+      48,
+      52,
+      56,
+      60
+     ],
+     "window": 5,
+     "id": 2
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      2,
+      8,
+      10,
+      14,
+      16,
+      20,
+      22,
+      24,
+      28,
+      30,
+      40,
+      42,
+      46,
+      48,
+      52,
+      54,
+      56,
+      58,
+      64
+     ],
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_075",
+   "request_tokens": 63,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      36,
+      40,
+      44,
+      64
+     ],
+     "window": 9,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 44,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_076",
+   "request_tokens": 34,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      10,
+      20,
+      32,
+      36,
+      46,
+      54,
+      56,
+      58,
+      62,
+      64
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      8,
+      12,
+      16,
+      20,
+      22,
+      32,
+      34,
+      38,
+      50,
+      52,
+      54
+     ],
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      6,
+      8,
+      14,
+      26,
+      30,
+      32,
+      34,
+      36,
+      38,
+      46,
+      48,
+      50,
+      52,
+      62
+     ],
+     "num_kv_heads": 1,
+     "id": 2
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      2,
+      12,
+      18,
+      22,
+      30,
+      38,
+      40,
+      42,
+      44,
+      46,
+      48,
+      56,
+      58,
+      62
+     ],
+     "num_kv_heads": 1,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_077",
+   "request_tokens": 16,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      8,
+      16,
+      24,
+      32,
+      56,
+      64
+     ],
+     "window": 5,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      6,
+      12,
+      28,
+      30,
+      32,
+      34,
+      42,
+      48,
+      50,
+      58,
+      60,
+      62,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 1
+    },
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      12,
+      16,
+      24,
+      32,
+      60
+     ],
+     "window": 9,
+     "id": 2
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      2,
+      8,
+      10,
+      12,
+      14,
+      16,
+      30,
+      32,
+      34,
+      40,
+      42,
+      46,
+      48,
+      54,
+      56,
+      60,
+      62,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_078",
+   "request_tokens": 57,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      4,
+      6,
+      8,
+      10,
+      16,
+      18,
+      20,
+      24,
+      30,
+      34,
+      38,
+      40,
+      44,
+      48,
+      52,
+      54,
+      56,
+      60,
+      64
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      8,
+      14,
+      24,
+      26,
+      28,
+      42,
+      52,
+      54
+     ],
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      6,
+      8,
+      10,
+      16,
+      20,
+      24,
+      26,
+      32,
+      36,
+      38,
+      40,
+      44,
+      46,
+      48,
+      50,
+      52,
+      54,
+      56,
+      60,
+      62
+     ],
+     "num_kv_heads": 1,
+     "id": 2
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      10,
+      12,
+      16,
+      18,
+      22,
+      30,
+      34,
+      36,
+      38,
+      42,
+      44,
+      46,
+      48,
+      50,
+      60
+     ],
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_079",
+   "request_tokens": 31,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      4,
+      6,
+      10,
+      12,
+      14,
+      18,
+      30,
+      32,
+      34,
+      38,
+      40,
+      42,
+      44,
+      48,
+      50,
+      52,
+      56,
+      60,
+      62,
+      64
+     ],
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      6,
+      12,
+      14,
+      18,
+      26,
+      28,
+      32,
+      34,
+      40,
+      46,
+      48,
+      50,
+      52,
+      54,
+      60,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      6,
+      8,
+      10,
+      14,
+      18,
+      20,
+      22,
+      24,
+      26,
+      28,
+      32,
+      36,
+      38,
+      40,
+      44,
+      46,
+      56,
+      58,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_080",
+   "request_tokens": 35,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      8,
+      12,
+      20,
+      32,
+      48,
+      56,
+      64
+     ],
+     "window": 3,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      2,
+      4,
+      6,
+      12,
+      14,
+      18,
+      20,
+      22,
+      24,
+      30,
+      32,
+      44,
+      46,
+      52,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      2,
+      4,
+      8,
+      12,
+      16,
+      18,
+      20,
+      22,
+      30,
+      32,
+      42,
+      46,
+      56,
+      58,
+      60
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_081",
+   "request_tokens": 28,
+   "hash_unit": 8,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      8,
+      32,
+      40,
+      56,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 8,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_082",
+   "request_tokens": 30,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      24,
+      36,
+      44,
+      48,
+      52
+     ],
+     "window": 3,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 24,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_083",
+   "request_tokens": 42,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      20,
+      28,
+      32,
+      36,
+      40,
+      52,
+      56,
+      60,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 8,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_084",
+   "request_tokens": 10,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      6,
+      8,
+      16,
+      28,
+      38,
+      40,
+      52,
+      54,
+      60,
+      62
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      2,
+      10,
+      12,
+      14,
+      20,
+      22,
+      26,
+      28,
+      30,
+      32,
+      38,
+      46,
+      48,
+      50,
+      56,
+      64
+     ],
+     "id": 1
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      8,
+      24,
+      32,
+      48,
+      56,
+      64
+     ],
+     "window": 17,
+     "id": 2
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      2,
+      8,
+      10,
+      16,
+      18,
+      20,
+      24,
+      28,
+      32,
+      34,
+      36,
+      38,
+      42,
+      44,
+      48,
+      56,
+      58,
+      60,
+      62,
+      64
+     ],
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_085",
+   "request_tokens": 39,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      4,
+      6,
+      10,
+      16,
+      20,
+      24,
+      28,
+      30,
+      32,
+      36,
+      40,
+      50,
+      52,
+      54,
+      56,
+      58,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      24,
+      26,
+      28,
+      30,
+      38,
+      44,
+      50,
+      56,
+      58,
+      60
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 4,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_086",
+   "request_tokens": 26,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      4,
+      16,
+      22,
+      24,
+      26,
+      32,
+      34,
+      38,
+      42,
+      46,
+      48,
+      50,
+      52,
+      54,
+      56
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      6,
+      12,
+      14,
+      32,
+      36,
+      38,
+      42,
+      48,
+      54,
+      62
+     ],
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      2,
+      6,
+      8,
+      16,
+      18,
+      22,
+      26,
+      28,
+      30,
+      32,
+      38,
+      40,
+      44,
+      48,
+      50,
+      52,
+      56,
+      60,
+      64
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_087",
+   "request_tokens": 56,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      2,
+      6,
+      8,
+      10,
+      14,
+      18,
+      24,
+      26,
+      30,
+      32,
+      34,
+      40,
+      44,
+      46,
+      48,
+      50,
+      54,
+      56
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      4,
+      6,
+      14,
+      16,
+      22,
+      24,
+      30,
+      40,
+      44,
+      48,
+      50,
+      58,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_088",
+   "request_tokens": 28,
+   "hash_unit": 8,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      8,
+      24,
+      32,
+      48,
+      64
+     ],
+     "window": 17,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 8,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_089",
+   "request_tokens": 56,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      20,
+      24,
+      32,
+      52
+     ],
+     "window": 17,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      8,
+      12,
+      14,
+      20,
+      24,
+      32,
+      38,
+      44,
+      48,
+      52,
+      60
+     ],
+     "window": 3,
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_090",
+   "request_tokens": 31,
+   "hash_unit": 8,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      8,
+      16,
+      24,
+      32,
+      56,
+      64
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 24,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_091",
+   "request_tokens": 59,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      6,
+      8,
+      24,
+      26,
+      30,
+      34,
+      36,
+      40,
+      42,
+      44,
+      46,
+      50,
+      54,
+      60,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      8,
+      16,
+      24,
+      32,
+      40
+     ],
+     "window": 17,
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 8,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_092",
+   "request_tokens": 52,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      6,
+      10,
+      12,
+      14,
+      16,
+      18,
+      24,
+      28,
+      32,
+      40,
+      42,
+      48,
+      58,
+      60
+     ],
+     "window": 9,
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      12,
+      18,
+      28,
+      30,
+      32,
+      46,
+      54,
+      62
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 18,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_093",
+   "request_tokens": 40,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      4,
+      12,
+      20,
+      26,
+      28,
+      32,
+      34,
+      38,
+      44,
+      54,
+      58
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      4,
+      8,
+      12,
+      18,
+      22,
+      24,
+      26,
+      28,
+      30,
+      38,
+      44,
+      48,
+      50,
+      54,
+      64
+     ],
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      8,
+      20,
+      26,
+      28,
+      32,
+      42,
+      56,
+      58,
+      62,
+      64
+     ],
+     "id": 2
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      2,
+      4,
+      6,
+      12,
+      14,
+      24,
+      30,
+      36,
+      44,
+      46,
+      48,
+      54,
+      56,
+      58
+     ],
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_094",
+   "request_tokens": 25,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      16,
+      24,
+      28,
+      40,
+      44,
+      52,
+      60,
+      64
+     ],
+     "window": 3,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      8,
+      16,
+      40,
+      48,
+      56,
+      64
+     ],
+     "window": 5,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      2,
+      8,
+      10,
+      12,
+      16,
+      20,
+      24,
+      28,
+      30,
+      32,
+      34,
+      38,
+      42,
+      58,
+      60,
+      62,
+      64
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 16,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_095",
+   "request_tokens": 2,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      40
+     ],
+     "window": 3,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      32,
+      64
+     ],
+     "window": 9,
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_096",
+   "request_tokens": 42,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      12,
+      28,
+      32,
+      36,
+      60,
+      64
+     ],
+     "window": 5,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      16,
+      24,
+      40,
+      48,
+      56,
+      64
+     ],
+     "window": 1,
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      18,
+      28,
+      30,
+      38,
+      44,
+      48,
+      60,
+      62
+     ],
+     "num_kv_heads": 1,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_097",
+   "request_tokens": 62,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      10,
+      20,
+      22,
+      38,
+      42,
+      44,
+      52,
+      54,
+      62,
+      64
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 54,
+   "alignment_tokens": 2,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_098",
+   "request_tokens": 64,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      4,
+      6,
+      10,
+      16,
+      24,
+      28,
+      36,
+      46,
+      48,
+      52,
+      56,
+      58,
+      60,
+      64
+     ],
+     "window": 1,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      6,
+      8,
+      12,
+      14,
+      22,
+      30,
+      32,
+      34,
+      38,
+      40,
+      44,
+      54,
+      58
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      2,
+      6,
+      8,
+      20,
+      24,
+      26,
+      30,
+      38,
+      44,
+      46,
+      50,
+      52,
+      54,
+      56,
+      58,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_099",
+   "request_tokens": 3,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      10,
+      12,
+      14,
+      22,
+      26,
+      32,
+      36,
+      38,
+      40,
+      46,
+      48,
+      50,
+      58,
+      62
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 2,
+   "alignment_tokens": 2,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_100",
+   "request_tokens": 39,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      12,
+      14,
+      18,
+      22,
+      26,
+      28,
+      30,
+      36,
+      40,
+      44,
+      46,
+      50,
+      58,
+      62
+     ],
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      8,
+      20,
+      24,
+      28,
+      40,
+      52,
+      56
+     ],
+     "window": 5,
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      2,
+      4,
+      8,
+      12,
+      14,
+      16,
+      18,
+      20,
+      28,
+      32,
+      38,
+      48,
+      50,
+      58
+     ],
+     "num_kv_heads": 1,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_101",
+   "request_tokens": 53,
+   "hash_unit": 8,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      32,
+      48,
+      64
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 48,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_102",
+   "request_tokens": 31,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      6,
+      12,
+      20,
+      22,
+      24,
+      28,
+      32,
+      36,
+      40,
+      42,
+      44,
+      52,
+      56,
+      58,
+      60,
+      62,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      10,
+      12,
+      18,
+      22,
+      24,
+      26,
+      30,
+      32,
+      34,
+      38,
+      40,
+      42,
+      50,
+      56
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      14,
+      18,
+      20,
+      22,
+      26,
+      28,
+      32,
+      38,
+      40,
+      46,
+      48,
+      50,
+      52,
+      54,
+      56,
+      64
+     ],
+     "id": 2
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      2,
+      4,
+      10,
+      12,
+      14,
+      36,
+      44,
+      48,
+      50,
+      64
+     ],
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_103",
+   "request_tokens": 51,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      12,
+      16,
+      20,
+      32,
+      40,
+      44,
+      52,
+      60,
+      64
+     ],
+     "window": 5,
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      8,
+      14,
+      16,
+      18,
+      24,
+      26,
+      30,
+      32,
+      38,
+      50,
+      52,
+      54,
+      58,
+      60,
+      62,
+      64
+     ],
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      6,
+      10,
+      12,
+      20,
+      22,
+      24,
+      28,
+      34,
+      40,
+      46,
+      50,
+      52,
+      58,
+      62
+     ],
+     "id": 2
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      6,
+      8,
+      10,
+      14,
+      26,
+      28,
+      30,
+      36,
+      40,
+      46,
+      48,
+      50,
+      52,
+      56,
+      60
+     ],
+     "num_kv_heads": 1,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_104",
+   "request_tokens": 45,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      4,
+      14,
+      24,
+      26,
+      30,
+      36,
+      40,
+      48,
+      50,
+      60,
+      62,
+      64
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      6,
+      14,
+      16,
+      20,
+      30,
+      34,
+      38,
+      40,
+      44,
+      64
+     ],
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      2,
+      4,
+      6,
+      12,
+      16,
+      18,
+      20,
+      26,
+      30,
+      34,
+      36,
+      38,
+      44,
+      46,
+      48,
+      54,
+      60,
+      62,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 2
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      2,
+      4,
+      6,
+      8,
+      16,
+      20,
+      24,
+      28,
+      32,
+      36,
+      40,
+      44,
+      46,
+      48,
+      56,
+      58,
+      60,
+      64
+     ],
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_105",
+   "request_tokens": 14,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      4,
+      10,
+      16,
+      20,
+      24,
+      26,
+      28,
+      30,
+      32,
+      44,
+      48,
+      52,
+      56,
+      64
+     ],
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      16,
+      32,
+      40
+     ],
+     "window": 17,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      14,
+      18,
+      20,
+      26,
+      28,
+      30,
+      36,
+      42,
+      48,
+      50,
+      56,
+      62,
+      64
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_106",
+   "request_tokens": 37,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      12,
+      16,
+      20,
+      32,
+      48,
+      52
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      8,
+      10,
+      20,
+      22,
+      30,
+      32,
+      34,
+      36,
+      40,
+      44,
+      46,
+      48,
+      58,
+      62
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      4,
+      12,
+      14,
+      16,
+      22,
+      24,
+      30,
+      40,
+      44,
+      48,
+      50,
+      56,
+      64
+     ],
+     "window": 17,
+     "id": 2
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      4,
+      10,
+      14,
+      16,
+      24,
+      28,
+      30,
+      34,
+      38,
+      44,
+      48,
+      56,
+      60,
+      62
+     ],
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_107",
+   "request_tokens": 26,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      2,
+      4,
+      16,
+      22,
+      24,
+      28,
+      34,
+      40,
+      42,
+      44,
+      48,
+      50,
+      54,
+      56,
+      58,
+      60,
+      62
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      6,
+      8,
+      10,
+      12,
+      14,
+      18,
+      24,
+      38,
+      40,
+      42,
+      50,
+      52,
+      54,
+      58
+     ],
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 24,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_108",
+   "request_tokens": 20,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      24,
+      26,
+      28,
+      32,
+      34,
+      38,
+      44,
+      48,
+      52,
+      54,
+      58,
+      60
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      18,
+      20,
+      26,
+      34,
+      36,
+      40,
+      46,
+      56
+     ],
+     "num_kv_heads": 2,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      8,
+      30,
+      32,
+      34,
+      40,
+      46,
+      50,
+      54,
+      64
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_109",
+   "request_tokens": 61,
+   "hash_unit": 8,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      16,
+      24,
+      32,
+      56
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 56,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_110",
+   "request_tokens": 34,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      6,
+      10,
+      14,
+      18,
+      24,
+      38,
+      60,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      10,
+      14,
+      16,
+      18,
+      28,
+      30,
+      34,
+      36,
+      40,
+      42,
+      44,
+      46,
+      50,
+      54,
+      58,
+      62
+     ],
+     "num_kv_heads": 2,
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_111",
+   "request_tokens": 17,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      6,
+      14,
+      24,
+      30,
+      34,
+      38,
+      44,
+      46,
+      48,
+      58,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      4,
+      6,
+      8,
+      10,
+      12,
+      16,
+      18,
+      22,
+      26,
+      28,
+      34,
+      38,
+      40,
+      42,
+      44,
+      46,
+      52,
+      58,
+      62,
+      64
+     ],
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      12,
+      16,
+      26,
+      28,
+      30,
+      32,
+      34,
+      36,
+      38,
+      40,
+      42,
+      48,
+      50,
+      52,
+      54,
+      56,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_112",
+   "request_tokens": 5,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      8,
+      24,
+      48,
+      64
+     ],
+     "window": 9,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      4,
+      8,
+      20,
+      24,
+      32,
+      34,
+      46,
+      48,
+      52,
+      58,
+      60,
+      62,
+      64
+     ],
+     "window": 9,
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_113",
+   "request_tokens": 58,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      12,
+      28,
+      32,
+      36,
+      44,
+      52,
+      56,
+      64
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 56,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_114",
+   "request_tokens": 21,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      8,
+      16,
+      20,
+      24,
+      32,
+      44,
+      48,
+      52,
+      64
+     ],
+     "window": 3,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      10,
+      16,
+      18,
+      20,
+      24,
+      30,
+      34,
+      36,
+      40,
+      42,
+      50,
+      58,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 1
+    }
+   ],
+   "expected_hit_tokens": 8,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_115",
+   "request_tokens": 16,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      16,
+      18,
+      20,
+      24,
+      26,
+      34,
+      38,
+      40,
+      44,
+      50,
+      54,
+      64
+     ],
+     "window": 9,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      8,
+      12,
+      14,
+      16,
+      26,
+      30,
+      36,
+      38,
+      42,
+      52,
+      60,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      4,
+      6,
+      10,
+      18,
+      26,
+      30,
+      40,
+      42,
+      44,
+      50,
+      58,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_116",
+   "request_tokens": 10,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      16,
+      20,
+      36,
+      44,
+      48,
+      52,
+      60
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 8,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_117",
+   "request_tokens": 21,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      4,
+      8,
+      10,
+      20,
+      22,
+      24,
+      26,
+      28,
+      34,
+      36,
+      38,
+      44,
+      48,
+      50,
+      52,
+      54,
+      56,
+      58,
+      60,
+      64
+     ],
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      8,
+      16,
+      24,
+      32,
+      64
+     ],
+     "window": 3,
+     "id": 1
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      10,
+      12,
+      14,
+      16,
+      20,
+      28,
+      32,
+      34,
+      38,
+      40,
+      44,
+      46,
+      48,
+      50,
+      52,
+      56,
+      58,
+      60
+     ],
+     "window": 1,
+     "id": 2
+    },
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      20,
+      22,
+      32,
+      36,
+      38,
+      42,
+      46,
+      54,
+      64
+     ],
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_118",
+   "request_tokens": 15,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      6,
+      12,
+      14,
+      18,
+      22,
+      26,
+      30,
+      32,
+      36,
+      40,
+      44,
+      48,
+      58,
+      60,
+      62,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      6,
+      10,
+      16,
+      18,
+      22,
+      28,
+      32,
+      34,
+      38,
+      40,
+      46,
+      52,
+      54,
+      60,
+      62
+     ],
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      6,
+      8,
+      10,
+      12,
+      14,
+      16,
+      18,
+      20,
+      24,
+      28,
+      32,
+      38,
+      42,
+      46,
+      48,
+      52,
+      56,
+      62
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 6,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_119",
+   "request_tokens": 56,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      12,
+      14,
+      16,
+      18,
+      20,
+      24,
+      26,
+      28,
+      32,
+      34,
+      38,
+      42,
+      48,
+      50,
+      54,
+      58,
+      60,
+      64
+     ],
+     "window": 3,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 54,
+   "alignment_tokens": 2,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_120",
+   "request_tokens": 41,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      4,
+      6,
+      10,
+      12,
+      14,
+      18,
+      20,
+      24,
+      28,
+      30,
+      32,
+      36,
+      38,
+      44,
+      46,
+      48,
+      52,
+      58,
+      60,
+      64
+     ],
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      2,
+      6,
+      14,
+      20,
+      26,
+      28,
+      32,
+      38,
+      42,
+      44,
+      50,
+      52,
+      54,
+      64
+     ],
+     "window": 1,
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      8,
+      24,
+      30,
+      34,
+      36,
+      38,
+      40,
+      46,
+      48,
+      50,
+      52,
+      54,
+      56,
+      60
+     ],
+     "num_kv_heads": 1,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_121",
+   "request_tokens": 3,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      24,
+      36,
+      40,
+      44,
+      56
+     ],
+     "window": 5,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      8,
+      24,
+      32,
+      40,
+      48
+     ],
+     "window": 9,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      6,
+      8,
+      12,
+      14,
+      16,
+      20,
+      26,
+      30,
+      36,
+      44,
+      46,
+      48,
+      52,
+      56,
+      60,
+      64
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_122",
+   "request_tokens": 19,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 4,
+     "cached": [
+      2,
+      4,
+      10,
+      16,
+      26,
+      28,
+      32,
+      34,
+      36,
+      40,
+      42,
+      50,
+      64
+     ],
+     "id": 0
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      6,
+      8,
+      12,
+      14,
+      20,
+      26,
+      28,
+      30,
+      34,
+      48,
+      50,
+      52,
+      54,
+      58,
+      62
+     ],
+     "id": 1
+    },
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      4,
+      8,
+      10,
+      12,
+      20,
+      32,
+      34,
+      38,
+      46,
+      48,
+      50,
+      56,
+      58,
+      62,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  },
+  {
+   "name": "random_123",
+   "request_tokens": 41,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      6,
+      8,
+      12,
+      20,
+      24,
+      28,
+      32,
+      34,
+      40,
+      42,
+      46,
+      50,
+      52,
+      60
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      6,
+      10,
+      14,
+      18,
+      22,
+      26,
+      42,
+      52
+     ],
+     "num_kv_heads": 2,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 2,
+     "cached": [
+      6,
+      8,
+      12,
+      24,
+      26,
+      28,
+      30,
+      38,
+      48,
+      52,
+      54,
+      56,
+      58,
+      62
+     ],
+     "id": 2
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_124",
+   "request_tokens": 58,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      2,
+      6,
+      10,
+      16,
+      20,
+      22,
+      24,
+      26,
+      28,
+      30,
+      42,
+      46,
+      48,
+      50,
+      52,
+      58,
+      60,
+      62,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      16,
+      32,
+      36,
+      48,
+      60,
+      64
+     ],
+     "window": 1,
+     "id": 1
+    },
+    {
+     "kind": "swa",
+     "block_size": 2,
+     "cached": [
+      8,
+      10,
+      18,
+      22,
+      28,
+      32,
+      34,
+      36,
+      38,
+      46,
+      50,
+      54,
+      60
+     ],
+     "window": 5,
+     "id": 2
+    },
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      2,
+      4,
+      6,
+      14,
+      18,
+      20,
+      28,
+      36,
+      40,
+      44,
+      52
+     ],
+     "num_kv_heads": 2,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_125",
+   "request_tokens": 22,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      4,
+      8,
+      16,
+      20,
+      24,
+      44,
+      60,
+      64
+     ],
+     "num_kv_heads": 2,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 8,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_126",
+   "request_tokens": 47,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      2,
+      8,
+      12,
+      16,
+      18,
+      22,
+      26,
+      36,
+      38,
+      42,
+      44,
+      48,
+      56,
+      60
+     ],
+     "id": 0
+    },
+    {
+     "kind": "swa",
+     "block_size": 4,
+     "cached": [
+      4,
+      24,
+      44
+     ],
+     "window": 9,
+     "id": 1
+    },
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      2,
+      6,
+      10,
+      12,
+      14,
+      18,
+      20,
+      22,
+      24,
+      30,
+      32,
+      38,
+      40,
+      44,
+      46,
+      52,
+      54,
+      62,
+      64
+     ],
+     "id": 2
+    },
+    {
+     "kind": "full",
+     "block_size": 2,
+     "cached": [
+      2,
+      4,
+      8,
+      14,
+      16,
+      24,
+      26,
+      28,
+      32,
+      34,
+      36,
+      44,
+      48,
+      62
+     ],
+     "num_kv_heads": 1,
+     "id": 3
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "random_127",
+   "request_tokens": 33,
+   "hash_unit": 4,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 4,
+     "cached": [
+      12,
+      20,
+      24,
+      28,
+      32,
+      40,
+      44,
+      48,
+      56,
+      64
+     ],
+     "num_kv_heads": 1,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 0,
+   "alignment_tokens": 4,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "unreachable_single_full_finer_hash",
+   "request_tokens": 15,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "full",
+     "block_size": 8,
+     "cached": [
+      8,
+      12
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 8,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "unreachable_single_swa_finer_hash",
+   "request_tokens": 15,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "swa",
+     "block_size": 8,
+     "cached": [
+      8,
+      12
+     ],
+     "window": 9,
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 8,
+   "alignment_tokens": 8,
+   "partial_hash_hits": false
+  },
+  {
+   "name": "unreachable_single_mamba_finer_hash",
+   "request_tokens": 15,
+   "hash_unit": 2,
+   "groups": [
+    {
+     "kind": "mamba",
+     "block_size": 8,
+     "cached": [
+      8,
+      12
+     ],
+     "id": 0
+    }
+   ],
+   "expected_hit_tokens": 12,
+   "alignment_tokens": 2,
+   "partial_hash_hits": true
+  }
+ ]
+}

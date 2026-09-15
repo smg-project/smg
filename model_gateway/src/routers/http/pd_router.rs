@@ -1353,6 +1353,10 @@ impl PDRouter {
                 headers,
                 rid_key,
                 cache_namespace,
+                // HTTP PD does not query the shared index yet (its prefill
+                // pool would also have to publish; own PR): places as
+                // without one.
+                remote: crate::policies::RemoteLookup::NotAttempted,
             },
         )
         .map_err(|failure| Box::new(Self::pair_failure(*failure)))?;
