@@ -6,6 +6,14 @@ inputs:
     description: 'sccache version to use'
     required: false
     default: 'v0.12.0'
+  cache-key:
+    description: >-
+      rust-cache shared key. Every job saving under the same key races for
+      one cache entry per lockfile hash and only the first save wins, so a
+      job whose target dir differs from the rest (bench profile, other
+      features) should use its own key to keep its artifacts warm.
+    required: false
+    default: 'rust-cache'
 
 runs:
   using: 'composite'
@@ -34,7 +42,7 @@ runs:
         # so the Go FFI build is incremental across runs like the wheel build.
         cache-directories: |
           bindings/golang/target
-        shared-key: "rust-cache"
+        shared-key: ${{ inputs.cache-key }}
         cache-all-crates: true
         cache-on-failure: true
         save-if: true

@@ -44,9 +44,13 @@ jobs:
 
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
+        with:
+          # Bench-profile artifacts; kept apart from the debug-profile cache
+          # every other job saves under the default key.
+          cache-key: rust-cache-bench-tokenizer
 
       - name: Run benchmark
-        timeout-minutes: 40
+        timeout-minutes: 60
         run: |
           source "$HOME/.cargo/env"
           cargo bench --bench tokenizer_benchmark 2>&1 | tee benchmark_output.txt
