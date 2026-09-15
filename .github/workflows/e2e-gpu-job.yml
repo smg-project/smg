@@ -237,6 +237,14 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      # The prebuilt TokenSpeed payload is a per-job copy on the node's shared
+      # NVMe cache (scripts/ci_fetch_tokenspeed_prebuilt.sh); drop it so the
+      # cache does not keep one copy per lane. A hard-killed runner never
+      # reaches this step; those copies are swept by the next fetch on the node.
+      - name: Remove per-job TokenSpeed payload copy
+        if: always() && env.TOKENSPEED_PREBUILT_JOB_DIR != ''
+        run: rm -rf "$TOKENSPEED_PREBUILT_JOB_DIR"
+
       - name: Cleanup Oracle test users
         if: always() && inputs.setup_agentic_deps
         run: |
