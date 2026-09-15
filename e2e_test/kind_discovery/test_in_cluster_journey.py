@@ -80,6 +80,16 @@ def engine_pod_ips(label: str = "app=engines-incluster") -> set[str]:
     }
 
 
+def _wait_until_gone(label: str, timeout: float = 120.0) -> None:
+    """Block until no Pod matching `label` is listed as live."""
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        if not engine_pod_ips(label):
+            return
+        time.sleep(1)
+    raise AssertionError(f"timed out waiting for pods matching {label!r} to go away")
+
+
 def expected_urls(pod_ips: set[str]) -> set[str]:
     return {f"http://{ip}:{port}" for ip in pod_ips for port in ENGINE_PORTS}
 
@@ -236,6 +246,13 @@ spec:
         )
 
         kubectl("delete", "deployment", "engines-typo", "--wait=true")
+        # `--wait` covers the Deployment object only: its Pod is garbage
+        # collected asynchronously and can still be listed, without a
+        # deletionTimestamp, right after the call returns. Snapshotting the
+        # fleet here would fold the doomed typo Pod into `expected` at four
+        # ports -- a set the gateway can never produce, since that Pod only
+        # ever contributed one worker.
+        _wait_until_gone("app=engines-incluster,variant=typo")
         self._wait_for_urls(
             incluster,
             expected_urls(engine_pod_ips()),

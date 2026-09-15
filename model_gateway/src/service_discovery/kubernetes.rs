@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
@@ -197,7 +198,7 @@ pub enum PodType {
 pub struct PodInfo {
     pub name: String,
     pub uid: String,
-    pub ip: String,
+    pub ip: IpAddr,
     pub status: String,
     pub is_ready: bool,
     pub pod_type: Option<PodType>,
@@ -255,7 +256,17 @@ impl PodInfo {
             }
         };
         let status = pod.status.clone()?;
-        let pod_ip = status.pod_ip?;
+        let raw_ip = status.pod_ip?;
+        // Parsed rather than kept as a string so the worker URL renders an
+        // IPv6 address in bracketed form; `format!("{ip}:{port}")` would
+        // produce the unusable `fd00::1:8080`.
+        let pod_ip: IpAddr = match raw_ip.parse() {
+            Ok(ip) => ip,
+            Err(e) => {
+                warn!("Pod {} has an unparsable Pod IP '{}': {e}", name, raw_ip);
+                return None;
+            }
+        };
 
         let is_ready = if let Some(conditions) = &status.conditions {
             conditions
@@ -628,7 +639,7 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
             continue;
         }
         for (index, port) in info.ports.iter().enumerate() {
-            let url = format!("{}:{}", info.ip, port);
+            let url = SocketAddr::new(info.ip, *port).to_string();
             if state.uid_by_url.contains_key(&url) {
                 continue;
             }
@@ -869,7 +880,7 @@ mod tests {
         );
         let pod_info = PodInfo::from_pod(&k8s_pod, None).unwrap();
         assert_eq!(pod_info.name, "test-pod");
-        assert_eq!(pod_info.ip, "10.0.0.1");
+        assert_eq!(pod_info.ip.to_string(), "10.0.0.1");
         assert_eq!(pod_info.status, "Running");
         assert!(pod_info.is_ready);
         assert!(pod_info.pod_type.is_none());
@@ -884,7 +895,7 @@ mod tests {
 
         let pod_info = PodInfo::from_pod(&k8s_pod, Some(&config)).unwrap();
         assert_eq!(pod_info.name, "prefill-pod");
-        assert_eq!(pod_info.ip, "10.0.0.1");
+        assert_eq!(pod_info.ip.to_string(), "10.0.0.1");
         assert_eq!(pod_info.status, "Running");
         assert!(pod_info.is_ready);
         assert_eq!(pod_info.pod_type, Some(PodType::Prefill));
@@ -899,7 +910,7 @@ mod tests {
 
         let pod_info = PodInfo::from_pod(&k8s_pod, Some(&config)).unwrap();
         assert_eq!(pod_info.name, "encode-pod");
-        assert_eq!(pod_info.ip, "10.0.0.5");
+        assert_eq!(pod_info.ip.to_string(), "10.0.0.5");
         assert_eq!(pod_info.status, "Running");
         assert!(pod_info.is_ready);
         assert_eq!(pod_info.pod_type, Some(PodType::Encode));
@@ -914,7 +925,7 @@ mod tests {
 
         let pod_info = PodInfo::from_pod(&k8s_pod, Some(&config)).unwrap();
         assert_eq!(pod_info.name, "decode-pod");
-        assert_eq!(pod_info.ip, "10.0.0.2");
+        assert_eq!(pod_info.ip.to_string(), "10.0.0.2");
         assert_eq!(pod_info.status, "Running");
         assert!(pod_info.is_ready);
         assert_eq!(pod_info.pod_type, Some(PodType::Decode));
@@ -929,7 +940,7 @@ mod tests {
 
         let pod_info = PodInfo::from_pod(&k8s_pod, Some(&config)).unwrap();
         assert_eq!(pod_info.name, "regular-pod");
-        assert_eq!(pod_info.ip, "10.0.0.3");
+        assert_eq!(pod_info.ip.to_string(), "10.0.0.3");
         assert_eq!(pod_info.status, "Running");
         assert!(pod_info.is_ready);
         assert_eq!(pod_info.pod_type, Some(PodType::Regular));
@@ -943,7 +954,7 @@ mod tests {
 
         let pod_info = PodInfo::from_pod(&k8s_pod, Some(&config)).unwrap();
         assert_eq!(pod_info.name, "unknown-pod");
-        assert_eq!(pod_info.ip, "10.0.0.4");
+        assert_eq!(pod_info.ip.to_string(), "10.0.0.4");
         assert_eq!(pod_info.status, "Running");
         assert!(pod_info.is_ready);
         assert_eq!(pod_info.pod_type, Some(PodType::Regular));
@@ -1021,7 +1032,7 @@ mod tests {
         let healthy_pod = PodInfo {
             name: "p1".into(),
             uid: "uid-p1".into(),
-            ip: "1.1.1.1".into(),
+            ip: "1.1.1.1".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
@@ -1036,7 +1047,7 @@ mod tests {
         let not_ready_pod = PodInfo {
             name: "p2".into(),
             uid: "uid-p2".into(),
-            ip: "1.1.1.2".into(),
+            ip: "1.1.1.2".parse().unwrap(),
             status: "Running".into(),
             is_ready: false,
             pod_type: None,
@@ -1051,7 +1062,7 @@ mod tests {
         let not_running_pod = PodInfo {
             name: "p3".into(),
             uid: "uid-p3".into(),
-            ip: "1.1.1.3".into(),
+            ip: "1.1.1.3".parse().unwrap(),
             status: "Pending".into(),
             is_ready: true,
             pod_type: None,
@@ -1258,6 +1269,35 @@ mod tests {
         assert_eq!(desired.addable.len(), 2);
         assert!(desired.addable.iter().all(|w| w.pod_uid == "uid-w"));
         assert!(desired.addable.iter().all(|w| w.pod_name == "w"));
+    }
+
+    #[test]
+    fn test_compute_desired_state_brackets_ipv6_worker_urls() {
+        let config = make_regular_config();
+        let mut pod = make_labeled_pod("w", "10.0.0.1", &[("app", "sglang")]);
+        if let Some(status) = pod.status.as_mut() {
+            status.pod_ip = Some("fd00::1".to_string());
+        }
+        let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
+        assert_eq!(
+            desired
+                .addable
+                .iter()
+                .map(|w| w.url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["[fd00::1]:8000"],
+            "an IPv6 Pod IP must render as a bracketed authority"
+        );
+    }
+
+    #[test]
+    fn test_from_pod_rejects_an_unparsable_pod_ip() {
+        let config = make_regular_config();
+        let mut pod = make_labeled_pod("w", "10.0.0.1", &[("app", "sglang")]);
+        if let Some(status) = pod.status.as_mut() {
+            status.pod_ip = Some("not-an-ip".to_string());
+        }
+        assert!(PodInfo::from_pod(&pod, Some(&config)).is_none());
     }
 
     #[test]

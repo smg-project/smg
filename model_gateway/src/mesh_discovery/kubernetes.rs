@@ -89,7 +89,7 @@ impl RouterPodInfo {
             Ok(ip) => ip,
             Err(e) => {
                 warn!(
-                    "Router pod {} has an unparseable Pod IP '{}': {e}",
+                    "Router pod {} has an unparsable Pod IP '{}': {e}",
                     name, raw_ip
                 );
                 return None;
@@ -444,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_pod_rejects_an_unparseable_pod_ip() {
+    fn test_from_pod_rejects_an_unparsable_pod_ip() {
         let (config, mut pod) = router_config_and_pod();
         if let Some(status) = pod.status.as_mut() {
             status.pod_ip = Some("not-an-ip".to_string());
@@ -488,6 +488,7 @@ mod tests {
             cluster_state.read().get("r1").unwrap().address,
             "10.1.0.1:7000"
         );
+        assert!(logs_contain("invalid sglang.ai/mesh-port annotation"));
     }
 
     #[test]
