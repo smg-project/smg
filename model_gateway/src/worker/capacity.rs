@@ -1,10 +1,14 @@
 //! Aggregate backend capacity tracking.
 //!
-//! See `.claude/priority-scheduling/01-worker-capacity-design.md` for the
-//! full design rationale.
+//! Capacity is a single fleet-wide scalar (summed across every healthy
+//! worker, with no model dimension). That is correct only for
+//! single-model fleets: with multiple models, an idle model's slots
+//! inflate other models' admission budgets (smg-project/smg#2069). The
+//! tracker logs a one-time warning when the healthy fleet reports more
+//! than one model id.
 
 use std::sync::{
-    atomic::{AtomicU16, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering},
     Arc, Weak,
 };
 
@@ -113,6 +117,8 @@ pub struct WorkerCapacity {
     capacity: AtomicU16,
     source: AtomicU8,
     watch_tx: watch::Sender<u16>,
+    /// One-shot latch for the multi-model warning (#2069).
+    warned_multi_model: AtomicBool,
 }
 
 impl WorkerCapacity {
@@ -141,7 +147,31 @@ impl WorkerCapacity {
             capacity: AtomicU16::new(capacity),
             source: AtomicU8::new(source as u8),
             watch_tx: tx,
+            warned_multi_model: AtomicBool::new(false),
         })
+    }
+
+    /// Log once at startup when the healthy fleet serves more than one
+    /// model id.
+    ///
+    /// Capacity is a fleet-wide scalar, so multi-model admission limits are
+    /// incorrect (#2069): an idle model's slots mask a saturated model's
+    /// queue. Startup-only by design — the check is O(fleet size), which is
+    /// not acceptable in the worker-event loop.
+    fn warn_once_if_multi_model(&self, workers: &[Arc<dyn Worker>]) {
+        if self.warned_multi_model.load(Ordering::Relaxed) {
+            return;
+        }
+        let models = distinct_model_count(workers);
+        if models > 1 {
+            self.warned_multi_model.store(true, Ordering::Relaxed);
+            tracing::warn!(
+                models,
+                "priority scheduler capacity is fleet-wide: an idle model's slots \
+                 inflate other models' admission budgets (#2069). Mitigations: \
+                 --worker-capacity-override, or one gateway per model."
+            );
+        }
     }
 
     /// Construct a `WorkerCapacity`, compute the initial value
@@ -163,7 +193,9 @@ impl WorkerCapacity {
             capacity: AtomicU16::new(initial_capacity),
             source: AtomicU8::new(initial_source as u8),
             watch_tx,
+            warned_multi_model: AtomicBool::new(false),
         });
+        this.warn_once_if_multi_model(&workers);
 
         // Supervised loop: any panic in the inner future restarts the task
         // after a 1s backoff. Graceful exit (Ok) breaks out.
@@ -214,6 +246,27 @@ fn healthy_workers(registry: &WorkerRegistry) -> Vec<Arc<dyn Worker>> {
         .into_iter()
         .filter(|w| w.is_healthy())
         .collect()
+}
+
+/// Count distinct advertised model ids across the given workers.
+///
+/// Every model card counts, not just the primary — a worker serving
+/// several models must not read as single-model. Used by the multi-model
+/// warning: capacity is a fleet-wide scalar, so a fleet reporting more
+/// than one model id gets incorrect per-model admission limits (#2069).
+pub(super) fn distinct_model_count(workers: &[Arc<dyn Worker>]) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    for w in workers {
+        let cards = w.models();
+        if cards.is_empty() {
+            // No model cards (e.g. wildcard or label-only worker) — fall back
+            // to the primary id, matching WorkerRegistry::worker_model_ids().
+            seen.insert(w.model_id().to_string());
+        } else {
+            seen.extend(cards.into_iter().map(|card| card.id));
+        }
+    }
+    seen.len()
 }
 
 async fn run_event_loop(
@@ -618,5 +671,114 @@ mod tests {
 
         let rx = tracker.watch();
         assert_eq!(*rx.borrow(), 42);
+    }
+
+    fn worker_with_model(url: &str, model: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(openai_protocol::model_card::ModelCard::new(model))
+                .build(),
+        )
+    }
+
+    #[test]
+    fn distinct_model_count_counts_unique_models() {
+        let workers = vec![
+            worker_with_model("http://w1", "llama-7b"),
+            worker_with_model("http://w2", "llama-7b"),
+            worker_with_model("http://w3", "llama-70b"),
+        ];
+        assert_eq!(distinct_model_count(&workers), 2);
+    }
+
+    #[test]
+    fn distinct_model_count_single_model_fleet() {
+        let workers = vec![
+            worker_with_model("http://w1", "llama-7b"),
+            worker_with_model("http://w2", "llama-7b"),
+        ];
+        assert_eq!(distinct_model_count(&workers), 1);
+    }
+
+    #[test]
+    fn distinct_model_count_counts_every_advertised_model_card() {
+        // One worker can advertise multiple model cards; counting only the
+        // primary id would undercount and suppress the warning.
+        let spec: openai_protocol::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+            "url": "http://w1",
+            "models": [{"id": "llama-7b"}, {"id": "llama-70b"}],
+        }))
+        .expect("multi-model spec");
+        let workers =
+            vec![Arc::new(BasicWorkerBuilder::from_spec(spec).build()) as Arc<dyn Worker>];
+        assert_eq!(distinct_model_count(&workers), 2);
+    }
+
+    #[test]
+    fn distinct_model_count_falls_back_to_primary_model_id_when_no_cards() {
+        // Label-only workers (no model cards) must still count — matches the
+        // WorkerRegistry::worker_model_ids() fallback.
+        let with_label = |url: &str, model: &str| {
+            let mut labels = HashMap::new();
+            labels.insert("model_id".to_string(), model.to_string());
+            Arc::new(BasicWorkerBuilder::new(url).labels(labels).build()) as Arc<dyn Worker>
+        };
+        let workers = vec![
+            with_label("http://w1", "llama-7b"),
+            with_label("http://w2", "llama-70b"),
+        ];
+        assert_eq!(distinct_model_count(&workers), 2);
+    }
+
+    #[tokio::test]
+    async fn spawn_latches_warning_for_multi_model_registry() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let id1 = registry
+            .register(worker_with_model("http://w1", "llama-7b"))
+            .expect("registered");
+        registry.transition_status(&id1, WorkerStatus::Ready);
+        let id2 = registry
+            .register(worker_with_model("http://w2", "llama-70b"))
+            .expect("registered");
+        registry.transition_status(&id2, WorkerStatus::Ready);
+
+        let tracker = WorkerCapacity::spawn(registry, CapacityTrackerSettings::default());
+        assert!(tracker.warned_multi_model.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn warn_once_if_multi_model_sets_flag_once() {
+        let tracker = WorkerCapacity::for_test_with_value(64, CapacitySource::Mixed);
+        let workers = vec![
+            worker_with_model("http://w1", "llama-7b"),
+            worker_with_model("http://w2", "llama-70b"),
+        ];
+        assert!(!tracker.warned_multi_model.load(Ordering::Relaxed));
+        tracker.warn_once_if_multi_model(&workers);
+        assert!(tracker.warned_multi_model.load(Ordering::Relaxed));
+        // Second call is a no-op regardless of input.
+        tracker.warn_once_if_multi_model(&[]);
+        assert!(tracker.warned_multi_model.load(Ordering::Relaxed));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn warn_once_if_multi_model_logs_for_multi_model_fleet() {
+        let tracker = WorkerCapacity::for_test_with_value(64, CapacitySource::Mixed);
+        let workers = vec![
+            worker_with_model("http://w1", "llama-7b"),
+            worker_with_model("http://w2", "llama-70b"),
+        ];
+        tracker.warn_once_if_multi_model(&workers);
+        assert!(logs_contain("fleet-wide"));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn warn_once_if_multi_model_quiet_for_single_model() {
+        let tracker = WorkerCapacity::for_test_with_value(64, CapacitySource::Mixed);
+        let workers = vec![worker_with_model("http://w1", "llama-7b")];
+        tracker.warn_once_if_multi_model(&workers);
+        assert!(!logs_contain("fleet-wide"));
     }
 }
