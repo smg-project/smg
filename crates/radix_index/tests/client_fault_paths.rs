@@ -202,8 +202,8 @@ async fn bytes_keyspace_roundtrips_and_is_isolated_from_tokens() {
         {
             QueryOutcome::Scores(scores) => {
                 assert_eq!(scores.len(), 1, "tokens keyspace holds one holder");
-                assert_eq!(scores[0].0, tokens_holder);
-                assert_eq!(scores[0].1, hashes.len() as u32);
+                assert_eq!(scores[0].holder, tokens_holder);
+                assert_eq!(scores[0].matched_blocks, hashes.len() as u32);
                 break;
             }
             _ if tokio::time::Instant::now() < deadline => {
@@ -222,8 +222,8 @@ async fn bytes_keyspace_roundtrips_and_is_isolated_from_tokens() {
         {
             QueryOutcome::Scores(scores) => {
                 assert_eq!(scores.len(), 1, "bytes keyspace holds one holder");
-                assert_eq!(scores[0].0, bytes_holder);
-                assert_eq!(scores[0].1, hashes.len() as u32);
+                assert_eq!(scores[0].holder, bytes_holder);
+                assert_eq!(scores[0].matched_blocks, hashes.len() as u32);
                 break;
             }
             _ if tokio::time::Instant::now() < deadline => {

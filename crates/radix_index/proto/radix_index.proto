@@ -141,11 +141,26 @@ message Query {
   repeated fixed64 content_hashes = 3;
 }
 
+// One covered run of the query path: the holder holds every block in
+// [start, end) of the query and neither neighbour (runs are maximal).
+message Interval {
+  uint32 start = 1;
+  uint32 end = 2;
+}
+
 message HolderScore {
   string holder = 1;
+  // Consecutive covered blocks from position 0 (the contiguous-cache
+  // answer; 0 when the holder's coverage starts later).
   uint32 matched_blocks = 2;
   uint64 total_blocks = 3;
   bool event_fed = 4;
+  // Every covered run along the query path, in path order. A holder
+  // whose cache is one contiguous prefix has one run starting at 0.
+  repeated Interval intervals = 5;
+  // Opaque publisher metadata for this holder (`Added.metadata`),
+  // echoed verbatim; the index never interprets it.
+  bytes lane_meta = 6;
 }
 
 message Match {

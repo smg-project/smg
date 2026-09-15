@@ -63,7 +63,7 @@ async fn dropped_holder_stops_scoring_then_readvertise_restores() {
         &client,
         &hashes,
         "placement to become queryable",
-        |o| matches!(o, QueryOutcome::Scores(s) if s[0].0 == holder),
+        |o| matches!(o, QueryOutcome::Scores(s) if s[0].holder == holder),
     )
     .await;
 
@@ -80,7 +80,7 @@ async fn dropped_holder_stops_scoring_then_readvertise_restores() {
         &client,
         &hashes,
         "re-added holder to score again",
-        |o| matches!(o, QueryOutcome::Scores(s) if s[0].0 == holder),
+        |o| matches!(o, QueryOutcome::Scores(s) if s[0].holder == holder),
     )
     .await;
 }
@@ -127,8 +127,12 @@ async fn evicted_digest_chain_is_resent_full_and_recovers() {
             .query(MODEL, BLOCK, hashes.clone(), Duration::from_millis(50))
             .await
         {
-            assert_eq!(scores[0].0, holder);
-            assert_eq!(scores[0].1, hashes.len() as u32, "full chain resent");
+            assert_eq!(scores[0].holder, holder);
+            assert_eq!(
+                scores[0].matched_blocks,
+                hashes.len() as u32,
+                "full chain resent"
+            );
             return;
         }
         if tokio::time::Instant::now() >= deadline {

@@ -209,8 +209,11 @@ async fn client_placements_and_queries_roundtrip() {
             .await
         {
             QueryOutcome::Scores(scores) => {
-                assert_eq!(scores[0].0, "grpc://10.0.0.1:9000");
-                assert_eq!(scores[0].1, 4, "16 tokens at block 4 = 4 blocks");
+                assert_eq!(scores[0].holder, "grpc://10.0.0.1:9000");
+                assert_eq!(
+                    scores[0].matched_blocks, 4,
+                    "16 tokens at block 4 = 4 blocks"
+                );
                 break;
             }
             _ if tokio::time::Instant::now() < deadline => {
@@ -259,7 +262,7 @@ async fn client_digest_roundtrip_establishes_and_recovers_misses() {
                 .query(MODEL, BLOCK, hashes.clone(), Duration::from_millis(50))
                 .await
             {
-                return scores[0].1;
+                return scores[0].matched_blocks;
             }
             if tokio::time::Instant::now() >= deadline {
                 panic!("never became queryable");

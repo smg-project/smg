@@ -27,14 +27,30 @@ use crate::{
 /// fallback ladder and metrics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryOutcome {
-    /// Per-holder (url, matched_blocks), descending.
-    Scores(Vec<(String, u32)>),
+    /// Per-holder answers, descending by contiguous depth.
+    Scores(Vec<HolderAnswer>),
     /// The index answered with no overlap.
     Empty,
     /// Deadline elapsed; the late answer is dropped by id.
     Timeout,
     /// No live stream (index down / reconnecting).
     Disconnected,
+}
+
+/// One holder's answer to a query. `holder` is the publisher's holder
+/// name: a worker URL, or `worker#lane` for a worker published as
+/// several independently evicted position sets, each with the
+/// publisher's opaque `lane_meta`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HolderAnswer {
+    pub holder: String,
+    /// Consecutive covered blocks from position 0.
+    pub matched_blocks: u32,
+    pub total_blocks: u64,
+    pub event_fed: bool,
+    /// Every covered `[start, end)` run along the query, in path order.
+    pub intervals: Vec<(u32, u32)>,
+    pub lane_meta: Vec<u8>,
 }
 
 /// Bound on a lifecycle send into the publish queue. Generous against a
@@ -172,10 +188,17 @@ impl RemoteIndex {
         }
         match tokio::time::timeout(deadline, reply_rx).await {
             Ok(Ok(answer)) => {
-                let scores: Vec<(String, u32)> = answer
+                let scores: Vec<HolderAnswer> = answer
                     .scores
                     .into_iter()
-                    .map(|s| (s.holder, s.matched_blocks))
+                    .map(|s| HolderAnswer {
+                        holder: s.holder,
+                        matched_blocks: s.matched_blocks,
+                        total_blocks: s.total_blocks,
+                        event_fed: s.event_fed,
+                        intervals: s.intervals.iter().map(|i| (i.start, i.end)).collect(),
+                        lane_meta: s.lane_meta,
+                    })
                     .collect();
                 if scores.is_empty() {
                     QueryOutcome::Empty

@@ -106,3 +106,30 @@ request. Flag off = every code path byte-identical to local behavior.
 
 `/metrics` (Prometheus text): `radix_index_{keyspaces,holders,event_fed_holders,dropped_holders,blocks}`
 gauges and `radix_index_{applies,queries,relay_dropped}_total` counters.
+
+## Lanes and intervals
+
+A worker's cache is not always one contiguous prefix. Hybrid models keep
+several independently evicted position sets per worker (full attention, a
+sliding window that frees its old blocks, recurrent state saved at
+checkpoints), and the reusable prefix is the largest position every set
+accepts at that position. The index stays engine-neutral about that:
+
+- A **lane** is one independently evicted set, published as its own holder
+  named `worker#lane`, with the publisher's opaque description on
+  `Added.metadata`; the index keeps it, carries it in snapshots and echoes
+  it on every answer, and never parses it. Lifecycle control addressed to
+  `worker` fans out to `worker#*`. Splitting an engine's event stream into
+  lanes is the publisher's job (the vLLM group-events work), not the
+  index's.
+- Answers carry every covered run of the query per holder
+  (`HolderScore.intervals`) next to the contiguous depth (`matched_blocks`),
+  from one `coverage` walk. The reuse rules (full attention = coverage from
+  0, window = `W-1` tokens before the candidate, checkpoint = a block end at
+  the candidate, candidates aligned to the lanes' blocks) live in the
+  gateway (`model_gateway/src/policies/reuse.rs`), where the engine's
+  semantics belong.
+- Snapshots (bootstrap, anti-entropy) ship a holder per run, path-prefixed
+  with placeholder blocks the same snapshot removes, so a run that starts
+  past position 0 lands at the same positions on the same lineage; replica
+  digests are position-bound.

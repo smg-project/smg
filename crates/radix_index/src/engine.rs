@@ -28,7 +28,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use radix_tree::{Config as TreeConfig, HolderId, Overlap, OverlapScratch, RadixTree, StoreError};
+use radix_tree::{
+    Config as TreeConfig, CoverageRun, HolderId, OverlapScratch, RadixTree, StoreError,
+};
 
 use crate::{ContentHash, SequenceHash};
 
@@ -60,11 +62,35 @@ pub enum WireEvent {
     },
 }
 
+/// Key of a snapshot placeholder block: the uncovered head of a run is
+/// shipped under keys no publisher can emit (a mix of the content, its
+/// position and a private tag) and removed again in the same snapshot.
+fn snapshot_placeholder_key(content: ContentHash, pos: u32) -> SequenceHash {
+    let mixed = (content.0 ^ 0x5A5A_F00D_C0FF_EE11)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(17)
+        ^ u64::from(pos).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    SequenceHash(mixed | 1)
+}
+
+/// Separator between a worker name and one of its lanes in a holder
+/// name (`worker#lane`): a lane is one independently evicted position
+/// set of a worker, published as its own holder. Lifecycle control for
+/// the worker applies to its lanes too.
+pub const LANE_SEPARATOR: char = '#';
+
 /// Membership / capacity control payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AddedControl {
     pub capacity_blocks: u64,
     pub event_fed: bool,
+    /// Opaque publisher metadata, kept on the holder and echoed on every
+    /// answer (`HolderScore::lane_meta`). Empty means "no claim": a bare
+    /// lifecycle re-announce never clears standing metadata. The index
+    /// never interprets it; a publisher that splits one worker into
+    /// several independently evicted holders (`worker#lane`) uses it to
+    /// tell the consumer what each lane is.
+    pub metadata: Vec<u8>,
 }
 
 /// One `Publish` message, decoded.
@@ -135,9 +161,15 @@ pub struct KeyspaceKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HolderScore {
     pub holder: String,
+    /// Consecutive covered blocks from position 0.
     pub matched_blocks: u32,
     pub total_blocks: u64,
     pub event_fed: bool,
+    /// Every covered `[start, end)` run along the query path, in path
+    /// order; `matched_blocks` is the first run's end when it starts at 0.
+    pub intervals: Vec<(u32, u32)>,
+    /// The holder's `AddedControl::metadata`, verbatim.
+    pub lane_meta: Vec<u8>,
 }
 
 pub struct EngineConfig {
@@ -177,6 +209,9 @@ struct HolderState {
     last_seq: u64,
     event_fed: bool,
     capacity_blocks: u64,
+    /// Opaque publisher metadata (`AddedControl::metadata`), echoed on
+    /// answers and carried by snapshots.
+    metadata: Vec<u8>,
     dropped: bool,
     /// `dropped` was set by the `event_ttl` silence backstop rather than
     /// by a real departure signal. Such a holder keeps its entry AND its
@@ -475,6 +510,31 @@ impl Engine {
                 continue;
             }
             let mut space = space_arc.write().expect(LOCK_MSG);
+            // A lifecycle signal names the WORKER; a publisher that split
+            // the worker into lanes (`worker#lane`) never sees the
+            // gateway's add/drop, so the signal fans out to every lane
+            // as a bare membership control (no capacity or metadata
+            // claim: those are the lane publisher's).
+            let lanes: Vec<String> = if update.holder.contains(LANE_SEPARATOR) {
+                Vec::new()
+            } else {
+                let prefix = format!("{}{LANE_SEPARATOR}", update.holder);
+                space
+                    .holders
+                    .keys()
+                    .filter(|name| name.starts_with(&prefix))
+                    .cloned()
+                    .collect()
+            };
+            for lane in lanes {
+                let control = UpdateMsg {
+                    holder: lane,
+                    added: update.added.as_ref().map(|_| AddedControl::default()),
+                    ..update.clone()
+                };
+                result.changed |= self.apply_locked(&mut space, &control).changed;
+                found_any = true;
+            }
             if !space.holders.contains_key(&update.holder) {
                 continue;
             }
@@ -560,6 +620,7 @@ impl Engine {
             space.holders.insert(
                 update.holder.clone(),
                 HolderState {
+                    metadata: Vec::new(),
                     id,
                     epoch: update.epoch,
                     last_seq: 0,
@@ -603,6 +664,10 @@ impl Engine {
             }
             if added.event_fed && !holder.event_fed {
                 holder.event_fed = true;
+                changed = true;
+            }
+            if !added.metadata.is_empty() && holder.metadata != added.metadata {
+                holder.metadata.clone_from(&added.metadata);
                 changed = true;
             }
             if holder.dropped {
@@ -956,32 +1021,48 @@ impl Engine {
         // so the routing hot path does not pay a fresh allocation set
         // on every query.
         thread_local! {
-            static QUERY_SCRATCH: std::cell::RefCell<(OverlapScratch, Vec<Overlap>, Vec<u64>)> =
+            static QUERY_SCRATCH: std::cell::RefCell<(OverlapScratch, Vec<CoverageRun>, Vec<u64>)> =
                 std::cell::RefCell::new((OverlapScratch::default(), Vec::new(), Vec::new()));
         }
         let space = space.read().expect(LOCK_MSG);
         let KeyspaceState { tree, holders } = &*space;
         QUERY_SCRATCH.with(|cell| {
-            let (scratch, answers, chain) = &mut *cell.borrow_mut();
+            let (scratch, runs, chain) = &mut *cell.borrow_mut();
             chain.clear();
             chain.extend(hashes.iter().map(|h| h.0));
-            tree.overlap(chain, scratch, answers);
-            let mut scores = Vec::with_capacity(answers.len());
-            for o in answers.iter() {
-                let Some(name) = tree.holder_name(o.holder) else {
+            // One walk answers both shapes: the contiguous depth from 0
+            // for a contiguous cache, and every covered run for a
+            // holder whose cache is several independently evicted sets
+            // (runs come sorted by holder, so one holder's runs are
+            // adjacent).
+            tree.coverage(chain, scratch, runs);
+            let mut scores: Vec<HolderScore> = Vec::new();
+            let mut i = 0;
+            while i < runs.len() {
+                let first = runs[i];
+                let mut j = i;
+                while j < runs.len() && runs[j].holder == first.holder {
+                    j += 1;
+                }
+                let group = &runs[i..j];
+                i = j;
+                let Some(name) = tree.holder_name(first.holder) else {
                     continue;
                 };
                 let Some(holder) = holders.get(name) else {
                     continue;
                 };
-                if holder.dropped || o.depth == 0 {
+                if holder.dropped {
                     continue;
                 }
+                let matched_blocks = if first.start == 0 { first.end } else { 0 };
                 scores.push(HolderScore {
                     holder: name.to_string(),
-                    matched_blocks: o.depth,
-                    total_blocks: o.total_blocks,
+                    matched_blocks,
+                    total_blocks: first.total_blocks,
                     event_fed: holder.event_fed,
+                    intervals: group.iter().map(|r| (r.start, r.end)).collect(),
+                    lane_meta: holder.metadata.clone(),
                 });
             }
             // Holder name as the tie key: equal depths sort identically
@@ -1018,6 +1099,7 @@ impl Engine {
             space.holders.insert(
                 update.holder.clone(),
                 HolderState {
+                    metadata: Vec::new(),
                     id,
                     epoch: update.epoch,
                     last_seq: 0,
@@ -1042,6 +1124,9 @@ impl Engine {
             if added.event_fed {
                 holder.event_fed = true;
             }
+            if !added.metadata.is_empty() {
+                holder.metadata.clone_from(&added.metadata);
+            }
         }
         holder.dropped = update.dropped;
         holder.soft_retired = false;
@@ -1053,28 +1138,42 @@ impl Engine {
         // Store every chunk's blocks, parent-linked, with no feed
         // rejection or capacity truncation — reconstructed ground truth.
         for event in &update.events {
-            if let WireEvent::Stored { parent, blocks } = event {
-                let pairs: Vec<(u64, u64)> = blocks
-                    .iter()
-                    .map(|b| (b.seq_hash.0, b.content_hash.0))
-                    .collect();
-                let stored =
-                    tree.store(holder.id, parent.map(|p| p.0), &pairs)
+            match event {
+                WireEvent::Stored { parent, blocks } => {
+                    let pairs: Vec<(u64, u64)> = blocks
+                        .iter()
+                        .map(|b| (b.seq_hash.0, b.content_hash.0))
+                        .collect();
+                    // Snapshot chunks are path-prefixed (`snapshot_holder`),
+                    // so a missing parent is a truncated stream, not a run
+                    // that starts past 0; the fallback keeps the blocks
+                    // rather than dropping them, and says so.
+                    let stored = tree
+                        .store(holder.id, parent.map(|p| p.0), &pairs)
                         .or_else(|e| match e {
-                            StoreError::ParentNotFound => tree.store(holder.id, None, &pairs),
+                            StoreError::ParentNotFound => {
+                                tracing::warn!(
+                                    holder = %update.holder,
+                                    "snapshot chunk parent missing; placing at the root"
+                                );
+                                tree.store(holder.id, None, &pairs)
+                            }
                             other => Err(other),
                         });
-                if let Err(error) = stored {
-                    // Bootstrap state that did not land is a replica
-                    // that will under-match until the feeds catch up;
-                    // say so rather than swallowing it.
-                    tracing::warn!(
-                        holder = %update.holder,
-                        ?error,
-                        blocks = pairs.len(),
-                        "snapshot chunk rejected by the tree; replica under-matches until refed"
-                    );
+                    if let Err(error) = stored {
+                        tracing::warn!(
+                            holder = %update.holder,
+                            ?error,
+                            blocks = pairs.len(),
+                            "snapshot chunk rejected by the tree; replica under-matches until refed"
+                        );
+                    }
                 }
+                WireEvent::Removed { seq_hashes } => {
+                    let keys: Vec<u64> = seq_hashes.iter().map(|k| k.0).collect();
+                    tree.remove(holder.id, &keys);
+                }
+                WireEvent::Cleared | WireEvent::StoredDigest { .. } => {}
             }
         }
     }
@@ -1098,10 +1197,13 @@ impl Engine {
                     continue;
                 };
                 let (mut blocks, mut xor, mut sum) = (0u64, 0u64, 0u64);
-                for (_pos, _k, content) in space.tree.enumerate(holder.id) {
+                // Position-bound: the same block set at different
+                // positions (a mis-placed run) must not digest equal.
+                for (pos, _k, content) in space.tree.enumerate(holder.id) {
+                    let entry = content ^ u64::from(pos).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
                     blocks += 1;
-                    xor ^= content;
-                    sum = sum.wrapping_add(content.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                    xor ^= entry;
+                    sum = sum.wrapping_add(entry.wrapping_mul(0x9E37_79B9_7F4A_7C15));
                 }
                 out.push(HolderDigest {
                     keyspace: key.clone(),
@@ -1176,53 +1278,91 @@ impl Engine {
         let Some(holder) = space.holders.get(holder_key) else {
             return Vec::new();
         };
-        let blocks: Vec<WireBlock> = space
-            .tree
-            .enumerate(holder.id)
-            .map(|(_pos, k, content)| WireBlock {
-                seq_hash: SequenceHash(k),
-                content_hash: ContentHash(content),
-            })
-            .collect();
         // CHUNKED: one giant Stored per holder blows through gRPC
         // message limits at production block counts (audit finding:
         // >4MiB past ~210k blocks). Chunks are parent-linked so the
         // puller reassembles the exact chain; the control payload rides
         // only the first chunk.
+        //
+        // PER RUN: a holder's coverage is reported per chain lineage as
+        // maximal runs with the content path from position 0. A run
+        // that starts past 0 (an event-fed holder after mid-chain
+        // removals, or a lane whose engine keeps only a window or
+        // checkpoints) is shipped as placeholder blocks for its
+        // uncovered head followed by its real blocks, then a Removed
+        // for the placeholders: the puller lands the run at the same
+        // positions on the same lineage and ends with the same holes.
+        // Shipping such a run as a bare parent-less Stored placed it at
+        // position 0 on a new lineage — a silent positional divergence
+        // the content-only digest could not see.
         const SNAPSHOT_CHUNK: usize = 16_384;
         let control = AddedControl {
             capacity_blocks: holder.capacity_blocks,
             event_fed: holder.event_fed,
+            metadata: holder.metadata.clone(),
         };
         let seq = if holder.event_fed { holder.last_seq } else { 0 };
+        let runs = space.tree.runs(holder.id);
         let mut out = Vec::new();
-        if blocks.is_empty() {
+        let mut first_chunk = true;
+        let mut push = |events: Vec<WireEvent>, out: &mut Vec<UpdateMsg>| {
             out.push(UpdateMsg {
                 keyspace: key.clone(),
                 holder: holder_key.to_string(),
                 epoch: holder.epoch,
                 seq,
-                events: Vec::new(),
-                added: Some(control),
+                events,
+                added: std::mem::take(&mut first_chunk).then(|| control.clone()),
                 dropped: holder.dropped,
             });
+        };
+        if runs.is_empty() {
+            push(Vec::new(), &mut out);
             return out;
         }
-        let mut parent: Option<SequenceHash> = None;
-        for (i, chunk) in blocks.chunks(SNAPSHOT_CHUNK).enumerate() {
-            out.push(UpdateMsg {
-                keyspace: key.clone(),
-                holder: holder_key.to_string(),
-                epoch: holder.epoch,
-                seq,
-                events: vec![WireEvent::Stored {
-                    parent,
-                    blocks: chunk.to_vec(),
-                }],
-                added: (i == 0).then_some(control.clone()),
-                dropped: holder.dropped,
-            });
-            parent = chunk.last().map(|b| b.seq_hash);
+        for run in runs {
+            let head = run.start as usize;
+            let placeholders: Vec<SequenceHash> = run.path[..head]
+                .iter()
+                .enumerate()
+                .map(|(pos, content)| snapshot_placeholder_key(ContentHash(*content), pos as u32))
+                .collect();
+            let blocks: Vec<WireBlock> = placeholders
+                .iter()
+                .zip(&run.path[..head])
+                .map(|(k, c)| WireBlock {
+                    seq_hash: *k,
+                    content_hash: ContentHash(*c),
+                })
+                .chain(
+                    run.keys
+                        .iter()
+                        .zip(&run.path[head..])
+                        .map(|(k, c)| WireBlock {
+                            seq_hash: SequenceHash(*k),
+                            content_hash: ContentHash(*c),
+                        }),
+                )
+                .collect();
+            let mut parent: Option<SequenceHash> = None;
+            for chunk in blocks.chunks(SNAPSHOT_CHUNK) {
+                push(
+                    vec![WireEvent::Stored {
+                        parent,
+                        blocks: chunk.to_vec(),
+                    }],
+                    &mut out,
+                );
+                parent = chunk.last().map(|b| b.seq_hash);
+            }
+            if !placeholders.is_empty() {
+                push(
+                    vec![WireEvent::Removed {
+                        seq_hashes: placeholders,
+                    }],
+                    &mut out,
+                );
+            }
         }
         out
     }
@@ -1666,6 +1806,7 @@ mod tests {
                 blocks: fresh,
             }],
             added: Some(AddedControl {
+                metadata: Vec::new(),
                 capacity_blocks: 0,
                 event_fed: true,
             }),
@@ -1793,6 +1934,171 @@ mod tests {
             late <= early * 13 / 10,
             "live chains grew {early} -> {late}"
         );
+    }
+
+    /// Lanes (§6b): a holder whose coverage has holes is answered as
+    /// its covered runs, with the contiguous depth from 0 kept for the
+    /// contiguous-cache consumer, and its lane metadata echoed verbatim.
+    #[test]
+    fn answers_carry_intervals_and_lane_metadata() {
+        let engine = Engine::new(EngineConfig::default());
+        let chain = placement_chain(&prefix_hashes(21, 8));
+        let keys: Vec<_> = chain.iter().map(|b| b.seq_hash).collect();
+        // Three lanes of one worker: full attention holds all eight
+        // blocks; the window lane evicted the first three; the mamba
+        // lane keeps checkpoints at blocks 4 and 8 only.
+        for (lane, meta) in [
+            ("w1#0", "kind=full;block=1"),
+            ("w1#1", "kind=swa;block=1;window=3"),
+            ("w1#2", "kind=mamba;block=4"),
+        ] {
+            engine.apply(&UpdateMsg {
+                added: Some(AddedControl {
+                    capacity_blocks: 0,
+                    event_fed: true,
+                    metadata: meta.as_bytes().to_vec(),
+                }),
+                ..event_batch(
+                    lane,
+                    1,
+                    vec![WireEvent::Stored {
+                        parent: None,
+                        blocks: chain.clone(),
+                    }],
+                )
+            });
+        }
+        engine.apply(&event_batch(
+            "w1#1",
+            2,
+            vec![WireEvent::Removed {
+                seq_hashes: keys[..3].to_vec(),
+            }],
+        ));
+        engine.apply(&event_batch(
+            "w1#2",
+            2,
+            vec![WireEvent::Removed {
+                seq_hashes: [&keys[..3], &keys[4..7]].concat(),
+            }],
+        ));
+        let mut answers = engine.find_matches(&keyspace(), &prefix_hashes(21, 8));
+        answers.sort_by(|a, b| a.holder.cmp(&b.holder));
+        type View<'a> = (&'a str, u32, &'a [(u32, u32)], &'a str);
+        let view: Vec<View<'_>> = answers
+            .iter()
+            .map(|a| {
+                (
+                    a.holder.as_str(),
+                    a.matched_blocks,
+                    a.intervals.as_slice(),
+                    std::str::from_utf8(&a.lane_meta).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            view,
+            vec![
+                ("w1#0", 8, &[(0, 8)][..], "kind=full;block=1"),
+                ("w1#1", 0, &[(3, 8)][..], "kind=swa;block=1;window=3"),
+                ("w1#2", 0, &[(3, 4), (7, 8)][..], "kind=mamba;block=4"),
+            ]
+        );
+        // A bare lifecycle re-announce (empty metadata) keeps the
+        // standing metadata; a new claim replaces it.
+        engine.apply(&UpdateMsg {
+            added: Some(AddedControl::default()),
+            ..event_batch("w1#1", 0, Vec::new())
+        });
+        engine.apply(&UpdateMsg {
+            added: Some(AddedControl {
+                metadata: b"kind=swa;block=1;window=5".to_vec(),
+                ..AddedControl::default()
+            }),
+            ..event_batch("w1#2", 0, Vec::new())
+        });
+        let metas: Vec<(String, Vec<u8>)> = engine
+            .find_matches(&keyspace(), &prefix_hashes(21, 8))
+            .into_iter()
+            .map(|a| (a.holder, a.lane_meta))
+            .collect();
+        assert!(metas.contains(&("w1#1".to_string(), b"kind=swa;block=1;window=3".to_vec())));
+        assert!(metas.contains(&("w1#2".to_string(), b"kind=swa;block=1;window=5".to_vec())));
+        // Snapshots carry the metadata and the holes; a bootstrapped
+        // replica answers identically.
+        let replica = Engine::new(EngineConfig::default());
+        for key in engine.snapshot_keys() {
+            for holder in engine.snapshot_holders(&key) {
+                for chunk in engine.snapshot_holder(&key, &holder) {
+                    replica.apply_snapshot(&chunk);
+                }
+            }
+        }
+        let mut a = engine.find_matches(&keyspace(), &prefix_hashes(21, 8));
+        let mut b = replica.find_matches(&keyspace(), &prefix_hashes(21, 8));
+        a.sort_by(|x, y| x.holder.cmp(&y.holder));
+        b.sort_by(|x, y| x.holder.cmp(&y.holder));
+        assert_eq!(a, b);
+    }
+
+    /// Lifecycle control names the worker; its lanes follow. A lane can
+    /// also be dropped on its own.
+    #[test]
+    fn lifecycle_control_for_a_worker_fans_out_to_its_lanes() {
+        let engine = Engine::new(EngineConfig::default());
+        let chain = placement_chain(&prefix_hashes(31, 4));
+        for holder in ["w1", "w1#0", "w1#1", "w10#0"] {
+            engine.apply(&UpdateMsg {
+                added: Some(AddedControl {
+                    event_fed: true,
+                    ..AddedControl::default()
+                }),
+                ..event_batch(
+                    holder,
+                    1,
+                    vec![WireEvent::Stored {
+                        parent: None,
+                        blocks: chain.clone(),
+                    }],
+                )
+            });
+        }
+        let answering = |engine: &Engine| -> Vec<String> {
+            let mut v: Vec<String> = engine
+                .find_matches(&keyspace(), &prefix_hashes(31, 4))
+                .into_iter()
+                .map(|a| a.holder)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(answering(&engine), vec!["w1", "w1#0", "w1#1", "w10#0"]);
+        // Drop the worker: its lanes go with it, the other worker's lane
+        // (a name that merely shares the prefix) stays.
+        let dropped = engine.apply(&UpdateMsg {
+            dropped: true,
+            ..event_batch("w1", 0, Vec::new())
+        });
+        assert!(dropped.changed);
+        assert_eq!(answering(&engine), vec!["w10#0"]);
+        // Re-add the worker: lanes come back, with their own metadata
+        // and capacity untouched (the fan-out is a bare membership
+        // control).
+        engine.apply(&UpdateMsg {
+            added: Some(AddedControl {
+                capacity_blocks: 77,
+                ..AddedControl::default()
+            }),
+            ..event_batch("w1", 0, Vec::new())
+        });
+        assert_eq!(answering(&engine), vec!["w1", "w1#0", "w1#1", "w10#0"]);
+        // A single lane dropped on its own leaves the worker and its
+        // sibling lane answering.
+        engine.apply(&UpdateMsg {
+            dropped: true,
+            ..event_batch("w1#1", 0, Vec::new())
+        });
+        assert_eq!(answering(&engine), vec!["w1", "w1#0", "w10#0"]);
     }
 
     #[test]
@@ -2294,6 +2600,7 @@ mod tests {
             seq: 0,
             events: Vec::new(),
             added: (!dropped).then_some(AddedControl {
+                metadata: Vec::new(),
                 capacity_blocks: 0,
                 event_fed: false,
             }),
@@ -2324,6 +2631,7 @@ mod tests {
         engine.apply(&stranger);
         assert_eq!(engine.stats().holders, 1, "bare re-announce mints nothing");
         stranger.added = Some(AddedControl {
+            metadata: Vec::new(),
             capacity_blocks: 64,
             event_fed: false,
         });
@@ -2531,6 +2839,7 @@ mod tests {
             seq: 0,
             events: vec![],
             added: Some(AddedControl {
+                metadata: Vec::new(),
                 capacity_blocks: cap,
                 event_fed: false,
             }),
@@ -2615,6 +2924,7 @@ mod tests {
 
         let readvertise = UpdateMsg {
             added: Some(AddedControl {
+                metadata: Vec::new(),
                 capacity_blocks: 0,
                 event_fed: false,
             }),

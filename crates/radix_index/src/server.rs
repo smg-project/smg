@@ -465,6 +465,12 @@ impl RadixIndex for IndexService {
                             matched_blocks: s.matched_blocks,
                             total_blocks: s.total_blocks,
                             event_fed: s.event_fed,
+                            intervals: s
+                                .intervals
+                                .into_iter()
+                                .map(|(start, end)| proto::Interval { start, end })
+                                .collect(),
+                            lane_meta: s.lane_meta,
                         })
                         .collect(),
                 };

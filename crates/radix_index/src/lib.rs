@@ -84,6 +84,7 @@ impl From<&proto::Update> for UpdateMsg {
                 })
                 .collect(),
             added: u.added.as_ref().map(|a| AddedControl {
+                metadata: a.metadata.clone(),
                 capacity_blocks: a.capacity_blocks,
                 event_fed: a.event_fed,
             }),
@@ -143,7 +144,7 @@ impl From<&UpdateMsg> for proto::Update {
             added: u.added.as_ref().map(|a| proto::Added {
                 capacity_blocks: a.capacity_blocks,
                 event_fed: a.event_fed,
-                metadata: Vec::new(),
+                metadata: a.metadata.clone(),
             }),
             dropped: u.dropped,
         }
