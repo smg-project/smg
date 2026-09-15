@@ -71,6 +71,15 @@ pub(crate) struct ChatResponseSpec {
     pub ignore_eos: bool,
     /// Fallback when preparation derived no override.
     pub skip_special_tokens: bool,
+    /// Exact rendered prompt prefix used to validate the response template's
+    /// start anchor without rendering the request a second time.
+    pub rendered_prompt_prefix: String,
+    /// A checkpoint-provided response template. `None` preserves the existing
+    /// reasoning/tool parser precedence unchanged.
+    pub response_template: Option<Value>,
+    /// Template close literals that are single EOS/stop tokens. These must be
+    /// visible to the private parser while remaining hidden from public output.
+    pub template_close_token_ids: Vec<u32>,
 }
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
@@ -90,6 +99,9 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             no_stop_trim: request.no_stop_trim,
             ignore_eos: request.ignore_eos,
             skip_special_tokens: request.skip_special_tokens,
+            rendered_prompt_prefix: String::new(),
+            response_template: None,
+            template_close_token_ids: Vec::new(),
         }
     }
 }

@@ -1,0 +1,18 @@
+[package]
+name = "response-template-parser"
+version = "0.1.0"
+edition = "2021"
+description = "Generic parser for tokenizer response-template schemas"
+license = "Apache-2.0"
+repository = "https://github.com/smg-project/smg"
+readme = "README.md"
+
+[dependencies]
+regex = "1.12"
+regex-syntax = "0.8"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

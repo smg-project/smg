@@ -18,6 +18,8 @@ use openai_protocol::{
     messages::{self, Message},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
+use response_template_parser::{ParserConfig as ResponseParserConfig, ResponseTemplateParser};
+use serde_json::Value;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
 
@@ -39,6 +41,32 @@ pub(crate) struct ResponseProcessor {
     pub reasoning_parser_factory: ReasoningParserFactory,
     /// Per-request parser-name resolution (model-card override → configured).
     pub parser_resolver: utils::ParserResolver,
+}
+
+/// Template-owned close markers are private framing. They are handed to the
+/// response parser, but must not be echoed through the public `matched_stop`
+/// field when a backend also reports the same stop as metadata.
+fn template_owns_matched_stop(request: &ChatResponseSpec, matched_stop: &Value) -> bool {
+    if let Some(token_id) = matched_stop.as_u64().and_then(|id| u32::try_from(id).ok()) {
+        return request.template_close_token_ids.contains(&token_id);
+    }
+
+    let Some(literal) = matched_stop.as_str() else {
+        return false;
+    };
+    request
+        .response_template
+        .as_ref()
+        .and_then(|template| template.get("fields"))
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|fields| fields.values())
+        .filter_map(|field| field.get("close"))
+        .any(|close| match close {
+            Value::String(value) => value == literal,
+            Value::Array(values) => values.iter().any(|value| value.as_str() == Some(literal)),
+            _ => false,
+        })
 }
 
 impl ResponseProcessor {
@@ -74,24 +102,29 @@ impl ResponseProcessor {
         tool_parser_name: Option<&str>,
     ) -> Result<ChatChoice, String> {
         stop_decoder.reset();
-        // Decode tokens
-        let outputs = stop_decoder
-            .process_tokens(complete.output_ids())
-            .map_err(|e| format!("Failed to process tokens: {e}"))?;
-
-        // Accumulate text with early breaks
+        // Decode tokens while retaining the exact ID that triggered a stop.
+        // Template-bearing responses use it to distinguish private framing
+        // closes from ordinary caller-visible `no_stop_trim` stops.
         let mut final_text = String::new();
         let mut stopped = false;
-        for output in outputs {
+        let mut stop_token_id = None;
+        let mut stopped_with_text = false;
+        for &token_id in complete.output_ids() {
+            let output = stop_decoder
+                .process_token(token_id)
+                .map_err(|e| format!("Failed to process token {token_id}: {e}"))?;
             match output {
                 SequenceDecoderOutput::Text(t) => final_text.push_str(&t),
                 SequenceDecoderOutput::StoppedWithText(t) => {
                     final_text.push_str(&t);
                     stopped = true;
+                    stop_token_id = Some(token_id);
+                    stopped_with_text = true;
                     break;
                 }
                 SequenceDecoderOutput::Stopped => {
                     stopped = true;
+                    stop_token_id = Some(token_id);
                     break;
                 }
                 SequenceDecoderOutput::Held => {}
@@ -101,6 +134,99 @@ impl ResponseProcessor {
         // Flush remaining text
         if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
             final_text.push_str(&t);
+        }
+
+        // A checkpoint response template is authoritative for all assistant
+        // fields. Template-less tokenizers continue through the pre-existing
+        // reasoning/tool parser precedence below.
+        if let Some(template) = original_request.response_template.as_ref() {
+            let external_visible_stop = if stopped
+                && stopped_with_text
+                && original_request.no_stop_trim
+                && stop_token_id
+                    .is_none_or(|id| !original_request.template_close_token_ids.contains(&id))
+            {
+                let literal = stop_decoder
+                    .matched_stop()
+                    .map(str::to_owned)
+                    .or_else(|| stop_token_id.and_then(|id| tokenizer.decode(&[id], false).ok()))
+                    .unwrap_or_default();
+                if !literal.is_empty() && final_text.ends_with(&literal) {
+                    final_text.truncate(final_text.len() - literal.len());
+                    Some(literal)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let parser =
+                ResponseTemplateParser::from_json(model, template, ResponseParserConfig::default())
+                    .map_err(|error| {
+                        format!("Invalid response template for model '{model}': {error}")
+                    })?;
+            let mut parsed = parser
+                .parse_complete(&original_request.rendered_prompt_prefix, &final_text)
+                .map_err(|error| {
+                    format!("Response-template parse failed for model '{model}': {error}")
+                })?;
+            if let Some(stop) = external_visible_stop {
+                parsed.content.push_str(&stop);
+            }
+
+            if !parsed.wire_bytes.is_empty() {
+                return Err("Response-template parser exposed private wire bytes".to_string());
+            }
+            let has_template_tool_calls = !parsed.tool_calls.is_empty();
+            let tool_calls = has_template_tool_calls.then(|| {
+                parsed
+                    .tool_calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(tool_index, call)| ToolCall {
+                        id: utils::generate_tool_call_id(
+                            model,
+                            &call.name,
+                            tool_index,
+                            history_tool_calls_count,
+                        ),
+                        tool_type: "function".to_string(),
+                        function: FunctionCallResponse {
+                            name: call.name,
+                            arguments: Some(Value::Object(call.arguments).to_string()),
+                        },
+                    })
+                    .collect()
+            });
+            let finish_reason = if has_template_tool_calls {
+                "tool_calls"
+            } else if stopped {
+                "stop"
+            } else {
+                complete.finish_reason()
+            };
+            let matched_stop = stop_decoder
+                .matched_stop()
+                .map(|value| Value::String(value.to_string()))
+                .or_else(|| complete.matched_stop_json())
+                .filter(|value| !template_owns_matched_stop(original_request, value));
+            let logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
+                utils::convert_proto_to_openai_logprobs(proto_logprobs, tokenizer)
+            });
+
+            return Ok(ChatChoice {
+                index: index as u32,
+                message: ChatCompletionMessage {
+                    role: "assistant".to_string(),
+                    content: (!parsed.content.is_empty()).then_some(parsed.content),
+                    tool_calls,
+                    reasoning_content: (!parsed.thinking.is_empty()).then_some(parsed.thinking),
+                },
+                logprobs,
+                finish_reason: Some(finish_reason.to_string()),
+                matched_stop,
+                hidden_states: None,
+            });
         }
 
         // Step 1: Handle reasoning content parsing
@@ -206,7 +332,7 @@ impl ResponseProcessor {
         // reports no stop_reason over the ZMQ path); otherwise use the engine's.
         let matched_stop = stop_decoder
             .matched_stop()
-            .map(|s| serde_json::Value::String(s.to_string()))
+            .map(|s| Value::String(s.to_string()))
             .or_else(|| complete.matched_stop_json());
 
         // Step 4: Convert output logprobs if present
@@ -730,10 +856,10 @@ impl ResponseProcessor {
                             error = %e,
                             "Failed to parse tool call arguments, defaulting to empty object"
                         );
-                        serde_json::Value::Object(serde_json::Map::new())
+                        Value::Object(Default::default())
                     })
                 } else {
-                    serde_json::Value::Object(serde_json::Map::new())
+                    Value::Object(Default::default())
                 };
 
                 content_blocks.push(messages::ContentBlock::ToolUse {
@@ -892,7 +1018,7 @@ impl ResponseProcessor {
                         None
                     } else if reason == "stop" || reason == "length" {
                         Some(reason.to_string())
-                    } else if let Ok(json) = serde_json::from_str::<serde_json::Value>(reason) {
+                    } else if let Ok(json) = serde_json::from_str::<Value>(reason) {
                         json.get("type").and_then(|v| v.as_str()).map(|s| match s {
                             "length" => "length".to_string(),
                             "stop" => "stop".to_string(),
@@ -908,7 +1034,7 @@ impl ResponseProcessor {
                 // the engine's.
                 let matched_stop = stop_decoder
                     .matched_stop()
-                    .map(|s| serde_json::Value::String(s.to_string()))
+                    .map(|s| Value::String(s.to_string()))
                     .or_else(|| complete.matched_stop_json());
 
                 let suffix_len = completion_req.suffix.as_ref().map_or(0, |s| s.len());

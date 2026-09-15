@@ -80,6 +80,7 @@ uuid = { workspace = true, features = ["serde"] }
 # Workspace crates
 openai-protocol = { workspace = true, features = ["axum"] }
 reasoning-parser.workspace = true
+response-template-parser.workspace = true
 tool-parser.workspace = true
 wfaas.workspace = true
 llm-tokenizer.workspace = true

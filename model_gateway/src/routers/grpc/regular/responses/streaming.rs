@@ -201,11 +201,21 @@ async fn process_and_transform_sse_stream(
 
             // Try to parse as ChatCompletionStreamResponse
             match serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
-                Ok(chat_chunk) => {
+                Ok(mut chat_chunk) => {
                     // Update accumulator
                     accumulator.process_chunk(&chat_chunk);
 
                     // Process chunk through event emitter (emits proper OpenAI events)
+                    // A Chat `tool_calls` finish means generation is complete,
+                    // but the generic Responses emitter only closes its current
+                    // message for `stop`/`length`. Normalize that internal
+                    // handoff so content is committed before we append the
+                    // accumulated function-call items below.
+                    for choice in &mut chat_chunk.choices {
+                        if choice.finish_reason.as_deref() == Some("tool_calls") {
+                            choice.finish_reason = Some("stop".to_string());
+                        }
+                    }
                     event_emitter.process_chunk(&chat_chunk, &tx).await?;
                 }
                 Err(_) => {
@@ -241,6 +251,15 @@ async fn process_and_transform_sse_stream(
 
         usage_obj
     });
+
+    // The Chat stream carries response-template reasoning and function calls
+    // as choice deltas. The generic Responses emitter only translates text,
+    // so materialize the accumulated non-text fields before its terminal
+    // snapshot. This keeps streaming Responses aligned with the non-streaming
+    // `chat_to_responses` conversion without parsing model bytes a second time.
+    accumulator
+        .emit_non_text_items(&mut event_emitter, &tx)
+        .await?;
 
     let completed_event = event_emitter.emit_completed(usage_json.as_ref());
     event_emitter.send_event(&completed_event, &tx).await?;
@@ -371,6 +390,75 @@ impl StreamingResponseAccumulator {
         }
     }
 
+    async fn emit_non_text_items(
+        &self,
+        emitter: &mut ResponseStreamEventEmitter,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        if !self.reasoning_buffer.is_empty() {
+            emitter
+                .emit_reasoning_item(tx, Some(self.reasoning_buffer.clone()))
+                .await?;
+        }
+
+        for tool_call in &self.tool_calls {
+            let ResponseOutputItem::FunctionToolCall {
+                call_id,
+                name,
+                arguments,
+                status,
+                ..
+            } = tool_call
+            else {
+                continue;
+            };
+
+            let (name, namespace) =
+                resolve_function_identity(self.original_request.tools.as_deref(), name);
+
+            let (output_index, item_id) =
+                emitter.allocate_output_index(OutputItemKind::FunctionCall);
+            let mut item = json!({
+                "id": item_id,
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": "",
+                "status": status,
+            });
+            if let Some(namespace) = &namespace {
+                item["namespace"] = json!(namespace);
+            }
+            let event = emitter.emit_output_item_added(output_index, &item);
+            emitter.send_event(&event, tx).await?;
+
+            let event =
+                emitter.emit_function_call_arguments_delta(output_index, &item_id, arguments);
+            emitter.send_event(&event, tx).await?;
+
+            let event =
+                emitter.emit_function_call_arguments_done(output_index, &item_id, arguments);
+            emitter.send_event(&event, tx).await?;
+
+            let mut item = json!({
+                "id": item_id,
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+                "status": status,
+            });
+            if let Some(namespace) = &namespace {
+                item["namespace"] = json!(namespace);
+            }
+            let event = emitter.emit_output_item_done(output_index, &item);
+            emitter.send_event(&event, tx).await?;
+            emitter.complete_output_item(output_index);
+        }
+
+        Ok(())
+    }
+
     fn finalize(self) -> ResponsesResponse {
         let mut output: Vec<ResponseOutputItem> = Vec::new();
 
@@ -425,7 +513,7 @@ impl StreamingResponseAccumulator {
                     reason: IncompleteReason::MaxOutputTokens,
                 }),
             ),
-            Some("tool_calls") => (ResponseStatus::InProgress, None),
+            Some("tool_calls") => (ResponseStatus::Completed, None),
             Some("failed") | Some("error") => (ResponseStatus::Failed, None),
             _ => (ResponseStatus::Completed, None),
         };

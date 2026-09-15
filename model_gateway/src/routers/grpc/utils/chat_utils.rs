@@ -647,6 +647,28 @@ pub fn create_stop_decoder(
     no_stop_trim: bool,
     ignore_eos: bool,
 ) -> StopSequenceDecoder {
+    create_stop_decoder_with_visible_stop_tokens(
+        tokenizer,
+        stop,
+        stop_token_ids,
+        skip_special_tokens,
+        no_stop_trim,
+        ignore_eos,
+        &[],
+    )
+}
+
+/// Create a stop decoder while exposing only template-owned close token IDs
+/// to the private response parser.
+pub fn create_stop_decoder_with_visible_stop_tokens(
+    tokenizer: &Arc<dyn Tokenizer>,
+    stop: Option<&StringOrArray>,
+    stop_token_ids: Option<&Vec<u32>>,
+    skip_special_tokens: bool,
+    no_stop_trim: bool,
+    ignore_eos: bool,
+    template_visible_stop_token_ids: &[u32],
+) -> StopSequenceDecoder {
     // Extract stop sequences
     let stop_sequences: Vec<String> = match stop {
         Some(StringOrArray::String(s)) => vec![s.clone()],
@@ -676,11 +698,15 @@ pub fn create_stop_decoder(
     } else {
         tokenizer.eos_token_ids()
     };
-    for &token_id in eos_ids
+    let mut stop_ids = eos_ids
         .iter()
         .chain(stop_token_ids.map(|ids| ids.as_slice()).unwrap_or_default())
-    {
-        builder = if no_stop_trim {
+        .copied()
+        .collect::<Vec<_>>();
+    stop_ids.sort_unstable();
+    stop_ids.dedup();
+    for token_id in stop_ids {
+        builder = if no_stop_trim || template_visible_stop_token_ids.contains(&token_id) {
             builder.visible_stop_token(token_id)
         } else {
             builder.stop_token(token_id)
@@ -688,6 +714,56 @@ pub fn create_stop_decoder(
     }
 
     builder.build()
+}
+
+/// Resolve response-template close literals that are represented by one token.
+/// Only these EOS/stop IDs are made visible to the private template parser;
+/// every other stop keeps the pre-existing trim policy.
+pub fn response_template_close_token_ids(
+    tokenizer: &Arc<dyn Tokenizer>,
+    stop_token_ids: Option<&Vec<u32>>,
+    ignore_eos: bool,
+) -> Vec<u32> {
+    let close_literals = tokenizer
+        .response_template()
+        .map(response_template_close_literals)
+        .unwrap_or_default();
+    let eos_ids = if ignore_eos {
+        &[] as &[u32]
+    } else {
+        tokenizer.eos_token_ids()
+    };
+    let mut candidates = eos_ids
+        .iter()
+        .chain(stop_token_ids.map(Vec::as_slice).unwrap_or_default())
+        .copied()
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .filter(|token_id| {
+            tokenizer
+                .decode(&[*token_id], false)
+                .is_ok_and(|literal| close_literals.contains(&literal))
+        })
+        .collect::<Vec<_>>()
+}
+
+fn response_template_close_literals(template: &Value) -> std::collections::HashSet<String> {
+    template
+        .get("fields")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|fields| fields.values())
+        .filter_map(|field| field.get("close"))
+        .flat_map(|close| match close {
+            Value::String(value) => vec![value.as_str()],
+            Value::Array(values) => values.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        })
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Parse tool calls from JSON schema constrained response

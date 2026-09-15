@@ -213,7 +213,7 @@ async fn chat_events(
     responses: Vec<proto::GenerateResponse>,
     with_tools: bool,
     grpc_status: &'static str,
-) -> (Result<(), String>, Vec<Value>) {
+) -> (Result<(), ChatStreamError>, Vec<Value>) {
     let (stream, server) = scripted_stream(responses, grpc_status).await;
     let (tx, rx) = sse_channel();
     let result = processor(with_tools)

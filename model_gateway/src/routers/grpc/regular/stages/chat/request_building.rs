@@ -201,6 +201,19 @@ impl BuildStage for ChatRequestBuildingStage {
             ));
         };
 
+        let mut response_spec = ChatResponseSpec::from(chat_request.as_ref());
+        if let Some(tokenizer) = ctx.tokenizer_arc() {
+            if let Some(template) = tokenizer.response_template() {
+                response_spec.rendered_prompt_prefix = processed_messages.text.clone();
+                response_spec.response_template = Some(template.clone());
+                response_spec.template_close_token_ids = utils::response_template_close_token_ids(
+                    &tokenizer,
+                    chat_request.stop_token_ids.as_ref(),
+                    chat_request.ignore_eos,
+                );
+            }
+        }
+
         let (plan, stamp) = build_chat_backed_plan(
             ctx,
             &chat_request,
@@ -215,7 +228,7 @@ impl BuildStage for ChatRequestBuildingStage {
 
         Ok(BuildOutput {
             plan,
-            spec: ResponseSpec::Chat(Box::new(ChatResponseSpec::from(chat_request.as_ref()))),
+            spec: ResponseSpec::Chat(Box::new(response_spec)),
             stamp,
         })
     }
