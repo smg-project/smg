@@ -924,6 +924,45 @@ pub fn resize_bicubic_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> Dynam
     )
 }
 
+/// Pillow-compatible `ImageOps.pad` using bicubic resize and centered paste.
+///
+/// Pillow uses Python's round-to-even for both the contained edge and the
+/// centered paste origin. Both details are observable on half-pixel cases and
+/// differ from Rust's default `f64::round` behavior.
+pub fn pad_contain_pil(
+    image: &DynamicImage,
+    out_w: u32,
+    out_h: u32,
+    color: Rgb<u8>,
+) -> DynamicImage {
+    let (in_w, in_h) = image.dimensions();
+    if in_w == out_w && in_h == out_h {
+        return DynamicImage::ImageRgb8(image.to_rgb8());
+    }
+
+    let image_ratio = f64::from(in_w) / f64::from(in_h);
+    let destination_ratio = f64::from(out_w) / f64::from(out_h);
+    let (contained_w, contained_h) = if image_ratio >= destination_ratio {
+        (
+            out_w,
+            round_half_to_even(f64::from(in_h) / f64::from(in_w) * f64::from(out_w)).max(1.0)
+                as u32,
+        )
+    } else {
+        (
+            round_half_to_even(f64::from(in_w) / f64::from(in_h) * f64::from(out_h)).max(1.0)
+                as u32,
+            out_h,
+        )
+    };
+    let resized = resize_bicubic_pil(image, contained_w, contained_h).to_rgb8();
+    let mut canvas = RgbImage::from_pixel(out_w, out_h, color);
+    let left = round_half_to_even(f64::from(out_w - contained_w) * 0.5) as i64;
+    let top = round_half_to_even(f64::from(out_h - contained_h) * 0.5) as i64;
+    image::imageops::replace(&mut canvas, &resized, left, top);
+    DynamicImage::ImageRgb8(canvas)
+}
+
 /// PIL-exact bicubic resize over borrowed interleaved RGB bytes.
 ///
 /// Byte-for-byte equivalent of [`resize_bicubic_pil`] but for the raw-RGB video

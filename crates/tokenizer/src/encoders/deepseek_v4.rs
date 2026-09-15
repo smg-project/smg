@@ -114,6 +114,7 @@ pub const EOS_TOKEN: &str = "<｜end▁of▁sentence｜>";
 pub const THINKING_START_TOKEN: &str = "<think>";
 pub const THINKING_END_TOKEN: &str = "</think>";
 pub const DSML_TOKEN: &str = "｜DSML｜";
+pub const IMAGE_PLACEHOLDER: &str = "<｜deepseek_image｜>";
 const USER_SP_TOKEN: &str = "<｜User｜>";
 const ASSISTANT_SP_TOKEN: &str = "<｜Assistant｜>";
 const LATEST_REMINDER_SP_TOKEN: &str = "<｜latest_reminder｜>";
@@ -225,6 +226,214 @@ fn after_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
         Some(idx) => index > idx,
         None => true,
     }
+}
+
+/// Convert `<image>path</image>` markup into the same content blocks as the
+/// checkpoint CLI helper. This is intentionally opt-in and is never applied to
+/// ordinary API request text.
+pub fn parse_tagged_text(text: &str) -> Result<Value, DsEncodingError> {
+    let mut blocks = Vec::new();
+    let mut cursor = 0;
+    let mut matched = false;
+    while let Some(relative_start) = text[cursor..].find("<image>") {
+        let start = cursor + relative_start;
+        if text[cursor..start].contains("</image>") {
+            return Err(DsEncodingError::Image(
+                "Malformed <image>path</image> tag".to_string(),
+            ));
+        }
+        let path_start = start + "<image>".len();
+        let relative_end = text[path_start..].find("</image>").ok_or_else(|| {
+            DsEncodingError::Image("Malformed <image>path</image> tag".to_string())
+        })?;
+        let end = path_start + relative_end;
+        if start > cursor {
+            blocks.push(json!({"type": "text", "text": &text[cursor..start]}));
+        }
+        let path = &text[path_start..end];
+        if path.is_empty() {
+            return Err(DsEncodingError::Image(
+                "Image path must not be empty".to_string(),
+            ));
+        }
+        blocks.push(json!({"type": "image_url", "image_url": {"url": path}}));
+        cursor = end + "</image>".len();
+        matched = true;
+    }
+    if text[cursor..].contains("<image>") || text[cursor..].contains("</image>") {
+        return Err(DsEncodingError::Image(
+            "Malformed <image>path</image> tag".to_string(),
+        ));
+    }
+    if !matched {
+        return Ok(Value::String(text.to_string()));
+    }
+    if cursor < text.len() {
+        blocks.push(json!({"type": "text", "text": &text[cursor..]}));
+    }
+    Ok(Value::Array(blocks))
+}
+
+pub fn is_image_block(block: &Value) -> bool {
+    matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("image" | "image_url")
+    )
+}
+
+/// Normalize a record-bearing image, or return `None` for the gateway's
+/// source-less positional marker.
+pub fn extract_image(block: &Value) -> Result<Option<Value>, DsEncodingError> {
+    let mut record = serde_json::Map::new();
+    record.insert("type".to_string(), Value::String("image".to_string()));
+    if block.get("type").and_then(Value::as_str) == Some("image_url") {
+        let image_url = block.get("image_url");
+        let url = image_url
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                image_url
+                    .and_then(Value::as_object)
+                    .and_then(|value| value.get("url"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        record.insert("url".to_string(), Value::String(url));
+    } else {
+        let mut present = false;
+        for key in ["source", "url", "data"] {
+            if let Some(value) = block.get(key) {
+                present = true;
+                record.insert(key.to_string(), value.clone());
+            }
+        }
+        if !present {
+            return Ok(None);
+        }
+    }
+    let truthy = ["source", "url", "data"].iter().any(|key| {
+        record.get(*key).is_some_and(|value| match value {
+            Value::Null => false,
+            Value::Bool(value) => *value,
+            Value::String(value) => !value.is_empty(),
+            Value::Array(value) => !value.is_empty(),
+            Value::Object(value) => !value.is_empty(),
+            Value::Number(_) => true,
+        })
+    });
+    if !truthy {
+        return Err(DsEncodingError::Image(
+            "Image block does not contain a valid source".to_string(),
+        ));
+    }
+    Ok(Some(Value::Object(record)))
+}
+
+pub fn process_image_blocks(blocks: &[Value]) -> Result<(Vec<Value>, Vec<Value>), DsEncodingError> {
+    let mut new_blocks = Vec::with_capacity(blocks.len());
+    let mut images = Vec::new();
+    for block in blocks {
+        if !block.is_object() {
+            new_blocks.push(block.clone());
+        } else if is_image_block(block) {
+            new_blocks.push(json!({"type": "text", "text": IMAGE_PLACEHOLDER}));
+            if let Some(record) = extract_image(block)? {
+                images.push(record);
+            }
+        } else if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+            if let Some(nested_content) = block.get("content").and_then(Value::as_array) {
+                let mut nested = block.clone();
+                let (content, nested_images) = process_image_blocks(nested_content)?;
+                if let Some(object) = nested.as_object_mut() {
+                    object.insert("content".to_string(), Value::Array(content));
+                }
+                new_blocks.push(nested);
+                images.extend(nested_images);
+            } else {
+                new_blocks.push(block.clone());
+            }
+        } else if block.get("type").and_then(Value::as_str) == Some("text") {
+            let text = block.get("text").and_then(Value::as_str).unwrap_or("");
+            if text.contains(IMAGE_PLACEHOLDER) {
+                return Err(DsEncodingError::Image(format!(
+                    "Text block contains image placeholder '{IMAGE_PLACEHOLDER}': '{}'. Images should be separate content blocks.",
+                    text.chars().take(100).collect::<String>()
+                )));
+            }
+            new_blocks.push(block.clone());
+        } else {
+            new_blocks.push(block.clone());
+        }
+    }
+    Ok((new_blocks, images))
+}
+
+fn validate_no_image_sp_tokens(message: &Value) -> Result<(), DsEncodingError> {
+    if message
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some_and(|content| content.contains(IMAGE_PLACEHOLDER))
+    {
+        return Err(DsEncodingError::Image(format!(
+            "Message content contains image special token '{IMAGE_PLACEHOLDER}'. Images should be provided as image content blocks."
+        )));
+    }
+    if message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .is_some_and(|content| content.contains(IMAGE_PLACEHOLDER))
+    {
+        return Err(DsEncodingError::Image(format!(
+            "reasoning_content contains image special token '{IMAGE_PLACEHOLDER}'"
+        )));
+    }
+    Ok(())
+}
+
+/// Replace image blocks with the learned placeholder and collect record-bearing
+/// images in prompt order. Source-less gateway markers intentionally add no
+/// record because the gateway's `MediaPlan` is authoritative for transport.
+pub fn process_image_messages(
+    messages: &[Value],
+) -> Result<(Vec<Value>, Vec<Value>), DsEncodingError> {
+    let mut processed = Vec::with_capacity(messages.len());
+    let mut images = Vec::new();
+    for source in messages {
+        let mut message = source.clone();
+        validate_no_image_sp_tokens(&message)?;
+        if message.get("content").is_some_and(Value::is_array)
+            && message.get("content_blocks").is_none()
+        {
+            if let Some(object) = message.as_object_mut() {
+                let content = object.remove("content").unwrap_or(Value::Null);
+                object.insert("content_blocks".to_string(), content);
+            }
+        }
+        let content_blocks = message
+            .get("content_blocks")
+            .and_then(Value::as_array)
+            .filter(|blocks| !blocks.is_empty());
+        if let Some(content_blocks) = content_blocks {
+            let (blocks, message_images) = process_image_blocks(content_blocks)?;
+            let content_is_string = message.get("content").is_some_and(Value::is_string);
+            if let Some(object) = message.as_object_mut() {
+                object.insert("content_blocks".to_string(), Value::Array(blocks.clone()));
+                if !content_is_string {
+                    let text = blocks
+                        .iter()
+                        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                        .map(|block| block.get("text").and_then(Value::as_str).unwrap_or(""))
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    object.insert("content".to_string(), Value::String(text));
+                }
+            }
+            images.extend(message_images);
+        }
+        processed.push(message);
+    }
+    Ok((processed, images))
 }
 
 // ---------------------------------------------------------------------------
@@ -492,8 +701,10 @@ pub fn encode_messages(
     thinking_mode: ThinkingMode,
     params: &EncodeParams,
 ) -> Result<String, DsEncodingError> {
-    // Preprocess: merge tool messages and sort tool results.
-    let merged = merge_tool_messages(messages);
+    // Normalize image blocks before tool-message merging, as the checkpoint's
+    // encoder does. Media transport remains the gateway MediaPlan's job.
+    let (processed_messages, _) = process_image_messages(messages)?;
+    let merged = merge_tool_messages(&processed_messages);
     let mut full_messages = sort_tool_results_by_call_order(merged);
     let mut prompt = if params.add_default_bos_token {
         BOS_TOKEN.to_string()
@@ -530,11 +741,359 @@ pub fn encode_messages(
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+    };
+
     use serde_json::json;
 
     use super::*;
+    use crate::{Encoder, HuggingFaceTokenizer};
     fn user(text: &str) -> Value {
         json!({ "role": "user", "content": text })
+    }
+
+    const REFERENCE_ROOT_ENV: &str = "DSV4_VISION_REFERENCE_ROOT";
+
+    #[expect(
+        clippy::print_stderr,
+        reason = "portable golden tests report explicit skips"
+    )]
+    fn external_reference_root(test_name: &str) -> Option<PathBuf> {
+        let Some(root) = env::var_os(REFERENCE_ROOT_ENV) else {
+            eprintln!(
+                "skipping external portion of {test_name}: set {REFERENCE_ROOT_ENV} to the DeepSeek reference artifact root"
+            );
+            return None;
+        };
+        Some(PathBuf::from(root))
+    }
+
+    fn load_reference_case(root: &Path, index: usize) -> Vec<Value> {
+        let path = root
+            .join("harness-encoding/tests")
+            .join(format!("test_input_{index}.json"));
+        let value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let mut messages = if let Some(messages) = value.get("messages") {
+            messages.as_array().unwrap().clone()
+        } else {
+            value.as_array().unwrap().clone()
+        };
+        if let Some(tools) = value.get("tools") {
+            messages[0]
+                .as_object_mut()
+                .unwrap()
+                .insert("tools".to_string(), tools.clone());
+        }
+        messages
+    }
+
+    fn reference_rendering_params(name: &str) -> (ThinkingMode, EncodeParams) {
+        let (mode, effort) = name.split_once('-').unwrap();
+        let thinking_mode = match mode {
+            "chat" => ThinkingMode::Chat,
+            "thinking" => ThinkingMode::Thinking,
+            _ => panic!("unexpected mode {mode}"),
+        };
+        let reasoning_effort = match effort {
+            "low" => Some(ReasoningEffort::Low),
+            "high" => Some(ReasoningEffort::High),
+            "max" => Some(ReasoningEffort::Max),
+            _ => panic!("unexpected effort {effort}"),
+        };
+        (
+            thinking_mode,
+            EncodeParams {
+                reasoning_effort,
+                effort_encoding: EffortEncoding::V0731,
+                ..EncodeParams::default()
+            },
+        )
+    }
+
+    #[test]
+    fn parse_tagged_text_deepseek_v4_vision_golden() {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../multimodal/tests/fixtures/deepseek_v4_vision/parse_tagged_text.json"
+        )))
+        .unwrap();
+        for (name, case) in fixture["cases"].as_object().unwrap() {
+            let result = parse_tagged_text(case["input"].as_str().unwrap());
+            if let Some(expected) = case.get("output") {
+                assert_eq!(&result.unwrap(), expected, "{name}");
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains(case["error"].as_str().unwrap()),
+                    "{name}: {error}"
+                );
+            }
+        }
+
+        let Some(reference_root) =
+            external_reference_root("parse_tagged_text_deepseek_v4_vision_golden")
+        else {
+            return;
+        };
+        let examples = reference_root.join("harness/examples");
+        let tagged = fs::read_to_string(examples.join("example_vl.txt")).unwrap();
+        let tagged_content = parse_tagged_text(tagged.trim_end()).unwrap();
+        let tagged_messages = [json!({"role": "user", "content": tagged_content})];
+        let harmony: Value =
+            serde_json::from_slice(&fs::read(examples.join("example_vl_harmony.json")).unwrap())
+                .unwrap();
+        let harmony_messages = harmony[0]["messages"].as_array().unwrap();
+        let tagged_prompt = encode_messages(
+            &tagged_messages,
+            ThinkingMode::Chat,
+            &EncodeParams::default(),
+        )
+        .unwrap();
+        let harmony_prompt = encode_messages(
+            harmony_messages,
+            ThinkingMode::Chat,
+            &EncodeParams::default(),
+        )
+        .unwrap();
+        assert_eq!(tagged_prompt, harmony_prompt);
+        let (_, tagged_images) = process_image_messages(&tagged_messages).unwrap();
+        let (_, harmony_images) = process_image_messages(harmony_messages).unwrap();
+        assert_eq!(tagged_images, harmony_images);
+        assert_eq!(tagged_images[0]["url"], "examples/images/carrots.jpeg");
+        assert_eq!(tagged_images[1]["url"], "examples/images/corn.jpeg");
+
+        let literal = [user("ordinary <image>x.png</image> text")];
+        let (processed, images) = process_image_messages(&literal).unwrap();
+        assert_eq!(processed, literal);
+        assert!(images.is_empty());
+        assert!(
+            encode_messages(&literal, ThinkingMode::Chat, &EncodeParams::default())
+                .unwrap()
+                .contains("<image>x.png</image>")
+        );
+    }
+
+    #[test]
+    fn deepseek_v4_process_image_messages_contract() {
+        let blocks = vec![
+            json!({"type": "image_url", "image_url": "https://example.test/a.png"}),
+            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}),
+            json!({"type": "image", "source": {"type": "base64", "data": "AA=="}}),
+            json!({"type": "image", "url": "/tmp/local.png"}),
+            json!({"type": "image", "data": "raw"}),
+            json!({"type": "image"}),
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "call-1",
+                "content": [
+                    {"type": "text", "text": "nested"},
+                    {"type": "image_url", "image_url": {"url": "https://example.test/nested.png"}}
+                ]
+            }),
+        ];
+        let (processed, images) = process_image_blocks(&blocks).unwrap();
+        assert_eq!(images.len(), 6);
+        assert_eq!(images[0]["url"], "https://example.test/a.png");
+        assert_eq!(images[1]["url"], "data:image/png;base64,AA==");
+        assert_eq!(images[2]["source"]["type"], "base64");
+        assert_eq!(images[3]["url"], "/tmp/local.png");
+        assert_eq!(images[4]["data"], "raw");
+        assert_eq!(images[5]["url"], "https://example.test/nested.png");
+        assert_eq!(processed[0]["text"], IMAGE_PLACEHOLDER);
+        assert_eq!(
+            processed[5],
+            json!({"type": "text", "text": IMAGE_PLACEHOLDER})
+        );
+        assert_eq!(processed[6]["content"][1]["text"], IMAGE_PLACEHOLDER);
+
+        for invalid in [
+            json!({"type": "image", "url": ""}),
+            json!({"type": "image", "source": null}),
+            json!({"type": "image", "data": ""}),
+            json!({"type": "image_url", "image_url": {}}),
+        ] {
+            let error = extract_image(&invalid).unwrap_err().to_string();
+            assert!(error.contains("does not contain a valid source"), "{error}");
+        }
+        assert_eq!(extract_image(&json!({"type": "image"})).unwrap(), None);
+        assert!(is_image_block(&json!({"type": "image"})));
+        assert!(is_image_block(&json!({"type": "image_url"})));
+        assert!(!is_image_block(&json!({"type": "text"})));
+
+        for message in [
+            json!({"role": "user", "content": IMAGE_PLACEHOLDER}),
+            json!({"role": "assistant", "content": "ok", "reasoning_content": IMAGE_PLACEHOLDER}),
+            json!({"role": "user", "content": [{"type": "text", "text": IMAGE_PLACEHOLDER}]}),
+        ] {
+            assert!(process_image_messages(&[message])
+                .unwrap_err()
+                .to_string()
+                .contains("image"));
+        }
+    }
+
+    #[test]
+    fn deepseek_v4_content_format_preserves_blocks_and_double_newlines() {
+        let messages = [
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "A"},
+                    {"type": "image"},
+                    {"type": "text", "text": "B"}
+                ],
+                "task": "retain-me"
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": [
+                    {"type": "text", "text": "tool text"},
+                    {"type": "image"}
+                ]
+            }),
+        ];
+        let (processed, _) = process_image_messages(&messages).unwrap();
+        assert_eq!(processed[0]["content"], "A\n\n<｜deepseek_image｜>\n\nB");
+        assert_eq!(processed[0]["task"], "retain-me");
+        let merged = merge_tool_messages(&processed);
+        assert_eq!(merged[0]["task"], "retain-me");
+        assert_eq!(merged[0]["content_blocks"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            merged[0]["content_blocks"][3]["content"][1]["text"],
+            IMAGE_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn deepseek_v4_tool_result_image_rendering_order() {
+        let messages = [
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "tool-1", "type": "function", "function": {"name": "first", "arguments": "{}"}},
+                    {"id": "tool-2", "type": "function", "function": {"name": "second", "arguments": "{}"}}
+                ]
+            }),
+            json!({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-2",
+                        "content": [
+                            {"type": "text", "text": "second-before"},
+                            {"type": "image"},
+                            {"type": "text", "text": "second-after"}
+                        ]
+                    },
+                    {"type": "text", "text": "top-before"},
+                    {"type": "image"},
+                    {"type": "text", "text": "top-after"},
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": [
+                            {"type": "text", "text": "first-before"},
+                            {"type": "image"},
+                            {"type": "text", "text": "first-after"}
+                        ]
+                    }
+                ]
+            }),
+        ];
+        let prompt =
+            encode_messages(&messages, ThinkingMode::Chat, &EncodeParams::default()).unwrap();
+        let first = prompt.find("first-before").unwrap();
+        let top = prompt.find("top-before").unwrap();
+        let second = prompt.find("second-before").unwrap();
+        assert!(first < top && top < second, "unexpected prompt: {prompt}");
+        assert_eq!(prompt.matches(IMAGE_PLACEHOLDER).count(), 3);
+    }
+
+    #[test]
+    fn deepseek_v4_vision_reference_prompt_and_token_parity() {
+        let Some(reference_root) =
+            external_reference_root("deepseek_v4_vision_reference_prompt_and_token_parity")
+        else {
+            return;
+        };
+        let expected: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../multimodal/tests/fixtures/deepseek_v4_vision/prompts.json"
+        )))
+        .unwrap();
+        let tokenizer_json = reference_root.join("dsv4vision-mp8/tokenizer.json");
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_json.to_str().unwrap()).unwrap();
+
+        let official: Value = serde_json::from_slice(
+            &fs::read(reference_root.join("harness/examples/example_vl_harmony.json")).unwrap(),
+        )
+        .unwrap();
+        let official_messages = official[0]["messages"].as_array().unwrap().clone();
+        let tagged =
+            fs::read_to_string(reference_root.join("harness/examples/example_vl.txt")).unwrap();
+        let tagged_messages = vec![json!({
+            "role": "user",
+            "content": parse_tagged_text(tagged.trim_end()).unwrap()
+        })];
+
+        let mut cases = Vec::new();
+        for index in 1..=4 {
+            cases.push((
+                format!("text-{index}"),
+                load_reference_case(&reference_root, index),
+            ));
+        }
+        cases.push(("official-harmony".to_string(), official_messages));
+        cases.push(("official-tagged".to_string(), tagged_messages));
+        for index in 1..=9 {
+            cases.push((
+                format!("image-f{index}"),
+                vec![json!({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image."},
+                        {"type": "image_url", "image_url": {"url": format!("images/F{index}.png")}}
+                    ]
+                })],
+            ));
+        }
+
+        for (case_name, messages) in cases {
+            for (rendering_name, reference) in expected["cases"][&case_name].as_object().unwrap() {
+                let (mode, params) = reference_rendering_params(rendering_name);
+                let prompt = encode_messages(&messages, mode, &params).unwrap();
+                assert_eq!(
+                    prompt, reference["prompt"],
+                    "{case_name}/{rendering_name} prompt"
+                );
+                let encoding = tokenizer.encode(&prompt, false).unwrap();
+                let expected_ids = reference["token_ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_u64().unwrap() as u32)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    encoding.token_ids(),
+                    expected_ids,
+                    "{case_name}/{rendering_name} token ids"
+                );
+                assert_eq!(
+                    encoding
+                        .token_ids()
+                        .iter()
+                        .filter(|&&id| id == reference["placeholder_id"].as_u64().unwrap() as u32)
+                        .count(),
+                    reference["placeholder_count"].as_u64().unwrap() as usize,
+                    "{case_name}/{rendering_name} placeholder count"
+                );
+            }
+        }
     }
     #[test]
     fn one_turn_user_chat_mode() {

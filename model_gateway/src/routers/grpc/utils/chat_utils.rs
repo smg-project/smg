@@ -537,6 +537,7 @@ pub fn process_chat_messages(
         tokenizer,
         placeholder_tokens.as_ref(),
         MediaPartOrder::MediaFirst,
+        tokenizer.chat_template_content_format(),
     )?;
     if matches!(encoding, PromptEncoding::Deferred(_)) {
         static WARNED: OnceLock<()> = OnceLock::new();
@@ -559,10 +560,10 @@ pub(crate) fn process_chat_messages_with_placeholders(
     tokenizer: &dyn Tokenizer,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
+    content_format: ChatTemplateContentFormat,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
     let rendered = {
         // Get content format and transform messages accordingly
-        let content_format = tokenizer.chat_template_content_format();
         let mut transformed_messages = process_content_format_with_order(
             &request.messages,
             content_format,
@@ -1750,6 +1751,7 @@ mod tests {
             &tokenizer,
             None,
             MediaPartOrder::MediaFirst,
+            tokenizer.chat_template_content_format(),
         )
         .unwrap();
         assert_eq!(processed.text, "user: Hello\nassistant: Sure");
@@ -1791,6 +1793,7 @@ mod tests {
             &tokenizer,
             None,
             MediaPartOrder::MediaFirst,
+            tokenizer.chat_template_content_format(),
         )
         .unwrap();
         // The default `apply_chat_template_with_encoding` appends the
@@ -1883,6 +1886,7 @@ mod tests {
             &tokenizer,
             None,
             MediaPartOrder::MediaFirst,
+            tokenizer.chat_template_content_format(),
         )
         .unwrap();
         assert_eq!(
@@ -1925,6 +1929,7 @@ mod tests {
                 &*tokenizer,
                 None,
                 MediaPartOrder::MediaFirst,
+                tokenizer.chat_template_content_format(),
             )
             .unwrap()
         };

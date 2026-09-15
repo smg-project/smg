@@ -84,9 +84,9 @@ pub(crate) async fn prepare_chat_like(
             .tokenizer_registry
             .get_by_name(model_id)
             .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id));
-        let media_order = match (ctx.components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
+        let rendering = match (ctx.components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
             (Some(mm_components), Some(entry)) => {
-                multimodal::resolve_media_part_order(
+                multimodal::resolve_media_rendering(
                     model_id,
                     &*tokenizer,
                     mm_components,
@@ -95,12 +95,27 @@ pub(crate) async fn prepare_chat_like(
                 )
                 .await
             }
-            _ => llm_multimodal::MediaPartOrder::MediaFirst,
+            _ => multimodal::MediaRenderingContract::default(),
+        };
+        let content_format = if rendering.requires_structured_chat_content {
+            llm_tokenizer::chat_template::ChatTemplateContentFormat::OpenAI
+        } else {
+            tokenizer.chat_template_content_format()
         };
 
         // Normalize media once. The same plan drives placeholder resolution,
         // rendering, fetching, preprocessing, and final count validation.
-        let media_plan = multimodal::media_plan_chat(&request.messages);
+        let media_plan =
+            multimodal::media_plan_chat(&request.messages, rendering.tool_result_order);
+        if rendering.requires_structured_chat_content {
+            multimodal::validate_marker_backing(
+                multimodal::renderable_image_marker_count_chat(&request.messages),
+                &media_plan,
+            )
+            .map_err(|error| {
+                error::bad_request("multimodal_prompt_contract_mismatch", error.to_string())
+            })?;
+        }
         let (placeholder_tokens, mm_context) = if media_plan.is_empty() {
             (None, None)
         } else if let Some(mm_components) = ctx.components.multimodal.as_ref() {
@@ -169,7 +184,8 @@ pub(crate) async fn prepare_chat_like(
                 &body_ref,
                 &*tokenizer,
                 placeholder_tokens.as_ref(),
-                media_order,
+                rendering.media_part_order,
+                content_format,
             ) {
                 Ok(msgs) => msgs,
                 Err(e) => {
@@ -341,5 +357,607 @@ pub(crate) async fn prepare_chat_like(
             processed_messages,
             tool_call_constraint.map(|c| c.to_tuple()),
         ))
+    }
+}
+
+#[cfg(test)]
+mod deepseek_v4_vision_preparation_tests {
+    #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
+    use std::{
+        io::Cursor,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
+
+    use anyhow::Result;
+    use axum::http::StatusCode;
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+    use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+    use llm_multimodal::{Modality, PreProcessorConfig};
+    use llm_tokenizer::{
+        chat_template::{
+            ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+        },
+        encoders::deepseek_v4::{encode_messages, EncodeParams, ThinkingMode},
+        traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer},
+        HuggingFaceTokenizer, TokenizerRegistry,
+    };
+    use openai_protocol::{chat::ChatCompletionRequest, messages::CreateMessageRequest};
+    use reasoning_parser::ParserFactory as ReasoningParserFactory;
+    use serde_json::{json, Value};
+    use tool_parser::ParserFactory as ToolParserFactory;
+
+    use super::{ChatPreparationStage, PipelineStage};
+    use crate::{
+        routers::grpc::{
+            context::{PreparationOutput, RequestContext, SharedComponents},
+            multimodal::{
+                MediaBatch, MultimodalComponents, MultimodalConfigRegistry, MultimodalModelConfig,
+            },
+            regular::stages::messages::MessagePreparationStage,
+            utils::ParserResolver,
+        },
+        worker::WorkerRegistry,
+    };
+
+    const MODEL: &str = "deepseek-v4-vision-preparation";
+    const REFERENCE_ROOT_ENV: &str = "DSV4_VISION_REFERENCE_ROOT";
+    const PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+    struct RecordingTokenizer {
+        inner: HuggingFaceTokenizer,
+        inputs: Arc<Mutex<Vec<Vec<Value>>>>,
+    }
+
+    impl Encoder for RecordingTokenizer {
+        fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
+            self.inner.encode(input, add_special_tokens)
+        }
+
+        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
+            self.inner.encode_batch(inputs, add_special_tokens)
+        }
+    }
+
+    impl Decoder for RecordingTokenizer {
+        fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String> {
+            self.inner.decode(token_ids, skip_special_tokens)
+        }
+    }
+
+    impl Tokenizer for RecordingTokenizer {
+        fn vocab_size(&self) -> usize {
+            self.inner.vocab_size()
+        }
+
+        fn get_special_tokens(&self) -> &SpecialTokens {
+            self.inner.get_special_tokens()
+        }
+
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            self.inner.token_to_id(token)
+        }
+
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            self.inner.id_to_token(id)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn apply_chat_template(
+            &self,
+            messages: &[Value],
+            _params: ChatTemplateParams,
+        ) -> Result<String> {
+            self.inputs.lock().unwrap().push(messages.to_vec());
+            encode_messages(messages, ThinkingMode::Chat, &EncodeParams::default())
+                .map_err(Into::into)
+        }
+
+        fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
+            self.inner.chat_template_content_format()
+        }
+
+        fn thinking_toggle(&self) -> ThinkingToggle {
+            ThinkingToggle::DefaultOff
+        }
+
+        fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
+            Some(ThinkingKeyName::Thinking)
+        }
+
+        fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
+            &["high", "max"]
+        }
+
+        fn think_in_prefill(&self) -> bool {
+            true
+        }
+
+        fn eos_token_ids(&self) -> &[u32] {
+            self.inner.eos_token_ids()
+        }
+    }
+
+    struct Harness {
+        components: Arc<SharedComponents>,
+        recorder: Arc<RecordingTokenizer>,
+        multimodal: Arc<MultimodalComponents>,
+        config_registry: Arc<MultimodalConfigRegistry>,
+    }
+
+    #[expect(
+        clippy::print_stderr,
+        reason = "portable golden tests report explicit skips"
+    )]
+    fn external_tokenizer_root(test_name: &str) -> Option<PathBuf> {
+        let Some(root) = std::env::var_os(REFERENCE_ROOT_ENV) else {
+            eprintln!(
+                "skipping {test_name}: set {REFERENCE_ROOT_ENV} to the DeepSeek reference artifact root"
+            );
+            return None;
+        };
+        Some(PathBuf::from(root).join("dsv4vision-mp8"))
+    }
+
+    fn png_base64(width: u32, height: u32, color: [u8; 3]) -> String {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(width, height, Rgb(color)));
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, ImageFormat::Png).unwrap();
+        BASE64_STANDARD.encode(bytes.into_inner())
+    }
+
+    async fn harness(test_name: &str) -> Option<Harness> {
+        let tokenizer_dir = external_tokenizer_root(test_name)?;
+        let tokenizer_json = tokenizer_dir.join("tokenizer.json");
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::new(RecordingTokenizer {
+            inner: HuggingFaceTokenizer::from_file(tokenizer_json.to_str().unwrap()).unwrap(),
+            inputs,
+        });
+        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+        let registered: Arc<dyn Tokenizer> = recorder.clone();
+        let outcome = tokenizer_registry
+            .load(
+                "dsv4-preparation-tokenizer",
+                MODEL,
+                tokenizer_dir.to_str().unwrap(),
+                || async move { Ok(registered) },
+            )
+            .await
+            .unwrap();
+
+        let config_registry = Arc::new(MultimodalConfigRegistry::new());
+        config_registry.insert(
+            outcome.id().to_string(),
+            Arc::new(MultimodalModelConfig {
+                config: json!({"model_type": "deepseek_v4", "vision_n_layers": 32}),
+                preprocessor_config: PreProcessorConfig::default(),
+                video_preprocessor_config: None,
+            }),
+        );
+        let multimodal =
+            Arc::new(MultimodalComponents::new(config_registry.clone(), None).unwrap());
+        let components = Arc::new(SharedComponents {
+            tokenizer_registry,
+            worker_registry: Arc::new(WorkerRegistry::new()),
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            parser_resolver: ParserResolver::disabled(),
+            multimodal: Some(multimodal.clone()),
+        });
+        Some(Harness {
+            components,
+            recorder,
+            multimodal,
+            config_registry,
+        })
+    }
+
+    fn source_less_marker_count(value: &Value) -> usize {
+        match value {
+            Value::Array(values) => values.iter().map(source_less_marker_count).sum(),
+            Value::Object(object) => {
+                let here = usize::from(object.get("type").and_then(Value::as_str) == Some("image"));
+                if here == 1 {
+                    assert_eq!(object.len(), 1, "encoder image marker must be source-less");
+                }
+                here + object.values().map(source_less_marker_count).sum::<usize>()
+            }
+            _ => 0,
+        }
+    }
+
+    fn chat_request(value: Value) -> ChatCompletionRequest {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn messages_request(value: Value) -> CreateMessageRequest {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn assert_lookup_counts(harness: &Harness, expected: usize) {
+        assert_eq!(
+            harness.config_registry.get_or_load_call_count(),
+            expected,
+            "config lookups moved from the frozen HEAD request profile"
+        );
+        assert_eq!(
+            harness.multimodal.model_lookup_call_count(),
+            expected,
+            "model-spec lookups must stay paired with config lookups"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_v4_vision_preparation_chat_prompt_tokens_media_and_guards() {
+        let Some(harness) =
+            harness("deepseek_v4_vision_preparation_chat_prompt_tokens_media_and_guards").await
+        else {
+            return;
+        };
+        let data_url = format!("data:image/png;base64,{PNG_BASE64}");
+        let request = chat_request(json!({
+            "model": MODEL,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {"type": "image_url", "image_url": {"url": data_url}}
+                ]
+            }]
+        }));
+        let mut ctx = RequestContext::for_chat(
+            Arc::new(request),
+            None,
+            MODEL.to_string(),
+            harness.components.clone(),
+        );
+        if let Err(response) = ChatPreparationStage.execute(&mut ctx).await {
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            panic!(
+                "chat preparation failed with {status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        assert_lookup_counts(&harness, 3);
+
+        let golden: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../crates/multimodal/tests/fixtures/deepseek_v4_vision/prompts.json"
+        )))
+        .unwrap();
+        let expected = &golden["cases"]["image-f1"]["chat-high"];
+        let expected_ids = expected["token_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_u64().unwrap() as u32)
+            .collect::<Vec<_>>();
+        let PreparationOutput::Chat {
+            token_ids,
+            processed_messages,
+            ..
+        } = ctx.state.preparation.as_ref().unwrap()
+        else {
+            panic!("chat preparation output missing");
+        };
+        assert_eq!(processed_messages.text, expected["prompt"]);
+        assert_eq!(
+            harness
+                .recorder
+                .encode(&processed_messages.text, false)
+                .unwrap()
+                .token_ids(),
+            expected_ids
+        );
+        let intermediate = ctx.state.multimodal_intermediate.as_ref().unwrap();
+        let [batch] = intermediate.batches() else {
+            panic!("expected one image batch");
+        };
+        assert_eq!(batch.media.modality(), Modality::Image);
+        assert_eq!(batch.media.len(), 1);
+        let [binding] = batch.bindings.as_slice() else {
+            panic!("expected one image binding");
+        };
+        assert_eq!(binding.item_index, 0);
+        assert_eq!(binding.prompt_ordinal, 0);
+        assert_eq!(binding.structural.offset, 6);
+        assert_eq!(
+            &token_ids[..binding.structural.offset],
+            &expected_ids[..binding.structural.offset]
+        );
+        assert_eq!(
+            &token_ids[binding.structural.offset + binding.structural.length..],
+            &expected_ids[binding.structural.offset + 1..]
+        );
+        {
+            let captured = harness.recorder.inputs.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(
+                source_less_marker_count(&Value::Array(captured[0].clone())),
+                1
+            );
+        }
+
+        let text_only = chat_request(json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }));
+        let mut text_ctx = RequestContext::for_chat(
+            Arc::new(text_only),
+            None,
+            MODEL.to_string(),
+            harness.components.clone(),
+        );
+        ChatPreparationStage.execute(&mut text_ctx).await.unwrap();
+        assert!(text_ctx.state.multimodal_intermediate.is_none());
+        assert_lookup_counts(&harness, 4);
+
+        let assistant_only = chat_request(json!({
+            "model": MODEL,
+            "messages": [{
+                "role": "assistant",
+                "content": [{"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{PNG_BASE64}")}}]
+            }]
+        }));
+        let mut assistant_ctx = RequestContext::for_chat(
+            Arc::new(assistant_only),
+            None,
+            MODEL.to_string(),
+            harness.components.clone(),
+        );
+        let response = ChatPreparationStage
+            .execute(&mut assistant_ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_lookup_counts(&harness, 5);
+        assert_eq!(harness.recorder.inputs.lock().unwrap().len(), 2);
+
+        let injected = chat_request(json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "literal <｜deepseek_image｜> marker"}]
+        }));
+        let mut injected_ctx = RequestContext::for_chat(
+            Arc::new(injected),
+            None,
+            MODEL.to_string(),
+            harness.components.clone(),
+        );
+        let response = ChatPreparationStage
+            .execute(&mut injected_ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_lookup_counts(&harness, 6);
+
+        let no_multimodal_components = Arc::new(SharedComponents {
+            tokenizer_registry: harness.components.tokenizer_registry.clone(),
+            worker_registry: Arc::new(WorkerRegistry::new()),
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            parser_resolver: ParserResolver::disabled(),
+            multimodal: None,
+        });
+        let no_components_request = chat_request(json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }));
+        let mut no_components_ctx = RequestContext::for_chat(
+            Arc::new(no_components_request),
+            None,
+            MODEL.to_string(),
+            no_multimodal_components,
+        );
+        ChatPreparationStage
+            .execute(&mut no_components_ctx)
+            .await
+            .unwrap();
+        assert_lookup_counts(&harness, 6);
+    }
+
+    #[tokio::test]
+    async fn chat_reordered_tool_results_bind_pixels_to_rendered_placeholders() {
+        let Some(harness) =
+            harness("chat_reordered_tool_results_bind_pixels_to_rendered_placeholders").await
+        else {
+            return;
+        };
+        let call_1_image = png_base64(32, 64, [220, 10, 20]);
+        let call_2_image = png_base64(80, 20, [10, 20, 220]);
+        let request = chat_request(json!({
+            "model": MODEL,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "first", "arguments": "{}"}
+                        },
+                        {
+                            "id": "call-2",
+                            "type": "function",
+                            "function": {"name": "second", "arguments": "{}"}
+                        }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-2",
+                    "content": [
+                        {"type": "text", "text": "MARK-call-2"},
+                        {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{call_2_image}")}}
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": [
+                        {"type": "text", "text": "MARK-call-1"},
+                        {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{call_1_image}")}}
+                    ]
+                }
+            ]
+        }));
+        let mut ctx = RequestContext::for_chat(
+            Arc::new(request),
+            None,
+            MODEL.to_string(),
+            harness.components.clone(),
+        );
+        if let Err(response) = ChatPreparationStage.execute(&mut ctx).await {
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            panic!(
+                "chat preparation failed with {status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        assert_lookup_counts(&harness, 3);
+
+        let PreparationOutput::Chat {
+            processed_messages, ..
+        } = ctx.state.preparation.as_ref().unwrap()
+        else {
+            panic!("chat preparation output missing");
+        };
+        let call_1_marker = processed_messages.text.find("MARK-call-1").unwrap();
+        let call_2_marker = processed_messages.text.find("MARK-call-2").unwrap();
+        assert!(
+            call_1_marker < call_2_marker,
+            "DeepSeek rendering must preserve assistant tool-call order"
+        );
+
+        let intermediate = ctx.state.multimodal_intermediate.as_ref().unwrap();
+        let [batch] = intermediate.batches() else {
+            panic!("expected one image batch");
+        };
+        let MediaBatch::Images(images) = &batch.media else {
+            panic!("expected image batch");
+        };
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].size(), llm_multimodal::ImageSize::new(32, 64));
+        assert_eq!(images[1].size(), llm_multimodal::ImageSize::new(80, 20));
+        assert_eq!(&images[0].data().to_rgb8().as_raw()[..3], &[220, 10, 20]);
+        assert_eq!(&images[1].data().to_rgb8().as_raw()[..3], &[10, 20, 220]);
+        assert_eq!(batch.bindings.len(), 2);
+        assert_eq!(batch.bindings[0].item_index, 0);
+        assert_eq!(batch.bindings[0].prompt_ordinal, 0);
+        assert_eq!(batch.bindings[1].item_index, 1);
+        assert_eq!(batch.bindings[1].prompt_ordinal, 1);
+    }
+
+    #[tokio::test]
+    async fn deepseek_v4_vision_preparation_messages_tool_result_binding_order() {
+        let Some(harness) =
+            harness("deepseek_v4_vision_preparation_messages_tool_result_binding_order").await
+        else {
+            return;
+        };
+        let nested_first = png_base64(800, 100, [220, 10, 20]);
+        let top_level_second = png_base64(64, 64, [10, 20, 220]);
+        let request = messages_request(json!({
+            "model": MODEL,
+            "max_tokens": 16,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": [
+                            {"type": "text", "text": "nested"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": nested_first}}
+                        ]
+                    },
+                    {"type": "text", "text": "top-level"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": top_level_second}}
+                ]
+            }]
+        }));
+        let mut ctx = RequestContext::for_messages(
+            Arc::new(request),
+            None,
+            MODEL.to_string(),
+            harness.components.clone(),
+        );
+        if let Err(response) = MessagePreparationStage.execute(&mut ctx).await {
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            panic!(
+                "messages preparation failed with {status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        assert_lookup_counts(&harness, 3);
+
+        let PreparationOutput::Messages {
+            token_ids,
+            processed_messages,
+            ..
+        } = ctx.state.preparation.as_ref().unwrap()
+        else {
+            panic!("messages preparation output missing");
+        };
+        assert!(processed_messages.text.contains("top-level"));
+        assert!(processed_messages.text.contains("nested"));
+        let placeholder_id = harness
+            .recorder
+            .token_to_id("<｜deepseek_image｜>")
+            .unwrap();
+        assert!(token_ids.iter().filter(|&&id| id == placeholder_id).count() > 2);
+
+        let intermediate = ctx.state.multimodal_intermediate.as_ref().unwrap();
+        let [batch] = intermediate.batches() else {
+            panic!("expected one image batch");
+        };
+        assert_eq!(batch.media.len(), 2);
+        let MediaBatch::Images(images) = &batch.media else {
+            panic!("expected image batch");
+        };
+        assert_eq!(images[0].size(), llm_multimodal::ImageSize::new(64, 64));
+        assert_eq!(images[1].size(), llm_multimodal::ImageSize::new(800, 100));
+        assert_eq!(batch.preprocessed.item_sizes, [(64, 64), (100, 800)]);
+        assert_eq!(batch.bindings.len(), 2);
+        assert_eq!(batch.bindings[0].item_index, 0);
+        assert_eq!(batch.bindings[0].prompt_ordinal, 0);
+        assert_eq!(batch.bindings[1].item_index, 1);
+        assert_eq!(batch.bindings[1].prompt_ordinal, 1);
+
+        let captured = harness.recorder.inputs.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            source_less_marker_count(&Value::Array(captured[0].clone())),
+            2
+        );
+    }
+
+    #[test]
+    fn marker_backing_guard_precedes_empty_plan_return_in_both_stages() {
+        for source in [
+            include_str!("preparation.rs"),
+            include_str!("../messages/preparation.rs"),
+        ] {
+            let guard = source.find("validate_marker_backing(").unwrap();
+            let empty_plan = source.find("media_plan.is_empty()").unwrap();
+            assert!(
+                guard < empty_plan,
+                "marker guard must run before empty-plan return"
+            );
+        }
     }
 }

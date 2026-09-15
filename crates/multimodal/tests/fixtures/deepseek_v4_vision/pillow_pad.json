@@ -1,0 +1,17 @@
+{
+  "pillow": "12.3.0",
+  "cases": [
+    {"input": [2, 1], "output": [5, 5], "fnv1a_rgb8": "cc03d31869265b0e"},
+    {"input": [2, 1], "output": [3, 3], "fnv1a_rgb8": "fcd96e65878bbe3e"},
+    {"input": [2, 1], "output": [7, 6], "fnv1a_rgb8": "a56c367701f9e6f7"},
+    {"input": [4, 2], "output": [9, 8], "fnv1a_rgb8": "51e40ce79a5cfa3e"},
+    {"input": [1, 2], "output": [5, 5], "fnv1a_rgb8": "7d8ec34a74ae3eae"},
+    {"input": [1, 2], "output": [3, 3], "fnv1a_rgb8": "d4483ab51bef7fdc"},
+    {"input": [1, 2], "output": [6, 7], "fnv1a_rgb8": "733762ce1be39e0f"},
+    {"input": [2, 4], "output": [8, 9], "fnv1a_rgb8": "1bd8360dcaa9713e"},
+    {"input": [3, 2], "output": [8, 8], "fnv1a_rgb8": "5f3019afeb935bde"},
+    {"input": [2, 3], "output": [8, 8], "fnv1a_rgb8": "da1ed37d36e05f42"},
+    {"input": [7, 3], "output": [11, 9], "fnv1a_rgb8": "cffda4bccb97e0d5"},
+    {"input": [3, 7], "output": [9, 11], "fnv1a_rgb8": "7c91c40b9fd4eb02"}
+  ]
+}

@@ -146,6 +146,7 @@ mod tests {
                     length: 1,
                 },
                 patches: vec![],
+                offset_variant: None,
             }],
             placeholder_token_id: Some(10),
             field_layouts: EncoderFieldLayouts::default(),

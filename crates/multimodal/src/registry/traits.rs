@@ -113,6 +113,16 @@ pub enum MediaPartOrder {
     Authored,
 }
 
+/// Ordering of tool results when a renderer combines a maximal user/tool run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolResultOrder {
+    /// Preserve tool results in request-authored order.
+    #[default]
+    Authored,
+    /// Reorder tool results to match their assistant tool-call declarations.
+    AssistantCall,
+}
+
 /// The tokenizer surface the registry needs: resolving placeholder and
 /// structural token ids, and encoding the short text fragments some families
 /// splice into their media wrappers (e.g. an `image {W}x{H}` header).
@@ -174,6 +184,39 @@ pub trait ModelProcessorSpec: Send + Sync {
     /// parts positionally override to `Authored`.
     fn media_part_order(&self) -> MediaPartOrder {
         MediaPartOrder::MediaFirst
+    }
+
+    /// Whether this model's native renderer consumes structured content parts.
+    ///
+    /// Kept as a boolean so the multimodal crate remains independent of the
+    /// tokenizer crate's content-format type. The gateway maps `true` to its
+    /// OpenAI structured-content representation.
+    fn requires_structured_chat_content(&self) -> bool {
+        false
+    }
+
+    /// Ordering of tool results within a maximal user/tool run.
+    fn tool_result_order(&self) -> ToolResultOrder {
+        ToolResultOrder::Authored
+    }
+
+    /// Whether prompt-replacement length depends on its absolute prompt offset.
+    fn offset_dependent_replacements(&self) -> bool {
+        false
+    }
+
+    /// Rebuild a replacement at its final absolute prompt offset.
+    ///
+    /// The returned variant is recorded on the prompt binding and can be used
+    /// by transport hashing. Offset-independent specs keep the default, which
+    /// preserves both their replacement and content hash byte-for-byte.
+    fn rebuild_replacement_at_offset(
+        &self,
+        _metadata: &ModelMetadata,
+        replacement: &PromptReplacement,
+        _start_offset: usize,
+    ) -> RegistryResult<(PromptReplacement, Option<u32>)> {
+        Ok((replacement.clone(), None))
     }
 
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String>;

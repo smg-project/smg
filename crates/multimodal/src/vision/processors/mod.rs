@@ -7,6 +7,7 @@
 //!
 //! - **DeepSeek-V4.1** (`deepseek_v41`): contain-fit resize with gray padding, 14px patches and a 3x3 aligner downsample
 //! - **GLM-5.3-Flash** (`glm53_flash`): Aspect-preserving aligned-canvas image/video preprocessing
+//! - **DeepSeek V4 Vision** (`deepseek_v4_vision`): Pillow-exact dynamic N-layout preprocessing
 //! - **LLaVA 1.5** (`llava`): CLIP-based preprocessing with configurable aspect ratio
 //! - **LLaVA-NeXT** (`llava`): Multi-crop anyres processing
 //! - **Qwen2-VL** (`qwen2_vl`): Dynamic resolution with smart resizing
@@ -23,6 +24,7 @@
 //! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
 
 pub mod deepseek_v41;
+pub mod deepseek_v4_vision;
 pub mod glm53_flash;
 pub mod inkling;
 pub mod kimi_k25;
@@ -40,6 +42,7 @@ pub mod qwen3_vl;
 pub mod qwen_vl_base;
 
 pub use deepseek_v41::DeepseekV41Processor;
+pub use deepseek_v4_vision::{deepseek_v4_geometry, DeepseekV4Geometry, DeepseekV4VisionProcessor};
 pub use glm53_flash::Glm53FlashProcessor;
 pub use inkling::InklingImageProcessor;
 pub use kimi_k25::KimiK25Processor;

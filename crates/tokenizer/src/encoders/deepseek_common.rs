@@ -55,6 +55,8 @@ pub enum DsEncodingError {
         "Invalid task `{0}`. Valid tasks are: action, query, authority, domain, title, read_url"
     )]
     InvalidTask(String),
+    #[error("{0}")]
+    Image(String),
     // --- V4.1 only -----------------------------------------------------
     #[error("Message text contains the image special token `<｜deepseek_image｜>`; images must be sent as image content parts")]
     PlaceholderInText,
@@ -101,10 +103,15 @@ pub(super) fn merge_tool_messages(messages: &[Value]) -> Vec<Value> {
         let msg = msg.clone();
         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
         if role == "tool" {
+            let tool_content = msg
+                .get("content_blocks")
+                .cloned()
+                .or_else(|| msg.get("content").cloned())
+                .unwrap_or(Value::String(String::new()));
             let tool_block = json!({
                 "type": "tool_result",
                 "tool_use_id": msg.get("tool_call_id").cloned().unwrap_or(Value::String(String::new())),
-                "content": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
+                "content": tool_content,
             });
             // Append to a previous user message that already has content_blocks.
             let appended = if let Some(prev) = merged.last_mut() {
@@ -132,10 +139,16 @@ pub(super) fn merge_tool_messages(messages: &[Value]) -> Vec<Value> {
                 }));
             }
         } else if role == "user" {
-            let text_block = json!({
-                "type": "text",
-                "text": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
-            });
+            let content_blocks = msg
+                .get("content_blocks")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_else(|| {
+                    vec![json!({
+                        "type": "text",
+                        "text": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
+                    })]
+                });
             let merged_into_prev = if let Some(prev) = merged.last_mut() {
                 let prev_role = prev.get("role").and_then(|v| v.as_str()).unwrap_or("");
                 let prev_has_blocks = prev.get("content_blocks").is_some();
@@ -145,7 +158,7 @@ pub(super) fn merge_tool_messages(messages: &[Value]) -> Vec<Value> {
                         .get_mut("content_blocks")
                         .and_then(|v| v.as_array_mut())
                     {
-                        blocks.push(text_block.clone());
+                        blocks.extend(content_blocks.clone());
                         true
                     } else {
                         false
@@ -157,18 +170,9 @@ pub(super) fn merge_tool_messages(messages: &[Value]) -> Vec<Value> {
                 false
             };
             if !merged_into_prev {
-                let mut new_msg = json!({
-                    "role": "user",
-                    "content": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
-                    "content_blocks": [text_block],
-                });
-                // Preserve extra fields (task, wo_eos, mask, etc.).
+                let mut new_msg = msg;
                 if let Some(obj) = new_msg.as_object_mut() {
-                    for key in ["task", "wo_eos", "mask"] {
-                        if let Some(v) = msg.get(key) {
-                            obj.insert(key.to_string(), v.clone());
-                        }
-                    }
+                    obj.insert("content_blocks".to_string(), Value::Array(content_blocks));
                 }
                 merged.push(new_msg);
             }
