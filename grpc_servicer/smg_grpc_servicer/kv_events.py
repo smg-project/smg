@@ -135,6 +135,8 @@ async def stream_kv_events(
     is_cancelled: Callable[[], bool],
     *,
     recv_timeout: float = 1.0,
+    convert: Callable[[object, int, int], tuple[common_pb2.KvEventBatch, int]] = convert_batch,
+    strict: bool = False,
 ) -> AsyncIterator[common_pb2.KvEventBatch]:
     """Core ZMQ→proto streaming loop, decoupled from any engine and gRPC types.
 
@@ -147,6 +149,8 @@ async def stream_kv_events(
             gRPC client's ``subscribe_kv_events().await`` resolves promptly.
         is_cancelled: returns True when the RPC is cancelled; loop then exits.
         recv_timeout: poll timeout so cancellation is observed even when idle.
+        strict: abort on malformed/undecodable input so consumers invalidate
+            immediately, even if no later batch arrives to expose a gap.
 
     Yields proto KvEventBatch using the ZMQ publisher's native sequence numbers.
     """
@@ -160,14 +164,20 @@ async def stream_kv_events(
         frames = await sub_socket.recv_multipart()
 
         # ZMQ multipart: [topic, 8-byte big-endian seq, msgpack payload].
-        if len(frames) < 3:
+        if len(frames) < 3 or (strict and len(frames) != 3):
+            if strict:
+                raise ValueError("Malformed KV event multipart frame")
             continue
+        if strict and len(frames[1]) != 8:
+            raise ValueError("Malformed KV event sequence number")
         zmq_seq = int.from_bytes(frames[1], "big")
         try:
             raw_batch = decode(frames[2])
-        except Exception as e:  # noqa: BLE001 - one bad frame must not kill the stream
+        except Exception as e:  # noqa: BLE001 - legacy consumers tolerate bad frames
+            if strict:
+                raise
             logger.warning("Failed to decode KV event batch: %s", e)
             continue
 
-        proto_batch, event_id = convert_batch(raw_batch, zmq_seq, event_id)
+        proto_batch, event_id = convert(raw_batch, zmq_seq, event_id)
         yield proto_batch
