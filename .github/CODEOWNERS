@@ -20,7 +20,6 @@
 
 # Main source code (model_gateway)
 /model_gateway/src/config @slin1237 @CatherineSue
-/model_gateway/src/core @slin1237 @CatherineSue
 /model_gateway/src/policies @slin1237
 /model_gateway/src/routers @CatherineSue @key4ng @slin1237
 
@@ -47,3 +46,13 @@
 
 # Examples
 /examples/wasm @tonyluj @slin1237
+
+# API stability and generated client contracts
+/governance/ @slin1237 @CatherineSue @key4ng
+/clients/openapi-gen @slin1237 @CatherineSue @key4ng
+/clients/openapi @slin1237 @CatherineSue @key4ng
+/clients/python @slin1237 @CatherineSue @key4ng
+/clients/rust @slin1237 @CatherineSue @key4ng
+/clients/java @slin1237 @CatherineSue @key4ng
+/crates/grpc_client/proto @njhill @CatherineSue @slin1237
+/crates/mesh/src/proto @tonyluj @llfl @slin1237
