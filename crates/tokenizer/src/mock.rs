@@ -5,10 +5,10 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Result;
 
 use crate::{
-    chat_template::ChatTemplateParams,
+    chat_template::{ChatTemplateParams, ThinkingKeyName, ThinkingToggle},
     traits::{
-        ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, PromptEncoding, SpecialTokens,
-        Tokenizer as TokenizerTrait,
+        ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, PromptEncoding,
+        RendererCapabilities, SpecialTokens, Tokenizer as TokenizerTrait,
     },
 };
 
@@ -22,6 +22,17 @@ pub struct MockTokenizer {
     deferred_chat_ids: Option<Vec<u32>>,
     /// Runs inside the deferred job, on whatever thread the caller runs it.
     deferred_chat_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// The renderer-shaped trait hooks, so a test can stand in for a native
+    /// renderer (thinking toggle, effort names, capabilities) without a
+    /// checkpoint.
+    thinking_toggle: ThinkingToggle,
+    thinking_key_name: Option<ThinkingKeyName>,
+    native_reasoning_effort_values: &'static [&'static str],
+    renderer_capabilities: RendererCapabilities,
+    /// When set, `apply_chat_template` renders the message list and the
+    /// generation-prompt flag as JSON, so a test can assert exactly what
+    /// reached the template.
+    json_chat_template: bool,
 }
 
 impl Default for MockTokenizer {
@@ -75,6 +86,11 @@ impl MockTokenizer {
             special_tokens,
             deferred_chat_ids: None,
             deferred_chat_probe: None,
+            thinking_toggle: ThinkingToggle::None,
+            thinking_key_name: None,
+            native_reasoning_effort_values: &[],
+            renderer_capabilities: RendererCapabilities::default(),
+            json_chat_template: false,
         }
     }
 
@@ -90,6 +106,38 @@ impl MockTokenizer {
     /// caller ran it.
     pub fn with_deferred_chat_probe(mut self, probe: impl Fn() + Send + Sync + 'static) -> Self {
         self.deferred_chat_probe = Some(Arc::new(probe));
+        self
+    }
+
+    /// Report `toggle` from `thinking_toggle()`.
+    pub fn with_thinking_toggle(mut self, toggle: ThinkingToggle) -> Self {
+        self.thinking_toggle = toggle;
+        self
+    }
+
+    /// Report `name` from `thinking_key_name()`.
+    pub fn with_thinking_key_name(mut self, name: ThinkingKeyName) -> Self {
+        self.thinking_key_name = Some(name);
+        self
+    }
+
+    /// Report `values` from `native_reasoning_effort_values()`.
+    pub fn with_native_reasoning_effort_values(mut self, values: &'static [&'static str]) -> Self {
+        self.native_reasoning_effort_values = values;
+        self
+    }
+
+    /// Declare `capabilities` from `renderer_capabilities()`.
+    pub fn with_renderer_capabilities(mut self, capabilities: RendererCapabilities) -> Self {
+        self.renderer_capabilities = capabilities;
+        self
+    }
+
+    /// Render `{"messages": [...], "add_generation_prompt": bool}` instead of
+    /// the `role: content` lines, so a test can assert on the exact message
+    /// list the template received.
+    pub fn with_json_chat_template(mut self) -> Self {
+        self.json_chat_template = true;
         self
     }
 }
@@ -155,6 +203,22 @@ impl TokenizerTrait for MockTokenizer {
         &[999]
     }
 
+    fn thinking_toggle(&self) -> ThinkingToggle {
+        self.thinking_toggle
+    }
+
+    fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
+        self.thinking_key_name
+    }
+
+    fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
+        self.native_reasoning_effort_values
+    }
+
+    fn renderer_capabilities(&self) -> RendererCapabilities {
+        self.renderer_capabilities
+    }
+
     /// One `role: content` line per message, plus an `assistant:` tail when a
     /// generation prompt is requested.
     fn apply_chat_template(
@@ -162,6 +226,13 @@ impl TokenizerTrait for MockTokenizer {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
+        if self.json_chat_template {
+            return Ok(serde_json::json!({
+                "messages": messages,
+                "add_generation_prompt": params.add_generation_prompt,
+            })
+            .to_string());
+        }
         let mut text = String::new();
         for message in messages {
             let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");

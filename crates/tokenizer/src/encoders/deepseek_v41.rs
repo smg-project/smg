@@ -116,10 +116,12 @@ impl ReasoningEffort {
 
 /// Parse the request's `reasoning_effort` field.
 ///
-/// `None` = not present. Strings low/high/xhigh/max, integers 1..=100. `"none"`
-/// is handled by the caller (it means "thinking off", not an effort level), so
-/// it lands here only by mistake. Anything else — floats, booleans, unknown
-/// names, out-of-range integers — is [`DsEncodingError::InvalidReasoningEffort`].
+/// `None` = not present. Strings low/high/xhigh/max, integers 1..=100. The
+/// thinking switch (`"none"`/`"minimal"`, see
+/// `openai_protocol::chat::thinking_from_reasoning_effort`) is handled by the
+/// caller — those mean "thinking off", not an effort level — so they land here
+/// only by mistake. Anything else — floats, booleans, unknown names,
+/// out-of-range integers — is [`DsEncodingError::InvalidReasoningEffort`].
 pub fn parse_reasoning_effort(value: &Value) -> Result<Option<ReasoningEffort>, DsEncodingError> {
     match value {
         Value::Null => Ok(None),

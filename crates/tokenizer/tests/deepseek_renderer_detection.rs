@@ -613,17 +613,67 @@ mod tests {
     }
 
     #[test]
-    fn v41_enable_thinking_alone_is_ignored_until_the_gateway_learns_the_alias() {
-        // The gateway reads only the key this tokenizer reports
-        // (`thinking_key_name() == Thinking`), so `enable_thinking: false`
-        // must not switch the prompt to chat mode while the parser stays
-        // armed. vLLM's `enable_thinking` alias is scheduled for the
-        // gateway-side task (Task 17); re-enable it in the shim together with
-        // that change.
+    fn v41_reasoning_effort_minimal_renders_chat_mode_like_none() {
+        // `minimal` is the other spelling of the gateway's thinking switch
+        // (`thinking_from_reasoning_effort` maps both to off); the reference
+        // encoder knows neither, so the shim short-circuits both.
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let none_kw = HashMap::from([("reasoning_effort".to_string(), json!("none"))]);
+        let minimal_kw = HashMap::from([("reasoning_effort".to_string(), json!("minimal"))]);
+        let off = render_v41_turn(&tokenizer, Some(&none_kw), None).unwrap();
+        assert_eq!(
+            render_v41_turn(&tokenizer, Some(&minimal_kw), None).unwrap(),
+            off
+        );
+        assert!(off.ends_with(V41_CHAT_TAIL), "{off}");
+        // An explicit toggle wins over `minimal` exactly as it wins over `none`.
+        let kw = HashMap::from([
+            ("reasoning_effort".to_string(), json!("minimal")),
+            ("thinking".to_string(), json!(true)),
+        ]);
+        let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
+        assert!(out.ends_with(V41_THINKING_TAIL), "{out}");
+        assert!(out.contains("Reasoning Effort: 50 (range"), "{out}");
+    }
+
+    #[test]
+    fn v41_enable_thinking_alias_switches_the_mode_like_thinking() {
+        // vLLM's `enable_thinking` alias is honoured on both sides: the shim
+        // reads it here and the gateway reads it when it arms the parser
+        // (`renderer_capabilities().enable_thinking_alias`).
         let (_tmp, tokenizer) = v41_tokenizer();
         let kw = HashMap::from([("enable_thinking".to_string(), json!(false))]);
         let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
-        assert!(out.ends_with(V41_THINKING_TAIL), "{out}");
+        assert!(out.ends_with("<｜Assistant｜></think>"), "{out}");
+        // Agreeing duplicates are fine ...
+        let kw = HashMap::from([
+            ("enable_thinking".to_string(), json!(false)),
+            ("thinking".to_string(), json!(false)),
+        ]);
+        let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
+        assert!(out.ends_with("<｜Assistant｜></think>"), "{out}");
+        // ... disagreeing ones are a request error naming both keys.
+        let kw = HashMap::from([
+            ("enable_thinking".to_string(), json!(true)),
+            ("thinking".to_string(), json!(false)),
+        ]);
+        let err = render_v41_turn(&tokenizer, Some(&kw), None)
+            .expect_err("disagreeing toggles must error")
+            .to_string();
+        assert!(err.contains("disagree"), "{err}");
+        assert!(
+            err.contains("enable_thinking") && err.contains("thinking"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn v41_reports_its_renderer_capabilities() {
+        let (_tmp, tokenizer) = v41_tokenizer();
+        let caps = tokenizer.renderer_capabilities();
+        assert!(caps.enable_thinking_alias, "{caps:?}");
+        assert!(caps.native_assistant_continuation, "{caps:?}");
+        assert!(caps.raw_tool_call_arguments, "{caps:?}");
     }
 
     #[test]

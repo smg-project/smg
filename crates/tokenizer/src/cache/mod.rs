@@ -324,6 +324,10 @@ impl Tokenizer for CachedTokenizer {
         self.inner.think_in_prefill()
     }
 
+    fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
+        self.inner.renderer_capabilities()
+    }
+
     fn eos_token_ids(&self) -> &[TokenIdType] {
         self.inner.eos_token_ids()
     }
