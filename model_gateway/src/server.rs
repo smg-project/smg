@@ -1536,7 +1536,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
     } else {
-        axum_server::bind(addr)
+        bind_http_server(addr)
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
@@ -1555,6 +1555,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Return original server error if any, otherwise Ok
     server_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+}
+
+/// Disable Nagle buffering on accepted plain-HTTP sockets so small streaming
+/// writes need not wait for outstanding data to be acknowledged. This changes
+/// neither HTTP payloads nor the separately configured TLS listener.
+fn bind_http_server(
+    addr: std::net::SocketAddr,
+) -> axum_server::Server<std::net::SocketAddr, axum_server::accept::NoDelayAcceptor> {
+    axum_server::bind(addr).acceptor(axum_server::accept::NoDelayAcceptor::new())
 }
 
 #[expect(
@@ -1622,8 +1631,88 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+
+    use axum::response::sse::{Event, Sse};
+    use axum_server::accept::Accept;
+    use tokio::net::{TcpListener, TcpStream};
+
     use super::*;
     use crate::config::TenantApiKeyEntry;
+
+    #[tokio::test]
+    async fn plain_http_acceptor_enables_nodelay() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+            let _client = client.unwrap();
+            let (socket, _) = accepted.unwrap();
+            socket.set_nodelay(false).unwrap();
+            assert!(!socket.nodelay().unwrap());
+            let service = Arc::new(());
+            let server = bind_http_server(addr);
+            let (socket, returned_service) = server
+                .get_ref()
+                .accept(socket, service.clone())
+                .await
+                .unwrap();
+            assert!(socket.nodelay().unwrap());
+            assert!(Arc::ptr_eq(&service, &returned_service));
+        })
+        .await
+        .expect("plain HTTP acceptor test timed out");
+    }
+
+    #[tokio::test]
+    async fn plain_http_acceptor_preserves_response_bytes() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let handle = axum_server::Handle::new();
+            let app = Router::new()
+                .route(
+                    "/plain",
+                    get(|| async { Json(serde_json::json!({"ok": true})) }),
+                )
+                .route(
+                    "/stream",
+                    get(|| async {
+                        Sse::new(futures::stream::iter([
+                            Ok::<_, Infallible>(Event::default().data("first")),
+                            Ok::<_, Infallible>(Event::default().data("second")),
+                        ]))
+                    }),
+                );
+            let serving = bind_http_server("127.0.0.1:0".parse().unwrap())
+                .handle(handle.clone())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>());
+            let checking = async {
+                let addr = handle.listening().await.expect("HTTP server did not bind");
+                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                for (path, content_type, expected) in [
+                    ("plain", "application/json", "{\"ok\":true}"),
+                    (
+                        "stream",
+                        "text/event-stream",
+                        "data: first\n\ndata: second\n\n",
+                    ),
+                ] {
+                    let response = client
+                        .get(format!("http://{addr}/{path}"))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(response.headers()["content-type"], content_type);
+                    assert_eq!(response.text().await.unwrap(), expected);
+                }
+                handle.shutdown();
+            };
+            let (result, ()) = tokio::join!(serving, checking);
+            result.unwrap();
+        })
+        .await
+        .expect("plain HTTP response test timed out");
+    }
 
     fn minimal_server_config(router_config: RouterConfig) -> ServerConfig {
         ServerConfig {
