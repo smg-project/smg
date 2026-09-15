@@ -19,7 +19,7 @@ async fn main() -> ExitCode {
     let cfg = match Config::from_args() {
         Ok(cfg) => Arc::new(cfg),
         Err(message) => {
-            eprintln!("{message}");
+            tracing::error!("{message}");
             return ExitCode::from(2);
         }
     };
