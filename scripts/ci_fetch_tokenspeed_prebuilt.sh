@@ -25,7 +25,13 @@
 # tree. The copy is reflink-when-possible on the same filesystem, so it is
 # cheap; the fixed /opt paths become symlinks into it. e2e-gpu-job.yml removes
 # the job copy when the job ends (TOKENSPEED_PREBUILT_JOB_DIR); copies left by
-# cancelled jobs are swept here after 24 h, superseded tags after 7 days.
+# hard-killed jobs are swept here after 24 h, superseded tags after 7 days.
+# An entry is trusted only when its marker AND both payload dirs are present,
+# and a populate replaces whatever is at the entry path (a populate killed
+# between rename and marker leaves a dir without one), so a damaged entry
+# can never poison later lanes. Without a writable shared cache root the same
+# flow runs against a job-local root under RUNNER_TEMP: no reuse, but still
+# the ~8 min carrier path rather than the ~20 min source build.
 #
 # TOLERANT BY DESIGN: this script must never fail the job. No image resolved,
 # no docker on the runner, no writable cache, a failed pull or extraction —
@@ -52,9 +58,17 @@ if command -v sudo &> /dev/null; then SUDO="sudo"; else SUDO=""; fi
 # the cache key; reduce it to a plain path segment.
 tag="$(printf '%s' "${IMAGE##*:}" | tr -c 'A-Za-z0-9._-' '_')"
 [ -n "$tag" ] || fallback "cannot derive a tag from ${IMAGE}"
+init_cache_root() { mkdir -p "$1/.locks" "$1/jobs" 2> /dev/null; }
+if ! init_cache_root "$CACHE_ROOT"; then
+    log "cache root ${CACHE_ROOT} not writable; using a job-local cache instead (no reuse across lanes)"
+    CACHE_ROOT="${RUNNER_TEMP:-/tmp}/tokenspeed-prebuilt-cache"
+    init_cache_root "$CACHE_ROOT" || fallback "no writable cache root"
+fi
 entry="${CACHE_ROOT}/${tag}"
-mkdir -p "${CACHE_ROOT}/.locks" "${CACHE_ROOT}/jobs" 2> /dev/null \
-    || fallback "cache root ${CACHE_ROOT} not writable"
+# The marker alone is not proof: require the payload dirs too.
+entry_usable() {
+    [ -f "$entry/.complete" ] && [ -d "$entry/smg-ci" ] && [ -d "$entry/tokenspeed-src" ]
+}
 
 # Housekeeping: job copies left behind by cancelled jobs, and tags nothing
 # pulls anymore (the tag changes on every tokenspeed.ref bump).
@@ -77,7 +91,8 @@ pull_image() {
 
 # Runs under the per-tag lock. Extracts into a sibling temp dir and renames it
 # into place, so a reader never sees a half-written entry and a failure leaves
-# nothing behind.
+# nothing behind. Any leftover at the entry path is removed first; `mv -T`
+# then cannot nest the temp dir inside a surviving directory.
 populate() {
     pull_image || return 1
     local cid tmp
@@ -92,7 +107,8 @@ populate() {
     if docker cp "$cid:/opt/smg-ci" "$tmp/smg-ci" \
         && docker cp "$cid:/opt/tokenspeed-src" "$tmp/tokenspeed-src" \
         && $SUDO chown -R "$(id -u):$(id -g)" "$tmp" \
-        && mv "$tmp" "$entry" \
+        && rm -rf "$entry" \
+        && mv -T "$tmp" "$entry" \
         && touch "$entry/.complete"; then
         docker rm -f "$cid" > /dev/null 2>&1 || true
         return 0
@@ -102,12 +118,12 @@ populate() {
     return 1
 }
 
-if [ -f "$entry/.complete" ]; then
+if entry_usable; then
     log "cache hit: ${entry}"
 else
     (
         flock -w 1800 200 || exit 1
-        if [ -f "$entry/.complete" ]; then
+        if entry_usable; then
             log "cache hit (populated by another job while waiting): ${entry}"
             exit 0
         fi
@@ -128,19 +144,28 @@ if ! { cp -a --reflink=auto "$entry/smg-ci" "$job/smg-ci" \
     fallback "could not copy the payload for this job"
 fi
 
+# Undo a half-done install (a dangling symlink would otherwise greet the
+# source build) and the job copy, then fall back.
+abort_install() {
+    $SUDO rm -rf "${INSTALL_ROOT}/smg-ci" "${INSTALL_ROOT}/tokenspeed-src" > /dev/null 2>&1 || true
+    rm -rf "$job"
+    fallback "$@"
+}
+
 # Fixed destination paths (the venv's shebangs and editable installs are
 # absolute) now point into the job's copy.
 if ! { $SUDO rm -rf "${INSTALL_ROOT}/smg-ci" "${INSTALL_ROOT}/tokenspeed-src" \
     && $SUDO ln -s "$job/smg-ci" "${INSTALL_ROOT}/smg-ci" \
     && $SUDO ln -s "$job/tokenspeed-src" "${INSTALL_ROOT}/tokenspeed-src"; }; then
-    rm -rf "$job"
-    fallback "install to ${INSTALL_ROOT} failed"
+    abort_install "install to ${INSTALL_ROOT} failed"
 fi
 
+# Later steps only learn about the payload through GITHUB_ENV; if that write
+# fails the install is useless and its copy would linger, so roll it back.
 if [ -n "${GITHUB_ENV:-}" ]; then
     {
         echo "SMG_BAKED_VENV=${INSTALL_ROOT}/smg-ci/.venv"
         echo "TOKENSPEED_PREBUILT_JOB_DIR=${job}"
-    } >> "$GITHUB_ENV"
+    } >> "$GITHUB_ENV" || abort_install "could not write ${GITHUB_ENV}"
 fi
 log "Prebuilt payload installed (stamp: $(cat "${INSTALL_ROOT}/smg-ci/tokenspeed.ref" 2> /dev/null || echo missing))"

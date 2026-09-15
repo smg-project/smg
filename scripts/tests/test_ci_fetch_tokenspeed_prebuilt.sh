@@ -24,7 +24,8 @@ assert_eq() {
 }
 
 assert_file() { [ -e "$1" ] || { echo "FAIL: expected '$1' to exist"; exit 1; }; }
-assert_no_file() { [ ! -e "$1" ] || { echo "FAIL: expected '$1' to be absent"; exit 1; }; }
+# -L too: a dangling symlink is invisible to -e but is exactly the leftover we care about.
+assert_no_file() { { [ ! -e "$1" ] && [ ! -L "$1" ]; } || { echo "FAIL: expected '$1' to be absent"; exit 1; }; }
 assert_link_into() {
     local link="$1" dir="$2" target
     [ -L "$link" ] || { echo "FAIL: expected '$link' to be a symlink"; exit 1; }
@@ -37,8 +38,12 @@ assert_contains() {
 }
 
 # One sandbox per test: fake image tree, fake docker on PATH, empty cache root,
-# and an install root standing in for /opt.
+# and an install root standing in for /opt. The previous sandbox is removed on
+# the next setup, the last one on exit.
+cleanup_sandbox() { [ -z "${T:-}" ] || rm -rf "$T"; }
+trap cleanup_sandbox EXIT
 setup() {
+    cleanup_sandbox
     T="$(mktemp -d)"
     export FAKE_IMAGE_ROOT="$T/image" FAKE_DOCKER_LOG="$T/docker.log"
     mkdir -p "$FAKE_IMAGE_ROOT/opt/smg-ci/.venv/bin" "$FAKE_IMAGE_ROOT/opt/tokenspeed-src"
@@ -70,11 +75,13 @@ run_fetch() {
     local install="$1" run_id="$2"; shift 2
     mkdir -p "$install"
     : > "$install/github.env"
-    env "$@" TOKENSPEED_PREBUILT_IMAGE="$IMAGE" \
+    # Defaults first: a caller's own assignments (later on the env command line) win.
+    env TOKENSPEED_PREBUILT_IMAGE="$IMAGE" \
         TOKENSPEED_PREBUILT_CACHE_ROOT="$CACHE" \
         TOKENSPEED_PREBUILT_INSTALL_ROOT="$install" \
         GITHUB_ENV="$install/github.env" GITHUB_RUN_ID="$run_id" GITHUB_JOB="e2e" GITHUB_RUN_ATTEMPT="1" \
-        bash "$SCRIPT"
+        RUNNER_TEMP="$T/runner-temp" \
+        "$@" bash "$SCRIPT"
 }
 
 pull_count() { grep -c '^pull ' "$FAKE_DOCKER_LOG" || true; }
@@ -147,14 +154,71 @@ test_failed_extraction_leaves_no_cache_entry_and_falls_back() {
     assert_eq "" "$(find "$CACHE" -mindepth 1 -maxdepth 1 -type d ! -name jobs ! -name .locks)" "no partial entries"
 }
 
-test_unwritable_cache_root_falls_back_to_source_build() {
+test_unwritable_cache_root_degrades_to_a_job_local_cache() {
     setup
     : > "$T/not-a-dir"
     CACHE="$T/not-a-dir/cache"
     local out; out="$(run_fetch "$T/opt" 100)"
+    assert_contains "$out" "job-local cache"
+    assert_eq 1 "$(pull_count)" "still pulls the payload"
+    assert_link_into "$T/opt/smg-ci" "$T/runner-temp"
+    assert_eq "deadbeef" "$(cat "$T/opt/smg-ci/tokenspeed.ref")"
+    assert_contains "$(cat "$T/opt/github.env")" "SMG_BAKED_VENV=$T/opt/smg-ci/.venv"
+}
+
+# A populate killed between the rename and the marker leaves an entry dir
+# without .complete. The next populate must replace it, not move its temp dir
+# inside it and then mark the nested result complete.
+test_leftover_entry_without_marker_is_replaced_not_nested() {
+    setup
+    mkdir -p "$CACHE/$TAG"
+    : > "$CACHE/$TAG/leftover"
+    run_fetch "$T/opt" 100 > /dev/null
+    assert_file "$CACHE/$TAG/.complete"
+    assert_file "$CACHE/$TAG/smg-ci/tokenspeed.ref"
+    assert_no_file "$CACHE/$TAG/leftover"
+    assert_eq "" "$(find "$CACHE/$TAG" -mindepth 1 -maxdepth 1 -name ".*tmp*")" "no nested temp dir"
+    assert_eq "deadbeef" "$(cat "$T/opt/smg-ci/tokenspeed.ref")"
+}
+
+# The marker alone must not be trusted: an entry missing its payload dirs is
+# a miss and gets repopulated instead of poisoning every later lane.
+test_marked_entry_missing_payload_is_treated_as_miss() {
+    setup
+    mkdir -p "$CACHE/$TAG"
+    : > "$CACHE/$TAG/.complete"
+    local out; out="$(run_fetch "$T/opt" 100)"
+    assert_eq 1 "$(pull_count)" "repopulated"
+    assert_file "$CACHE/$TAG/smg-ci/tokenspeed.ref"
+    assert_contains "$out" "Prebuilt payload installed"
+}
+
+# If the second symlink cannot be created, the first one must not be left
+# dangling in the install root, and the job copy must go with it.
+test_partial_install_links_are_removed_on_failure() {
+    setup
+    cat > "$T/bin/ln" <<'FAKE'
+#!/bin/bash
+for a in "$@"; do case "$a" in *tokenspeed-src) exit 1 ;; esac; done
+exec /bin/ln "$@"
+FAKE
+    chmod +x "$T/bin/ln"
+    local out; out="$(run_fetch "$T/opt" 100)"
     assert_contains "$out" "lane will build from source"
-    assert_eq 0 "$(pull_count)" "no pull attempted"
     assert_no_file "$T/opt/smg-ci"
+    assert_no_file "$T/opt/tokenspeed-src"
+    assert_eq "" "$(find "$CACHE/jobs" -mindepth 1 -maxdepth 1)" "job copy removed"
+}
+
+# A failed GITHUB_ENV write means later steps never learn about the payload;
+# roll the install back rather than report success.
+test_unwritable_github_env_rolls_back_the_install() {
+    setup
+    local out; out="$(run_fetch "$T/opt" 100 GITHUB_ENV="$T/nonexistent/github.env")"
+    assert_contains "$out" "lane will build from source"
+    assert_no_file "$T/opt/smg-ci"
+    assert_no_file "$T/opt/tokenspeed-src"
+    assert_eq "" "$(find "$CACHE/jobs" -mindepth 1 -maxdepth 1)" "job copy removed"
 }
 
 test_concurrent_callers_pull_once() {
@@ -195,7 +259,11 @@ tests=(
     test_job_copies_are_private
     test_job_dir_is_unique_even_when_pid_and_job_identity_collide
     test_failed_extraction_leaves_no_cache_entry_and_falls_back
-    test_unwritable_cache_root_falls_back_to_source_build
+    test_unwritable_cache_root_degrades_to_a_job_local_cache
+    test_leftover_entry_without_marker_is_replaced_not_nested
+    test_marked_entry_missing_payload_is_treated_as_miss
+    test_partial_install_links_are_removed_on_failure
+    test_unwritable_github_env_rolls_back_the_install
     test_concurrent_callers_pull_once
     test_stale_job_dirs_are_swept
     test_superseded_tag_dirs_are_swept_after_seven_days
