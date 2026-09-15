@@ -122,6 +122,7 @@ pub fn should_mark_reasoning_started(
     tokenizer: &dyn Tokenizer,
 ) -> bool {
     match tokenizer.thinking_toggle() {
+        ThinkingToggle::Always => true,
         ThinkingToggle::None => false,
         ThinkingToggle::DefaultOn => user_thinking != Some(false),
         ThinkingToggle::DefaultOff => user_thinking == Some(true),
@@ -414,6 +415,31 @@ mod tests {
         assert_eq!(resolve_thinking_pref(None, None, Some("none")), Some(false));
         assert_eq!(resolve_thinking_pref(None, None, Some("high")), None);
         assert_eq!(resolve_thinking_pref(None, None, None), None);
+    }
+
+    /// GLM-5.3 templates have no thinking toggle — reasoning is always on —
+    /// so the parser is armed no matter what the user asks for: a
+    /// `thinking: false` kwarg or `reasoning_effort: "none"` would otherwise
+    /// disarm it while the prompt still opens `<think>`.
+    #[test]
+    fn always_thinking_toggle_arms_the_parser_unconditionally() {
+        let tok = llm_tokenizer::MockTokenizer::new().with_thinking_toggle(ThinkingToggle::Always);
+        assert!(should_mark_reasoning_started(None, &tok));
+        assert!(should_mark_reasoning_started(Some(true), &tok));
+        assert!(should_mark_reasoning_started(Some(false), &tok));
+
+        let thinking_off =
+            std::collections::HashMap::from([("thinking".to_string(), Value::Bool(false))]);
+        assert_eq!(
+            extract_thinking_from_kwargs(Some(&thinking_off), &tok),
+            None
+        );
+        assert!(reasoning_starts_in_prefill(
+            Some(&thinking_off),
+            Some("none"),
+            false,
+            &tok
+        ));
     }
 
     /// A kwargs `reasoning_effort` of `"none"` renders chat mode for native
