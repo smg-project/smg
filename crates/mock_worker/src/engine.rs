@@ -711,6 +711,7 @@ impl SchedulerState {
                 event_id: self.kv_event_id,
                 data: Some(common::kv_cache_event::Data::Removed(
                     common::KvBlocksRemoved {
+                        cache_group: None,
                         block_hashes: removed,
                         cache_level: None,
                     },
@@ -731,6 +732,9 @@ impl SchedulerState {
             event_id: self.kv_event_id,
             data: Some(common::kv_cache_event::Data::Stored(
                 common::KvBlocksStored {
+                    sliding_window: None,
+                    cache_kind: None,
+                    cache_group: None,
                     blocks: vec![common::KvBlock {
                         block_hash: key as i64,
                         token_ids,

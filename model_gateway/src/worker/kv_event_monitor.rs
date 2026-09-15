@@ -858,6 +858,9 @@ mod tests {
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerBlockMap::default();
         let stored = KvBlocksStored {
+            sliding_window: None,
+            cache_kind: None,
+            cache_group: None,
             blocks: vec![
                 KvBlock {
                     block_hash: 1,
@@ -888,6 +891,9 @@ mod tests {
         let mut wb = WorkerBlockMap::default();
 
         let stored1 = KvBlocksStored {
+            sliding_window: None,
+            cache_kind: None,
+            cache_group: None,
             blocks: vec![KvBlock {
                 block_hash: 1,
                 token_ids: vec![10, 20, 30, 40],
@@ -900,6 +906,9 @@ mod tests {
         KvEventMonitor::apply_stored(&stored1, w1, &indexer, &mut wb);
 
         let stored2 = KvBlocksStored {
+            sliding_window: None,
+            cache_kind: None,
+            cache_group: None,
             blocks: vec![KvBlock {
                 block_hash: 2,
                 token_ids: vec![50, 60, 70, 80],
@@ -921,6 +930,9 @@ mod tests {
 
         // Pass parent_block_hash for an untracked worker — should fallback to no parent.
         let stored = KvBlocksStored {
+            sliding_window: None,
+            cache_kind: None,
+            cache_group: None,
             blocks: vec![KvBlock {
                 block_hash: 1,
                 token_ids: vec![10, 20, 30, 40],
@@ -941,6 +953,9 @@ mod tests {
         let mut wb = WorkerBlockMap::default();
 
         let stored = KvBlocksStored {
+            sliding_window: None,
+            cache_kind: None,
+            cache_group: None,
             blocks: vec![
                 KvBlock {
                     block_hash: 1,
@@ -962,6 +977,7 @@ mod tests {
         KvEventMonitor::apply_stored(&stored, w1, &indexer, &mut wb);
 
         let removed = KvBlocksRemoved {
+            cache_group: None,
             block_hashes: vec![2],
             cache_level: None,
         };
@@ -976,6 +992,9 @@ mod tests {
         let mut wb = WorkerBlockMap::default();
 
         let stored = KvBlocksStored {
+            sliding_window: None,
+            cache_kind: None,
+            cache_group: None,
             blocks: vec![KvBlock {
                 block_hash: 1,
                 token_ids: vec![10, 20, 30, 40],
@@ -1000,6 +1019,9 @@ mod tests {
         let event = KvCacheEvent {
             event_id: 1,
             data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                sliding_window: None,
+                cache_kind: None,
+                cache_group: None,
                 blocks: vec![KvBlock {
                     block_hash: 42,
                     token_ids: vec![1, 2, 3, 4],
@@ -1024,6 +1046,9 @@ mod tests {
         let stored_event = KvCacheEvent {
             event_id: 1,
             data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                sliding_window: None,
+                cache_kind: None,
+                cache_group: None,
                 blocks: vec![KvBlock {
                     block_hash: 1,
                     token_ids: vec![1, 2, 3, 4],
@@ -1039,6 +1064,7 @@ mod tests {
         let removed_event = KvCacheEvent {
             event_id: 2,
             data: Some(kv_cache_event::Data::Removed(KvBlocksRemoved {
+                cache_group: None,
                 block_hashes: vec![1],
                 cache_level: None,
             })),
@@ -1057,6 +1083,9 @@ mod tests {
             &KvCacheEvent {
                 event_id: 1,
                 data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                    sliding_window: None,
+                    cache_kind: None,
+                    cache_group: None,
                     blocks: vec![KvBlock {
                         block_hash: 1,
                         token_ids: vec![1, 2, 3, 4],

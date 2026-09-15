@@ -40,6 +40,17 @@ message KvCacheEvent {
 message KvBlocksStored {
   repeated KvBlock blocks = 1;
   optional int64 parent_block_hash = 2;
+  // The engine's independently evicted cache set these blocks belong
+  // to (vLLM: the KV cache group index). Absent = the worker has one
+  // cache. Consumers that keep one position set per worker ignore it;
+  // the shared index keeps one holder per (worker, group).
+  optional uint32 cache_group = 3;
+  // What the group is, as the engine names it (vLLM: `full_attention`,
+  // `mla_attention`, `sliding_window`, `mamba`). Opaque to the bridge.
+  optional string cache_kind = 4;
+  // Sliding-window width in tokens for a window group; 0 or absent
+  // otherwise.
+  optional uint32 sliding_window = 5;
 }
 
 message KvBlock {
@@ -53,6 +64,8 @@ message KvBlock {
 message KvBlocksRemoved {
   repeated int64 block_hashes = 1;
   optional int32 cache_level = 2;
+  // See `KvBlocksStored.cache_group`.
+  optional uint32 cache_group = 3;
 }
 
 message KvCacheCleared {}

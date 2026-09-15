@@ -19,17 +19,31 @@ _spec.loader.exec_module(kv_events)
 
 # --- Fake vLLM event objects (dispatch is by class name, so names matter) ---
 class BlockStored:
-    def __init__(self, block_hashes, parent_block_hash, token_ids, block_size, lora_id=None):
+    def __init__(
+        self,
+        block_hashes,
+        parent_block_hash,
+        token_ids,
+        block_size,
+        lora_id=None,
+        **group_fields,
+    ):
         self.block_hashes = block_hashes
         self.parent_block_hash = parent_block_hash
         self.token_ids = token_ids
         self.block_size = block_size
         self.lora_id = lora_id
+        # Newer vLLM schemas add group_idx / kv_cache_spec_kind /
+        # kv_cache_spec_sliding_window; older ones have no such attributes.
+        for key, value in group_fields.items():
+            setattr(self, key, value)
 
 
 class BlockRemoved:
-    def __init__(self, block_hashes):
+    def __init__(self, block_hashes, **group_fields):
         self.block_hashes = block_hashes
+        for key, value in group_fields.items():
+            setattr(self, key, value)
 
 
 class AllBlocksCleared:
@@ -280,3 +294,56 @@ class TestServicerWiring:
         servicer = VllmEngineServicer(_Engine(), start_time=0.0)
         assert servicer._kv_events_config is not None
         assert hasattr(servicer, "SubscribeKvEvents")
+
+
+class TestCacheGroups:
+    def test_legacy_schema_reports_no_group(self):
+        out = kv_events.convert_event(BlockStored([1, 2], None, [1, 2, 3, 4], 2), event_id=1)
+        assert not out.stored.HasField("cache_group")
+        assert not out.stored.HasField("cache_kind")
+        assert not out.stored.HasField("sliding_window")
+        out = kv_events.convert_event(BlockRemoved([1]), event_id=2)
+        assert not out.removed.HasField("cache_group")
+
+    def test_group_fields_ride_the_wire_untouched(self):
+        ev = BlockStored(
+            [1, 2],
+            None,
+            [1, 2, 3, 4],
+            2,
+            group_idx=3,
+            kv_cache_spec_kind="sliding_window",
+            kv_cache_spec_sliding_window=1024,
+        )
+        out = kv_events.convert_event(ev, event_id=1)
+        assert out.stored.cache_group == 3
+        assert out.stored.cache_kind == "sliding_window"
+        assert out.stored.sliding_window == 1024
+        out = kv_events.convert_event(BlockRemoved([1], group_idx=3), event_id=2)
+        assert out.removed.cache_group == 3
+
+    def test_full_attention_group_has_no_window(self):
+        ev = BlockStored(
+            [1],
+            None,
+            [1, 2],
+            2,
+            group_idx=0,
+            kv_cache_spec_kind="full_attention",
+            kv_cache_spec_sliding_window=None,
+        )
+        out = kv_events.convert_event(ev, event_id=1)
+        assert out.stored.cache_group == 0
+        assert out.stored.cache_kind == "full_attention"
+        assert not out.stored.HasField("sliding_window")
+
+    @pytest.mark.parametrize("group", [None, -1, 2**32, True, "0"])
+    def test_malformed_group_is_not_reported(self, group):
+        ev = BlockStored([1], None, [1, 2], 2, group_idx=group, kv_cache_spec_kind="mamba")
+        out = kv_events.convert_event(ev, event_id=1)
+        assert not out.stored.HasField("cache_group")
+        assert out.stored.cache_kind == "mamba"
+
+    def test_group_stores_still_require_dense_alignment(self):
+        ev = BlockStored([1], None, [1, 2, 3], 2, group_idx=1, kv_cache_spec_kind="mamba")
+        assert kv_events.convert_event(ev, event_id=1) is None

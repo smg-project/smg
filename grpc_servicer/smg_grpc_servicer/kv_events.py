@@ -52,6 +52,18 @@ def endpoint_for_rank(endpoint: str, dp_rank: int) -> str:
     return resolved
 
 
+def _set_cache_group(message: object, event: object) -> None:
+    """Carry the engine's cache-group index when the event reports one.
+
+    Hybrid models keep several independently evicted caches per worker;
+    a consumer that folds them into one set mis-scores them, so the
+    group rides the wire untouched. Absent or malformed = not reported.
+    """
+    group = getattr(event, "group_idx", None)
+    if isinstance(group, int) and not isinstance(group, bool) and 0 <= group < 2**32:
+        message.cache_group = group
+
+
 def convert_event(event: object, event_id: int) -> common_pb2.KvCacheEvent | None:
     """Convert a decoded event, skipping unknown types or unaligned block stores."""
     name = type(event).__name__
@@ -84,15 +96,21 @@ def convert_event(event: object, event_id: int) -> common_pb2.KvCacheEvent | Non
         parent = getattr(event, "parent_block_hash", None)
         if parent is not None:
             stored.parent_block_hash = to_int64(parent)
+        _set_cache_group(stored, event)
+        kind = getattr(event, "kv_cache_spec_kind", None)
+        if isinstance(kind, str) and kind:
+            stored.cache_kind = kind
+        window = getattr(event, "kv_cache_spec_sliding_window", None)
+        if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+            stored.sliding_window = window
         return common_pb2.KvCacheEvent(event_id=event_id, stored=stored)
 
     if name == "BlockRemoved":
-        return common_pb2.KvCacheEvent(
-            event_id=event_id,
-            removed=common_pb2.KvBlocksRemoved(
-                block_hashes=[to_int64(h) for h in event.block_hashes]
-            ),
+        removed = common_pb2.KvBlocksRemoved(
+            block_hashes=[to_int64(h) for h in event.block_hashes]
         )
+        _set_cache_group(removed, event)
+        return common_pb2.KvCacheEvent(event_id=event_id, removed=removed)
 
     if name == "AllBlocksCleared":
         return common_pb2.KvCacheEvent(event_id=event_id, cleared=common_pb2.KvCacheCleared())
