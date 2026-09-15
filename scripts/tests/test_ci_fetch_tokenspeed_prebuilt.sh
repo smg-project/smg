@@ -48,6 +48,7 @@ setup() {
     export FAKE_IMAGE_ROOT="$T/image" FAKE_DOCKER_LOG="$T/docker.log"
     mkdir -p "$FAKE_IMAGE_ROOT/opt/smg-ci/.venv/bin" "$FAKE_IMAGE_ROOT/opt/tokenspeed-src"
     echo "#!/bin/sh" > "$FAKE_IMAGE_ROOT/opt/smg-ci/.venv/bin/python"
+    chmod +x "$FAKE_IMAGE_ROOT/opt/smg-ci/.venv/bin/python"
     echo "deadbeef" > "$FAKE_IMAGE_ROOT/opt/smg-ci/tokenspeed.ref"
     echo "src" > "$FAKE_IMAGE_ROOT/opt/tokenspeed-src/README"
     : > "$FAKE_DOCKER_LOG"
@@ -164,6 +165,10 @@ test_unwritable_cache_root_degrades_to_a_job_local_cache() {
     assert_link_into "$T/opt/smg-ci" "$T/runner-temp"
     assert_eq "deadbeef" "$(cat "$T/opt/smg-ci/tokenspeed.ref")"
     assert_contains "$(cat "$T/opt/github.env")" "SMG_BAKED_VENV=$T/opt/smg-ci/.venv"
+    # One reader, pod-local storage, no reflink: the payload must exist once,
+    # in the job dir the workflow's cleanup step removes, not also in the entry.
+    assert_no_file "$T/runner-temp/tokenspeed-prebuilt-cache/$TAG/smg-ci"
+    assert_no_file "$T/runner-temp/tokenspeed-prebuilt-cache/$TAG/tokenspeed-src"
 }
 
 # A populate killed between the rename and the marker leaves an entry dir
@@ -191,6 +196,19 @@ test_marked_entry_missing_payload_is_treated_as_miss() {
     assert_eq 1 "$(pull_count)" "repopulated"
     assert_file "$CACHE/$TAG/smg-ci/tokenspeed.ref"
     assert_contains "$out" "Prebuilt payload installed"
+}
+
+# An interrupted `rm -rf` of an entry can leave the marker plus emptied but
+# present payload dirs. Directory existence is not proof; the files the venv
+# needs must be there, or it is a miss.
+test_hollow_entry_with_marker_is_treated_as_miss() {
+    setup
+    mkdir -p "$CACHE/$TAG/smg-ci" "$CACHE/$TAG/tokenspeed-src"
+    : > "$CACHE/$TAG/.complete"
+    run_fetch "$T/opt" 100 > /dev/null
+    assert_eq 1 "$(pull_count)" "repopulated"
+    assert_file "$CACHE/$TAG/smg-ci/.venv/bin/python"
+    assert_eq "deadbeef" "$(cat "$T/opt/smg-ci/tokenspeed.ref")"
 }
 
 # If the second symlink cannot be created, the first one must not be left
@@ -262,6 +280,7 @@ tests=(
     test_unwritable_cache_root_degrades_to_a_job_local_cache
     test_leftover_entry_without_marker_is_replaced_not_nested
     test_marked_entry_missing_payload_is_treated_as_miss
+    test_hollow_entry_with_marker_is_treated_as_miss
     test_partial_install_links_are_removed_on_failure
     test_unwritable_github_env_rolls_back_the_install
     test_concurrent_callers_pull_once

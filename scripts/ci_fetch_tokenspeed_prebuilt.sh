@@ -26,12 +26,14 @@
 # cheap; the fixed /opt paths become symlinks into it. e2e-gpu-job.yml removes
 # the job copy when the job ends (TOKENSPEED_PREBUILT_JOB_DIR); copies left by
 # hard-killed jobs are swept here after 24 h, superseded tags after 7 days.
-# An entry is trusted only when its marker AND both payload dirs are present,
-# and a populate replaces whatever is at the entry path (a populate killed
-# between rename and marker leaves a dir without one), so a damaged entry
-# can never poison later lanes. Without a writable shared cache root the same
+# An entry is trusted only when its marker AND the files the payload needs
+# are present (a killed populate or invalidation can leave a marker over a
+# hollow tree), and a populate retires whatever is at the entry path by
+# rename-then-delete before moving its own tree in, so a damaged entry can
+# never poison later lanes. Without a writable shared cache root the same
 # flow runs against a job-local root under RUNNER_TEMP: no reuse, but still
-# the ~8 min carrier path rather than the ~20 min source build.
+# the ~8 min carrier path rather than the ~20 min source build; the payload
+# is then moved into the job dir rather than copied, since it has one reader.
 #
 # TOLERANT BY DESIGN: this script must never fail the job. No image resolved,
 # no docker on the runner, no writable cache, a failed pull or extraction —
@@ -59,15 +61,26 @@ if command -v sudo &> /dev/null; then SUDO="sudo"; else SUDO=""; fi
 tag="$(printf '%s' "${IMAGE##*:}" | tr -c 'A-Za-z0-9._-' '_')"
 [ -n "$tag" ] || fallback "cannot derive a tag from ${IMAGE}"
 init_cache_root() { mkdir -p "$1/.locks" "$1/jobs" 2> /dev/null; }
+job_local=0
 if ! init_cache_root "$CACHE_ROOT"; then
     log "cache root ${CACHE_ROOT} not writable; using a job-local cache instead (no reuse across lanes)"
     CACHE_ROOT="${RUNNER_TEMP:-/tmp}/tokenspeed-prebuilt-cache"
     init_cache_root "$CACHE_ROOT" || fallback "no writable cache root"
+    job_local=1
 fi
 entry="${CACHE_ROOT}/${tag}"
-# The marker alone is not proof: require the payload dirs too.
+# The marker alone is not proof, and neither are the dirs (an interrupted
+# rm -rf leaves them hollow): require the files the payload actually needs.
 entry_usable() {
-    [ -f "$entry/.complete" ] && [ -d "$entry/smg-ci" ] && [ -d "$entry/tokenspeed-src" ]
+    [ -f "$entry/.complete" ] && [ -f "$entry/smg-ci/tokenspeed.ref" ] \
+        && [ -x "$entry/smg-ci/.venv/bin/python" ] && [ -d "$entry/tokenspeed-src" ]
+}
+# Invalidate atomically: rename first (instant), then delete under a name
+# nothing consults, so a kill mid-delete cannot leave a half-emptied entry.
+retire_entry() {
+    [ -e "$entry" ] || return 0
+    local old
+    old="$(mktemp -d "${CACHE_ROOT}/.${tag}.old.XXXXXX")" && mv -T "$entry" "$old" && rm -rf "$old"
 }
 
 # Housekeeping: job copies left behind by cancelled jobs, and tags nothing
@@ -91,7 +104,7 @@ pull_image() {
 
 # Runs under the per-tag lock. Extracts into a sibling temp dir and renames it
 # into place, so a reader never sees a half-written entry and a failure leaves
-# nothing behind. Any leftover at the entry path is removed first; `mv -T`
+# nothing behind. Any leftover at the entry path is retired first; `mv -T`
 # then cannot nest the temp dir inside a surviving directory.
 populate() {
     pull_image || return 1
@@ -107,7 +120,7 @@ populate() {
     if docker cp "$cid:/opt/smg-ci" "$tmp/smg-ci" \
         && docker cp "$cid:/opt/tokenspeed-src" "$tmp/tokenspeed-src" \
         && $SUDO chown -R "$(id -u):$(id -g)" "$tmp" \
-        && rm -rf "$entry" \
+        && retire_entry \
         && mv -T "$tmp" "$entry" \
         && touch "$entry/.complete"; then
         docker rm -f "$cid" > /dev/null 2>&1 || true
@@ -138,8 +151,15 @@ touch "$entry"
 # lanes of one run on the same node can share run id, job, attempt and pid.
 job="$(mktemp -d "${CACHE_ROOT}/jobs/${GITHUB_RUN_ID:-local}-${GITHUB_JOB:-job}-${GITHUB_RUN_ATTEMPT:-1}.XXXXXX")" \
     || fallback "could not create a job dir under ${CACHE_ROOT}/jobs"
-if ! { cp -a --reflink=auto "$entry/smg-ci" "$job/smg-ci" \
-    && cp -a --reflink=auto "$entry/tokenspeed-src" "$job/tokenspeed-src"; }; then
+if [ "$job_local" = 1 ]; then
+    # Pod-local storage has no reflink and the entry has exactly one reader:
+    # move it (a rename) rather than hold two ~15 GB trees on the pod.
+    transfer=(mv -T)
+else
+    transfer=(cp -a --reflink=auto)
+fi
+if ! { "${transfer[@]}" "$entry/smg-ci" "$job/smg-ci" \
+    && "${transfer[@]}" "$entry/tokenspeed-src" "$job/tokenspeed-src"; }; then
     rm -rf "$job"
     fallback "could not copy the payload for this job"
 fi
