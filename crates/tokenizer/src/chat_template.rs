@@ -70,6 +70,10 @@ pub enum ThinkingToggle {
     /// `always_in_reasoning` config.
     #[default]
     None,
+    /// Template forces reasoning on: there is no toggle to honor and the
+    /// generation prompt always opens `<think>`, so the parser must start
+    /// armed regardless of the user's preference. (GLM-5.3)
+    Always,
     /// Template supports a thinking toggle that defaults to ON.
     /// If the user doesn't pass anything, thinking is enabled.
     /// (Qwen3, Qwen3.5, Nemotron, GLM-4.6, GLM-5, Kimi-K2.5)
@@ -80,9 +84,24 @@ pub enum ThinkingToggle {
     DefaultOff,
 }
 
+/// GLM-5.3 keeps the GLM-4.5 prompt and tool-call markers but replaces the
+/// `enable_thinking` toggle with an always-on "Reasoning Effort:" header.
+fn is_glm53_template(template: &str) -> bool {
+    template.contains("[gMASK]<sop>")
+        && template.contains("Reasoning Effort:")
+        && template.contains("<tool_call>")
+        && template.contains("<arg_key>")
+        && template.contains("<arg_value>")
+        && !template.contains("enable_thinking")
+}
+
 /// Detect whether the chat template supports a thinking/reasoning toggle
 /// and what its default value is.
 pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<ThinkingKeyName>) {
+    if is_glm53_template(template) {
+        return (ThinkingToggle::Always, None);
+    }
+
     // Tri-state string toggle, detected only when the template actually
     // branches on the variable: only `thinking_mode == "enabled"` prefills
     // the think-start token, so the toggle defaults OFF.
@@ -1362,6 +1381,84 @@ mod tests {
                 .unwrap();
             assert_eq!(out, rendered);
         }
+    }
+
+    /// GLM-5.3 shape: always-on thinking behind a `Reasoning Effort:` header
+    /// (no `enable_thinking` toggle) and the compact GLM-4.7 tool-call format;
+    /// HF revisions differ only in the `+` / `~` concat operator.
+    fn glm53_template(concat: &str) -> String {
+        format!(
+            "[gMASK]<sop>\n\
+             {{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined \
+             and reasoning_effort in ['low', 'high'] else 'max' -%}}\n\
+             <|system|>Reasoning Effort: {{{{ effective_reasoning_effort | capitalize }}}}\n\
+             {{% for tc in m.tool_calls %}}\n\
+             {{{{- '<tool_call>' {concat} tc.name -}}}}\n\
+             {{% set _args = tc.arguments %}}\
+             {{% for k, v in _args.items() %}}\
+             <arg_key>{{{{ k }}}}</arg_key><arg_value>{{{{ v }}}}</arg_value>\
+             {{% endfor %}}</tool_call>\n\
+             {{% endfor %}}\n\
+             {{%- if add_generation_prompt -%}}\
+             <|assistant|>{{{{- '<think>' -}}}}\
+             {{%- endif -%}}"
+        )
+    }
+
+    #[test]
+    fn glm53_effort_template_forces_reasoning() {
+        for concat in ["+", "~"] {
+            let template = glm53_template(concat);
+            assert_eq!(
+                detect_thinking_toggle(&template),
+                (ThinkingToggle::Always, None),
+                "concat {concat}"
+            );
+
+            let state = ChatTemplateState::new(Some(template)).unwrap();
+            assert_eq!(state.thinking_toggle(), ThinkingToggle::Always);
+            assert_eq!(state.thinking_key_name(), None);
+            assert!(state.think_in_prefill());
+        }
+    }
+
+    #[test]
+    fn glm53_detection_survives_clear_thinking_false_positive() {
+        // The published GLM-5.3 template also uses `clear_thinking`, whose
+        // `clear_thinking is defined` branch must not be mistaken for a
+        // `thinking` toggle the template does not have.
+        let mut template = glm53_template("+");
+        template = template.replace(
+            "<|system|>",
+            "{%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}\n<|system|>",
+        );
+        assert_eq!(
+            detect_thinking_toggle(&template),
+            (ThinkingToggle::Always, None)
+        );
+    }
+
+    #[test]
+    fn glm53_signature_requires_glm_tool_call_markers_and_no_toggle() {
+        // A GLM-4.5-style template keeps its enable_thinking toggle.
+        let glm45_template = "[gMASK]<sop>\n\
+            {%- set enable_thinking = enable_thinking if enable_thinking is defined else true -%}\n\
+            <tool_call>\n";
+        assert_eq!(
+            detect_thinking_toggle(glm45_template),
+            (
+                ThinkingToggle::DefaultOn,
+                Some(ThinkingKeyName::EnableThinking)
+            )
+        );
+
+        // "Reasoning Effort:" alone, without the GLM tool-call markers, is
+        // not the GLM-5.3 signature.
+        let effort_only = "Reasoning Effort: max\n{{ message.content }}";
+        assert_eq!(
+            detect_thinking_toggle(effort_only),
+            (ThinkingToggle::None, None)
+        );
     }
 
     /// Regression: a conditional expression used as a keyword-argument value.
