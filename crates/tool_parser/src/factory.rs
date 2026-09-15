@@ -201,6 +201,11 @@ impl ParserRegistry {
     /// Generate a chat constraint for the configured parser and effective tools.
     /// `tool_choice` selects permitted calls; `enable_thinking` describes the
     /// chat template's prefilled thinking mode. Returns a constraint or no grammar.
+    ///
+    /// A request that offers no tools gets no grammar at all: there is nothing
+    /// to constrain, and an engine launched without a grammar backend must keep
+    /// serving plain chat. The tool-less grammar is reserved for
+    /// `tool_choice: none` with tools offered, where it forbids the calls.
     pub fn generate_chat_constraint(
         &self,
         configured_parser: Option<&str>,
@@ -208,6 +213,9 @@ impl ParserRegistry {
         tool_choice: &ToolChoice,
         enable_thinking: bool,
     ) -> Result<Option<ToolConstraint>, String> {
+        if tools.is_empty() {
+            return Ok(None);
+        }
         if self.uses_full_assistant_constraint(configured_parser, tools) {
             let tools = if matches!(tool_choice, ToolChoice::Value(ToolChoiceValue::None)) {
                 &[]
