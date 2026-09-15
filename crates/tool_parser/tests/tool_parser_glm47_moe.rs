@@ -137,6 +137,8 @@ fn test_glm47_chat_constraint_only_when_tools_are_offered() {
         none_offered.is_none(),
         "no tools, no grammar: {none_offered:?}"
     );
+    // The response side reads the same predicate, so it must agree.
+    assert!(!registry.uses_full_assistant_constraint(parser, &[]));
 
     let tools = create_test_tools();
     match registry

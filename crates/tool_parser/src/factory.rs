@@ -188,12 +188,19 @@ impl ParserRegistry {
 
     /// Return whether `configured_parser` constrains the full assistant turn
     /// for `tools`, which must already be filtered by the request's tool choice.
+    ///
+    /// A request that offers no tools is never constrained: there is nothing
+    /// to constrain, and an engine launched without a grammar backend must
+    /// keep serving plain chat. This is the one place that rule lives; the
+    /// request side (grammar generation) and the response side (native tool
+    /// format) both read it.
     pub fn uses_full_assistant_constraint(
         &self,
         configured_parser: Option<&str>,
         tools: &[Tool],
     ) -> bool {
-        configured_parser == Some("glm47_moe")
+        !tools.is_empty()
+            && configured_parser == Some("glm47_moe")
             && self.has_parser("glm47_moe")
             && !tools.iter().any(|tool| tool.function.strict == Some(true))
     }
@@ -202,10 +209,10 @@ impl ParserRegistry {
     /// `tool_choice` selects permitted calls; `enable_thinking` describes the
     /// chat template's prefilled thinking mode. Returns a constraint or no grammar.
     ///
-    /// A request that offers no tools gets no grammar at all: there is nothing
-    /// to constrain, and an engine launched without a grammar backend must keep
-    /// serving plain chat. The tool-less grammar is reserved for
-    /// `tool_choice: none` with tools offered, where it forbids the calls.
+    /// A request that offers no tools gets no grammar at all (see
+    /// [`Self::uses_full_assistant_constraint`]). The tool-less grammar is
+    /// reserved for `tool_choice: none` with tools offered, where it forbids
+    /// the calls the model was shown.
     pub fn generate_chat_constraint(
         &self,
         configured_parser: Option<&str>,
@@ -213,9 +220,6 @@ impl ParserRegistry {
         tool_choice: &ToolChoice,
         enable_thinking: bool,
     ) -> Result<Option<ToolConstraint>, String> {
-        if tools.is_empty() {
-            return Ok(None);
-        }
         if self.uses_full_assistant_constraint(configured_parser, tools) {
             let tools = if matches!(tool_choice, ToolChoice::Value(ToolChoiceValue::None)) {
                 &[]
