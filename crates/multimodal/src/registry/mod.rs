@@ -1,4 +1,5 @@
 mod deepseek_v41;
+mod deepseek_v4_vision;
 mod glm53_flash;
 mod inkling;
 mod kimi_k25;
@@ -16,6 +17,7 @@ pub mod transcription;
 
 use deepseek_v41::DeepseekV41VisionSpec;
 pub use deepseek_v41::DEEPSEEK_V41_IMAGE_PLACEHOLDER;
+use deepseek_v4_vision::DeepseekV4VisionSpec;
 use glm53_flash::Glm53FlashSpec;
 use inkling::InklingSpec;
 use kimi_k25::KimiK25VisionSpec;
@@ -32,7 +34,7 @@ use qwen_vl::QwenVLVisionSpec;
 // Re-export public API from traits.
 pub use traits::{
     MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
-    Tokenizer,
+    Tokenizer, ToolResultOrder,
 };
 
 pub struct ModelRegistry {
@@ -45,6 +47,7 @@ impl ModelRegistry {
             specs: vec![
                 // DeepSeek-V4.1 matches only its own model_type / id, so it can lead.
                 LazySpec::new(|| Box::new(DeepseekV41VisionSpec)),
+                LazySpec::new(|| Box::new(DeepseekV4VisionSpec)),
                 LazySpec::new(|| Box::new(Glm53FlashSpec)),
                 LazySpec::new(|| Box::new(InklingSpec)),
                 // Kimi-K3 must be registered before Kimi-K2.5: the two families
@@ -195,6 +198,42 @@ pub(super) mod test_helpers {
             feature_token_counts: vec![0; sizes.len()],
             item_sizes: sizes,
             model_specific,
+        }
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    #[test]
+    fn deepseek_v4_vision_is_the_only_offset_structured_spec() {
+        let registry = ModelRegistry::new();
+        for spec in &registry.specs {
+            let spec = spec.get();
+            if spec.name() == "deepseek_v4_vision" {
+                assert!(spec.offset_dependent_replacements());
+                assert!(spec.requires_structured_chat_content());
+                assert_eq!(spec.media_part_order(), MediaPartOrder::Authored);
+                assert_eq!(spec.tool_result_order(), ToolResultOrder::AssistantCall);
+            } else {
+                assert!(
+                    !spec.offset_dependent_replacements(),
+                    "{} unexpectedly opted into offset-dependent replacements",
+                    spec.name()
+                );
+                assert!(
+                    !spec.requires_structured_chat_content(),
+                    "{} unexpectedly opted into structured content",
+                    spec.name()
+                );
+                assert_eq!(
+                    spec.tool_result_order(),
+                    ToolResultOrder::Authored,
+                    "{} unexpectedly opted into assistant-call tool-result ordering",
+                    spec.name()
+                );
+            }
         }
     }
 }

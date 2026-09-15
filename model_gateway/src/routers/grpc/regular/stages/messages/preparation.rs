@@ -91,9 +91,9 @@ impl MessagePreparationStage {
             .tokenizer_registry
             .get_by_name(model_id)
             .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id));
-        let media_order = match (ctx.components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
+        let rendering = match (ctx.components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
             (Some(mm_components), Some(entry)) => {
-                multimodal::resolve_media_part_order(
+                multimodal::resolve_media_rendering(
                     model_id,
                     &*tokenizer,
                     mm_components,
@@ -102,11 +102,23 @@ impl MessagePreparationStage {
                 )
                 .await
             }
-            _ => llm_multimodal::MediaPartOrder::MediaFirst,
+            _ => multimodal::MediaRenderingContract::default(),
+        };
+        let content_format = if rendering.requires_structured_chat_content {
+            llm_tokenizer::chat_template::ChatTemplateContentFormat::OpenAI
+        } else {
+            tokenizer.chat_template_content_format()
         };
 
         // Resolve multimodal context once (see chat/preparation.rs for details).
         let media_plan = multimodal::media_plan_messages(&request.messages);
+        if rendering.requires_structured_chat_content {
+            multimodal::validate_marker_backing(
+                multimodal::renderable_image_marker_count_messages(&request.messages),
+                &media_plan,
+            )
+            .map_err(invalid_multimodal_request)?;
+        }
         let (placeholder_tokens, mm_context) = if media_plan.is_empty() {
             (None, None)
         } else if let Some(mm_components) = ctx.components.multimodal.as_ref() {
@@ -172,7 +184,8 @@ impl MessagePreparationStage {
             &*tokenizer,
             tools_for_template,
             placeholder_tokens.as_ref(),
-            media_order,
+            rendering.media_part_order,
+            content_format,
         ) {
             Ok(msgs) => msgs,
             Err(e) => {

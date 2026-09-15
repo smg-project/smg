@@ -367,7 +367,7 @@ fn assemble_tokenspeed_with_options(
                 return Err(error);
             }
         };
-        let content_hash = match content_hash_for_item(intermediate, item_index) {
+        let content_hash = match content_hash_for_item(intermediate, binding) {
             Ok(value) => value,
             Err(error) => {
                 cleanup_tokenspeed_items_encoder_shm(&items, None);
@@ -401,7 +401,7 @@ fn assemble_tokenspeed_with_options(
         };
         let encoder_input_serialize_ms = encoder_input_started.elapsed().as_secs_f64() * 1000.0;
         let model_specific_started = Instant::now();
-        let model_specific_tensors = match serialize_model_specific_for_item(
+        let mut model_specific_tensors = match serialize_model_specific_for_item(
             &intermediate.preprocessed.model_specific,
             &intermediate.field_layouts.model_specific,
             item_index,
@@ -414,6 +414,16 @@ fn assemble_tokenspeed_with_options(
                 return Err(error);
             }
         };
+        if let Some(compress_pad) = binding.offset_variant {
+            let value = ModelSpecificValue::uint_1d(vec![compress_pad]);
+            let Some(tensor) = model_specific_to_tensor_bytes(&value) else {
+                cleanup_tokenspeed_items_encoder_shm(&items, Some(&encoder_input));
+                return Err(anyhow::anyhow!(
+                    "failed to serialize DeepSeek V4 compression padding"
+                ));
+            };
+            model_specific_tensors.insert("dsv4_compress_pad".to_string(), tensor);
+        }
         let model_specific_serialize_ms = model_specific_started.elapsed().as_secs_f64() * 1000.0;
         if log_timing {
             info!(
@@ -612,7 +622,7 @@ pub(crate) fn encode_routing_hashes(intermediate: &MultimodalIntermediate) -> Re
         for binding in &batch.bindings {
             hashes.push((
                 binding.prompt_ordinal,
-                content_hash_for_item(batch, binding.item_index)?,
+                content_hash_for_item(batch, binding)?,
             ));
         }
     }
@@ -704,8 +714,9 @@ fn placeholder_range_to_u32(range: &PlaceholderRange) -> Result<(u32, u32)> {
 
 fn content_hash_for_item(
     intermediate: &PrecomputedMultimodalIntermediate,
-    item_index: usize,
+    binding: &PromptBinding,
 ) -> Result<Vec<u8>> {
+    let item_index = binding.item_index;
     let hash = match &intermediate.media {
         MediaBatch::Images(items) => items.get(item_index).map(|item| item.hash.as_str()),
         MediaBatch::Videos(items) => items.get(item_index).map(|item| item.hash.as_str()),
@@ -717,7 +728,29 @@ fn content_hash_for_item(
             intermediate.media.modality()
         )
     })?;
-    Ok(hash_hex_strings(std::iter::once(hash)))
+    let Some(offset_variant) = binding.offset_variant else {
+        return Ok(hash_hex_strings(std::iter::once(hash)));
+    };
+    let model_u32 = |key: &str| -> Result<u32> {
+        match intermediate.preprocessed.model_specific.get(key) {
+            Some(ModelSpecificValue::UintTensor { data, .. }) => data
+                .get(item_index)
+                .copied()
+                .with_context(|| format!("missing {key} value for media item {item_index}")),
+            _ => Err(anyhow::anyhow!(
+                "offset-dependent media item is missing uint tensor {key}"
+            )),
+        }
+    };
+    let n_llm_h = model_u32("n_llm_h")?;
+    let n_llm_w = model_u32("n_llm_w")?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(hash.as_bytes());
+    hasher.update(b"\0deepseek-v4-vision\0");
+    hasher.update(&n_llm_h.to_le_bytes());
+    hasher.update(&n_llm_w.to_le_bytes());
+    hasher.update(&offset_variant.to_le_bytes());
+    Ok(hasher.finalize().as_bytes().to_vec())
 }
 
 fn tensor_sizes_from_model_specific(
@@ -765,6 +798,123 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use crate::routers::grpc::proto_wrapper::write_tokenspeed_shm_with;
+
+    fn image(hash: &str) -> Arc<ImageFrame> {
+        Arc::new(ImageFrame::new(
+            image::DynamicImage::new_rgb8(1, 1),
+            bytes::Bytes::from_static(b"image"),
+            ImageDetail::Auto,
+            llm_multimodal::ImageSource::InlineBytes,
+            hash.to_string(),
+        ))
+    }
+
+    fn deepseek_hash_intermediate() -> PrecomputedMultimodalIntermediate {
+        let model_specific = HashMap::from([
+            (
+                "patches_per_image".to_string(),
+                ModelSpecificValue::uint_1d(vec![1, 1]),
+            ),
+            (
+                "n_llm_h".to_string(),
+                ModelSpecificValue::uint_1d(vec![10, 10]),
+            ),
+            (
+                "n_llm_w".to_string(),
+                ModelSpecificValue::uint_1d(vec![10, 10]),
+            ),
+        ]);
+        PrecomputedMultimodalIntermediate {
+            preprocessed: PreprocessedEncoderInputs {
+                encoder_input: ArrayD::from_shape_vec(IxDyn(&[2, 1]), vec![1.0, 2.0]).unwrap(),
+                feature_token_counts: vec![114, 114],
+                item_sizes: vec![(1, 1), (1, 1)],
+                model_specific,
+            },
+            media: MediaBatch::Images(vec![image("same-hash"), image("same-hash")]),
+            bindings: vec![
+                PromptBinding {
+                    item_index: 0,
+                    prompt_ordinal: 0,
+                    structural: PlaceholderRange {
+                        offset: 0,
+                        length: 117,
+                    },
+                    patches: vec![],
+                    offset_variant: Some(3),
+                },
+                PromptBinding {
+                    item_index: 1,
+                    prompt_ordinal: 1,
+                    structural: PlaceholderRange {
+                        offset: 120,
+                        length: 115,
+                    },
+                    patches: vec![],
+                    offset_variant: Some(1),
+                },
+            ],
+            placeholder_token_id: Some(50),
+            field_layouts: EncoderFieldLayouts::new(
+                FieldLayout::flat("patches_per_image"),
+                HashMap::from([
+                    ("patches_per_image".to_string(), FieldLayout::Batched),
+                    ("n_llm_h".to_string(), FieldLayout::Batched),
+                    ("n_llm_w".to_string(), FieldLayout::Batched),
+                ]),
+            ),
+            keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
+        }
+    }
+
+    #[test]
+    fn content_hash_deepseek_v4_vision_carries_offset_variant() {
+        let intermediate = deepseek_hash_intermediate();
+        let first = content_hash_for_item(&intermediate, &intermediate.bindings[0]).unwrap();
+        let second = content_hash_for_item(&intermediate, &intermediate.bindings[1]).unwrap();
+        assert_ne!(
+            first, second,
+            "same image at different residues must not deduplicate"
+        );
+
+        let mut same_residue = intermediate.bindings[1].clone();
+        same_residue.offset_variant = intermediate.bindings[0].offset_variant;
+        assert_eq!(
+            first,
+            content_hash_for_item(&intermediate, &same_residue).unwrap(),
+            "same image, geometry and residue must deduplicate"
+        );
+
+        let mut different_image = deepseek_hash_intermediate();
+        different_image.media = MediaBatch::Images(vec![image("other-hash"), image("same-hash")]);
+        assert_ne!(
+            first,
+            content_hash_for_item(&different_image, &different_image.bindings[0]).unwrap()
+        );
+
+        let mut legacy = intermediate.bindings[0].clone();
+        legacy.offset_variant = None;
+        assert_eq!(
+            content_hash_for_item(&intermediate, &legacy).unwrap(),
+            hash_hex_strings(std::iter::once("same-hash")),
+            "legacy hash bytes must remain unchanged"
+        );
+
+        let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
+        assert_eq!(assembled.items[0].mm_placeholders, [(0, 117)]);
+        assert_eq!(assembled.items[1].mm_placeholders, [(120, 115)]);
+        for item in &assembled.items {
+            let pad = &item.model_specific_tensors["dsv4_compress_pad"];
+            assert_eq!(pad.shape, [1]);
+            assert_eq!(pad.dtype, "uint32");
+        }
+
+        let routed =
+            encode_routing_hashes(&MultimodalIntermediate::try_new(vec![intermediate]).unwrap())
+                .unwrap();
+        assert_eq!(routed, vec![first, second]);
+    }
 
     #[cfg(target_os = "linux")]
     fn pending_tokenspeed_shm_assembly() -> (PendingTokenSpeedAssembly, std::path::PathBuf) {
@@ -873,6 +1023,7 @@ mod tests {
                         offset: 10,
                         length: 2,
                     }],
+                    offset_variant: None,
                 },
                 PromptBinding {
                     item_index: 1,
@@ -885,6 +1036,7 @@ mod tests {
                         offset: 20,
                         length: 2,
                     }],
+                    offset_variant: None,
                 },
             ],
             placeholder_token_id: Some(151655),
@@ -993,6 +1145,7 @@ mod tests {
                         offset: 30,
                         length: 2,
                     }],
+                    offset_variant: None,
                 },
                 PromptBinding {
                     item_index: 1,
@@ -1005,6 +1158,7 @@ mod tests {
                         offset: 40,
                         length: 2,
                     }],
+                    offset_variant: None,
                 },
             ],
             placeholder_token_id: Some(151656),
@@ -1112,6 +1266,7 @@ mod tests {
                         offset: 30,
                         length: 2,
                     }],
+                    offset_variant: None,
                 },
                 PromptBinding {
                     item_index: 1,
@@ -1124,6 +1279,7 @@ mod tests {
                         offset: 40,
                         length: 2,
                     }],
+                    offset_variant: None,
                 },
             ],
             placeholder_token_id: Some(42),
@@ -1186,6 +1342,7 @@ mod tests {
                     length: 1,
                 },
                 patches: vec![],
+                offset_variant: None,
             }],
             placeholder_token_id: Some(10),
             field_layouts: EncoderFieldLayouts::default(),
@@ -1208,6 +1365,7 @@ mod tests {
                     length: 1,
                 },
                 patches: vec![],
+                offset_variant: None,
             }],
             placeholder_token_id: Some(30),
             field_layouts: EncoderFieldLayouts::default(),
@@ -1233,6 +1391,7 @@ mod tests {
                     length: 1,
                 },
                 patches: vec![],
+                offset_variant: None,
             }],
             placeholder_token_id: Some(20),
             field_layouts: EncoderFieldLayouts::default(),

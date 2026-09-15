@@ -1,13 +1,15 @@
 //! Multimodal model configuration: the shared config-file registry and the
 //! per-router component bundle (media connector + processor/model registries).
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use llm_multimodal::{
-    MediaConnector, MediaConnectorConfig, Modality, ModelRegistry, PreProcessorConfig,
-    VisionProcessorRegistry,
+    MediaConnector, MediaConnectorConfig, Modality, ModelMetadata, ModelProcessorSpec,
+    ModelRegistry, PreProcessorConfig, VisionProcessorRegistry,
 };
 use tracing::{debug, warn};
 
@@ -31,12 +33,16 @@ pub(crate) struct MultimodalModelConfig {
 /// 2. Lazy-loaded from local disk / HF on first multimodal request.
 pub struct MultimodalConfigRegistry {
     configs: DashMap<String, Arc<MultimodalModelConfig>>,
+    #[cfg(test)]
+    get_or_load_calls: AtomicUsize,
 }
 
 impl MultimodalConfigRegistry {
     pub(crate) fn new() -> Self {
         Self {
             configs: DashMap::new(),
+            #[cfg(test)]
+            get_or_load_calls: AtomicUsize::new(0),
         }
     }
 
@@ -63,6 +69,8 @@ impl MultimodalConfigRegistry {
         tokenizer_id: &str,
         tokenizer_source: &str,
     ) -> Result<Arc<MultimodalModelConfig>> {
+        #[cfg(test)]
+        self.get_or_load_calls.fetch_add(1, Ordering::Relaxed);
         if let Some(cached) = self.get(tokenizer_id) {
             debug!(%tokenizer_id, "multimodal config cache hit");
             return Ok(cached);
@@ -113,6 +121,11 @@ impl MultimodalConfigRegistry {
 
         debug!(%tokenizer_id, "multimodal config loaded and cached");
         Ok(model_config)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_or_load_call_count(&self) -> usize {
+        self.get_or_load_calls.load(Ordering::Relaxed)
     }
 }
 
@@ -243,6 +256,8 @@ pub(crate) struct MultimodalComponents {
     pub pixel_cache: Option<Arc<PixelCache>>,
     /// Router-configured per-modality media-count limits replacing spec limits.
     pub modality_limit_overrides: HashMap<Modality, usize>,
+    #[cfg(test)]
+    model_lookup_calls: AtomicUsize,
 }
 
 impl MultimodalComponents {
@@ -268,7 +283,23 @@ impl MultimodalComponents {
             modality_limit_overrides: image_limit_override
                 .map(|limit| HashMap::from([(Modality::Image, limit)]))
                 .unwrap_or_default(),
+            #[cfg(test)]
+            model_lookup_calls: AtomicUsize::new(0),
         })
+    }
+
+    pub(crate) fn lookup_model<'a>(
+        &'a self,
+        metadata: &ModelMetadata<'_>,
+    ) -> Option<&'a dyn ModelProcessorSpec> {
+        #[cfg(test)]
+        self.model_lookup_calls.fetch_add(1, Ordering::Relaxed);
+        self.model_registry.lookup(metadata)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_lookup_call_count(&self) -> usize {
+        self.model_lookup_calls.load(Ordering::Relaxed)
     }
 }
 

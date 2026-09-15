@@ -161,7 +161,8 @@ impl VisionProcessorRegistry {
 
     /// Find a processor for the given model ID, falling back to model_type.
     ///
-    /// Matches by substring containment (case-insensitive).
+    /// Matches by substring containment (case-insensitive), preferring the
+    /// longest pattern so a broad family prefix cannot shadow a newer model.
     pub fn find(
         &self,
         model_id: &str,
@@ -173,12 +174,13 @@ impl VisionProcessorRegistry {
 
     fn find_in_candidate(&self, candidate: &str) -> Option<&dyn VisionPreProcessor> {
         let candidate = candidate.to_lowercase();
-        for (pattern, processor) in &self.processors {
-            if candidate.contains(&pattern.to_lowercase()) {
-                return Some(processor.as_ref());
-            }
-        }
-        None
+        self.processors
+            .iter()
+            .filter(|(pattern, _)| candidate.contains(&pattern.to_lowercase()))
+            .max_by(|(left, _), (right, _)| {
+                left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+            })
+            .map(|(_, processor)| processor.as_ref())
     }
 
     /// Get list of supported model patterns.
@@ -198,6 +200,7 @@ impl VisionProcessorRegistry {
     ///
     /// Currently registers:
     /// - `deepseek_v41` / `deepseek-v4.1` -> DeepseekV41Processor (gray-padded contain fit)
+    /// - `deepseek_v4` / `deepseek-v4` -> DeepseekV4VisionProcessor (experimental V4 vision)
     /// - `glm-5.3-flash` / `glm5_next` -> Glm53FlashProcessor
     /// - `llava-next` -> LlavaNextProcessor
     /// - `llava-1.5` / `llava-v1.5` -> LlavaProcessor
@@ -217,6 +220,13 @@ impl VisionProcessorRegistry {
             registry.register(
                 pattern,
                 Box::new(super::processors::DeepseekV41Processor::new()),
+            );
+        }
+
+        for pattern in ["deepseek-v4", "deepseek_v4"] {
+            registry.register(
+                pattern,
+                Box::new(super::processors::DeepseekV4VisionProcessor::new()),
             );
         }
 
@@ -490,6 +500,31 @@ mod tests {
                 .model_name(),
             "kimi-k2.5"
         );
+    }
+
+    #[test]
+    fn test_registry_separates_deepseek_v4_vision_and_v41() {
+        let registry = VisionProcessorRegistry::with_defaults();
+        for (id, model_type, expected) in [
+            (
+                "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+                None,
+                "deepseek_v4_vision",
+            ),
+            ("deepseek-ai/DeepSeek-V4.1", None, "deepseek_v41"),
+            ("deepseek_v41", None, "deepseek_v41"),
+            (
+                "custom-checkpoint",
+                Some("deepseek_v4"),
+                "deepseek_v4_vision",
+            ),
+            ("custom-checkpoint", Some("deepseek_v41"), "deepseek_v41"),
+        ] {
+            assert_eq!(
+                registry.find(id, model_type).unwrap().model_name(),
+                expected
+            );
+        }
     }
 
     #[test]

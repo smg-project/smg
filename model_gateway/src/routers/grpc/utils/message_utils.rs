@@ -38,9 +38,8 @@ pub fn process_messages(
     chat_tools: Option<&[ChatTool]>,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
+    content_format: ChatTemplateContentFormat,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
-    let content_format = tokenizer.chat_template_content_format();
-
     // Step 1: Convert InputMessages to chat template JSON values
     let mut transformed_messages = process_message_content_format(
         &request.messages,
@@ -217,7 +216,7 @@ fn convert_user_message(
                             tool_msgs.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tr.tool_use_id,
-                                "content": extract_tool_result_text(tr)
+                                "content": convert_tool_result_content(tr, content_format)
                             }));
                         }
                         _ => {}
@@ -241,18 +240,41 @@ fn convert_user_message(
 }
 
 /// Extract text content from a ToolResult block.
-fn extract_tool_result_text(tool_result: &messages::ToolResultBlock) -> String {
-    match &tool_result.content {
-        Some(ToolResultContent::String(s)) => s.clone(),
-        Some(ToolResultContent::Blocks(blocks)) => blocks
-            .iter()
-            .filter_map(|b| match b {
-                messages::ToolResultContentBlock::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        None => String::new(),
+fn convert_tool_result_content(
+    tool_result: &messages::ToolResultBlock,
+    content_format: ChatTemplateContentFormat,
+) -> Value {
+    match (&tool_result.content, content_format) {
+        (Some(ToolResultContent::String(text)), _) => Value::String(text.clone()),
+        (Some(ToolResultContent::Blocks(blocks)), ChatTemplateContentFormat::String) => {
+            Value::String(
+                blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        messages::ToolResultContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        }
+        (Some(ToolResultContent::Blocks(blocks)), ChatTemplateContentFormat::OpenAI) => {
+            Value::Array(
+                blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        messages::ToolResultContentBlock::Text(text) => {
+                            Some(json!({"type": "text", "text": text.text}))
+                        }
+                        messages::ToolResultContentBlock::Image(_) => {
+                            Some(json!({"type": "image"}))
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+            )
+        }
+        (None, _) => Value::String(String::new()),
     }
 }
 
@@ -699,6 +721,45 @@ mod tests {
         assert_eq!(result[0]["role"], "tool");
         assert_eq!(result[0]["tool_call_id"], "tu_1");
         assert_eq!(result[0]["content"], "4");
+    }
+
+    #[test]
+    fn nested_tool_result_images_survive_openai_format_only() {
+        let tool_result = messages::ToolResultBlock {
+            tool_use_id: "tu-image".to_string(),
+            content: Some(ToolResultContent::Blocks(vec![
+                messages::ToolResultContentBlock::Text(TextBlock {
+                    text: "before".to_string(),
+                    cache_control: None,
+                    citations: None,
+                }),
+                messages::ToolResultContentBlock::Image(messages::ImageBlock {
+                    source: messages::ImageSource::Url {
+                        url: "https://example.test/image.png".to_string(),
+                    },
+                    cache_control: None,
+                }),
+                messages::ToolResultContentBlock::Text(TextBlock {
+                    text: "after".to_string(),
+                    cache_control: None,
+                    citations: None,
+                }),
+            ])),
+            is_error: None,
+            cache_control: None,
+        };
+        assert_eq!(
+            convert_tool_result_content(&tool_result, ChatTemplateContentFormat::OpenAI),
+            json!([
+                {"type": "text", "text": "before"},
+                {"type": "image"},
+                {"type": "text", "text": "after"}
+            ])
+        );
+        assert_eq!(
+            convert_tool_result_content(&tool_result, ChatTemplateContentFormat::String),
+            "before\nafter"
+        );
     }
 
     #[test]

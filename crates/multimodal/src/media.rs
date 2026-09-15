@@ -2120,14 +2120,15 @@ mod tests {
 
     use bytes::Bytes;
     use futures::stream;
+    use reqwest::Client;
 
     use super::{
         checked_payload_length, collect_http_body_with_limit, decode_base64_with_limit,
         effective_sample_fps, ensure_input_byte_limit, expected_sampled_frame_count,
         fps_filter_for_metadata, parse_ffmpeg_duration_seconds, parse_ffprobe_video_info,
         parse_ppm_stream, read_file_with_limit, split_png_stream, video_temp_suffix,
-        MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaSource, VideoFetchConfig,
-        VideoMetadata,
+        ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaSource,
+        VideoFetchConfig, VideoMetadata,
     };
 
     const TINY_PNG: &[u8] = &[
@@ -2149,6 +2150,38 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0], TINY_PNG);
         assert_eq!(frames[1], TINY_PNG);
+    }
+
+    #[tokio::test]
+    async fn deepseek_v4_malformed_image_bytes_are_actionable() {
+        let connector = MediaConnector::new(Client::new(), MediaConnectorConfig::default())
+            .expect("media connector");
+        let error = connector
+            .fetch_image(
+                MediaSource::InlineBytes(b"this is not an encoded image".to_vec()),
+                ImageFetchConfig::default(),
+            )
+            .await
+            .expect_err("malformed image bytes must be rejected");
+        assert!(matches!(error, MediaConnectorError::Image(_)));
+        assert!(error.to_string().contains("image decode error"));
+    }
+
+    #[tokio::test]
+    async fn deepseek_v4_non_base64_data_url_is_actionable() {
+        let connector = MediaConnector::new(Client::new(), MediaConnectorConfig::default())
+            .expect("media connector");
+        let error = connector
+            .fetch_image(
+                MediaSource::DataUrl("data:image/jpeg,this-is-not-base64".to_string()),
+                ImageFetchConfig::default(),
+            )
+            .await
+            .expect_err("non-base64 data URL must be rejected");
+        assert!(matches!(error, MediaConnectorError::DataUrl(_)));
+        let message = error.to_string();
+        assert!(message.contains("data URL"));
+        assert!(message.contains("base64"));
     }
 
     #[test]
@@ -2406,9 +2439,8 @@ mod tests {
     /// spends a decode on the clip, exactly as the image decoder does.
     #[tokio::test]
     async fn decode_video_rejects_an_invalid_long_side_cap() {
-        let connector =
-            MediaConnector::new(reqwest::Client::new(), MediaConnectorConfig::default())
-                .expect("default connector");
+        let connector = MediaConnector::new(Client::new(), MediaConnectorConfig::default())
+            .expect("default connector");
         for value in [0, 505] {
             let cfg = VideoFetchConfig {
                 max_long_side_pixel: Some(value),

@@ -67,8 +67,9 @@ pub(crate) use config::{
 };
 pub(crate) use detect::{media_plan_chat, media_plan_messages};
 pub(crate) use plan::{
-    prepare_placeholder_tokens, resolve_media_part_order, validate_rendered_media_anchors,
-    PlaceholderTokens,
+    prepare_placeholder_tokens, renderable_image_marker_count_chat,
+    renderable_image_marker_count_messages, resolve_media_rendering, validate_marker_backing,
+    validate_rendered_media_anchors, MediaRenderingContract, PlaceholderTokens,
 };
 pub(crate) use process::process_multimodal_plan;
 pub(crate) use transport::{init_mm_transport_defaults, mm_rdma_exporter};
@@ -177,6 +178,9 @@ pub(crate) struct PromptBinding {
     pub structural: PlaceholderRange,
     /// Patch-only spans within `structural`.
     pub patches: Vec<PlaceholderRange>,
+    /// Spec-defined offset variant used to rebuild this replacement.
+    /// `None` preserves the pre-change contract for every existing model.
+    pub offset_variant: Option<u32>,
 }
 
 #[derive(Debug)]

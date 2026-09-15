@@ -179,8 +179,7 @@ pub(crate) async fn process_multimodal_plan(
         config: &model_config.config,
     };
     let spec = components
-        .model_registry
-        .lookup(&metadata)
+        .lookup_model(&metadata)
         .ok_or_else(|| anyhow::anyhow!("Multimodal not supported for model: {model_id}"))?;
     let config_elapsed_ms = config_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -279,7 +278,11 @@ pub(crate) async fn process_multimodal_plan(
             replacements: &part.prompt_replacements,
         })
         .collect::<Vec<_>>();
-    let expanded = expand_tokens_for_modalities(&token_ids, &expansions)?;
+    let offset_rebuild = spec
+        .offset_dependent_replacements()
+        .then_some((spec, &metadata));
+    let expanded =
+        expand_tokens_for_modalities_with_rebuild(&token_ids, &expansions, offset_rebuild)?;
     let placeholder_count = expanded.bindings.iter().map(Vec::len).sum::<usize>();
 
     debug!(
@@ -543,9 +546,18 @@ struct ExpandedMultimodalTokens {
     bindings: Vec<Vec<PromptBinding>>,
 }
 
+#[cfg(test)]
 fn expand_tokens_for_modalities(
     token_ids: &[u32],
     expansions: &[ModalityExpansion<'_>],
+) -> Result<ExpandedMultimodalTokens> {
+    expand_tokens_for_modalities_with_rebuild(token_ids, expansions, None)
+}
+
+fn expand_tokens_for_modalities_with_rebuild(
+    token_ids: &[u32],
+    expansions: &[ModalityExpansion<'_>],
+    offset_rebuild: Option<(&dyn ModelProcessorSpec, &ModelMetadata<'_>)>,
 ) -> Result<ExpandedMultimodalTokens> {
     let mut anchor_to_expansion = HashMap::with_capacity(expansions.len());
     for (idx, expansion) in expansions.iter().enumerate() {
@@ -596,6 +608,23 @@ fn expand_tokens_for_modalities(
                     expansion.replacements.len()
                 )
             })?;
+            let offset = expanded.len();
+            let (replacement, offset_variant) = if let Some((spec, metadata)) = offset_rebuild {
+                spec.rebuild_replacement_at_offset(metadata, replacement, offset)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                        "Failed to rebuild {} replacement {item_index} at offset {offset}: {error}",
+                        expansion.modality
+                    )
+                    })?
+            } else {
+                (replacement.clone(), None)
+            };
+            anyhow::ensure!(
+                replacement.modality == expansion.modality && !replacement.tokens.is_empty(),
+                "Rebuilt prompt replacement {item_index} for {} is invalid",
+                expansion.modality
+            );
             let replacement_tokens = replacement
                 .tokens
                 .iter()
@@ -609,7 +638,6 @@ fn expand_tokens_for_modalities(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let offset = expanded.len();
             let length = replacement_tokens.len();
             let patches = if let Some(feature_ranges) = &replacement.feature_ranges {
                 explicit_feature_ranges(offset, length, feature_ranges).with_context(|| {
@@ -631,6 +659,7 @@ fn expand_tokens_for_modalities(
                     length: length + prefix,
                 },
                 patches,
+                offset_variant,
             });
             prompt_ordinal = prompt_ordinal
                 .checked_add(1)
@@ -734,9 +763,108 @@ fn explicit_feature_ranges(
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use llm_multimodal::VideoSource;
+    use llm_multimodal::{ModelRegistry, Tokenizer as RegistryTokenizer, VideoSource};
+    use serde_json::json;
 
     use super::*;
+
+    struct DeepseekTestTokenizer;
+
+    impl RegistryTokenizer for DeepseekTestTokenizer {
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            (token == "<｜deepseek_image｜>").then_some(50)
+        }
+
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            (id == 50).then(|| "<｜deepseek_image｜>".to_string())
+        }
+
+        fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
+            None
+        }
+    }
+
+    #[test]
+    fn expand_tokens_deepseek_v4_vision_uses_running_offset() {
+        let tokenizer = DeepseekTestTokenizer;
+        let config = json!({"model_type": "deepseek_v4", "vision_n_layers": 32});
+        let metadata = ModelMetadata {
+            model_id: "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let registry = ModelRegistry::new();
+        let spec = registry.lookup(&metadata).unwrap();
+
+        for residue in 0..4 {
+            let replacements = vec![PromptReplacement::repeated(
+                Modality::Image,
+                "<｜deepseek_image｜>",
+                50,
+                114,
+            )];
+            let expansion = ModalityExpansion {
+                modality: Modality::Image,
+                search_token_id: Some(100),
+                placeholder_token_id: Some(50),
+                replacements: &replacements,
+            };
+            let mut input = vec![7; residue];
+            input.push(100);
+            let result = expand_tokens_for_modalities_with_rebuild(
+                &input,
+                &[expansion],
+                Some((spec, &metadata)),
+            )
+            .unwrap();
+            let binding = &result.bindings[0][0];
+            let compress_pad = 3 - residue;
+            assert_eq!(binding.structural.offset % 4, residue);
+            assert_eq!(binding.structural.length, 114 + compress_pad);
+            assert_eq!(binding.offset_variant, Some(compress_pad as u32));
+            assert_eq!(binding.patches, vec![binding.structural.clone()]);
+        }
+
+        let second_variant = |first_tokens: usize| {
+            let replacements = vec![
+                PromptReplacement::repeated(
+                    Modality::Image,
+                    "<｜deepseek_image｜>",
+                    50,
+                    first_tokens,
+                ),
+                PromptReplacement::repeated(Modality::Image, "<｜deepseek_image｜>", 50, 114),
+            ];
+            let expansion = ModalityExpansion {
+                modality: Modality::Image,
+                search_token_id: Some(100),
+                placeholder_token_id: Some(50),
+                replacements: &replacements,
+            };
+            let result = expand_tokens_for_modalities_with_rebuild(
+                &[100, 9, 100],
+                &[expansion],
+                Some((spec, &metadata)),
+            )
+            .unwrap();
+            (
+                result.bindings[0][1].structural.offset % 4,
+                result.bindings[0][1].offset_variant,
+            )
+        };
+        assert_ne!(second_variant(114), second_variant(115));
+
+        let unchanged = PromptReplacement::repeated(Modality::Image, "<image>", 50, 3);
+        let unchanged_expansion = ModalityExpansion {
+            modality: Modality::Image,
+            search_token_id: Some(100),
+            placeholder_token_id: Some(50),
+            replacements: std::slice::from_ref(&unchanged),
+        };
+        let result = expand_tokens_for_modalities(&[1, 100, 2], &[unchanged_expansion]).unwrap();
+        assert_eq!(result.token_ids, [1, 50, 50, 50, 2]);
+        assert_eq!(result.bindings[0][0].offset_variant, None);
+    }
 
     #[test]
     fn decoded_video_sample_fps_overrides_processor_default() {

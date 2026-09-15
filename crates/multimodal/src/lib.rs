@@ -19,7 +19,7 @@ pub use media::{
     ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSource, VideoFetchConfig,
 };
 pub use registry::{
-    MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer,
+    MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer, ToolResultOrder,
     DEEPSEEK_V41_IMAGE_PLACEHOLDER,
 };
 pub use tracker::{AsyncMultiModalTracker, TrackerOutput};
@@ -30,6 +30,6 @@ pub use types::{
 };
 // Re-export vision processing components
 pub use vision::{
-    DeepseekV41Processor, LlavaNextProcessor, LlavaProcessor, PreProcessorConfig,
-    VisionPreProcessor, VisionProcessorRegistry,
+    DeepseekV41Processor, DeepseekV4VisionProcessor, LlavaNextProcessor, LlavaProcessor,
+    PreProcessorConfig, VisionPreProcessor, VisionProcessorRegistry,
 };
