@@ -8,6 +8,8 @@ on:
     paths:
       - model_gateway/src/service_discovery/**
       - model_gateway/src/mesh_discovery/**
+      # The start/skip gating for both discoveries now lives in `startup`.
+      - model_gateway/src/server.rs
       - model_gateway/tests/k8s_discovery_test.rs
       - e2e_test/kind_discovery/**
       - .github/workflows/e2e-kind-discovery.yml

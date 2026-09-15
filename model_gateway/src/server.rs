@@ -1043,6 +1043,23 @@ pub fn build_app(
         .with_state(app_state))
 }
 
+/// Discovery tasks owned by `startup`, aborted when this guard drops.
+///
+/// Discovery starts before `build_app`, address parsing, and TLS setup, so an
+/// error on any of those paths returns from `startup` early. Dropping a bare
+/// `AbortHandle` does not stop its task, so the guard makes cancellation
+/// unconditional rather than relying on reaching the cleanup block.
+#[derive(Default)]
+struct DiscoveryTasks(Vec<tokio::task::AbortHandle>);
+
+impl Drop for DiscoveryTasks {
+    fn drop(&mut self) {
+        for task in self.0.drain(..) {
+            task.abort();
+        }
+    }
+}
+
 /// Keep a discovery task's abort handle for shutdown while a supervisor logs if
 /// the task ever stops on its own. A watcher that panics or whose stream ends
 /// permanently disables that discovery, so it must not fail silently.
@@ -1414,7 +1431,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // Worker discovery and mesh-router discovery are independent lifetimes:
     // either may run without the other. Each is supervised for unexpected exit
     // and its abort handle held so shutdown cancels it.
-    let mut discovery_tasks: Vec<tokio::task::AbortHandle> = Vec::new();
+    let mut discovery_tasks = DiscoveryTasks::default();
 
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {
@@ -1422,7 +1439,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             match start_service_discovery(service_discovery_config, app_context_arc).await {
                 Ok(handle) => {
                     info!("Service discovery started");
-                    discovery_tasks.push(supervise_discovery("Worker discovery", handle));
+                    discovery_tasks
+                        .0
+                        .push(supervise_discovery("Worker discovery", handle));
                 }
                 Err(e) => {
                     error!("Failed to start service discovery: {e}");
@@ -1442,7 +1461,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 match start_mesh_discovery(mesh_discovery_config, cluster_state, port).await {
                     Ok(handle) => {
                         info!("Mesh router discovery started");
-                        discovery_tasks.push(supervise_discovery("Mesh router discovery", handle));
+                        discovery_tasks
+                            .0
+                            .push(supervise_discovery("Mesh router discovery", handle));
                     }
                     Err(e) => {
                         error!("Failed to start mesh router discovery: {e}");
@@ -1587,9 +1608,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     info!("HTTP server stopped. Starting component cleanup...");
 
-    for task in discovery_tasks {
-        task.abort();
-    }
+    drop(discovery_tasks);
 
     // This triggers background task cancellation, waits for tools, and denies approvals
     if let Some(orchestrator) = app_context.mcp_orchestrator.get() {

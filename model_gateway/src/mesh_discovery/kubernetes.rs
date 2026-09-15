@@ -4,7 +4,10 @@
 //! SWIM/CRDT layer owns convergence, so this is edge-triggered off the watch
 //! stream and keeps no store of its own.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+};
 
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
@@ -67,7 +70,7 @@ impl MeshDiscoveryConfig {
 /// The router Pod fields the mesh cares about.
 struct RouterPodInfo {
     name: String,
-    ip: String,
+    ip: IpAddr,
     phase: String,
     is_ready: bool,
     mesh_port: Option<u16>,
@@ -81,7 +84,17 @@ impl RouterPodInfo {
             return None;
         }
         let status = pod.status.clone()?;
-        let ip = status.pod_ip?;
+        let raw_ip = status.pod_ip?;
+        let ip: IpAddr = match raw_ip.parse() {
+            Ok(ip) => ip,
+            Err(e) => {
+                warn!(
+                    "Router pod {} has an unparseable Pod IP '{}': {e}",
+                    name, raw_ip
+                );
+                return None;
+            }
+        };
 
         let is_ready = status.conditions.as_ref().is_some_and(|conditions| {
             conditions
@@ -94,7 +107,17 @@ impl RouterPodInfo {
             .annotations
             .as_ref()
             .and_then(|annotations| annotations.get(&config.router_mesh_port_annotation))
-            .and_then(|port| port.parse::<u16>().ok());
+            .and_then(|raw| match raw.trim().parse::<u16>() {
+                Ok(port) if port != 0 => Some(port),
+                _ => {
+                    warn!(
+                        "Router pod {}: invalid {} annotation '{}', falling back to the \
+                         gateway's own mesh port",
+                        name, config.router_mesh_port_annotation, raw
+                    );
+                    None
+                }
+            });
 
         Some(RouterPodInfo {
             name,
@@ -170,7 +193,7 @@ fn apply_router_event(
         }
     } else if pod_info.is_healthy() {
         let mesh_port = pod_info.mesh_port.unwrap_or(default_mesh_port);
-        let node_address = format!("{}:{}", pod_info.ip, mesh_port);
+        let node_address = SocketAddr::new(pod_info.ip, mesh_port).to_string();
         let mut state = cluster_state.write();
         let existing_version = state.get(&pod_info.name).map(|n| n.version).unwrap_or(0);
 
@@ -402,6 +425,68 @@ mod tests {
         assert_eq!(
             cluster_state.read().get("r1").unwrap().status,
             NodeStatus::Suspected as i32
+        );
+    }
+
+    #[test]
+    fn test_apply_router_event_brackets_ipv6_addresses() {
+        let (config, mut pod) = router_config_and_pod();
+        if let Some(status) = pod.status.as_mut() {
+            status.pod_ip = Some("fd00::1".to_string());
+        }
+        let cluster_state: ClusterState = Arc::default();
+
+        apply_router_event(&Event::Apply(pod), &config, &cluster_state, 7000);
+        assert_eq!(
+            cluster_state.read().get("r1").unwrap().address,
+            "[fd00::1]:7100"
+        );
+    }
+
+    #[test]
+    fn test_from_pod_rejects_an_unparseable_pod_ip() {
+        let (config, mut pod) = router_config_and_pod();
+        if let Some(status) = pod.status.as_mut() {
+            status.pod_ip = Some("not-an-ip".to_string());
+        }
+        assert!(RouterPodInfo::from_pod(&pod, &config).is_none());
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_invalid_mesh_port_annotation_warns_and_falls_back() {
+        let (config, mut pod) = router_config_and_pod();
+        pod.metadata.annotations = Some(
+            [("sglang.ai/mesh-port".to_string(), "not-a-port".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let cluster_state: ClusterState = Arc::default();
+
+        apply_router_event(&Event::Apply(pod), &config, &cluster_state, 7000);
+        assert_eq!(
+            cluster_state.read().get("r1").unwrap().address,
+            "10.1.0.1:7000",
+            "an unusable annotation must fall back to the configured mesh port"
+        );
+        assert!(logs_contain("invalid sglang.ai/mesh-port annotation"));
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_zero_mesh_port_annotation_is_rejected() {
+        let (config, mut pod) = router_config_and_pod();
+        pod.metadata.annotations = Some(
+            [("sglang.ai/mesh-port".to_string(), "0".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let cluster_state: ClusterState = Arc::default();
+
+        apply_router_event(&Event::Apply(pod), &config, &cluster_state, 7000);
+        assert_eq!(
+            cluster_state.read().get("r1").unwrap().address,
+            "10.1.0.1:7000"
         );
     }
 
