@@ -459,7 +459,9 @@ fn zmq_tokenspeed_mm(
 ) -> Result<Option<tokenspeed_proto::MultimodalInputs>, String> {
     inputs
         .map(|mm| match mm {
-            MultimodalData::TokenSpeed(data) => Ok(data.into_proto(true)),
+            // No RDMA staging: the ZMQ engine reads tensors inline off the wire
+            // and has no puller for `remote` payloads.
+            MultimodalData::TokenSpeed(data) => Ok(data.into_proto(false)),
             other => Err(mm_variant_mismatch("TokenSpeed", &other)),
         })
         .transpose()
