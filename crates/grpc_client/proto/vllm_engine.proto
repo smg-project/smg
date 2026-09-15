@@ -156,6 +156,12 @@ message MultimodalInputs {
   // modality (`pixel_values_videos` / `video_grid_thw`) and expands the video
   // placeholder token instead of the image one. Unset (0) is treated as image.
   smg.grpc.common.Modality modality = 10;
+
+  // Wire key for the primary encoder tensor carried in `pixel_values`: the
+  // model's forward kwarg when it is not the HF-conventional `pixel_values`
+  // (DeepSeek-V4.1 takes `patches`). Absent = pixel_values. `batched_keys`
+  // and `flat_keys` name the tensor by this key.
+  optional string encoder_input_key = 11;
 }
 
 // =====================

@@ -184,12 +184,18 @@ pub(crate) fn build_mm_features(
     let is_video = mm.modality == common::Modality::Video as i32;
     let modality = if is_video { "video" } else { "image" };
 
-    // Decode every tensor once, applying the video key rename.
+    // Decode every tensor once, applying the video key rename. The primary
+    // tensor travels in `pixel_values` but is named by the model's forward
+    // kwarg (`encoder_input_key`, e.g. DeepSeek-V4.1's `patches`).
+    let primary_key = mm
+        .encoder_input_key
+        .clone()
+        .unwrap_or_else(|| "pixel_values".to_string());
     let mut tensors: BTreeMap<String, Decoded> = BTreeMap::new();
     if let Some(pixel_values) = mm.pixel_values {
         tensors.insert(
-            mm_key("pixel_values", is_video),
-            decode_tensor("pixel_values", pixel_values, model_dtype)?,
+            mm_key(&primary_key, is_video),
+            decode_tensor(&primary_key, pixel_values, model_dtype)?,
         );
     }
     for (key, tensor) in mm.model_specific_tensors {
@@ -411,6 +417,34 @@ mod tests {
             flat_keys: Default::default(),
             keep_on_cpu_keys: vec![],
             modality: common::Modality::Image as i32,
+            encoder_input_key: None,
+        }
+    }
+
+    /// DeepSeek-V4.1 names its primary tensor `patches`: the proto's
+    /// `pixel_values` field lands under that key, sliced by the flat sizes
+    /// tensor, and no `pixel_values` kwarg is emitted.
+    #[test]
+    fn encoder_input_key_renames_the_primary_tensor() {
+        let mut mm = base_inputs();
+        mm.encoder_input_key = Some("patches".to_string());
+        mm.batched_keys = vec!["patches_per_image".to_string()];
+        mm.flat_keys = HashMap::from([("patches".to_string(), "patches_per_image".to_string())]);
+        mm.model_specific_tensors.insert(
+            "patches_per_image".to_string(),
+            inline_tensor(vec![2], "int64", i64_bytes(&[1, 1])),
+        );
+        let features = build_mm_features(mm, &[0; 9], ModelDtype::BFloat16).expect("built");
+        assert_eq!(features.len(), 2);
+        for feature in &features {
+            let item = feature.data.as_ref().expect("item present");
+            assert!(
+                item.contains_key("patches"),
+                "{:?}",
+                item.keys().collect::<Vec<_>>()
+            );
+            assert!(!item.contains_key("pixel_values"));
+            assert_eq!(tensor_of(&item["patches"]).shape, vec![1, 4]);
         }
     }
 

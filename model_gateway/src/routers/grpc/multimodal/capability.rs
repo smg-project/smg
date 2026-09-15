@@ -150,6 +150,7 @@ mod tests {
             placeholder_token_id: Some(10),
             field_layouts: EncoderFieldLayouts::default(),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
         }])
         .unwrap()
     }

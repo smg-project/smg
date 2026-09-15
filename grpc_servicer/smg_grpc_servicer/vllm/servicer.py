@@ -53,6 +53,7 @@ from smg_grpc_servicer.vllm.kv_transfer import (
 from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, mm_identity_cache_salt
 
 from ..pd_pairing import pairing_protocol_from_env
+from .mm_keys import modality_key, primary_encoder_key
 
 logger = init_logger(__name__)
 SAMPLING_DEFAULT_KEYS = (
@@ -664,15 +665,17 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         mm_modality = "video" if is_video else "image"
 
         def mm_key(key: str) -> str:
-            if is_video and key == "pixel_values":
-                return "pixel_values_videos"
-            return key
+            return modality_key(key, is_video)
 
         # Deserialize all tensors from proto. The PD decode leg carries no
         # pixel_values (KV arrives via the P/D transfer), only grid tensors.
+        # The primary tensor is registered under the model's forward kwarg
+        # (``encoder_input_key``; DeepSeek-V4.1 takes ``patches``), the same
+        # name the router uses in ``batched_keys`` / ``flat_keys``.
         hf_dict: dict[str, torch.Tensor] = {}
         if mm_proto.HasField("pixel_values"):
-            hf_dict[mm_key("pixel_values")] = _tensor_from_proto(mm_proto.pixel_values)
+            primary_key = mm_key(primary_encoder_key(mm_proto))
+            hf_dict[primary_key] = _tensor_from_proto(mm_proto.pixel_values)
         for key, td in mm_proto.model_specific_tensors.items():
             hf_dict[mm_key(key)] = _tensor_from_proto(td)
 

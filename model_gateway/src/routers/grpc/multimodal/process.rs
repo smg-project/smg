@@ -33,6 +33,7 @@ struct PreparedMultimodalPart {
     placeholder_token_id: Option<u32>,
     field_layouts: EncoderFieldLayouts,
     keep_on_cpu_keys: Vec<String>,
+    encoder_input_key: Option<String>,
 }
 
 /// Process a protocol-independent, ordered media plan.
@@ -262,6 +263,7 @@ pub(crate) async fn process_multimodal_plan(
             placeholder_token_id,
             field_layouts: spec.encoder_field_layouts_for(modality),
             keep_on_cpu_keys: spec.keep_on_cpu_keys_for(modality),
+            encoder_input_key: spec.encoder_input_key_for(modality),
         });
     }
     let preprocess_elapsed_ms = preprocess_started.elapsed().as_secs_f64() * 1000.0;
@@ -302,6 +304,7 @@ pub(crate) async fn process_multimodal_plan(
             placeholder_token_id: part.placeholder_token_id,
             field_layouts: part.field_layouts,
             keep_on_cpu_keys: part.keep_on_cpu_keys,
+            encoder_input_key: part.encoder_input_key,
         })
         .collect::<Vec<_>>();
     let intermediate = MultimodalIntermediate::try_new(batches)?;

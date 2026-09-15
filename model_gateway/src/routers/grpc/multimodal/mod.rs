@@ -193,4 +193,8 @@ pub(crate) struct PrecomputedMultimodalIntermediate {
     pub field_layouts: EncoderFieldLayouts,
     /// Tensor keys that should remain on CPU (vLLM `keep_on_cpu` hint).
     pub keep_on_cpu_keys: Vec<String>,
+    /// Wire key for the primary encoder tensor when the model's forward does
+    /// not take `pixel_values` (DeepSeek-V4.1 takes `patches`); `None` keeps
+    /// the default name.
+    pub encoder_input_key: Option<String>,
 }

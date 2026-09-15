@@ -125,6 +125,9 @@ pub struct VllmMultimodalData {
     pub flat_keys: HashMap<String, String>,
     /// Tensor keys that should remain on CPU (`keep_on_cpu=True` in vLLM).
     pub keep_on_cpu_keys: Vec<String>,
+    /// Wire key for the primary tensor when the model's forward does not take
+    /// `pixel_values` (`None` keeps the default name).
+    pub encoder_input_key: Option<String>,
     /// Input modality (image/video). Selects the video modality
     /// (`pixel_values_videos` / `video_grid_thw`) on the servicer side.
     pub modality: common::Modality,
@@ -337,6 +340,7 @@ impl VllmMultimodalData {
             flat_keys: self.flat_keys,
             keep_on_cpu_keys: self.keep_on_cpu_keys,
             modality: self.modality as i32,
+            encoder_input_key: self.encoder_input_key,
         }
     }
 }
@@ -1406,6 +1410,7 @@ impl ProtoGenerateRequest {
                             keep_on_cpu_keys: retained(&mm_ref.keep_on_cpu_keys),
                             flat_keys,
                             model_specific_tensors: grid_tensors,
+                            encoder_input_key: mm_ref.encoder_input_key.clone(),
                             ..Default::default()
                         });
                     }
@@ -3010,6 +3015,7 @@ mod tests {
             batched_keys: vec![],
             flat_keys: HashMap::new(),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
             modality,
             shm_enabled: false,
             shm_min_bytes: 0,

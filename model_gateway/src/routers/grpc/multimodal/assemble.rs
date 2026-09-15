@@ -230,7 +230,14 @@ fn assemble_vllm(
         }
     };
     let mm_placeholders = placeholders_for_bindings(&intermediate.bindings, false)?;
-    let (batched_keys, flat_keys) = vllm_field_layout_keys(&intermediate.field_layouts);
+    // The primary tensor travels in the proto's `pixel_values` field but is
+    // named by the model's forward kwarg in the layout keys and on the wire.
+    let primary_key = intermediate
+        .encoder_input_key
+        .clone()
+        .unwrap_or_else(|| "pixel_values".to_string());
+    let (batched_keys, flat_keys) =
+        vllm_field_layout_keys(&intermediate.field_layouts, &primary_key);
 
     Ok(VllmMultimodalData {
         pixel_values,
@@ -242,6 +249,7 @@ fn assemble_vllm(
         batched_keys,
         flat_keys,
         keep_on_cpu_keys: intermediate.keep_on_cpu_keys,
+        encoder_input_key: intermediate.encoder_input_key,
         modality,
         shm_enabled: resolve_mm_shm_enabled(workers, false),
         shm_min_bytes: resolve_mm_shm_min_bytes(workers),
@@ -250,14 +258,18 @@ fn assemble_vllm(
     })
 }
 
-/// Translate the neutral layout contract to vLLM's legacy HF field names.
-fn vllm_field_layout_keys(layouts: &EncoderFieldLayouts) -> (Vec<String>, HashMap<String, String>) {
+/// Translate the neutral layout contract to vLLM's HF field names, naming the
+/// primary tensor `primary_key` (`pixel_values` unless the spec renames it).
+fn vllm_field_layout_keys(
+    layouts: &EncoderFieldLayouts,
+    primary_key: &str,
+) -> (Vec<String>, HashMap<String, String>) {
     let mut batched_keys = PreprocessedEncoderInputs::batched_keys(&layouts.model_specific);
     let mut flat_keys = PreprocessedEncoderInputs::flat_keys(&layouts.model_specific);
     match &layouts.encoder_input {
-        FieldLayout::Batched => batched_keys.push("pixel_values".to_string()),
+        FieldLayout::Batched => batched_keys.push(primary_key.to_string()),
         FieldLayout::Flat { sizes_key } => {
-            flat_keys.insert("pixel_values".to_string(), sizes_key.clone());
+            flat_keys.insert(primary_key.to_string(), sizes_key.clone());
         }
     }
     (batched_keys, flat_keys)
@@ -884,6 +896,7 @@ mod tests {
                 ]),
             ),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
         };
 
         let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
@@ -1003,6 +1016,7 @@ mod tests {
                 ]),
             ),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
         };
 
         let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
@@ -1118,6 +1132,7 @@ mod tests {
                 HashMap::from([("row_lengths".to_string(), FieldLayout::Batched)]),
             ),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
         };
 
         let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
@@ -1175,6 +1190,7 @@ mod tests {
             placeholder_token_id: Some(10),
             field_layouts: EncoderFieldLayouts::default(),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
         };
         let video_batch = PrecomputedMultimodalIntermediate {
             preprocessed: one_item_inputs(),
@@ -1196,6 +1212,7 @@ mod tests {
             placeholder_token_id: Some(30),
             field_layouts: EncoderFieldLayouts::default(),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
         };
         let audio_batch = PrecomputedMultimodalIntermediate {
             preprocessed: one_item_inputs(),
@@ -1220,6 +1237,7 @@ mod tests {
             placeholder_token_id: Some(20),
             field_layouts: EncoderFieldLayouts::default(),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
         };
         let intermediate =
             MultimodalIntermediate::try_new(vec![image_batch, video_batch, audio_batch]).unwrap();
@@ -1295,7 +1313,7 @@ mod tests {
             FieldLayout::flat("patches_per_image"),
             HashMap::from([("image_grid_thw".to_string(), FieldLayout::Batched)]),
         );
-        let (batched_keys, flat_keys) = vllm_field_layout_keys(&flat);
+        let (batched_keys, flat_keys) = vllm_field_layout_keys(&flat, "pixel_values");
         assert_eq!(batched_keys, vec!["image_grid_thw"]);
         assert_eq!(
             flat_keys.get("pixel_values").map(String::as_str),
@@ -1303,8 +1321,32 @@ mod tests {
         );
 
         let batched = EncoderFieldLayouts::default();
-        let (batched_keys, flat_keys) = vllm_field_layout_keys(&batched);
+        let (batched_keys, flat_keys) = vllm_field_layout_keys(&batched, "pixel_values");
         assert_eq!(batched_keys, vec!["pixel_values"]);
         assert!(flat_keys.is_empty());
+    }
+
+    /// DeepSeek-V4.1's forward pops `patches`: the layout keys and the wire
+    /// key name the primary tensor by the spec's `encoder_input_key_for`.
+    #[test]
+    fn vllm_layout_adapter_names_the_primary_tensor_by_the_spec_key() {
+        let layouts = EncoderFieldLayouts::new(
+            FieldLayout::flat("patches_per_image"),
+            HashMap::from([
+                ("vit_grid".to_string(), FieldLayout::Batched),
+                ("types".to_string(), FieldLayout::flat("types_per_image")),
+            ]),
+        );
+        let (batched_keys, flat_keys) = vllm_field_layout_keys(&layouts, "patches");
+        assert_eq!(batched_keys, vec!["vit_grid"]);
+        assert_eq!(
+            flat_keys.get("patches").map(String::as_str),
+            Some("patches_per_image")
+        );
+        assert_eq!(
+            flat_keys.get("types").map(String::as_str),
+            Some("types_per_image")
+        );
+        assert!(!flat_keys.contains_key("pixel_values"));
     }
 }
