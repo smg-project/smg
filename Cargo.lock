@@ -6474,6 +6474,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "response-template-parser"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "rfc6979"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7442,6 +7453,7 @@ dependencies = [
  "reasoning-parser",
  "regex",
  "reqwest 0.13.4",
+ "response-template-parser",
  "rmcp",
  "rsa",
  "rustix",

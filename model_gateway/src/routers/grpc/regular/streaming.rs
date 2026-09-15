@@ -3,7 +3,7 @@
 //! This module contains shared streaming logic for both Regular and PD router.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap, HashSet},
     sync::Arc,
     time::Instant,
 };
@@ -28,6 +28,10 @@ use openai_protocol::{
     },
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
+use response_template_parser::{
+    ParseOutput as ResponseTemplateOutput, ParserConfig as ResponseParserConfig,
+    ResponseTemplateError, ResponseTemplateParser, StreamingParser as ResponseStreamingParser,
+};
 use serde_json::{json, Value};
 use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
 use tracing::{debug, error, warn};
@@ -76,6 +80,31 @@ struct CompletionStreamOutcome {
     /// clean EOF partway through leaves this `false` even if some choices
     /// did complete, so a partial result is never mistaken for full usage.
     saw_complete: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ChatStreamError {
+    #[error("{0}")]
+    Message(String),
+    #[error(transparent)]
+    ResponseTemplate(#[from] ResponseTemplateError),
+}
+
+impl From<String> for ChatStreamError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl ChatStreamError {
+    fn sse_error_type(&self) -> &'static str {
+        match self {
+            Self::ResponseTemplate(ResponseTemplateError::PendingOverflow { .. }) => {
+                "response_template_pending_overflow"
+            }
+            _ => "internal_error",
+        }
+    }
 }
 
 /// Shared streaming processor for both single and prefill/decode dispatch modes
@@ -171,7 +200,7 @@ impl StreamingProcessor {
                         .await;
 
                     if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error").await;
+                        utils::send_error_sse(&tx, &e, e.sse_error_type()).await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
@@ -204,7 +233,7 @@ impl StreamingProcessor {
                         .await;
 
                     if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error").await;
+                        utils::send_error_sse(&tx, &e, e.sse_error_type()).await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
@@ -246,7 +275,7 @@ impl StreamingProcessor {
         original_request: ChatResponseSpec,
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ChatStreamError> {
         self.process_streaming_chunks_inner(
             grpc_stream,
             dispatch,
@@ -274,7 +303,7 @@ impl StreamingProcessor {
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ChatStreamError> {
         // Metrics timing
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
@@ -327,6 +356,17 @@ impl StreamingProcessor {
         // Per-request effective parser names (model-card override → configured).
         let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
         let tool_parser_name = self.parser_resolver.tool_parser(model);
+
+        let response_template_parser = original_request
+            .response_template
+            .as_ref()
+            .map(|template| {
+                ResponseTemplateParser::from_json(model, template, ResponseParserConfig::default())
+            })
+            .transpose()?;
+        let mut response_template_streams: HashMap<u32, ResponseStreamingParser> = HashMap::new();
+        let mut response_template_tool_counts: HashMap<u32, usize> = HashMap::new();
+        let mut response_template_external_stops: HashMap<u32, String> = HashMap::new();
 
         // Check parser availability once upfront (log warning only once per request)
         let reasoning_parser_available = separate_reasoning
@@ -409,129 +449,183 @@ impl StreamingProcessor {
             // Text the stop decoder produced for this response, if any. Per-chunk
             // text and the end-of-stream flush both funnel into the shared emission
             // below, so neither can reach the client without being parsed.
-            let pending: Option<(u32, String, Option<ChatLogProbs>)> = match response
-                .map(|response| response.into_response())
-            {
-                Some(ProtoResponseVariant::Chunk(chunk)) => {
-                    // Track TTFT immediately on first chunk received from backend
-                    if first_token_time.is_none() {
-                        first_token_time = Some(Instant::now());
-                        if let Some(timing) = &pd_timing {
-                            Metrics::record_pd_ttft(
-                                self.backend_type,
-                                model,
-                                timing.runtime,
-                                timing.prefill_start.elapsed(),
-                            );
+            let pending: Option<(u32, String, Option<ChatLogProbs>, Option<String>)> =
+                match response.map(|response| response.into_response()) {
+                    Some(ProtoResponseVariant::Chunk(chunk)) => {
+                        // Track TTFT immediately on first chunk received from backend
+                        if first_token_time.is_none() {
+                            first_token_time = Some(Instant::now());
+                            if let Some(timing) = &pd_timing {
+                                Metrics::record_pd_ttft(
+                                    self.backend_type,
+                                    model,
+                                    timing.runtime,
+                                    timing.prefill_start.elapsed(),
+                                );
+                            }
                         }
-                    }
 
-                    let index = chunk.index();
+                        let index = chunk.index();
 
-                    // Once the local stop decoder has fired for an index, ignore
-                    // any further engine output the backend emits for it.
-                    if stopped_indices.contains(&index) {
-                        continue;
-                    }
+                        // Once the local stop decoder has fired for an index, ignore
+                        // any further engine output the backend emits for it.
+                        if stopped_indices.contains(&index) {
+                            continue;
+                        }
 
-                    completion_tokens.record_chunk(&chunk);
+                        completion_tokens.record_chunk(&chunk);
 
-                    // Get or create stop decoder for this index
-                    let stop_decoder = stop_decoders.entry(index).or_insert_with(|| {
-                        let (
-                            ref stop,
-                            ref stop_token_ids,
-                            skip_special_tokens,
-                            no_stop_trim,
-                            ignore_eos,
-                        ) = stop_params;
-                        utils::create_stop_decoder(
-                            &tokenizer,
-                            stop.as_ref(),
-                            stop_token_ids.as_ref(),
-                            skip_special_tokens,
-                            no_stop_trim,
-                            ignore_eos,
-                        )
-                    });
-
-                    // Process tokens through stop decoder
-                    let (chunk_text, should_stop) =
-                        Self::process_chunk_tokens(stop_decoder, chunk.token_ids())?;
-
-                    if should_stop {
-                        // Stop-decoder match takes precedence: pin "stop" even if
-                        // the backend's eventual Complete carries "length" (the
-                        // local stop sequence fired first). Any pre-stop text in
-                        // `chunk_text` is still emitted below before the finish
-                        // reason is flushed in Phase 4.
-                        finish_reasons
-                            .entry(index)
-                            .or_insert_with(|| "stop".to_string());
-                        matched_stops.entry(index).or_insert_with(|| {
-                            stop_decoder
-                                .matched_stop()
-                                .map(|s| Value::String(s.to_string()))
+                        // Get or create stop decoder for this index
+                        let stop_decoder = stop_decoders.entry(index).or_insert_with(|| {
+                            let (
+                                ref stop,
+                                ref stop_token_ids,
+                                skip_special_tokens,
+                                no_stop_trim,
+                                ignore_eos,
+                            ) = stop_params;
+                            utils::create_stop_decoder_with_visible_stop_tokens(
+                                &tokenizer,
+                                stop.as_ref(),
+                                stop_token_ids.as_ref(),
+                                skip_special_tokens,
+                                no_stop_trim,
+                                ignore_eos,
+                                &original_request.template_close_token_ids,
+                            )
                         });
-                        stopped_indices.insert(index);
+
+                        // Process tokens through stop decoder
+                        let (mut chunk_text, should_stop, stop_token_id, stopped_with_text) =
+                            Self::process_chunk_tokens(stop_decoder, chunk.token_ids())?;
+
+                        // `no_stop_trim` keeps ordinary caller-owned stops public,
+                        // but those bytes are not response-template framing. Split
+                        // them off before feeding the private parser; its external
+                        // finish path will preserve them in the mapped output.
+                        let external_visible_stop = if response_template_parser.is_some()
+                            && should_stop
+                            && stopped_with_text
+                            && stop_params.3
+                            && stop_token_id.is_none_or(|id| {
+                                !original_request.template_close_token_ids.contains(&id)
+                            }) {
+                            let literal = stop_decoder
+                                .matched_stop()
+                                .map(str::to_owned)
+                                .or_else(|| {
+                                    stop_token_id
+                                        .and_then(|id| tokenizer.decode(&[id], stop_params.2).ok())
+                                })
+                                .unwrap_or_default();
+                            if !literal.is_empty() && chunk_text.ends_with(&literal) {
+                                chunk_text.truncate(chunk_text.len() - literal.len());
+                                Some(literal)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        if should_stop {
+                            // Stop-decoder match takes precedence: pin "stop" even if
+                            // the backend's eventual Complete carries "length" (the
+                            // local stop sequence fired first). Any pre-stop text in
+                            // `chunk_text` is still emitted below before the finish
+                            // reason is flushed in Phase 4.
+                            finish_reasons
+                                .entry(index)
+                                .or_insert_with(|| "stop".to_string());
+                            matched_stops.entry(index).or_insert_with(|| {
+                                stop_decoder
+                                    .matched_stop()
+                                    .map(|s| Value::String(s.to_string()))
+                                    .filter(|value| {
+                                        !Self::template_owns_matched_stop(&original_request, value)
+                                    })
+                            });
+                            stopped_indices.insert(index);
+                        }
+
+                        if chunk_text.is_empty() && external_visible_stop.is_none() {
+                            continue;
+                        }
+
+                        // Process logprobs if present
+                        let choice_logprobs = chunk.output_logprobs().map(|ref proto_logprobs| {
+                            utils::convert_proto_to_openai_logprobs(proto_logprobs, &tokenizer)
+                        });
+
+                        Some((index, chunk_text, choice_logprobs, external_visible_stop))
                     }
+                    Some(ProtoResponseVariant::Complete(complete)) => {
+                        let index = complete.index();
 
-                    if chunk_text.is_empty() {
-                        continue;
-                    }
+                        // Even a choice whose decoder emitted no text owns one
+                        // parser instance. Feeding an empty chunk validates the
+                        // rendered start anchor; the final pass below applies
+                        // defaults and keeps streaming equal to complete parsing.
+                        if let (Some(template_parser), Entry::Vacant(entry)) = (
+                            response_template_parser.as_ref(),
+                            response_template_streams.entry(index),
+                        ) {
+                            let mut parser = template_parser
+                                .stream(original_request.rendered_prompt_prefix.clone());
+                            let initial = parser.feed(&[])?;
+                            debug_assert!(initial.is_empty());
+                            entry.insert(parser);
+                        }
 
-                    // Process logprobs if present
-                    let choice_logprobs = chunk.output_logprobs().map(|ref proto_logprobs| {
-                        utils::convert_proto_to_openai_logprobs(proto_logprobs, &tokenizer)
-                    });
-
-                    Some((index, chunk_text, choice_logprobs))
-                }
-                Some(ProtoResponseVariant::Complete(complete)) => {
-                    let index = complete.index();
-
-                    // Release whatever the stop decoder still holds. It only ever
-                    // retains a partial stop-sequence match, and it is routed through
-                    // the same parsers as every other chunk rather than straight out.
-                    let flushed =
-                        stop_decoders
-                            .get_mut(&index)
-                            .and_then(|decoder| match decoder.flush() {
-                                SequenceDecoderOutput::Text(text) if !text.is_empty() => Some(text),
-                                _ => None,
+                        // Release whatever the stop decoder still holds. It only ever
+                        // retains a partial stop-sequence match, and it is routed through
+                        // the same parsers as every other chunk rather than straight out.
+                        let flushed =
+                            stop_decoders.get_mut(&index).and_then(|decoder| {
+                                match decoder.flush() {
+                                    SequenceDecoderOutput::Text(text) if !text.is_empty() => {
+                                        Some(text)
+                                    }
+                                    _ => None,
+                                }
                             });
 
-                    // Store metadata
-                    prompt_tokens.insert(index, complete.prompt_tokens());
+                        // Store metadata
+                        prompt_tokens.insert(index, complete.prompt_tokens());
 
-                    completion_tokens.record_complete(&complete);
+                        completion_tokens.record_complete(&complete);
 
-                    cached_tokens.insert(index, complete.cached_tokens());
-                    reasoning_tokens.insert(index, complete.reasoning_tokens());
-                    spec_accepted.insert(index, complete.spec_accepted_tokens());
-                    spec_drafted.insert(index, complete.spec_draft_tokens());
+                        cached_tokens.insert(index, complete.cached_tokens());
+                        reasoning_tokens.insert(index, complete.reasoning_tokens());
+                        spec_accepted.insert(index, complete.spec_accepted_tokens());
+                        spec_drafted.insert(index, complete.spec_draft_tokens());
 
-                    // A local stop-decoder match already pinned "stop" for this
-                    // index; don't let the engine's finish reason overwrite it.
-                    if !stopped_indices.contains(&index) {
-                        finish_reasons.insert(index, complete.finish_reason().to_string());
-                        matched_stops.insert(index, complete.matched_stop_json());
+                        // A local stop-decoder match already pinned "stop" for this
+                        // index; don't let the engine's finish reason overwrite it.
+                        if !stopped_indices.contains(&index) {
+                            finish_reasons.insert(index, complete.finish_reason().to_string());
+                            matched_stops.insert(
+                                index,
+                                complete.matched_stop_json().filter(|value| {
+                                    !Self::template_owns_matched_stop(&original_request, value)
+                                }),
+                            );
+                        }
+
+                        // Don't break - continue reading all Complete messages for n>1
+                        flushed.map(|text| (index, text, None, None))
                     }
+                    Some(ProtoResponseVariant::None) => continue,
+                    None => {
+                        // Preserve the reasoning parser EOF path for template-less responses.
+                        let indices = final_indices
+                            .get_or_insert_with(|| reasoning_parsers.keys().copied().collect());
+                        let Some(index) = indices.pop() else { break };
+                        Some((index, String::new(), None, None))
+                    }
+                };
 
-                    // Don't break - continue reading all Complete messages for n>1
-                    flushed.map(|text| (index, text, None))
-                }
-                Some(ProtoResponseVariant::None) => continue,
-                None => {
-                    // Route each parser's EOF text through the same tool and content path.
-                    let indices = final_indices
-                        .get_or_insert_with(|| reasoning_parsers.keys().copied().collect());
-                    let Some(index) = indices.pop() else { break };
-                    Some((index, String::new(), None))
-                }
-            };
-
-            let Some((index, text, choice_logprobs)) = pending else {
+            let Some((index, text, choice_logprobs, external_visible_stop)) = pending else {
                 continue;
             };
 
@@ -550,6 +644,34 @@ impl StreamingProcessor {
                     .await
                     .map_err(|_| "Failed to send first chunk".to_string())?;
                 is_firsts.insert(index, false);
+            }
+
+            if let Some(parser) = response_template_parser.as_ref() {
+                let stream = response_template_streams.entry(index).or_insert_with(|| {
+                    parser.stream(original_request.rendered_prompt_prefix.clone())
+                });
+                // Feeding even an empty first chunk is intentional: it makes
+                // every per-choice parser validate the rendered start anchor
+                // exactly once before any finish path can apply defaults.
+                let parsed = stream.feed(text.as_bytes())?;
+                Self::emit_response_template_output(
+                    parsed,
+                    index,
+                    &mut response_template_tool_counts,
+                    &mut has_tool_calls,
+                    history_tool_calls_count,
+                    request_id,
+                    model,
+                    created,
+                    system_fingerprint,
+                    tx,
+                    &mut sse_encoder,
+                )
+                .await?;
+                if let Some(stop) = external_visible_stop {
+                    response_template_external_stops.insert(index, stop);
+                }
+                continue;
             }
 
             // Calculate delta
@@ -654,6 +776,30 @@ impl StreamingProcessor {
                     .await
                     .map_err(|_| "Failed to send content chunk".to_string())?;
             }
+        }
+
+        for (index, parser) in &mut response_template_streams {
+            let parsed = if let Some(stop) = response_template_external_stops.remove(index) {
+                let mut parsed = parser.finish()?;
+                parsed.content.push_str(&stop);
+                parsed
+            } else {
+                parser.finish()?
+            };
+            Self::emit_response_template_output(
+                parsed,
+                *index,
+                &mut response_template_tool_counts,
+                &mut has_tool_calls,
+                history_tool_calls_count,
+                request_id,
+                model,
+                created,
+                system_fingerprint,
+                tx,
+                &mut sse_encoder,
+            )
+            .await?;
         }
 
         // Phase 3: End-of-stream parser flush: first any text still buffered
@@ -809,6 +955,107 @@ impl StreamingProcessor {
         Ok(())
     }
 
+    #[expect(clippy::too_many_arguments)]
+    async fn emit_response_template_output(
+        output: ResponseTemplateOutput,
+        index: u32,
+        tool_counts: &mut HashMap<u32, usize>,
+        has_tool_calls: &mut HashMap<u32, bool>,
+        history_tool_calls_count: usize,
+        request_id: &str,
+        model: &str,
+        created: u64,
+        system_fingerprint: Option<&str>,
+        tx: &SseSender,
+        encoder: &mut SseEncoder,
+    ) -> Result<(), ChatStreamError> {
+        if !output.wire_bytes.is_empty() {
+            return Err(ChatStreamError::Message(
+                "Response-template parser exposed private wire bytes".to_string(),
+            ));
+        }
+        if !output.thinking.is_empty() {
+            let chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                .created(created)
+                .add_choice_reasoning(index, output.thinking)
+                .maybe_system_fingerprint(system_fingerprint)
+                .build();
+            let data = encoder
+                .encode_data(&chunk)
+                .map_err(|error| format!("Failed to serialize reasoning chunk: {error}"))?;
+            tx.send(Ok(data))
+                .await
+                .map_err(|_| "Failed to send reasoning chunk".to_string())?;
+        }
+        if !output.content.is_empty() {
+            let chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                .created(created)
+                .add_choice_content(index, "assistant", output.content)
+                .maybe_system_fingerprint(system_fingerprint)
+                .build();
+            let data = encoder
+                .encode_data(&chunk)
+                .map_err(|error| format!("Failed to serialize content chunk: {error}"))?;
+            tx.send(Ok(data))
+                .await
+                .map_err(|_| "Failed to send content chunk".to_string())?;
+        }
+        for call in output.tool_calls {
+            let count = tool_counts.entry(index).or_default();
+            let tool_index = *count;
+            *count += 1;
+            has_tool_calls.insert(index, true);
+            let delta = ToolCallDelta {
+                index: tool_index as u32,
+                id: Some(utils::generate_tool_call_id(
+                    model,
+                    &call.name,
+                    tool_index,
+                    history_tool_calls_count,
+                )),
+                tool_type: Some("function".to_string()),
+                function: Some(FunctionCallDelta {
+                    name: Some(call.name),
+                    arguments: Some(Value::Object(call.arguments).to_string()),
+                }),
+            };
+            let chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                .created(created)
+                .add_choice_tool_call_delta(index, delta)
+                .maybe_system_fingerprint(system_fingerprint)
+                .build();
+            let data = encoder
+                .encode_data(&chunk)
+                .map_err(|error| format!("Failed to serialize tool-call chunk: {error}"))?;
+            tx.send(Ok(data))
+                .await
+                .map_err(|_| "Failed to send tool-call chunk".to_string())?;
+        }
+        Ok(())
+    }
+
+    fn template_owns_matched_stop(request: &ChatResponseSpec, matched_stop: &Value) -> bool {
+        if let Some(token_id) = matched_stop.as_u64().and_then(|id| u32::try_from(id).ok()) {
+            return request.template_close_token_ids.contains(&token_id);
+        }
+        let Some(literal) = matched_stop.as_str() else {
+            return false;
+        };
+        request
+            .response_template
+            .as_ref()
+            .and_then(|template| template.get("fields"))
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|fields| fields.values())
+            .filter_map(|field| field.get("close"))
+            .any(|close| match close {
+                Value::String(value) => value == literal,
+                Value::Array(values) => values.iter().any(|value| value.as_str() == Some(literal)),
+                _ => false,
+            })
+    }
+
     /// Process prefill/decode streaming chunks (prefill + decode) - PD mode
     #[expect(clippy::too_many_arguments)]
     pub async fn process_prefill_decode_streaming_chunks(
@@ -822,7 +1069,7 @@ impl StreamingProcessor {
         tx: &SseSender,
         pd_timing: context::PdTiming,
         reservation: Option<Arc<SharedReservationHandle>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ChatStreamError> {
         // Phase 1.5: Collect input_logprobs from prefill stream if requested
         if original_request.logprobs {
             while let Some(response) = prefill_stream.next().await {
@@ -1383,7 +1630,7 @@ impl StreamingProcessor {
     fn process_chunk_tokens(
         stop_decoder: &mut StopSequenceDecoder,
         token_ids: &[u32],
-    ) -> Result<(String, bool), String> {
+    ) -> Result<(String, bool, Option<u32>, bool), String> {
         let mut chunk_text = String::new();
 
         for &token_id in token_ids {
@@ -1396,15 +1643,15 @@ impl StreamingProcessor {
                 }
                 SequenceDecoderOutput::StoppedWithText(text) => {
                     chunk_text.push_str(&text);
-                    return Ok((chunk_text, true));
+                    return Ok((chunk_text, true, Some(token_id), true));
                 }
                 SequenceDecoderOutput::Stopped => {
-                    return Ok((chunk_text, true));
+                    return Ok((chunk_text, true, Some(token_id), false));
                 }
                 SequenceDecoderOutput::Held => {}
             }
         }
-        Ok((chunk_text, false))
+        Ok((chunk_text, false, None, false))
     }
 
     /// Helper: Process reasoning content in streaming mode
@@ -2091,7 +2338,7 @@ impl StreamingProcessor {
 
                     completion_tokens.record_chunk(&chunk);
 
-                    let (chunk_text, should_stop) =
+                    let (chunk_text, should_stop, _, _) =
                         Self::process_chunk_tokens(&mut stop_decoder, chunk.token_ids())?;
 
                     if should_stop {
@@ -2973,7 +3220,7 @@ impl StreamingProcessor {
                         )
                     });
 
-                    let (decoded_text, stopped) =
+                    let (decoded_text, stopped, _, _) =
                         Self::process_chunk_tokens(stop_decoder, chunk.token_ids())?;
                     chunk_text.clear();
                     chunk_text.push_str(&decoded_text);

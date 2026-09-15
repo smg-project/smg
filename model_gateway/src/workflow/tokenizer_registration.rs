@@ -13,9 +13,10 @@ use async_trait::async_trait;
 use llm_tokenizer::{
     cache::{CacheConfig, CachedTokenizer},
     factory,
-    registry::LoadOutcome,
+    registry::{LoadError, LoadOutcome},
     traits::Tokenizer,
 };
+use response_template_parser::{ParserConfig, ResponseTemplateError, ResponseTemplateParser};
 use serde::{Deserialize, Serialize};
 use smg_grpc_client::{tokenizer_bundle, tokenizer_bundle::StreamBundle};
 use tracing::{debug, error, info, warn};
@@ -112,7 +113,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         // This handles: validation, deduplication, and loading
         let result = app_context
             .tokenizer_registry
-            .load(&id, &name, &source, || {
+            .load_typed(&id, &name, &source, || {
                 let source = source.clone();
                 let chat_template = chat_template.clone();
                 let cache_cfg = cache_config.clone();
@@ -126,20 +127,31 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                     )
                     .await
                     {
-                        Ok(tok) => tok,
+                        Ok(tok) => {
+                            // Validate the local tokenizer's response template before
+                            // considering remote fallback. An invalid template is a
+                            // permanent configuration error, not evidence that the
+                            // tokenizer is absent locally.
+                            validate_response_template(tok.as_ref(), &name)?;
+                            tok
+                        }
                         Err(local_err) => {
                             debug!(
                                 "Local tokenizer load failed for source '{}', attempting to fetch from worker. Error: {:?}",
                                 source, local_err
                             );
 
-                            fetch_tokenizer_from_worker(&app_context, &id, &name).await.map_err(
-                                |worker_err| {
-                                    format!(
+                            match fetch_tokenizer_from_worker(&app_context, &id, &name).await {
+                                Ok(tokenizer) => tokenizer,
+                                Err(error @ LoadError::InvalidResponseTemplate { .. }) => {
+                                    return Err(error);
+                                }
+                                Err(worker_err) => {
+                                    return Err(LoadError::LoadFailed(format!(
                                         "Failed to load tokenizer locally ({local_err}) and remotely from worker ({worker_err})"
-                                    )
-                                },
-                            )?
+                                    )));
+                                }
+                            }
                         }
                     };
 
@@ -187,17 +199,61 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 Ok(StepResult::Success)
             }
             Err(e) => {
-                error!("Failed to load tokenizer '{}': {}", name, e);
-                Err(WorkflowError::StepFailed {
-                    step_id: StepId::new("load_tokenizer"),
-                    message: e.to_string(),
-                })
+                if matches!(e, LoadError::InvalidResponseTemplate { .. }) {
+                    error!("Invalid response template for tokenizer '{}': {}", name, e);
+                } else {
+                    error!("Failed to load tokenizer '{}': {}", name, e);
+                }
+                Err(workflow_error_from_load_error(e))
             }
         }
     }
 
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true // Network/IO errors are retryable
+    fn is_retryable(&self, error: &WorkflowError) -> bool {
+        !matches!(error, WorkflowError::InvalidConfiguration { .. })
+    }
+}
+
+fn workflow_error_from_load_error(error: LoadError) -> WorkflowError {
+    match error {
+        error @ LoadError::InvalidResponseTemplate { .. } => WorkflowError::InvalidConfiguration {
+            message: error.to_string(),
+        },
+        error => WorkflowError::StepFailed {
+            step_id: StepId::new("load_tokenizer"),
+            message: error.to_string(),
+        },
+    }
+}
+
+/// Validate the optional tokenizer-supplied response template without
+/// classifying failures from error text. Parser construction can only make an
+/// invalid-template error permanent; request-time parser failures remain
+/// runtime errors and never flow through registration.
+fn validate_response_template(
+    tokenizer: &dyn Tokenizer,
+    model_name: &str,
+) -> Result<(), LoadError> {
+    let Some(template) = tokenizer.response_template() else {
+        return Ok(());
+    };
+
+    match ResponseTemplateParser::from_json(model_name, template, ParserConfig::default()) {
+        Ok(_) => Ok(()),
+        Err(ResponseTemplateError::InvalidTemplate {
+            model_name,
+            field,
+            limit,
+            reason,
+        }) => Err(LoadError::InvalidResponseTemplate {
+            model_name,
+            field,
+            limit,
+            reason,
+        }),
+        Err(error) => Err(LoadError::LoadFailed(format!(
+            "response template validation failed unexpectedly: {error}"
+        ))),
     }
 }
 
@@ -221,8 +277,13 @@ fn with_optional_cache(
 
 fn load_tokenizer_from_bundle(
     bundle: &StreamBundle,
-) -> Result<(Arc<dyn Tokenizer>, Option<MultimodalModelConfig>), String> {
-    tokenizer_bundle::with_extracted_bundle(bundle, |tokenizer_dir| {
+    model_name: &str,
+) -> Result<(Arc<dyn Tokenizer>, Option<MultimodalModelConfig>), LoadError> {
+    let extracted = tokenizer_bundle::extract_bundle_to_tempdir(bundle)
+        .map_err(|e| LoadError::LoadFailed(format!("bundle extraction failed: {e}")))?;
+
+    let result = (|| {
+        let tokenizer_dir = extracted.path();
         let tokenizer_path = tokenizer_dir.to_string_lossy().into_owned();
         info!(
             "Tokenizer extracted from temporary path: {}",
@@ -230,13 +291,20 @@ fn load_tokenizer_from_bundle(
         );
 
         let tokenizer = factory::create_tokenizer_with_chat_template(&tokenizer_path, None)
-            .map_err(|e| format!("tokenizer load failed: {e}"))?;
+            .map_err(|e| LoadError::LoadFailed(format!("tokenizer load failed: {e}")))?;
+
+        validate_response_template(tokenizer.as_ref(), model_name)?;
 
         let mm_config = try_load_multimodal_config(tokenizer_dir);
 
         Ok((tokenizer, mm_config))
-    })
-    .map_err(|e| format!("bundle extraction/load failed: {e}"))
+    })();
+
+    if let Err(e) = extracted.cleanup() {
+        warn!("Bundle extraction tempdir cleanup failed: {e}");
+    }
+
+    result
 }
 
 /// Best-effort read of `config.json` + `preprocessor_config.json` from a
@@ -283,7 +351,7 @@ async fn fetch_tokenizer_from_worker(
     app_context: &AppContext,
     tokenizer_id: &str,
     model_id: &str,
-) -> Result<Arc<dyn Tokenizer>, String> {
+) -> Result<Arc<dyn Tokenizer>, LoadError> {
     let workers = app_context.worker_registry.get_workers_filtered(
         Some(model_id),
         None,
@@ -293,9 +361,9 @@ async fn fetch_tokenizer_from_worker(
     );
 
     if workers.is_empty() {
-        return Err(format!(
+        return Err(LoadError::LoadFailed(format!(
             "No healthy gRPC worker available to fetch tokenizer for model '{model_id}'"
-        ));
+        )));
     }
 
     let mut failures = Vec::new();
@@ -359,7 +427,7 @@ async fn fetch_tokenizer_from_worker(
             worker.url()
         );
 
-        match load_tokenizer_from_bundle(&bundle) {
+        match load_tokenizer_from_bundle(&bundle, model_id) {
             Ok((tokenizer, mm_config)) => {
                 if let Some(cfg) = mm_config {
                     app_context
@@ -373,6 +441,7 @@ async fn fetch_tokenizer_from_worker(
                 }
                 return Ok(tokenizer);
             }
+            Err(error @ LoadError::InvalidResponseTemplate { .. }) => return Err(error),
             Err(e) => failures.push(format!(
                 "worker {} (runtime: {runtime}) bundle extraction/load failed: {e}",
                 worker.url(),
@@ -381,9 +450,9 @@ async fn fetch_tokenizer_from_worker(
     }
 
     let failures_summary = failures.join("; ");
-    Err(format!(
+    Err(LoadError::LoadFailed(format!(
         "Failed to fetch tokenizer for model '{model_id}' from {worker_count} healthy gRPC worker(s): {failures_summary}"
-    ))
+    )))
 }
 
 // ============================================================================
@@ -517,5 +586,43 @@ mod tests {
         workflow
             .validate()
             .expect("Workflow validation should pass");
+    }
+
+    #[test]
+    fn invalid_response_template_is_a_permanent_workflow_error() {
+        let error = workflow_error_from_load_error(LoadError::InvalidResponseTemplate {
+            model_name: "invalid-model".to_string(),
+            field: "response_template.fields.thinking.open".to_string(),
+            limit: 0,
+            reason: "unsupported expression".to_string(),
+        });
+
+        assert!(matches!(
+            error,
+            WorkflowError::InvalidConfiguration { ref message }
+                if message.contains("invalid-model")
+                    && message.contains("response_template.fields.thinking.open")
+        ));
+        assert!(!<LoadTokenizerStep as StepExecutor<
+            TokenizerWorkflowData,
+        >>::is_retryable(&LoadTokenizerStep, &error,));
+    }
+
+    #[test]
+    fn misleading_io_message_remains_retryable() {
+        let misleading =
+            "I/O failure while reading invalid response template response_template.json";
+        let error = workflow_error_from_load_error(LoadError::LoadFailed(misleading.to_string()));
+
+        assert!(matches!(
+            error,
+            WorkflowError::StepFailed { ref message, .. } if message == misleading
+        ));
+        assert!(
+            <LoadTokenizerStep as StepExecutor<TokenizerWorkflowData>>::is_retryable(
+                &LoadTokenizerStep,
+                &error,
+            )
+        );
     }
 }

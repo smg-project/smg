@@ -627,7 +627,7 @@ pub(crate) fn chat_to_responses(
                 reason: IncompleteReason::MaxOutputTokens,
             }),
         ),
-        Some("tool_calls") => (ResponseStatus::InProgress, None), // Waiting for tool execution
+        Some("tool_calls") => (ResponseStatus::Completed, None),
         Some("failed") | Some("error") => (ResponseStatus::Failed, None),
         _ => (ResponseStatus::Completed, None), // Default to completed
     };

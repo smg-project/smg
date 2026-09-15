@@ -129,6 +129,16 @@ pub trait Tokenizer: Encoder + Decoder {
     /// Enable downcasting to concrete types
     fn as_any(&self) -> &dyn std::any::Any;
 
+    /// Raw checkpoint-declared response template, when present.
+    ///
+    /// The tokenizer deliberately retains the JSON value without interpreting
+    /// it. Registration validates the schema with the response-template parser
+    /// and request handling decides whether to activate that parser. A missing
+    /// value keeps the existing template-less parser precedence unchanged.
+    fn response_template(&self) -> Option<&serde_json::Value> {
+        None
+    }
+
     /// Apply chat template to messages. Default returns an error for tokenizers without template support.
     fn apply_chat_template(
         &self,

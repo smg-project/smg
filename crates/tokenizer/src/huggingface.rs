@@ -41,6 +41,8 @@ pub struct HuggingFaceTokenizer {
     vocab: HashMap<String, TokenIdType>,
     reverse_vocab: HashMap<TokenIdType, String>,
     chat_template: ChatTemplateState,
+    /// Raw `response_template` retained from the sibling tokenizer_config.json.
+    response_template: Option<serde_json::Value>,
     /// EOS token IDs from config.json + generation_config.json
     eos_token_ids: Vec<TokenIdType>,
     /// Which renderer applies chat templates for this model.
@@ -233,6 +235,7 @@ impl HuggingFaceTokenizer {
         // Load tokenizer_config.json once for chat template, add_bos/eos, and special tokens
         let config_result = Self::load_chat_template_and_config(&tokenizer_path.to_string_lossy());
         let mut chat_template_str = config_result.chat_template;
+        let response_template = config_result.response_template;
         let add_bos_token = config_result.add_bos_token;
         let add_eos_token = config_result.add_eos_token;
 
@@ -280,6 +283,7 @@ impl HuggingFaceTokenizer {
             vocab,
             reverse_vocab,
             chat_template: ChatTemplateState::new(chat_template_str)?,
+            response_template,
             eos_token_ids,
             renderer,
         })
@@ -348,6 +352,7 @@ impl HuggingFaceTokenizer {
             vocab,
             reverse_vocab,
             chat_template: ChatTemplateState::empty(),
+            response_template: None,
             eos_token_ids: Vec::new(), // No directory path in from_tokenizer
             renderer: Renderer::Jinja,
         }
@@ -426,6 +431,10 @@ impl HuggingFaceTokenizer {
                 .get("chat_template")
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            // Presence, rather than shape, determines applicability. Keep the
+            // raw value so registration can validate it with the dedicated
+            // parser while preserving model and offending-field context.
+            let response_template = config.get("response_template").cloned();
 
             let add_bos_token = config.get("add_bos_token").and_then(|v| v.as_bool());
             let add_eos_token = config.get("add_eos_token").and_then(|v| v.as_bool());
@@ -448,6 +457,7 @@ impl HuggingFaceTokenizer {
 
             Some(TokenizerConfigResult {
                 chat_template,
+                response_template,
                 add_bos_token,
                 add_eos_token,
                 config_tokens,
@@ -470,6 +480,7 @@ struct ConfigTokens {
 #[derive(Default)]
 struct TokenizerConfigResult {
     chat_template: Option<String>,
+    response_template: Option<serde_json::Value>,
     add_bos_token: Option<bool>,
     add_eos_token: Option<bool>,
     config_tokens: ConfigTokens,
@@ -547,6 +558,10 @@ impl TokenizerTrait for HuggingFaceTokenizer {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn response_template(&self) -> Option<&serde_json::Value> {
+        self.response_template.as_ref()
     }
 
     fn eos_token_ids(&self) -> &[TokenIdType] {
@@ -1001,13 +1016,70 @@ fn apply_deepseek_v41(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, fs};
+
+    use serde_json::json;
+    use tempfile::TempDir;
 
     use super::derive_thinking_mode;
-    use crate::{chat_template::ChatTemplateParams, encoders::deepseek_v32::ThinkingMode};
+    use crate::{
+        chat_template::ChatTemplateParams, encoders::deepseek_v32::ThinkingMode,
+        traits::Tokenizer as _, HuggingFaceTokenizer,
+    };
+
+    const MIN_TOKENIZER_JSON: &str = r#"{
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": { "type": "Whitespace" },
+        "post_processor": null,
+        "decoder": null,
+        "model": {
+            "type": "BPE",
+            "vocab": { "hello": 0 },
+            "merges": []
+        }
+    }"#;
 
     fn thinking_kwargs(value: bool) -> HashMap<String, serde_json::Value> {
         HashMap::from([("thinking".to_string(), serde_json::Value::Bool(value))])
+    }
+
+    #[test]
+    fn response_template_is_retained_from_tokenizer_config() {
+        let temp = TempDir::new().unwrap();
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        fs::write(&tokenizer_path, MIN_TOKENIZER_JSON).unwrap();
+        let expected = json!({
+            "defaults": {"thinking": "", "content": "", "tool_calls": []},
+            "start_anchor_pattern": "anchor",
+            "fields": {"sentinel": "raw-value-is-not-rewritten"}
+        });
+        fs::write(
+            temp.path().join("tokenizer_config.json"),
+            json!({"response_template": expected}).to_string(),
+        )
+        .unwrap();
+
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        assert_eq!(tokenizer.response_template(), Some(&expected));
+    }
+
+    #[test]
+    fn tokenizer_without_response_template_reports_none() {
+        let temp = TempDir::new().unwrap();
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        fs::write(&tokenizer_path, MIN_TOKENIZER_JSON).unwrap();
+        fs::write(
+            temp.path().join("tokenizer_config.json"),
+            json!({"chat_template": "{{ messages }}"}).to_string(),
+        )
+        .unwrap();
+
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        assert_eq!(tokenizer.response_template(), None);
     }
 
     // Regression: DeepSeek V3.2/V4 bypass ChatTemplateState::apply, so the

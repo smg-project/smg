@@ -1,5 +1,5 @@
 [workspace]
-members = ["model_gateway", "crates/protocols", "crates/reasoning_parser", "crates/tool_parser", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp",
+members = ["model_gateway", "crates/protocols", "crates/reasoning_parser", "crates/response_template_parser", "crates/tool_parser", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp",
     "crates/external_router", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/rl", "crates/radix_tree"]
 resolver = "2"
 
@@ -8,6 +8,7 @@ resolver = "2"
 openai-protocol = { version = "1.13.0", path = "crates/protocols" }
 smg-mm-rdma = { version = "0.1.1", path = "crates/mm_rdma" }
 reasoning-parser = { version = "1.7.0", path = "crates/reasoning_parser" }
+response-template-parser = { version = "0.1.0", path = "crates/response_template_parser" }
 tool-parser = { version = "1.7.0", path = "crates/tool_parser" }
 wfaas = { version = "1.1.0", path = "crates/workflow" }
 llm-tokenizer = { version = "1.7.0", path = "crates/tokenizer" }
