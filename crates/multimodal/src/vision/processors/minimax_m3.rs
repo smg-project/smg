@@ -18,7 +18,7 @@
 //! - factor: 28 (patch_size * merge_size)
 //! - min_pixels: 3,136 (4 * 28 * 28)
 //! - max_pixels: 451,584 (576 * 28 * 28) — matches `image_seq_length: 576`
-//! - video max_pixels: 602,112 (768 * 28 * 28)
+//! - video max_pixels: 602,112 (768 * 28 * 28), bounding each frame rather than the sampled volume
 //! - min short side: 112 px (images below it are raised first; video frames are not);
 //!   past roughly 36:1 the raised image overshoots max_pixels, so the grid is its uniform
 //!   scale-down and the short side ends below 112 again
@@ -63,7 +63,7 @@ pub const DEFAULT_MIN_PIXELS: usize = 4 * 28 * 28;
 /// it).
 pub const DEFAULT_MAX_PIXELS: usize = 576 * 28 * 28;
 
-/// Default maximum pixels per video frame (768 * 28 * 28 = 602,112).
+/// Default maximum pixels per video frame (768 * 28 * 28 = 602,112), not per sampled volume.
 pub const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 28 * 28;
 
 /// Short side floor in pixels, four patch factors; smaller images are scaled up to it first.
@@ -140,7 +140,7 @@ impl MiniMaxM3VisionProcessor {
                 max_pixels,
                 video_min_pixels: min_pixels,
                 video_max_pixels,
-                video_resize_mode: QwenVideoResizeMode::TotalVolume,
+                video_resize_mode: QwenVideoResizeMode::PerFrame,
                 temporal_patch_size,
                 mean: CLIP_MEAN,
                 std: CLIP_STD,
@@ -910,6 +910,44 @@ mod tests {
         let base = processor.inner.preprocess_video(&frames, &config).unwrap();
         assert_eq!(out.feature_token_counts, base.feature_token_counts);
         assert_eq!(out.feature_token_counts, vec![14]);
+    }
+
+    fn video_grid_thw(out: &PreprocessedEncoderInputs) -> Vec<i64> {
+        let crate::ModelSpecificValue::IntTensor { data, .. } =
+            &out.model_specific["video_grid_thw"]
+        else {
+            panic!("video_grid_thw is an int tensor");
+        };
+        data.clone()
+    }
+
+    #[test]
+    fn the_video_budget_bounds_each_frame_not_the_sampled_volume() {
+        // 720p lands on 560x1008 (720 tokens per pair) at any frame count; a volume budget gives 392x728 (364) for two frames.
+        let processor = MiniMaxM3VisionProcessor::new();
+        assert_eq!(processor.video_resize_mode(), QwenVideoResizeMode::PerFrame);
+        assert_eq!(processor.video_max_pixels(), 602_112);
+        assert_eq!(
+            processor.smart_resize_video(2, 720, 1280).unwrap(),
+            (560, 1008)
+        );
+        assert_eq!(
+            processor.smart_resize_video(16, 720, 1280).unwrap(),
+            (560, 1008)
+        );
+
+        let config = m3_config();
+        let out = processor
+            .preprocess_video(&vec![DynamicImage::new_rgb8(1280, 720); 2], &config)
+            .unwrap();
+        assert_eq!(video_grid_thw(&out), vec![1, 40, 72]);
+        assert_eq!(out.feature_token_counts, vec![720]);
+
+        let out = processor
+            .preprocess_video(&vec![DynamicImage::new_rgb8(1280, 720); 16], &config)
+            .unwrap();
+        assert_eq!(video_grid_thw(&out), vec![8, 40, 72]);
+        assert_eq!(out.feature_token_counts, vec![5760]);
     }
 
     #[test]
