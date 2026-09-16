@@ -28,6 +28,11 @@ if [ -f ".venv/bin/activate" ]; then
     source .venv/bin/activate
 fi
 
+# CPython dev headers: Triton (and torch's cpp_extension) compile against them
+# at engine startup. Fail here, not 20 minutes later inside a JIT build. Engine
+# lanes only -- CPU lanes (wheel builds) never need them.
+bash "${SCRIPT_DIR}/ci_ensure_python_headers.sh"
+
 # ── Runtime system dependencies ──────────────────────────────────────────────
 export DEBIAN_FRONTEND=noninteractive
 sudo dpkg --configure -a --force-confnew 2>/dev/null || true

@@ -292,7 +292,7 @@ fi
 setup_cuda_env
 # Python dev headers: Triton compiles against them at runtime, and the baked
 # venv skipped the apt repair that used to provide them by accident. Shared
-# with ci_setup_python_venv.sh, which now runs it for every lane.
+# with the other engine install scripts (vllm / sglang / trtllm).
 bash "${SCRIPT_DIR}/ci_ensure_python_headers.sh"
 ensure_rdma_libs
 

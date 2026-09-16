@@ -19,6 +19,11 @@
 # the venv script's repair path, so a host whose `python3 -m venv` just works
 # (Ubuntu 24.04 bare-metal runners) never gets it. Install it explicitly.
 #
+# Called by the engine install scripts (ci_install_{vllm,sglang,trtllm,
+# tokenspeed}.sh) right after they activate the venv. Deliberately NOT part of
+# ci_setup_python_venv.sh: CPU-only lanes (wheel builds) never compile against
+# Python.h and must not inherit an apt dependency for it.
+#
 # Usage: ci_ensure_python_headers.sh [python]
 #   python  interpreter to check; defaults to .venv/bin/python when present,
 #           else python3. posix_prefix resolves against the BASE interpreter of
