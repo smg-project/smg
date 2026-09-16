@@ -19,7 +19,7 @@ pub use media::{
     ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSource, VideoFetchConfig,
 };
 pub use registry::{
-    MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer,
+    MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer,
     DEEPSEEK_V41_IMAGE_PLACEHOLDER,
 };
 pub use tracker::{AsyncMultiModalTracker, TrackerOutput};
