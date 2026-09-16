@@ -6,7 +6,10 @@ KV apart (per-image mm identity) and, for M-RoPE models, decode with
 grid-aware positions from the relayed grid tensors.
 
 Requirements: same as test_pd_mmlu (2 GPUs, 1 prefill + 1 decode). Runs
-under both NIXL and Mooncake KV backends.
+under both NIXL and Mooncake KV backends. Under ``E2E_MM_PROCESSING=worker``
+the legs fetch and process the media themselves, and each class asserts the
+path the gateway took: Qwen3-VL forwards references, Phi-3.5 stays on the
+router path because its placeholder is not one a vLLM worker expands.
 
 Usage:
     E2E_RUNTIME=vllm pytest e2e_test/router/test_pd_multimodal.py -v
@@ -20,6 +23,7 @@ import logging
 from pathlib import Path
 
 import pytest
+from infra import assert_mm_processing
 from PIL import Image
 
 logger = logging.getLogger(__name__)
@@ -105,8 +109,9 @@ class TestPDMultimodalKvIsolation:
     """Grid-less (standard-RoPE) decode leg: isolation via mm cache_salt."""
 
     def test_different_images_same_prefix_do_not_alias(self, setup_backend):
-        backend, model, client, *_ = setup_backend
+        backend, model, client, gateway = setup_backend
         _assert_no_cross_image_aliasing(client, model)
+        assert_mm_processing(gateway, worker_expandable=False)
 
 
 @pytest.mark.engine("vllm")
@@ -123,8 +128,9 @@ class TestPDMultimodalMrope:
     """
 
     def test_mrope_decode_answers_and_does_not_alias(self, setup_backend):
-        backend, model, client, *_ = setup_backend
+        backend, model, client, gateway = setup_backend
         _assert_no_cross_image_aliasing(client, model)
+        assert_mm_processing(gateway, worker_expandable=True)
 
     def test_parallel_sampling_keeps_vision_on_decode(self, setup_backend):
         # n>1 skips the KV handoff, so the decode leg recomputes the prompt

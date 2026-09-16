@@ -15,6 +15,7 @@ import logging
 from pathlib import Path
 
 import pytest
+from infra import assert_mm_processing
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,28 @@ class TestMultimodalQwen3VL:
             f"Expected dog-related content, got: {text}"
         )
         logger.info("Single image URL (stream=%s): %s", stream, text)
+
+    def test_processing_location_matches_lane(self, model, setup_backend):
+        """The gateway records where this lane processed each image request."""
+        _, _, client, gateway = setup_backend
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What animal is in this image?"},
+                        _make_image_content(_image_to_base64_url(DOG_IMAGE_PATH)),
+                    ],
+                }
+            ],
+            temperature=0,
+            max_tokens=16,
+        )
+        assert response.choices[0].message.content
+        # Qwen3-VL's <|image_pad|> anchor is one a vLLM worker expands itself.
+        assert_mm_processing(gateway, worker_expandable=True)
 
     def test_multi_images_mixed(self, model, setup_backend):
         """Test multiple images with mixed base64 and URL inputs, including duplicates."""

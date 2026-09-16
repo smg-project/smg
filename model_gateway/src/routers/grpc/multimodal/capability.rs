@@ -4,9 +4,10 @@
 //! Previously this was implicit and duplicated across assembly (per-backend
 //! `into_single_image_batch` / `into_single_vision_batch` / ad-hoc `bail!`s with
 //! divergent messages). Centralizing it here lets the pipeline reject an
-//! unsupported (engine, modality) request early -- at worker selection, before
-//! any media is fetched or preprocessed -- with one consistent message, and lets
-//! assembly assert against the same matrix as defense in depth.
+//! unsupported (engine, modality) request at worker selection -- once the
+//! runtime is known, before request building assembles the payload -- with one
+//! consistent message, and lets assembly assert against the same matrix as
+//! defense in depth.
 
 use anyhow::Result;
 use llm_multimodal::Modality;
@@ -41,8 +42,8 @@ pub(crate) fn runtime_supports_modality(runtime: RuntimeType, modality: Modality
 
 /// Reject early if the selected backend does not support every modality present
 /// in the request. Runs at worker selection, once the runtime is known but
-/// before media is fetched/preprocessed, so an unsupported combination fails
-/// fast with one clear message instead of dying deep in assembly.
+/// before request building assembles the payload, so an unsupported combination
+/// fails fast with one clear message instead of dying deep in assembly.
 pub(crate) fn ensure_backend_supports_modalities(
     runtime: RuntimeType,
     intermediate: &MultimodalIntermediate,
