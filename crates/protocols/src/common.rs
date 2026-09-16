@@ -513,12 +513,28 @@ fn empty_parameters_schema() -> Value {
     Value::Object(Map::new())
 }
 
+/// An explicit `"parameters": null` means the same as omitting the field
+/// (vLLM reads it as "no schema" too), and `null` is not a JSON Schema, so it
+/// is normalised to the empty schema once here rather than in every consumer:
+/// the structural-tag builders, the JSON-schema constraint and the renderers.
+fn deserialize_parameters<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    Ok(if value.is_null() {
+        empty_parameters_schema()
+    } else {
+        value
+    })
+}
+
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Function {
     pub name: String,
     pub description: Option<String>,
-    #[serde(default = "empty_parameters_schema")]
+    #[serde(
+        default = "empty_parameters_schema",
+        deserialize_with = "deserialize_parameters"
+    )]
     pub parameters: Value, // JSON Schema
     /// Whether to enable strict schema adherence (OpenAI structured outputs)
     pub strict: Option<bool>,
@@ -1231,6 +1247,19 @@ mod tests {
         let value = json!({"name": "web_search", "description": ""});
         let function: Function = serde_json::from_value(value).expect("parameterless function");
         assert_eq!(function.parameters, json!({}));
+
+        // An explicit null is the same thing; `serde(default)` alone would
+        // keep `Value::Null`, which is not a JSON Schema and would reach the
+        // constraint builders as one.
+        let value = json!({"name": "web_search", "parameters": null});
+        let function: Function = serde_json::from_value(value).expect("null parameters");
+        assert_eq!(function.parameters, json!({}));
+
+        // A real schema passes through untouched.
+        let schema = json!({"type": "object", "properties": {"q": {"type": "string"}}});
+        let value = json!({"name": "web_search", "parameters": schema});
+        let function: Function = serde_json::from_value(value).expect("schema");
+        assert_eq!(function.parameters, schema);
     }
 
     #[test]

@@ -106,9 +106,10 @@ impl Glm4MoeParser {
     /// built-in `glm_4_7` tag; TokenSpeed pins 0.2.3, where the tag emitted
     /// here compiles with `Grammar.from_structural_tag` and accepts the
     /// model's real call syntax. The schema is passed through as written,
-    /// like every other builder in this crate: a no-argument tool arrives as
-    /// `{}` (the deserialization default) and renders as a call with an empty
-    /// argument body.
+    /// like the JSON-schema builders (mistral, kimik2, inkling): a tool with
+    /// no parameters, whether the field is absent or an explicit `null`,
+    /// arrives as `{}` (`Function::parameters` normalises both) and renders
+    /// as a call with an empty argument body.
     ///
     /// Like the other builders in this crate (and unlike xgrammar's built-in,
     /// which prepends a `</think>`-terminated reasoning block when asked),
