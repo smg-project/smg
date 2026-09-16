@@ -39,6 +39,7 @@ from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
 from smg_grpc_servicer import mm_shm
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
+from smg_grpc_servicer.vllm import attach_vllm_logging
 from smg_grpc_servicer.vllm.admin import flush_cache
 from smg_grpc_servicer.vllm.kv_events import (
     endpoint_for_rank,
@@ -51,12 +52,19 @@ from smg_grpc_servicer.vllm.kv_transfer import (
     params_to_response_fields,
     resolve_pd_connector,
 )
+from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
+from smg_grpc_servicer.vllm.mm_processor import (
+    ENV_PROCESSOR,
+    MmProcessorUnavailable,
+    build_mm_processor,
+)
 from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, mm_identity_cache_salt
 
 from ..pd_pairing import pairing_protocol_from_env
 from .mm_keys import modality_key, primary_encoder_key
 
 logger = init_logger(__name__)
+attach_vllm_logging()
 SAMPLING_DEFAULT_KEYS = (
     "temperature",
     "top_p",
@@ -161,7 +169,17 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # Resolve KV-event publishing config from the engine. Non-None only when
         # vLLM was started with --kv-events-config enabling the ZMQ publisher.
         self._kv_events_config = resolve_kv_events_config(async_llm)
-        logger.info("VllmEngineServicer initialized")
+        # Worker-side media processing (media_refs); None keeps refs rejected.
+        self._mm_processor = build_mm_processor(async_llm)
+        self._mm_inflight = (
+            asyncio.Semaphore(self._mm_processor.max_inflight)
+            if self._mm_processor is not None
+            else None
+        )
+        logger.info(
+            "VllmEngineServicer initialized (mm_processor=%s)",
+            self._mm_processor.name if self._mm_processor is not None else "off",
+        )
 
     async def Generate(
         self,
@@ -188,12 +206,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         has_preprocessed_mm = request.HasField("mm_inputs") and has_preprocessed_mm_payload(
             request.mm_inputs
         )
+        media_ref_count = len(request.media_refs.items) if request.HasField("media_refs") else 0
         logger.info(
-            "Generate request %s: input_type=%s, stream=%s, preprocessed_mm=%s, dp_rank=%s",
+            "Generate request %s: input_type=%s, stream=%s, preprocessed_mm=%s, "
+            "media_refs=%d, dp_rank=%s",
             request_id,
             input_type,
             request.stream,
             has_preprocessed_mm,
+            media_ref_count,
             request.data_parallel_rank if request.HasField("data_parallel_rank") else None,
         )
 
@@ -203,7 +224,29 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             arrival_time = time.time()
             kv_transfer_params = params_from_request(request)
 
-            if has_preprocessed_mm and input_type == "tokenized":
+            if request.HasField("media_refs"):
+                # Media references from the router: the worker fetches and runs
+                # vLLM's own processor over the unexpanded placeholder anchors.
+                if input_type != "tokenized" or request.HasField("mm_inputs"):
+                    raise ValueError(
+                        "media_refs requires tokenized input and is mutually exclusive "
+                        "with mm_inputs"
+                    )
+                if self._mm_processor is None:
+                    raise ValueError(
+                        f"media_refs sent but {ENV_PROCESSOR} is off on this worker; check the "
+                        "router's SMG_MM_PROCESSING and this worker's mm_processor label"
+                    )
+                items = parse_media_refs(request.media_refs)
+                validate_schemes(items, self._mm_processor.accepted_schemes)
+                async with self._mm_inflight:
+                    prompt = await self._mm_processor.process(
+                        list(request.tokenized.input_ids),
+                        request.tokenized.original_text or None,
+                        items,
+                        arrival_time,
+                    )
+            elif has_preprocessed_mm and input_type == "tokenized":
                 # A pixel-less payload (PD decode leg) is only decodable with
                 # remote KV: a local recompute would schedule the vision
                 # encoder with no pixels and crash the engine.
@@ -308,6 +351,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # Invalid request error (equiv to 400).
             await self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
+        except MmProcessorUnavailable as e:
+            # Retryable: the router re-selects a worker on UNAVAILABLE.
+            logger.warning("Media processing unavailable for request %s: %s", request_id, e)
+            await self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(e))
         except Exception as e:
             logger.exception("Error in Generate for request %s", request_id)
             await self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
@@ -530,12 +578,24 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # `{id}_dp{rank}` and the router derives the suffix from the rank it
             # pins per request.
 
+        mm_processor = ""
+        mm_media_ref_schemes = ""
+        if (
+            self._mm_processor is not None
+            and self.engine.model_config.is_multimodal_model
+            and await self._mm_processor.probe()
+        ):
+            mm_processor = self._mm_processor.name
+            mm_media_ref_schemes = self._mm_processor.schemes
+
         return vllm_engine_pb2.GetServerInfoResponse(
             kv_connector=kv_connector,
             kv_role=kv_role,
             kv_engine_id=kv_engine_id,
             data_parallel_size=parallel.data_parallel_size,
             shm_namespace_id=mm_shm.shm_namespace_id(),
+            mm_processor=mm_processor,
+            mm_media_ref_schemes=mm_media_ref_schemes,
             pairing_protocol=pairing_protocol_from_env(),
             **pairing_fields(self.engine.vllm_config),
         )

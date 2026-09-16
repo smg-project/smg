@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smg-grpc-servicer"
-version = "0.9.1"
+version = "0.10.0"
 description = "SMG gRPC servicer implementations for LLM inference engines (vLLM, MLX, TokenSpeed, SGLang)"
 requires-python = ">=3.10"
 dependencies = [
-    "smg-grpc-proto>=0.4.18",  # 0.4.18: first release with GetServerInfoResponse.pairing_protocol (15)
+    "smg-grpc-proto>=0.4.19",  # 0.4.19: first release with GenerateRequest.media_refs (field 10)
     "grpcio>=1.81.1",
     "grpcio-reflection>=1.81.1",
     "grpcio-health-checking>=1.81.1",
