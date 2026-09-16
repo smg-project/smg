@@ -16,6 +16,7 @@
 //! abort payload is a plain msgpack `list[str]` of request ids, not a tagged
 //! struct.
 
+pub mod multimodal;
 pub mod output;
 pub mod request;
 pub mod sampling;

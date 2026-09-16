@@ -2,7 +2,8 @@
 mod common;
 
 use common::create_test_tools;
-use tool_parser::{Glm4MoeParser, ParserFactory, ToolParser};
+use openai_protocol::common::{ToolChoice, ToolChoiceValue};
+use tool_parser::{Glm4MoeParser, ParserFactory, ToolConstraint, ToolParser};
 
 #[tokio::test]
 async fn test_glm47_complete_parsing() {
@@ -114,6 +115,51 @@ async fn test_glm5_routes_to_glm47_moe() {
         let (_, tools) = parser.parse_complete(input).await.unwrap();
         assert_eq!(tools.len(), 1, "{model} should extract one tool call");
         assert_eq!(tools[0].function.name, "get_weather", "{model}");
+    }
+}
+
+/// #2548: a GLM-4.7-family request that offers no tools must not carry the
+/// full-assistant EBNF — an engine launched without a grammar backend
+/// (TokenSpeed's default) rejects every constrained request, and plain chat
+/// has nothing to constrain. Tools in auto mode still get the grammar, and
+/// `tool_choice: none` with tools offered gets the grammar that forbids calls.
+#[test]
+fn test_glm47_chat_constraint_only_when_tools_are_offered() {
+    let factory = ParserFactory::new();
+    let registry = factory.registry();
+    let parser = Some("glm47_moe");
+    let auto = ToolChoice::Value(ToolChoiceValue::Auto);
+
+    let none_offered = registry
+        .generate_chat_constraint(parser, &[], &auto, true)
+        .unwrap();
+    assert!(
+        none_offered.is_none(),
+        "no tools, no grammar: {none_offered:?}"
+    );
+    // The response side reads the same predicate, so it must agree.
+    assert!(!registry.uses_full_assistant_constraint(parser, &[]));
+
+    let tools = create_test_tools();
+    match registry
+        .generate_chat_constraint(parser, &tools, &auto, true)
+        .unwrap()
+    {
+        Some(ToolConstraint::Ebnf(grammar)) => {
+            assert!(grammar.contains("tool_calls ::= tool_call*"), "{grammar}");
+        }
+        other => panic!("tools in auto mode must yield the EBNF, got {other:?}"),
+    }
+
+    let none = ToolChoice::Value(ToolChoiceValue::None);
+    match registry
+        .generate_chat_constraint(parser, &tools, &none, true)
+        .unwrap()
+    {
+        Some(ToolConstraint::Ebnf(grammar)) => {
+            assert!(grammar.contains("tool_calls ::= \"\""), "{grammar}");
+        }
+        other => panic!("tool_choice none must forbid calls with a grammar, got {other:?}"),
     }
 }
 

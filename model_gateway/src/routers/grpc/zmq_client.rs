@@ -11,19 +11,26 @@
 // the request-execution stage is reused unchanged.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
     sync::{Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use engine_zmq_client::{
-    codec::dtype::ModelDtype,
+    codec::{
+        dtype::ModelDtype,
+        tensor::{checked_numel, WireTensor},
+    },
     connect_handshake,
     connector::{EngineCoreClient, EngineCoreStream, TokenSpeedClient, TokenSpeedStream},
     protocol::{
         tokenspeed::{
-            output::TokenSpeedOutput, request::TokenizedGenerateReqInput,
+            multimodal::{
+                mm_pad_value, TokenSpeedWireMmInputs, TokenSpeedWireMmItem, TokenSpeedWireModality,
+            },
+            output::TokenSpeedOutput,
+            request::TokenizedGenerateReqInput,
             sampling::SamplingParams as TokenSpeedSamplingParams,
         },
         vllm::{
@@ -40,7 +47,8 @@ use engine_zmq_client::{
 use futures::{stream::SelectAll, Stream, StreamExt};
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
-use smg_grpc_client::{tokenspeed_proto, vllm_proto as vllm};
+use smg_grpc_client::{common_proto as common, tokenspeed_proto, vllm_proto as vllm};
+use tracing::warn;
 
 use crate::{
     routers::grpc::{
@@ -1336,18 +1344,18 @@ fn fan_out_tokenspeed_requests(
 fn translate_request_tokenspeed(
     req: tokenspeed_proto::GenerateRequest,
 ) -> Result<TokenizedGenerateReqInput, String> {
-    // The TokenSpeed ZMQ wire has no multimodal slot yet; reject loudly rather
-    // than silently dropping pixels (assembly also refuses upstream).
-    if req.mm_inputs.is_some() {
-        return Err(
-            "multimodal inputs are not supported over the TokenSpeed ZMQ backend".to_string(),
-        );
-    }
-    let input_ids = match req.tokenized {
+    let mut input_ids = match req.tokenized {
         Some(tokenized) => tokenized.input_ids,
         None => {
             return Err("ZMQ mode requires pre-tokenized input; no input provided".to_string());
         }
+    };
+    let (input_ids_unpadded, multimodal_inputs) = match req.mm_inputs {
+        Some(mm) => {
+            let (unpadded, inputs) = translate_tokenspeed_multimodal(mm, &mut input_ids)?;
+            (Some(unpadded), Some(inputs))
+        }
+        None => (None, None),
     };
     // Over the ZMQ wire TokenSpeed returns only the single sampled-token logprob
     // per token: no top-k candidates (`top_logprobs_num > 1`) and no prompt
@@ -1375,10 +1383,189 @@ fn translate_request_tokenspeed(
             }),
         return_logprob: req.return_logprob,
         stream: req.stream,
-        // Every other field keeps its neutral default (the fields after
-        // `stream` are not even emitted; the engine fills them from defaults).
+        input_ids_unpadded,
+        multimodal_inputs,
+        // Every other field keeps its neutral default (text requests do not
+        // even emit the fields after `stream`; the engine fills them from
+        // defaults).
         ..TokenizedGenerateReqInput::default()
     })
+}
+
+/// Map the proto multimodal payload onto the TokenSpeed wire structs, doing
+/// the work the engine's `InputProcessor` does on other transports but the
+/// msgpack path bypasses: derive each item's pad value from its content hash
+/// and substitute it into the placeholder ranges of `input_ids`. Returns the
+/// original ids (for `input_ids_unpadded`, which detokenization reads) and
+/// the wire payload.
+fn translate_tokenspeed_multimodal(
+    mm: tokenspeed_proto::MultimodalInputs,
+    input_ids: &mut [u32],
+) -> Result<(Vec<u32>, TokenSpeedWireMmInputs), String> {
+    if mm.items.is_empty() {
+        return Err("multimodal payload carried no items".to_string());
+    }
+    let unpadded = input_ids.to_vec();
+    let mut im_token_id = None;
+    let mut video_token_id = None;
+    let mut mm_items = Vec::with_capacity(mm.items.len());
+    for item in mm.items {
+        // The proto and engine modality enums disagree (proto: AUDIO=2,
+        // VIDEO=3; engine: VIDEO=2, AUDIO=3) — translate, never pass through.
+        // Unknown values are rejected, mirroring the gRPC servicer's
+        // `_modality_from_proto`.
+        let modality = match item.modality() {
+            common::Modality::Image => TokenSpeedWireModality::Image,
+            common::Modality::Video => TokenSpeedWireModality::Video,
+            common::Modality::Audio => TokenSpeedWireModality::Audio,
+            common::Modality::Unspecified => {
+                return Err("multimodal item carried an unspecified modality".to_string());
+            }
+        };
+        if item.content_hash.is_empty() {
+            return Err(
+                "multimodal item carried no content hash; the engine pad value derives from it"
+                    .to_string(),
+            );
+        }
+        // u64 little-endian fold of the leading hash bytes — the same fold the
+        // gRPC servicer applies (`int.from_bytes(content_hash[:8], "little")`),
+        // so an item hashes identically on both transports.
+        let mut hash_bytes = [0u8; 8];
+        for (dst, src) in hash_bytes.iter_mut().zip(item.content_hash.iter()) {
+            *dst = *src;
+        }
+        let hash = u64::from_le_bytes(hash_bytes);
+        let pad_value = mm_pad_value(modality, hash);
+
+        if item.placeholders.is_empty() {
+            return Err("multimodal item carried no placeholders".to_string());
+        }
+        let mut offsets = Vec::with_capacity(item.placeholders.len());
+        for placeholder in &item.placeholders {
+            if placeholder.length == 0 {
+                return Err("multimodal placeholder length must be > 0".to_string());
+            }
+            let start = placeholder.offset as usize;
+            let end = start + placeholder.length as usize - 1;
+            if end >= input_ids.len() {
+                return Err(format!(
+                    "multimodal placeholder [{start}, {end}] exceeds the {} prompt tokens",
+                    input_ids.len()
+                ));
+            }
+            for id in &mut input_ids[start..=end] {
+                *id = pad_value;
+            }
+            offsets.push((start as u64, end as u64));
+        }
+        match modality {
+            TokenSpeedWireModality::Image => {
+                im_token_id = im_token_id.or(item.placeholder_token_id);
+            }
+            TokenSpeedWireModality::Video => {
+                video_token_id = video_token_id.or(item.placeholder_token_id);
+            }
+            TokenSpeedWireModality::Audio => {}
+        }
+
+        let feature = wire_tensor_tokenspeed(
+            item.encoder_input
+                .ok_or("multimodal item carried no encoder_input")?,
+        )?;
+        let mut model_specific_data = BTreeMap::new();
+        for (name, tensor) in item.model_specific_tensors {
+            model_specific_data.insert(name, wire_tensor_tokenspeed(tensor)?);
+        }
+        // Nothing on the msgpack path computes `mrope_positions` (the engine's
+        // InputProcessor is bypassed), and shipping nil silently degrades
+        // image grounding to 1-D positions. For the known MRoPE families the
+        // grid tensors are the tell: fail loudly rather than succeed wrong.
+        for key in ["image_grid_thw", "video_grid_thw"] {
+            if model_specific_data.contains_key(key) {
+                return Err(format!(
+                    "multimodal item carries {key:?}: MRoPE position tensors are not \
+                     derivable over the TokenSpeed ZMQ wire yet; use the gRPC transport \
+                     for this model"
+                ));
+            }
+        }
+        mm_items.push(TokenSpeedWireMmItem {
+            modality,
+            hash,
+            pad_value,
+            offsets,
+            feature,
+            model_specific_data,
+        });
+    }
+    // Surface the position-tensor gap in the gateway's own logs (once per
+    // process): models outside the gated MRoPE families still receive no
+    // mrope_positions on this wire.
+    static MROPE_POSITIONS_NOTE: std::sync::Once = std::sync::Once::new();
+    MROPE_POSITIONS_NOTE.call_once(|| {
+        warn!(
+            "TokenSpeed ZMQ multimodal requests carry no mrope_positions; models that \
+             require them fall back to 1-D positions engine-side"
+        );
+    });
+    Ok((
+        unpadded,
+        TokenSpeedWireMmInputs {
+            mm_items,
+            im_token_id,
+            video_token_id,
+        },
+    ))
+}
+
+/// Convert an inline proto tensor to the wire `(dtype, shape, ext)` tuple.
+/// SHM/remote payloads never reach this translate: ZMQ assembly runs with SHM
+/// disabled and RDMA staging off.
+fn wire_tensor_tokenspeed(tensor: tokenspeed_proto::TensorData) -> Result<WireTensor, String> {
+    let bytes = match tensor.payload {
+        Some(tokenspeed_proto::tensor_data::Payload::Inline(bytes)) => bytes,
+        Some(_) => {
+            return Err(
+                "ZMQ multimodal requires inline tensor payloads; got a SHM/remote handle"
+                    .to_string(),
+            );
+        }
+        None => return Err("multimodal tensor carried no payload".to_string()),
+    };
+    let shape: Vec<usize> = tensor.shape.iter().map(|&d| d as usize).collect();
+    // The engine views raw bytes as the named dtype, and a malformed frame is
+    // silently dropped engine-side (no terminal frame back) — so a byte-count
+    // mismatch must fail here, where the client still gets an error.
+    if let Some(width) = tensor_dtype_width(&tensor.dtype) {
+        let numel =
+            checked_numel(&shape).ok_or_else(|| "multimodal tensor shape overflows".to_string())?;
+        if numel * width != bytes.len() {
+            return Err(format!(
+                "multimodal tensor byte length {} does not match dtype {:?} shape {:?}",
+                bytes.len(),
+                tensor.dtype,
+                tensor.shape
+            ));
+        }
+    }
+    Ok(WireTensor::from_raw_bytes(
+        tensor.dtype,
+        shape,
+        bytes.into(),
+    ))
+}
+
+/// Byte width of the wire dtypes the gateway emits; `None` for dtypes we do
+/// not recognize (passed through unvalidated rather than rejected).
+fn tensor_dtype_width(dtype: &str) -> Option<usize> {
+    match dtype {
+        "float64" | "int64" | "uint64" => Some(8),
+        "float32" | "int32" | "uint32" => Some(4),
+        "bfloat16" | "float16" | "int16" | "uint16" => Some(2),
+        "uint8" | "int8" | "bool" => Some(1),
+        _ => None,
+    }
 }
 
 /// Map TokenSpeed proto sampling params onto the wire `SamplingParams`, in the
@@ -2738,13 +2925,124 @@ mod tests {
         assert_eq!(req.sampling_params.stop, None);
     }
 
+    fn ts_mm_item(hash: &[u8], offset: u32, length: u32) -> tokenspeed_proto::MultimodalItem {
+        tokenspeed_proto::MultimodalItem {
+            modality: common::Modality::Image as i32,
+            content_hash: hash.to_vec(),
+            encoder_input: Some(tokenspeed_proto::TensorData {
+                shape: vec![2, 4],
+                dtype: "bfloat16".to_string(),
+                payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(vec![
+                    0u8;
+                    16
+                ])),
+            }),
+            model_specific_tensors: [(
+                "vit_grid".to_string(),
+                tokenspeed_proto::TensorData {
+                    shape: vec![1, 3],
+                    dtype: "uint32".to_string(),
+                    payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(vec![
+                        0u8;
+                        12
+                    ])),
+                },
+            )]
+            .into(),
+            placeholders: vec![tokenspeed_proto::PlaceholderRange { offset, length }],
+            placeholder_token_id: Some(9),
+        }
+    }
+
     #[test]
-    fn tokenspeed_rejects_multimodal_inputs() {
-        // The TokenSpeed ZMQ wire has no multimodal slot yet; reject rather than
-        // silently drop pixels.
+    fn tokenspeed_translates_multimodal_inputs() {
+        // The translate does the engine InputProcessor's job (bypassed on the
+        // msgpack path): pad-value substitution into input_ids, unpadded ids
+        // preserved, offsets converted to inclusive [start, end] pairs.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
-        req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs::default());
-        assert!(translate_request_tokenspeed(req).is_err());
+        req.tokenized.as_mut().unwrap().input_ids = vec![10, 20, 30, 40, 50];
+        req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
+            items: vec![ts_mm_item(&0xDEAD_BEEFu64.to_le_bytes(), 1, 3)],
+        });
+        let wire = translate_request_tokenspeed(req).expect("translated");
+
+        let expected_pad = mm_pad_value(TokenSpeedWireModality::Image, 0xDEAD_BEEF);
+        assert_eq!(
+            wire.input_ids,
+            vec![10, expected_pad, expected_pad, expected_pad, 50]
+        );
+        assert_eq!(wire.input_ids_unpadded, Some(vec![10, 20, 30, 40, 50]));
+
+        let mm = wire.multimodal_inputs.expect("mm payload");
+        assert_eq!(mm.im_token_id, Some(9));
+        assert_eq!(mm.video_token_id, None);
+        assert_eq!(mm.mm_items.len(), 1);
+        let item = &mm.mm_items[0];
+        assert_eq!(item.modality, TokenSpeedWireModality::Image);
+        assert_eq!(item.hash, 0xDEAD_BEEF);
+        assert_eq!(item.pad_value, expected_pad);
+        assert_eq!(item.offsets, vec![(1, 3)]);
+        assert_eq!(item.model_specific_data["vit_grid"].dtype, "uint32");
+    }
+
+    #[test]
+    fn tokenspeed_multimodal_rejects_bad_items() {
+        // Out-of-bounds placeholder: prompt has 3 tokens, range needs 4.
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
+            items: vec![ts_mm_item(b"12345678", 1, 3)],
+        });
+        assert!(translate_request_tokenspeed(req)
+            .unwrap_err()
+            .contains("exceeds"));
+
+        // Missing content hash: pad value cannot be derived.
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
+            items: vec![ts_mm_item(b"", 0, 1)],
+        });
+        assert!(translate_request_tokenspeed(req)
+            .unwrap_err()
+            .contains("content hash"));
+
+        // Byte-length mismatch would be silently dropped engine-side; the
+        // translate must catch it while the client can still see an error.
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        let mut item = ts_mm_item(b"12345678", 0, 1);
+        item.encoder_input.as_mut().unwrap().shape = vec![3, 4];
+        req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
+        assert!(translate_request_tokenspeed(req)
+            .unwrap_err()
+            .contains("byte length"));
+
+        // Unspecified modality is rejected, mirroring the gRPC servicer.
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        let mut item = ts_mm_item(b"12345678", 0, 1);
+        item.modality = common::Modality::Unspecified as i32;
+        req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
+        assert!(translate_request_tokenspeed(req)
+            .unwrap_err()
+            .contains("modality"));
+
+        // Known MRoPE families fail loudly: nothing derives mrope_positions
+        // on this wire, and 1-D fallback would silently degrade grounding.
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        let mut item = ts_mm_item(b"12345678", 0, 1);
+        item.model_specific_tensors.insert(
+            "image_grid_thw".to_string(),
+            tokenspeed_proto::TensorData {
+                shape: vec![1, 3],
+                dtype: "uint32".to_string(),
+                payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(vec![
+                    0u8;
+                    12
+                ])),
+            },
+        );
+        req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
+        assert!(translate_request_tokenspeed(req)
+            .unwrap_err()
+            .contains("MRoPE"));
     }
 
     #[test]
