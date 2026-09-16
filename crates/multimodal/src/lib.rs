@@ -26,7 +26,8 @@ pub use tracker::{AsyncMultiModalTracker, TrackerOutput};
 pub use types::{
     AudioClip, AudioSource, EncoderFieldLayouts, FieldLayout, ImageDetail, ImageFrame, ImageSize,
     ImageSource, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, PlaceholderRange,
-    PromptReplacement, RgbFrameRef, TokenId, TrackedMedia, VideoClip, VideoSource,
+    PromptReplacement, RgbFrameRef, TokenId, TrackedMedia, VideoClip, VideoSamplingInfo,
+    VideoSource,
 };
 // Re-export vision processing components
 pub use vision::{
