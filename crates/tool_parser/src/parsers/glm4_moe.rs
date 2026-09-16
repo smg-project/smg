@@ -98,26 +98,35 @@ impl Glm4MoeParser {
     /// `glm_xml` style (`<arg_key>k</arg_key><arg_value>v</arg_value>`), then
     /// `</tool_call>`; free text is allowed around the calls and `<tool_call>`
     /// is the trigger. `at_least_one` forces a call, for `required` and named
-    /// choices. A tool with `strict: false` keeps the syntax constraint but
-    /// not its schema (`json_schema: true`), as xgrammar and OpenAI's
-    /// `strict` contract do; an unset or true `strict` constrains the schema.
+    /// choices.
+    ///
+    /// Wire shape: `{"type": "json_schema", "json_schema": …, "style":
+    /// "glm_xml"}` is xgrammar's `JSONSchemaFormat` (python/xgrammar/
+    /// structural_tag.py), present since the 0.2 line that also ships the
+    /// built-in `glm_4_7` tag; TokenSpeed pins 0.2.3, where the tag emitted
+    /// here compiles with `Grammar.from_structural_tag` and accepts the
+    /// model's real call syntax. The schema is passed through as written,
+    /// like every other builder in this crate: a no-argument tool arrives as
+    /// `{}` (the deserialization default) and renders as a call with an empty
+    /// argument body.
+    ///
+    /// Like the other builders in this crate (and unlike xgrammar's built-in,
+    /// which prepends a `</think>`-terminated reasoning block when asked),
+    /// the tag carries no reasoning prefix: a forced call on a prompt that
+    /// ends inside `<think>` starts before any reasoning. Passing the
+    /// thinking state into the registry so every builder can emit the prefix
+    /// is a separate change.
     pub fn build_structural_tag(tools: &[Tool], at_least_one: bool) -> Value {
         let tags: Vec<Value> = tools
             .iter()
             .filter(|tool| !tool.function.name.is_empty())
             .map(|tool| {
-                let schema =
-                    if tool.function.strict == Some(false) || tool.function.parameters.is_null() {
-                        Value::Bool(true)
-                    } else {
-                        tool.function.parameters.clone()
-                    };
                 serde_json::json!({
                     "type": "tag",
                     "begin": format!("<tool_call>{}", tool.function.name),
                     "content": {
                         "type": "json_schema",
-                        "json_schema": schema,
+                        "json_schema": tool.function.parameters,
                         "style": "glm_xml",
                     },
                     "end": "</tool_call>",
@@ -436,8 +445,8 @@ mod tests {
     }
 
     /// The tag follows xgrammar's built-in `glm_4_7` shape: one `<tool_call>`
-    /// trigger, a `glm_xml`-styled schema per tool, the schema dropped for
-    /// `strict: false`, and `at_least_one` forcing a call.
+    /// trigger, a `glm_xml`-styled schema per tool passed through as written
+    /// (a no-argument tool's `{}` included), and `at_least_one` forcing a call.
     #[test]
     fn structural_tag_mirrors_the_xgrammar_glm_4_7_model() {
         let schema =
@@ -445,6 +454,7 @@ mod tests {
         let tools = vec![
             tool("get_weather", None, schema.clone()),
             tool("lookup", Some(false), schema.clone()),
+            tool("ping", None, serde_json::json!({})),
             tool("", None, schema.clone()),
         ];
         let tag = Glm4MoeParser::build_structural_tag(&tools, true);
@@ -453,15 +463,20 @@ mod tests {
         assert_eq!(format["triggers"], serde_json::json!(["<tool_call>"]));
         assert_eq!(format["at_least_one"], true);
         let tags = format["tags"].as_array().unwrap();
-        assert_eq!(tags.len(), 2, "a nameless tool has no tag");
+        assert_eq!(tags.len(), 3, "a nameless tool has no tag");
         assert_eq!(tags[0]["begin"], "<tool_call>get_weather");
         assert_eq!(tags[0]["end"], "</tool_call>");
         assert_eq!(tags[0]["content"]["type"], "json_schema");
         assert_eq!(tags[0]["content"]["style"], "glm_xml");
         assert_eq!(tags[0]["content"]["json_schema"], schema);
         assert_eq!(
-            tags[1]["content"]["json_schema"], true,
-            "strict: false keeps only the syntax"
+            tags[1]["content"]["json_schema"], schema,
+            "strict is not a constraint switch here, as in the other builders"
+        );
+        assert_eq!(
+            tags[2]["content"]["json_schema"],
+            serde_json::json!({}),
+            "a no-argument tool keeps its empty schema"
         );
 
         let tag = Glm4MoeParser::build_structural_tag(&tools, false);

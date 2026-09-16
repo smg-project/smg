@@ -147,20 +147,70 @@ fn test_glm47_constrains_only_forced_tool_choices_with_a_structural_tag() {
         .unwrap()
         .is_none());
 
-    let required = registry
-        .generate_tool_constraint(
-            parser,
-            &tools,
-            &ToolChoice::Value(ToolChoiceValue::Required),
-        )
-        .unwrap();
-    let Some(ToolConstraint::StructuralTag(tag)) = required else {
-        panic!("required must yield the structural tag, got {required:?}");
+    let structural_tag = |constraint: Option<ToolConstraint>| -> serde_json::Value {
+        let Some(ToolConstraint::StructuralTag(tag)) = constraint else {
+            panic!("expected the structural tag, got {constraint:?}");
+        };
+        serde_json::from_str(&tag).unwrap()
     };
-    let tag: serde_json::Value = serde_json::from_str(&tag).unwrap();
-    assert_eq!(tag["format"]["type"], "triggered_tags");
-    assert_eq!(tag["format"]["at_least_one"], true);
-    assert_eq!(tag["format"]["tags"].as_array().unwrap().len(), tools.len());
+
+    let required = structural_tag(
+        registry
+            .generate_tool_constraint(
+                parser,
+                &tools,
+                &ToolChoice::Value(ToolChoiceValue::Required),
+            )
+            .unwrap(),
+    );
+    assert_eq!(required["format"]["type"], "triggered_tags");
+    assert_eq!(required["format"]["at_least_one"], true);
+    assert_eq!(
+        required["format"]["tags"].as_array().unwrap().len(),
+        tools.len()
+    );
+
+    // A named function used to fall back to a JSON schema (pure-JSON output);
+    // it is now the structural tag with a forced call. The gateway narrows
+    // `tools` to the named one before asking the registry, so the tag carries
+    // exactly that tool.
+    let named: ToolChoice = serde_json::from_value(serde_json::json!({
+        "type": "function",
+        "function": {"name": tools[0].function.name}
+    }))
+    .unwrap();
+    let named_tag = structural_tag(
+        registry
+            .generate_tool_constraint(parser, &tools[..1], &named)
+            .unwrap(),
+    );
+    assert_eq!(named_tag["format"]["at_least_one"], true);
+    let tags = named_tag["format"]["tags"].as_array().unwrap();
+    assert_eq!(tags.len(), 1);
+    assert_eq!(
+        tags[0]["begin"],
+        format!("<tool_call>{}", tools[0].function.name)
+    );
+
+    // Allowed tools: forced only in required mode; auto mode is unconstrained.
+    let allowed = |mode: &str| -> ToolChoice {
+        serde_json::from_value(serde_json::json!({
+            "type": "allowed_tools",
+            "mode": mode,
+            "tools": [{"type": "function", "name": tools[0].function.name}]
+        }))
+        .unwrap()
+    };
+    let allowed_required = structural_tag(
+        registry
+            .generate_tool_constraint(parser, &tools[..1], &allowed("required"))
+            .unwrap(),
+    );
+    assert_eq!(allowed_required["format"]["at_least_one"], true);
+    assert!(registry
+        .generate_tool_constraint(parser, &tools[..1], &allowed("auto"))
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
