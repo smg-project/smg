@@ -279,7 +279,11 @@ jobs:
           command -v uv >/dev/null || export PATH="$HOME/.local/bin:$PATH"
           uv pip install "vllm==${VLLM_VERSION}" --torch-backend=auto \
             --extra-index-url "https://wheels.vllm.ai/${VLLM_COMMIT}"
-          python -c "import torch, torchcodec, vllm; print('vllm', vllm.__version__)"
+          # The main wheel pulls a newer flashinfer-python; flashinfer refuses to
+          # import unless flashinfer-jit-cache matches it exactly, so re-sync the
+          # cache (the script's import canary fails here, not at engine start).
+          bash scripts/ci_install_flashinfer_jit_cache.sh
+          python -c "import torch, torchcodec, flashinfer, vllm; print('vllm', vllm.__version__)"
       - name: Install smg wheel + ninja (for vLLM torch.compile)
         run: |
           pip uninstall -y smg || true
