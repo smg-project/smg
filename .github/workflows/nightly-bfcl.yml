@@ -175,11 +175,14 @@ jobs:
                # --kv-cache-dtype auto -> fp8_ds_mla and picks the kernel block size
                # itself (128 on Blackwell); V4's --block-size 256 no longer matches.
                "vllm_extra": "--tokenizer-mode deepseek_v41 --trust-remote-code",
-               # Per-commit vLLM main wheel (wheels.vllm.ai/<commit>): the V4.1 model
-               # definitions merge. Both arms get the same wheel, so the A/B stays
-               # engine-identical. Drop once the CI pin moves to a release with V4.1.
-               "vllm_commit": "9b959b86577c082c0b2bf9e2c22263255a36ad83",
-               "vllm_version": "0.28.1rc1.dev651+g9b959b865",
+               # Per-commit vLLM main wheel (wheels.vllm.ai/<commit>). Must be at or
+               # after vllm-project/vllm#56214 (2026-09-11), which registers
+               # DeepseekV41ForCausalLM — #56228 alone ships the classes unregistered
+               # and vLLM rejects the arch at startup. Pinned past the 09-11..09-15 V4.1
+               # fixes. Both arms get the same wheel, so the A/B stays engine-identical.
+               # Drop once the CI pin moves to a release with V4.1.
+               "vllm_commit": "a31ec3a68bbbedd4b5d59490c762bcf32abf1a17",
+               "vllm_version": "0.29.1rc1.dev185+ga31ec3a68",
                # 765GB load + first-run JIT kernels on a new arch: generous ceiling.
                "gpu_mem": "0.90", "startup_timeout": "3600", "model_cache": "/raid/models",
                # Sequential: both arms share the 360m job. Kept tight until the

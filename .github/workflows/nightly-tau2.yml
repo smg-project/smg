@@ -179,8 +179,8 @@ jobs:
                # (see nightly-bfcl.yml).
                "vllm_extra": "--tokenizer-mode deepseek_v41 --trust-remote-code",
                # Per-commit vLLM main wheel; see nightly-bfcl.yml for why.
-               "vllm_commit": "9b959b86577c082c0b2bf9e2c22263255a36ad83",
-               "vllm_version": "0.28.1rc1.dev651+g9b959b865",
+               "vllm_commit": "a31ec3a68bbbedd4b5d59490c762bcf32abf1a17",
+               "vllm_version": "0.29.1rc1.dev185+ga31ec3a68",
                "gpu_mem": "0.90", "startup_timeout": "3600", "model_cache": "/raid/models",
                "arm_mode": "sequential", "max_model_len": "auto", "num_tasks": 30,
                # 20m/domain = ~1h/arm, arms serial; the V4 leg hung here before.
