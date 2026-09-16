@@ -358,6 +358,14 @@ jobs:
           bash scripts/ci_agentic_svc_deps.sh check --postgres postgres-db
           bash scripts/ci_agentic_svc_deps.sh create-postgres-db postgres-db
 
+      # ffmpeg and ffprobe let the gated video sampling decode test run instead of returning early.
+      - name: Install ffmpeg
+        run: |
+          sudo=""; command -v sudo >/dev/null 2>&1 && sudo=sudo
+          export DEBIAN_FRONTEND=noninteractive
+          $sudo apt-get update
+          $sudo apt-get install -y --no-install-recommends ffmpeg
+
       - name: Run Rust tests
         timeout-minutes: 30
         run: |
