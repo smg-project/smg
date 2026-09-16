@@ -4,12 +4,19 @@ use serde_json::{json, Value};
 
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
-    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
-    types::{FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId},
+    registry::{
+        MediaItemInfo, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
+    },
+    types::{
+        FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId, VideoSamplingInfo,
+    },
 };
 
 /// Maximum images accepted in one request (MiniMax-M3 spec 1.3.6).
 const MAX_IMAGES_PER_REQUEST: usize = 200;
+
+/// Frames per temporal patch when the checkpoint config omits it.
+const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
 
 /// Maximum videos accepted in one request.
 ///
@@ -80,6 +87,59 @@ impl MiniMaxM3VisionSpec {
             || metadata.token_id(Self::VIDEO_TOKEN).is_ok()
     }
 
+    /// Encode timestamp text on its own with no special tokens, as vLLM does.
+    fn encode_plain_text(metadata: &ModelMetadata, text: &str) -> RegistryResult<Vec<TokenId>> {
+        let ids = metadata.tokenizer.encode_text(text).ok_or_else(|| {
+            ModelRegistryError::TextEncodingFailed {
+                spec: "minimax_m3",
+                text: text.to_string(),
+            }
+        })?;
+        Ok(ids.into_iter().map(|id| id as TokenId).collect())
+    }
+
+    /// Frames per temporal patch, from `img_token_compression_config` at the top level or under `vision_config`.
+    fn temporal_patch_size(metadata: &ModelMetadata) -> usize {
+        metadata
+            .config_u32(&["img_token_compression_config", "temporal_patch_size"])
+            .or_else(|| {
+                metadata.config_u32(&[
+                    "vision_config",
+                    "img_token_compression_config",
+                    "temporal_patch_size",
+                ])
+            })
+            .filter(|&size| size > 0)
+            .map_or(DEFAULT_TEMPORAL_PATCH_SIZE, |size| size as usize)
+    }
+
+    /// The `]<]X.X seconds[>[` stamp for one temporal frame: its first sampled source frame over the source fps.
+    ///
+    /// `frame_indices` must be non-empty; the lookup is clamped to the last
+    /// sampled frame, as in the reference processor.
+    fn timestamp_text(
+        frame: usize,
+        temporal_patch_size: usize,
+        sampling: &VideoSamplingInfo,
+    ) -> String {
+        let last = sampling.frame_indices.len() - 1;
+        let source_index = sampling.frame_indices[(frame * temporal_patch_size).min(last)];
+        let seconds = source_index as f64 / sampling.source_fps;
+        format!("]<]{seconds:.1} seconds[>[")
+    }
+
+    /// Sampling for the request's one clip, when the decoder reported a usable fps and frame list.
+    fn video_sampling(media: &[MediaItemInfo]) -> Option<&VideoSamplingInfo> {
+        media
+            .first()
+            .and_then(|item| item.video_sampling.as_ref())
+            .filter(|sampling| {
+                !sampling.frame_indices.is_empty()
+                    && sampling.source_fps.is_finite()
+                    && sampling.source_fps > 0.0
+            })
+    }
+
     /// Build `[start] + N * pad + [end]` for one media item.
     fn wrapped_replacement(
         metadata: &ModelMetadata,
@@ -132,34 +192,35 @@ impl MiniMaxM3VisionSpec {
         }
     }
 
-    /// Build the per-frame video body.
+    /// Build the per-frame video body and the feature range of each frame.
     ///
     /// M3 lays video out as one `]<]start of image[>[` .. `]<]end of image[>[`
     /// block **per temporal frame**, each holding `grid_h * grid_w / merge^2`
     /// pad tokens — not one flat block over the whole clip, and with the image
-    /// markers rather than the vocabulary's unused video pair. The reference
-    /// processor builds the same shape:
+    /// markers rather than the vocabulary's unused video pair. When the clip's
+    /// sampling is known, a `]<]X.X seconds[>[` stamp precedes each block. The
+    /// reference processor builds the same shape:
     ///
     /// ```text
     /// for frame in 0..grid_t:
-    ///     [start of image] + [video_token] * M + [end of image]
+    ///     [X.X seconds if sampled] + [start of image] + [video_token] * M + [end of image]
     /// ```
     ///
-    /// The reference also prefixes each frame with a `]<]X.X seconds[>[`
-    /// timestamp from the sampled source frame indices; SMG does not carry
-    /// that metadata yet, so the frame blocks alone are emitted.
+    /// The stamps tokenize to different lengths, so each range is recorded at
+    /// its running offset; only the pad runs are features.
     ///
-    /// Returns `None` for a single-frame clip, where one block is the same
-    /// layout, leaving the caller on the single-block path. A token count that
-    /// does not divide by the frame count means the grid and the features
-    /// disagree; that is rejected rather than flattened.
+    /// Returns `None` for an unstamped single-frame clip, where one block is
+    /// the same layout, leaving the caller on the single-block path. A token
+    /// count that does not divide by the frame count means the grid and the
+    /// features disagree; that is rejected rather than flattened.
     fn per_frame_video_tokens(
         metadata: &ModelMetadata,
         pad_token_id: TokenId,
         num_tokens: usize,
         grid_t: usize,
-    ) -> RegistryResult<Option<Vec<TokenId>>> {
-        if grid_t <= 1 || num_tokens == 0 {
+        sampling: Option<&VideoSamplingInfo>,
+    ) -> RegistryResult<Option<(Vec<TokenId>, Vec<PlaceholderRange>)>> {
+        if num_tokens == 0 || (grid_t <= 1 && sampling.is_none()) {
             return Ok(None);
         }
         if !num_tokens.is_multiple_of(grid_t) {
@@ -169,25 +230,64 @@ impl MiniMaxM3VisionSpec {
         }
         let start_id = metadata.token_id(Self::IMAGE_START_TOKEN)?;
         let end_id = metadata.token_id(Self::IMAGE_END_TOKEN)?;
+        let temporal_patch_size = Self::temporal_patch_size(metadata);
 
         let per_frame = num_tokens / grid_t;
         let mut tokens = Vec::with_capacity(num_tokens + 2 * grid_t);
-        for _ in 0..grid_t {
+        let mut ranges = Vec::with_capacity(grid_t);
+        for frame in 0..grid_t {
+            if let Some(sampling) = sampling {
+                let stamp = Self::timestamp_text(frame, temporal_patch_size, sampling);
+                tokens.extend(Self::encode_plain_text(metadata, &stamp)?);
+            }
             tokens.push(start_id);
+            ranges.push(PlaceholderRange {
+                offset: tokens.len(),
+                length: per_frame,
+            });
             tokens.extend(std::iter::repeat_n(pad_token_id, per_frame));
             tokens.push(end_id);
         }
-        Ok(Some(tokens))
+        Ok(Some((tokens, ranges)))
     }
 
-    /// Feature ranges for a per-frame video body: the pad run inside each
-    /// frame's markers.
-    fn per_frame_feature_ranges(grid_t: usize, per_frame: usize) -> Vec<PlaceholderRange> {
-        (0..grid_t)
-            .map(|frame| PlaceholderRange {
-                // Each frame contributes [start] + per_frame pads + [end].
-                offset: frame * (per_frame + 2) + 1,
-                length: per_frame,
+    /// One replacement per clip, stamped with timestamps when `sampling` is known.
+    fn video_replacements(
+        metadata: &ModelMetadata,
+        preprocessed: &PreprocessedEncoderInputs,
+        placeholder_token: &str,
+        sampling: Option<&VideoSamplingInfo>,
+    ) -> RegistryResult<Vec<PromptReplacement>> {
+        let pad_token_id = Self::video_token_id(metadata)?;
+        let grid_t = Self::video_grid_t(preprocessed)?;
+
+        preprocessed
+            .feature_token_counts
+            .iter()
+            .map(|&num_tokens| {
+                let per_frame = Self::per_frame_video_tokens(
+                    metadata,
+                    pad_token_id,
+                    num_tokens,
+                    grid_t,
+                    sampling,
+                )?;
+
+                match per_frame {
+                    Some((tokens, ranges)) => {
+                        Ok(
+                            PromptReplacement::sequence(Modality::Video, placeholder_token, tokens)
+                                .with_feature_ranges(ranges),
+                        )
+                    }
+                    None => Self::wrapped_replacement(
+                        metadata,
+                        Modality::Video,
+                        placeholder_token,
+                        pad_token_id,
+                        num_tokens,
+                    ),
+                }
             })
             .collect()
     }
@@ -311,45 +411,34 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         match modality {
             Modality::Image => self.prompt_replacements(metadata, preprocessed),
             Modality::Video => {
-                let pad_token_id = Self::video_token_id(metadata)?;
                 let placeholder_token = self.placeholder_token_for(metadata, Modality::Video)?;
-                let grid_t = Self::video_grid_t(preprocessed)?;
-
-                preprocessed
-                    .feature_token_counts
-                    .iter()
-                    .map(|&num_tokens| {
-                        let per_frame = Self::per_frame_video_tokens(
-                            metadata,
-                            pad_token_id,
-                            num_tokens,
-                            grid_t,
-                        )?;
-
-                        match per_frame {
-                            Some(tokens) => Ok(PromptReplacement::sequence(
-                                Modality::Video,
-                                &placeholder_token,
-                                tokens,
-                            )
-                            .with_feature_ranges(
-                                Self::per_frame_feature_ranges(grid_t, num_tokens / grid_t),
-                            )),
-                            None => Self::wrapped_replacement(
-                                metadata,
-                                Modality::Video,
-                                &placeholder_token,
-                                pad_token_id,
-                                num_tokens,
-                            ),
-                        }
-                    })
-                    .collect()
+                Self::video_replacements(metadata, preprocessed, &placeholder_token, None)
             }
             _ => Err(ModelRegistryError::UnsupportedModality {
                 spec: self.name(),
                 modality,
             }),
+        }
+    }
+
+    fn prompt_replacements_with_media(
+        &self,
+        metadata: &ModelMetadata,
+        preprocessed: &PreprocessedEncoderInputs,
+        modality: Modality,
+        media: &[MediaItemInfo],
+    ) -> RegistryResult<Vec<PromptReplacement>> {
+        match modality {
+            Modality::Video => {
+                let placeholder_token = self.placeholder_token_for(metadata, Modality::Video)?;
+                Self::video_replacements(
+                    metadata,
+                    preprocessed,
+                    &placeholder_token,
+                    Self::video_sampling(media),
+                )
+            }
+            _ => self.prompt_replacements_for(metadata, preprocessed, modality),
         }
     }
 
@@ -381,10 +470,13 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
+    use serde::Deserialize;
     use serde_json::json;
 
     use super::*;
-    use crate::registry::{ModelMetadata, Tokenizer};
+    use crate::registry::{test_helpers::TestTokenizer, ModelMetadata, Tokenizer};
 
     /// Vocabulary ids for M3's media markers, as the checkpoint declares them.
     const IMAGE_ID: TokenId = 200_025;
@@ -394,50 +486,81 @@ mod tests {
     // Present in the vocabulary but never emitted by the reference processor.
     const VIDEO_START_ID: TokenId = 200_031;
     const VIDEO_END_ID: TokenId = 200_032;
+    /// Byte-encoder offset, chosen so text ids cannot collide with the marker ids.
+    const TEXT_BASE: u32 = 1000;
 
-    struct M3Tokenizer;
+    /// SHA-256 of the reference `processing_minimax.py` the timestamp fixture
+    /// was recorded from; a regeneration against a different file fails here.
+    const REFERENCE_SHA256: &str =
+        "0706ae8b93b3489a3b3bc7f48a5f29fb34b1449ebebb37586250e4d5fa8f5e35";
 
-    impl Tokenizer for M3Tokenizer {
-        fn token_to_id(&self, token: &str) -> Option<u32> {
-            match token {
-                MiniMaxM3VisionSpec::IMAGE_TOKEN => Some(IMAGE_ID as u32),
-                MiniMaxM3VisionSpec::VIDEO_TOKEN => Some(VIDEO_ID as u32),
-                MiniMaxM3VisionSpec::IMAGE_START_TOKEN => Some(IMAGE_START_ID as u32),
-                MiniMaxM3VisionSpec::IMAGE_END_TOKEN => Some(IMAGE_END_ID as u32),
-                "]<]start of video[>[" => Some(VIDEO_START_ID as u32),
-                "]<]end of video[>[" => Some(VIDEO_END_ID as u32),
-                _ => None,
-            }
-        }
+    fn m3_tokenizer() -> TestTokenizer {
+        TestTokenizer::new(&[
+            (MiniMaxM3VisionSpec::IMAGE_TOKEN, IMAGE_ID as u32),
+            (MiniMaxM3VisionSpec::VIDEO_TOKEN, VIDEO_ID as u32),
+            (
+                MiniMaxM3VisionSpec::IMAGE_START_TOKEN,
+                IMAGE_START_ID as u32,
+            ),
+            (MiniMaxM3VisionSpec::IMAGE_END_TOKEN, IMAGE_END_ID as u32),
+            ("]<]start of video[>[", VIDEO_START_ID as u32),
+            ("]<]end of video[>[", VIDEO_END_ID as u32),
+        ])
+        .with_byte_encoder(TEXT_BASE)
+    }
 
-        fn id_to_token(&self, id: u32) -> Option<String> {
-            match id {
-                id if id == IMAGE_ID as u32 => Some(MiniMaxM3VisionSpec::IMAGE_TOKEN.to_string()),
-                id if id == VIDEO_ID as u32 => Some(MiniMaxM3VisionSpec::VIDEO_TOKEN.to_string()),
-                _ => None,
-            }
-        }
+    fn tokenizer() -> &'static TestTokenizer {
+        static TOKENIZER: OnceLock<TestTokenizer> = OnceLock::new();
+        TOKENIZER.get_or_init(m3_tokenizer)
+    }
 
-        fn encode_text(&self, text: &str) -> Option<Vec<u32>> {
-            self.token_to_id(text).map(|id| vec![id])
-        }
+    fn m3_config() -> Value {
+        json!({
+            "model_type": "minimax_m3_vl",
+            "image_token_index": IMAGE_ID,
+            "video_token_index": VIDEO_ID,
+        })
     }
 
     fn metadata() -> ModelMetadata<'static> {
-        static CONFIG: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-        static TOKENIZER: M3Tokenizer = M3Tokenizer;
-        let config = CONFIG.get_or_init(|| {
-            json!({
-                "model_type": "minimax_m3_vl",
-                "image_token_index": IMAGE_ID,
-                "video_token_index": VIDEO_ID,
-            })
-        });
+        static CONFIG: OnceLock<Value> = OnceLock::new();
+        metadata_with(CONFIG.get_or_init(m3_config))
+    }
+
+    /// Metadata over the shared tokenizer and a leaked per-test config.
+    fn metadata_with(config: &'static Value) -> ModelMetadata<'static> {
         ModelMetadata {
             model_id: "MiniMaxAI/MiniMax-M3",
             config,
-            tokenizer: &TOKENIZER,
+            tokenizer: tokenizer(),
         }
+    }
+
+    fn leaked(config: Value) -> &'static Value {
+        Box::leak(Box::new(config))
+    }
+
+    /// Knows the markers but cannot encode plain text.
+    struct NoTextTokenizer;
+
+    impl Tokenizer for NoTextTokenizer {
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            tokenizer().token_to_id(token)
+        }
+
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            tokenizer().id_to_token(id)
+        }
+
+        fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
+            None
+        }
+    }
+
+    fn text_ids(text: &str) -> Vec<TokenId> {
+        text.bytes()
+            .map(|b| (TEXT_BASE + u32::from(b)) as TokenId)
+            .collect()
     }
 
     fn preprocessed(counts: Vec<usize>) -> PreprocessedEncoderInputs {
@@ -624,6 +747,341 @@ mod tests {
                 IMAGE_END_ID
             ]
         );
+    }
+
+    /// Media info for the request's one clip, with its sampling.
+    fn sampled(frame_indices: &[usize], source_fps: f64) -> MediaItemInfo {
+        MediaItemInfo {
+            video_sampling: Some(VideoSamplingInfo {
+                source_fps,
+                frame_indices: frame_indices.to_vec(),
+            }),
+        }
+    }
+
+    /// One `[start of image] + pads + [end of image]` frame block.
+    fn frame_block(pads: usize) -> Vec<TokenId> {
+        let mut block = vec![IMAGE_START_ID];
+        block.extend(std::iter::repeat_n(VIDEO_ID, pads));
+        block.push(IMAGE_END_ID);
+        block
+    }
+
+    fn range(offset: usize, length: usize) -> PlaceholderRange {
+        PlaceholderRange { offset, length }
+    }
+
+    /// The video replacement for one clip, given its decoder-side media info.
+    fn video_replacement(
+        meta: &ModelMetadata,
+        counts: Vec<usize>,
+        grid_t: i64,
+        media: &[MediaItemInfo],
+    ) -> PromptReplacement {
+        let mut replacements = MiniMaxM3VisionSpec
+            .prompt_replacements_with_media(
+                meta,
+                &preprocessed_video(counts, grid_t),
+                Modality::Video,
+                media,
+            )
+            .unwrap();
+        assert_eq!(replacements.len(), 1);
+        replacements.remove(0)
+    }
+
+    /// The stamp texts spliced into a replacement, decoded from their byte ids.
+    fn stamps(replacement: &PromptReplacement) -> Vec<String> {
+        let mut stamps = Vec::new();
+        let mut text = Vec::new();
+        for &id in &replacement.tokens {
+            let byte = u32::try_from(id)
+                .ok()
+                .and_then(|id| id.checked_sub(TEXT_BASE))
+                .and_then(|byte| u8::try_from(byte).ok());
+            match byte {
+                Some(byte) => text.push(byte),
+                None if !text.is_empty() => {
+                    stamps.push(String::from_utf8(std::mem::take(&mut text)).unwrap());
+                }
+                None => {}
+            }
+        }
+        stamps
+    }
+
+    #[test]
+    fn sampled_video_stamps_each_frame_with_its_source_time() {
+        // Five frames at 30 fps pair into three temporal frames; each pair is
+        // stamped with the time of its first frame.
+        let replacement = video_replacement(
+            &metadata(),
+            vec![12],
+            3,
+            &[sampled(&[0, 15, 30, 45, 60], 30.0)],
+        );
+
+        let mut expected = Vec::new();
+        for stamp in [
+            "]<]0.0 seconds[>[",
+            "]<]1.0 seconds[>[",
+            "]<]2.0 seconds[>[",
+        ] {
+            expected.extend(text_ids(stamp));
+            expected.extend(frame_block(4));
+        }
+        assert_eq!(replacement.tokens, expected);
+        // Each frame's pads follow its 17-byte stamp and start marker.
+        assert_eq!(
+            replacement.feature_ranges.as_ref().unwrap(),
+            &vec![range(18, 4), range(41, 4), range(64, 4)]
+        );
+        // The stamps live inside `tokens`, so nothing is folded in from
+        // before the placeholder.
+        assert_eq!(replacement.structural_prefix, 0);
+        assert_eq!(replacement.modality, Modality::Video);
+        assert_eq!(replacement.placeholder_token, "]<]video[>[");
+    }
+
+    #[test]
+    fn feature_ranges_track_the_variable_width_stamps() {
+        // A three-digit second count is two bytes longer than a one-digit
+        // one, so the frame stride is not fixed and each range is a running
+        // offset.
+        let replacement = video_replacement(
+            &metadata(),
+            vec![12],
+            3,
+            &[sampled(&[0, 1, 3000, 3001, 3002], 30.0)],
+        );
+
+        assert_eq!(
+            stamps(&replacement),
+            [
+                "]<]0.0 seconds[>[",
+                "]<]100.0 seconds[>[",
+                "]<]100.1 seconds[>["
+            ]
+        );
+        let ranges = replacement.feature_ranges.as_ref().unwrap();
+        assert_eq!(ranges, &vec![range(18, 4), range(43, 4), range(68, 4)]);
+        for range in ranges {
+            let pads = &replacement.tokens[range.offset..range.offset + range.length];
+            assert!(pads.iter().all(|&id| id == VIDEO_ID));
+            assert_eq!(replacement.tokens[range.offset - 1], IMAGE_START_ID);
+            assert_eq!(
+                replacement.tokens[range.offset + range.length],
+                IMAGE_END_ID
+            );
+        }
+    }
+
+    #[test]
+    fn odd_frame_count_stamps_the_padded_pair_with_its_real_frame() {
+        // Three frames pad to two temporal frames; the second pair's stamp is
+        // the time of its one real frame.
+        let replacement =
+            video_replacement(&metadata(), vec![8], 2, &[sampled(&[0, 15, 30], 30.0)]);
+
+        assert_eq!(
+            stamps(&replacement),
+            ["]<]0.0 seconds[>[", "]<]1.0 seconds[>["]
+        );
+    }
+
+    #[test]
+    fn short_frame_index_list_clamps_to_the_last_sampled_frame() {
+        // Fewer indices than frames: frames past the list reuse the last
+        // index, as the reference processor's `min(.., len - 1)` does.
+        let replacement = video_replacement(&metadata(), vec![12], 3, &[sampled(&[0, 30], 30.0)]);
+
+        assert_eq!(
+            stamps(&replacement),
+            [
+                "]<]0.0 seconds[>[",
+                "]<]1.0 seconds[>[",
+                "]<]1.0 seconds[>["
+            ]
+        );
+    }
+
+    #[test]
+    fn single_frame_video_with_sampling_is_stamped() {
+        // The reference loops over grid_t even when it is 1, so a sampled
+        // one-frame clip still carries its stamp.
+        let replacement = video_replacement(&metadata(), vec![4], 1, &[sampled(&[7], 25.0)]);
+
+        let mut expected = text_ids("]<]0.3 seconds[>[");
+        expected.extend(frame_block(4));
+        assert_eq!(replacement.tokens, expected);
+        assert_eq!(
+            replacement.feature_ranges.as_ref().unwrap(),
+            &vec![range(18, 4)]
+        );
+    }
+
+    #[test]
+    fn temporal_patch_size_from_config_picks_the_stamped_frames() {
+        let indices = [0, 15, 30, 45, 60, 75, 90, 105];
+        // The default pairs frames: four temporal frames, one second apart.
+        let replacement = video_replacement(&metadata(), vec![16], 4, &[sampled(&indices, 30.0)]);
+        assert_eq!(
+            stamps(&replacement),
+            [
+                "]<]0.0 seconds[>[",
+                "]<]1.0 seconds[>[",
+                "]<]2.0 seconds[>[",
+                "]<]3.0 seconds[>["
+            ]
+        );
+
+        // temporal_patch_size 4 groups four frames per temporal frame, so the
+        // second stamp comes from the fifth sampled frame.
+        let mut config = m3_config();
+        config["img_token_compression_config"] = json!({ "temporal_patch_size": 4 });
+        let replacement = video_replacement(
+            &metadata_with(leaked(config)),
+            vec![8],
+            2,
+            &[sampled(&indices, 30.0)],
+        );
+        assert_eq!(
+            stamps(&replacement),
+            ["]<]0.0 seconds[>[", "]<]2.0 seconds[>["]
+        );
+    }
+
+    #[test]
+    fn temporal_patch_size_falls_back_through_vision_config_to_the_default() {
+        assert_eq!(MiniMaxM3VisionSpec::temporal_patch_size(&metadata()), 2);
+
+        let mut nested = m3_config();
+        nested["vision_config"] =
+            json!({ "img_token_compression_config": { "temporal_patch_size": 3 } });
+        assert_eq!(
+            MiniMaxM3VisionSpec::temporal_patch_size(&metadata_with(leaked(nested.clone()))),
+            3
+        );
+
+        // The top-level block wins over the nested one.
+        nested["img_token_compression_config"] = json!({ "temporal_patch_size": 4 });
+        assert_eq!(
+            MiniMaxM3VisionSpec::temporal_patch_size(&metadata_with(leaked(nested))),
+            4
+        );
+
+        // A zero would stamp every frame with the first index; it is unset.
+        let mut zero = m3_config();
+        zero["img_token_compression_config"] = json!({ "temporal_patch_size": 0 });
+        assert_eq!(
+            MiniMaxM3VisionSpec::temporal_patch_size(&metadata_with(leaked(zero))),
+            2
+        );
+    }
+
+    #[test]
+    fn unencodable_stamp_text_is_rejected() {
+        let config = m3_config();
+        let meta = ModelMetadata {
+            model_id: "MiniMaxAI/MiniMax-M3",
+            config: &config,
+            tokenizer: &NoTextTokenizer,
+        };
+        let err = MiniMaxM3VisionSpec
+            .prompt_replacements_with_media(
+                &meta,
+                &preprocessed_video(vec![12], 3),
+                Modality::Video,
+                &[sampled(&[0, 15, 30, 45, 60], 30.0)],
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            ModelRegistryError::TextEncodingFailed {
+                spec: "minimax_m3",
+                text: "]<]0.0 seconds[>[".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn unusable_sampling_falls_back_to_the_unstamped_layout() {
+        let meta = metadata();
+        let unstamped = MiniMaxM3VisionSpec
+            .prompt_replacements_for(&meta, &preprocessed_video(vec![12], 3), Modality::Video)
+            .unwrap();
+
+        for media in [
+            vec![],
+            vec![MediaItemInfo::default()],
+            vec![sampled(&[], 30.0)],
+            vec![sampled(&[0, 15, 30, 45, 60], 0.0)],
+        ] {
+            let replacement = video_replacement(&meta, vec![12], 3, &media);
+            assert_eq!(replacement.tokens, unstamped[0].tokens);
+            assert_eq!(replacement.feature_ranges, unstamped[0].feature_ranges);
+        }
+    }
+
+    #[test]
+    fn images_ignore_video_sampling() {
+        let meta = metadata();
+        let plain = MiniMaxM3VisionSpec
+            .prompt_replacements(&meta, &preprocessed(vec![4]))
+            .unwrap();
+        let with_media = MiniMaxM3VisionSpec
+            .prompt_replacements_with_media(
+                &meta,
+                &preprocessed(vec![4]),
+                Modality::Image,
+                &[sampled(&[0], 30.0)],
+            )
+            .unwrap();
+
+        assert_eq!(with_media[0].tokens, plain[0].tokens);
+        assert_eq!(with_media[0].feature_ranges, plain[0].feature_ranges);
+    }
+
+    #[derive(Deserialize)]
+    struct TimestampGolden {
+        reference: String,
+        reference_sha256: String,
+        cases: Vec<TimestampCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct TimestampCase {
+        name: String,
+        source_fps: f64,
+        frame_indices: Vec<usize>,
+        temporal_patch_size: usize,
+        grid_t: usize,
+        timestamps: Vec<String>,
+    }
+
+    #[test]
+    fn stamps_match_the_reference_processor() {
+        let golden: TimestampGolden = serde_json::from_str(include_str!(
+            "../../tests/fixtures/golden/minimax_m3_video_timestamps.json"
+        ))
+        .unwrap();
+        assert_eq!(golden.reference, "processing_minimax.py");
+        assert_eq!(golden.reference_sha256, REFERENCE_SHA256);
+        assert!(!golden.cases.is_empty());
+
+        for case in &golden.cases {
+            let sampling = VideoSamplingInfo {
+                source_fps: case.source_fps,
+                frame_indices: case.frame_indices.clone(),
+            };
+            let stamps: Vec<String> = (0..case.grid_t)
+                .map(|frame| {
+                    MiniMaxM3VisionSpec::timestamp_text(frame, case.temporal_patch_size, &sampling)
+                })
+                .collect();
+            assert_eq!(stamps, case.timestamps, "case {}", case.name);
+        }
     }
 
     #[test]
