@@ -245,6 +245,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                         request.tokenized.original_text or None,
                         items,
                         arrival_time,
+                        request_id=request_id,
                     )
             elif has_preprocessed_mm and input_type == "tokenized":
                 # A pixel-less payload (PD decode leg) is only decodable with
