@@ -222,8 +222,8 @@ jobs:
                "vllm_tool": "glm47", "vllm_reason": "glm45",
                "smg_tool": "glm47_moe", "smg_reason": "glm45",
                "vllm_extra": "--trust-remote-code --kv-cache-dtype fp8",
-               "vllm_commit": "9b959b86577c082c0b2bf9e2c22263255a36ad83",
-               "vllm_version": "0.28.1rc1.dev651+g9b959b865",
+               "vllm_commit": "a31ec3a68bbbedd4b5d59490c762bcf32abf1a17",
+               "vllm_version": "0.29.1rc1.dev185+ga31ec3a68",
                # Recipe sets VLLM_ENGINE_READY_TIMEOUT_S=3600: FP8 load + KDA/sparse-MLA
                # JIT on a new arch. Kept at the V4.1 leg's ceiling.
                "gpu_mem": "0.90", "startup_timeout": "3600",
