@@ -31,9 +31,9 @@ const MAX_VIDEOS_PER_REQUEST: usize = 1;
 /// `_get_prompt_updates`, which builds
 /// `[start_token_id] + [image_token_id] * N + [end_token_id]`.
 ///
-/// The start/end markers are modality-specific: M3's vocabulary carries a
-/// separate `]<]start of video[>[` / `]<]end of video[>[` pair alongside the
-/// image one, unlike Qwen's modality-neutral `<|vision_start|>`.
+/// Both modalities are wrapped with the image markers: the vocabulary also
+/// carries a `]<]start of video[>[` / `]<]end of video[>[` pair, but the
+/// reference processor never emits it, so neither does this spec.
 pub(super) struct MiniMaxM3VisionSpec;
 
 impl MiniMaxM3VisionSpec {
@@ -41,14 +41,13 @@ impl MiniMaxM3VisionSpec {
     const VIDEO_TOKEN: &'static str = "]<]video[>[";
     const IMAGE_START_TOKEN: &'static str = "]<]start of image[>[";
     const IMAGE_END_TOKEN: &'static str = "]<]end of image[>[";
-    const VIDEO_START_TOKEN: &'static str = "]<]start of video[>[";
-    const VIDEO_END_TOKEN: &'static str = "]<]end of video[>[";
 
     /// The structural markers wrapping one modality's feature run.
     fn wrapper_tokens(modality: Modality) -> RegistryResult<(&'static str, &'static str)> {
         match modality {
-            Modality::Image => Ok((Self::IMAGE_START_TOKEN, Self::IMAGE_END_TOKEN)),
-            Modality::Video => Ok((Self::VIDEO_START_TOKEN, Self::VIDEO_END_TOKEN)),
+            Modality::Image | Modality::Video => {
+                Ok((Self::IMAGE_START_TOKEN, Self::IMAGE_END_TOKEN))
+            }
             _ => Err(ModelRegistryError::UnsupportedModality {
                 spec: "minimax_m3",
                 modality,
@@ -135,21 +134,20 @@ impl MiniMaxM3VisionSpec {
 
     /// Build the per-frame video body.
     ///
-    /// M3 lays video out as one `]<]start of video[>[` .. `]<]end of video[>[`
+    /// M3 lays video out as one `]<]start of image[>[` .. `]<]end of image[>[`
     /// block **per temporal frame**, each holding `grid_h * grid_w / merge^2`
-    /// pad tokens — not one flat block over the whole clip. vLLM's
-    /// `_get_prompt_updates` builds the same shape:
+    /// pad tokens — not one flat block over the whole clip, and with the image
+    /// markers rather than the vocabulary's unused video pair. The reference
+    /// processor builds the same shape:
     ///
     /// ```text
     /// for frame in 0..grid_t:
-    ///     [start] + [video_token] * M + [end]
+    ///     [start of image] + [video_token] * M + [end of image]
     /// ```
     ///
-    /// vLLM additionally prefixes each frame with a `]<]X.X seconds[>[` marker
-    /// when the sampled frame indices and fps are known, and documents the
-    /// no-metadata path as an aligned fallback. SMG does not carry that
-    /// per-frame metadata, so the timestamp markers are omitted and the frame
-    /// blocks alone are emitted.
+    /// The reference also prefixes each frame with a `]<]X.X seconds[>[`
+    /// timestamp from the sampled source frame indices; SMG does not carry
+    /// that metadata yet, so the frame blocks alone are emitted.
     ///
     /// Returns `None` for a single-frame clip, where one block is the same
     /// layout, leaving the caller on the single-block path. A token count that
@@ -169,8 +167,8 @@ impl MiniMaxM3VisionSpec {
                 field: "video_grid_thw".to_string(),
             });
         }
-        let start_id = metadata.token_id(Self::VIDEO_START_TOKEN)?;
-        let end_id = metadata.token_id(Self::VIDEO_END_TOKEN)?;
+        let start_id = metadata.token_id(Self::IMAGE_START_TOKEN)?;
+        let end_id = metadata.token_id(Self::IMAGE_END_TOKEN)?;
 
         let per_frame = num_tokens / grid_t;
         let mut tokens = Vec::with_capacity(num_tokens + 2 * grid_t);
@@ -393,6 +391,7 @@ mod tests {
     const VIDEO_ID: TokenId = 200_026;
     const IMAGE_START_ID: TokenId = 200_029;
     const IMAGE_END_ID: TokenId = 200_030;
+    // Present in the vocabulary but never emitted by the reference processor.
     const VIDEO_START_ID: TokenId = 200_031;
     const VIDEO_END_ID: TokenId = 200_032;
 
@@ -405,8 +404,8 @@ mod tests {
                 MiniMaxM3VisionSpec::VIDEO_TOKEN => Some(VIDEO_ID as u32),
                 MiniMaxM3VisionSpec::IMAGE_START_TOKEN => Some(IMAGE_START_ID as u32),
                 MiniMaxM3VisionSpec::IMAGE_END_TOKEN => Some(IMAGE_END_ID as u32),
-                MiniMaxM3VisionSpec::VIDEO_START_TOKEN => Some(VIDEO_START_ID as u32),
-                MiniMaxM3VisionSpec::VIDEO_END_TOKEN => Some(VIDEO_END_ID as u32),
+                "]<]start of video[>[" => Some(VIDEO_START_ID as u32),
+                "]<]end of video[>[" => Some(VIDEO_END_ID as u32),
                 _ => None,
             }
         }
@@ -538,11 +537,14 @@ mod tests {
             )
             .unwrap();
 
-        // Video uses M3's own video markers, not the image pair.
+        // Video pads sit inside the image markers; the vocabulary's video
+        // marker pair is never emitted, as in the reference processor.
         assert_eq!(
             replacements[0].tokens,
-            vec![VIDEO_START_ID, VIDEO_ID, VIDEO_ID, VIDEO_ID, VIDEO_END_ID]
+            vec![IMAGE_START_ID, VIDEO_ID, VIDEO_ID, VIDEO_ID, IMAGE_END_ID]
         );
+        assert!(!replacements[0].tokens.contains(&VIDEO_START_ID));
+        assert!(!replacements[0].tokens.contains(&VIDEO_END_ID));
         assert_eq!(replacements[0].modality, Modality::Video);
         assert_eq!(replacements[0].placeholder_token, "]<]video[>[");
     }
@@ -571,11 +573,11 @@ mod tests {
             .unwrap();
 
         let tokens = &replacements[0].tokens;
-        // Each frame is [start] + 4 pads + [end], repeated once per frame;
-        // vLLM builds the same shape.
-        let mut frame_tokens = vec![VIDEO_START_ID];
+        // Each frame is [start of image] + 4 pads + [end of image], repeated
+        // once per frame; the reference processor builds the same shape.
+        let mut frame_tokens = vec![IMAGE_START_ID];
         frame_tokens.extend(std::iter::repeat_n(VIDEO_ID, 4));
-        frame_tokens.push(VIDEO_END_ID);
+        frame_tokens.push(IMAGE_END_ID);
         let expected: Vec<TokenId> = std::iter::repeat_n(frame_tokens, 3).flatten().collect();
         assert_eq!(tokens, &expected);
         assert_eq!(tokens.len(), 3 * (4 + 2));
@@ -614,12 +616,12 @@ mod tests {
         assert_eq!(
             replacements[0].tokens,
             vec![
-                VIDEO_START_ID,
+                IMAGE_START_ID,
                 VIDEO_ID,
                 VIDEO_ID,
                 VIDEO_ID,
                 VIDEO_ID,
-                VIDEO_END_ID
+                IMAGE_END_ID
             ]
         );
     }
