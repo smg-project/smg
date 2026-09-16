@@ -2,7 +2,6 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
-use openai_protocol::messages;
 use tracing::error;
 
 use crate::routers::{
@@ -117,15 +116,19 @@ impl BuildStage for MessageRequestBuildingStage {
             None
         };
 
-        let user_thinking = match &messages_request.thinking {
-            Some(messages::ThinkingConfig::Enabled { .. })
-            | Some(messages::ThinkingConfig::Adaptive { .. }) => Some(true),
-            Some(messages::ThinkingConfig::Disabled) => Some(false),
-            None => None,
-        };
+        // A structural tag that already opens with the reasoning block runs
+        // from the first token; asking SGLang to also defer the grammar past
+        // `</think>` would make the model owe a second one.
         let require_reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
-            utils::should_mark_reasoning_started(user_thinking, tokenizer.as_ref())
-        });
+            utils::messages_reasoning_starts_in_prefill(&messages_request, tokenizer.as_ref())
+        }) && !utils::constraint_covers_reasoning(
+            &ctx.components.tool_parser_factory,
+            ctx.components
+                .parser_resolver
+                .tool_parser(&messages_request.model)
+                .as_deref(),
+            tool_constraints.as_ref(),
+        );
 
         let mut proto_request = builder_client
             .build_messages_request(

@@ -102,9 +102,19 @@ pub(crate) async fn build_chat_backed_plan(
         None
     };
 
+    // A structural tag that already opens with the reasoning block runs from
+    // the first token; asking SGLang to also defer the grammar past `</think>`
+    // would make the model owe a second one.
     let require_reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
         utils::chat_reasoning_starts_in_prefill(chat_request, tokenizer.as_ref())
-    });
+    }) && !utils::constraint_covers_reasoning(
+        &ctx.components.tool_parser_factory,
+        ctx.components
+            .parser_resolver
+            .tool_parser(&chat_request.model)
+            .as_deref(),
+        tool_constraints.as_ref(),
+    );
 
     let mut proto_request = builder_client
         .build_chat_request(

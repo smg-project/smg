@@ -391,14 +391,21 @@ fn structural_tag_mirrors_vllm_forced_grammar() {
 fn factory_constraint(tools: &[Tool]) -> String {
     use openai_protocol::common::{ToolChoice, ToolChoiceValue};
     let factory = ParserFactory::new();
+    let required = ToolChoice::Value(ToolChoiceValue::Required);
     let constraint = factory
         .registry()
-        .generate_tool_constraint(
-            Some("deepseek_v41"),
-            tools,
-            &ToolChoice::Value(ToolChoiceValue::Required),
-        )
+        .generate_tool_constraint(Some("deepseek_v41"), tools, &required, false)
         .unwrap()
         .unwrap();
+    let on_thinking_prompt = factory
+        .registry()
+        .generate_tool_constraint(Some("deepseek_v41"), tools, &required, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        on_thinking_prompt.to_tuple(),
+        constraint.to_tuple(),
+        "no reasoning prefix is registered for DSML, so the thinking flag changes nothing"
+    );
     constraint.to_tuple().1
 }

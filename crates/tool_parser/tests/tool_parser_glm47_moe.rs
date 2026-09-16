@@ -135,7 +135,7 @@ fn test_glm47_constrains_only_forced_tool_choices_with_a_structural_tag() {
         ToolChoice::Value(ToolChoiceValue::None),
     ] {
         let constraint = registry
-            .generate_tool_constraint(parser, &tools, &choice)
+            .generate_tool_constraint(parser, &tools, &choice, false)
             .unwrap();
         assert!(
             constraint.is_none(),
@@ -143,7 +143,12 @@ fn test_glm47_constrains_only_forced_tool_choices_with_a_structural_tag() {
         );
     }
     assert!(registry
-        .generate_tool_constraint(parser, &[], &ToolChoice::Value(ToolChoiceValue::Required))
+        .generate_tool_constraint(
+            parser,
+            &[],
+            &ToolChoice::Value(ToolChoiceValue::Required),
+            false
+        )
         .unwrap()
         .is_none());
 
@@ -160,6 +165,7 @@ fn test_glm47_constrains_only_forced_tool_choices_with_a_structural_tag() {
                 parser,
                 &tools,
                 &ToolChoice::Value(ToolChoiceValue::Required),
+                false,
             )
             .unwrap(),
     );
@@ -181,7 +187,7 @@ fn test_glm47_constrains_only_forced_tool_choices_with_a_structural_tag() {
     .unwrap();
     let named_tag = structural_tag(
         registry
-            .generate_tool_constraint(parser, &tools[..1], &named)
+            .generate_tool_constraint(parser, &tools[..1], &named, false)
             .unwrap(),
     );
     assert_eq!(named_tag["format"]["at_least_one"], true);
@@ -203,12 +209,62 @@ fn test_glm47_constrains_only_forced_tool_choices_with_a_structural_tag() {
     };
     let allowed_required = structural_tag(
         registry
-            .generate_tool_constraint(parser, &tools[..1], &allowed("required"))
+            .generate_tool_constraint(parser, &tools[..1], &allowed("required"), false)
             .unwrap(),
     );
     assert_eq!(allowed_required["format"]["at_least_one"], true);
     assert!(registry
-        .generate_tool_constraint(parser, &tools[..1], &allowed("auto"))
+        .generate_tool_constraint(parser, &tools[..1], &allowed("auto"), false)
+        .unwrap()
+        .is_none());
+}
+
+/// On a thinking prompt (GLM-4.7 with `enable_thinking` on, GLM-5 always) the
+/// forced call must follow the model's reasoning, as xgrammar's built-in
+/// `glm_4_7` tag lays it out with `reasoning=True`:
+/// `sequence[<free text></think>, <calls>]`. Without a forced choice there is
+/// still no constraint, thinking or not.
+#[test]
+fn test_glm47_forced_choice_on_a_thinking_prompt_reasons_first() {
+    let factory = ParserFactory::new();
+    let registry = factory.registry();
+    let parser = Some("glm47_moe");
+    let tools = create_test_tools();
+    assert!(registry.has_reasoning_prefix(parser));
+    assert!(!registry.has_reasoning_prefix(Some("mistral")));
+    assert!(!registry.has_reasoning_prefix(None));
+
+    let required = ToolChoice::Value(ToolChoiceValue::Required);
+    let tag = |reasoning: bool| -> serde_json::Value {
+        match registry
+            .generate_tool_constraint(parser, &tools, &required, reasoning)
+            .unwrap()
+        {
+            Some(ToolConstraint::StructuralTag(tag)) => serde_json::from_str(&tag).unwrap(),
+            other => panic!("expected the structural tag, got {other:?}"),
+        }
+    };
+    let plain = tag(false);
+    let thinking = tag(true);
+    assert_eq!(thinking["format"]["type"], "sequence");
+    let elements = thinking["format"]["elements"].as_array().unwrap();
+    assert_eq!(elements.len(), 2);
+    assert_eq!(elements[0]["type"], "tag");
+    assert_eq!(elements[0]["begin"], "");
+    assert_eq!(elements[0]["end"], "</think>");
+    assert_eq!(elements[0]["content"]["type"], "any_text");
+    assert_eq!(
+        elements[1], plain["format"],
+        "the calls part is the non-thinking tag"
+    );
+
+    assert!(registry
+        .generate_tool_constraint(
+            parser,
+            &tools,
+            &ToolChoice::Value(ToolChoiceValue::Auto),
+            true
+        )
         .unwrap()
         .is_none());
 }

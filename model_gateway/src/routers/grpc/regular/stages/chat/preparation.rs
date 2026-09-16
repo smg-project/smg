@@ -259,10 +259,14 @@ pub(crate) async fn prepare_chat_like(
 
         // Step 4: Build tool constraints if needed
         // The tool parser registry handles both structural tag (for native format
-        // parsers like Mistral, KimiK2) and generic JSON schema fallback.
+        // parsers like Mistral, KimiK2) and generic JSON schema fallback. When
+        // the prompt ends inside the model's thinking block, a parser with a
+        // reasoning prefix gets its tag wrapped so a forced call follows the
+        // reasoning instead of preempting it.
         let tool_call_constraint = if let (Some(tools), Some(tool_choice)) =
             (body_ref.tools.as_ref(), request.tool_choice.as_ref())
         {
+            let reasoning = utils::chat_reasoning_starts_in_prefill(request, tokenizer.as_ref());
             ctx.components
                 .tool_parser_factory
                 .registry()
@@ -273,6 +277,7 @@ pub(crate) async fn prepare_chat_like(
                         .as_deref(),
                     tools,
                     tool_choice,
+                    reasoning,
                 )
                 .map_err(|e| {
                     error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");

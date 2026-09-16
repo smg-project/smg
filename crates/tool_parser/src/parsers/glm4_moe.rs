@@ -111,12 +111,13 @@ impl Glm4MoeParser {
     /// arrives as `{}` (`Function::parameters` normalises both) and renders
     /// as a call with an empty argument body.
     ///
-    /// Like the other builders in this crate (and unlike xgrammar's built-in,
-    /// which prepends a `</think>`-terminated reasoning block when asked),
-    /// the tag carries no reasoning prefix: a forced call on a prompt that
-    /// ends inside `<think>` starts before any reasoning. Passing the
-    /// thinking state into the registry so every builder can emit the prefix
-    /// is a separate change.
+    /// Thinking prompts: GLM-4.7 (`enable_thinking`, on by default) and GLM-5
+    /// (always) end the generation prompt with `<think>`, so a call forced
+    /// from the first token would land inside the thinking block, where the
+    /// reasoning parser swallows it. This builder is thinking-agnostic; when
+    /// the gateway reports that the prompt ends inside `<think>`, the
+    /// registry wraps the tag in [`Self::reasoning_prefix`] (see
+    /// `ParserRegistry::generate_tool_constraint`).
     pub fn build_structural_tag(tools: &[Tool], at_least_one: bool) -> Value {
         let tags: Vec<Value> = tools
             .iter()
@@ -141,6 +142,28 @@ impl Glm4MoeParser {
                 "tags": tags,
                 "at_least_one": at_least_one,
             }
+        })
+    }
+
+    /// The reasoning block that precedes a forced call on a thinking prompt:
+    /// xgrammar's built-in `glm_4_7` prefix (`reasoning=True`) — free text
+    /// closed by `</think>`, with the think and tool-call control tokens
+    /// excluded so the model can neither open a call nor nest a block inside
+    /// its reasoning. The registry emits `sequence[prefix, calls]`, so the
+    /// first `<tool_call>` follows `</think>` directly, as in the built-in.
+    pub fn reasoning_prefix() -> Value {
+        serde_json::json!({
+            "type": "tag",
+            "begin": "",
+            "content": {
+                "type": "any_text",
+                "excludes": [
+                    "<think>", "</think>",
+                    "<tool_call>", "</tool_call>",
+                    "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>",
+                ],
+            },
+            "end": "</think>",
         })
     }
 
@@ -482,6 +505,31 @@ mod tests {
 
         let tag = Glm4MoeParser::build_structural_tag(&tools, false);
         assert_eq!(tag["format"]["at_least_one"], false);
+    }
+
+    #[test]
+    fn reasoning_prefix_mirrors_the_xgrammar_glm_4_7_reasoning_block() {
+        let prefix = Glm4MoeParser::reasoning_prefix();
+        assert_eq!(prefix["type"], "tag");
+        assert_eq!(prefix["begin"], "");
+        assert_eq!(prefix["end"], "</think>");
+        assert_eq!(prefix["content"]["type"], "any_text");
+        let excludes = prefix["content"]["excludes"].as_array().unwrap();
+        for token in [
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<arg_key>",
+            "</arg_key>",
+            "<arg_value>",
+            "</arg_value>",
+        ] {
+            assert!(
+                excludes.contains(&Value::String(token.to_string())),
+                "{token} must not appear inside the reasoning block"
+            );
+        }
     }
 
     fn tool_with_props(props: Value) -> Vec<Tool> {
