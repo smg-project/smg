@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4|minimax-m2.7|kimi-k2.6|glm-5.2); empty = all"
+        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m2.7|kimi-k2.6|glm-5.2); empty = all"
         required: false
         default: ""
       model:
@@ -160,20 +160,32 @@ jobs:
                "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
               # Blackwell legs (B200). Models pre-staged on NVMe at /raid/models/<id>.
               # Concurrent TP=4 per arm (0-3 + 4-7).
-              {"name": "deepseek-v4", "runner": "blackwell", "tp": 4,
-               "gpu_a": "0,1,2,3", "gpu_b": "4,5,6,7",
-               # -0731 encoding + deepseek_v4 SMG reasoning parser landed in #2080;
-               # B300 A/B validated at parity (simple_python/irrelevance/multiple).
-               "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "bfcl_model": "deepseek-ai/DeepSeek-V4-Flash-0731-FC",
-               "vllm_tool": "deepseek_v4", "vllm_reason": "deepseek_v4",
-               "smg_tool": "deepseek_v4", "smg_reason": "deepseek_v4",
-               # --kv-cache-dtype fp8 + --block-size 256 REQUIRED: V4's FlashMLA fp8
-               # kernel asserts fp8 kv-cache (else EngineCore dies at startup).
-               "vllm_extra": "--tokenizer-mode deepseek_v4 --trust-remote-code --kv-cache-dtype fp8 --block-size 256",
-               "gpu_mem": "0.90", "startup_timeout": "2400", "model_cache": "/raid/models",
-               # Kept tight until the first clean nightly score on this leg.
+              # DeepSeek-V4.1-Flash is ~765GB on disk (552B backbone + 196B int8 Engram,
+              # all GPU-resident), so it outgrows a TP=4 half-node and runs SEQUENTIAL
+              # on the whole node like glm-5.2. SMG: deepseek_v41 tool/reasoning parsers
+              # + native renderer (#2524/#2525/#2527). vLLM: V4.1 is on main only
+              # (vllm-project/vllm#56208 + #56228, 2026-09-10), not in the 0.27.1 CI
+              # pin, so this leg installs a per-commit main wheel (vllm_commit below).
+              {"name": "deepseek-v4.1", "runner": "blackwell", "tp": 8,
+               "gpu_a": "0,1,2,3,4,5,6,7", "gpu_b": "",  # sequential: arm B reuses GPU_A (whole node)
+               "model": "deepseek-ai/DeepSeek-V4.1-Flash", "bfcl_model": "deepseek-ai/DeepSeek-V4.1-Flash-FC",
+               "vllm_tool": "deepseek_v41", "vllm_reason": "deepseek_v41",
+               "smg_tool": "deepseek_v41", "smg_reason": "deepseek_v41",
+               # No kv-cache/block-size flags: vLLM's V4.1 sparse-MLA path maps
+               # --kv-cache-dtype auto -> fp8_ds_mla and picks the kernel block size
+               # itself (128 on Blackwell); V4's --block-size 256 no longer matches.
+               "vllm_extra": "--tokenizer-mode deepseek_v41 --trust-remote-code",
+               # Per-commit vLLM main wheel (wheels.vllm.ai/<commit>): the V4.1 model
+               # definitions merge. Both arms get the same wheel, so the A/B stays
+               # engine-identical. Drop once the CI pin moves to a release with V4.1.
+               "vllm_commit": "9b959b86577c082c0b2bf9e2c22263255a36ad83",
+               "vllm_version": "0.28.1rc1.dev651+g9b959b865",
+               # 765GB load + first-run JIT kernels on a new arch: generous ceiling.
+               "gpu_mem": "0.90", "startup_timeout": "3600", "model_cache": "/raid/models",
+               # Sequential: both arms share the 360m job. Kept tight until the
+               # first clean nightly score on this leg.
                "run_timeout": "5400",
-               "arm_mode": "concurrent", "max_model_len": "auto"},
+               "arm_mode": "sequential", "max_model_len": "auto"},
               {"name": "minimax-m2.7", "runner": "blackwell", "tp": 4,
                "gpu_a": "0,1,2,3", "gpu_b": "4,5,6,7",
                "model": "MiniMaxAI/MiniMax-M2.7", "bfcl_model": "MiniMaxAI/MiniMax-M2.7-FC",
@@ -255,6 +267,20 @@ jobs:
           path: wheel
       - name: Setup vLLM env (provides vllm + grpc servicer + smg)
         uses: ./.github/actions/setup-vllm
+      - name: Override vLLM with a per-commit main wheel (legs newer than the CI pin)
+        # A leg whose model the pinned vLLM release (scripts/ci_install_vllm.sh)
+        # cannot serve sets vllm_commit + vllm_version to a wheels.vllm.ai build.
+        # Skipped (matrix key absent) for every other leg.
+        if: matrix.vllm_commit != ''
+        env:
+          VLLM_COMMIT: ${{ matrix.vllm_commit }}
+          VLLM_VERSION: ${{ matrix.vllm_version }}
+        run: |
+          set -euo pipefail
+          command -v uv >/dev/null || export PATH="$HOME/.local/bin:$PATH"
+          uv pip install "vllm==${VLLM_VERSION}" --torch-backend=auto \
+            --extra-index-url "https://wheels.vllm.ai/${VLLM_COMMIT}"
+          python -c "import torch, torchcodec, vllm; print('vllm', vllm.__version__)"
       - name: Install smg wheel + bfcl-eval (+ ninja for vLLM torch.compile, soundfile for bfcl's qwen handler)
         run: |
           pip uninstall -y smg || true
