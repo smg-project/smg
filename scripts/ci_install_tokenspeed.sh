@@ -118,49 +118,6 @@ setup_cuda_env() {
     export C_INCLUDE_PATH="${_cuda_inc}${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
 }
 
-ensure_python_headers() {
-    # ── Python dev headers ─────────────────────────────────────────────────
-    # Triton (and torch's cpp_extension) compile C sources against the
-    # interpreter's headers at RUNTIME, not at install time: the first
-    # TokenSpeed import builds tokenspeed_triton's cuda_utils and dies with
-    # "Python.h: No such file or directory", which Triton then reports as
-    # "Triton is not supported on the current platform".
-    #
-    # Like the CUDA toolkit above, the headers belong to the runner and are
-    # not part of the prebuilt payload. The source path only ever got them by
-    # accident -- python3-dev is an apt Recommends of python3-pip, which
-    # ci_setup_python_venv.sh installs when host venv creation fails -- so
-    # adopting the baked venv skipped that repair and left the runner without
-    # them. Install them explicitly instead, on both paths.
-    #
-    # posix_prefix resolves against the BASE interpreter, not the venv -- that
-    # is the include dir Triton hands to gcc.
-    local include_dir
-    include_dir="$(python3 -c 'import sysconfig; print(sysconfig.get_paths(scheme="posix_prefix")["include"])')"
-    if [ -f "${include_dir}/Python.h" ]; then
-        echo "Python headers: present at ${include_dir}"
-        return
-    fi
-
-    local py_version
-    py_version="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-    echo "Python.h missing from ${include_dir}; installing python${py_version}-dev"
-    if ! command -v apt-get &> /dev/null; then
-        echo "ERROR: no apt-get to install python${py_version}-dev with" >&2
-        exit 1
-    fi
-    export DEBIAN_FRONTEND=noninteractive
-    bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
-    $SUDO apt-get update -qq
-    $SUDO apt-get install -y --no-install-recommends "python${py_version}-dev"
-
-    # Fail here rather than 20 minutes later inside a Triton JIT compile.
-    if [ ! -f "${include_dir}/Python.h" ]; then
-        echo "ERROR: python${py_version}-dev did not provide ${include_dir}/Python.h" >&2
-        exit 1
-    fi
-}
-
 ensure_rdma_libs() {
     # ── RDMA runtime libraries ─────────────────────────────────────────────
     # The EPD lane moves embeddings over Mooncake, whose native extension
@@ -333,7 +290,10 @@ if [ "${TOKENSPEED_BUILD_ONLY:-0}" != "1" ] && [ "${TOKENSPEED_FORCE_SOURCE:-0}"
 fi
 
 setup_cuda_env
-ensure_python_headers
+# Python dev headers: Triton compiles against them at runtime, and the baked
+# venv skipped the apt repair that used to provide them by accident. Shared
+# with ci_setup_python_venv.sh, which now runs it for every lane.
+bash "${SCRIPT_DIR}/ci_ensure_python_headers.sh"
 ensure_rdma_libs
 
 if [ "$use_prebuilt" = "0" ]; then

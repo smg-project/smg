@@ -102,6 +102,14 @@ fi
 
 echo "venv interpreter: $ACTUAL_VERSION (pinned)"
 
+# Triton and torch's cpp_extension compile against the BASE interpreter's
+# headers at runtime. A uv-provisioned CPython bundles them; a host interpreter
+# only has them if python3.X-dev is installed, which the repair branch above
+# used to pull in by accident (a Recommends of python3-pip) and a host whose
+# venv creation just works never gets. Guarantee them here so every engine lane
+# fails at setup, not 20 minutes later inside a Triton JIT compile.
+bash "${SCRIPT_DIR}/ci_ensure_python_headers.sh" .venv/bin/python
+
 # Add to GitHub Actions PATH if running in CI
 if [ -n "${GITHUB_PATH:-}" ]; then
     echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
