@@ -1510,6 +1510,24 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// Attach media references for worker-side multimodal processing (vLLM only).
+    pub fn set_vllm_media_refs(&mut self, refs: vllm::MediaRefs) -> Result<(), String> {
+        match self {
+            Self::Vllm(req) => {
+                req.media_refs = Some(refs);
+                Ok(())
+            }
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
+                Err("media refs require a vLLM gRPC worker".to_string())
+            }
+        }
+    }
+
+    /// Whether this vLLM request carries media references.
+    pub fn has_vllm_media_refs(&self) -> bool {
+        matches!(self, Self::Vllm(req) if req.media_refs.is_some())
+    }
+
     /// Number of parallel samples requested (1 when unset). vLLM, SGLang
     /// and TokenSpeed carry it in their sampling params; the others have no
     /// per-request sample count.

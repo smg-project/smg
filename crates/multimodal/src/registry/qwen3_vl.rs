@@ -129,6 +129,11 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         "qwen3_vl"
     }
 
+    /// `<|image_pad|>` / `<|video_pad|>` are vLLM's single-token targets.
+    fn worker_expandable(&self, modality: Modality) -> bool {
+        matches!(modality, Modality::Image | Modality::Video)
+    }
+
     fn matches(&self, metadata: &ModelMetadata) -> bool {
         let id = metadata.model_id.to_ascii_lowercase();
         let model_type = metadata.config_model_type();
