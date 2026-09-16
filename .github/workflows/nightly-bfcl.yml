@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m2.7|kimi-k2.6|glm-5.3-flash); empty = all"
+        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m3|kimi-k2.6|glm-5.3-flash); empty = all"
         required: false
         default: ""
       model:
@@ -189,12 +189,22 @@ jobs:
                # first clean nightly score on this leg.
                "run_timeout": "5400",
                "arm_mode": "sequential", "max_model_len": "auto"},
-              {"name": "minimax-m2.7", "runner": "blackwell", "tp": 4,
+              # MiniMax-M3 (427B/26B-active VLM MoE, MSA sparse attention). The official
+              # MXFP8 checkpoint (~444GB) fits a TP=4 half-node; nvidia/MiniMax-M3-NVFP4
+              # (~224GB, ModelOpt 4-bit, small drops vs FP8) is the fallback if headroom
+              # ever bites. Served by the stock CI vLLM pin (0.27.1 has M3, mxfp8 and the
+              # minimax_m3 parsers) — no per-commit wheel. Flags per the vLLM recipe
+              # (models/MiniMaxAI/MiniMax-M3.yaml): --block-size 128 is mandatory (MSA
+              # sparse_block_size) and the mxfp8 variant sets indexer_kv_dtype fp8.
+              {"name": "minimax-m3", "runner": "blackwell", "tp": 4,
                "gpu_a": "0,1,2,3", "gpu_b": "4,5,6,7",
-               "model": "MiniMaxAI/MiniMax-M2.7", "bfcl_model": "MiniMaxAI/MiniMax-M2.7-FC",
-               "vllm_tool": "minimax_m2", "vllm_reason": "minimax_m2",
-               "smg_tool": "minimax_m2", "smg_reason": "minimax",
-               "vllm_extra": "--trust-remote-code", "gpu_mem": "0.90", "startup_timeout": "2400",
+               "model": "MiniMaxAI/MiniMax-M3-MXFP8", "bfcl_model": "MiniMaxAI/MiniMax-M3-MXFP8-FC",
+               "vllm_tool": "minimax_m3", "vllm_reason": "minimax_m3",
+               "smg_tool": "minimax_m3", "smg_reason": "minimax_m3",
+               "vllm_extra": "--trust-remote-code --block-size 128 --attention_config.indexer_kv_dtype fp8",
+               # MXFP8 MoE kernel JIT + vision tower on first runs: a bit above M2.7's 2400.
+               "gpu_mem": "0.90", "startup_timeout": "3000",
+               # Per-arm cap carried over from the M2.7 leg.
                "run_timeout": "14400",
                "model_cache": "/raid/models", "arm_mode": "concurrent", "max_model_len": "auto"},
               # Kimi-K2.6 int4 (~500GB) fits TP=4 half-node.

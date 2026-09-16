@@ -65,7 +65,7 @@ Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`)
 | Qwen3.8-27B (`qwen3.8`) | `4-gpu-h100` | 2 | `qwen3_xml` / `qwen3` | `qwen_xml` / `qwen3` |
 | gpt-oss-120b (`gpt-oss`) | `4-gpu-h100` | 2 | `openai` / — | _(none — SMG auto-routes harmony)_ / — |
 | DeepSeek-V4.1-Flash (`deepseek-v4.1`) | `blackwell` | 8 (seq) | `deepseek_v41` / `deepseek_v41` (+`--tokenizer-mode deepseek_v41 --trust-remote-code`; per-commit vLLM main wheel) | `deepseek_v41` / `deepseek_v41` |
-| MiniMax-M2.7 (`minimax-m2.7`) | `blackwell` | 4 | `minimax_m2` / `minimax_m2` (+`--trust-remote-code`) | `minimax_m2` / `minimax` |
+| MiniMax-M3 MXFP8 (`minimax-m3`) | `blackwell` | 4 | `minimax_m3` / `minimax_m3` (+`--trust-remote-code --block-size 128 --attention_config.indexer_kv_dtype fp8`) | `minimax_m3` / `minimax_m3` |
 | Kimi-K2.6 int4 (`kimi-k2.6`) | `blackwell` | 4 | `kimi_k2` / `kimi_k2` (+`--trust-remote-code`) | `kimik2` / `kimi_k25`† |
 | GLM-5.3-Flash (`glm-5.3-flash`) | `blackwell` | 4 | `glm47` / `glm45` (+`--trust-remote-code --kv-cache-dtype fp8`; per-commit vLLM main wheel) | `glm47_moe` / `glm45` |
 
@@ -90,7 +90,7 @@ The nightly (`.github/workflows/nightly-bfcl.yml`) runs the A/B as a GitHub Acti
 matrix — one leg per model, `fail-fast: false`, each on its own runner:
 
 - `4-gpu-h100` — Qwen3.8-27B and gpt-oss-120b, TP=2 per arm (GPUs 0,1 + 2,3).
-- `blackwell` (B200) — MiniMax-M2.7, Kimi-K2.6 int4 and GLM-5.3-Flash, TP=4 per arm
+- `blackwell` (B200) — MiniMax-M3 MXFP8, Kimi-K2.6 int4 and GLM-5.3-Flash, TP=4 per arm
   (GPUs 0-3 + 4-7); DeepSeek-V4.1-Flash needs the whole node (TP=8, arms sequential).
 
 All legs use `max_model_len` **32768**: the `multi_turn` categories emit ~18k-token
