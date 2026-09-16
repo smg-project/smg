@@ -118,49 +118,49 @@ async fn test_glm5_routes_to_glm47_moe() {
     }
 }
 
-/// #2548: a GLM-4.7-family request that offers no tools must not carry the
-/// full-assistant EBNF — an engine launched without a grammar backend
-/// (TokenSpeed's default) rejects every constrained request, and plain chat
-/// has nothing to constrain. Tools in auto mode still get the grammar, and
-/// `tool_choice: none` with tools offered gets the grammar that forbids calls.
+/// GLM-4.7 follows the same contract as every other native tool format:
+/// `auto` and `none` send no constraint (an engine launched without a grammar
+/// backend, TokenSpeed's default, keeps serving tool calls), and `required`
+/// or a named function sends the structural tag with a forced call.
 #[test]
-fn test_glm47_chat_constraint_only_when_tools_are_offered() {
+fn test_glm47_constrains_only_forced_tool_choices_with_a_structural_tag() {
     let factory = ParserFactory::new();
     let registry = factory.registry();
     let parser = Some("glm47_moe");
-    let auto = ToolChoice::Value(ToolChoiceValue::Auto);
-
-    let none_offered = registry
-        .generate_chat_constraint(parser, &[], &auto, true)
-        .unwrap();
-    assert!(
-        none_offered.is_none(),
-        "no tools, no grammar: {none_offered:?}"
-    );
-    // The response side reads the same predicate, so it must agree.
-    assert!(!registry.uses_full_assistant_constraint(parser, &[]));
-
     let tools = create_test_tools();
-    match registry
-        .generate_chat_constraint(parser, &tools, &auto, true)
-        .unwrap()
-    {
-        Some(ToolConstraint::Ebnf(grammar)) => {
-            assert!(grammar.contains("tool_calls ::= tool_call*"), "{grammar}");
-        }
-        other => panic!("tools in auto mode must yield the EBNF, got {other:?}"),
-    }
+    assert!(registry.has_structural_tag("glm47_moe"));
 
-    let none = ToolChoice::Value(ToolChoiceValue::None);
-    match registry
-        .generate_chat_constraint(parser, &tools, &none, true)
-        .unwrap()
-    {
-        Some(ToolConstraint::Ebnf(grammar)) => {
-            assert!(grammar.contains("tool_calls ::= \"\""), "{grammar}");
-        }
-        other => panic!("tool_choice none must forbid calls with a grammar, got {other:?}"),
+    for choice in [
+        ToolChoice::Value(ToolChoiceValue::Auto),
+        ToolChoice::Value(ToolChoiceValue::None),
+    ] {
+        let constraint = registry
+            .generate_tool_constraint(parser, &tools, &choice)
+            .unwrap();
+        assert!(
+            constraint.is_none(),
+            "{choice:?} must not constrain: {constraint:?}"
+        );
     }
+    assert!(registry
+        .generate_tool_constraint(parser, &[], &ToolChoice::Value(ToolChoiceValue::Required))
+        .unwrap()
+        .is_none());
+
+    let required = registry
+        .generate_tool_constraint(
+            parser,
+            &tools,
+            &ToolChoice::Value(ToolChoiceValue::Required),
+        )
+        .unwrap();
+    let Some(ToolConstraint::StructuralTag(tag)) = required else {
+        panic!("required must yield the structural tag, got {required:?}");
+    };
+    let tag: serde_json::Value = serde_json::from_str(&tag).unwrap();
+    assert_eq!(tag["format"]["type"], "triggered_tags");
+    assert_eq!(tag["format"]["at_least_one"], true);
+    assert_eq!(tag["format"]["tags"].as_array().unwrap().len(), tools.len());
 }
 
 #[tokio::test]

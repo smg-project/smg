@@ -25,7 +25,6 @@ use openai_protocol::{
 };
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
-use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::error;
 use uuid::Uuid;
 
@@ -472,22 +471,6 @@ pub(crate) fn filter_tools_by_tool_choice(
         }
         _ => None, // No filtering needed
     }
-}
-
-pub(crate) fn uses_native_chat_tool_format(
-    factory: &ToolParserFactory,
-    configured_parser: Option<&str>,
-    tools: &[Tool],
-    tool_choice: Option<&ToolChoice>,
-) -> bool {
-    let filtered = filter_tools_by_tool_choice(tools, tool_choice);
-    let tools = filtered.as_deref().unwrap_or(tools);
-    factory
-        .registry()
-        .has_structural_tag_for_parser(configured_parser)
-        || factory
-            .registry()
-            .uses_full_assistant_constraint(configured_parser, tools)
 }
 
 /// Filter ChatCompletionRequest by tool_choice

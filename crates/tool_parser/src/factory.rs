@@ -36,8 +36,6 @@ pub enum ToolConstraint {
     /// Structural tag constraint — output includes model-native framing tokens.
     /// The model-specific parser IS used to parse the response.
     StructuralTag(String),
-    /// EBNF covering the complete assistant turn, including native tool calls.
-    Ebnf(String),
 }
 
 impl ToolConstraint {
@@ -46,7 +44,6 @@ impl ToolConstraint {
         match self {
             ToolConstraint::JsonSchema(s) => ("json_schema".to_string(), s.clone()),
             ToolConstraint::StructuralTag(s) => ("structural_tag".to_string(), s.clone()),
-            ToolConstraint::Ebnf(s) => ("ebnf".to_string(), s.clone()),
         }
     }
 
@@ -184,61 +181,6 @@ impl ParserRegistry {
     /// via `--tool-call-parser`).
     pub fn has_structural_tag_for_parser(&self, configured: Option<&str>) -> bool {
         configured.is_some_and(|p| self.has_structural_tag(p))
-    }
-
-    /// Return whether `configured_parser` constrains the full assistant turn
-    /// for `tools`, which must already be filtered by the request's tool choice.
-    ///
-    /// A request that offers no tools is never constrained: there is nothing
-    /// to constrain, and an engine launched without a grammar backend must
-    /// keep serving plain chat. This is the one place that rule lives; the
-    /// request side (grammar generation) and the response side (native tool
-    /// format) both read it.
-    pub fn uses_full_assistant_constraint(
-        &self,
-        configured_parser: Option<&str>,
-        tools: &[Tool],
-    ) -> bool {
-        !tools.is_empty()
-            && configured_parser == Some("glm47_moe")
-            && self.has_parser("glm47_moe")
-            && !tools.iter().any(|tool| tool.function.strict == Some(true))
-    }
-
-    /// Generate a chat constraint for the configured parser and effective tools.
-    /// `tool_choice` selects permitted calls; `enable_thinking` describes the
-    /// chat template's prefilled thinking mode. Returns a constraint or no grammar.
-    ///
-    /// A request that offers no tools gets no grammar at all (see
-    /// [`Self::uses_full_assistant_constraint`]). The tool-less grammar is
-    /// reserved for `tool_choice: none` with tools offered, where it forbids
-    /// the calls the model was shown.
-    pub fn generate_chat_constraint(
-        &self,
-        configured_parser: Option<&str>,
-        tools: &[Tool],
-        tool_choice: &ToolChoice,
-        enable_thinking: bool,
-    ) -> Result<Option<ToolConstraint>, String> {
-        if self.uses_full_assistant_constraint(configured_parser, tools) {
-            let tools = if matches!(tool_choice, ToolChoice::Value(ToolChoiceValue::None)) {
-                &[]
-            } else {
-                tools
-            };
-            // Forcing choices (required, named function, allowed-tools in
-            // required mode) must not permit a tool-less turn, so the
-            // grammar requires at least one call.
-            let at_least_one = match tool_choice {
-                ToolChoice::Value(ToolChoiceValue::Required) => true,
-                ToolChoice::Function { .. } => true,
-                ToolChoice::AllowedTools { mode, .. } => mode == "required",
-                ToolChoice::Value(ToolChoiceValue::None | ToolChoiceValue::Auto) => false,
-            };
-            return Glm4MoeParser::generate_chat_ebnf(tools, enable_thinking, at_least_one)
-                .map(|grammar| Some(ToolConstraint::Ebnf(grammar)));
-        }
-        self.generate_tool_constraint(configured_parser, tools, tool_choice)
     }
 
     /// Generate tool call constraint.
@@ -391,7 +333,11 @@ impl ParserFactory {
             DeepSeekDsmlParser::build_v41_structural_tag,
         );
         registry.register_parser("glm45_moe", || Box::new(Glm4MoeParser::glm45()));
-        registry.register_parser("glm47_moe", || Box::new(Glm4MoeParser::glm47()));
+        registry.register_parser_with_structural_tag(
+            "glm47_moe",
+            || Box::new(Glm4MoeParser::glm47()),
+            Glm4MoeParser::build_structural_tag,
+        );
         registry.register_parser("step3", || Box::new(Step3Parser::new()));
         registry.register_parser("sarashina", || Box::new(SarashinaParser::new()));
         registry.register_parser_with_structural_tag(
