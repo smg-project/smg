@@ -433,6 +433,20 @@ fn transform_content_field(
     Ok(())
 }
 
+/// A popped assistant message's prefill: its string content, or its text parts joined in order.
+fn prefill_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => Some(
+            parts
+                .iter()
+                .filter_map(|part| part.get("text")?.as_str())
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 fn modality_for_chat_part(type_name: &str) -> Option<Modality> {
     match type_name {
         "image_url" | "image" => Some(Modality::Image),
@@ -621,14 +635,12 @@ pub(crate) fn process_chat_messages_with_placeholders(
                     ProcessedMessages {
                         text: String::new(),
                         stop_sequences: request.stop.clone(),
+                        unbilled_prompt_tokens: 0,
                     },
                     PromptEncoding::FromText,
                 ));
             };
-            last_msg
-                .get("content")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
+            last_msg.get("content").and_then(prefill_text)
         } else {
             None
         };
@@ -649,6 +661,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
         ProcessedMessages {
             text: rendered.text,
             stop_sequences: request.stop.clone(),
+            unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
         },
         rendered.encoding,
     ))
@@ -1821,6 +1834,41 @@ mod tests {
         assert_eq!(native["assistant_prefix"], json!(""));
     }
 
+    /// Under the OpenAI content format the popped assistant message keeps its
+    /// parts, so the prefill is their text.
+    #[test]
+    fn parts_valued_prefill_reaches_the_render_call_under_openai_content_format() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "continue_final_message": true,
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Sure"},
+                    {"type": "text", "text": "!"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let tokenizer = llm_tokenizer::MockTokenizer::new()
+            .with_content_format(ChatTemplateContentFormat::OpenAI)
+            .with_json_chat_template();
+        let (processed, _) = process_chat_messages_with_placeholders(
+            &request,
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        let (rendered, prefix) = processed
+            .text
+            .split_at(processed.text.rfind('}').unwrap() + 1);
+        let rendered: Value = serde_json::from_str(rendered).unwrap();
+        assert_eq!(rendered["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(rendered["add_generation_prompt"], json!(true));
+        assert_eq!(prefix, "Sure!");
+    }
+
     /// Without the capability a tool call's `arguments` string is parsed into
     /// an object before rendering (what Transformers templates expect); with
     /// it the string reaches the renderer as written, so a native renderer can
@@ -1858,9 +1906,50 @@ mod tests {
         );
     }
 
+    /// A renderer that parses `arguments` itself (K3) gets a malformed history
+    /// string as written and applies its own tolerance; Transformers templates
+    /// keep the 400.
+    #[test]
+    fn malformed_tool_call_arguments_are_forwarded_when_the_renderer_parses_them() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "北京天气"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"location\":\"北京\""}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "晴"}
+            ]
+        }))
+        .unwrap();
+
+        let err = process_chat_messages_with_placeholders(
+            &request,
+            &llm_tokenizer::MockTokenizer::new(),
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap_err();
+        assert!(err.contains("Failed to parse tool call arguments"), "{err}");
+
+        let raw = render_with(RAW_ARGUMENTS, &request);
+        assert_eq!(
+            raw["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            json!("{\"location\":\"北京\"")
+        );
+    }
+
     #[test]
     fn deferred_renderer_gets_the_prefill_and_its_job_runs_in_the_tokenize_step() {
-        let tokenizer = llm_tokenizer::MockTokenizer::new().with_deferred_chat_ids(vec![7, 8, 9]);
+        let tokenizer = llm_tokenizer::MockTokenizer::new()
+            .with_deferred_chat_ids(vec![7, 8, 9])
+            .with_unbilled_prompt_tokens(3);
         let (processed, encoding) = process_chat_messages_with_placeholders(
             &prefill_request(),
             &tokenizer,
@@ -1873,6 +1962,18 @@ mod tests {
             "the prefill is passed into the render call"
         );
         assert!(matches!(encoding, PromptEncoding::Deferred(_)));
+        assert_eq!(
+            processed.unbilled_prompt_tokens, 3,
+            "the renderer's unbilled count rides along"
+        );
+        let (flat, _) = process_chat_messages_with_placeholders(
+            &prefill_request(),
+            &llm_tokenizer::MockTokenizer::new(),
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        assert_eq!(flat.unbilled_prompt_tokens, 0);
 
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(tokenizer);
         let ids = block_on(encode_prompt_blocking(tokenizer, &processed.text, encoding)).unwrap();

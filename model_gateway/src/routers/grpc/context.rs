@@ -701,6 +701,9 @@ pub(crate) struct ResponseState {
     /// Final processed response
     pub final_response: Option<FinalResponse>,
 
+    /// Rendered prompt tokens the client-facing usage drops; settlement adds them back.
+    pub unbilled_prompt_tokens: u32,
+
     /// Responses API iteration result (Harmony only, for tool loop orchestration)
     pub responses_iteration_result: Option<super::harmony::ResponsesIterationResult>,
 }

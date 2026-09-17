@@ -114,6 +114,7 @@ pub fn process_messages(
         ProcessedMessages {
             text: rendered.text,
             stop_sequences,
+            unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
         },
         rendered.encoding,
     ))

@@ -682,6 +682,16 @@ impl Usage {
         }
         self
     }
+
+    /// Drop prompt tokens the provider does not bill (the rendered generation stub).
+    pub fn with_unbilled_prompt_tokens(mut self, unbilled: u32) -> Self {
+        self.prompt_tokens = self.prompt_tokens.saturating_sub(unbilled);
+        self.total_tokens = self.prompt_tokens + self.completion_tokens;
+        if let Some(details) = &mut self.prompt_tokens_details {
+            details.cached_tokens = details.cached_tokens.min(self.prompt_tokens);
+        }
+        self
+    }
 }
 
 #[serde_with::skip_serializing_none]
@@ -1081,6 +1091,36 @@ mod tests {
             usage.prompt_tokens_details,
             Some(PromptTokenUsageInfo { cached_tokens: 0 })
         ));
+    }
+
+    #[test]
+    fn unbilled_prompt_tokens_come_off_the_prompt_and_total() {
+        let usage = Usage::from_counts(10, 4)
+            .with_cached_tokens(10)
+            .with_unbilled_prompt_tokens(3);
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (7, 4, 11)
+        );
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens),
+            Some(7),
+            "cached tokens are clamped to the billed prompt"
+        );
+
+        let saturated = Usage::from_counts(2, 4).with_unbilled_prompt_tokens(3);
+        assert_eq!((saturated.prompt_tokens, saturated.total_tokens), (0, 4));
+        assert!(saturated.prompt_tokens_details.is_none());
+
+        let unchanged = Usage::from_counts(10, 4).with_unbilled_prompt_tokens(0);
+        assert_eq!((unchanged.prompt_tokens, unchanged.total_tokens), (10, 14));
     }
 
     #[test]

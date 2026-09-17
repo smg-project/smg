@@ -750,7 +750,8 @@ impl StreamingProcessor {
                         Usage::from_counts(total_prompt, total_completion)
                             .with_cached_tokens(total_cached)
                             .with_reasoning_tokens(total_reasoning)
-                            .with_speculative_tokens(total_spec_accepted, total_spec_drafted),
+                            .with_speculative_tokens(total_spec_accepted, total_spec_drafted)
+                            .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens),
                     )
                     .maybe_system_fingerprint(system_fingerprint)
                     .build();

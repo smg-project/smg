@@ -22,14 +22,14 @@ use crate::{
         kimi_k25_tools::apply_kimi_k25_tools,
         kimi_k3_xtml::{
             apply_kimi_k3_xtml_with_effort_default, join_segments, render_kimi_k3_xtml_prompt,
-            PromptSegment,
+            PromptSegment, RenderedXtml,
         },
     },
     factory::discover_chat_template_in_dir,
     kimi_k2_tokenizer,
     traits::{
-        ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, PromptEncoding, SpecialTokens,
-        TokenIdType, Tokenizer as TokenizerTrait,
+        ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, PromptEncoding,
+        RendererCapabilities, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
     },
 };
 
@@ -653,6 +653,7 @@ impl TokenizerTrait for TiktokenTokenizer {
             return Ok(ChatTemplateOutput {
                 text,
                 encoding: PromptEncoding::FromText,
+                unbilled_prompt_tokens: 0,
             });
         }
         // K3's ids are not a function of the flat text: render the reference's
@@ -660,18 +661,27 @@ impl TokenizerTrait for TiktokenTokenizer {
         // would have encoded the text. The renderer reads none of
         // `params.special_tokens`, so the injection `apply_chat_template`
         // performs is a no-op here.
-        let segments = render_kimi_k3_xtml_prompt(messages, &params, assistant_prefix)?;
+        let RenderedXtml { segments, pending } =
+            render_kimi_k3_xtml_prompt(messages, &params, assistant_prefix)?;
         let text = join_segments(&segments);
+        // Piecewise encoding makes the stub's own count its share of the full encode.
+        let unbilled_prompt_tokens =
+            encode_segments(&self.tokenizer, &segments[pending])?.len() as u32;
         let bpe = Arc::clone(&self.tokenizer);
         let job = EncodeJob::new(move || encode_segments(&bpe, &segments).map(Encoding::Tiktoken));
         Ok(ChatTemplateOutput {
             text,
             encoding: PromptEncoding::Deferred(job),
+            unbilled_prompt_tokens,
         })
     }
 
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
-        self.chat_template.content_format()
+        match self.renderer {
+            // K3 renders content parts positionally, so the gateway passes them through.
+            Renderer::KimiK3Xtml => ChatTemplateContentFormat::OpenAI,
+            Renderer::Jinja | Renderer::KimiK25Tools => self.chat_template.content_format(),
+        }
     }
 
     fn thinking_toggle(&self) -> ThinkingToggle {
@@ -699,6 +709,17 @@ impl TokenizerTrait for TiktokenTokenizer {
             // (the default), so completions start mid-reasoning.
             Renderer::KimiK3Xtml => true,
             _ => self.chat_template.think_in_prefill(),
+        }
+    }
+
+    fn renderer_capabilities(&self) -> RendererCapabilities {
+        match self.renderer {
+            // The K3 encoder parses `arguments` itself; the gateway forwards them as written.
+            Renderer::KimiK3Xtml => RendererCapabilities {
+                raw_tool_call_arguments: true,
+                ..RendererCapabilities::default()
+            },
+            Renderer::Jinja | Renderer::KimiK25Tools => RendererCapabilities::default(),
         }
     }
 
@@ -1155,7 +1176,9 @@ mod tests {
         let ids = job.run().unwrap();
         let expected = encode_segments(
             &tokenizer.tokenizer,
-            &render_kimi_k3_xtml_prompt(&messages, &params(), None).unwrap(),
+            &render_kimi_k3_xtml_prompt(&messages, &params(), None)
+                .unwrap()
+                .segments,
         )
         .unwrap();
         assert_eq!(ids.token_ids(), &expected[..]);
@@ -1196,6 +1219,80 @@ mod tests {
     }
 
     #[test]
+    fn test_k3_renderer_reports_openai_content_format() {
+        let k3 = write_minimal_tiktoken_dir(
+            "{}",
+            Some(r#"{"architectures": ["KimiK3ForConditionalGeneration"]}"#),
+        );
+        let k3 = TiktokenTokenizer::from_dir(k3.path()).unwrap();
+        assert_eq!(
+            k3.chat_template_content_format(),
+            ChatTemplateContentFormat::OpenAI
+        );
+
+        let llama =
+            write_minimal_tiktoken_dir("{}", Some(r#"{"architectures": ["LlamaForCausalLM"]}"#));
+        let llama = TiktokenTokenizer::from_dir(llama.path()).unwrap();
+        assert_eq!(
+            llama.chat_template_content_format(),
+            ChatTemplateContentFormat::String
+        );
+    }
+
+    #[test]
+    fn test_k3_reports_raw_tool_call_arguments() {
+        let k3 = TiktokenTokenizer::from_dir(k3_byte_dir().path()).unwrap();
+        let caps = k3.renderer_capabilities();
+        assert!(caps.raw_tool_call_arguments, "{caps:?}");
+        assert!(
+            !caps.enable_thinking_alias && !caps.native_assistant_continuation,
+            "{caps:?}"
+        );
+
+        let jinja = write_minimal_tiktoken_dir("{}", None);
+        let jinja = TiktokenTokenizer::from_dir(jinja.path()).unwrap();
+        assert_eq!(
+            jinja.renderer_capabilities(),
+            RendererCapabilities::default()
+        );
+    }
+
+    #[test]
+    fn test_k3_reports_the_pending_stub_length() {
+        let tokenizer = TiktokenTokenizer::from_dir(k3_byte_dir().path()).unwrap();
+        let messages = vec![serde_json::json!({"role": "user", "content": "Hi"})];
+        let params = || ChatTemplateParams {
+            add_generation_prompt: true,
+            ..Default::default()
+        };
+        // `<|open|>` + b"think" + `<|sep|>` under the byte vocabulary: 7 ids.
+        let stub: Vec<u32> = std::iter::once(300)
+            .chain("think".bytes().map(u32::from))
+            .chain(std::iter::once(302))
+            .collect();
+
+        let rendered = tokenizer
+            .apply_chat_template_with_encoding(&messages, params(), None)
+            .unwrap();
+        assert_eq!(rendered.unbilled_prompt_tokens, stub.len() as u32);
+        let PromptEncoding::Deferred(job) = rendered.encoding else {
+            panic!("K3 must defer its encode");
+        };
+        let ids = job.run().unwrap();
+        assert!(
+            ids.token_ids().ends_with(&stub),
+            "the stub is the prompt's tail: {:?}",
+            ids.token_ids()
+        );
+
+        // A prefill after the stub is billed.
+        let prefilled = tokenizer
+            .apply_chat_template_with_encoding(&messages, params(), Some("Sure"))
+            .unwrap();
+        assert_eq!(prefilled.unbilled_prompt_tokens, stub.len() as u32);
+    }
+
+    #[test]
     fn test_flat_renderer_reports_from_text_with_prefill_joined() {
         let dir = write_minimal_tiktoken_dir("{}", None);
         let mut tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
@@ -1218,6 +1315,7 @@ mod tests {
             tokenizer.apply_chat_template(&messages, params()).unwrap() + " there"
         );
         assert!(matches!(rendered.encoding, PromptEncoding::FromText));
+        assert_eq!(rendered.unbilled_prompt_tokens, 0);
     }
 
     #[test]

@@ -84,11 +84,15 @@ fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
 }
 
 fn complete(index: u32, reason: &str) -> proto::GenerateResponse {
+    complete_with_prompt(index, reason, 1)
+}
+
+fn complete_with_prompt(index: u32, reason: &str, prompt_tokens: u32) -> proto::GenerateResponse {
     proto::GenerateResponse {
         response: Some(GenerationEvent::Complete(proto::GenerateComplete {
             index,
             finish_reason: reason.to_string(),
-            prompt_tokens: 1,
+            prompt_tokens,
             completion_tokens: 12,
             ..Default::default()
         })),
@@ -316,6 +320,51 @@ async fn chat_stream_error_does_not_flush_a_success_tail() {
     assert!(events
         .iter()
         .all(|event| event["choices"][0]["finish_reason"].is_null()));
+}
+
+#[tokio::test]
+async fn chat_usage_chunk_excludes_unbilled_prompt_tokens() {
+    for unbilled in [0, 3] {
+        let (stream, server) = scripted_stream(
+            vec![chunk(0, "hi"), complete_with_prompt(0, "stop", 10)],
+            "0",
+        )
+        .await;
+        let (tx, rx) = sse_channel();
+        let request = serde_json::json!({
+            "model": "eof-test", "messages": [], "stream": true,
+            "stream_options": {"include_usage": true}
+        });
+        let mut spec = ChatResponseSpec::from(
+            &serde_json::from_value::<ChatCompletionRequest>(request).expect("chat request"),
+        );
+        spec.unbilled_prompt_tokens = unbilled;
+        let result = processor(false)
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+
+        let usage = events
+            .iter()
+            .find_map(|event| event.get("usage").filter(|usage| !usage.is_null()))
+            .expect("usage chunk");
+        assert_eq!(usage["prompt_tokens"], 10 - unbilled);
+        assert_eq!(
+            usage["total_tokens"],
+            usage["prompt_tokens"].as_u64().unwrap() + usage["completion_tokens"].as_u64().unwrap()
+        );
+    }
 }
 
 #[tokio::test]

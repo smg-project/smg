@@ -74,6 +74,8 @@ pub(crate) struct ChatResponseSpec {
     pub ignore_eos: bool,
     /// Fallback when preparation derived no override.
     pub skip_special_tokens: bool,
+    /// Rendered prompt tokens the provider does not bill; set by request building.
+    pub unbilled_prompt_tokens: u32,
 }
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
@@ -94,6 +96,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             no_stop_trim: request.no_stop_trim,
             ignore_eos: request.ignore_eos,
             skip_special_tokens: request.skip_special_tokens,
+            unbilled_prompt_tokens: 0,
         }
     }
 }

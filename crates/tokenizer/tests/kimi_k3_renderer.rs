@@ -49,6 +49,21 @@ fn render(messages: &[Value], tools: Option<&[Value]>, thinking: bool) -> String
     apply_kimi_k3_xtml(messages, &params).expect("k3 render should succeed")
 }
 
+/// A K3 directory with a stub vocabulary and, intentionally, no
+/// chat_template.json / .jinja.
+fn k3_tokenizer_without_chat_template() -> (TempDir, TiktokenTokenizer) {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("tiktoken.model"), MIN_TIKTOKEN_MODEL).unwrap();
+    fs::write(
+        dir.path().join("config.json"),
+        r#"{"architectures": ["KimiK3ForConditionalGeneration"]}"#,
+    )
+    .unwrap();
+    fs::write(dir.path().join("tokenizer_config.json"), "{}").unwrap();
+    let tok = TiktokenTokenizer::from_dir(dir.path()).expect("K3 tokenizer should load");
+    (dir, tok)
+}
+
 fn get_weather_tools() -> Vec<Value> {
     vec![json!({
         "type": "function",
@@ -191,17 +206,7 @@ fn thinking_effort_invalid_is_rejected() {
 /// effort word swapped — the directive is identical at every level.
 #[test]
 fn tokenizer_loads_and_renders_k3_without_chat_template() {
-    let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("tiktoken.model"), MIN_TIKTOKEN_MODEL).unwrap();
-    fs::write(
-        dir.path().join("config.json"),
-        r#"{"architectures": ["KimiK3ForConditionalGeneration"]}"#,
-    )
-    .unwrap();
-    fs::write(dir.path().join("tokenizer_config.json"), "{}").unwrap();
-    // Note: intentionally NO chat_template.json / .jinja in this directory.
-
-    let tok = TiktokenTokenizer::from_dir(dir.path()).expect("K3 tokenizer should load");
+    let (_dir, tok) = k3_tokenizer_without_chat_template();
     let messages = vec![json!({"role": "user", "content": "Hi"})];
     let rendered = tok
         .apply_chat_template(
@@ -223,11 +228,73 @@ fn tokenizer_loads_and_renders_k3_without_chat_template() {
     );
 }
 
+/// The K3 encoder coerces tool-call `arguments` itself, so the gateway must
+/// forward them as written.
+#[test]
+fn k3_tokenizer_reports_raw_tool_call_arguments() {
+    let (_dir, tok) = k3_tokenizer_without_chat_template();
+    let caps = tok.renderer_capabilities();
+    assert!(caps.raw_tool_call_arguments, "{caps:?}");
+    assert!(!caps.enable_thinking_alias, "{caps:?}");
+    assert!(!caps.native_assistant_continuation, "{caps:?}");
+}
+
+/// An image part is exactly one `<|media_pad|>` id at its authored position:
+/// the text ids on either side are untouched and no separator is added.
+#[test]
+fn image_part_adds_exactly_one_anchor_token() {
+    let model_dir = common::ensure_kimi_k3_cached();
+    let tok = TiktokenTokenizer::from_dir(&model_dir).expect("K3 tokenizer should load");
+    let anchor = tok.token_to_id("<|media_pad|>").expect("anchor id");
+    let sep = tok.token_to_id("<|sep|>").expect("sep id");
+    let close = tok.token_to_id("<|close|>").expect("close id");
+    let text = "Describe the image set in one short sentence.";
+    let ids = |content: Value| {
+        let messages = vec![json!({"role": "user", "content": content})];
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            thinking: Some(false),
+            ..Default::default()
+        };
+        let rendered = tok
+            .apply_chat_template_with_encoding(&messages, params, None)
+            .expect("render should succeed");
+        let PromptEncoding::Deferred(job) = rendered.encoding else {
+            panic!("K3 must defer its encode");
+        };
+        job.run().expect("encode").token_ids().to_vec()
+    };
+
+    let base = ids(json!(text));
+    assert!(!base.contains(&anchor));
+    let text_first = ids(json!([{"type": "text", "text": text}, {"type": "image"}]));
+    let image_first = ids(json!([{"type": "image"}, {"type": "text", "text": text}]));
+    for (with_image, neighbour) in [(text_first, close), (image_first, sep)] {
+        assert_eq!(with_image.len(), base.len() + 1, "{with_image:?}");
+        let positions: Vec<usize> = (0..with_image.len())
+            .filter(|&i| with_image[i] == anchor)
+            .collect();
+        let [p] = positions[..] else {
+            panic!("exactly one anchor expected: {positions:?}");
+        };
+        assert_eq!(&with_image[..p], &base[..p]);
+        assert_eq!(&with_image[p + 1..], &base[p..]);
+        // Text-first: the anchor precedes `<|close|>`; image-first: it follows `<|sep|>`.
+        let beside = if neighbour == close {
+            with_image[p + 1]
+        } else {
+            with_image[p - 1]
+        };
+        assert_eq!(beside, neighbour);
+    }
+}
+
 /// Token-id parity with the checkpoint's own `apply_chat_template(tokenize=True)`
 /// (`build_chat_segments` + `_encode_chat_segments`), recorded in
 /// `tests/fixtures/kimi_k3/k3_render_ids_fixtures.json` from
 /// `nvidia/Kimi-K3-NVFP4` (the same tokenizer files as `moonshotai/Kimi-K3`)
-/// and reproduced under transformers 4.57.6 and 5.16.1.
+/// and reproduced under transformers 4.57.6 and 5.16.1; `tool_call_bad_arguments`
+/// was recorded from the same tokenizer files under transformers 5.17.0.
 ///
 /// The real `tiktoken.model` and `tokenizer_config.json` are fetched once
 /// into `.tokenizer_cache/kimi_k3/`; `KIMI_K3_MODEL_DIR` points at a local

@@ -769,7 +769,10 @@ impl RequestPipeline {
                     let usage = response.usage.as_ref();
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        usage.map_or(0, |u| u.prompt_tokens),
+                        // The engine's count: the usage shown excludes the unbilled stub.
+                        usage.map_or(0, |u| {
+                            u.prompt_tokens + dctx.response.unbilled_prompt_tokens
+                        }),
                         usage.map_or(0, |u| u.completion_tokens),
                     )
                     .await;
