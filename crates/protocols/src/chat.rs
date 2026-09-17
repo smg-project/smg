@@ -6,10 +6,10 @@ use validator::Validate;
 
 use super::{
     common::{
-        default_true, deserialize_null_as_false, is_false, is_true, validate_stop, CachePartition,
-        ChatLogProbs, ContentPart, Function, FunctionCall, FunctionChoice, GenerationRequest,
-        ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice,
-        ToolChoiceValue, ToolReference, Usage,
+        default_true, deserialize_null_as_false, is_false, is_true, validate_json_schema_shape,
+        validate_stop, CachePartition, ChatLogProbs, ContentPart, Function, FunctionCall,
+        FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool,
+        ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -486,13 +486,9 @@ fn validate_chat_cross_parameters(
         return Err(e);
     }
 
-    // 6. Validate response format JSON schema name
+    // 6. Validate response format JSON schema name and shape
     if let Some(ResponseFormat::JsonSchema { json_schema }) = &req.response_format {
-        if json_schema.name.is_empty() {
-            let mut e = validator::ValidationError::new("json_schema_name_empty");
-            e.message = Some("JSON schema name cannot be empty".into());
-            return Err(e);
-        }
+        validate_json_schema_shape(&json_schema.name, &json_schema.schema)?;
     }
 
     // 7. Validate tool_choice requires tools — except "none" and "auto", which are valid without tools

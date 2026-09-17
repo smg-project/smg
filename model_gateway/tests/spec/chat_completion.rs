@@ -1,8 +1,8 @@
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{
-        Function, FunctionCall, FunctionChoice, StreamOptions, Tool, ToolChoice, ToolChoiceValue,
-        ToolReference,
+        Function, FunctionCall, FunctionChoice, JsonSchemaFormat, ResponseFormat, StreamOptions,
+        Tool, ToolChoice, ToolChoiceValue, ToolReference,
     },
     validated::Normalizable,
 };
@@ -640,5 +640,55 @@ fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
     assert!(
         err.contains("tool 'nonexistent_tool' not found"),
         "Error should mention the missing tool: {err}"
+    );
+}
+
+#[test]
+fn test_validate_response_format_json_schema_schema_not_object() {
+    fn request(name: &str, schema: serde_json::Value) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                ext: Default::default(),
+                content: MessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            response_format: Some(ResponseFormat::JsonSchema {
+                json_schema: JsonSchemaFormat {
+                    name: name.to_string(),
+                    schema,
+                    strict: None,
+                },
+            }),
+            ..Default::default()
+        }
+    }
+
+    for schema in [json!("x"), json!(1), json!([]), json!(null), json!(true)] {
+        let err = request("weather", schema.clone())
+            .validate()
+            .expect_err(&format!("schema {schema} should be rejected"));
+        assert!(
+            format!("{err:?}").contains("json_schema_schema_not_object"),
+            "schema {schema}: expected json_schema_schema_not_object, got: {err:?}"
+        );
+    }
+
+    for schema in [
+        json!({}),
+        json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+    ] {
+        assert!(
+            request("weather", schema.clone()).validate().is_ok(),
+            "schema {schema} should be accepted"
+        );
+    }
+
+    let err = request("", json!("x"))
+        .validate()
+        .expect_err("empty name should be rejected");
+    assert!(
+        format!("{err:?}").contains("json_schema_name_empty"),
+        "empty name should win over schema shape, got: {err:?}"
     );
 }

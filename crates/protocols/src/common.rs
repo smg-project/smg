@@ -332,6 +332,26 @@ pub struct JsonSchemaFormat {
     pub strict: Option<bool>,
 }
 
+/// Shared shape rules for a json_schema format: name non-empty, schema a JSON object.
+pub fn validate_json_schema_shape(
+    name: &str,
+    schema: &Value,
+) -> Result<(), validator::ValidationError> {
+    let (code, message) = if name.is_empty() {
+        ("json_schema_name_empty", "JSON schema name cannot be empty")
+    } else if !schema.is_object() {
+        (
+            "json_schema_schema_not_object",
+            "JSON schema 'schema' must be a JSON object",
+        )
+    } else {
+        return Ok(());
+    };
+    let mut e = validator::ValidationError::new(code);
+    e.message = Some(message.into());
+    Err(e)
+}
+
 // ============================================================================
 // Streaming
 // ============================================================================
@@ -1290,5 +1310,34 @@ mod tests {
     fn zero_speculative_counts_leave_usage_untouched() {
         let usage = Usage::from_counts(10, 20).with_speculative_tokens(0, 0);
         assert!(usage.completion_tokens_details.is_none());
+    }
+
+    #[test]
+    fn json_schema_shape_requires_name_and_object_schema() {
+        let cases = [
+            ("", json!({}), Some("json_schema_name_empty")),
+            ("", json!("x"), Some("json_schema_name_empty")),
+            ("w", json!("x"), Some("json_schema_schema_not_object")),
+            ("w", json!(1), Some("json_schema_schema_not_object")),
+            ("w", json!([]), Some("json_schema_schema_not_object")),
+            ("w", json!(null), Some("json_schema_schema_not_object")),
+            ("w", json!(true), Some("json_schema_schema_not_object")),
+            ("w", json!({}), None),
+            (
+                "w",
+                json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                None,
+            ),
+        ];
+        for (name, schema, expected) in cases {
+            let result = validate_json_schema_shape(name, &schema);
+            match expected {
+                Some(code) => {
+                    let err = result.expect_err(&format!("{name:?}/{schema} should fail"));
+                    assert_eq!(err.code, code, "{name:?}/{schema}");
+                }
+                None => assert!(result.is_ok(), "{name:?}/{schema} should pass"),
+            }
+        }
     }
 }

@@ -9,9 +9,10 @@ use validator::{Validate, ValidationError};
 
 use super::{
     common::{
-        default_true, validate_stop, ChatLogProbs, ContextManagementEntry, ConversationRef, Detail,
-        Function, FunctionChoice, GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo,
-        ResponsePrompt, StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
+        default_true, validate_json_schema_shape, validate_stop, ChatLogProbs,
+        ContextManagementEntry, ConversationRef, Detail, Function, FunctionChoice,
+        GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo, ResponsePrompt,
+        StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
         ToolChoiceValue as ChatToolChoiceValue, ToolReference, UsageInfo,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
@@ -3720,14 +3721,10 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
     Ok(())
 }
 
-/// Validates text format configuration (JSON schema name cannot be empty)
+/// Validates text format configuration (JSON schema name non-empty, schema an object)
 fn validate_text_format(text: &TextConfig) -> Result<(), ValidationError> {
-    if let Some(TextFormat::JsonSchema { name, .. }) = &text.format {
-        if name.is_empty() {
-            let mut e = ValidationError::new("json_schema_name_empty");
-            e.message = Some("JSON schema name cannot be empty".into());
-            return Err(e);
-        }
+    if let Some(TextFormat::JsonSchema { name, schema, .. }) = &text.format {
+        validate_json_schema_shape(name, schema)?;
     }
     Ok(())
 }
