@@ -11,6 +11,7 @@ use smg_data_connector::{
     StorageFactoryConfig,
 };
 use smg_mcp::McpOrchestrator;
+use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::debug;
 
@@ -28,7 +29,10 @@ use crate::{
         grpc::multimodal::MultimodalConfigRegistry,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    worker::{KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService},
+    worker::{
+        KvEventMonitor, PrefillAdmission, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry,
+        WorkerService,
+    },
     workflow::{JobQueue, WorkflowEngines},
 };
 
@@ -66,6 +70,7 @@ pub struct AppContext {
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
+    pub prefill_admission: Option<Arc<PrefillAdmission>>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub gateway: Option<Arc<Gateway>>,
     pub response_storage: Arc<dyn ResponseStorage>,
@@ -100,6 +105,28 @@ impl std::fmt::Debug for AppContext {
             .field("router_config", &self.router_config)
             .finish_non_exhaustive()
     }
+}
+
+fn start_prefill_admission_notifier(
+    worker_registry: &WorkerRegistry,
+    admission: &Arc<PrefillAdmission>,
+) -> Result<(), AppContextBuildError> {
+    let mut events = worker_registry.subscribe_events();
+    let admission = Arc::downgrade(admission);
+    let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+        AppContextBuildError::InvalidConfig(format!(
+            "Prefill admission requires a Tokio runtime: {error}"
+        ))
+    })?;
+    runtime.spawn(async move {
+        while let Ok(_) | Err(RecvError::Lagged(_)) = events.recv().await {
+            let Some(admission) = admission.upgrade() else {
+                break;
+            };
+            admission.notify_capacity_changed();
+        }
+    });
+    Ok(())
 }
 
 pub struct AppContextBuilder {
@@ -360,6 +387,24 @@ impl AppContextBuilder {
             .worker_job_queue
             .ok_or(AppContextBuildError::MissingField("worker_job_queue"))?;
 
+        let prefill_admission =
+            usize::try_from(router_config.prefill_max_inflight_requests_per_worker)
+                .ok()
+                .filter(|max| *max > 0)
+                .map(|max| {
+                    Arc::new(PrefillAdmission::new(
+                        max,
+                        router_config.effective_prefill_queue_size(),
+                        Duration::from_secs(router_config.effective_prefill_queue_timeout_secs()),
+                    ))
+                });
+        if let Some(admission) = prefill_admission
+            .as_ref()
+            .filter(|_| router_config.effective_prefill_queue_size() > 0)
+        {
+            start_prefill_admission_notifier(&worker_registry, admission)?;
+        }
+
         // Create WorkerService from the already-built components
         let worker_service = Arc::new(WorkerService::new(
             worker_registry.clone(),
@@ -390,6 +435,7 @@ impl AppContextBuilder {
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
+            prefill_admission,
             policy_registry: self
                 .policy_registry
                 .ok_or(AppContextBuildError::MissingField("policy_registry"))?,
@@ -779,8 +825,15 @@ impl Default for AppContextBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+
     use super::*;
-    use crate::config::types::PolicyConfig;
+    use crate::{
+        config::types::PolicyConfig,
+        worker::{BasicWorkerBuilder, PrefillAdmissionAttempt, Worker, WorkerType},
+    };
 
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
     /// h2c on the same listener, mirroring a dual-protocol engine.
@@ -1055,5 +1108,96 @@ mod tests {
         let result = AppContextBuilder::new().maybe_rate_limit_manager(&config);
         assert!(result.is_ok());
         assert!(result.unwrap().rate_limit_manager.is_some());
+    }
+
+    fn prefill_worker(url: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Prefill)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    #[tokio::test]
+    async fn worker_status_change_wakes_prefill_admission() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let admission = Arc::new(PrefillAdmission::new(1, 1, Duration::from_secs(1)));
+        start_prefill_admission_notifier(&registry, &admission).unwrap();
+
+        let first = prefill_worker("http://prefill-1:8000");
+        registry.register(Arc::clone(&first)).unwrap();
+        let occupied = admission
+            .admit(None, {
+                let first = Arc::clone(&first);
+                move |capacity| capacity.select(Arc::clone(&first), ())
+            })
+            .await
+            .unwrap();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test waiter must run concurrently with worker status changes"
+        )]
+        let waiting = tokio::spawn({
+            let admission = Arc::clone(&admission);
+            let registry = Arc::clone(&registry);
+            let attempts = Arc::clone(&attempts);
+            async move {
+                admission
+                    .admit(None, |capacity| {
+                        attempts.fetch_add(1, Ordering::Relaxed);
+                        let workers = registry.get_by_type(WorkerType::Prefill);
+                        if workers.is_empty() {
+                            return PrefillAdmissionAttempt::Unavailable;
+                        }
+                        workers
+                            .iter()
+                            .find(|worker| worker.is_available() && capacity.has_capacity(worker))
+                            .map_or(PrefillAdmissionAttempt::AtCapacity, |worker| {
+                                capacity.select(Arc::clone(worker), Arc::clone(worker))
+                            })
+                    })
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while admission.queued_requests() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let second: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://prefill-2:8000")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let second_id = registry.register(Arc::clone(&second)).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while attempts.load(Ordering::Relaxed) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(admission.queued_requests(), 1);
+
+        registry.transition_status(&second_id, WorkerStatus::Ready);
+        let selected = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected.selected.url(), second.url());
+        drop(selected);
+        drop(occupied);
     }
 }

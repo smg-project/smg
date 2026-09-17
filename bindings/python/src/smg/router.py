@@ -251,6 +251,15 @@ class Router:
             only). If not specified, uses the main policy. Default: None
         decode_policy: Specific load balancing policy for decode nodes (PD mode only).
             If not specified, uses the main policy. Default: None
+        prefill_max_inflight_requests_per_worker: Maximum in-flight Prefill requests
+            per worker in PD or EPD mode. A non-positive value disables the limit.
+            Default: -1
+        prefill_queue_size: Maximum number of requests waiting for Prefill admission.
+            Defaults to 100 when Prefill admission is enabled. Set to 0 to disable
+            waiting. Default: None
+        prefill_queue_timeout_secs: Maximum time in seconds a request may wait for
+            Prefill admission. Defaults to 60 when Prefill admission is enabled.
+            Default: None
         request_id_headers: List of HTTP headers to check for request IDs. If not
             specified, uses common defaults: ['x-request-id', 'x-correlation-id',
             'x-trace-id', 'request-id']. Example: ['x-my-request-id',

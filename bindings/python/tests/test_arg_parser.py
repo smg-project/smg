@@ -798,6 +798,29 @@ class TestParseRouterArgs:
         assert router_args.prefill_policy == "consistent_hashing"
         assert router_args.decode_policy == "prefix_hash"
 
+    def test_parse_pd_prefill_admission_args(self):
+        """Test parsing explicit Prefill admission options."""
+        args = [
+            "--pd-disaggregation",
+            "--prefill",
+            "http://prefill1:8000",
+            "none",
+            "--decode",
+            "http://decode1:8001",
+            "--prefill-max-inflight-requests-per-worker",
+            "7",
+            "--prefill-queue-size",
+            "13",
+            "--prefill-queue-timeout-secs",
+            "17",
+        ]
+
+        router_args = parse_router_args(args)
+
+        assert router_args.prefill_max_inflight_requests_per_worker == 7
+        assert router_args.prefill_queue_size == 13
+        assert router_args.prefill_queue_timeout_secs == 17
+
     def test_parse_service_discovery_args(self):
         """Test parsing service discovery arguments."""
         args_a = [
@@ -1468,6 +1491,9 @@ class TestRouterArgsFieldOrder:
         "enable_rl",
         "rl_control_timeout_secs",
         "rl_fanout_concurrency",
+        "prefill_max_inflight_requests_per_worker",
+        "prefill_queue_size",
+        "prefill_queue_timeout_secs",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

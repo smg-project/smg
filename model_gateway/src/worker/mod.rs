@@ -15,6 +15,7 @@ pub mod monitor;
 pub mod overload;
 pub mod pd_pair_index;
 pub mod pd_pairing;
+pub mod prefill_admission;
 pub mod registry;
 pub mod resilience;
 pub mod sampling_defaults;
@@ -48,6 +49,11 @@ pub use openai_protocol::{
 pub use overload::OverloadThresholds;
 pub(crate) use pd_pair_index::{PdPairIndex, PdWire};
 pub use pd_pairing::{PairingMismatch, PdPairing, PdPairingMode};
+pub use prefill_admission::{
+    acquire_prefill, AdmittedPrefill, PrefillAcquireError, PrefillAdmission,
+    PrefillAdmissionAttempt, PrefillAdmissionRejection, PrefillCandidateError, PrefillLoadGuard,
+    PrefillReservation, PrefillSelection, PrefillSelectionContext,
+};
 pub(crate) use registry::{ModelWorkerSnapshot, RoutingPool};
 pub use registry::{WorkerOrigin, WorkerRegistry};
 pub use resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_STATUS_CODES};

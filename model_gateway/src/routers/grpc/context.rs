@@ -42,7 +42,9 @@ use crate::{
     middleware::TenantRequestMeta,
     policies::CacheNamespace,
     routers::{common::pd_admission::PdAdmissionGuard, error::internal_error},
-    worker::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
+    worker::{
+        ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
+    },
 };
 
 /// Ingress-phase request context: owns the parsed request.
@@ -210,6 +212,10 @@ pub(crate) struct ProcessingState {
     // Stage 3: Client acquisition outputs
     pub clients: Option<ClientSelection>,
 
+    /// Prefill admission slot, taken during PD/EPD worker selection and
+    /// handed to the dispatch that runs the Prefill leg.
+    pub pd_prefill_guard: Option<PrefillLoadGuard>,
+
     // Response processing state seeded during ingress (stop decoder, router
     // stop obligations, derived skip_special_tokens).
     pub response: ResponseState,
@@ -273,6 +279,9 @@ pub(crate) struct DispatchContext {
     pub encode_outputs: Option<EncodeOutputs>,
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
+    /// Prefill admission slot for the next PD/EPD dispatch; a retry's
+    /// reselection refills it.
+    pub pd_prefill_guard: Option<PrefillLoadGuard>,
     pub response: ResponseState,
 }
 
@@ -615,10 +624,9 @@ pub(crate) enum LoadGuards {
     Single {
         _guard: WorkerLoadGuard,
     },
-    /// Disaggregated guards cover the prefill+decode pair. EPD encode workers are
-    /// assigned per item; their fire-and-supervise RPCs do not hold load guards.
+    /// Disaggregated guards cover the decode leg only. The Prefill load is
+    /// a `PrefillLoadGuard` that drops when the Prefill phase ends.
     Disaggregated {
-        _prefill: WorkerLoadGuard,
         _decode: WorkerLoadGuard,
     },
     /// Batched completion fan-out: one guard set per sub-request so load-aware
@@ -642,10 +650,7 @@ impl LoadGuards {
             WorkerSelection::Single { worker } => LoadGuards::Single {
                 _guard: WorkerLoadGuard::with_key(worker.clone(), routing_key),
             },
-            WorkerSelection::Disaggregated {
-                prefill, decode, ..
-            } => LoadGuards::Disaggregated {
-                _prefill: WorkerLoadGuard::with_key(prefill.clone(), routing_key),
+            WorkerSelection::Disaggregated { decode, .. } => LoadGuards::Disaggregated {
                 _decode: WorkerLoadGuard::with_key(decode.clone(), routing_key),
             },
         }
@@ -832,6 +837,7 @@ impl RequestContext {
             encode_outputs: state.encode_outputs,
             dispatch: None,
             load_guards: None,
+            pd_prefill_guard: state.pd_prefill_guard,
             response: state.response,
         })
     }
@@ -1209,6 +1215,9 @@ pub(crate) enum ExecutionResult {
     PrefillDecode {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
+        /// Prefill admission slots still held: one per fan-out sample for a
+        /// parallel dispatch, none after a sequential dispatch drained prefill.
+        prefill_guards: Vec<PrefillLoadGuard>,
         /// PD timing context, for honest PD TTFT (prefill start to first decode token).
         pd_timing: PdTiming,
     },
@@ -1269,6 +1278,131 @@ mod tests {
                 .collect(),
             joined_routing_text: joined.map(str::to_string),
         }
+    }
+
+    fn pd_selection(prefill: &Arc<dyn Worker>, decode: &Arc<dyn Worker>) -> WorkerSelection {
+        WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: Arc::clone(prefill),
+            decode: Arc::clone(decode),
+            runtime_type: RuntimeType::Sglang,
+        }
+    }
+
+    #[test]
+    fn disaggregated_load_guards_hold_decode_only() {
+        use crate::worker::{BasicWorkerBuilder, WorkerType};
+
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill-load")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode-load")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+
+        let prefill_guard = PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+        };
+        assert_eq!(prefill.load(), 1);
+        drop(prefill_guard);
+
+        let guards = LoadGuards::new(&pd_selection(&prefill, &decode), None);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 1);
+        drop(guards);
+        assert_eq!(decode.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_prompts_preserve_phase_load_semantics() {
+        use crate::worker::{BasicWorkerBuilder, PrefillAdmission, WorkerType};
+
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:30000")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        let routing_key = "batch-key";
+
+        let admission = PrefillAdmission::new(1, 0, std::time::Duration::from_secs(1));
+        let admitted = match admission
+            .admit(Some(routing_key), {
+                let prefill = Arc::clone(&prefill);
+                move |capacity| capacity.select(Arc::clone(&prefill), ())
+            })
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(_) => panic!("initial admission should succeed"),
+        };
+        let prefill_guard = PrefillLoadGuard::Admission {
+            _reservation: Arc::new(admitted.reservation),
+        };
+        let mut prefill_children = vec![prefill_guard.replicate(), prefill_guard.replicate()];
+        prefill_children.push(prefill_guard);
+        let mut decode_children =
+            match LoadGuards::scaled(&pd_selection(&prefill, &decode), Some(routing_key), 3) {
+                LoadGuards::Batch { _guards: guards } => guards,
+                _ => panic!("count > 1 should create batch guards"),
+            };
+
+        assert_eq!(prefill.load(), 1);
+        assert_eq!(decode.load(), 3);
+        assert_eq!(prefill.routing_key_load(), 1);
+        assert_eq!(decode.routing_key_load(), 1);
+
+        drop(prefill_children.pop());
+        drop(decode_children.pop());
+        assert_eq!(prefill.load(), 1);
+        assert_eq!(decode.load(), 2);
+        assert_eq!(prefill.routing_key_load(), 1);
+        assert_eq!(decode.routing_key_load(), 1);
+
+        drop(prefill_children);
+        drop(decode_children);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 0);
+        assert_eq!(prefill.routing_key_load(), 0);
+        assert_eq!(decode.routing_key_load(), 0);
+
+        let prefill_guard = PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), Some(routing_key)),
+        };
+        let mut prefill_children = vec![prefill_guard.replicate(), prefill_guard.replicate()];
+        prefill_children.push(prefill_guard);
+        let mut decode_children =
+            match LoadGuards::scaled(&pd_selection(&prefill, &decode), Some(routing_key), 3) {
+                LoadGuards::Batch { _guards: guards } => guards,
+                _ => panic!("count > 1 should create batch guards"),
+            };
+
+        assert_eq!(prefill.load(), 3);
+        assert_eq!(decode.load(), 3);
+        assert_eq!(prefill.routing_key_load(), 1);
+        assert_eq!(decode.routing_key_load(), 1);
+
+        drop(prefill_children.pop());
+        drop(decode_children.pop());
+        assert_eq!(prefill.load(), 2);
+        assert_eq!(decode.load(), 2);
+        assert_eq!(prefill.routing_key_load(), 1);
+        assert_eq!(decode.routing_key_load(), 1);
+
+        drop(prefill_children);
+        drop(decode_children);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 0);
+        assert_eq!(prefill.routing_key_load(), 0);
+        assert_eq!(decode.routing_key_load(), 0);
     }
 
     #[test]

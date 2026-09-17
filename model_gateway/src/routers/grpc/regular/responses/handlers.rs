@@ -125,7 +125,8 @@ async fn route_responses_streaming(
             &request,
             params,
             mcp_servers,
-        );
+        )
+        .await;
     }
 
     // 3. Convert ResponsesRequest → ChatCompletionRequest

@@ -39,10 +39,12 @@ pub(crate) async fn collect_responses(
         ExecutionResult::PrefillDecode {
             mut prefill,
             decode,
+            prefill_guards,
             ..
         } => {
             // Collect prefill for input_logprobs (don't mark completed yet)
             let prefill_responses = collect_stream_responses(&mut prefill, "Prefill").await?;
+            drop(prefill_guards);
 
             // Collect decode for actual output (don't mark completed yet)
             let mut decode_stream = *decode;
