@@ -1,7 +1,8 @@
 //! Kimi/Moonshot contract rules (Kimi-Vendor-Verifier).
 //!
 //! The sampling rules are K3's alone; other Kimi and Moonshot models keep
-//! OpenAI's ranges. Only requests entering through `ValidatedJson` reach
+//! OpenAI's ranges. The stream usage default is Kimi-wide, as the
+//! verifier expects. Only requests entering through `ValidatedJson` reach
 //! these rules; the Responses conversion builds its chat request without them.
 
 use crate::{
@@ -24,6 +25,13 @@ const TEMPERATURES: [f32; 3] = [0.0, 0.6, 1.0];
 const TOP_P: f32 = 0.95;
 
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
+    // KVV tests/prompt_tokens reads usage from streams sent without stream_options.
+    if req.stream {
+        req.stream_options
+            .get_or_insert_default()
+            .include_usage
+            .get_or_insert(true);
+    }
     if !is_k3(&req.model) {
         return;
     }

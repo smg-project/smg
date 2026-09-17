@@ -867,6 +867,70 @@ fn non_kimi_models_get_no_sampling_defaults() {
     }
 }
 
+fn include_usage(req: &ChatCompletionRequest) -> Option<bool> {
+    req.stream_options.as_ref().and_then(|o| o.include_usage)
+}
+
+#[test]
+fn kimi_profile_defaults_stream_usage_on() {
+    let mut req = sampling_request("kimi-k3", json!({"stream": true}));
+    req.normalize();
+    assert_eq!(include_usage(&req), Some(true));
+    assert!(req.validate().is_ok());
+}
+
+#[test]
+fn kimi_profile_keeps_explicit_stream_usage_opt_out() {
+    let mut req = sampling_request(
+        "kimi-k3",
+        json!({"stream": true, "stream_options": {"include_usage": false}}),
+    );
+    req.normalize();
+    assert_eq!(include_usage(&req), Some(false));
+}
+
+#[test]
+fn kimi_profile_stream_usage_default_preserves_other_stream_options() {
+    let mut req = sampling_request(
+        "kimi-k3",
+        json!({"stream": true, "stream_options": {"continuous_usage_stats": true, "include_obfuscation": false, "step_usage_chunks": "all"}}),
+    );
+    req.normalize();
+    let opts = req.stream_options.as_ref().unwrap();
+    assert_eq!(opts.include_usage, Some(true));
+    assert_eq!(opts.continuous_usage_stats, Some(true));
+    assert_eq!(opts.include_obfuscation, Some(false));
+    assert_eq!(opts.other["step_usage_chunks"], json!("all"));
+}
+
+#[test]
+fn kimi_profile_adds_no_stream_options_when_not_streaming() {
+    for fields in [json!({}), json!({"stream": false})] {
+        let mut req = sampling_request("kimi-k3", fields);
+        req.normalize();
+        assert!(req.stream_options.is_none());
+        assert!(!has_code(&req, "stream_options_requires_stream"));
+    }
+}
+
+#[test]
+fn kimi_profile_stream_usage_default_is_kimi_wide() {
+    for model in ["moonshotai/kimi-k2", "kimi-k2.6"] {
+        let mut req = sampling_request(model, json!({"stream": true}));
+        req.normalize();
+        assert_eq!(include_usage(&req), Some(true), "{model}");
+    }
+}
+
+#[test]
+fn non_kimi_models_get_no_stream_usage_default() {
+    for model in ["gpt-4o-mini", "MiniMax-M3"] {
+        let mut req = sampling_request(model, json!({"stream": true}));
+        req.normalize();
+        assert!(req.stream_options.is_none(), "{model}");
+    }
+}
+
 #[test]
 fn kimi_profile_accepts_the_verifier_sampling_set() {
     for temperature in [0.0, 0.6, 1.0] {
