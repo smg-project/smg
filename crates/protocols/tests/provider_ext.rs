@@ -1334,3 +1334,74 @@ fn k3_ids_in_paths_and_prefixes_get_the_sampling_pins() {
         );
     }
 }
+
+#[test]
+fn k3_rejects_invalid_thinking_effort_and_adaptive_type() {
+    for (thinking, code) in [
+        (
+            json!({"type": "enabled", "effort": "medium"}),
+            "thinking_effort_invalid",
+        ),
+        (json!({"effort": "bogus"}), "thinking_effort_invalid"),
+        // Rejected even when thinking is off: the rule keys on the field.
+        (
+            json!({"type": "disabled", "effort": "medium"}),
+            "thinking_effort_invalid",
+        ),
+        (json!({"type": "adaptive"}), "thinking_type_not_supported"),
+    ] {
+        let req = sampling_request("kimi-k3", json!({"thinking": thinking}));
+        assert!(
+            error_codes(&req).iter().any(|c| c == code),
+            "{thinking} must fail with {code}, got {:?}",
+            error_codes(&req)
+        );
+    }
+    // An unknown `type` fails at the parse boundary (400 json_parse_error).
+    assert!(serde_json::from_value::<ChatCompletionRequest>(json!({
+        "model": "kimi-k3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "bogus"}
+    }))
+    .is_err());
+}
+
+#[test]
+fn k3_accepts_disabled_with_any_keep() {
+    // KVV: `keep != "all"` rejection is skipped upstream; the renderer ignores keep.
+    for thinking in [
+        json!({"type": "disabled", "keep": "none"}),
+        json!({"type": "enabled", "keep": "all", "effort": "low"}),
+        json!({"type": "enabled", "effort": "high"}),
+        json!({"effort": "max"}),
+        json!({"keep": "all"}),
+        json!({}),
+    ] {
+        let req = sampling_request("kimi-k3", json!({"thinking": thinking}));
+        assert!(
+            error_codes(&req).is_empty(),
+            "{thinking}: {:?}",
+            error_codes(&req)
+        );
+    }
+}
+
+#[test]
+fn non_k3_models_ignore_thinking_effort_values() {
+    for model in [
+        "kimi-k2.5",
+        "moonshotai/kimi-k2",
+        "gpt-4o-mini",
+        "MiniMax-M3",
+    ] {
+        let req = sampling_request(
+            model,
+            json!({"thinking": {"type": "adaptive", "effort": "bogus"}}),
+        );
+        assert!(
+            error_codes(&req).is_empty(),
+            "{model} must not enforce K3 thinking rules: {:?}",
+            error_codes(&req)
+        );
+    }
+}

@@ -934,8 +934,9 @@ fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_j
 ///    thinking switch, `thinking_from_reasoning_effort`) switch thinking off,
 ///    a native effort name (`low`/`high`/`xhigh`/`max`) switches it on, and
 ///    an integer budget has no opinion;
-/// 3. else `params.thinking` (the gateway's projection of the top-level
-///    `reasoning_effort`: `Some(false)` for `none`/`minimal`);
+/// 3. else `params.thinking` (the gateway's projection of the typed
+///    `thinking.type` toggle, else `Some(false)` for a `none`/`minimal`
+///    effective `reasoning_effort`);
 /// 4. else on ([`ThinkingToggle::DefaultOn`]).
 ///
 /// Deliberate divergence from vLLM's Python: there `reasoning_effort: "none"`

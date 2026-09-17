@@ -236,6 +236,9 @@ pub struct ChatCompletionRequest {
     #[serde(default, deserialize_with = "deserialize_reasoning_effort")]
     pub reasoning_effort: Option<String>,
 
+    /// Vendor thinking control (Kimi `type`/`keep`/`effort`, MiniMax `type`)
+    pub thinking: Option<ThinkingParam>,
+
     /// An object specifying the format that the model must output
     pub response_format: Option<ResponseFormat>,
 
@@ -358,6 +361,53 @@ pub struct ChatCompletionRequest {
     /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
     #[serde(flatten)]
     pub other: Map<String, Value>,
+}
+
+/// `thinking.type`: the request's thinking toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingType {
+    Enabled,
+    Disabled,
+    Adaptive,
+}
+
+/// The `thinking` object shared by the Kimi and MiniMax chat APIs.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ThinkingParam {
+    #[serde(rename = "type")]
+    pub r#type: Option<ThinkingType>,
+    /// Kimi `keep` mode; accepted and ignored by the renderers.
+    pub keep: Option<String>,
+    /// Vendor effort level; more specific than the top-level `reasoning_effort`.
+    pub effort: Option<String>,
+}
+
+impl ThinkingParam {
+    /// `enabled` → on, `disabled` → off, `adaptive` or omitted → no preference.
+    pub fn toggle(&self) -> Option<bool> {
+        match self.r#type {
+            Some(ThinkingType::Enabled) => Some(true),
+            Some(ThinkingType::Disabled) => Some(false),
+            Some(ThinkingType::Adaptive) | None => None,
+        }
+    }
+}
+
+impl ChatCompletionRequest {
+    /// The thinking preference stated by `thinking.type`, if any.
+    pub fn thinking_toggle(&self) -> Option<bool> {
+        self.thinking.as_ref().and_then(ThinkingParam::toggle)
+    }
+
+    /// `thinking.effort` when present, else the top-level `reasoning_effort`.
+    pub fn effective_reasoning_effort(&self) -> Option<&str> {
+        self.thinking
+            .as_ref()
+            .and_then(|thinking| thinking.effort.as_deref())
+            .or(self.reasoning_effort.as_deref())
+    }
 }
 
 /// Map an OpenAI `reasoning_effort` to a thinking on/off preference.
@@ -872,7 +922,10 @@ pub struct ChatStreamChoice {
 mod tests {
     use serde_json::{json, Value};
 
-    use super::{thinking_from_reasoning_effort, ChatCompletionRequest, GenerationRequest};
+    use super::{
+        thinking_from_reasoning_effort, ChatCompletionRequest, GenerationRequest, ThinkingParam,
+        ThinkingType,
+    };
 
     fn request_with_output_fields(fields: &[(&str, Value)]) -> ChatCompletionRequest {
         let mut value = json!({
@@ -992,6 +1045,93 @@ mod tests {
             assert!(!request.other.contains_key("return_audio"));
             let serialized = serde_json::to_value(request).expect("request must serialize");
             assert_eq!(serialized.get("return_audio"), Some(&Value::Bool(value)));
+        }
+    }
+
+    #[test]
+    fn thinking_param_is_typed_not_other() {
+        let request = request_with_output_fields(&[(
+            "thinking",
+            json!({"type": "disabled", "keep": "all", "effort": "high"}),
+        )]);
+        assert_eq!(
+            request.thinking,
+            Some(ThinkingParam {
+                r#type: Some(ThinkingType::Disabled),
+                keep: Some("all".to_string()),
+                effort: Some("high".to_string()),
+            })
+        );
+        assert!(!request.other.contains_key("thinking"));
+        let serialized = serde_json::to_value(request).expect("request must serialize");
+        assert_eq!(
+            serialized["thinking"],
+            json!({"type": "disabled", "keep": "all", "effort": "high"})
+        );
+
+        let request = request_with_output_fields(&[("thinking", json!({"type": "adaptive"}))]);
+        assert_eq!(
+            request.thinking.as_ref().and_then(|t| t.r#type),
+            Some(ThinkingType::Adaptive)
+        );
+        let serialized = serde_json::to_value(request).expect("request must serialize");
+        assert_eq!(serialized["thinking"], json!({"type": "adaptive"}));
+
+        // `type` omitted (KVV test_default_type_is_enabled sends `{"keep": "all"}`).
+        let request = request_with_output_fields(&[("thinking", json!({"keep": "all"}))]);
+        let thinking = request.thinking.as_ref().expect("thinking must be typed");
+        assert_eq!(thinking.r#type, None);
+        assert_eq!(thinking.keep.as_deref(), Some("all"));
+
+        for fields in [vec![], vec![("thinking", Value::Null)]] {
+            let request = request_with_output_fields(&fields);
+            assert_eq!(request.thinking, None);
+            assert!(!request.other.contains_key("thinking"));
+            let serialized = serde_json::to_value(request).expect("request must serialize");
+            assert!(serialized.get("thinking").is_none());
+        }
+    }
+
+    #[test]
+    fn thinking_toggle_and_effective_effort() {
+        for (thinking, expected) in [
+            (json!({"type": "enabled"}), Some(true)),
+            (json!({"type": "disabled"}), Some(false)),
+            (json!({"type": "adaptive"}), None),
+            (json!({"keep": "all"}), None),
+        ] {
+            let request = request_with_output_fields(&[("thinking", thinking.clone())]);
+            assert_eq!(request.thinking_toggle(), expected, "{thinking}");
+        }
+        assert_eq!(request_with_output_fields(&[]).thinking_toggle(), None);
+
+        // `thinking.effort` beats the top-level field; absent, the field applies.
+        let request = request_with_output_fields(&[
+            ("thinking", json!({"type": "enabled", "effort": "low"})),
+            ("reasoning_effort", json!("max")),
+        ]);
+        assert_eq!(request.effective_reasoning_effort(), Some("low"));
+        let request = request_with_output_fields(&[
+            ("thinking", json!({"type": "enabled"})),
+            ("reasoning_effort", json!("max")),
+        ]);
+        assert_eq!(request.effective_reasoning_effort(), Some("max"));
+        assert_eq!(
+            request_with_output_fields(&[]).effective_reasoning_effort(),
+            None
+        );
+
+        // Unknown `type` values and non-object shapes fail deserialization.
+        for thinking in [json!({"type": "bogus"}), json!("enabled"), json!(true)] {
+            let mut request = json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            });
+            request["thinking"] = thinking.clone();
+            assert!(
+                serde_json::from_value::<ChatCompletionRequest>(request).is_err(),
+                "{thinking} must be rejected"
+            );
         }
     }
 

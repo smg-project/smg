@@ -228,10 +228,10 @@ const RESPONSE_FORMAT_KEY: &str = "response_format";
 fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
     let kwargs_capacity = 3 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
     let mut combined = HashMap::with_capacity(kwargs_capacity);
-    if let Some(reasoning_effort) = &request.reasoning_effort {
+    if let Some(reasoning_effort) = request.effective_reasoning_effort() {
         combined.insert(
             REASONING_EFFORT_KEY.to_string(),
-            Value::String(reasoning_effort.clone()),
+            Value::String(reasoning_effort.to_string()),
         );
     }
     if let Some(tool_choice) = &request.tool_choice {
@@ -248,6 +248,13 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
         combined.extend(template_kwargs.clone());
     }
     combined
+}
+
+/// Typed `thinking.type` first, else the OpenAI mapping of the effective effort.
+fn resolve_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
+    request.thinking_toggle().or_else(|| {
+        openai_protocol::chat::thinking_from_reasoning_effort(request.effective_reasoning_effort())
+    })
 }
 
 /// gRPC backends require content parts the gateway knows how to render.
@@ -616,12 +623,8 @@ pub(crate) fn process_chat_messages_with_placeholders(
             add_generation_prompt: !native_continuation,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
-            // Project OpenAI `reasoning_effort` (none/minimal) onto the model's
-            // thinking toggle; the tokenizer applies it under the correct key.
-            // An explicit chat_template_kwargs toggle still wins (in apply).
-            thinking: openai_protocol::chat::thinking_from_reasoning_effort(
-                request.reasoning_effort.as_deref(),
-            ),
+            // The tokenizer applies the toggle under the template's own key.
+            thinking: resolve_template_thinking(request),
             ..Default::default()
         };
 
@@ -1565,6 +1568,61 @@ mod tests {
         let kwargs = build_chat_template_kwargs(&request);
         assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
         assert_eq!(kwargs.get("custom"), Some(&Value::Bool(true)));
+    }
+
+    fn thinking_request(thinking: Value, reasoning_effort: Option<&str>) -> ChatCompletionRequest {
+        let mut request = effort_request(reasoning_effort);
+        request.thinking = Some(serde_json::from_value(thinking).expect("thinking param"));
+        request
+    }
+
+    #[test]
+    fn thinking_effort_overrides_top_level_effort_in_kwargs() {
+        // KVV test_reasoning_effort_ignored_when_effort_present: effort=low beats max.
+        let request = thinking_request(json!({"type": "enabled", "effort": "low"}), Some("max"));
+        let kwargs = build_chat_template_kwargs(&request);
+        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
+
+        // Absent `thinking.effort`, the top-level field still applies.
+        let request = thinking_request(json!({"type": "enabled"}), Some("max"));
+        let kwargs = build_chat_template_kwargs(&request);
+        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("max")));
+
+        // An explicit chat_template_kwargs entry outranks both.
+        let mut request = thinking_request(json!({"effort": "low"}), Some("max"));
+        request.chat_template_kwargs = Some(HashMap::from([(
+            REASONING_EFFORT_KEY.to_string(),
+            json!("high"),
+        )]));
+        let kwargs = build_chat_template_kwargs(&request);
+        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("high")));
+    }
+
+    #[test]
+    fn thinking_disabled_projects_params_thinking_false() {
+        let request = thinking_request(json!({"type": "disabled"}), Some("high"));
+        assert_eq!(resolve_template_thinking(&request), Some(false));
+        // `adaptive` and an omitted `type` leave the template default in charge.
+        for thinking in [json!({"type": "adaptive"}), json!({"keep": "all"})] {
+            assert_eq!(
+                resolve_template_thinking(&thinking_request(thinking, None)),
+                None
+            );
+        }
+        assert_eq!(resolve_template_thinking(&effort_request(None)), None);
+        assert_eq!(
+            resolve_template_thinking(&effort_request(Some("none"))),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn thinking_enabled_beats_reasoning_effort_none() {
+        let request = thinking_request(json!({"type": "enabled"}), Some("none"));
+        assert_eq!(resolve_template_thinking(&request), Some(true));
+        // A `none` inside `thinking.effort` is the switch too when no type is given.
+        let request = thinking_request(json!({"effort": "none"}), Some("high"));
+        assert_eq!(resolve_template_thinking(&request), Some(false));
     }
 
     #[test]
