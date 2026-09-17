@@ -2821,6 +2821,33 @@ mod tests {
     }
 
     #[test]
+    fn engine_rejections_do_not_open_the_circuit_breaker() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 2,
+            success_threshold: 1,
+            timeout_duration: Duration::from_millis(50),
+            window_duration: Duration::from_secs(60),
+        };
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .circuit_breaker_config(config)
+            .health_config(no_health_check())
+            .build();
+
+        // A 400 is the client's fault: any number of them leaves the breaker closed.
+        for _ in 0..10 {
+            worker.record_outcome(400);
+        }
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        assert!(worker.is_available());
+
+        worker.record_outcome(500);
+        worker.record_outcome(500);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+        assert!(!worker.is_available());
+    }
+
+    #[test]
     fn test_worker_with_circuit_breaker_config() {
         let config = CircuitBreakerConfig {
             failure_threshold: 2,

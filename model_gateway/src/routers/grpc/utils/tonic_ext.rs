@@ -54,3 +54,54 @@ impl<T> TonicResultExt for Result<T, tonic::Status> {
             .map_or_else(|e| e.http_status().as_u16(), |_| 200)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::resilience::{
+        DEFAULT_CAPACITY_STATUS_CODES, DEFAULT_RETRYABLE_STATUS_CODES,
+    };
+
+    #[test]
+    fn invalid_argument_maps_to_400_and_is_not_a_circuit_breaker_failure() {
+        for status in [
+            tonic::Status::invalid_argument("bad"),
+            tonic::Status::failed_precondition("bad"),
+            tonic::Status::out_of_range("bad"),
+        ] {
+            assert_eq!(status.http_status(), StatusCode::BAD_REQUEST);
+            let result: Result<(), tonic::Status> = Err(status);
+            assert_eq!(result.cb_status_code(), 400);
+        }
+        assert!(!DEFAULT_RETRYABLE_STATUS_CODES.contains(&400));
+    }
+
+    #[test]
+    fn internal_and_unknown_map_to_500() {
+        for status in [
+            tonic::Status::internal("boom"),
+            tonic::Status::unknown("boom"),
+            tonic::Status::data_loss("boom"),
+        ] {
+            assert_eq!(status.http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let result: Result<(), tonic::Status> = Err(status);
+            assert_eq!(result.cb_status_code(), 500);
+        }
+        assert!(DEFAULT_RETRYABLE_STATUS_CODES.contains(&500));
+    }
+
+    #[test]
+    fn resource_exhausted_maps_to_429_capacity_pushback() {
+        assert_eq!(
+            tonic::Status::resource_exhausted("busy").http_status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            tonic::Status::unavailable("down").http_status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(DEFAULT_CAPACITY_STATUS_CODES.contains(&429));
+        let ok: Result<(), tonic::Status> = Ok(());
+        assert_eq!(ok.cb_status_code(), 200);
+    }
+}

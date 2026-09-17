@@ -4,7 +4,7 @@ use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use axum::response::Response;
 use futures::future::{join_all, try_join_all};
-use tracing::{debug, error, info_span, Instrument};
+use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
     helpers::{maybe_inject_pd_metadata, maybe_inject_pd_rendezvous},
@@ -515,14 +515,30 @@ async fn execute_single(
     workers.record_outcome(result.cb_status_code());
 
     let stream = result.map_err(|e| {
-        error!(function = "execute_single", error = %e, "Failed to start generation");
-        e.to_http_error(
+        start_failure_response(
+            &e,
+            "execute_single",
+            "Failed to start generation",
             "start_generation_failed",
-            format!("Failed to start generation: {}", e.message()),
         )
     })?;
 
     Ok(ExecutionResult::Single { stream })
+}
+
+/// Client answer for a request the worker did not start; an engine rejection (4xx) is not a fault.
+fn start_failure_response(
+    e: &tonic::Status,
+    function: &'static str,
+    description: &str,
+    code: &str,
+) -> Response {
+    if e.http_status().is_client_error() {
+        warn!(function = function, error = %e, "{}: engine rejected the request", description);
+    } else {
+        error!(function = function, error = %e, "{}", description);
+    }
+    e.to_http_error(code, format!("{description}: {}", e.message()))
 }
 
 async fn execute_single_embed(
@@ -545,10 +561,11 @@ async fn execute_single_embed(
     workers.record_outcome(result.cb_status_code());
 
     let complete = result.map_err(|e| {
-        error!(function = "execute_single_embed", error = %e, "Failed to start embedding");
-        e.to_http_error(
+        start_failure_response(
+            &e,
+            "execute_single_embed",
+            "Failed to start embedding",
             "start_embedding_failed",
-            format!("Failed to start embedding: {}", e.message()),
         )
     })?;
 
@@ -749,17 +766,11 @@ async fn dispatch_pd_legs(
 /// Log, count and translate one leg's dispatch failure into the client answer.
 fn pd_leg_error(leg: PdLeg, connection: &'static str, error: &tonic::Status) -> Response {
     Metrics::record_worker_error(leg.name(), connection, metrics_labels::ERROR_BACKEND);
-    match leg {
-        PdLeg::Prefill => {
-            error!(function = "execute_parallel_pd", error = %error, "Prefill worker failed to start");
-        }
-        PdLeg::Decode => {
-            error!(function = "execute_parallel_pd", error = %error, "Decode worker failed to start");
-        }
-    }
-    error.to_http_error(
+    start_failure_response(
+        error,
+        "execute_parallel_pd",
+        leg.error_message(),
         leg.error_code(),
-        format!("{}: {}", leg.error_message(), error.message()),
     )
 }
 
@@ -932,18 +943,22 @@ async fn execute_sequential_pd(
     let (prefill_label, decode_label) = pd_leg_labels(workers);
     let prefill_start = Instant::now();
     let mut prefill_stream = prefill_client
-            .generate(prefill_request)
-            .await
-            .map_err(|e| {
-                workers.record_outcome_prefill(e.http_status().as_u16());
-                Metrics::record_worker_error(
-                    metrics_labels::WORKER_PREFILL,
-                    prefill_label,
-                    metrics_labels::ERROR_BACKEND,
-                );
-                error!(function = "execute_sequential_pd", error = %e, "Prefill worker failed to start");
-                e.to_http_error("prefill_worker_failed_to_start", format!("Prefill worker failed to start: {}", e.message()))
-            })?;
+        .generate(prefill_request)
+        .await
+        .map_err(|e| {
+            workers.record_outcome_prefill(e.http_status().as_u16());
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_PREFILL,
+                prefill_label,
+                metrics_labels::ERROR_BACKEND,
+            );
+            start_failure_response(
+                &e,
+                "execute_sequential_pd",
+                PdLeg::Prefill.error_message(),
+                PdLeg::Prefill.error_code(),
+            )
+        })?;
 
     // Drain prefill response, harvesting connector params from the Complete frame
     let mut prefill_kv_params: Option<String> = None;
@@ -1044,10 +1059,11 @@ async fn execute_sequential_pd(
             decode_label,
             metrics_labels::ERROR_BACKEND,
         );
-        error!(function = "execute_sequential_pd", error = %e, "Decode worker failed to start");
-        e.to_http_error(
-            "decode_worker_failed_to_start",
-            format!("Decode worker failed to start: {}", e.message()),
+        start_failure_response(
+            &e,
+            "execute_sequential_pd",
+            PdLeg::Decode.error_message(),
+            PdLeg::Decode.error_code(),
         )
     })?;
 
@@ -1116,6 +1132,39 @@ mod tests {
             decode: leg("grpc://decode:30000", WorkerType::Decode),
             runtime_type: RuntimeType::TokenSpeed,
         }
+    }
+
+    #[test]
+    fn engine_rejections_at_start_are_4xx_under_the_same_error_code() {
+        let rejected = start_failure_response(
+            &tonic::Status::invalid_argument("Invalid grammar specification"),
+            "execute_single",
+            "Failed to start generation",
+            "start_generation_failed",
+        );
+        assert_eq!(rejected.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            rejected
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "start_generation_failed"
+        );
+
+        let failed = start_failure_response(
+            &tonic::Status::internal("engine died"),
+            "execute_single",
+            "Failed to start generation",
+            "start_generation_failed",
+        );
+        assert_eq!(failed.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            failed
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "start_generation_failed"
+        );
     }
 
     #[test]
