@@ -897,55 +897,73 @@ impl PDRouter {
         // hits a transport error, the other is cancelled immediately — otherwise
         // the surviving request hangs waiting for a PD bootstrap that will never
         // come (see #831).
-        // Each leg captures its own head-arrival elapsed when its `send()`
-        // resolves, so the two are independent even though `try_join!` returns
-        // only once both heads arrive: decode TTFT isn't conflated with the
-        // prefill-head wait, and prefill duration isn't conflated with a slower
-        // decode head. Recorded on the success path only.
+        // Drain Prefill and release its slot inside its own future. A
+        // non-streaming Decode may not send its head until generation ends.
+        enum DispatchError {
+            Transport(reqwest::Error),
+            Prefill(Response),
+            Decode(reqwest::Response),
+        }
         let runtime = prefill.metadata().spec.runtime_type.as_str();
         let dispatch_start = Instant::now();
         let prefill_fut = async {
-            let resp = send_with_stale_conn_retry(prefill_request).await?;
-            Ok::<_, reqwest::Error>((dispatch_start.elapsed(), resp))
+            let resp = send_with_stale_conn_retry(prefill_request)
+                .await
+                .map_err(DispatchError::Transport)?;
+            let result = self
+                .process_prefill_response(resp, prefill.url(), context.return_logprob)
+                .await;
+            drop(prefill_guard);
+            let (_, body) = result.map_err(DispatchError::Prefill)?;
+            Metrics::record_pd_prefill_duration(
+                metrics_labels::BACKEND_PD,
+                context.model_id,
+                runtime,
+                dispatch_start.elapsed(),
+            );
+            Ok(body)
         };
         let decode_fut = async {
-            let resp = send_with_stale_conn_retry(decode_request).await?;
-            Ok::<_, reqwest::Error>((dispatch_start.elapsed(), resp))
+            let resp = send_with_stale_conn_retry(decode_request)
+                .await
+                .map_err(DispatchError::Transport)?;
+            if !resp.status().is_success() {
+                return Err(DispatchError::Decode(resp));
+            }
+            Ok((dispatch_start.elapsed(), resp))
         };
         let pd_result = tokio::try_join!(prefill_fut, decode_fut);
 
         events::RequestReceivedEvent {}.emit();
 
-        let ((prefill_head_elapsed, prefill_response), (decode_head_elapsed, decode_response)) =
-            match pd_result {
-                Ok(pair) => pair,
-                Err(e) => {
-                    error!("PD request transport error, both sides aborted: {e}");
-                    // Don't record_outcome here — the caller (execute_dual_dispatch)
-                    // records outcomes from the response status after we return.
-                    return error::bad_gateway(
-                        "PD disaggregation request failed",
-                        format!("Transport error: {e}"),
-                    );
-                }
-            };
+        let (prefill_body, (decode_head_elapsed, decode_response)) = match pd_result {
+            Ok(pair) => pair,
+            Err(DispatchError::Transport(e)) => {
+                error!("PD request transport error, both sides aborted: {e}");
+                // Don't record_outcome here — the caller (execute_dual_dispatch)
+                // records outcomes from the response status after we return.
+                return error::bad_gateway(
+                    "PD disaggregation request failed",
+                    format!("Transport error: {e}"),
+                );
+            }
+            Err(DispatchError::Prefill(response)) => return response,
+            Err(DispatchError::Decode(response)) => {
+                error!(
+                    "Decode server returned error status decode_url={} status={}",
+                    decode.url(),
+                    response.status()
+                );
+                return self
+                    .handle_decode_error_response(response, &context, decode, decode_guard)
+                    .await;
+            }
+        };
 
         // Process decode response
         let status = StatusCode::from_u16(decode_response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         debug!("Decode response status: {}", status);
-
-        if !status.is_success() {
-            error!(
-                "Decode server returned error status decode_url={} status={}",
-                decode.url(),
-                status
-            );
-
-            return self
-                .handle_decode_error_response(decode_response, &context, decode, decode_guard)
-                .await;
-        }
 
         // Honest PD TTFT: dispatch to the decode response head — the first
         // user-visible decode output, since the gateway forwards the decode body
@@ -956,28 +974,6 @@ impl PDRouter {
             context.model_id,
             runtime,
             decode_head_elapsed,
-        );
-
-        // Process prefill response
-        let prefill_drain_start = Instant::now();
-        let prefill_body = match self
-            .process_prefill_response(prefill_response, prefill.url(), context.return_logprob)
-            .await
-        {
-            Ok((_, body)) => body,
-            Err(error_response) => return error_response,
-        };
-        // The Prefill phase is over: its admission slot is free for the next
-        // request while decode still runs.
-        drop(prefill_guard);
-
-        // Prefill RPC duration: prefill-head elapsed + body drain, independent
-        // of decode so a slower decode head never inflates it.
-        Metrics::record_pd_prefill_duration(
-            metrics_labels::BACKEND_PD,
-            context.model_id,
-            runtime,
-            prefill_head_elapsed + prefill_drain_start.elapsed(),
         );
 
         self.forward_decode_body(
@@ -2882,6 +2878,266 @@ mod tests {
             released.load(Ordering::SeqCst),
             "the parsed request must be freed before the decode leg answers"
         );
+    }
+
+    fn admission_test_router(prefill_url: String, decode_url: String) -> PDRouter {
+        let router = PDRouter {
+            prefill_admission: Some(Arc::new(PrefillAdmission::new(
+                1,
+                1,
+                std::time::Duration::from_secs(3),
+            ))),
+            ..create_test_pd_router()
+        };
+        for (url, role) in [
+            (prefill_url, WorkerType::Prefill),
+            (decode_url, WorkerType::Decode),
+        ] {
+            router
+                .worker_registry
+                .register_or_replace(Arc::from(create_test_worker(url, role, true)));
+        }
+        router
+    }
+
+    #[tokio::test]
+    async fn pd_prefill_release_admits_next_request_before_decode_head() {
+        use std::{sync::atomic::Ordering, time::Duration};
+
+        use crate::routers::common::request_lease::test_probe::spawn_release_gated_stub;
+
+        for is_stream in [false, true] {
+            for return_logprob in [false, true] {
+                let prefill_probe = Arc::new(());
+                let prefill_hold = Arc::clone(&prefill_probe);
+                let decode_probe = Arc::new(());
+                let decode_hold = Arc::clone(&decode_probe);
+                let (prefill_url, prefill_released) =
+                    spawn_release_gated_stub(Arc::downgrade(&prefill_probe)).await;
+                let (decode_url, decode_released) =
+                    spawn_release_gated_stub(Arc::downgrade(&decode_probe)).await;
+                let router = admission_test_router(prefill_url, decode_url);
+                let ((prefill, decode), guards) = router
+                    .select_pd_pair_with_admission(
+                        UNKNOWN_MODEL_ID,
+                        PlacementInputs::default(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let context = PDRequestContext {
+                    route: "/generate",
+                    batch_size: None,
+                    is_stream,
+                    return_logprob,
+                    model_id: UNKNOWN_MODEL_ID,
+                    headers: None,
+                };
+                let dispatch = router.execute_dual_dispatch_internal(
+                    None,
+                    (Bytes::from_static(b"{}"), Bytes::from_static(b"{}")),
+                    context,
+                    Arc::clone(&prefill),
+                    Arc::clone(&decode),
+                    guards,
+                );
+                tokio::pin!(dispatch);
+
+                let next = router.select_pd_pair_with_admission(
+                    UNKNOWN_MODEL_ID,
+                    PlacementInputs::default(),
+                    None,
+                );
+                tokio::pin!(next);
+                tokio::select! {
+                    biased;
+                    _ = &mut dispatch => panic!("Decode must remain blocked"),
+                    _ = &mut next => panic!("Prefill must remain occupied until it responds"),
+                    () = tokio::task::yield_now() => {}
+                }
+                assert_eq!(
+                    router.prefill_admission.as_ref().unwrap().queued_requests(),
+                    1
+                );
+                assert_eq!(prefill.load(), 1);
+                assert_eq!(decode.load(), 1);
+                assert!(!prefill_released.load(Ordering::SeqCst));
+
+                drop(prefill_hold);
+                let (_, next_guards) = tokio::select! {
+                    _ = &mut dispatch => panic!("Decode must remain blocked"),
+                    result = tokio::time::timeout(Duration::from_secs(2), &mut next) => {
+                        result.expect("completed Prefill must admit the queued request").unwrap()
+                    }
+                };
+                assert!(prefill_released.load(Ordering::SeqCst));
+                assert!(!decode_released.load(Ordering::SeqCst));
+                assert_eq!(decode.load(), 2);
+                drop(next_guards);
+                assert_eq!(prefill.load(), 0);
+                assert_eq!(decode.load(), 1);
+
+                drop(decode_hold);
+                let response = tokio::time::timeout(Duration::from_secs(2), dispatch)
+                    .await
+                    .expect("released Decode must finish");
+                assert_eq!(response.status(), StatusCode::OK);
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(prefill.load(), 0);
+                assert_eq!(decode.load(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pd_prefill_release_preserves_response_and_logprobs() {
+        for is_stream in [false, true] {
+            for return_logprob in [false, true] {
+                let (prefill_url, _) = spawn_recording_stub(
+                    r#"{"meta_info":{"input_token_logprobs":[[-0.1,1,"p"]]}}"#,
+                )
+                .await;
+                let (decode_url, _) = spawn_recording_stub(if is_stream {
+                    "data: {\"text\":\"answer\",\"meta_info\":{\"input_token_logprobs\":[[-0.2,2,\"d\"]]}}\n\n"
+                } else {
+                    r#"{"text":"answer","meta_info":{"input_token_logprobs":[[-0.2,2,"d"]]}}"#
+                })
+                .await;
+                let router = admission_test_router(prefill_url, decode_url);
+                let ((prefill, decode), guards) = router
+                    .select_pd_pair_with_admission(
+                        UNKNOWN_MODEL_ID,
+                        PlacementInputs::default(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let response = router
+                    .execute_dual_dispatch_internal(
+                        None,
+                        (Bytes::from_static(b"{}"), Bytes::from_static(b"{}")),
+                        PDRequestContext {
+                            route: "/generate",
+                            batch_size: None,
+                            is_stream,
+                            return_logprob,
+                            model_id: UNKNOWN_MODEL_ID,
+                            headers: None,
+                        },
+                        prefill,
+                        decode,
+                        guards,
+                    )
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body = std::str::from_utf8(&body).unwrap();
+                let value: Value = serde_json::from_str(if is_stream {
+                    body.strip_prefix("data: ").unwrap().trim()
+                } else {
+                    body
+                })
+                .unwrap();
+                assert_eq!(value["text"], "answer");
+                assert_eq!(
+                    value["meta_info"]["input_token_logprobs"],
+                    if return_logprob {
+                        json!([[-0.1, 1, "p"], [-0.2, 2, "d"]])
+                    } else {
+                        json!([[-0.2, 2, "d"]])
+                    }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pd_prefill_release_on_error_or_cancellation() {
+        use std::time::Duration;
+
+        use crate::routers::common::request_lease::test_probe::{
+            spawn_immediate_stub, spawn_release_gated_stub,
+        };
+
+        // Each leg can fail while the other is still waiting for its head.
+        // A missing route exercises HTTP errors; a dropped listener exercises
+        // transport errors. Cancellation drops two pending legs.
+        for failed_prefill in [false, true] {
+            for failure in ["http", "transport", "cancel"] {
+                let probe = Arc::new(());
+                let hold = Arc::clone(&probe);
+                let (blocked_url, _) = spawn_release_gated_stub(Arc::downgrade(&probe)).await;
+                let failed_url = match failure {
+                    "http" => format!("{}/missing", spawn_immediate_stub().await),
+                    "transport" => {
+                        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        format!("http://{}", listener.local_addr().unwrap())
+                    }
+                    _ => spawn_release_gated_stub(Arc::downgrade(&probe)).await.0,
+                };
+                let (prefill_url, decode_url) = if failed_prefill {
+                    (failed_url, blocked_url)
+                } else {
+                    (blocked_url, failed_url)
+                };
+                let router = admission_test_router(prefill_url, decode_url);
+                let ((prefill, decode), guards) = router
+                    .select_pd_pair_with_admission(
+                        UNKNOWN_MODEL_ID,
+                        PlacementInputs::default(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let context = PDRequestContext {
+                    route: "/generate",
+                    batch_size: None,
+                    is_stream: false,
+                    return_logprob: false,
+                    model_id: UNKNOWN_MODEL_ID,
+                    headers: None,
+                };
+                {
+                    let dispatch = router.execute_dual_dispatch_internal(
+                        None,
+                        (Bytes::from_static(b"{}"), Bytes::from_static(b"{}")),
+                        context,
+                        Arc::clone(&prefill),
+                        Arc::clone(&decode),
+                        guards,
+                    );
+                    tokio::pin!(dispatch);
+                    if failure == "cancel" {
+                        tokio::select! {
+                            biased;
+                            _ = &mut dispatch => panic!("both legs must remain blocked"),
+                            () = tokio::task::yield_now() => {}
+                        }
+                        assert_eq!(prefill.load(), 1);
+                        assert_eq!(decode.load(), 1);
+                    } else {
+                        let response = tokio::time::timeout(Duration::from_secs(2), dispatch)
+                            .await
+                            .expect("a failed leg must cancel the pending leg");
+                        assert_eq!(
+                            response.status(),
+                            if failure == "http" {
+                                StatusCode::NOT_FOUND
+                            } else {
+                                StatusCode::BAD_GATEWAY
+                            }
+                        );
+                    }
+                }
+                assert_eq!(prefill.load(), 0);
+                assert_eq!(decode.load(), 0);
+                drop(hold);
+            }
+        }
     }
 
     #[tokio::test]
