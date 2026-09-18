@@ -26,6 +26,31 @@ message KvEventBatch {
   double timestamp = 2;
   repeated KvCacheEvent events = 3;
   optional int32 dp_rank = 4;
+  // Group metadata is learned from received events when the engine provides it.
+  // Legacy events remain unchanged when unset.
+  bool group_events_enabled = 5;
+  repeated KvGroupEvent group_events = 6;
+}
+
+// GPU-local reports, retaining opaque native keys and the complete token span.
+// Sparse stores need not contain one hash per token block; no offsets are guessed.
+message KvGroupEvent {
+  enum Operation {
+    INVALID = 0;
+    STORE = 1;
+    REMOVE = 2;
+    CLEAR = 3;
+  }
+  Operation operation = 1;
+  uint32 group_id = 2;
+  repeated bytes block_hashes = 3;
+  bytes parent_block_hash = 4;
+  repeated uint32 token_ids = 5;
+  uint32 block_size = 6;
+  string kind = 7;
+  uint32 sliding_window = 8;
+  // False when LoRA or extra hash inputs prevent token-only matching.
+  bool tokens_matchable = 9;
 }
 
 message KvCacheEvent {

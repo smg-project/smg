@@ -13,6 +13,7 @@
 
 mod common;
 mod event_tree;
+pub mod group_cache;
 mod path_hash;
 pub mod snapshot;
 mod string_tree;

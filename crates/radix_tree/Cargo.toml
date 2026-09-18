@@ -1,6 +1,6 @@
 [package]
 name = "smg-radix-tree"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Generic prefix-membership index: chain-native radix tree answering which holders share the longest prefix of a block chain, and how deep"
 license = "Apache-2.0"

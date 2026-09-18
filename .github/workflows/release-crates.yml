@@ -27,8 +27,6 @@ jobs:
             path: crates/protocols
           - crate: reasoning-parser
             path: crates/reasoning_parser
-          - crate: kv-index
-            path: crates/kv_index
           - crate: data-connector
             path: crates/data_connector
           - crate: wfaas
@@ -59,6 +57,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - crate: kv-index
+            path: crates/kv_index
           - crate: tool-parser
             path: crates/tool_parser
           - crate: smg-grpc-client

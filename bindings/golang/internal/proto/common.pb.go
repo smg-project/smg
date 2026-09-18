@@ -21,6 +21,112 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Multimodal input modality, shared across engine protos so the servicers can
+// route each request to the matching encoder (image vs video vs audio).
+type Modality int32
+
+const (
+	Modality_MODALITY_UNSPECIFIED Modality = 0
+	Modality_IMAGE                Modality = 1
+	Modality_AUDIO                Modality = 2
+	Modality_VIDEO                Modality = 3
+)
+
+// Enum value maps for Modality.
+var (
+	Modality_name = map[int32]string{
+		0: "MODALITY_UNSPECIFIED",
+		1: "IMAGE",
+		2: "AUDIO",
+		3: "VIDEO",
+	}
+	Modality_value = map[string]int32{
+		"MODALITY_UNSPECIFIED": 0,
+		"IMAGE":                1,
+		"AUDIO":                2,
+		"VIDEO":                3,
+	}
+)
+
+func (x Modality) Enum() *Modality {
+	p := new(Modality)
+	*p = x
+	return p
+}
+
+func (x Modality) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (Modality) Descriptor() protoreflect.EnumDescriptor {
+	return file_common_proto_enumTypes[0].Descriptor()
+}
+
+func (Modality) Type() protoreflect.EnumType {
+	return &file_common_proto_enumTypes[0]
+}
+
+func (x Modality) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use Modality.Descriptor instead.
+func (Modality) EnumDescriptor() ([]byte, []int) {
+	return file_common_proto_rawDescGZIP(), []int{0}
+}
+
+type KvGroupEvent_Operation int32
+
+const (
+	KvGroupEvent_INVALID KvGroupEvent_Operation = 0
+	KvGroupEvent_STORE   KvGroupEvent_Operation = 1
+	KvGroupEvent_REMOVE  KvGroupEvent_Operation = 2
+	KvGroupEvent_CLEAR   KvGroupEvent_Operation = 3
+)
+
+// Enum value maps for KvGroupEvent_Operation.
+var (
+	KvGroupEvent_Operation_name = map[int32]string{
+		0: "INVALID",
+		1: "STORE",
+		2: "REMOVE",
+		3: "CLEAR",
+	}
+	KvGroupEvent_Operation_value = map[string]int32{
+		"INVALID": 0,
+		"STORE":   1,
+		"REMOVE":  2,
+		"CLEAR":   3,
+	}
+)
+
+func (x KvGroupEvent_Operation) Enum() *KvGroupEvent_Operation {
+	p := new(KvGroupEvent_Operation)
+	*p = x
+	return p
+}
+
+func (x KvGroupEvent_Operation) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (KvGroupEvent_Operation) Descriptor() protoreflect.EnumDescriptor {
+	return file_common_proto_enumTypes[1].Descriptor()
+}
+
+func (KvGroupEvent_Operation) Type() protoreflect.EnumType {
+	return &file_common_proto_enumTypes[1]
+}
+
+func (x KvGroupEvent_Operation) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use KvGroupEvent_Operation.Descriptor instead.
+func (KvGroupEvent_Operation) EnumDescriptor() ([]byte, []int) {
+	return file_common_proto_rawDescGZIP(), []int{4, 0}
+}
+
 type GetTokenizerRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -160,8 +266,12 @@ type KvEventBatch struct {
 	Timestamp      float64                `protobuf:"fixed64,2,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
 	Events         []*KvCacheEvent        `protobuf:"bytes,3,rep,name=events,proto3" json:"events,omitempty"`
 	DpRank         *int32                 `protobuf:"varint,4,opt,name=dp_rank,json=dpRank,proto3,oneof" json:"dp_rank,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Group metadata is learned from received events when the engine provides it.
+	// Legacy events remain unchanged when unset.
+	GroupEventsEnabled bool            `protobuf:"varint,5,opt,name=group_events_enabled,json=groupEventsEnabled,proto3" json:"group_events_enabled,omitempty"`
+	GroupEvents        []*KvGroupEvent `protobuf:"bytes,6,rep,name=group_events,json=groupEvents,proto3" json:"group_events,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *KvEventBatch) Reset() {
@@ -222,6 +332,131 @@ func (x *KvEventBatch) GetDpRank() int32 {
 	return 0
 }
 
+func (x *KvEventBatch) GetGroupEventsEnabled() bool {
+	if x != nil {
+		return x.GroupEventsEnabled
+	}
+	return false
+}
+
+func (x *KvEventBatch) GetGroupEvents() []*KvGroupEvent {
+	if x != nil {
+		return x.GroupEvents
+	}
+	return nil
+}
+
+// GPU-local reports, retaining opaque native keys and the complete token span.
+// Sparse stores need not contain one hash per token block; no offsets are guessed.
+type KvGroupEvent struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Operation       KvGroupEvent_Operation `protobuf:"varint,1,opt,name=operation,proto3,enum=smg.grpc.common.KvGroupEvent_Operation" json:"operation,omitempty"`
+	GroupId         uint32                 `protobuf:"varint,2,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	BlockHashes     [][]byte               `protobuf:"bytes,3,rep,name=block_hashes,json=blockHashes,proto3" json:"block_hashes,omitempty"`
+	ParentBlockHash []byte                 `protobuf:"bytes,4,opt,name=parent_block_hash,json=parentBlockHash,proto3" json:"parent_block_hash,omitempty"`
+	TokenIds        []uint32               `protobuf:"varint,5,rep,packed,name=token_ids,json=tokenIds,proto3" json:"token_ids,omitempty"`
+	BlockSize       uint32                 `protobuf:"varint,6,opt,name=block_size,json=blockSize,proto3" json:"block_size,omitempty"`
+	Kind            string                 `protobuf:"bytes,7,opt,name=kind,proto3" json:"kind,omitempty"`
+	SlidingWindow   uint32                 `protobuf:"varint,8,opt,name=sliding_window,json=slidingWindow,proto3" json:"sliding_window,omitempty"`
+	// False when LoRA or extra hash inputs prevent token-only matching.
+	TokensMatchable bool `protobuf:"varint,9,opt,name=tokens_matchable,json=tokensMatchable,proto3" json:"tokens_matchable,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *KvGroupEvent) Reset() {
+	*x = KvGroupEvent{}
+	mi := &file_common_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *KvGroupEvent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*KvGroupEvent) ProtoMessage() {}
+
+func (x *KvGroupEvent) ProtoReflect() protoreflect.Message {
+	mi := &file_common_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use KvGroupEvent.ProtoReflect.Descriptor instead.
+func (*KvGroupEvent) Descriptor() ([]byte, []int) {
+	return file_common_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *KvGroupEvent) GetOperation() KvGroupEvent_Operation {
+	if x != nil {
+		return x.Operation
+	}
+	return KvGroupEvent_INVALID
+}
+
+func (x *KvGroupEvent) GetGroupId() uint32 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *KvGroupEvent) GetBlockHashes() [][]byte {
+	if x != nil {
+		return x.BlockHashes
+	}
+	return nil
+}
+
+func (x *KvGroupEvent) GetParentBlockHash() []byte {
+	if x != nil {
+		return x.ParentBlockHash
+	}
+	return nil
+}
+
+func (x *KvGroupEvent) GetTokenIds() []uint32 {
+	if x != nil {
+		return x.TokenIds
+	}
+	return nil
+}
+
+func (x *KvGroupEvent) GetBlockSize() uint32 {
+	if x != nil {
+		return x.BlockSize
+	}
+	return 0
+}
+
+func (x *KvGroupEvent) GetKind() string {
+	if x != nil {
+		return x.Kind
+	}
+	return ""
+}
+
+func (x *KvGroupEvent) GetSlidingWindow() uint32 {
+	if x != nil {
+		return x.SlidingWindow
+	}
+	return 0
+}
+
+func (x *KvGroupEvent) GetTokensMatchable() bool {
+	if x != nil {
+		return x.TokensMatchable
+	}
+	return false
+}
+
 type KvCacheEvent struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	EventId uint64                 `protobuf:"varint,1,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
@@ -237,7 +472,7 @@ type KvCacheEvent struct {
 
 func (x *KvCacheEvent) Reset() {
 	*x = KvCacheEvent{}
-	mi := &file_common_proto_msgTypes[4]
+	mi := &file_common_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -249,7 +484,7 @@ func (x *KvCacheEvent) String() string {
 func (*KvCacheEvent) ProtoMessage() {}
 
 func (x *KvCacheEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_common_proto_msgTypes[4]
+	mi := &file_common_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -262,7 +497,7 @@ func (x *KvCacheEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KvCacheEvent.ProtoReflect.Descriptor instead.
 func (*KvCacheEvent) Descriptor() ([]byte, []int) {
-	return file_common_proto_rawDescGZIP(), []int{4}
+	return file_common_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *KvCacheEvent) GetEventId() uint64 {
@@ -338,7 +573,7 @@ type KvBlocksStored struct {
 
 func (x *KvBlocksStored) Reset() {
 	*x = KvBlocksStored{}
-	mi := &file_common_proto_msgTypes[5]
+	mi := &file_common_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -350,7 +585,7 @@ func (x *KvBlocksStored) String() string {
 func (*KvBlocksStored) ProtoMessage() {}
 
 func (x *KvBlocksStored) ProtoReflect() protoreflect.Message {
-	mi := &file_common_proto_msgTypes[5]
+	mi := &file_common_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -363,7 +598,7 @@ func (x *KvBlocksStored) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KvBlocksStored.ProtoReflect.Descriptor instead.
 func (*KvBlocksStored) Descriptor() ([]byte, []int) {
-	return file_common_proto_rawDescGZIP(), []int{5}
+	return file_common_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *KvBlocksStored) GetBlocks() []*KvBlock {
@@ -393,7 +628,7 @@ type KvBlock struct {
 
 func (x *KvBlock) Reset() {
 	*x = KvBlock{}
-	mi := &file_common_proto_msgTypes[6]
+	mi := &file_common_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -405,7 +640,7 @@ func (x *KvBlock) String() string {
 func (*KvBlock) ProtoMessage() {}
 
 func (x *KvBlock) ProtoReflect() protoreflect.Message {
-	mi := &file_common_proto_msgTypes[6]
+	mi := &file_common_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -418,7 +653,7 @@ func (x *KvBlock) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KvBlock.ProtoReflect.Descriptor instead.
 func (*KvBlock) Descriptor() ([]byte, []int) {
-	return file_common_proto_rawDescGZIP(), []int{6}
+	return file_common_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *KvBlock) GetBlockHash() int64 {
@@ -466,7 +701,7 @@ type KvBlocksRemoved struct {
 
 func (x *KvBlocksRemoved) Reset() {
 	*x = KvBlocksRemoved{}
-	mi := &file_common_proto_msgTypes[7]
+	mi := &file_common_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -478,7 +713,7 @@ func (x *KvBlocksRemoved) String() string {
 func (*KvBlocksRemoved) ProtoMessage() {}
 
 func (x *KvBlocksRemoved) ProtoReflect() protoreflect.Message {
-	mi := &file_common_proto_msgTypes[7]
+	mi := &file_common_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -491,7 +726,7 @@ func (x *KvBlocksRemoved) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KvBlocksRemoved.ProtoReflect.Descriptor instead.
 func (*KvBlocksRemoved) Descriptor() ([]byte, []int) {
-	return file_common_proto_rawDescGZIP(), []int{7}
+	return file_common_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *KvBlocksRemoved) GetBlockHashes() []int64 {
@@ -516,7 +751,7 @@ type KvCacheCleared struct {
 
 func (x *KvCacheCleared) Reset() {
 	*x = KvCacheCleared{}
-	mi := &file_common_proto_msgTypes[8]
+	mi := &file_common_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -528,7 +763,7 @@ func (x *KvCacheCleared) String() string {
 func (*KvCacheCleared) ProtoMessage() {}
 
 func (x *KvCacheCleared) ProtoReflect() protoreflect.Message {
-	mi := &file_common_proto_msgTypes[8]
+	mi := &file_common_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -541,7 +776,7 @@ func (x *KvCacheCleared) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KvCacheCleared.ProtoReflect.Descriptor instead.
 func (*KvCacheCleared) Descriptor() ([]byte, []int) {
-	return file_common_proto_rawDescGZIP(), []int{8}
+	return file_common_proto_rawDescGZIP(), []int{9}
 }
 
 type FlushCacheRequest struct {
@@ -555,7 +790,7 @@ type FlushCacheRequest struct {
 
 func (x *FlushCacheRequest) Reset() {
 	*x = FlushCacheRequest{}
-	mi := &file_common_proto_msgTypes[9]
+	mi := &file_common_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -567,7 +802,7 @@ func (x *FlushCacheRequest) String() string {
 func (*FlushCacheRequest) ProtoMessage() {}
 
 func (x *FlushCacheRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_common_proto_msgTypes[9]
+	mi := &file_common_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -580,7 +815,7 @@ func (x *FlushCacheRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FlushCacheRequest.ProtoReflect.Descriptor instead.
 func (*FlushCacheRequest) Descriptor() ([]byte, []int) {
-	return file_common_proto_rawDescGZIP(), []int{9}
+	return file_common_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *FlushCacheRequest) GetTimeoutS() float32 {
@@ -600,7 +835,7 @@ type FlushCacheResponse struct {
 
 func (x *FlushCacheResponse) Reset() {
 	*x = FlushCacheResponse{}
-	mi := &file_common_proto_msgTypes[10]
+	mi := &file_common_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -612,7 +847,7 @@ func (x *FlushCacheResponse) String() string {
 func (*FlushCacheResponse) ProtoMessage() {}
 
 func (x *FlushCacheResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_common_proto_msgTypes[10]
+	mi := &file_common_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -625,7 +860,7 @@ func (x *FlushCacheResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FlushCacheResponse.ProtoReflect.Descriptor instead.
 func (*FlushCacheResponse) Descriptor() ([]byte, []int) {
-	return file_common_proto_rawDescGZIP(), []int{10}
+	return file_common_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *FlushCacheResponse) GetSuccess() bool {
@@ -661,7 +896,7 @@ type StartProfileRequest struct {
 
 func (x *StartProfileRequest) Reset() {
 	*x = StartProfileRequest{}
-	mi := &file_common_proto_msgTypes[11]
+	mi := &file_common_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -673,7 +908,7 @@ func (x *StartProfileRequest) String() string {
 func (*StartProfileRequest) ProtoMessage() {}
 
 func (x *StartProfileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_common_proto_msgTypes[11]
+	mi := &file_common_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -686,7 +921,7 @@ func (x *StartProfileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartProfileRequest.ProtoReflect.Descriptor instead.
 func (*StartProfileRequest) Descriptor() ([]byte, []int) {
-	return file_common_proto_rawDescGZIP(), []int{11}
+	return file_common_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *StartProfileRequest) GetOutputDir() string {
@@ -746,7 +981,7 @@ type StopProfileRequest struct {
 
 func (x *StopProfileRequest) Reset() {
 	*x = StopProfileRequest{}
-	mi := &file_common_proto_msgTypes[12]
+	mi := &file_common_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -758,7 +993,7 @@ func (x *StopProfileRequest) String() string {
 func (*StopProfileRequest) ProtoMessage() {}
 
 func (x *StopProfileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_common_proto_msgTypes[12]
+	mi := &file_common_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -771,7 +1006,7 @@ func (x *StopProfileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopProfileRequest.ProtoReflect.Descriptor instead.
 func (*StopProfileRequest) Descriptor() ([]byte, []int) {
-	return file_common_proto_rawDescGZIP(), []int{12}
+	return file_common_proto_rawDescGZIP(), []int{13}
 }
 
 type ProfileResponse struct {
@@ -784,7 +1019,7 @@ type ProfileResponse struct {
 
 func (x *ProfileResponse) Reset() {
 	*x = ProfileResponse{}
-	mi := &file_common_proto_msgTypes[13]
+	mi := &file_common_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -796,7 +1031,7 @@ func (x *ProfileResponse) String() string {
 func (*ProfileResponse) ProtoMessage() {}
 
 func (x *ProfileResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_common_proto_msgTypes[13]
+	mi := &file_common_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -809,7 +1044,7 @@ func (x *ProfileResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProfileResponse.ProtoReflect.Descriptor instead.
 func (*ProfileResponse) Descriptor() ([]byte, []int) {
-	return file_common_proto_rawDescGZIP(), []int{13}
+	return file_common_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *ProfileResponse) GetSuccess() bool {
@@ -826,6 +1061,136 @@ func (x *ProfileResponse) GetMessage() string {
 	return ""
 }
 
+type ShmHandle struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Name   string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Offset uint64                 `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
+	Nbytes uint64                 `protobuf:"varint,3,opt,name=nbytes,proto3" json:"nbytes,omitempty"`
+	// Producer/lifetime owner. Used by implementations to coordinate cleanup.
+	OwnerId       string `protobuf:"bytes,4,opt,name=owner_id,json=ownerId,proto3" json:"owner_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ShmHandle) Reset() {
+	*x = ShmHandle{}
+	mi := &file_common_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ShmHandle) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ShmHandle) ProtoMessage() {}
+
+func (x *ShmHandle) ProtoReflect() protoreflect.Message {
+	mi := &file_common_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ShmHandle.ProtoReflect.Descriptor instead.
+func (*ShmHandle) Descriptor() ([]byte, []int) {
+	return file_common_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *ShmHandle) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *ShmHandle) GetOffset() uint64 {
+	if x != nil {
+		return x.Offset
+	}
+	return 0
+}
+
+func (x *ShmHandle) GetNbytes() uint64 {
+	if x != nil {
+		return x.Nbytes
+	}
+	return 0
+}
+
+func (x *ShmHandle) GetOwnerId() string {
+	if x != nil {
+		return x.OwnerId
+	}
+	return ""
+}
+
+type RemoteTensorHandle struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Examples: "nixl", "ucx", "object_store".
+	Transport     string `protobuf:"bytes,1,opt,name=transport,proto3" json:"transport,omitempty"`
+	Descriptor_   []byte `protobuf:"bytes,2,opt,name=descriptor,proto3" json:"descriptor,omitempty"`
+	Nbytes        uint64 `protobuf:"varint,3,opt,name=nbytes,proto3" json:"nbytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoteTensorHandle) Reset() {
+	*x = RemoteTensorHandle{}
+	mi := &file_common_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoteTensorHandle) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoteTensorHandle) ProtoMessage() {}
+
+func (x *RemoteTensorHandle) ProtoReflect() protoreflect.Message {
+	mi := &file_common_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoteTensorHandle.ProtoReflect.Descriptor instead.
+func (*RemoteTensorHandle) Descriptor() ([]byte, []int) {
+	return file_common_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *RemoteTensorHandle) GetTransport() string {
+	if x != nil {
+		return x.Transport
+	}
+	return ""
+}
+
+func (x *RemoteTensorHandle) GetDescriptor_() []byte {
+	if x != nil {
+		return x.Descriptor_
+	}
+	return nil
+}
+
+func (x *RemoteTensorHandle) GetNbytes() uint64 {
+	if x != nil {
+		return x.Nbytes
+	}
+	return 0
+}
+
 var File_common_proto protoreflect.FileDescriptor
 
 const file_common_proto_rawDesc = "" +
@@ -836,14 +1201,33 @@ const file_common_proto_rawDesc = "" +
 	"\x04data\x18\x01 \x01(\fR\x04data\x12\x16\n" +
 	"\x06sha256\x18\x02 \x01(\tR\x06sha256\"N\n" +
 	"\x18SubscribeKvEventsRequest\x122\n" +
-	"\x15start_sequence_number\x18\x01 \x01(\x04R\x13startSequenceNumber\"\xb6\x01\n" +
+	"\x15start_sequence_number\x18\x01 \x01(\x04R\x13startSequenceNumber\"\xaa\x02\n" +
 	"\fKvEventBatch\x12'\n" +
 	"\x0fsequence_number\x18\x01 \x01(\x04R\x0esequenceNumber\x12\x1c\n" +
 	"\ttimestamp\x18\x02 \x01(\x01R\ttimestamp\x125\n" +
 	"\x06events\x18\x03 \x03(\v2\x1d.smg.grpc.common.KvCacheEventR\x06events\x12\x1c\n" +
-	"\adp_rank\x18\x04 \x01(\x05H\x00R\x06dpRank\x88\x01\x01B\n" +
+	"\adp_rank\x18\x04 \x01(\x05H\x00R\x06dpRank\x88\x01\x01\x120\n" +
+	"\x14group_events_enabled\x18\x05 \x01(\bR\x12groupEventsEnabled\x12@\n" +
+	"\fgroup_events\x18\x06 \x03(\v2\x1d.smg.grpc.common.KvGroupEventR\vgroupEventsB\n" +
 	"\n" +
-	"\b_dp_rank\"\xe7\x01\n" +
+	"\b_dp_rank\"\x9d\x03\n" +
+	"\fKvGroupEvent\x12E\n" +
+	"\toperation\x18\x01 \x01(\x0e2'.smg.grpc.common.KvGroupEvent.OperationR\toperation\x12\x19\n" +
+	"\bgroup_id\x18\x02 \x01(\rR\agroupId\x12!\n" +
+	"\fblock_hashes\x18\x03 \x03(\fR\vblockHashes\x12*\n" +
+	"\x11parent_block_hash\x18\x04 \x01(\fR\x0fparentBlockHash\x12\x1b\n" +
+	"\ttoken_ids\x18\x05 \x03(\rR\btokenIds\x12\x1d\n" +
+	"\n" +
+	"block_size\x18\x06 \x01(\rR\tblockSize\x12\x12\n" +
+	"\x04kind\x18\a \x01(\tR\x04kind\x12%\n" +
+	"\x0esliding_window\x18\b \x01(\rR\rslidingWindow\x12)\n" +
+	"\x10tokens_matchable\x18\t \x01(\bR\x0ftokensMatchable\":\n" +
+	"\tOperation\x12\v\n" +
+	"\aINVALID\x10\x00\x12\t\n" +
+	"\x05STORE\x10\x01\x12\n" +
+	"\n" +
+	"\x06REMOVE\x10\x02\x12\t\n" +
+	"\x05CLEAR\x10\x03\"\xe7\x01\n" +
 	"\fKvCacheEvent\x12\x19\n" +
 	"\bevent_id\x18\x01 \x01(\x04R\aeventId\x129\n" +
 	"\x06stored\x18\x02 \x01(\v2\x1f.smg.grpc.common.KvBlocksStoredH\x00R\x06stored\x12<\n" +
@@ -899,7 +1283,23 @@ const file_common_proto_rawDesc = "" +
 	"\x12StopProfileRequest\"E\n" +
 	"\x0fProfileResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessageb\x06proto3"
+	"\amessage\x18\x02 \x01(\tR\amessage\"j\n" +
+	"\tShmHandle\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
+	"\x06offset\x18\x02 \x01(\x04R\x06offset\x12\x16\n" +
+	"\x06nbytes\x18\x03 \x01(\x04R\x06nbytes\x12\x19\n" +
+	"\bowner_id\x18\x04 \x01(\tR\aownerId\"j\n" +
+	"\x12RemoteTensorHandle\x12\x1c\n" +
+	"\ttransport\x18\x01 \x01(\tR\ttransport\x12\x1e\n" +
+	"\n" +
+	"descriptor\x18\x02 \x01(\fR\n" +
+	"descriptor\x12\x16\n" +
+	"\x06nbytes\x18\x03 \x01(\x04R\x06nbytes*E\n" +
+	"\bModality\x12\x18\n" +
+	"\x14MODALITY_UNSPECIFIED\x10\x00\x12\t\n" +
+	"\x05IMAGE\x10\x01\x12\t\n" +
+	"\x05AUDIO\x10\x02\x12\t\n" +
+	"\x05VIDEO\x10\x03b\x06proto3"
 
 var (
 	file_common_proto_rawDescOnce sync.Once
@@ -913,34 +1313,42 @@ func file_common_proto_rawDescGZIP() []byte {
 	return file_common_proto_rawDescData
 }
 
-var file_common_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_common_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_common_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_common_proto_goTypes = []any{
-	(*GetTokenizerRequest)(nil),      // 0: smg.grpc.common.GetTokenizerRequest
-	(*GetTokenizerChunk)(nil),        // 1: smg.grpc.common.GetTokenizerChunk
-	(*SubscribeKvEventsRequest)(nil), // 2: smg.grpc.common.SubscribeKvEventsRequest
-	(*KvEventBatch)(nil),             // 3: smg.grpc.common.KvEventBatch
-	(*KvCacheEvent)(nil),             // 4: smg.grpc.common.KvCacheEvent
-	(*KvBlocksStored)(nil),           // 5: smg.grpc.common.KvBlocksStored
-	(*KvBlock)(nil),                  // 6: smg.grpc.common.KvBlock
-	(*KvBlocksRemoved)(nil),          // 7: smg.grpc.common.KvBlocksRemoved
-	(*KvCacheCleared)(nil),           // 8: smg.grpc.common.KvCacheCleared
-	(*FlushCacheRequest)(nil),        // 9: smg.grpc.common.FlushCacheRequest
-	(*FlushCacheResponse)(nil),       // 10: smg.grpc.common.FlushCacheResponse
-	(*StartProfileRequest)(nil),      // 11: smg.grpc.common.StartProfileRequest
-	(*StopProfileRequest)(nil),       // 12: smg.grpc.common.StopProfileRequest
-	(*ProfileResponse)(nil),          // 13: smg.grpc.common.ProfileResponse
+	(Modality)(0),                    // 0: smg.grpc.common.Modality
+	(KvGroupEvent_Operation)(0),      // 1: smg.grpc.common.KvGroupEvent.Operation
+	(*GetTokenizerRequest)(nil),      // 2: smg.grpc.common.GetTokenizerRequest
+	(*GetTokenizerChunk)(nil),        // 3: smg.grpc.common.GetTokenizerChunk
+	(*SubscribeKvEventsRequest)(nil), // 4: smg.grpc.common.SubscribeKvEventsRequest
+	(*KvEventBatch)(nil),             // 5: smg.grpc.common.KvEventBatch
+	(*KvGroupEvent)(nil),             // 6: smg.grpc.common.KvGroupEvent
+	(*KvCacheEvent)(nil),             // 7: smg.grpc.common.KvCacheEvent
+	(*KvBlocksStored)(nil),           // 8: smg.grpc.common.KvBlocksStored
+	(*KvBlock)(nil),                  // 9: smg.grpc.common.KvBlock
+	(*KvBlocksRemoved)(nil),          // 10: smg.grpc.common.KvBlocksRemoved
+	(*KvCacheCleared)(nil),           // 11: smg.grpc.common.KvCacheCleared
+	(*FlushCacheRequest)(nil),        // 12: smg.grpc.common.FlushCacheRequest
+	(*FlushCacheResponse)(nil),       // 13: smg.grpc.common.FlushCacheResponse
+	(*StartProfileRequest)(nil),      // 14: smg.grpc.common.StartProfileRequest
+	(*StopProfileRequest)(nil),       // 15: smg.grpc.common.StopProfileRequest
+	(*ProfileResponse)(nil),          // 16: smg.grpc.common.ProfileResponse
+	(*ShmHandle)(nil),                // 17: smg.grpc.common.ShmHandle
+	(*RemoteTensorHandle)(nil),       // 18: smg.grpc.common.RemoteTensorHandle
 }
 var file_common_proto_depIdxs = []int32{
-	4, // 0: smg.grpc.common.KvEventBatch.events:type_name -> smg.grpc.common.KvCacheEvent
-	5, // 1: smg.grpc.common.KvCacheEvent.stored:type_name -> smg.grpc.common.KvBlocksStored
-	7, // 2: smg.grpc.common.KvCacheEvent.removed:type_name -> smg.grpc.common.KvBlocksRemoved
-	8, // 3: smg.grpc.common.KvCacheEvent.cleared:type_name -> smg.grpc.common.KvCacheCleared
-	6, // 4: smg.grpc.common.KvBlocksStored.blocks:type_name -> smg.grpc.common.KvBlock
-	5, // [5:5] is the sub-list for method output_type
-	5, // [5:5] is the sub-list for method input_type
-	5, // [5:5] is the sub-list for extension type_name
-	5, // [5:5] is the sub-list for extension extendee
-	0, // [0:5] is the sub-list for field type_name
+	7,  // 0: smg.grpc.common.KvEventBatch.events:type_name -> smg.grpc.common.KvCacheEvent
+	6,  // 1: smg.grpc.common.KvEventBatch.group_events:type_name -> smg.grpc.common.KvGroupEvent
+	1,  // 2: smg.grpc.common.KvGroupEvent.operation:type_name -> smg.grpc.common.KvGroupEvent.Operation
+	8,  // 3: smg.grpc.common.KvCacheEvent.stored:type_name -> smg.grpc.common.KvBlocksStored
+	10, // 4: smg.grpc.common.KvCacheEvent.removed:type_name -> smg.grpc.common.KvBlocksRemoved
+	11, // 5: smg.grpc.common.KvCacheEvent.cleared:type_name -> smg.grpc.common.KvCacheCleared
+	9,  // 6: smg.grpc.common.KvBlocksStored.blocks:type_name -> smg.grpc.common.KvBlock
+	7,  // [7:7] is the sub-list for method output_type
+	7,  // [7:7] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_common_proto_init() }
@@ -949,27 +1357,28 @@ func file_common_proto_init() {
 		return
 	}
 	file_common_proto_msgTypes[3].OneofWrappers = []any{}
-	file_common_proto_msgTypes[4].OneofWrappers = []any{
+	file_common_proto_msgTypes[5].OneofWrappers = []any{
 		(*KvCacheEvent_Stored)(nil),
 		(*KvCacheEvent_Removed)(nil),
 		(*KvCacheEvent_Cleared)(nil),
 	}
-	file_common_proto_msgTypes[5].OneofWrappers = []any{}
 	file_common_proto_msgTypes[6].OneofWrappers = []any{}
 	file_common_proto_msgTypes[7].OneofWrappers = []any{}
-	file_common_proto_msgTypes[11].OneofWrappers = []any{}
+	file_common_proto_msgTypes[8].OneofWrappers = []any{}
+	file_common_proto_msgTypes[12].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_common_proto_rawDesc), len(file_common_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   14,
+			NumEnums:      2,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
 		GoTypes:           file_common_proto_goTypes,
 		DependencyIndexes: file_common_proto_depIdxs,
+		EnumInfos:         file_common_proto_enumTypes,
 		MessageInfos:      file_common_proto_msgTypes,
 	}.Build()
 	File_common_proto = out.File

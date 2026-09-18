@@ -593,6 +593,7 @@ impl SchedulerState {
                 timestamp: 0.0,
                 events: kv,
                 dp_rank: Some(0),
+                ..Default::default()
             })
         };
 

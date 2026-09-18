@@ -15,10 +15,13 @@ use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
 use dashmap::DashMap;
 use futures::FutureExt as _;
 use kv_index::{
-    compute_content_hash, ApplyError, PositionalIndexer, SequenceHash, StoredBlock, WorkerBlockMap,
+    compute_content_hash,
+    group_cache::{GroupCache, GroupEvent, GroupRequest},
+    ApplyError, PositionalIndexer, SequenceHash, StoredBlock, WorkerBlockMap,
 };
 use smg_grpc_client::common_proto::{
-    kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent, KvEventBatch,
+    kv_cache_event, kv_group_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent,
+    KvEventBatch,
 };
 use tokio::{
     sync::{oneshot, Mutex, Semaphore},
@@ -62,6 +65,8 @@ pub struct KvEventMonitor {
     /// a task that could ever own the last monitor reference would run the
     /// monitor's drop — and thus its own join — on its own thread.
     pub(crate) indexers: Arc<DashMap<String, Arc<PositionalIndexer>>>,
+    /// Presence selects the group path, including when its evidence is empty.
+    group_caches: Arc<DashMap<String, GroupCache>>,
     /// Per-model block sizes learned from KV events or set via WorkerSpec.
     /// Used by CacheAwarePolicy to chunk request tokens at query time.
     /// Arc-wrapped so subscription tasks can update it from events.
@@ -105,6 +110,7 @@ impl KvEventMonitor {
         let jump_size = jump_size.unwrap_or(DEFAULT_JUMP_SIZE).max(1);
         Self {
             indexers: Arc::new(DashMap::new()),
+            group_caches: Arc::new(DashMap::new()),
             block_sizes: Arc::new(DashMap::new()),
             worker_handles: Mutex::new(HashMap::new()),
             jump_size,
@@ -208,6 +214,8 @@ impl KvEventMonitor {
         let worker = Arc::clone(worker);
         let worker_url = url.clone();
         let block_sizes = Arc::clone(&self.block_sizes);
+        let group_caches = Arc::clone(&self.group_caches);
+        let panic_group_caches = Arc::clone(&self.group_caches);
 
         info!(
             worker_url = %url,
@@ -233,12 +241,16 @@ impl KvEventMonitor {
                 worker_url,
                 indexer,
                 block_sizes,
+                group_caches,
                 loop_model_id,
                 shutdown_rx,
             ))
             .catch_unwind()
             .await;
             if let Err(payload) = result {
+                if let Some(mut cache) = panic_group_caches.get_mut(&task_url) {
+                    cache.invalidate();
+                }
                 let msg = payload
                     .downcast_ref::<&str>()
                     .copied()
@@ -293,6 +305,7 @@ impl KvEventMonitor {
             );
             Metrics::record_kv_event_subscription_failure(worker_url, "join_error");
         }
+        self.group_caches.remove(worker_url);
 
         // Re-check under lock whether this was the last worker for the model.
         // Must re-acquire lock after shutdown to avoid TOCTOU with concurrent
@@ -336,12 +349,86 @@ impl KvEventMonitor {
         }
 
         self.indexers.clear();
+        self.group_caches.clear();
         self.block_sizes.clear();
     }
 
     /// Get the indexer for a model (used by `CacheAwarePolicy` for queries).
     pub fn get_indexer(&self, model_id: &str) -> Option<Arc<PositionalIndexer>> {
         self.indexers.get(model_id).map(|r| Arc::clone(&r))
+    }
+
+    /// Outer None is a legacy worker; inner None means the received group
+    /// reports cannot currently support a score.
+    pub(crate) fn group_reusable_tokens(
+        &self,
+        worker_url: &str,
+        request: &GroupRequest,
+    ) -> Option<Option<usize>> {
+        self.group_caches
+            .get(worker_url)
+            .map(|cache| cache.reusable_tokens(request))
+    }
+
+    pub(crate) fn is_group_worker(&self, worker_url: &str) -> bool {
+        self.group_caches.contains_key(worker_url)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_group_batch(&self, worker_url: &str, batch: &KvEventBatch) {
+        Self::apply_group_batch(&self.group_caches, worker_url, batch);
+    }
+
+    fn apply_group_batch(
+        caches: &DashMap<String, GroupCache>,
+        worker_url: &str,
+        batch: &KvEventBatch,
+    ) {
+        let mut cache = caches.entry(worker_url.to_owned()).or_default();
+        let result = if !batch.group_events_enabled
+            || !batch.events.is_empty()
+            || batch.dp_rank.is_some_and(|rank| rank != 0)
+        {
+            Err("missing group marker, mixed events or unsupported rank")
+        } else {
+            let events: Vec<_> = batch
+                .group_events
+                .iter()
+                .map(
+                    |event| match kv_group_event::Operation::try_from(event.operation) {
+                        Ok(kv_group_event::Operation::Store) => GroupEvent::Store {
+                            group_id: event.group_id,
+                            kind: event.kind.clone(),
+                            window: event.sliding_window as usize,
+                            keys: event.block_hashes.clone(),
+                            parent: (!event.parent_block_hash.is_empty())
+                                .then(|| event.parent_block_hash.clone()),
+                            tokens: event.token_ids.clone(),
+                            block_size: event.block_size as usize,
+                            tokens_matchable: event.tokens_matchable,
+                        },
+                        Ok(kv_group_event::Operation::Remove) => GroupEvent::Remove {
+                            group_id: event.group_id,
+                            keys: event.block_hashes.clone(),
+                        },
+                        Ok(kv_group_event::Operation::Clear) if event.block_hashes.is_empty() => {
+                            GroupEvent::Clear
+                        }
+                        _ => GroupEvent::Invalid,
+                    },
+                )
+                .collect();
+            cache.apply_batch(batch.sequence_number, &events)
+        };
+        if let Err(reason) = result {
+            // Keep the entry so invalid group data cannot fall through to a
+            // stale legacy positional tree.
+            cache.invalidate();
+            warn!(
+                worker_url,
+                reason, "KV group evidence unavailable; using routing fallback"
+            );
+        }
     }
 
     /// Get the block size for a model (learned from events or set via `set_block_size`).
@@ -441,6 +528,7 @@ impl KvEventMonitor {
         worker_url: String,
         indexer: Arc<PositionalIndexer>,
         block_sizes: Arc<DashMap<String, usize>>,
+        group_caches: Arc<DashMap<String, GroupCache>>,
         model_id: String,
         mut shutdown_rx: oneshot::Receiver<()>,
     ) {
@@ -569,6 +657,18 @@ impl KvEventMonitor {
             };
 
             let on_batch = |batch: &KvEventBatch| {
+                if batch.group_events_enabled || !batch.group_events.is_empty() {
+                    Self::apply_group_batch(&group_caches, &worker_url, batch);
+                    return;
+                }
+                if group_caches.contains_key(&worker_url) {
+                    group_caches.insert(worker_url.clone(), GroupCache::default());
+                    warn!(
+                        worker_url,
+                        "Group stream lost its marker; using routing fallback"
+                    );
+                    return;
+                }
                 Self::learn_block_size(&block_sizes, &model_id, &mut block_size_learned, batch);
             };
             let stream_result = tokio::select! {
@@ -586,6 +686,10 @@ impl KvEventMonitor {
                     return;
                 }
             };
+
+            if let Some(mut cache) = group_caches.get_mut(&worker_url) {
+                cache.invalidate();
+            }
 
             match stream_result {
                 StreamResult::Ended => {
@@ -671,6 +775,14 @@ impl KvEventMonitor {
                 Ok(batch) => batch,
                 Err(e) => return StreamResult::Error(e),
             };
+
+            // Group streams handle sequence zero and gaps in their own view.
+            // Legacy replay keeps its existing cursor semantics.
+            if batch.group_events_enabled || !batch.group_events.is_empty() {
+                on_batch(&batch);
+                *last_seq = batch.sequence_number;
+                continue;
+            }
 
             // Skip stale/duplicate batches (can occur after reconnect replay).
             if *last_seq > 0 && batch.sequence_number <= *last_seq {
@@ -802,6 +914,59 @@ impl fmt::Debug for KvEventMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_converter_proto_snapshots_and_lifecycle() {
+        use prost::Message;
+        let data: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/vllm-group-events.json")).unwrap();
+        let tokens: Vec<u32> = serde_json::from_value(data["request_tokens"].clone()).unwrap();
+        let monitor = KvEventMonitor::new(None);
+        for (collection, replays) in [("workers", 2), ("lifecycle", 1)] {
+            for row in data[collection].as_array().unwrap() {
+                let worker = row["worker"].as_str().unwrap();
+                let bytes: Vec<u8> = serde_json::from_value(row["batch"].clone()).unwrap();
+                let batch = KvEventBatch::decode(bytes.as_slice()).unwrap();
+                let expected = row["expected_hit_tokens"].as_u64().map(|v| v as usize);
+                for replay in 0..replays {
+                    monitor.test_group_batch(worker, &batch);
+                    assert_eq!(
+                        monitor.group_reusable_tokens(worker, &GroupRequest::new(&tokens)),
+                        Some(expected),
+                        "{} replay {replay}",
+                        row["name"]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_group_wire_never_uses_legacy_confidence() {
+        use prost::Message;
+        let data: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/vllm-group-events.json")).unwrap();
+        let bytes: Vec<u8> = serde_json::from_value(data["workers"][0]["batch"].clone()).unwrap();
+        let batch = KvEventBatch::decode(bytes.as_slice()).unwrap();
+        let monitor = KvEventMonitor::new(None);
+        for which in 0..4 {
+            let mut bad = batch.clone();
+            match which {
+                0 => bad.group_events_enabled = false,
+                1 => bad.dp_rank = Some(1),
+                2 => bad.events.push(KvCacheEvent::default()),
+                _ => bad.group_events[0].block_hashes[0].clear(),
+            }
+            monitor.test_group_batch("worker", &bad);
+            assert_eq!(
+                monitor.group_reusable_tokens(
+                    "worker",
+                    &GroupRequest::new(&[1, 2, 3, 4, 5, 6, 7, 8, 9])
+                ),
+                Some(None)
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Proto → kv-index conversion
