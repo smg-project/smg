@@ -49,6 +49,16 @@ impl ProviderProfile {
         }
     }
 
+    /// Whether responses are scanned for tool calls even when the request
+    /// declares no tools. MiniMax's verifier expects a tool the conversation
+    /// established (a retry after a transient tool error, say) to come back
+    /// as a `tool_calls` finish without any tool inventory; the model's
+    /// tool-call markup is a dedicated token, so scanning every response is
+    /// unambiguous. Other profiles keep the parser gated on declared tools.
+    pub fn parses_tool_calls_without_tools(self) -> bool {
+        matches!(self, ProviderProfile::Minimax)
+    }
+
     /// Select the profile from a model id.
     ///
     /// Matches the way the tool and reasoning parser factories do: any
@@ -202,6 +212,13 @@ mod tests {
                 "{model} must not pick up message-declared tools"
             );
         }
+    }
+
+    #[test]
+    fn only_the_minimax_profile_parses_tool_calls_without_tools() {
+        assert!(ProviderProfile::Minimax.parses_tool_calls_without_tools());
+        assert!(!ProviderProfile::Kimi.parses_tool_calls_without_tools());
+        assert!(!ProviderProfile::OpenAi.parses_tool_calls_without_tools());
     }
 
     #[test]

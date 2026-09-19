@@ -92,10 +92,15 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             separate_reasoning: request.separate_reasoning,
             tool_choice: request.tool_choice.clone(),
             // Every tool the model may call, dynamic tools declared on messages
-            // included; `None` only when the request declares no tools anywhere.
+            // included. `None` when the response is not scanned for tool calls:
+            // the request declares no tools anywhere and the provider does not
+            // parse tool calls without them.
             tools: {
                 let tools: Vec<Tool> = request.effective_tools().cloned().collect();
-                (request.tools.is_some() || !tools.is_empty()).then_some(tools)
+                let scanned = request.tools.is_some()
+                    || !tools.is_empty()
+                    || ProviderProfile::for_model(&request.model).parses_tool_calls_without_tools();
+                scanned.then_some(tools)
             },
             history_tool_calls_count: utils::get_history_tool_calls_count(request),
             stream_options: request.stream_options.clone(),
@@ -323,5 +328,15 @@ mod tests {
             ChatResponseSpec::from(&openai).provider,
             ProviderProfile::OpenAi
         );
+    }
+
+    #[test]
+    fn chat_spec_scans_minimax_responses_for_tool_calls_without_tools() {
+        let request = chat_request(json!({
+            "model": "MiniMax-M3",
+            "messages": [{"role": "user", "content": "try again"}]
+        }));
+
+        assert_eq!(ChatResponseSpec::from(&request).tools, Some(Vec::new()));
     }
 }
