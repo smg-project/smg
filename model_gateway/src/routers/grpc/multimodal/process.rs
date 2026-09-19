@@ -375,6 +375,9 @@ async fn preprocess_modality(
     let model_id_owned = model_id.to_string();
     let model_type_owned = model_type.map(String::from);
     let media_for_preprocess = media.clone(); // cheap Arc refcount bumps
+    let video_layouts = spec
+        .encoder_field_layouts_for(Modality::Video)
+        .model_specific;
     let audio_processor = if modality == Modality::Audio {
         Some(
             spec.audio_processor(&model_config.config, &model_config.preprocessor_config)
@@ -405,57 +408,58 @@ async fn preprocess_modality(
                 .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
         }
         MediaBatch::Videos(videos) => {
-            // VisionPreProcessor currently models one decoded clip per call.
-            // Video-capable model specs therefore declare a per-request limit
-            // of one; a future batched-video processor can lift this without
-            // adding any modality-combination policy here.
-            let [video] = videos.as_slice() else {
-                anyhow::bail!(
-                    "Video preprocessing currently requires exactly one clip per modality batch; got {}",
-                    videos.len()
-                );
-            };
             let processor = registry
                 .find(&model_id_owned, model_type_owned.as_deref())
                 .ok_or_else(|| {
                     anyhow::anyhow!("No vision processor found for model: {model_id_owned}")
                 })?;
-            let video_pp_config = with_video_sample_fps(pp_config.clone(), video);
+            // The processor takes one decoded clip at a time; the clips are
+            // joined into one batch afterwards, laid out as if processed together.
+            let preprocess_clip = |video: &VideoClip| -> Result<PreprocessedEncoderInputs> {
+                let video_pp_config = video_request_config(pp_config.clone(), video);
 
-            if !video.frames().is_empty() {
-                return processor
-                    .preprocess_video(video.frames(), &video_pp_config)
-                    .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"));
-            }
+                if !video.frames().is_empty() {
+                    return processor
+                        .preprocess_video(video.frames(), &video_pp_config)
+                        .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"));
+                }
 
-            if let Some(rgb_video) = video.rgb_video() {
-                match rgb_video.frame_refs() {
-                    Ok(frame_refs) => match processor
-                        .preprocess_video_rgb(&frame_refs, &video_pp_config)
-                    {
-                        Ok(preprocessed) => return Ok(preprocessed),
+                if let Some(rgb_video) = video.rgb_video() {
+                    match rgb_video.frame_refs() {
+                        Ok(frame_refs) => match processor
+                            .preprocess_video_rgb(&frame_refs, &video_pp_config)
+                        {
+                            Ok(preprocessed) => return Ok(preprocessed),
+                            Err(error) => {
+                                warn!(
+                                    error = %error,
+                                    "RGB video preprocessing fast path failed; falling back to materialized frames"
+                                );
+                            }
+                        },
                         Err(error) => {
                             warn!(
                                 error = %error,
-                                "RGB video preprocessing fast path failed; falling back to materialized frames"
+                                "RGB video frame refs are invalid; falling back to materialized frames"
                             );
                         }
-                    },
-                    Err(error) => {
-                        warn!(
-                            error = %error,
-                            "RGB video frame refs are invalid; falling back to materialized frames"
-                        );
                     }
                 }
-            }
 
-            let frames = video
-                .materialized_frames()
-                .map_err(|e| anyhow::anyhow!("Video frame materialization failed: {e}"))?;
-            processor
-                .preprocess_video(&frames, &video_pp_config)
-                .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"))
+                let frames = video
+                    .materialized_frames()
+                    .map_err(|e| anyhow::anyhow!("Video frame materialization failed: {e}"))?;
+                processor
+                    .preprocess_video(&frames, &video_pp_config)
+                    .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"))
+            };
+
+            let parts = videos
+                .iter()
+                .map(|video| preprocess_clip(video))
+                .collect::<Result<Vec<_>>>()?;
+            PreprocessedEncoderInputs::concat(parts, &video_layouts)
+                .map_err(|e| anyhow::anyhow!("Video batch assembly failed: {e}"))
         }
         MediaBatch::Audios(audios) => {
             let processor = audio_processor.ok_or_else(|| {
@@ -470,10 +474,18 @@ async fn preprocess_modality(
     .map_err(|e| anyhow::anyhow!("Preprocessing task panicked: {e}"))?
 }
 
-fn with_video_sample_fps(mut config: PreProcessorConfig, video: &VideoClip) -> PreProcessorConfig {
+/// The preprocessor config for one clip: its sampled frame rate and, when the
+/// caller named a `max_long_side_pixel` tier, that tier, so the processor can
+/// size the frames the way the caller asked.
+fn video_request_config(mut config: PreProcessorConfig, video: &VideoClip) -> PreProcessorConfig {
     config
         .extra
         .insert("fps".to_string(), serde_json::json!(video.sample_fps()));
+    if let Some(tier) = video.max_long_side_pixel() {
+        config
+            .extra
+            .insert("max_long_side_pixel".to_string(), serde_json::json!(tier));
+    }
     config
 }
 
@@ -779,9 +791,26 @@ mod tests {
             0.8,
         );
 
-        let config = with_video_sample_fps(PreProcessorConfig::default(), &video);
+        let config = video_request_config(PreProcessorConfig::default(), &video);
 
         assert!((config.get_extra::<f32>("fps").unwrap() - 0.8).abs() < 1e-6);
+        assert!(config.get_extra::<u32>("max_long_side_pixel").is_none());
+    }
+
+    #[test]
+    fn decoded_video_tier_reaches_the_processor_config() {
+        let video = VideoClip::new_with_sample_fps(
+            Vec::new(),
+            Bytes::new(),
+            VideoSource::InlineBytes,
+            "video-hash".to_string(),
+            2.0,
+        )
+        .with_max_long_side_pixel(Some(1008));
+
+        let config = video_request_config(PreProcessorConfig::default(), &video);
+
+        assert_eq!(config.get_extra::<u32>("max_long_side_pixel"), Some(1008));
     }
 
     #[test]

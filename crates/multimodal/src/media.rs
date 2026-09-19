@@ -558,7 +558,8 @@ impl MediaConnector {
                 sampling,
             } => VideoClip::new_rgb_with_sample_fps(video, bytes, source, hash, sample_fps)
                 .with_sampling(sampling),
-        };
+        }
+        .with_max_long_side_pixel(cfg.max_long_side_pixel);
         Ok(Arc::new(clip))
     }
 }

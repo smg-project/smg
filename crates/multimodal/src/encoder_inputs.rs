@@ -3,7 +3,7 @@
 use std::{borrow::Cow, collections::HashMap};
 
 use anyhow::{Context, Result as AnyhowResult};
-use ndarray::{Array, ArrayD, Dimension};
+use ndarray::{Array, ArrayD, Axis, Dimension};
 
 use crate::types::FieldLayout;
 
@@ -115,6 +115,108 @@ impl ModelSpecificValue {
             _ => Ok(self.clone()),
         }
     }
+
+    /// Stack per-item values along their first dimension. A scalar has no
+    /// item dimension: it must be the same in every part and is kept once.
+    pub fn concat_first_dim(parts: &[&Self]) -> AnyhowResult<Self> {
+        let first = parts.first().context("cannot join zero values")?;
+        match first {
+            Self::Tensor { .. } => {
+                let (data, shape) = concat_tensors(parts, |part| match part {
+                    Self::Tensor { data, shape } => Some((data.as_slice(), shape.as_slice())),
+                    _ => None,
+                })?;
+                Ok(Self::Tensor { data, shape })
+            }
+            Self::IntTensor { .. } => {
+                let (data, shape) = concat_tensors(parts, |part| match part {
+                    Self::IntTensor { data, shape } => Some((data.as_slice(), shape.as_slice())),
+                    _ => None,
+                })?;
+                Ok(Self::IntTensor { data, shape })
+            }
+            Self::UintTensor { .. } => {
+                let (data, shape) = concat_tensors(parts, |part| match part {
+                    Self::UintTensor { data, shape } => Some((data.as_slice(), shape.as_slice())),
+                    _ => None,
+                })?;
+                Ok(Self::UintTensor { data, shape })
+            }
+            Self::IntVec(_) => Ok(Self::IntVec(concat_vecs(parts, |part| match part {
+                Self::IntVec(values) => Some(values.as_slice()),
+                _ => None,
+            })?)),
+            Self::UintVec(_) => Ok(Self::UintVec(concat_vecs(parts, |part| match part {
+                Self::UintVec(values) => Some(values.as_slice()),
+                _ => None,
+            })?)),
+            Self::FloatVec(_) => Ok(Self::FloatVec(concat_vecs(parts, |part| match part {
+                Self::FloatVec(values) => Some(values.as_slice()),
+                _ => None,
+            })?)),
+            Self::TupleVec(_) => Ok(Self::TupleVec(concat_vecs(parts, |part| match part {
+                Self::TupleVec(values) => Some(values.as_slice()),
+                _ => None,
+            })?)),
+            Self::Int(_) | Self::Float(_) | Self::Bool(_) => {
+                anyhow::ensure!(
+                    parts.iter().all(|part| part.same_scalar(first)),
+                    "scalar model-specific value differs between batch parts"
+                );
+                Ok((*first).clone())
+            }
+        }
+    }
+
+    fn same_scalar(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// Concatenate tensors along the first dimension; the other dimensions must agree.
+fn concat_tensors<'a, T: Clone + 'a>(
+    parts: &[&'a ModelSpecificValue],
+    view: impl Fn(&'a ModelSpecificValue) -> Option<(&'a [T], &'a [usize])>,
+) -> AnyhowResult<(Vec<T>, Vec<usize>)> {
+    let mut data = Vec::new();
+    let mut shape: Option<Vec<usize>> = None;
+    for part in parts {
+        let (part_data, part_shape) =
+            view(part).context("model-specific value kinds differ between batch parts")?;
+        let (&first_dim, rest) = part_shape
+            .split_first()
+            .context("cannot join scalar tensors along an item dimension")?;
+        match &mut shape {
+            None => shape = Some(part_shape.to_vec()),
+            Some(shape) => {
+                anyhow::ensure!(
+                    shape[1..] == *rest,
+                    "model-specific tensor shapes differ beyond the item dimension"
+                );
+                shape[0] += first_dim;
+            }
+        }
+        data.extend_from_slice(part_data);
+    }
+    Ok((data, shape.context("cannot join zero tensors")?))
+}
+
+fn concat_vecs<'a, T: Clone + 'a>(
+    parts: &[&'a ModelSpecificValue],
+    view: impl Fn(&'a ModelSpecificValue) -> Option<&'a [T]>,
+) -> AnyhowResult<Vec<T>> {
+    let mut joined = Vec::new();
+    for part in parts {
+        joined.extend_from_slice(
+            view(part).context("model-specific value kinds differ between batch parts")?,
+        );
+    }
+    Ok(joined)
 }
 
 fn slice_tensor_first_dim<T: Clone>(
@@ -234,6 +336,72 @@ impl PreprocessedEncoderInputs {
         self.encoder_input.shape().to_vec()
     }
 
+    /// Join batches processed one item at a time into the batch a processor
+    /// would have produced from all items at once: the encoder input and every
+    /// per-item value are stacked along their first dimension. `layouts` names
+    /// the values the model reads per item; a value without a layout is still
+    /// stacked when it has an item dimension, and must be identical in every
+    /// part when it is a scalar.
+    pub fn concat(parts: Vec<Self>, layouts: &HashMap<String, FieldLayout>) -> AnyhowResult<Self> {
+        anyhow::ensure!(!parts.is_empty(), "cannot join zero batches");
+        if parts.len() == 1 {
+            return parts.into_iter().next().context("cannot join zero batches");
+        }
+        let views = parts
+            .iter()
+            .map(|part| part.encoder_input.view())
+            .collect::<Vec<_>>();
+        let encoder_input = ndarray::concatenate(Axis(0), &views)
+            .context("encoder inputs of the batch parts do not stack")?;
+
+        let keys = parts[0].model_specific.keys().cloned().collect::<Vec<_>>();
+        let mut model_specific = HashMap::with_capacity(keys.len());
+        for key in keys {
+            let values = parts
+                .iter()
+                .map(|part| {
+                    part.model_specific.get(&key).with_context(|| {
+                        format!("batch parts disagree on model-specific key {key}")
+                    })
+                })
+                .collect::<AnyhowResult<Vec<_>>>()?;
+            let joined = ModelSpecificValue::concat_first_dim(&values)
+                .with_context(|| format!("failed to join model-specific value {key}"))?;
+            debug_assert!(
+                !matches!(
+                    layouts.get(&key),
+                    Some(FieldLayout::Batched | FieldLayout::Flat { .. })
+                ) || !matches!(
+                    joined,
+                    ModelSpecificValue::Int(_)
+                        | ModelSpecificValue::Float(_)
+                        | ModelSpecificValue::Bool(_)
+                ),
+                "a per-item layout was declared for scalar value {key}"
+            );
+            model_specific.insert(key, joined);
+        }
+        anyhow::ensure!(
+            parts
+                .iter()
+                .all(|part| part.model_specific.len() == model_specific.len()),
+            "batch parts disagree on model-specific keys"
+        );
+
+        let mut feature_token_counts = Vec::new();
+        let mut item_sizes = Vec::new();
+        for part in parts {
+            feature_token_counts.extend(part.feature_token_counts);
+            item_sizes.extend(part.item_sizes);
+        }
+        Ok(Self {
+            encoder_input,
+            feature_token_counts,
+            item_sizes,
+            model_specific,
+        })
+    }
+
     /// Extract batched tensor keys from explicit field layout declarations.
     pub fn batched_keys(layouts: &HashMap<String, FieldLayout>) -> Vec<String> {
         layouts
@@ -324,5 +492,97 @@ mod tests {
         let inputs = PreprocessedEncoderInputs::new(encoder_input, vec![4], vec![(2, 2)]);
 
         assert_eq!(inputs.encoder_input_flat(), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    fn clip(patches: usize, grid_t: i64, fps_seconds: f32) -> PreprocessedEncoderInputs {
+        PreprocessedEncoderInputs::new(
+            ndarray::Array2::<f32>::from_elem((patches, 3), patches as f32),
+            vec![patches / 4],
+            vec![(64, 64)],
+        )
+        .with_extra(
+            "video_grid_thw",
+            ModelSpecificValue::int_2d(vec![grid_t, 4, 4], 1, 3),
+        )
+        .with_extra(
+            "patches_per_video",
+            ModelSpecificValue::int_1d(vec![patches as i64]),
+        )
+        .with_extra(
+            "video_second_per_grid",
+            ModelSpecificValue::Tensor {
+                data: vec![fps_seconds],
+                shape: vec![1],
+            },
+        )
+        .with_extra("temporal_patch_size", ModelSpecificValue::Int(2))
+    }
+
+    #[test]
+    fn concat_stacks_clips_the_way_one_batch_would_be_laid_out() {
+        let layouts = HashMap::from([
+            ("video_grid_thw".to_string(), FieldLayout::Batched),
+            ("patches_per_video".to_string(), FieldLayout::Batched),
+        ]);
+
+        let joined =
+            PreprocessedEncoderInputs::concat(vec![clip(16, 1, 1.0), clip(32, 2, 0.5)], &layouts)
+                .unwrap();
+
+        assert_eq!(joined.encoder_input_shape(), vec![48, 3]);
+        // Rows of the first clip come first, then the second clip's.
+        assert_eq!(joined.encoder_input_flat()[16 * 3 - 1], 16.0);
+        assert_eq!(joined.encoder_input_flat()[16 * 3], 32.0);
+        assert_eq!(joined.feature_token_counts, vec![4, 8]);
+        assert_eq!(joined.item_sizes, vec![(64, 64), (64, 64)]);
+        assert!(matches!(
+            &joined.model_specific["video_grid_thw"],
+            ModelSpecificValue::IntTensor { data, shape }
+                if data == &vec![1, 4, 4, 2, 4, 4] && shape == &vec![2, 3]
+        ));
+        assert!(matches!(
+            &joined.model_specific["patches_per_video"],
+            ModelSpecificValue::IntTensor { data, shape } if data == &vec![16, 32] && shape == &vec![2]
+        ));
+        assert!(matches!(
+            &joined.model_specific["video_second_per_grid"],
+            ModelSpecificValue::Tensor { data, shape } if data == &vec![1.0, 0.5] && shape == &vec![2]
+        ));
+        assert!(matches!(
+            joined.model_specific["temporal_patch_size"],
+            ModelSpecificValue::Int(2)
+        ));
+    }
+
+    #[test]
+    fn concat_keeps_a_single_clip_untouched_and_rejects_mismatched_parts() {
+        let layouts = HashMap::new();
+        let single = PreprocessedEncoderInputs::concat(vec![clip(16, 1, 1.0)], &layouts).unwrap();
+        assert_eq!(single.encoder_input_shape(), vec![16, 3]);
+
+        let mut other_scalar = clip(16, 1, 1.0);
+        other_scalar.model_specific.insert(
+            "temporal_patch_size".to_string(),
+            ModelSpecificValue::Int(3),
+        );
+        assert!(
+            PreprocessedEncoderInputs::concat(vec![clip(16, 1, 1.0), other_scalar], &layouts)
+                .is_err()
+        );
+
+        let mut extra_key = clip(16, 1, 1.0);
+        extra_key
+            .model_specific
+            .insert("only_here".to_string(), ModelSpecificValue::Bool(true));
+        assert!(
+            PreprocessedEncoderInputs::concat(vec![clip(16, 1, 1.0), extra_key], &layouts).is_err()
+        );
+
+        let mut wrong_width = clip(16, 1, 1.0);
+        wrong_width.encoder_input = ndarray::Array2::<f32>::zeros((16, 5)).into_dyn();
+        assert!(
+            PreprocessedEncoderInputs::concat(vec![clip(16, 1, 1.0), wrong_width], &layouts)
+                .is_err()
+        );
     }
 }

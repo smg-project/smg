@@ -173,6 +173,9 @@ pub struct VideoClip {
     pub source: VideoSource,
     /// Blake3 hex-digest of raw_bytes, computed at decode time.
     pub hash: String,
+    /// The long-side cap the caller asked for (MiniMax `max_long_side_pixel`);
+    /// the frames were already scaled to it when set.
+    pub max_long_side_pixel: Option<u32>,
 }
 
 /// Borrowed RGB frame data for video preprocessors.
@@ -274,6 +277,7 @@ impl VideoClip {
             raw_bytes,
             source,
             hash,
+            max_long_side_pixel: None,
         }
     }
 
@@ -301,6 +305,7 @@ impl VideoClip {
             raw_bytes,
             source,
             hash,
+            max_long_side_pixel: None,
         }
     }
 
@@ -309,8 +314,18 @@ impl VideoClip {
         self
     }
 
+    /// Record the long-side cap the frames were decoded under.
+    pub fn with_max_long_side_pixel(mut self, max_long_side_pixel: Option<u32>) -> Self {
+        self.max_long_side_pixel = max_long_side_pixel;
+        self
+    }
+
     pub fn frames(&self) -> &[DynamicImage] {
         &self.frames
+    }
+
+    pub fn max_long_side_pixel(&self) -> Option<u32> {
+        self.max_long_side_pixel
     }
 
     pub fn rgb_video(&self) -> Option<&DecodedRgbVideo> {

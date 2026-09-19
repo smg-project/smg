@@ -18,7 +18,12 @@
 //! - factor: 28 (patch_size * merge_size)
 //! - min_pixels: 3,136 (4 * 28 * 28)
 //! - max_pixels: 451,584 (576 * 28 * 28) — matches `image_seq_length: 576`
-//! - video max_pixels: 602,112 (768 * 28 * 28), bounding each frame rather than the sampled volume
+//! - video max_pixels: 602,112 (768 * 28 * 28), bounding each frame rather than
+//!   the sampled volume, as the reference video processor applies `smart_resize`
+//!   to the frame size. A request that names a `max_long_side_pixel` tier has
+//!   its frames capped to that long side upstream, and the tier's square becomes
+//!   the frame budget instead: shrinking those frames again to the default would
+//!   make the 1008 and 2016 tiers produce the same tokens for 16:9 sources.
 //! - min short side: 112 px (images below it are raised first; video frames are not);
 //!   past roughly 36:1 the raised image overshoots max_pixels, so the grid is its uniform
 //!   scale-down and the short side ends below 112 again
@@ -78,6 +83,9 @@ const STAGING_OVERSHOOT: f64 = 1.25;
 
 /// The config block holding M3's merge parameters.
 const COMPRESSION_CONFIG_KEY: &str = "img_token_compression_config";
+
+/// Per-request `extra` key carrying the video's `max_long_side_pixel` tier.
+pub const MAX_LONG_SIDE_PIXEL_KEY: &str = "max_long_side_pixel";
 
 /// MiniMax-M3 image/video processor.
 #[derive(Clone)]
@@ -224,8 +232,13 @@ impl MiniMaxM3VisionProcessor {
         // Track an explicit `max_pixels` in both directions: flooring the video
         // budget at the default would leave video six times an image's budget
         // for an operator who lowered `max_pixels` to bound encoder memory.
+        // A `max_long_side_pixel` tier on the request is the caller's frame
+        // budget (see the module docs), unless `max_pixels` was set explicitly.
+        let tier_frame_budget =
+            Self::tier_frame_budget(config)?.map(|budget| budget.max(min_pixels));
         let video_max_pixels = config
             .max_pixels
+            .or(tier_frame_budget)
             .unwrap_or_else(|| self.inner.video_max_pixels());
 
         Ok(Self::build(
@@ -236,6 +249,26 @@ impl MiniMaxM3VisionProcessor {
             max_pixels,
             video_max_pixels,
         ))
+    }
+
+    /// Per-frame pixel budget implied by a request's `max_long_side_pixel`
+    /// tier: the square of the long side, so a frame already capped to that
+    /// side is never shrunk again. `None` without a tier; a tier that is
+    /// present but not a positive integer is an error, not a silent default.
+    fn tier_frame_budget(config: &PreProcessorConfig) -> Result<Option<usize>, TransformError> {
+        let Some(value) = config.extra.get(MAX_LONG_SIDE_PIXEL_KEY) else {
+            return Ok(None);
+        };
+        let tier = value
+            .as_u64()
+            .and_then(|tier| usize::try_from(tier).ok())
+            .filter(|&tier| tier > 0)
+            .ok_or_else(|| {
+                TransformError::ShapeError(format!(
+                    "minimax_m3: {MAX_LONG_SIDE_PIXEL_KEY} must be a positive integer, got {value}"
+                ))
+            })?;
+        Ok(Some(tier.saturating_mul(tier)))
     }
 
     /// Rebuild for one request so per-request config overrides take effect.
@@ -546,6 +579,95 @@ mod tests {
         assert_eq!(layered.max_pixels(), 100_352);
         // Must track downwards, not stay floored at the video default.
         assert_eq!(layered.video_max_pixels(), 100_352);
+    }
+
+    #[test]
+    fn a_video_tier_sets_the_frame_budget() {
+        let processor = MiniMaxM3VisionProcessor::new();
+        let mut config = m3_config();
+        config
+            .extra
+            .insert(MAX_LONG_SIDE_PIXEL_KEY.to_string(), serde_json::json!(2016));
+
+        let layered = processor.layered_over(&config).unwrap();
+        assert_eq!(layered.video_max_pixels(), 2016 * 2016);
+        // The tier speaks for video frames only.
+        assert_eq!(layered.max_pixels(), DEFAULT_MAX_PIXELS);
+
+        // An explicit max_pixels still wins over the tier.
+        config.max_pixels = Some(100_352);
+        let layered = processor.layered_over(&config).unwrap();
+        assert_eq!(layered.video_max_pixels(), 100_352);
+    }
+
+    #[test]
+    fn a_tier_budget_never_drops_below_the_frame_minimum() {
+        let processor = MiniMaxM3VisionProcessor::new();
+        let mut config = m3_config();
+        config
+            .extra
+            .insert(MAX_LONG_SIDE_PIXEL_KEY.to_string(), serde_json::json!(28));
+
+        let layered = processor.layered_over(&config).unwrap();
+        assert_eq!(layered.video_max_pixels(), layered.min_pixels());
+    }
+
+    #[test]
+    fn a_malformed_tier_is_rejected() {
+        let processor = MiniMaxM3VisionProcessor::new();
+        for bad in [
+            serde_json::json!("1008"),
+            serde_json::json!(0),
+            serde_json::json!(-28),
+            serde_json::json!(1008.5),
+        ] {
+            let mut config = m3_config();
+            config
+                .extra
+                .insert(MAX_LONG_SIDE_PIXEL_KEY.to_string(), bad.clone());
+            let outcome = match processor.layered_over(&config) {
+                Ok(_) => "accepted".to_string(),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                outcome.contains(MAX_LONG_SIDE_PIXEL_KEY),
+                "{bad}: {outcome}"
+            );
+        }
+    }
+
+    #[test]
+    fn video_tiers_change_the_token_count() {
+        use crate::vision::processor::VisionPreProcessor;
+
+        let processor = MiniMaxM3VisionProcessor::new();
+        let tokens = |width: u32, height: u32, tier: Option<u32>| {
+            let mut config = m3_config();
+            if let Some(tier) = tier {
+                config
+                    .extra
+                    .insert(MAX_LONG_SIDE_PIXEL_KEY.to_string(), serde_json::json!(tier));
+            }
+            let frames = vec![DynamicImage::new_rgb8(width, height); 4];
+            processor
+                .preprocess_video(&frames, &config)
+                .unwrap()
+                .feature_token_counts[0]
+        };
+
+        // A 16:9 source, capped upstream to each tier's long side.
+        let low = tokens(504, 284, Some(504));
+        let mid = tokens(1008, 567, Some(1008));
+        let high = tokens(2016, 1134, Some(2016));
+        assert!(
+            low < mid && mid < high,
+            "tiers must order the token count: {low} < {mid} < {high}"
+        );
+
+        // Without a tier the reference per-frame budget (768 * 28 * 28) applies,
+        // and a 2016-wide frame is shrunk onto the same grid as a 1008-wide one.
+        assert_eq!(tokens(2016, 1134, None), tokens(1008, 567, None));
+        assert_eq!(tokens(1008, 567, None), mid);
     }
 
     #[test]

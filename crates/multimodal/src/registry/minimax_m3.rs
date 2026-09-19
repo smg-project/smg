@@ -16,14 +16,8 @@ use crate::{
 /// Maximum images accepted in one request (MiniMax-M3 spec 1.3.6).
 const MAX_IMAGES_PER_REQUEST: usize = 200;
 
-/// Maximum videos accepted in one request.
-///
-/// MiniMax-M3 spec 1.3.6 allows 20, but the gateway preprocesses one clip per
-/// modality batch today (`preprocess_modality` bails on more). Advertising the
-/// spec limit would turn a clean up-front rejection into an internal error
-/// after every clip had been fetched and decoded, so the limit stays at the
-/// pipeline's capacity until batched video preprocessing lands.
-const MAX_VIDEOS_PER_REQUEST: usize = 1;
+/// Maximum videos accepted in one request (MiniMax-M3 spec 1.3.6).
+const MAX_VIDEOS_PER_REQUEST: usize = 20;
 
 /// MiniMax-M3 vision spec.
 ///
@@ -165,21 +159,26 @@ impl MiniMaxM3VisionSpec {
         )
     }
 
-    /// Temporal grid depth for one video, from `video_grid_thw[0]`.
+    /// Temporal grid depth of each video, one per row of `video_grid_thw`.
     ///
     /// The video path always emits this tensor and the per-frame layout is
     /// built from it, so an absent or malformed grid is a broken preprocessing
     /// output. It is rejected rather than papered over with a flat block the
     /// model would read differently.
-    fn video_grid_t(preprocessed: &PreprocessedEncoderInputs) -> RegistryResult<usize> {
+    fn video_grid_ts(preprocessed: &PreprocessedEncoderInputs) -> RegistryResult<Vec<usize>> {
         let invalid = || ModelRegistryError::InvalidPreprocessedField {
             field: "video_grid_thw".to_string(),
         };
         match preprocessed.model_specific.get("video_grid_thw") {
             Some(ModelSpecificValue::IntTensor { data, shape })
-                if shape == &[1, 3] && !data.is_empty() =>
+                if shape.len() == 2
+                    && shape[1] == 3
+                    && shape[0] > 0
+                    && data.len() == shape[0] * 3 =>
             {
-                usize::try_from(data[0]).map_err(|_| invalid())
+                data.chunks(3)
+                    .map(|row| usize::try_from(row[0]).map_err(|_| invalid()))
+                    .collect()
             }
             _ => Err(invalid()),
         }
@@ -246,13 +245,19 @@ impl MiniMaxM3VisionSpec {
         stamps: &[Option<ClipStamps<'_>>],
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let pad_token_id = Self::video_token_id(metadata)?;
-        let grid_t = Self::video_grid_t(preprocessed)?;
+        let grid_ts = Self::video_grid_ts(preprocessed)?;
+        if grid_ts.len() != preprocessed.feature_token_counts.len() {
+            return Err(ModelRegistryError::InvalidPreprocessedField {
+                field: "video_grid_thw".to_string(),
+            });
+        }
 
         preprocessed
             .feature_token_counts
             .iter()
+            .zip(grid_ts)
             .enumerate()
-            .map(|(index, &num_tokens)| {
+            .map(|(index, (&num_tokens, grid_t))| {
                 let per_frame = Self::per_frame_video_tokens(
                     metadata,
                     pad_token_id,
@@ -657,13 +662,14 @@ mod tests {
         assert_eq!(replacements[0].placeholder_token, "]<]video[>[");
     }
 
-    /// Preprocessed video carrying a `video_grid_thw` of `[grid_t, h, w]`.
+    /// Preprocessed video carrying one `[grid_t, h, w]` row per clip.
     fn preprocessed_video(counts: Vec<usize>, grid_t: i64) -> PreprocessedEncoderInputs {
+        let clips = counts.len();
         preprocessed(counts).with_extra(
             "video_grid_thw",
             ModelSpecificValue::IntTensor {
-                data: vec![grid_t, 4, 4],
-                shape: vec![1, 3],
+                data: [grid_t, 4, 4].repeat(clips),
+                shape: vec![clips, 3],
             },
         )
     }
@@ -1161,11 +1167,45 @@ mod tests {
         assert_eq!(limits.get(&Modality::Image), Some(&MAX_IMAGES_PER_REQUEST));
         assert_eq!(MAX_IMAGES_PER_REQUEST, 200);
         assert_eq!(limits.get(&Modality::Video), Some(&MAX_VIDEOS_PER_REQUEST));
-        // The spec allows 20, but preprocessing handles one clip per request
-        // today; advertising more would turn a clean rejection into a 500
-        // after the clips were fetched and decoded.
-        assert_eq!(MAX_VIDEOS_PER_REQUEST, 1);
+        assert_eq!(MAX_VIDEOS_PER_REQUEST, 20);
         assert!(!limits.contains_key(&Modality::Audio));
+    }
+
+    #[test]
+    fn each_video_is_laid_out_from_its_own_grid_row() {
+        let spec = MiniMaxM3VisionSpec;
+        // Two clips joined into one batch: 2 frames of 4 tokens, then 3 frames of 4.
+        let preprocessed = preprocessed(vec![8, 12]).with_extra(
+            "video_grid_thw",
+            ModelSpecificValue::int_2d(vec![2, 4, 4, 3, 4, 4], 2, 3),
+        );
+
+        let replacements = spec
+            .prompt_replacements_for(&metadata(), &preprocessed, Modality::Video)
+            .unwrap();
+
+        assert_eq!(replacements.len(), 2);
+        // Each frame is [start] + tokens + [end].
+        assert_eq!(replacements[0].tokens.len(), 8 + 2 * 2);
+        assert_eq!(replacements[1].tokens.len(), 12 + 2 * 3);
+        assert_eq!(
+            replacements[0].feature_ranges.as_ref().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            replacements[1].feature_ranges.as_ref().map(Vec::len),
+            Some(3)
+        );
+
+        // A grid with fewer rows than clips is a broken batch, not a guess.
+        let short_grid = self::preprocessed(vec![8, 12]).with_extra(
+            "video_grid_thw",
+            ModelSpecificValue::int_2d(vec![2, 4, 4], 1, 3),
+        );
+        assert!(matches!(
+            spec.prompt_replacements_for(&metadata(), &short_grid, Modality::Video),
+            Err(ModelRegistryError::InvalidPreprocessedField { ref field }) if field == "video_grid_thw"
+        ));
     }
 
     #[test]
