@@ -292,13 +292,14 @@ pub trait ModelProcessorSpec: Send + Sync {
         }
     }
 
-    /// Prompt replacements given one [`MediaItemInfo`] per media item in batch order; the default ignores `media`.
+    /// Prompt replacements given one [`MediaItemInfo`] per media item in batch order and the config the modality was preprocessed with; the default ignores both.
     fn prompt_replacements_with_media(
         &self,
         metadata: &ModelMetadata,
         preprocessed: &PreprocessedEncoderInputs,
         modality: Modality,
         _media: &[MediaItemInfo],
+        _preprocessor_config: &PreProcessorConfig,
     ) -> RegistryResult<Vec<PromptReplacement>> {
         self.prompt_replacements_for(metadata, preprocessed, modality)
     }
@@ -439,8 +440,15 @@ mod tests {
             },
         ];
 
+        let preprocessor_config = PreProcessorConfig::default();
         let with_media = TestSpec
-            .prompt_replacements_with_media(&metadata, &preprocessed, Modality::Image, &media)
+            .prompt_replacements_with_media(
+                &metadata,
+                &preprocessed,
+                Modality::Image,
+                &media,
+                &preprocessor_config,
+            )
             .unwrap();
         let without_media = TestSpec
             .prompt_replacements_for(&metadata, &preprocessed, Modality::Image)
@@ -455,7 +463,13 @@ mod tests {
         assert_eq!(tokens(&with_media), vec![vec![1; 3], vec![1; 5]]);
         assert_eq!(tokens(&with_media), tokens(&without_media));
         let unsupported = TestSpec
-            .prompt_replacements_with_media(&metadata, &preprocessed, Modality::Video, &media)
+            .prompt_replacements_with_media(
+                &metadata,
+                &preprocessed,
+                Modality::Video,
+                &media,
+                &preprocessor_config,
+            )
             .unwrap_err();
         assert_eq!(
             unsupported,

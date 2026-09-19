@@ -1,6 +1,7 @@
 {
   "reference": "processing_minimax.py",
   "reference_sha256": "0706ae8b93b3489a3b3bc7f48a5f29fb34b1449ebebb37586250e4d5fa8f5e35",
+  "generated_by": "huggingface.co/MiniMaxAI/MiniMax-M3 processing_minimax.py lines 221-245, with metadata.frames_indices = frame_indices, metadata.fps = source_fps and self.video_processor.temporal_patch_size = temporal_patch_size: timestamps = [f\"]<]{frame_indices[min(frame_idx * temporal_patch_size, len(frame_indices) - 1)] / source_fps:.1f} seconds[>[\" for frame_idx in range(grid_t)]",
   "cases": [
     {
       "name": "thirty_fps_pairs",

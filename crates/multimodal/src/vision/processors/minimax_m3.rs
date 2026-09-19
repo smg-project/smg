@@ -177,6 +177,25 @@ impl MiniMaxM3VisionProcessor {
         }
     }
 
+    /// The `temporal_patch_size` the config declares: a positive flat key, else the compression block.
+    fn declared_temporal_patch_size(
+        config: &PreProcessorConfig,
+    ) -> Result<Option<usize>, TransformError> {
+        let nested = Self::compression_usize(config, "temporal_patch_size")?;
+        Ok(config
+            .temporal_patch_size
+            .filter(|&size| size > 0)
+            .or(nested))
+    }
+
+    /// Frames per temporal patch this processor pairs under `config`; unset or unusable values fall back to the default.
+    pub fn temporal_patch_size_from(config: &PreProcessorConfig) -> usize {
+        Self::declared_temporal_patch_size(config)
+            .ok()
+            .flatten()
+            .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE)
+    }
+
     /// Build a processor from a preprocessor config, falling back to M3's
     /// defaults for anything the config does not specify.
     ///
@@ -198,9 +217,7 @@ impl MiniMaxM3VisionProcessor {
             .merge_size
             .or(Self::compression_usize(config, "spatial_merge_size")?)
             .unwrap_or_else(|| self.inner.merge_size());
-        let temporal_patch_size = config
-            .temporal_patch_size
-            .or(Self::compression_usize(config, "temporal_patch_size")?)
+        let temporal_patch_size = Self::declared_temporal_patch_size(config)?
             .unwrap_or_else(|| self.inner.temporal_patch_size());
         let max_pixels = config.max_pixels.unwrap_or_else(|| self.inner.max_pixels());
         let min_pixels = config.min_pixels.unwrap_or_else(|| self.inner.min_pixels());
@@ -555,6 +572,73 @@ mod tests {
             .unwrap();
         assert_eq!(layered.merge_size(), DEFAULT_MERGE_SIZE);
         assert_eq!(layered.temporal_patch_size(), DEFAULT_TEMPORAL_PATCH_SIZE);
+    }
+
+    #[test]
+    fn temporal_patch_size_from_follows_the_layering_precedence() {
+        // The flat key, then the checkpoint block, then the default.
+        let mut config = m3_config();
+        assert_eq!(
+            MiniMaxM3VisionProcessor::temporal_patch_size_from(&config),
+            2
+        );
+        config.temporal_patch_size = Some(4);
+        assert_eq!(
+            MiniMaxM3VisionProcessor::temporal_patch_size_from(&config),
+            4
+        );
+        assert_eq!(
+            MiniMaxM3VisionProcessor::temporal_patch_size_from(&PreProcessorConfig::default()),
+            DEFAULT_TEMPORAL_PATCH_SIZE
+        );
+    }
+
+    #[test]
+    fn temporal_patch_size_from_treats_unusable_values_as_unset() {
+        // A zero flat key defers to the block; a zero or malformed block value is the default.
+        let mut config = m3_config();
+        config.temporal_patch_size = Some(0);
+        assert_eq!(
+            MiniMaxM3VisionProcessor::temporal_patch_size_from(&config),
+            2
+        );
+        for bad in ["0", "-1", "2.5", "\"two\"", "null"] {
+            let raw =
+                format!(r#"{{"img_token_compression_config": {{"temporal_patch_size": {bad}}}}}"#);
+            let config: PreProcessorConfig = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                MiniMaxM3VisionProcessor::temporal_patch_size_from(&config),
+                DEFAULT_TEMPORAL_PATCH_SIZE,
+                "temporal_patch_size {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn layering_pairs_frames_by_the_temporal_patch_size_the_lookup_reports() {
+        let mut flat = m3_config();
+        flat.temporal_patch_size = Some(4);
+        let mut zero_flat = m3_config();
+        zero_flat.temporal_patch_size = Some(0);
+        let nested: PreProcessorConfig =
+            serde_json::from_str(r#"{"img_token_compression_config": {"temporal_patch_size": 3}}"#)
+                .unwrap();
+
+        for config in [
+            m3_config(),
+            flat,
+            zero_flat,
+            nested,
+            PreProcessorConfig::default(),
+        ] {
+            let layered = MiniMaxM3VisionProcessor::new()
+                .layered_over(&config)
+                .unwrap();
+            assert_eq!(
+                layered.temporal_patch_size(),
+                MiniMaxM3VisionProcessor::temporal_patch_size_from(&config)
+            );
+        }
     }
 
     #[test]
