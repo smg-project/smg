@@ -8,7 +8,8 @@ use crate::{
         MediaItemInfo, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
     types::{
-        FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId, VideoSamplingInfo,
+        EncoderFieldLayouts, FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId,
+        VideoSamplingInfo,
     },
     vision::{MiniMaxM3VisionProcessor, PreProcessorConfig},
 };
@@ -460,6 +461,28 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
             ("video_grid_thw".to_string(), FieldLayout::Batched),
             ("patches_per_video".to_string(), FieldLayout::Batched),
         ])
+    }
+
+    fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
+        // One map per modality: a video batch must not advertise the image
+        // sizes key (or the other way round), or a request carrying both is
+        // sliced by a tensor the batch does not have.
+        match modality {
+            Modality::Video => EncoderFieldLayouts::new(
+                FieldLayout::flat("patches_per_video"),
+                HashMap::from([
+                    ("video_grid_thw".to_string(), FieldLayout::Batched),
+                    ("patches_per_video".to_string(), FieldLayout::Batched),
+                ]),
+            ),
+            _ => EncoderFieldLayouts::new(
+                FieldLayout::flat("patches_per_image"),
+                HashMap::from([
+                    ("image_grid_thw".to_string(), FieldLayout::Batched),
+                    ("patches_per_image".to_string(), FieldLayout::Batched),
+                ]),
+            ),
+        }
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {
@@ -1169,6 +1192,21 @@ mod tests {
         assert_eq!(limits.get(&Modality::Video), Some(&MAX_VIDEOS_PER_REQUEST));
         assert_eq!(MAX_VIDEOS_PER_REQUEST, 20);
         assert!(!limits.contains_key(&Modality::Audio));
+    }
+
+    #[test]
+    fn each_modality_declares_only_its_own_layouts() {
+        let spec = MiniMaxM3VisionSpec;
+
+        let image = spec.encoder_field_layouts_for(Modality::Image);
+        assert_eq!(image.encoder_input, FieldLayout::flat("patches_per_image"));
+        assert!(image.model_specific.contains_key("image_grid_thw"));
+        assert!(!image.model_specific.contains_key("video_grid_thw"));
+
+        let video = spec.encoder_field_layouts_for(Modality::Video);
+        assert_eq!(video.encoder_input, FieldLayout::flat("patches_per_video"));
+        assert!(video.model_specific.contains_key("video_grid_thw"));
+        assert!(!video.model_specific.contains_key("patches_per_image"));
     }
 
     #[test]
