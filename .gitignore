@@ -159,3 +159,4 @@ clients/java/target/
 clients/java/build.sbt
 clients/java/gradle.properties
 openapitools.json
+scripts/generate_sim/profiles/*.local.json
