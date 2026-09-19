@@ -269,6 +269,22 @@ pub(crate) fn init_metrics() {
         "smg_pd_kv_transfer_failures_total",
         "PD KV-transfer failures (missing connector params at decode handoff)"
     );
+    describe_gauge!(
+        "smg_pd_prefill_admission_inflight",
+        "Prefill requests admitted by SMG per worker"
+    );
+    describe_gauge!(
+        "smg_pd_prefill_admission_queued",
+        "Requests waiting in the SMG Prefill admission queue"
+    );
+    describe_histogram!(
+        "smg_pd_prefill_admission_wait_seconds",
+        "Time spent waiting in the SMG Prefill admission queue"
+    );
+    describe_counter!(
+        "smg_pd_prefill_admission_rejections_total",
+        "Prefill admission rejections by reason"
+    );
 
     // Layer 3: Worker metrics
     describe_gauge!(
@@ -1161,6 +1177,35 @@ impl Metrics {
         counter!("smg_pd_admission_sheds_total").increment(1);
     }
 
+    /// Set the number of requests SMG has admitted to a prefill worker.
+    pub fn set_pd_prefill_admission_inflight(worker_url: &str, count: usize) {
+        let worker = intern_string(worker_url);
+        gauge!(
+            "smg_pd_prefill_admission_inflight",
+            "worker" => worker
+        )
+        .set(count as f64);
+    }
+
+    /// Set the depth of the Router-wide Prefill admission queue.
+    pub fn set_pd_prefill_admission_queued(depth: usize) {
+        gauge!("smg_pd_prefill_admission_queued").set(depth as f64);
+    }
+
+    /// Record how long a request waited in the Prefill admission queue.
+    pub fn record_pd_prefill_admission_wait(duration: Duration) {
+        histogram!("smg_pd_prefill_admission_wait_seconds").record(duration.as_secs_f64());
+    }
+
+    /// Record a Prefill admission rejection (queue full or timeout).
+    pub fn record_pd_prefill_admission_rejection(reason: &'static str) {
+        counter!(
+            "smg_pd_prefill_admission_rejections_total",
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
     // ========================================================================
     // Layer 3: Worker metrics
     // ========================================================================
@@ -1662,6 +1707,7 @@ impl Metrics {
         gauge!("smg_worker_cb_consecutive_failures", "worker" => Arc::clone(&worker)).set(0.0);
         gauge!("smg_worker_cb_consecutive_successes", "worker" => Arc::clone(&worker)).set(0.0);
         gauge!("smg_worker_requests_active", "worker" => Arc::clone(&worker)).set(0.0);
+        gauge!("smg_pd_prefill_admission_inflight", "worker" => Arc::clone(&worker)).set(0.0);
 
         // Zero for these metrics have special valid meaning, thus we set to -1 temporarily
         // (and will remove them completely after https://github.com/metrics-rs/metrics/issues/653)
@@ -1739,6 +1785,20 @@ mod tests {
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, f);
         handle.render()
+    }
+
+    #[test]
+    fn prefill_worker_removal_resets_admission_gauge() {
+        let rendered = render_with_recorder(|| {
+            Metrics::set_pd_prefill_admission_inflight("http://removed-prefill", 7);
+            Metrics::remove_worker_metrics("http://removed-prefill");
+        });
+        assert_metric(
+            &rendered,
+            "smg_pd_prefill_admission_inflight",
+            &[r#"worker="http://removed-prefill""#],
+            "0",
+        );
     }
 
     /// Core engine gauges share these labels for the snapshot fixtures.

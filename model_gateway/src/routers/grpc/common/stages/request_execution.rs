@@ -34,7 +34,7 @@ use crate::{
             utils::tonic_ext::{TonicResultExt, TonicStatusExt},
         },
     },
-    worker::{ConnectionModeExt, Worker},
+    worker::{ConnectionModeExt, PrefillLoadGuard, Worker},
 };
 
 type StreamResult = Result<ProtoStream, tonic::Status>;
@@ -249,6 +249,9 @@ pub(crate) async fn execute_plan(
         admission,
         LoadGuards::scaled(workers, ctx.sticky_key.as_deref(), sub_requests),
     ));
+    // The Prefill admission slot worker selection took for this attempt. It
+    // is released when the Prefill phase ends, not with the load guards.
+    let prefill_guard = ctx.pd_prefill_guard.take();
 
     // Extract dispatch metadata for the tracing span and PD metric labels.
     let dispatch = ctx.dispatch.as_ref().ok_or_else(|| {
@@ -277,16 +280,26 @@ pub(crate) async fn execute_plan(
                 ProtoRequest::Embed(req) => execute_single_embed(req, clients, workers).await,
             },
             ExecutionPlan::PrefillDecode(req) => {
-                execute_pd_dispatch(req, clients, workers, model).await
+                let prefill_guard = require_prefill_guard(prefill_guard)?;
+                execute_pd_dispatch(req, clients, workers, model, prefill_guard).await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
                 // Bootstrap info was injected into the prefill request during
                 // request building; dispatch the encode jobs with the
                 // prefill+decode leg.
-                execute_epd_dispatch(request, clients, workers, model, encode_dispatch).await
+                let prefill_guard = require_prefill_guard(prefill_guard)?;
+                execute_epd_dispatch(
+                    request,
+                    clients,
+                    workers,
+                    model,
+                    encode_dispatch,
+                    prefill_guard,
+                )
+                .await
             }
             ExecutionPlan::Batch { kind, requests, .. } => {
-                execute_batch_dispatch(kind, requests, clients, workers, model).await
+                execute_batch_dispatch(kind, requests, clients, workers, model, prefill_guard).await
             }
         }
     }
@@ -298,11 +311,27 @@ pub(crate) async fn execute_plan(
     Ok(())
 }
 
+/// A disaggregated dispatch without the Prefill admission slot worker
+/// selection took for it is a pipeline bug, not a routable request.
+fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadGuard, Response> {
+    guard.ok_or_else(|| {
+        error!(
+            function = "execute_plan",
+            "PD dispatch without a Prefill admission slot"
+        );
+        error::internal_error(
+            "prefill_admission_missing",
+            "PD dispatch without a Prefill admission slot",
+        )
+    })
+}
+
 async fn execute_pd_dispatch(
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     model: &str,
+    prefill_guard: PrefillLoadGuard,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -331,11 +360,15 @@ async fn execute_pd_dispatch(
     // carried in the request.
     match protocol.dispatch {
         PdDispatch::Sequential => {
-            execute_sequential_pd(proto_request, clients, workers, model).await
+            execute_sequential_pd(proto_request, clients, workers, model, prefill_guard).await
         }
         PdDispatch::Parallel => match pd_fanout_width(&proto_request, protocol) {
-            Some(n) => execute_fanout_pd(proto_request, n, clients, workers, protocol).await,
-            None => execute_parallel_pd(proto_request, clients, workers, protocol).await,
+            Some(n) => {
+                execute_fanout_pd(proto_request, n, clients, workers, protocol, prefill_guard).await
+            }
+            None => {
+                execute_parallel_pd(proto_request, clients, workers, protocol, prefill_guard).await
+            }
         },
     }
 }
@@ -350,6 +383,7 @@ async fn execute_fanout_pd(
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     protocol: PdProtocol,
+    prefill_guard: PrefillLoadGuard,
 ) -> Result<ExecutionResult, Response> {
     let subs = fan_out_pd_request(&proto_request, n, |sub| {
         maybe_inject_pd_metadata(sub, workers);
@@ -360,19 +394,24 @@ async fn execute_fanout_pd(
         samples = n,
         "PD fan-out: one single-sample pair per sample, each with its own room"
     );
-    let dispatches = subs.into_iter().map(|sub| {
+    // The samples share the one admission slot; each pair's Prefill phase
+    // ends on its own, so each carries its own handle.
+    let guards = prefill_guard.replicate_to(subs.len());
+    let dispatches = subs.into_iter().zip(guards).map(|(sub, guard)| {
         let mut clients = clients.clone();
-        async move { execute_parallel_pd(sub, &mut clients, workers, protocol).await }
+        async move { execute_parallel_pd(sub, &mut clients, workers, protocol, guard).await }
     });
     let results = try_join_all(dispatches).await?;
 
     let mut prefills = Vec::with_capacity(results.len());
     let mut decodes = Vec::with_capacity(results.len());
+    let mut prefill_guards = Vec::with_capacity(results.len());
     let mut timing: Option<PdTiming> = None;
     for result in results {
         let ExecutionResult::PrefillDecode {
             prefill,
             decode,
+            prefill_guards: guards,
             pd_timing,
         } = result
         else {
@@ -387,6 +426,7 @@ async fn execute_fanout_pd(
         };
         prefills.push(prefill);
         decodes.push(*decode);
+        prefill_guards.extend(guards);
         // The earliest prefill start anchors the merged request's TTFT.
         timing = Some(match timing {
             Some(earliest) if earliest.prefill_start <= pd_timing.prefill_start => earliest,
@@ -402,6 +442,7 @@ async fn execute_fanout_pd(
     Ok(ExecutionResult::PrefillDecode {
         prefill: ProtoStream::Fanout(FanoutStream::new(prefills)),
         decode: Box::new(ProtoStream::Fanout(FanoutStream::new(decodes))),
+        prefill_guards,
         pd_timing,
     })
 }
@@ -412,12 +453,13 @@ async fn execute_epd_dispatch(
     workers: &WorkerSelection,
     model: &str,
     encode_dispatch: Option<EncodeDispatchPlan>,
+    prefill_guard: PrefillLoadGuard,
 ) -> Result<ExecutionResult, Response> {
     if let Some(encode_dispatch) = encode_dispatch {
         spawn_encode_dispatch(encode_dispatch);
     }
     proto_request.clear_mm_pixel_values();
-    execute_pd_dispatch(proto_request, clients, workers, model).await
+    execute_pd_dispatch(proto_request, clients, workers, model, prefill_guard).await
 }
 
 #[expect(
@@ -473,19 +515,38 @@ async fn execute_batch_dispatch(
     clients: &ClientSelection,
     workers: &WorkerSelection,
     model: &str,
+    prefill_guard: Option<PrefillLoadGuard>,
 ) -> Result<ExecutionResult, Response> {
-    let dispatches = requests.into_iter().map(|request| {
-        let mut clients = clients.clone();
-        async move {
-            match kind {
-                ExecutionPlanKind::Single => execute_single(request, &mut clients, workers).await,
-                // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
-                ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
-                    execute_pd_dispatch(request, &mut clients, workers, model).await
+    // One Prefill handle per PD sub-request, all on the one admission slot.
+    let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
+        ExecutionPlanKind::Single => requests.iter().map(|_| None).collect(),
+        ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
+            require_prefill_guard(prefill_guard)?
+                .replicate_to(requests.len())
+                .into_iter()
+                .map(Some)
+                .collect()
+        }
+    };
+    let dispatches = requests
+        .into_iter()
+        .zip(prefill_guards)
+        .map(|(request, prefill_guard)| {
+            let mut clients = clients.clone();
+            async move {
+                match kind {
+                    ExecutionPlanKind::Single => {
+                        execute_single(request, &mut clients, workers).await
+                    }
+                    // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
+                    ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
+                        let prefill_guard = require_prefill_guard(prefill_guard)?;
+                        execute_pd_dispatch(request, &mut clients, workers, model, prefill_guard)
+                            .await
+                    }
                 }
             }
-        }
-    });
+        });
 
     let results = try_join_all(dispatches).await?;
     Ok(ExecutionResult::Batch { results })
@@ -577,6 +638,7 @@ async fn execute_parallel_pd(
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     protocol: PdProtocol,
+    prefill_guard: PrefillLoadGuard,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -663,6 +725,7 @@ async fn execute_parallel_pd(
             Ok(ExecutionResult::PrefillDecode {
                 prefill: prefill_stream,
                 decode: Box::new(decode_stream),
+                prefill_guards: vec![Some(prefill_guard)],
                 pd_timing: PdTiming {
                     prefill_start,
                     runtime,
@@ -830,6 +893,7 @@ async fn execute_sequential_pd(
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     model: &str,
+    prefill_guard: PrefillLoadGuard,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -987,6 +1051,8 @@ async fn execute_sequential_pd(
         }
     }
     prefill_stream.mark_completed();
+    // Prefill is drained: its admission slot is free while decode runs.
+    drop(prefill_guard);
     workers.record_outcome_prefill(200);
     // Captured at drain; recorded below only once decode is established.
     let prefill_duration = prefill_start.elapsed();

@@ -20,13 +20,13 @@ use tracing::{debug, warn};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::{
-        policy_filters_unavailable_workers, CacheNamespace, PolicyRegistry, SelectWorkerInfo,
-        WorkerLeg,
+        policy_filters_unavailable_workers, CacheNamespace, LoadBalancingPolicy, PolicyRegistry,
+        SelectWorkerInfo, WorkerLeg,
     },
-    routers::common::overload,
+    routers::common::{header_utils, overload},
     worker::{
-        ConnectionMode, ConnectionModeExt, PdPairIndex, RoutingPool, RuntimeType, Worker,
-        WorkerRegistry,
+        ConnectionMode, ConnectionModeExt, PdPairIndex, PrefillCandidateError,
+        PrefillSelectionContext, RoutingPool, RuntimeType, Worker, WorkerRegistry,
     },
 };
 
@@ -37,6 +37,19 @@ use crate::{
 pub(crate) struct WireConstraint {
     pub runtime: RuntimeType,
     pub connection: ConnectionMode,
+}
+
+/// Whether Prefill admission may drop full workers from the candidate set
+/// before the policy runs. An explicit target under consistent hashing is
+/// exempt: it indexes the unfiltered set and stays strict, so the request
+/// waits for that worker (checked after selection) instead of moving to
+/// another one.
+pub(crate) fn admission_prefilters(
+    prefill_policy: &dyn LoadBalancingPolicy,
+    headers: Option<&HeaderMap>,
+) -> bool {
+    prefill_policy.name() != "consistent_hashing"
+        || header_utils::extract_target_worker(headers).is_none()
 }
 
 /// Everything a single-worker placement reads from the request.
@@ -74,6 +87,7 @@ impl Candidates {
 
 /// Why a placement produced nothing, judged from exactly the pool selection
 /// drew from.
+#[derive(Debug)]
 pub(crate) enum PlacementFailure {
     /// Nothing serves the model on this wire.
     NoCandidates,
@@ -93,6 +107,15 @@ pub(crate) enum PlacementFailure {
         decode: Vec<String>,
         mismatches: Vec<String>,
     },
+    /// Every prefill worker that could serve the request is at its Prefill
+    /// admission limit. Selection was not run; the request waits for a slot.
+    PrefillAtCapacity,
+}
+
+impl PrefillCandidateError for PlacementFailure {
+    fn is_at_capacity(&self) -> bool {
+        matches!(self, Self::PrefillAtCapacity)
+    }
 }
 
 /// A selected prefill/decode pair.
@@ -106,9 +129,16 @@ pub(crate) struct Pair {
 
 /// Which leg of a pair placement failed, and why. Boxed at the `Err`
 /// site: a shed verdict carries a whole response.
+#[derive(Debug)]
 pub(crate) struct PairFailure {
     pub leg: WorkerLeg,
     pub verdict: PlacementFailure,
+}
+
+impl PrefillCandidateError for PairFailure {
+    fn is_at_capacity(&self) -> bool {
+        self.verdict.is_at_capacity()
+    }
 }
 
 /// The candidates for `model_id` in `pool`, narrowed to `wire` when a retry
@@ -246,6 +276,10 @@ pub(crate) fn failure_from(candidates: &[Arc<dyn Worker>], model_id: &str) -> Pl
 /// prefill worker open under its own runtime, which the gRPC wire needs
 /// because its rendezvous is runtime-specific. A miss names the leg and carries the verdict judged
 /// from that leg's own candidates.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "pair placement threads every routing input plus the admission view"
+)]
 pub(crate) fn select_pair(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -253,6 +287,7 @@ pub(crate) fn select_pair(
     pairs: &PdPairIndex,
     wire: Option<WireConstraint>,
     homogeneous_runtime: bool,
+    prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
 ) -> Result<Pair, Box<PairFailure>> {
     let eligible = |w: &Arc<dyn Worker>| {
@@ -323,7 +358,7 @@ pub(crate) fn select_pair(
     // One pass: the open prefills on the leg's runtime, counting the
     // pairable ones the narrowing excluded so the exclusion leaves a trace.
     let mut excluded = 0usize;
-    let open: Vec<usize> = (0..pairs.prefill.len())
+    let mut open: Vec<usize> = (0..pairs.prefill.len())
         .filter(|&i| {
             let p = &pairs.prefill[i];
             if !eligible(p) {
@@ -354,15 +389,30 @@ pub(crate) fn select_pair(
             failure_from(&pairs.decode_pool, model_id),
         ));
     }
-    let prefill: Vec<Arc<dyn Worker>> = open
-        .iter()
-        .map(|&i| Arc::clone(&pairs.prefill[i]))
-        .collect();
 
     // Independent prefill/decode policies so stateful ones (round robin) do
     // not share a counter; each leg tags the sticky key with its own prefix.
     let prefill_policy = policies.get_prefill_policy();
     let decode_policy = policies.get_decode_policy();
+
+    // Under Prefill admission, workers at their limit leave the candidate set
+    // before the policy runs, so a stateful policy never commits a choice
+    // the reservation then refuses.
+    if let Some(capacity) =
+        prefill_capacity.filter(|_| admission_prefilters(prefill_policy.as_ref(), inputs.headers))
+    {
+        open.retain(|&i| capacity.has_capacity(&pairs.prefill[i]));
+        if open.is_empty() {
+            return Err(fail(
+                WorkerLeg::Prefill,
+                PlacementFailure::PrefillAtCapacity,
+            ));
+        }
+    }
+    let prefill: Vec<Arc<dyn Worker>> = open
+        .iter()
+        .map(|&i| Arc::clone(&pairs.prefill[i]))
+        .collect();
     let hash_ring = registry.get_hash_ring(model_id);
     let mut info = SelectWorkerInfo {
         request_text: inputs.text,
@@ -386,6 +436,12 @@ pub(crate) fn select_pair(
         return Err(declined(WorkerLeg::Prefill, prefill_policy.name()));
     };
     let selected_prefill = prefill[prefill_idx].clone();
+    if prefill_capacity.is_some_and(|capacity| !capacity.has_capacity(&selected_prefill)) {
+        return Err(fail(
+            WorkerLeg::Prefill,
+            PlacementFailure::PrefillAtCapacity,
+        ));
+    }
     // The pick's open partners: non-empty by construction, short of an
     // availability flip between the two reads.
     let decode: Vec<Arc<dyn Worker>> = pairs.partners[open[prefill_idx]]
@@ -487,6 +543,7 @@ mod tests {
             &pairs_of(registry, policies),
             None,
             true,
+            None,
             PlacementInputs::default(),
         )
     }
@@ -516,9 +573,9 @@ mod tests {
                 &pairs,
                 None,
                 true,
+                None,
                 PlacementInputs::default(),
             )
-            .ok()
             .expect("a pair is open");
             *hits.entry(pair.prefill.url().to_string()).or_insert(0) += 1;
             *hits.entry(pair.decode.url().to_string()).or_insert(0) += 1;
@@ -601,9 +658,7 @@ mod tests {
         assert!(Arc::ptr_eq(&pairs, &pairs_of(&registry, &policies)));
 
         // And a placement lands on a matching pair.
-        let pair = pair_from(&registry, &policies)
-            .ok()
-            .expect("the fleet has matching pairs");
+        let pair = pair_from(&registry, &policies).expect("the fleet has matching pairs");
         assert_eq!(
             pair.prefill.pd_pairing().transport(),
             pair.decode.pd_pairing().transport()
@@ -638,9 +693,7 @@ mod tests {
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
         for _ in 0..4 {
-            let pair = pair_from(&registry, &policies)
-                .ok()
-                .expect("P2 and D2 pair on one runtime");
+            let pair = pair_from(&registry, &policies).expect("P2 and D2 pair on one runtime");
             assert_eq!(pair.prefill.url(), "grpc://p:2");
             assert_eq!(pair.decode.url(), "grpc://d:2");
             assert_eq!(pair.runtime, RuntimeType::Vllm);
@@ -687,9 +740,7 @@ mod tests {
         vllm_decode.set_status(WorkerStatus::NotReady);
 
         for _ in 0..3 {
-            let pair = pair_from(&registry, &policies)
-                .ok()
-                .expect("the SGLang pair is healthy");
+            let pair = pair_from(&registry, &policies).expect("the SGLang pair is healthy");
             assert_eq!(pair.prefill.url(), "grpc://p:sglang");
             assert_eq!(pair.decode.url(), "grpc://d:sglang");
             assert_eq!(pair.runtime, RuntimeType::Sglang);
@@ -869,9 +920,7 @@ mod tests {
         ]);
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
-        let pair = pair_from(&registry, &policies)
-            .ok()
-            .expect("a pair exists under either runtime");
+        let pair = pair_from(&registry, &policies).expect("a pair exists under either runtime");
         assert_eq!(pair.prefill.metadata().spec.runtime_type, pair.runtime);
         assert_eq!(pair.decode.metadata().spec.runtime_type, pair.runtime);
 
@@ -929,6 +978,7 @@ mod tests {
             &pairs,
             None,
             false,
+            None,
             PlacementInputs::default(),
         )
         .is_ok());
@@ -944,6 +994,7 @@ mod tests {
                 connection: ConnectionMode::Grpc,
             }),
             false,
+            None,
             PlacementInputs::default(),
         )
         .err()

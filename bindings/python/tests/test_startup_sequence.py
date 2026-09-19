@@ -697,6 +697,9 @@ def test_router_defaults_and_start(monkeypatch):
         prefill_selector=None,
         decode_selector=None,
         cors_allowed_origins=None,
+        prefill_max_inflight_requests_per_worker=7,
+        prefill_queue_size=13,
+        prefill_queue_timeout_secs=17,
     )
 
     r = Router.from_args(args)
@@ -707,6 +710,9 @@ def test_router_defaults_and_start(monkeypatch):
     assert captured["decode_selector"] is None
     assert captured["cors_allowed_origins"] is None
     assert captured["worker_urls"] == ["http://w1:8000"]
+    assert captured["prefill_max_inflight_requests_per_worker"] == 7
+    assert captured["prefill_queue_size"] == 13
+    assert captured["prefill_queue_timeout_secs"] == 17
     from smg.smg_rs import PolicyType
 
     assert captured["policy"] == PolicyType.RoundRobin

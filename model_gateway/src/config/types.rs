@@ -187,6 +187,18 @@ pub struct RouterConfig {
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
     pub queue_timeout_secs: u64,
+    /// Maximum in-flight Prefill requests per worker in PD or EPD mode.
+    /// A non-positive value disables the limit.
+    #[serde(default = "default_disabled_limit")]
+    pub prefill_max_inflight_requests_per_worker: i32,
+    /// Maximum number of PD requests waiting for Prefill admission.
+    /// `None` applies the built-in default when admission is enabled.
+    #[serde(default)]
+    pub prefill_queue_size: Option<usize>,
+    /// Maximum time a PD request may wait for Prefill admission.
+    /// `None` applies the built-in default when admission is enabled.
+    #[serde(default)]
+    pub prefill_queue_timeout_secs: Option<u64>,
     /// Unset or 0 = no refill: `max_concurrent_requests` bounds standing
     /// concurrency alone.
     pub rate_limit_tokens_per_second: Option<i32>,
@@ -352,6 +364,13 @@ fn default_load_monitor_interval_secs() -> u64 {
 fn default_pd_admission_wait_secs() -> u64 {
     DEFAULT_PD_ADMISSION_WAIT_SECS
 }
+
+const fn default_disabled_limit() -> i32 {
+    -1
+}
+
+pub const DEFAULT_PREFILL_QUEUE_SIZE: usize = 100;
+pub const DEFAULT_PREFILL_QUEUE_TIMEOUT_SECS: u64 = 60;
 
 fn default_job_queue_capacity() -> usize {
     1000
@@ -1162,6 +1181,9 @@ impl Default for RouterConfig {
             max_concurrent_requests: -1,
             queue_size: 100,
             queue_timeout_secs: 60,
+            prefill_max_inflight_requests_per_worker: default_disabled_limit(),
+            prefill_queue_size: None,
+            prefill_queue_timeout_secs: None,
             rate_limit_tokens_per_second: None,
             priority_scheduler_enabled: false,
             priority_scheduler_default_max_class: default_priority_scheduler_max_class(),
@@ -1248,6 +1270,16 @@ impl RouterConfig {
             Some(trace_config) => trace_config.enable_trace,
             None => false,
         }
+    }
+
+    pub fn effective_prefill_queue_size(&self) -> usize {
+        self.prefill_queue_size
+            .unwrap_or(DEFAULT_PREFILL_QUEUE_SIZE)
+    }
+
+    pub fn effective_prefill_queue_timeout_secs(&self) -> u64 {
+        self.prefill_queue_timeout_secs
+            .unwrap_or(DEFAULT_PREFILL_QUEUE_TIMEOUT_SECS)
     }
 
     /// Compute the effective retry config considering disable flag

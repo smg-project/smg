@@ -26,8 +26,10 @@ use crate::{
         },
         grpc::{
             common::responses::{
-                build_sse_response, ensure_mcp_connection, persist_response_if_needed,
-                streaming::ResponseStreamEventEmitter, ResponsesContext,
+                await_stream_startup, ensure_mcp_connection, persist_response_if_needed,
+                stream_startup_channel,
+                streaming::{ResponseStreamEventEmitter, StreamStartupSender},
+                ResponsesContext,
             },
             harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
         },
@@ -67,6 +69,7 @@ pub(crate) async fn serve_harmony_responses_stream(
 
     // Create SSE channel
     let (tx, rx) = sse_channel();
+    let (startup_tx, startup_rx) = stream_startup_channel();
 
     // Create response event emitter
     let response_id = format!("resp_{}", Uuid::now_v7());
@@ -106,6 +109,7 @@ pub(crate) async fn serve_harmony_responses_stream(
                 mcp_servers,
                 &mut emitter,
                 &tx,
+                Some(startup_tx),
             )
             .await;
         } else {
@@ -116,13 +120,13 @@ pub(crate) async fn serve_harmony_responses_stream(
                 tenant_request_meta,
                 &mut emitter,
                 &tx,
+                Some(startup_tx),
             )
             .await;
         }
     });
 
-    // Return SSE stream response
-    build_sse_response(rx)
+    await_stream_startup(startup_rx, rx).await
 }
 
 /// Execute MCP tool loop with streaming
@@ -133,6 +137,10 @@ pub(crate) async fn serve_harmony_responses_stream(
 /// - Loops through tool execution iterations
 /// - Emits final response.completed event
 /// - Persists response internally
+#[expect(
+    clippy::too_many_arguments,
+    reason = "streaming MCP loop needs request state, emitter, channel and startup barrier"
+)]
 async fn execute_mcp_tool_loop_streaming(
     ctx: &ResponsesContext,
     mut current_request: ResponsesRequest,
@@ -141,6 +149,7 @@ async fn execute_mcp_tool_loop_streaming(
     mcp_servers: Vec<McpServerBinding>,
     emitter: &mut ResponseStreamEventEmitter,
     tx: &SseSender,
+    mut startup: Option<StreamStartupSender>,
 ) {
     let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
 
@@ -224,17 +233,22 @@ async fn execute_mcp_tool_loop_streaming(
         );
 
         // Execute pipeline and get stream + load guards
+        let startup_pending = startup.is_some();
         let (execution_result, _load_guards) = match ctx
             .pipeline
             .execute_harmony_responses_streaming(
                 &current_request,
                 ctx,
                 Some(tenant_request_meta.clone()),
+                startup.take(),
             )
             .await
         {
             Ok(result) => result,
             Err(err_response) => {
+                if startup_pending {
+                    return;
+                }
                 emitter
                     .emit_error(
                         &format!("Pipeline execution failed: {err_response:?}"),
@@ -446,17 +460,27 @@ async fn execute_without_mcp_streaming(
     tenant_request_meta: TenantRequestMeta,
     emitter: &mut ResponseStreamEventEmitter,
     tx: &SseSender,
+    mut startup: Option<StreamStartupSender>,
 ) {
     debug!("No MCP tools - executing single iteration");
 
     // Execute pipeline and get stream + load guards
+    let startup_pending = startup.is_some();
     let (execution_result, _load_guards) = match ctx
         .pipeline
-        .execute_harmony_responses_streaming(current_request, ctx, Some(tenant_request_meta))
+        .execute_harmony_responses_streaming(
+            current_request,
+            ctx,
+            Some(tenant_request_meta),
+            startup.take(),
+        )
         .await
     {
         Ok(result) => result,
         Err(err_response) => {
+            if startup_pending {
+                return;
+            }
             emitter
                 .emit_error(
                     &format!("Pipeline execution failed: {err_response:?}"),

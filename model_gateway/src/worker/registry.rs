@@ -2369,10 +2369,10 @@ impl WorkerRegistry {
                 let status = existing.status();
                 if state.health {
                     if matches!(status, WorkerStatus::Pending | WorkerStatus::NotReady) {
-                        existing.set_status(WorkerStatus::Ready);
+                        self.transition_status(&existing_id, WorkerStatus::Ready);
                     }
                 } else if status == WorkerStatus::Ready {
-                    existing.set_status(WorkerStatus::NotReady);
+                    self.transition_status(&existing_id, WorkerStatus::NotReady);
                 }
                 tracing::debug!(
                     url = %state.url,
