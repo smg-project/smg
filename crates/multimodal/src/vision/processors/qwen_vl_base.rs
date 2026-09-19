@@ -432,10 +432,6 @@ impl QwenVLProcessorBase {
             ModelSpecificValue::int_1d(vec![plan.num_patches as i64]),
         )
         .with_extra(
-            "patches_per_image",
-            ModelSpecificValue::int_1d(vec![plan.num_patches as i64]),
-        )
-        .with_extra(
             "video_second_per_grid",
             ModelSpecificValue::Tensor {
                 data: vec![plan.second_per_grid],
