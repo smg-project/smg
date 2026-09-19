@@ -38,7 +38,10 @@ use crate::{
     routers::{
         common::sse::{sse_channel, SseEncoder, SseSender},
         grpc::{
-            common::{response_formatting::CompletionTokenTracker, responses::build_sse_response},
+            common::{
+                response_collection::drain_prefill, response_formatting::CompletionTokenTracker,
+                responses::build_sse_response,
+            },
             context,
             proto_wrapper::{ProtoResponseVariant, ProtoStream},
             spec::{
@@ -59,7 +62,7 @@ enum CompletionStreamUnit {
     PrefillDecode {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
-        prefill_guards: Vec<PrefillLoadGuard>,
+        prefill_guards: Vec<Option<PrefillLoadGuard>>,
     },
 }
 
@@ -819,19 +822,14 @@ impl StreamingProcessor {
         original_request: ChatResponseSpec,
         tx: &SseSender,
         pd_timing: context::PdTiming,
-        prefill_guards: Vec<PrefillLoadGuard>,
+        prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         // Phase 1.5: Drain prefill stream. Streaming chat does not emit prompt
         // logprobs, but the Prefill reservation must end with this phase.
-        while let Some(response) = prefill_stream.next().await {
-            let gen_response =
-                response.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
-            if let ProtoResponseVariant::Complete(_) = gen_response.into_response() {
-                break;
-            }
-        }
-        drop(prefill_guards);
+        drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
+            .await
+            .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
 
         // Phase 2-5: Process decode stream (same as single mode). Pass pd_timing
         // so the first decode token yields honest PD TTFT.
@@ -1115,25 +1113,21 @@ impl StreamingProcessor {
         ctx: GenerateStreamContext,
         tx: &SseSender,
         pd_timing: context::PdTiming,
-        prefill_guards: Vec<PrefillLoadGuard>,
+        prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         // Drain prefill stream. Collect input_logprobs only when requested.
         let mut input_token_logprobs = None;
-        while let Some(response) = prefill_stream.next().await {
-            let gen_response =
-                response.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
-            if let ProtoResponseVariant::Complete(complete) = gen_response.into_response() {
-                if ctx.return_logprob {
-                    input_token_logprobs = complete
-                        .input_logprobs()
-                        .as_ref()
-                        .map(utils::convert_generate_input_logprobs);
-                }
-                break;
+        drain_prefill(&mut prefill_stream, prefill_guards, true, |complete| {
+            if ctx.return_logprob && input_token_logprobs.is_none() {
+                input_token_logprobs = complete
+                    .input_logprobs()
+                    .as_ref()
+                    .map(utils::convert_generate_input_logprobs);
             }
-        }
-        drop(prefill_guards);
+        })
+        .await
+        .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
 
         // Process decode stream with input_logprobs prepended. Pass pd_timing so
         // the first decode token yields honest PD TTFT.
@@ -2625,19 +2619,13 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: MessagesResponseSpec,
         tx: &SseSender,
-        prefill_guards: Vec<PrefillLoadGuard>,
+        prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         // Consume prefill stream (Messages API does not expose prompt logprobs)
-        while let Some(response) = prefill_stream.next().await {
-            let gen_response =
-                response.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
-            match gen_response.into_response() {
-                ProtoResponseVariant::Complete(_) => break,
-                _ => continue,
-            }
-        }
-        drop(prefill_guards);
+        drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
+            .await
+            .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
 
         let result = self
             .process_messages_streaming_chunks(
@@ -3237,18 +3225,11 @@ impl StreamingProcessor {
         prompt_text: &str,
         index_offset: u32,
         tx: &SseSender,
-        prefill_guards: Vec<PrefillLoadGuard>,
+        prefill_guards: Vec<Option<PrefillLoadGuard>>,
     ) -> Result<CompletionStreamOutcome, String> {
-        while let Some(response) = prefill_stream.next().await {
-            let gen_response =
-                response.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
-
-            match gen_response.into_response() {
-                ProtoResponseVariant::Complete(_) => break,
-                _ => continue,
-            }
-        }
-        drop(prefill_guards);
+        drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
+            .await
+            .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
 
         let result = self
             .process_completion_streaming_chunks(

@@ -1707,6 +1707,7 @@ impl Metrics {
         gauge!("smg_worker_cb_consecutive_failures", "worker" => Arc::clone(&worker)).set(0.0);
         gauge!("smg_worker_cb_consecutive_successes", "worker" => Arc::clone(&worker)).set(0.0);
         gauge!("smg_worker_requests_active", "worker" => Arc::clone(&worker)).set(0.0);
+        gauge!("smg_pd_prefill_admission_inflight", "worker" => Arc::clone(&worker)).set(0.0);
 
         // Zero for these metrics have special valid meaning, thus we set to -1 temporarily
         // (and will remove them completely after https://github.com/metrics-rs/metrics/issues/653)
@@ -1784,6 +1785,20 @@ mod tests {
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, f);
         handle.render()
+    }
+
+    #[test]
+    fn prefill_worker_removal_resets_admission_gauge() {
+        let rendered = render_with_recorder(|| {
+            Metrics::set_pd_prefill_admission_inflight("http://removed-prefill", 7);
+            Metrics::remove_worker_metrics("http://removed-prefill");
+        });
+        assert_metric(
+            &rendered,
+            "smg_pd_prefill_admission_inflight",
+            &[r#"worker="http://removed-prefill""#],
+            "0",
+        );
     }
 
     /// Core engine gauges share these labels for the snapshot fixtures.

@@ -725,7 +725,7 @@ async fn execute_parallel_pd(
             Ok(ExecutionResult::PrefillDecode {
                 prefill: prefill_stream,
                 decode: Box::new(decode_stream),
-                prefill_guards: vec![prefill_guard],
+                prefill_guards: vec![Some(prefill_guard)],
                 pd_timing: PdTiming {
                     prefill_start,
                     runtime,

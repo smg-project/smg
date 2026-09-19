@@ -1218,9 +1218,9 @@ pub(crate) enum ExecutionResult {
     PrefillDecode {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
-        /// Prefill admission slots still held: one per fan-out sample for a
-        /// parallel dispatch, none after a sequential dispatch drained prefill.
-        prefill_guards: Vec<PrefillLoadGuard>,
+        /// Guards indexed by fan-out sample. Each starts as `Some` and is taken
+        /// when that sample completes; siblings retain their guards.
+        prefill_guards: Vec<Option<PrefillLoadGuard>>,
         /// PD timing context, for honest PD TTFT (prefill start to first decode token).
         pd_timing: PdTiming,
     },

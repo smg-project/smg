@@ -38,6 +38,7 @@ use crate::{
         },
         grpc::{
             common::{
+                response_collection::drain_prefill,
                 response_formatting::CompletionTokenTracker,
                 responses::{
                     build_sse_response,
@@ -223,22 +224,19 @@ impl HarmonyStreamingProcessor {
         original_request: Arc<ChatCompletionRequest>,
         tx: &SseSender,
         router_stop_strings: Vec<String>,
-        prefill_guards: Vec<PrefillLoadGuard>,
+        prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         // Phase 1: Process prefill stream (collect metadata)
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
 
-        while let Some(result) = prefill_stream.next().await {
-            let response = result.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
-
-            if let ProtoResponseVariant::Complete(complete_wrapper) = response.into_response() {
-                prompt_tokens.insert(complete_wrapper.index(), complete_wrapper.prompt_tokens());
-                cached_tokens.insert(complete_wrapper.index(), complete_wrapper.cached_tokens());
-            }
-        }
-        drop(prefill_guards);
+        drain_prefill(&mut prefill_stream, prefill_guards, false, |complete| {
+            prompt_tokens.insert(complete.index(), complete.prompt_tokens());
+            cached_tokens.insert(complete.index(), complete.cached_tokens());
+        })
+        .await
+        .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
 
         // Phase 2: Decode (shared helper)
         Self::process_chat_decode_stream(
@@ -742,19 +740,16 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
-        prefill_guards: Vec<PrefillLoadGuard>,
+        prefill_guards: Vec<Option<PrefillLoadGuard>>,
     ) -> Result<ResponsesIterationResult, String> {
         // Phase 1: Drain prefill stream, collecting cached_tokens from Complete messages
         let mut prefill_cached_tokens_by_index: HashMap<u32, u32> = HashMap::new();
-        while let Some(result) = prefill_stream.next().await {
-            let response = result.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
-            if let ProtoResponseVariant::Complete(complete_wrapper) = response.into_response() {
-                prefill_cached_tokens_by_index
-                    .insert(complete_wrapper.index(), complete_wrapper.cached_tokens());
-            }
-        }
+        drain_prefill(&mut prefill_stream, prefill_guards, false, |complete| {
+            prefill_cached_tokens_by_index.insert(complete.index(), complete.cached_tokens());
+        })
+        .await
+        .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
         let prefill_cached_tokens: u32 = prefill_cached_tokens_by_index.values().sum();
-        drop(prefill_guards);
 
         // Phase 2: Process decode stream
         let result = Self::process_decode_stream(
