@@ -93,6 +93,7 @@ smg-mm-rdma.workspace = true
 smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
 smg-rl.workspace = true
+smg-http-utils.workspace = true
 smg-grpc-client.workspace = true
 engine-zmq-client.workspace = true
 

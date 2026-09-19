@@ -7490,6 +7490,7 @@ dependencies = [
  "smg-auth",
  "smg-external-router",
  "smg-grpc-client",
+ "smg-http-utils",
  "smg-mcp",
  "smg-mesh",
  "smg-mm-rdma",
@@ -7595,6 +7596,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "smg-http-utils",
  "smg-mcp",
  "str0m",
  "thiserror 2.0.20",
@@ -7653,6 +7655,14 @@ dependencies = [
  "tower",
  "tracing",
  "zip 8.6.0",
+]
+
+[[package]]
+name = "smg-http-utils"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
 ]
 
 [[package]]
@@ -7773,6 +7783,7 @@ dependencies = [
  "reqwest 0.13.4",
  "serde",
  "serde_json",
+ "smg-http-utils",
  "thiserror 2.0.20",
  "tokio",
  "tower",

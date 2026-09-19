@@ -51,6 +51,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std", "preserve_order", "raw_value"] }
 smg-data-connector.workspace = true
 smg-mcp.workspace = true
+smg-http-utils.workspace = true
 str0m = { workspace = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
