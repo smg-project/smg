@@ -639,6 +639,8 @@ fn main() -> anyhow::Result<()> {
     let rl_entry_name = collect_schema(schema_for!(RlWorkerEntry), &mut schemas)?;
     let rl_outcome_name = collect_schema(schema_for!(RlCallOutcome), &mut schemas)?;
     let rl_fanout_name = collect_schema(schema_for!(RlFanoutResponse), &mut schemas)?;
+    let rl_set_version_name = collect_schema(schema_for!(RlSetVersionRequest), &mut schemas)?;
+    let rl_set_control_name = collect_schema(schema_for!(RlSetControlRequest), &mut schemas)?;
     let json_content = |name: &str| -> BTreeMap<String, MediaType> {
         let mut content = BTreeMap::new();
         content.insert(
@@ -744,6 +746,71 @@ fn main() -> anyhow::Result<()> {
         PathItem {
             get: Some(rl_fanout("fanoutRlEngineRouteGet", None)),
             post: Some(rl_fanout("fanoutRlEngineRoute", Some(engine_body()))),
+            ..PathItem::default()
+        },
+    );
+
+    let json_body = |name: &str| RequestBody {
+        required: true,
+        content: json_content(name),
+    };
+    let selector_param = || Parameter {
+        name: "selector".to_string(),
+        location: "query".to_string(),
+        required: true,
+        schema: ParameterSchema {
+            schema_type: "string".to_string(),
+        },
+    };
+    paths.insert(
+        "/v1/rl/workers/{worker_id}/version".to_string(),
+        PathItem {
+            post: Some(operation(
+                "setRlWorkerVersion",
+                "Record the weight version one engine holds (no engine call)",
+                Some(vec![path_param("worker_id")]),
+                Some(json_body(&rl_set_version_name)),
+                json_response(&rl_entry_name, "The updated worker"),
+            )),
+            ..PathItem::default()
+        },
+    );
+    paths.insert(
+        "/v1/rl/workers/{worker_id}/state".to_string(),
+        PathItem {
+            post: Some(operation(
+                "setRlWorkerState",
+                "Record whether one engine is active, paused, or asleep (no engine call)",
+                Some(vec![path_param("worker_id")]),
+                Some(json_body(&rl_set_control_name)),
+                json_response(&rl_entry_name, "The updated worker"),
+            )),
+            ..PathItem::default()
+        },
+    );
+    paths.insert(
+        "/v1/rl/version".to_string(),
+        PathItem {
+            post: Some(operation(
+                "setRlFleetVersion",
+                "Record the weight version every worker matching `selector` holds",
+                Some(vec![selector_param()]),
+                Some(json_body(&rl_set_version_name)),
+                json_response(&rl_workers_name, "The updated workers"),
+            )),
+            ..PathItem::default()
+        },
+    );
+    paths.insert(
+        "/v1/rl/state".to_string(),
+        PathItem {
+            post: Some(operation(
+                "setRlFleetState",
+                "Record the control state of every worker matching `selector`",
+                Some(vec![selector_param()]),
+                Some(json_body(&rl_set_control_name)),
+                json_response(&rl_workers_name, "The updated workers"),
+            )),
             ..PathItem::default()
         },
     );

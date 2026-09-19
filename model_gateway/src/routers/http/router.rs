@@ -935,8 +935,7 @@ impl Router {
             // JSON body (success or 4xx error). Don't relabel non-SSE
             // responses as SSE; leave that judgment to whatever the worker
             // set.
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            header_utils::insert_routed_worker_id(&mut response_headers, worker.url());
+            let response_headers = header_utils::preserve_response_headers(res.headers());
             let stream = res.bytes_stream();
             // Bounded channel applies backpressure: if the downstream client
             // is slow, the upstream relay awaits on `send` rather than piling
@@ -1045,16 +1044,17 @@ impl Router {
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
+            header_utils::stamp_routed_worker(&mut response, worker.url());
             response = AttachedBody::wrap_response(response, load_guard);
             response
         } else {
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            header_utils::insert_routed_worker_id(&mut response_headers, worker.url());
+            let response_headers = header_utils::preserve_response_headers(res.headers());
             match res.bytes().await {
                 Ok(body) => {
                     let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
+                    header_utils::stamp_routed_worker(&mut response, worker.url());
                     response
                 }
                 Err(e) => error::internal_error(
@@ -1195,7 +1195,6 @@ impl Router {
         if is_stream {
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            header_utils::insert_routed_worker_id(&mut response_headers, worker_url);
             if status.is_success() && !response_headers.contains_key(CONTENT_TYPE) {
                 response_headers
                     .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
@@ -1245,6 +1244,7 @@ impl Router {
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
+            header_utils::stamp_routed_worker(&mut response, worker_url);
 
             // Attach load guard to response body for proper RAII lifecycle
             // Guard is dropped when response body is consumed or client disconnects
@@ -1270,7 +1270,7 @@ impl Router {
                 }
                 Err(error_response) => error_response,
             };
-            header_utils::insert_routed_worker_id(response.headers_mut(), worker_url);
+            header_utils::stamp_routed_worker(&mut response, worker_url);
 
             // load_guard dropped here automatically after response body is read
             response

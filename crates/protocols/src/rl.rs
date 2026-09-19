@@ -1,5 +1,6 @@
 //! Wire types of the RL control plane (`/v1/rl/*`): worker discovery rows,
-//! per-call outcomes, and fan-out envelopes.
+//! version and control-state writes, per-call outcomes, and fan-out
+//! envelopes.
 //!
 //! The logic that produces them lives in the `smg-rl` crate; this module is
 //! the contract that clients and the OpenAPI generator depend on, in the same
@@ -40,6 +41,38 @@ pub struct RlCapabilities {
     pub reports_weight_version: bool,
 }
 
+/// Whether an engine can serve requests, as SMG last observed it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RlControlState {
+    #[default]
+    Active,
+    Paused,
+    Asleep,
+}
+
+/// How SMG learned an engine's weight version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RlVersionSource {
+    Registration,
+    Passthrough,
+    Api,
+}
+
+/// Body of `POST /v1/rl/workers/{id}/version` and `POST /v1/rl/version`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RlSetVersionRequest {
+    /// Non-empty, at most 128 bytes; compared numerically when it parses.
+    pub weight_version: String,
+}
+
+/// Body of `POST /v1/rl/workers/{id}/state` and `POST /v1/rl/state`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RlSetControlRequest {
+    pub control: RlControlState,
+}
+
 /// One row of `GET /v1/rl/workers`. DP-aware ranks that share a `base_url`
 /// collapse into one row; `dp_ranks` counts them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -66,6 +99,11 @@ pub struct RlWorkerEntry {
     /// Registry status (`ready`, `not_ready`, ...).
     pub health: String,
     pub weight_version: Option<String>,
+    /// How SMG learned `weight_version`; `None` when unversioned.
+    pub version_source: Option<RlVersionSource>,
+    /// Pause/sleep state as last observed through SMG; `active` when never observed.
+    #[serde(default)]
+    pub control: RlControlState,
     /// Registration labels, discovered metadata merged with caller labels.
     pub labels: HashMap<String, String>,
     pub capabilities: RlCapabilities,
@@ -157,6 +195,8 @@ mod tests {
             role: None,
             health: "ready".to_string(),
             weight_version: Some("default".to_string()),
+            version_source: None,
+            control: RlControlState::Active,
             labels: HashMap::new(),
             capabilities: RlCapabilities {
                 source: RlCapabilitySource::Static,
@@ -250,12 +290,42 @@ mod tests {
     }
 
     #[test]
+    fn control_state_and_source_serialize_lowercase_and_default() {
+        assert_eq!(
+            serde_json::to_value(RlControlState::Asleep).unwrap(),
+            json!("asleep")
+        );
+        assert_eq!(
+            serde_json::to_value(RlVersionSource::Passthrough).unwrap(),
+            json!("passthrough")
+        );
+        let mut v = serde_json::to_value(sample_entry()).unwrap();
+        assert_eq!(v["control"], "active");
+        assert_eq!(v["version_source"], Value::Null);
+        v.as_object_mut().unwrap().remove("control");
+        let back: RlWorkerEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            back.control,
+            RlControlState::Active,
+            "older gateways omit control"
+        );
+        let req: RlSetControlRequest =
+            serde_json::from_value(json!({"control": "paused"})).unwrap();
+        assert_eq!(req.control, RlControlState::Paused);
+        assert!(
+            serde_json::from_value::<RlSetControlRequest>(json!({"control": "Paused"})).is_err()
+        );
+    }
+
+    #[test]
     fn every_wire_type_has_a_json_schema() {
         for schema in [
             schema_for!(RlWorkersResponse),
             schema_for!(RlWorkerEntry),
             schema_for!(RlCallOutcome),
             schema_for!(RlFanoutResponse),
+            schema_for!(RlSetVersionRequest),
+            schema_for!(RlSetControlRequest),
         ] {
             assert!(schema.to_value().get("title").is_some());
         }

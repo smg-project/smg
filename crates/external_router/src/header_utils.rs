@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     body::Body,
@@ -138,10 +138,31 @@ pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
 /// [`preserve_response_headers`] so the gateway's value wins over anything an
 /// upstream set under the same name. Skipped if the URL isn't representable as
 /// a header value.
+///
+/// This is the header half of [`stamp_routed_worker`], which is what callers
+/// with a whole response in hand should use: it sets this header and the
+/// [`RoutedWorker`] extension together, and layers keyed on the extension
+/// (the RL version stamp among them) see nothing when only the header is set.
 pub fn insert_routed_worker_id(headers: &mut HeaderMap, worker_url: &str) {
     if let Ok(value) = HeaderValue::from_str(worker_url) {
         headers.insert(HEADER_ROUTED_WORKER_ID.clone(), value);
     }
+}
+
+/// Response extension naming the worker that served the request. Set only by
+/// the gateway, never derived from an upstream header, so a layer keyed on it
+/// cannot be fooled through [`preserve_response_headers`] (the same reason
+/// the error code travels as an extension).
+#[derive(Clone, Debug)]
+pub struct RoutedWorker(pub Arc<str>);
+
+/// Stamp `x-smg-routed-worker-id` and the [`RoutedWorker`] extension on a
+/// response. Call after the headers are in place so the gateway's value wins.
+pub fn stamp_routed_worker<B>(response: &mut http::Response<B>, worker_url: &str) {
+    insert_routed_worker_id(response.headers_mut(), worker_url);
+    response
+        .extensions_mut()
+        .insert(RoutedWorker(Arc::from(worker_url)));
 }
 
 /// Whether `name` is SMG's own error-code response header.
@@ -408,6 +429,23 @@ pub fn should_forward_request_header(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stamp_routed_worker_sets_header_and_extension() {
+        let mut response = http::Response::new(());
+        response
+            .headers_mut()
+            .insert("x-smg-routed-worker-id", "http://forged".parse().unwrap());
+        stamp_routed_worker(&mut response, "http://w1:1@2");
+        assert_eq!(
+            response.headers()["x-smg-routed-worker-id"],
+            "http://w1:1@2"
+        );
+        assert_eq!(
+            &*response.extensions().get::<RoutedWorker>().unwrap().0,
+            "http://w1:1@2"
+        );
+    }
 
     #[test]
     fn preserve_response_headers_drops_smg_owned_error_code() {

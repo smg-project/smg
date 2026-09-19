@@ -45,7 +45,7 @@ const SSE_DONE: &str = "data: [DONE]\n\n";
 use crate::{
     error,
     header_utils::{
-        extract_forwardable_request_headers, insert_routed_worker_id, preserve_response_headers,
+        extract_forwardable_request_headers, preserve_response_headers, stamp_routed_worker,
         ApiProvider,
     },
     mcp_utils::DEFAULT_MAX_ITERATIONS,
@@ -567,8 +567,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
         return (status_code, error_body).into_response();
     }
 
-    let mut preserved_headers = preserve_response_headers(response.headers());
-    insert_routed_worker_id(&mut preserved_headers, worker.url());
+    let preserved_headers = preserve_response_headers(response.headers());
     let mut upstream_stream = response.bytes_stream();
 
     let (tx, rx) = sse_channel();
@@ -677,6 +676,8 @@ pub(super) async fn handle_simple_streaming_passthrough(
     if !headers_mut.contains_key(CONTENT_TYPE) {
         headers_mut.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
     }
+
+    stamp_routed_worker(&mut response, worker.url());
 
     response
 }

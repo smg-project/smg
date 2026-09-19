@@ -23,8 +23,10 @@ use crate::{
     discovery::enum_str,
     error::RlError,
     metrics::{op_label, record_control_call},
+    observe::observe,
     path::{passthrough_query, validate_engine_path},
     state::RlState,
+    table::VersionSource,
     view::RlWorkerInfo,
 };
 
@@ -220,6 +222,11 @@ pub async fn call_worker(
         body,
         body_truncated,
     };
+    if outcome.is_success() {
+        if let Some(observation) = observe(&req.path, &req.body) {
+            state.apply_observation(worker, observation, VersionSource::Passthrough);
+        }
+    }
     record_control_call(
         op,
         if outcome.is_success() {
@@ -283,6 +290,7 @@ mod tests {
             enabled: true,
             control_timeout_secs: timeout_secs,
             fanout_concurrency: 4,
+            ..RlConfig::default()
         };
         Arc::new(RlState::new(Arc::new(FakeView(workers)), cfg))
     }
@@ -519,6 +527,83 @@ mod tests {
         let (v, truncated) = parse_body(None, &big, false);
         assert!(truncated);
         assert_eq!(v.as_str().unwrap().len(), BODY_CAP);
+    }
+
+    #[tokio::test]
+    async fn a_successful_refit_records_the_version_and_a_failed_one_does_not() {
+        let ok = FakeEngine::start(StatusCode::OK, json!({"success": true}), 0).await;
+        let bad = FakeEngine::start(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"success": false}),
+            0,
+        )
+        .await;
+        let state = state(
+            vec![
+                worker("w1", &ok.url, RuntimeType::Sglang),
+                worker("w2", &bad.url, RuntimeType::Sglang),
+            ],
+            5,
+        );
+        let app = crate::router::<()>(Arc::clone(&state));
+        for id in ["w1", "w2"] {
+            let _ = app
+                .clone()
+                .oneshot(
+                    Request::post(format!("/workers/{id}/engine/update_weights_from_disk"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"model_path": "/ckpt", "weight_version": "5"}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(state.table().version_of(&ok.url).unwrap().as_str(), "5");
+        assert_eq!(state.table().version_of(&bad.url), None);
+        assert_eq!(
+            state.table().get(&ok.url).unwrap().version_source,
+            Some(VersionSource::Passthrough)
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_flip_the_control_state() {
+        let engine = FakeEngine::start(StatusCode::OK, json!({}), 0).await;
+        let state = state(vec![worker("w1", &engine.url, RuntimeType::Sglang)], 5);
+        let app = crate::router::<()>(Arc::clone(&state));
+        let post = |path: &str| {
+            Request::post(format!("/workers/w1/engine/{path}"))
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+        app.clone().oneshot(post("pause_generation")).await.unwrap();
+        assert_eq!(
+            state.table().control_of(&engine.url),
+            crate::table::ControlState::Paused
+        );
+        app.clone()
+            .oneshot(post("continue_generation"))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.table().control_of(&engine.url),
+            crate::table::ControlState::Active
+        );
+        app.clone()
+            .oneshot(post("release_memory_occupation"))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.table().control_of(&engine.url),
+            crate::table::ControlState::Asleep
+        );
+        app.oneshot(post("resume_memory_occupation")).await.unwrap();
+        assert_eq!(
+            state.table().control_of(&engine.url),
+            crate::table::ControlState::Active
+        );
     }
 
     #[tokio::test]

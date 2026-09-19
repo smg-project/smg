@@ -360,6 +360,8 @@ impl MockWorker {
             .route("/continue_generation", post(rl_control_handler))
             .route("/update_weights_from_disk", post(rl_control_handler))
             .route("/update_weight_version", post(rl_control_handler))
+            .route("/release_memory_occupation", post(rl_control_handler))
+            .route("/resume_memory_occupation", post(rl_control_handler))
             .route("/pause", post(rl_control_handler))
             .route("/resume", post(rl_control_handler))
             .route("/v1/loads", get(loads_handler))
@@ -576,6 +578,24 @@ async fn model_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>)
     .into_response()
 }
 
+/// Test hook: merge a request's `mock_meta_info` object into a response's
+/// `meta_info`, so a test can make the mock report engine-side fields (weight
+/// versions, for one) without a per-field knob on `MockWorkerConfig`. Existing
+/// keys stay unless the request overrides them by name.
+fn merge_mock_meta_info(payload: &serde_json::Value, response: &mut serde_json::Value) {
+    let Some(extra) = payload.get("mock_meta_info").and_then(|v| v.as_object()) else {
+        return;
+    };
+    if let Some(meta) = response
+        .get_mut("meta_info")
+        .and_then(|m| m.as_object_mut())
+    {
+        for (key, value) in extra {
+            meta.insert(key.clone(), value.clone());
+        }
+    }
+}
+
 #[expect(
     clippy::unwrap_used,
     reason = "test helper - panicking on failure is intentional"
@@ -641,7 +661,7 @@ async fn generate_handler(
                 .unwrap()
                 .as_secs_f64();
 
-            let data = json!({
+            let mut data = json!({
                 "text": format!("Mock response {}", i + 1),
                 "meta_info": {
                     "prompt_tokens": 10,
@@ -661,6 +681,7 @@ async fn generate_handler(
                 },
                 "stage": "mid"
             });
+            merge_mock_meta_info(&payload, &mut data);
 
             events.push(Ok::<_, Infallible>(Event::default().data(data.to_string())));
         }
@@ -676,27 +697,26 @@ async fn generate_handler(
         )
             .into_response()
     } else {
-        (
-            [("x-worker-id", worker_id)],
-            Json(json!({
-                "text": "This is a mock response.",
-                "meta_info": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 5,
-                    "completion_tokens_wo_jump_forward": 5,
-                    "input_token_logprobs": null,
-                    "output_token_logprobs": null,
-                    "first_token_latency": config.response_delay_ms as f64 / 1000.0,
-                    "time_to_first_token": config.response_delay_ms as f64 / 1000.0,
-                    "time_per_output_token": 0.01,
-                    "finish_reason": {
-                        "type": "stop",
-                        "reason": "length"
-                    }
+        let mut body = json!({
+            "text": "This is a mock response.",
+            "meta_info": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "completion_tokens_wo_jump_forward": 5,
+                "input_token_logprobs": null,
+                "output_token_logprobs": null,
+                "first_token_latency": config.response_delay_ms as f64 / 1000.0,
+                "time_to_first_token": config.response_delay_ms as f64 / 1000.0,
+                "time_per_output_token": 0.01,
+                "finish_reason": {
+                    "type": "stop",
+                    "reason": "length"
                 }
-            })),
-        )
-            .into_response()
+            }
+        });
+        merge_mock_meta_info(&payload, &mut body);
+
+        ([("x-worker-id", worker_id)], Json(body)).into_response()
     }
 }
 

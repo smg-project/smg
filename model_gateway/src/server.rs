@@ -1024,6 +1024,16 @@ pub fn build_app(
         app = app.merge(rl_routes);
     }
 
+    // RL M2: validate x-smg-version-policy and stamp served responses with
+    // the engine's weight version. Innermost layer, so it sees the router's
+    // response before logging and metrics do.
+    if let Some(rl) = app_state.context.rl.as_ref() {
+        app = app.layer(axum::middleware::from_fn_with_state(
+            Arc::clone(rl),
+            crate::rl_adapter::rl_middleware,
+        ));
+    }
+
     Ok(app
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
@@ -1623,7 +1633,15 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
                 http::Method::OPTIONS,
             ])
             .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION])
-            .expose_headers([http::header::HeaderName::from_static("x-request-id")])
+            // A browser client reads none of these unless they are exposed:
+            // the request id it correlates on, and the routing/version stamps
+            // an RL trainer needs to tell which engine answered.
+            .expose_headers([
+                http::header::HeaderName::from_static("x-request-id"),
+                http::header::HeaderName::from_static("x-smg-routed-worker-id"),
+                http::header::HeaderName::from_static("x-smg-weight-version"),
+                http::header::HeaderName::from_static("x-smg-mixed-version"),
+            ])
     };
 
     cors.max_age(Duration::from_secs(3600))

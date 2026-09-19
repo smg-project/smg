@@ -50,6 +50,7 @@ class TestRouterArgs:
         assert args.enable_rl is False
         assert args.rl_control_timeout_secs == 600
         assert args.rl_fanout_concurrency == 32
+        assert args.rl_version_policy == "any"
 
     def test_rl_flags_parse(self):
         """RL control-plane flags land on the dataclass."""
@@ -63,12 +64,15 @@ class TestRouterArgs:
                     "1200",
                     "--rl-fanout-concurrency",
                     "8",
+                    "--rl-version-policy",
+                    "max-staleness:2",
                 ]
             )
         )
         assert args.enable_rl is True
         assert args.rl_control_timeout_secs == 1200
         assert args.rl_fanout_concurrency == 8
+        assert args.rl_version_policy == "max-staleness:2"
 
     def test_parse_selector_valid(self):
         """Test parsing valid selector arguments."""
@@ -1468,6 +1472,7 @@ class TestRouterArgsFieldOrder:
         "enable_rl",
         "rl_control_timeout_secs",
         "rl_fanout_concurrency",
+        "rl_version_policy",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1506,6 +1511,7 @@ class TestRouterArgsFieldOrder:
             "enable_rl",
             "rl_control_timeout_secs",
             "rl_fanout_concurrency",
+            "rl_version_policy",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

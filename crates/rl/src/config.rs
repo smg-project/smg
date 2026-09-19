@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::policy::VersionPolicy;
+
 /// Configuration for the RL control plane. Inert unless `enabled`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -12,6 +14,9 @@ pub struct RlConfig {
     pub control_timeout_secs: u64,
     /// Maximum concurrent engine calls during a fan-out.
     pub fanout_concurrency: usize,
+    /// The default version policy, overridable per-request by the
+    /// `x-smg-version-policy` header.
+    pub version_policy: VersionPolicy,
 }
 
 impl Default for RlConfig {
@@ -20,6 +25,7 @@ impl Default for RlConfig {
             enabled: false,
             control_timeout_secs: 600,
             fanout_concurrency: 32,
+            version_policy: VersionPolicy::Any,
         }
     }
 }
@@ -28,6 +34,9 @@ impl RlConfig {
     /// Validate the values that matter when the control plane is enabled.
     pub fn validate(&self) -> Result<(), String> {
         if !self.enabled {
+            if self.version_policy != VersionPolicy::Any {
+                return Err("rl.version_policy requires rl.enabled".to_string());
+            }
             return Ok(());
         }
         if self.control_timeout_secs == 0 {
@@ -50,6 +59,7 @@ mod tests {
         assert!(!cfg.enabled);
         assert_eq!(cfg.control_timeout_secs, 600);
         assert_eq!(cfg.fanout_concurrency, 32);
+        assert_eq!(cfg.version_policy, VersionPolicy::Any);
         assert_eq!(cfg.validate(), Ok(()));
     }
 
@@ -68,12 +78,25 @@ mod tests {
             enabled: true,
             control_timeout_secs: 0,
             fanout_concurrency: 32,
+            ..RlConfig::default()
         };
         assert!(cfg.validate().unwrap_err().contains("control_timeout_secs"));
         cfg.control_timeout_secs = 600;
         cfg.fanout_concurrency = 0;
         assert!(cfg.validate().unwrap_err().contains("fanout_concurrency"));
         cfg.enabled = false;
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn version_policy_needs_the_flag() {
+        let mut cfg = RlConfig {
+            enabled: false,
+            version_policy: VersionPolicy::LatestOnly,
+            ..RlConfig::default()
+        };
+        assert!(cfg.validate().unwrap_err().contains("version_policy"));
+        cfg.enabled = true;
         assert_eq!(cfg.validate(), Ok(()));
     }
 }

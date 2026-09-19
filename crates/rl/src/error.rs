@@ -21,6 +21,12 @@ pub enum RlError {
     NoWorkersMatch(String),
     #[error("worker `{0}` not found")]
     WorkerNotFound(String),
+    #[error("{0}")]
+    InvalidVersion(String),
+    #[error("{0}")]
+    InvalidBody(String),
+    #[error("{0}")]
+    InvalidVersionPolicy(String),
     #[error("worker `{worker_id}` uses connection mode `{mode}`, which cannot be proxied")]
     UnsupportedConnectionMode {
         worker_id: String,
@@ -50,6 +56,9 @@ impl RlError {
             Self::InvalidSelector { .. } => "invalid_selector",
             Self::NoWorkersMatch(_) => "no_workers_match",
             Self::WorkerNotFound(_) => "worker_not_found",
+            Self::InvalidVersion(_) => "invalid_version",
+            Self::InvalidBody(_) => "invalid_body",
+            Self::InvalidVersionPolicy(_) => "invalid_version_policy",
             Self::UnsupportedConnectionMode { .. } => "unsupported_connection_mode",
             Self::UpstreamUnreachable { .. } => "upstream_unreachable",
             Self::UpstreamTimeout { .. } => "upstream_timeout",
@@ -61,7 +70,10 @@ impl RlError {
             Self::InvalidEnginePath(_)
             | Self::SelectorRequired
             | Self::InvalidSelector { .. }
-            | Self::NoWorkersMatch(_) => StatusCode::BAD_REQUEST,
+            | Self::NoWorkersMatch(_)
+            | Self::InvalidVersion(_)
+            | Self::InvalidBody(_)
+            | Self::InvalidVersionPolicy(_) => StatusCode::BAD_REQUEST,
             Self::WorkerNotFound(_) => StatusCode::NOT_FOUND,
             Self::UnsupportedConnectionMode { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::UpstreamUnreachable { .. } => StatusCode::BAD_GATEWAY,

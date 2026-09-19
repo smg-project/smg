@@ -6,10 +6,11 @@
 
 Sequence: pause_generation -> update_weights_from_disk -> continue_generation,
 each as one fan-out, then one /generate through SMG to confirm the engine
-reports the new meta_info.weight_version. The pause/resume pair is
-`smg.rl.paused`, so a failure at any stage still resumes the engines that did
-pause. Only HTTP workers can be proxied: a gRPC or ZMQ worker matched by
-`--selector` fails the fan-out with `unsupported_connection_mode`.
+reports the new meta_info.weight_version, and that SMG stamps
+`x-smg-weight-version` with it. The pause/resume pair is `smg.rl.paused`, so
+a failure at any stage still resumes the engines that did pause. Only HTTP
+workers can be proxied: a gRPC or ZMQ worker matched by `--selector` fails
+the fan-out with `unsupported_connection_mode`.
 """
 
 from __future__ import annotations
@@ -64,11 +65,16 @@ def main() -> int:
     )
     with urllib.request.urlopen(req, timeout=120) as resp:
         out = json.loads(resp.read())
+        stamped = resp.headers.get("x-smg-weight-version")
     got = str(out.get("meta_info", {}).get("weight_version"))
     print(f"/generate reported weight_version={got}")
     if got != str(args.weight_version):
         print("MISMATCH: engine did not report the new version", file=sys.stderr)
         return 1
+    if stamped != str(args.weight_version):
+        print(f"MISMATCH: gateway stamped x-smg-weight-version={stamped!r}", file=sys.stderr)
+        return 1
+    print(f"x-smg-weight-version={stamped}")
     print("OK")
     return 0
 

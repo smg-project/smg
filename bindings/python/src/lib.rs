@@ -534,6 +534,7 @@ struct Router {
     enable_rl: bool,
     rl_control_timeout_secs: u64,
     rl_fanout_concurrency: usize,
+    rl_version_policy: String,
 }
 
 impl Router {
@@ -832,6 +833,17 @@ impl Router {
                 None
             };
 
+        let rl_version_policy: smg_rl::VersionPolicy =
+            self.rl_version_policy
+                .parse()
+                .map_err(
+                    |e: smg_rl::VersionPolicyError| config::ConfigError::InvalidValue {
+                        field: "rl-version-policy".to_string(),
+                        value: self.rl_version_policy.clone(),
+                        reason: e.reason.to_string(),
+                    },
+                )?;
+
         config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -944,6 +956,7 @@ impl Router {
                 enabled: self.enable_rl,
                 control_timeout_secs: self.rl_control_timeout_secs,
                 fanout_concurrency: self.rl_fanout_concurrency,
+                version_policy: rl_version_policy,
             })
             .maybe_client_cert_and_key(
                 self.client_cert_path.as_ref(),
@@ -1117,6 +1130,7 @@ impl Router {
         enable_rl = false,
         rl_control_timeout_secs = 600,
         rl_fanout_concurrency = 32,
+        rl_version_policy = String::from("any"),
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1276,6 +1290,7 @@ impl Router {
         enable_rl: bool,
         rl_control_timeout_secs: u64,
         rl_fanout_concurrency: usize,
+        rl_version_policy: String,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1447,6 +1462,7 @@ impl Router {
             enable_rl,
             rl_control_timeout_secs,
             rl_fanout_concurrency,
+            rl_version_policy,
         })
     }
 

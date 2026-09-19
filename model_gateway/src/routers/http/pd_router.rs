@@ -1248,11 +1248,10 @@ impl PDRouter {
                 None
             };
 
-            let mut response_headers =
+            let response_headers =
                 header_utils::preserve_response_headers(decode_response.headers());
-            header_utils::insert_routed_worker_id(&mut response_headers, decode.url());
 
-            self.create_streaming_response(
+            let mut response = self.create_streaming_response(
                 decode_response.bytes_stream(),
                 status,
                 prefill_logprobs,
@@ -1260,7 +1259,9 @@ impl PDRouter {
                 None,
                 Some(response_headers),
                 load_guards,
-            )
+            );
+            header_utils::stamp_routed_worker(&mut response, decode.url());
+            response
         } else {
             // Non-streaming response
             let mut response = if context.return_logprob {
@@ -1292,7 +1293,7 @@ impl PDRouter {
 
             // The decode worker is the one that produced the body the client
             // sees, on both the merged-logprob and passthrough paths.
-            header_utils::insert_routed_worker_id(response.headers_mut(), decode.url());
+            header_utils::stamp_routed_worker(&mut response, decode.url());
             response
         }
     }

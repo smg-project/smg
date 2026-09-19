@@ -17,8 +17,8 @@ use tracing::{debug, info, warn};
 use super::{
     get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
-    BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig,
-    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
+    BucketPolicy, CacheAwarePolicy, CandidateFilter, ConsistentHashingPolicy, DPRankLoadPolicy,
+    LoadBalancingPolicy, ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
 };
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
@@ -26,7 +26,8 @@ use crate::{
     observability::metrics::Metrics,
     policies::cache_aware::LoadReceiver,
     routers::common::header_utils::{
-        extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
+        extract_routing_key_hint_named, extract_target_worker, parse_routing_tokens_hint,
+        ROUTING_KEY_HINT_MAX_BYTES,
     },
     worker::{KvEventMonitor, Worker},
 };
@@ -74,6 +75,10 @@ pub struct PolicyRegistry {
 
     // DP-rank policy: Supports the selection of dp-rank outside the engine.
     dp_rank_policy: Arc<OnceLock<Arc<dyn DPRankLoadPolicy>>>,
+
+    /// Optional pre-policy candidate filter (see [`CandidateFilter`]), set
+    /// once at startup like the PD leg policies.
+    candidate_filter: Arc<OnceLock<Arc<dyn CandidateFilter>>>,
 
     /// Shared sticky selector for the routing-key override. `Some` when the
     /// override is enabled; consulted (instead of the configured policy) for keyed
@@ -161,6 +166,7 @@ impl PolicyRegistry {
             load_rx: Arc::new(RwLock::new(None)),
             mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
+            candidate_filter: Arc::new(OnceLock::new()),
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
@@ -252,8 +258,109 @@ impl PolicyRegistry {
     /// configured policy does not already honor the key (`manual` /
     /// `consistent_hashing`, which read `rid_key` and the header themselves
     /// with the same rid-first precedence). Otherwise delegates to `policy`.
-    /// `policy.name()` stays the real policy (for metrics).
+    /// `policy.name()` stays the real policy (for metrics). A candidate
+    /// filter, when installed, narrows `workers` first; the returned index
+    /// always refers to the caller's slice.
     pub fn select_worker(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        if let Some(filter) = self.candidate_filter.get() {
+            if let Some(keep) = filter.eligible(workers, info.headers) {
+                if keep.is_empty() {
+                    return None;
+                }
+                if keep.len() < workers.len() {
+                    // An explicit target index is answered against the
+                    // caller's slice before the subset is built; handing it
+                    // to the policy would silently rewrite which worker it
+                    // names. See `target_worker_under_filter`.
+                    if let Some(decision) =
+                        Self::target_worker_under_filter(policy, workers, info, &keep)
+                    {
+                        return decision;
+                    }
+                    let subset: Vec<Arc<dyn Worker>> =
+                        keep.iter().map(|&i| Arc::clone(&workers[i])).collect();
+                    return self
+                        .select_unfiltered(policy, &subset, info)
+                        .and_then(|i| keep.get(i).copied());
+                }
+            }
+        }
+        self.select_unfiltered(policy, workers, info)
+    }
+
+    /// Decide an `x-smg-target-worker` request against the *caller's* slice
+    /// when a candidate filter narrowed it to a strict subset.
+    ///
+    /// The header carries an index, and an index only means something
+    /// relative to the list it indexes. Passing the narrowed subset to a
+    /// policy that honors the header would make index `1` name a different
+    /// worker than the caller asked for — silently, and differently on every
+    /// request as the filter's verdict moves. So the registry answers it
+    /// here instead, and never re-bases the number.
+    ///
+    /// `Some(Some(idx))` when the named worker survived the filter and is
+    /// available; `Some(None)` when it did not, which the caller already
+    /// turns into the retryable 503. `None` means no target-worker decision
+    /// applies (this policy does not honor the header, or none was sent),
+    /// and the subset path continues.
+    ///
+    /// [`ConsistentHashingPolicy`] is the only policy that honors the header
+    /// today, and this mirrors its own rules: a value that is not an index
+    /// into the slice, or names an unavailable worker, refuses rather than
+    /// falling through to a different worker.
+    fn target_worker_under_filter(
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        keep: &[usize],
+    ) -> Option<Option<usize>> {
+        if !policy.as_any().is::<ConsistentHashingPolicy>() {
+            return None;
+        }
+        let raw = extract_target_worker(info.headers)?;
+        let Ok(idx) = raw.parse::<usize>() else {
+            debug!(
+                target_worker = raw,
+                "x-smg-target-worker is not a worker index; refusing the request"
+            );
+            return Some(None);
+        };
+        if idx >= workers.len() {
+            debug!(
+                target_worker = idx,
+                workers = workers.len(),
+                "x-smg-target-worker is out of range; refusing the request"
+            );
+            return Some(None);
+        }
+        if !keep.contains(&idx) {
+            debug!(
+                target_worker = idx,
+                worker = workers[idx].url(),
+                "x-smg-target-worker names a worker the candidate filter dropped \
+                 (paused, asleep, or too stale for the version policy); refusing the request"
+            );
+            return Some(None);
+        }
+        if !workers[idx].is_healthy_and_eligible() {
+            debug!(
+                target_worker = idx,
+                worker = workers[idx].url(),
+                "x-smg-target-worker names an unavailable worker; refusing the request"
+            );
+            return Some(None);
+        }
+        Some(Some(idx))
+    }
+
+    /// Today's selection: the sticky routing-key override when it applies,
+    /// else the policy.
+    fn select_unfiltered(
         &self,
         policy: &Arc<dyn LoadBalancingPolicy>,
         workers: &[Arc<dyn Worker>],
@@ -695,6 +802,16 @@ impl PolicyRegistry {
         self.dp_rank_policy.get().map(Arc::clone)
     }
 
+    /// Install the candidate filter. Returns `false` (and keeps the first)
+    /// when one was already set.
+    pub fn set_candidate_filter(&self, filter: Arc<dyn CandidateFilter>) -> bool {
+        self.candidate_filter.set(filter).is_ok()
+    }
+
+    pub fn has_candidate_filter(&self) -> bool {
+        self.candidate_filter.get().is_some()
+    }
+
     /// Set the decode policy for PD mode (lock-free, set once at startup)
     pub fn set_decode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
         // OnceLock::set returns Err if already set, which we ignore since
@@ -898,6 +1015,26 @@ impl PolicyRegistry {
         }
     }
 
+    /// The worker's engine flushed its cache (a weight refit): reset its
+    /// entries in every cache-aware policy that could route the model.
+    ///
+    /// A model can route through its explicit, default, or PD/EPD leg policy;
+    /// `policies_for_model` covers all of them and deduplicates shared
+    /// instances, so each tree is reset at most once. The worker keeps its
+    /// load state — it is still serving, just with a cold cache.
+    pub fn reset_worker_cache(&self, worker: &dyn Worker) {
+        for policy in self.policies_for_model(worker.model_id()) {
+            if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                cache_aware.reset_worker_cache(worker);
+                debug!(
+                    worker = worker.url(),
+                    policy = policy.name(),
+                    "Reset cache-aware entries after a weight version change"
+                );
+            }
+        }
+    }
+
     /// Drop a removed worker's cached load report from all load-aware
     /// policies.
     ///
@@ -981,7 +1118,7 @@ impl std::fmt::Debug for PolicyRegistry {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::HealthCheckConfig;
+    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
     use tracing_test::traced_test;
 
     use super::*;
@@ -1161,6 +1298,70 @@ mod tests {
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
         }
+    }
+
+    /// Downcast a registry policy to the cache-aware implementation under test.
+    fn as_cache_aware(policy: &Arc<dyn LoadBalancingPolicy>) -> &CacheAwarePolicy {
+        policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap()
+    }
+
+    #[test]
+    fn reset_worker_cache_clears_the_model_and_leg_policies() {
+        let reg = PolicyRegistry::new(cache_aware_config());
+        let leg = cache_aware_policy();
+        reg.set_prefill_policy(Arc::clone(&leg));
+        let workers = vec![worker("http://w1:8000", WorkerType::Regular)];
+        let model = workers[0].model_id().to_string();
+        reg.on_worker_added(&model, None);
+        reg.init_cache_aware_policy(&model, &workers);
+        let model_policy = reg.get_policy(&model).unwrap();
+
+        let text = "a long shared instruction block this worker has served before";
+        for policy in [&model_policy, &leg] {
+            as_cache_aware(policy).insert_text_for_test(&model, text, workers[0].url());
+            assert_eq!(
+                as_cache_aware(policy).string_prefix_for_tenant(&model, text, workers[0].url()),
+                text
+            );
+        }
+
+        reg.reset_worker_cache(workers[0].as_ref());
+
+        for policy in [&model_policy, &leg] {
+            assert_eq!(
+                as_cache_aware(policy).string_prefix_for_tenant(&model, text, workers[0].url()),
+                "",
+                "every cache-aware policy that may route the model must forget the flush"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_worker_cache_reaches_a_model_served_by_the_default_policy() {
+        // A model with no explicit entry routes through the default policy, so
+        // reaching only `model_policies` would leave a flushed worker's tree
+        // stale (the bug `policies_for_model` exists to prevent).
+        let reg = PolicyRegistry::new(cache_aware_config());
+        let workers = [worker("http://w1:8000", WorkerType::Regular)];
+        let model = workers[0].model_id().to_string();
+        let default_policy = reg.get_default_policy();
+        assert!(
+            reg.get_policy(&model).is_none(),
+            "precondition: no per-model policy"
+        );
+        let text = "default-policy deployment prefix";
+        as_cache_aware(&default_policy).insert_text_for_test(&model, text, workers[0].url());
+
+        reg.reset_worker_cache(workers[0].as_ref());
+
+        assert_eq!(
+            as_cache_aware(&default_policy).string_prefix_for_tenant(
+                &model,
+                text,
+                workers[0].url()
+            ),
+            ""
+        );
     }
 
     fn headers_with_tokens(value: &str) -> HeaderMap {
@@ -2126,5 +2327,174 @@ mod tests {
 
         registry.remove_worker_from_pd_cache_aware("http://prefill-1:8000");
         registry.remove_worker_from_pd_cache_aware("http://decode-1:8000");
+    }
+
+    struct KeepIndices(Option<Vec<usize>>);
+
+    impl CandidateFilter for KeepIndices {
+        fn eligible(
+            &self,
+            _workers: &[Arc<dyn Worker>],
+            _headers: Option<&HeaderMap>,
+        ) -> Option<Vec<usize>> {
+            self.0.clone()
+        }
+    }
+
+    fn three_workers() -> Vec<Arc<dyn Worker>> {
+        ["http://w1:1", "http://w2:1", "http://w3:1"]
+            .iter()
+            .map(|url| {
+                let w: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new(*url)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                );
+                w.set_status(WorkerStatus::Ready);
+                w
+            })
+            .collect()
+    }
+
+    #[test]
+    fn candidate_filter_remaps_indices_into_the_callers_slice() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        assert!(registry.set_candidate_filter(Arc::new(KeepIndices(Some(vec![2])))));
+        assert!(
+            !registry.set_candidate_filter(Arc::new(KeepIndices(None))),
+            "set once"
+        );
+        let workers = three_workers();
+        let policy = registry.get_policy_or_default("m");
+        for _ in 0..4 {
+            assert_eq!(
+                registry.select_worker(&policy, &workers, &SelectWorkerInfo::default()),
+                Some(2)
+            );
+        }
+    }
+
+    #[test]
+    fn empty_eligible_set_selects_nothing() {
+        let registry = PolicyRegistry::new(PolicyConfig::Random);
+        registry.set_candidate_filter(Arc::new(KeepIndices(Some(vec![]))));
+        let workers = three_workers();
+        let policy = registry.get_policy_or_default("m");
+        assert_eq!(
+            registry.select_worker(&policy, &workers, &SelectWorkerInfo::default()),
+            None
+        );
+    }
+
+    fn headers_with_target(idx: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-smg-target-worker", idx.parse().unwrap());
+        h
+    }
+
+    /// `x-smg-target-worker` indexes the caller's slice. Under a narrowed
+    /// candidate set the registry answers it itself, so the number always
+    /// names the worker the caller meant: a survivor is routed to at its own
+    /// index, and a dropped one refuses rather than resolving to whichever
+    /// worker happens to sit at that offset in the subset.
+    #[test]
+    fn target_worker_index_stays_in_the_callers_slice_under_a_filter() {
+        let registry = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        registry.set_candidate_filter(Arc::new(KeepIndices(Some(vec![0, 2]))));
+        let workers = three_workers();
+        let policy = registry.get_policy_or_default("m");
+        assert_eq!(policy.name(), "consistent_hashing");
+
+        for (target, expected, note) in [
+            (
+                "2",
+                Some(2),
+                "a survivor keeps the caller's index, not the subset's",
+            ),
+            ("0", Some(0), "the first survivor is unaffected"),
+            (
+                "1",
+                None,
+                "a filtered-out worker refuses instead of sliding to another",
+            ),
+            ("3", None, "out of range refuses"),
+            ("nope", None, "a non-index value refuses"),
+        ] {
+            let headers = headers_with_target(target);
+            let info = SelectWorkerInfo {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            assert_eq!(
+                registry.select_worker(&policy, &workers, &info),
+                expected,
+                "{note}"
+            );
+        }
+    }
+
+    /// With every candidate eligible there is no subset, so the policy reads
+    /// the header against the caller's slice exactly as it always has.
+    #[test]
+    fn target_worker_index_is_unchanged_when_the_filter_keeps_everything() {
+        let registry = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        registry.set_candidate_filter(Arc::new(KeepIndices(None)));
+        let workers = three_workers();
+        let policy = registry.get_policy_or_default("m");
+        let headers = headers_with_target("1");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        assert_eq!(registry.select_worker(&policy, &workers, &info), Some(1));
+    }
+
+    /// Only a policy that honors the header gets this treatment. Round robin
+    /// ignores `x-smg-target-worker`, so it keeps selecting from the subset.
+    #[test]
+    fn a_policy_that_ignores_the_target_header_still_routes_within_the_subset() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry.set_candidate_filter(Arc::new(KeepIndices(Some(vec![0, 2]))));
+        let workers = three_workers();
+        let policy = registry.get_policy_or_default("m");
+        let headers = headers_with_target("1");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        for _ in 0..4 {
+            let picked = registry.select_worker(&policy, &workers, &info);
+            assert!(
+                matches!(picked, Some(0) | Some(2)),
+                "round robin ignores the header and stays in the subset: {picked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_filter_that_keeps_everything_changes_nothing() {
+        for config in [
+            PolicyConfig::RoundRobin,
+            PolicyConfig::Random,
+            PolicyConfig::PowerOfTwo {
+                load_check_interval_secs: 60,
+            },
+        ] {
+            let plain = PolicyRegistry::new(config.clone());
+            let filtered = PolicyRegistry::new(config);
+            filtered.set_candidate_filter(Arc::new(KeepIndices(None)));
+            let workers = three_workers();
+            let info = SelectWorkerInfo::default();
+            // Round robin is deterministic; random/p2 are checked for validity only.
+            let a = plain.select_worker(&plain.get_policy_or_default("m"), &workers, &info);
+            let b = filtered.select_worker(&filtered.get_policy_or_default("m"), &workers, &info);
+            assert!(a.is_some() && b.is_some());
+            if plain.get_policy_or_default("m").name() == "round_robin" {
+                assert_eq!(a, b);
+            }
+        }
     }
 }

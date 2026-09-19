@@ -485,6 +485,14 @@ struct CliArgs {
     #[arg(long, default_value_t = 32, help_heading = "RL Control Plane")]
     rl_fanout_concurrency: usize,
 
+    /// Which engines a request may be routed to, judged against the model's
+    /// newest known weight version: any | latest-only | min-version:<v> |
+    /// max-staleness:<k>. Per-request override: the x-smg-version-policy
+    /// header. An empty eligible set is a retryable 503; raise
+    /// --retry-max-retries / --retry-max-backoff-ms to wait out a refit.
+    #[arg(long, default_value = "any", help_heading = "RL Control Plane")]
+    rl_version_policy: String,
+
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
@@ -1832,6 +1840,15 @@ impl CliArgs {
             }
         }
 
+        let rl_version_policy: smg_rl::VersionPolicy =
+            self.rl_version_policy
+                .parse()
+                .map_err(|e: smg_rl::VersionPolicyError| ConfigError::InvalidValue {
+                    field: "rl-version-policy".to_string(),
+                    value: self.rl_version_policy.clone(),
+                    reason: e.reason.to_string(),
+                })?;
+
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -1958,6 +1975,7 @@ impl CliArgs {
                 enabled: self.enable_rl,
                 control_timeout_secs: self.rl_control_timeout_secs,
                 fanout_concurrency: self.rl_fanout_concurrency,
+                version_policy: rl_version_policy,
             })
             .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
             .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
