@@ -13,7 +13,11 @@ mod common;
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
+use llm_tokenizer::{
+    chat_template::ChatTemplateParams,
+    traits::{ChatTemplateOutput, Tokenizer},
+    Decoder, Encoder, Encoding, MockTokenizer, SpecialTokens, TokenizerRegistry,
+};
 use openai_protocol::{
     completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
 };
@@ -29,6 +33,70 @@ use tokio::net::TcpListener;
 const MODEL: &str = "pd-fanout-test-model";
 /// Tokens the canned mock emits per request; every sample reports exactly this.
 const OUTPUT_TOKENS: u32 = 3;
+
+/// The canned backend emits IDs starting at 100, outside MockTokenizer's
+/// vocabulary. Decode those IDs as visible text so chat tests exercise deltas.
+struct CannedTokenizer(MockTokenizer);
+
+impl Encoder for CannedTokenizer {
+    fn encode(&self, input: &str, add_special_tokens: bool) -> anyhow::Result<Encoding> {
+        self.0.encode(input, add_special_tokens)
+    }
+
+    fn encode_batch(
+        &self,
+        inputs: &[&str],
+        add_special_tokens: bool,
+    ) -> anyhow::Result<Vec<Encoding>> {
+        self.0.encode_batch(inputs, add_special_tokens)
+    }
+}
+
+impl Decoder for CannedTokenizer {
+    fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+        let ids: Vec<u32> = ids
+            .iter()
+            .map(|&id| {
+                if (100..100 + OUTPUT_TOKENS).contains(&id) {
+                    1
+                } else {
+                    id
+                }
+            })
+            .collect();
+        self.0.decode(&ids, skip_special_tokens)
+    }
+}
+
+impl Tokenizer for CannedTokenizer {
+    fn vocab_size(&self) -> usize {
+        self.0.vocab_size()
+    }
+    fn get_special_tokens(&self) -> &SpecialTokens {
+        self.0.get_special_tokens()
+    }
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.0.token_to_id(token)
+    }
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.0.id_to_token(id)
+    }
+    fn eos_token_ids(&self) -> &[u32] {
+        self.0.eos_token_ids()
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn apply_chat_template_with_encoding(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+        assistant_prefix: Option<&str>,
+    ) -> anyhow::Result<ChatTemplateOutput> {
+        self.0
+            .apply_chat_template_with_encoding(messages, params, assistant_prefix)
+    }
+}
 
 /// Spawn a canned mock gRPC worker in-process: one index-0 completion of
 /// `OUTPUT_TOKENS` tokens per request, `n` ignored.
@@ -90,7 +158,7 @@ async fn build_pd_router(prefill_port: u16, decode_port: u16) -> Box<dyn RouterT
     config.health_check.disable_health_check = true;
 
     let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
+    let tokenizer = Arc::new(CannedTokenizer(MockTokenizer::new())) as Arc<dyn Tokenizer>;
     tokenizer_registry
         .load(
             "tokenizer-id",
@@ -250,4 +318,101 @@ async fn a_single_sample_is_one_choice() {
         u64::from(OUTPUT_TOKENS),
         "{body}"
     );
+}
+
+/// Both the single-pair and n>1 merged chat paths must attach a cumulative
+/// snapshot to every JSON chunk, including role and finish events.
+#[tokio::test]
+async fn chat_continuous_usage_is_opt_in_for_single_and_multiple_choices() {
+    let prefill = start_mock_grpc_worker().await;
+    let decode = start_mock_grpc_worker().await;
+    let router = build_pd_router(prefill, decode).await;
+
+    for n in [1, 2] {
+        for options in [
+            serde_json::Value::Null,
+            serde_json::json!({"include_usage": true}),
+            serde_json::json!({"include_usage": true, "continuous_usage_stats": false}),
+            serde_json::json!({"include_usage": false, "continuous_usage_stats": true}),
+            serde_json::json!({"include_usage": true, "continuous_usage_stats": true}),
+        ] {
+            let include = options["include_usage"].as_bool().unwrap_or(false);
+            let continuous =
+                include && options["continuous_usage_stats"].as_bool().unwrap_or(false);
+            let request = serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hello world"}],
+                "n": n,
+                "max_tokens": 8,
+                "stream": true,
+                "stream_options": options,
+            }))
+            .unwrap();
+            let response = router.route_chat(None, &tenant(), request, MODEL).await;
+            let status = response.status();
+            let body = read_body(response).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert!(body.contains("data: [DONE]"), "{body}");
+            let events: Vec<serde_json::Value> = body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|payload| *payload != "[DONE]")
+                .map(|payload| serde_json::from_str(payload).unwrap())
+                .collect();
+            let mut previous_completion = 0;
+            let mut saw_completion_progress = false;
+            let mut roles = BTreeSet::new();
+            let mut finishes = BTreeSet::new();
+            let mut contents = BTreeSet::new();
+            for event in &events {
+                assert!(event.get("error").is_none(), "{event}");
+                let choices = event["choices"].as_array().unwrap();
+                assert_eq!(
+                    !event["usage"].is_null(),
+                    continuous || (include && choices.is_empty()),
+                    "{event}"
+                );
+                if let Some(usage) = event["usage"].as_object() {
+                    let completion = usage["completion_tokens"].as_u64().unwrap();
+                    assert!(completion >= previous_completion, "{event}");
+                    previous_completion = completion;
+                    saw_completion_progress |= !choices.is_empty() && completion > 0;
+                    assert_eq!(usage["prompt_tokens"], 1, "shared prompt counted once");
+                    assert_eq!(usage["total_tokens"], 1 + completion);
+                }
+                for choice in choices {
+                    let index = choice["index"].as_u64().unwrap();
+                    if choice["delta"]["role"] == "assistant" {
+                        roles.insert(index);
+                    }
+                    if choice["delta"]["content"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty())
+                    {
+                        contents.insert(index);
+                    }
+                    if !choice["finish_reason"].is_null() {
+                        finishes.insert(index);
+                    }
+                }
+            }
+            let expected: BTreeSet<u64> = (0..n).collect();
+            assert_eq!(roles, expected, "{body}");
+            assert_eq!(contents, expected, "{body}");
+            assert_eq!(finishes, expected, "{body}");
+            if continuous {
+                assert!(
+                    saw_completion_progress,
+                    "no progress before final usage: {body}"
+                );
+            }
+            if include {
+                assert_eq!(previous_completion, u64::from(OUTPUT_TOKENS) * n);
+                assert!(events.last().unwrap()["choices"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty());
+            }
+        }
+    }
 }

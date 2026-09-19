@@ -324,16 +324,21 @@ async fn chat_stream_error_does_not_flush_a_success_tail() {
 
 #[tokio::test]
 async fn chat_usage_chunk_excludes_unbilled_prompt_tokens() {
-    for unbilled in [0, 3] {
-        let (stream, server) = scripted_stream(
-            vec![chunk(0, "hi"), complete_with_prompt(0, "stop", 10)],
-            "0",
-        )
-        .await;
+    for (unbilled, continuous) in [(0, false), (3, false), (0, true), (3, true)] {
+        let mut first = chunk(0, "hi");
+        if let Some(GenerationEvent::Chunk(chunk)) = &mut first.response {
+            chunk.prompt_tokens = 10;
+            chunk.cached_tokens = 10;
+        }
+        let mut last = complete_with_prompt(0, "stop", 10);
+        if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
+            complete.cached_tokens = 10;
+        }
+        let (stream, server) = scripted_stream(vec![first, last], "0").await;
         let (tx, rx) = sse_channel();
         let request = serde_json::json!({
             "model": "eof-test", "messages": [], "stream": true,
-            "stream_options": {"include_usage": true}
+            "stream_options": {"include_usage": true, "continuous_usage_stats": continuous}
         });
         let mut spec = ChatResponseSpec::from(
             &serde_json::from_value::<ChatCompletionRequest>(request).expect("chat request"),
@@ -355,10 +360,34 @@ async fn chat_usage_chunk_excludes_unbilled_prompt_tokens() {
         server.abort();
         assert!(result.is_ok(), "{result:?}");
 
-        let usage = events
+        let final_event = events.last().expect("final usage event");
+        assert!(final_event["choices"].as_array().unwrap().is_empty());
+        let usage = &final_event["usage"];
+        for event in &events[..events.len() - 1] {
+            let snapshot = &event["usage"];
+            if continuous {
+                assert_eq!(snapshot["prompt_tokens"], 10 - unbilled, "{event}");
+                assert_eq!(
+                    snapshot["prompt_tokens_details"]["cached_tokens"],
+                    10 - unbilled
+                );
+                assert_eq!(
+                    snapshot["total_tokens"].as_u64().unwrap(),
+                    u64::from(10 - unbilled) + snapshot["completion_tokens"].as_u64().unwrap()
+                );
+                if !event["choices"][0]["finish_reason"].is_null() {
+                    assert_eq!(snapshot, usage, "finish and final usage must agree");
+                }
+            } else {
+                assert!(snapshot.is_null(), "{event}");
+            }
+        }
+        assert!(events
             .iter()
-            .find_map(|event| event.get("usage").filter(|usage| !usage.is_null()))
-            .expect("usage chunk");
+            .any(|event| event["choices"][0]["delta"]["content"] == "hi"));
+        assert!(events
+            .iter()
+            .any(|event| event["choices"][0]["finish_reason"] == "stop"));
         assert_eq!(usage["prompt_tokens"], 10 - unbilled);
         assert_eq!(
             usage["total_tokens"],

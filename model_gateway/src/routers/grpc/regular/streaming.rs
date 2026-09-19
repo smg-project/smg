@@ -40,7 +40,9 @@ use crate::{
         grpc::{
             common::{response_formatting::CompletionTokenTracker, responses::build_sse_response},
             context,
-            proto_wrapper::{ProtoResponseVariant, ProtoStream},
+            proto_wrapper::{
+                ProtoGenerateComplete, ProtoGenerateStreamChunk, ProtoResponseVariant, ProtoStream,
+            },
             spec::{
                 ChatResponseSpec, CompletionResponseSpec, GenerateResponseSpec,
                 MessagesResponseSpec,
@@ -76,6 +78,65 @@ struct CompletionStreamOutcome {
     /// clean EOF partway through leaves this `false` even if some choices
     /// did complete, so a partial result is never mistaken for full usage.
     saw_complete: bool,
+}
+
+/// Running usage is separate from settlement state: only Complete messages
+/// authorize settlement, even when intermediate chunks already report counts.
+#[derive(Default)]
+struct ChatStreamUsage {
+    choices: HashMap<u32, ChatStreamTokenCounts>,
+}
+
+#[derive(Default)]
+struct ChatStreamTokenCounts {
+    prompt: u32,
+    completion: u32,
+    cached: u32,
+    reasoning: u32,
+    spec_accepted: u32,
+    spec_drafted: u32,
+}
+
+impl ChatStreamUsage {
+    fn record_chunk(&mut self, chunk: &ProtoGenerateStreamChunk) {
+        let counts = self.choices.entry(chunk.index()).or_default();
+        counts.prompt = chunk.prompt_tokens();
+        counts.cached = chunk.cached_tokens();
+        counts.reasoning = chunk.reasoning_tokens();
+        if chunk.chunk_semantics().is_delta() {
+            counts.completion += chunk.token_ids().len() as u32;
+        } else {
+            counts.completion = chunk.completion_tokens();
+        }
+    }
+
+    fn record_complete(&mut self, complete: &ProtoGenerateComplete) {
+        let counts = self.choices.entry(complete.index()).or_default();
+        counts.prompt = complete.prompt_tokens();
+        counts.cached = complete.cached_tokens();
+        counts.reasoning = complete.reasoning_tokens();
+        counts.spec_accepted = complete.spec_accepted_tokens();
+        counts.spec_drafted = complete.spec_draft_tokens();
+        // Match CompletionTokenTracker: delta streams retain their observed
+        // token count, including when a local stop suppresses subsequent output.
+        if !complete.chunk_semantics().is_delta() {
+            counts.completion = complete.completion_tokens();
+        }
+    }
+
+    fn snapshot(&self) -> Usage {
+        // Choices share one prompt/cache but each generates its own output.
+        Usage::from_counts(
+            self.choices.values().map(|c| c.prompt).max().unwrap_or(0),
+            self.choices.values().map(|c| c.completion).sum(),
+        )
+        .with_cached_tokens(self.choices.values().map(|c| c.cached).max().unwrap_or(0))
+        .with_reasoning_tokens(self.choices.values().map(|c| c.reasoning).sum())
+        .with_speculative_tokens(
+            self.choices.values().map(|c| c.spec_accepted).sum(),
+            self.choices.values().map(|c| c.spec_drafted).sum(),
+        )
+    }
 }
 
 /// Shared streaming processor for both single and prefill/decode dispatch modes
@@ -285,6 +346,12 @@ impl StreamingProcessor {
         let tools = &original_request.tools;
         let history_tool_calls_count = original_request.history_tool_calls_count;
         let stream_options = &original_request.stream_options;
+        let mut continuous_usage = stream_options
+            .as_ref()
+            .filter(|opts| {
+                opts.include_usage.unwrap_or(false) && opts.continuous_usage_stats.unwrap_or(false)
+            })
+            .map(|_| ChatStreamUsage::default());
 
         // Phase 1: Initialize state tracking (per-index for n>1 support)
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
@@ -428,6 +495,9 @@ impl StreamingProcessor {
                     }
 
                     completion_tokens.record_chunk(&chunk);
+                    if let Some(usage) = &mut continuous_usage {
+                        usage.record_chunk(&chunk);
+                    }
 
                     // Get or create stop decoder for this index
                     let stop_decoder = stop_decoders.entry(index).or_insert_with(|| {
@@ -498,6 +568,9 @@ impl StreamingProcessor {
                     prompt_tokens.insert(index, complete.prompt_tokens());
 
                     completion_tokens.record_complete(&complete);
+                    if let Some(usage) = &mut continuous_usage {
+                        usage.record_complete(&complete);
+                    }
 
                     cached_tokens.insert(index, complete.cached_tokens());
                     reasoning_tokens.insert(index, complete.reasoning_tokens());
@@ -524,6 +597,11 @@ impl StreamingProcessor {
                 }
             };
 
+            let usage = continuous_usage.as_ref().map(|tracker| {
+                tracker
+                    .snapshot()
+                    .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens)
+            });
             let Some((index, text, choice_logprobs)) = pending else {
                 continue;
             };
@@ -537,6 +615,7 @@ impl StreamingProcessor {
                     .created(created)
                     .add_choice_role(index, "assistant")
                     .maybe_system_fingerprint(system_fingerprint)
+                    .maybe_usage(usage.clone())
                     .build();
                 Self::format_sse_chunk_into(&mut sse_buffer, &first_chunk);
                 tx.send(Ok(Bytes::from(sse_buffer.clone())))
@@ -565,7 +644,8 @@ impl StreamingProcessor {
                         system_fingerprint,
                     )
                     .await;
-                if let Some(chunk) = reasoning_chunk {
+                if let Some(mut chunk) = reasoning_chunk {
+                    chunk.usage = usage.clone();
                     Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
                     tx.send(Ok(Bytes::from(sse_buffer.clone())))
                         .await
@@ -622,7 +702,8 @@ impl StreamingProcessor {
                         .await
                     };
 
-                    for chunk in tool_chunks {
+                    for mut chunk in tool_chunks {
+                        chunk.usage = usage.clone();
                         Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
                         tx.send(Ok(Bytes::from(sse_buffer.clone())))
                             .await
@@ -641,6 +722,7 @@ impl StreamingProcessor {
                     .created(created)
                     .add_choice_content_with_logprobs(index, "assistant", delta, choice_logprobs)
                     .maybe_system_fingerprint(system_fingerprint)
+                    .maybe_usage(usage.clone())
                     .build();
                 Self::format_sse_chunk_into(&mut sse_buffer, &content_chunk);
                 tx.send(Ok(Bytes::from(sse_buffer.clone())))
@@ -648,6 +730,12 @@ impl StreamingProcessor {
                     .map_err(|_| "Failed to send content chunk".to_string())?;
             }
         }
+
+        let usage = continuous_usage.as_ref().map(|tracker| {
+            tracker
+                .snapshot()
+                .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens)
+        });
 
         // Phase 3: End-of-stream parser flush: first any text still buffered
         // as a prospective tool call that never materialized (dropping it
@@ -662,6 +750,7 @@ impl StreamingProcessor {
                     .created(created)
                     .add_choice_content(*index, "assistant", leftover_text)
                     .maybe_system_fingerprint(system_fingerprint)
+                    .maybe_usage(usage.clone())
                     .build();
 
                 let sse_chunk = sse_encoder
@@ -692,6 +781,7 @@ impl StreamingProcessor {
                         .created(created)
                         .add_choice_tool_call_delta(*index, tool_call_delta)
                         .maybe_system_fingerprint(system_fingerprint)
+                        .maybe_usage(usage.clone())
                         .build();
 
                     let sse_chunk = sse_encoder
@@ -719,6 +809,7 @@ impl StreamingProcessor {
                 .created(created)
                 .add_choice_finish_reason(*index, final_finish_reason, matched_stop_value)
                 .maybe_system_fingerprint(system_fingerprint)
+                .maybe_usage(usage.clone())
                 .build();
 
             let sse_chunk = sse_encoder
@@ -3326,6 +3417,71 @@ mod eof_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
+        use smg_grpc_client::sglang_proto as proto;
+
+        let mut tracker = ChatStreamUsage::default();
+        for (index, completion_tokens, reasoning_tokens) in [(0, 2, 1), (0, 5, 3), (1, 4, 2)] {
+            tracker.record_chunk(&ProtoGenerateStreamChunk::Sglang(
+                proto::GenerateStreamChunk {
+                    index,
+                    prompt_tokens: 10,
+                    cached_tokens: 8,
+                    completion_tokens,
+                    reasoning_tokens,
+                    token_ids: vec![1], // Incremental IDs must not replace cumulative counts.
+                    ..Default::default()
+                },
+            ));
+        }
+        let usage = serde_json::to_value(tracker.snapshot()).unwrap();
+        assert_eq!(usage["prompt_tokens"], 10);
+        assert_eq!(usage["completion_tokens"], 9);
+        assert_eq!(usage["total_tokens"], 19);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 8);
+        assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 5);
+
+        tracker.record_complete(&ProtoGenerateComplete::Sglang(proto::GenerateComplete {
+            index: 0,
+            prompt_tokens: 10,
+            cached_tokens: 8,
+            completion_tokens: 6,
+            reasoning_tokens: 3,
+            spec_accepted_tokens: 2,
+            spec_draft_tokens: 3,
+            ..Default::default()
+        }));
+        let usage = tracker.snapshot();
+        assert_eq!(usage.completion_tokens, 10);
+        let details = usage.completion_tokens_details.unwrap();
+        assert_eq!(details.accepted_prediction_tokens, Some(2));
+        assert_eq!(details.rejected_prediction_tokens, Some(1));
+    }
+
+    #[test]
+    fn continuous_chat_usage_accumulates_delta_ids_without_double_counting_complete() {
+        use smg_grpc_client::vllm_proto as proto;
+
+        let mut tracker = ChatStreamUsage::default();
+        for ids in [vec![1, 2], vec![3]] {
+            tracker.record_chunk(&ProtoGenerateStreamChunk::Vllm(
+                proto::GenerateStreamChunk {
+                    prompt_tokens: 10,
+                    token_ids: ids,
+                    ..Default::default()
+                },
+            ));
+        }
+        assert_eq!(tracker.snapshot().completion_tokens, 3);
+        tracker.record_complete(&ProtoGenerateComplete::Vllm(proto::GenerateComplete {
+            prompt_tokens: 10,
+            completion_tokens: 3,
+            ..Default::default()
+        }));
+        assert_eq!(tracker.snapshot().completion_tokens, 3);
+    }
 
     #[test]
     fn completion_streaming_usage_includes_reasoning_tokens() {
