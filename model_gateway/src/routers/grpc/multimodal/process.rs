@@ -215,7 +215,13 @@ pub(crate) async fn process_multimodal_plan(
 
         let media_info = media_item_infos(&media);
         let prompt_replacements = spec
-            .prompt_replacements_with_media(&metadata, &preprocessed, modality, &media_info)
+            .prompt_replacements_with_media(
+                &metadata,
+                &preprocessed,
+                modality,
+                &media_info,
+                preprocessor_config_for(&model_config, modality),
+            )
             .map_err(|e| anyhow::anyhow!("Failed to compute prompt replacements: {e}"))?;
 
         let media_count = media.len();
@@ -348,13 +354,7 @@ async fn preprocess_modality(
     // block the tokio async runtime under concurrent load.
     // TODO: consider making the thread pool size configurable.
     let modality = media.modality();
-    let pp_config = match modality {
-        Modality::Video => model_config
-            .video_preprocessor_config
-            .clone()
-            .unwrap_or_else(|| model_config.preprocessor_config.clone()),
-        _ => model_config.preprocessor_config.clone(),
-    };
+    let pp_config = preprocessor_config_for(model_config, modality).clone();
 
     if let MediaBatch::Images(images) = media {
         if let (Some(cache), [image]) = (components.pixel_cache.clone(), images.as_slice()) {
@@ -475,6 +475,20 @@ fn with_video_sample_fps(mut config: PreProcessorConfig, video: &VideoClip) -> P
         .extra
         .insert("fps".to_string(), serde_json::json!(video.sample_fps()));
     config
+}
+
+/// The config a modality is preprocessed with: video's own when the checkpoint ships one.
+fn preprocessor_config_for(
+    model_config: &MultimodalModelConfig,
+    modality: Modality,
+) -> &PreProcessorConfig {
+    match modality {
+        Modality::Video => model_config
+            .video_preprocessor_config
+            .as_ref()
+            .unwrap_or(&model_config.preprocessor_config),
+        _ => &model_config.preprocessor_config,
+    }
 }
 
 /// One descriptor per media item, in batch order; only decoded clips carry sampling.
@@ -821,6 +835,36 @@ mod tests {
         let infos = media_item_infos(&MediaBatch::Images(vec![image(), image(), image()]));
 
         assert_eq!(infos, vec![MediaItemInfo::default(); 3]);
+    }
+
+    #[test]
+    fn preprocessor_config_for_video_is_the_video_config_when_shipped() {
+        let image_config = PreProcessorConfig {
+            temporal_patch_size: Some(2),
+            ..Default::default()
+        };
+        let video_config = PreProcessorConfig {
+            temporal_patch_size: Some(4),
+            ..Default::default()
+        };
+        let with_video = MultimodalModelConfig {
+            config: serde_json::json!({}),
+            preprocessor_config: image_config.clone(),
+            video_preprocessor_config: Some(video_config),
+        };
+        let without_video = MultimodalModelConfig {
+            config: serde_json::json!({}),
+            preprocessor_config: image_config,
+            video_preprocessor_config: None,
+        };
+
+        let temporal = |config: &MultimodalModelConfig, modality| {
+            preprocessor_config_for(config, modality).temporal_patch_size
+        };
+        assert_eq!(temporal(&with_video, Modality::Video), Some(4));
+        assert_eq!(temporal(&with_video, Modality::Image), Some(2));
+        assert_eq!(temporal(&with_video, Modality::Audio), Some(2));
+        assert_eq!(temporal(&without_video, Modality::Video), Some(2));
     }
 
     #[test]
