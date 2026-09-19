@@ -185,8 +185,9 @@ pub(crate) fn select_from(
 
     // The registry applies the routing-key sticky override when enabled and
     // otherwise delegates to the configured policy.
-    let idx = policies.select_worker(
+    let idx = policies.select_worker_for_model(
         &policy,
+        model_id,
         available,
         &SelectWorkerInfo {
             request_text: inputs.text,
@@ -382,7 +383,9 @@ pub(crate) fn select_pair(
             verdict: PlacementFailure::PolicyDeclined(policy),
         })
     };
-    let Some(prefill_idx) = policies.select_worker(&prefill_policy, &prefill, &info) else {
+    let Some(prefill_idx) =
+        policies.select_worker_for_model(&prefill_policy, model_id, &prefill, &info)
+    else {
         return Err(declined(WorkerLeg::Prefill, prefill_policy.name()));
     };
     let selected_prefill = prefill[prefill_idx].clone();
@@ -401,7 +404,9 @@ pub(crate) fn select_pair(
         return Err(fail(WorkerLeg::Decode, PlacementFailure::Unavailable));
     }
     info.leg = WorkerLeg::Decode;
-    let Some(decode_idx) = policies.select_worker(&decode_policy, &decode, &info) else {
+    let Some(decode_idx) =
+        policies.select_worker_for_model(&decode_policy, model_id, &decode, &info)
+    else {
         return Err(declined(WorkerLeg::Decode, decode_policy.name()));
     };
     let selected_decode = decode[decode_idx].clone();

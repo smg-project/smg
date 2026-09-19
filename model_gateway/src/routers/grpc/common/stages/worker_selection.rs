@@ -680,13 +680,19 @@ impl WorkerSelectionStage {
             hash_ring: hash_ring.clone(),
             leg: WorkerLeg::Prefill,
         };
-        let prefill_idx =
-            self.policy_registry
-                .select_worker(&prefill_policy, &available_prefill, &info)?;
+        let prefill_idx = self.policy_registry.select_worker_for_model(
+            &prefill_policy,
+            model_id,
+            &available_prefill,
+            &info,
+        )?;
         info.leg = WorkerLeg::Decode;
-        let decode_idx =
-            self.policy_registry
-                .select_worker(&decode_policy, &available_decode, &info)?;
+        let decode_idx = self.policy_registry.select_worker_for_model(
+            &decode_policy,
+            model_id,
+            &available_decode,
+            &info,
+        )?;
 
         let encode_assignments = assign_encode_workers(
             &available_encode,
