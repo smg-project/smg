@@ -502,7 +502,7 @@ impl GrpcClient {
             }
             Self::Vllm(_) => {
                 let vllm_mm = options.multimodal_inputs.map(|mm| match mm {
-                    MultimodalData::Vllm(data) => data.into_proto(),
+                    MultimodalData::Vllm(data) => data.into_protos(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
                 finish_vllm_request(vllm_mm, |mm| {
@@ -594,7 +594,7 @@ impl GrpcClient {
             }
             Self::Vllm(_) => {
                 let vllm_mm = options.multimodal_inputs.map(|mm| match mm {
-                    MultimodalData::Vllm(data) => data.into_proto(),
+                    MultimodalData::Vllm(data) => data.into_protos(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
                 finish_vllm_request(vllm_mm, |mm| {

@@ -143,6 +143,7 @@ impl VllmEngineClient {
             data_parallel_rank: None,
             mm_inputs,
             media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         Ok(grpc_request)
@@ -173,6 +174,7 @@ impl VllmEngineClient {
             data_parallel_rank: None,
             mm_inputs: None,
             media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         Ok(grpc_request)
@@ -207,6 +209,7 @@ impl VllmEngineClient {
             data_parallel_rank: None,
             mm_inputs: None,
             media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         Ok(grpc_request)
@@ -420,6 +423,7 @@ impl VllmEngineClient {
             data_parallel_rank: None,
             mm_inputs: multimodal_inputs,
             media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         Ok(grpc_request)
@@ -480,6 +484,7 @@ impl VllmEngineClient {
             data_parallel_rank: None,
             mm_inputs: None,
             media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         Ok(grpc_request)
@@ -809,6 +814,7 @@ mod tests {
             data_parallel_rank: None,
             mm_inputs: None,
             media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         assert_eq!(gen_req.request_id, "test-req-123");

@@ -10,7 +10,25 @@ that key for the field configs to line up.
 
 from __future__ import annotations
 
+from smg_grpc_proto.generated import common_pb2
+
 DEFAULT_ENCODER_INPUT_KEY = "pixel_values"
+
+
+def mm_batches(request) -> list:
+    """Every multimodal batch on a GenerateRequest, ``mm_inputs`` first and
+    then ``extra_mm_inputs`` (a request mixing image and video carries one
+    batch per modality). A stub built from an older proto has no
+    ``extra_mm_inputs``; it reads as none.
+    """
+    batches = [request.mm_inputs] if request.HasField("mm_inputs") else []
+    batches.extend(getattr(request, "extra_mm_inputs", ()))
+    return batches
+
+
+def modality_name(mm_proto) -> str:
+    """vLLM's name for the batch's modality: ``video`` or ``image``."""
+    return "video" if mm_proto.modality == common_pb2.VIDEO else "image"
 
 
 def primary_encoder_key(mm_proto) -> str:

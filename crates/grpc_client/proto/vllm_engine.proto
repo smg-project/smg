@@ -210,6 +210,11 @@ message GenerateRequest {
   // Optional multimodal data (images for vision models)
   MultimodalInputs mm_inputs = 7;
 
+  // Further preprocessed batches when one request carries several modalities
+  // (an image batch in mm_inputs and a video batch here, say). Each batch has
+  // its own modality, tensors, placeholders and hashes.
+  repeated MultimodalInputs extra_mm_inputs = 11;
+
   // Connector KV-transfer params as a JSON object, passed verbatim to the
   // engine (e.g. NIXL's do_remote_prefill/remote_block_ids/remote_host/...).
   // Preferred over the legacy typed kv_transfer_params field.

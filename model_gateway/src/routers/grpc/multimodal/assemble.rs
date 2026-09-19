@@ -80,10 +80,9 @@ async fn assemble_multimodal_data_impl(
             let batch = into_single_batch(intermediate, "SGLang")?;
             Ok(MultimodalData::Sglang(assemble_sglang(batch)?))
         }
-        BackendClient::Grpc(GrpcClient::Vllm(_)) => {
-            let batch = into_single_batch(intermediate, "vLLM")?;
-            Ok(MultimodalData::Vllm(assemble_vllm(batch, workers)?))
-        }
+        BackendClient::Grpc(GrpcClient::Vllm(_)) => Ok(MultimodalData::Vllm(
+            assemble_vllm_batches(intermediate, workers)?,
+        )),
         BackendClient::Grpc(GrpcClient::Trtllm(_)) => {
             let batch = into_single_batch(intermediate, "TRT-LLM")?;
             Ok(MultimodalData::Trtllm(assemble_trtllm(batch)?))
@@ -111,12 +110,15 @@ async fn assemble_multimodal_data_impl(
             // connect() admits only vLLM/TokenSpeed runtimes over ZMQ, so no
             // Unspecified fallback: anything else is a hard error below.
             RuntimeType::Vllm => {
-                let batch = into_single_batch(intermediate, "vLLM")?;
-                let mut data = assemble_vllm(batch, workers)?;
+                let mut data = assemble_vllm_batches(intermediate, workers)?;
                 // The ZMQ translate reads tensor bytes inline; this wire has no
                 // /dev/shm or RDMA pull on the engine side.
                 data.shm_enabled = false;
                 data.rdma_enabled = false;
+                for batch in &mut data.extra_batches {
+                    batch.shm_enabled = false;
+                    batch.rdma_enabled = false;
+                }
                 Ok(MultimodalData::Vllm(data))
             }
             RuntimeType::TokenSpeed => {
@@ -196,11 +198,27 @@ impl Drop for PendingTokenSpeedAssembly {
     }
 }
 
-/// Backends other than TokenSpeed take a single preprocessed batch (one
-/// modality). The per-modality capability is enforced by
+/// vLLM takes every modality batch of the request: the first travels as
+/// `mm_inputs`, the rest as `extra_mm_inputs`, each assembled the same way.
+fn assemble_vllm_batches(
+    intermediate: MultimodalIntermediate,
+    workers: Option<&WorkerSelection>,
+) -> Result<VllmMultimodalData> {
+    let mut batches = intermediate.into_batches().into_iter();
+    let first = batches
+        .next()
+        .context("multimodal intermediate is missing its first batch")?;
+    let mut data = assemble_vllm(first, workers)?;
+    data.extra_batches = batches
+        .map(|batch| assemble_vllm(batch, workers))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(data)
+}
+
+/// SGLang and TRT-LLM take a single preprocessed batch (one modality). The
+/// per-modality capability is enforced by
 /// [`ensure_client_supports_intermediate`]; this only enforces the structural
-/// single-batch constraint (multiple modalities in one request are TokenSpeed-
-/// only).
+/// single-batch constraint.
 fn into_single_batch(
     intermediate: MultimodalIntermediate,
     backend: &str,
@@ -292,6 +310,7 @@ fn assemble_vllm(
         shm_min_bytes: resolve_mm_shm_min_bytes(workers),
         // vLLM workers cannot pull RDMA payloads yet.
         rdma_enabled: false,
+        extra_batches: Vec::new(),
     })
 }
 

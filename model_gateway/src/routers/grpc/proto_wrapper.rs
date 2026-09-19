@@ -140,6 +140,10 @@ pub struct VllmMultimodalData {
     /// Whether `pixel_values` may use the RDMA lane. Gated on the worker being able
     /// to pull, so SMG never emits a `remote` payload a worker would reject.
     pub rdma_enabled: bool,
+    /// The other modalities of a mixed request (a video batch next to an
+    /// image batch), each assembled the same way; they travel in the
+    /// request's `extra_mm_inputs`.
+    pub extra_batches: Vec<VllmMultimodalData>,
 }
 
 /// TRT-LLM multimodal data: raw image bytes only.
@@ -283,8 +287,17 @@ impl SglangMultimodalData {
 }
 
 impl VllmMultimodalData {
-    /// Convert to vLLM proto MultimodalInputs.
-    pub fn into_proto(self) -> vllm::MultimodalInputs {
+    /// Convert to the request's `mm_inputs` and `extra_mm_inputs`.
+    pub fn into_protos(mut self) -> (vllm::MultimodalInputs, Vec<vllm::MultimodalInputs>) {
+        let extras = std::mem::take(&mut self.extra_batches)
+            .into_iter()
+            .map(Self::into_proto)
+            .collect();
+        (self.into_proto(), extras)
+    }
+
+    /// Convert one batch to a vLLM proto MultimodalInputs.
+    fn into_proto(self) -> vllm::MultimodalInputs {
         let shm_enabled = self.shm_enabled;
         let shm_min_bytes = self.shm_min_bytes;
         // RDMA only for pixel_values (see TokenSpeed item conversion).
@@ -868,15 +881,23 @@ pub(crate) fn finish_tokenspeed_request(
 /// request is fully assembled (sampling/tool validation), so a build error must
 /// unlink them or the worker — which never receives the request — leaks them.
 pub(crate) fn finish_vllm_request(
-    vllm_mm: Option<vllm::MultimodalInputs>,
+    vllm_mm: Option<(vllm::MultimodalInputs, Vec<vllm::MultimodalInputs>)>,
     build: impl FnOnce(Option<vllm::MultimodalInputs>) -> Result<vllm::GenerateRequest, String>,
 ) -> Result<ProtoGenerateRequest, String> {
-    let shm_handles = vllm_mm
-        .as_ref()
-        .map(collect_vllm_multimodal_inputs_shm_handles)
-        .unwrap_or_default();
-    match build(vllm_mm) {
-        Ok(req) => Ok(ProtoGenerateRequest::Vllm(Box::new(req))),
+    let (primary, extra) = match vllm_mm {
+        Some((primary, extra)) => (Some(primary), extra),
+        None => (None, Vec::new()),
+    };
+    let shm_handles: Vec<_> = primary
+        .iter()
+        .chain(&extra)
+        .flat_map(collect_vllm_multimodal_inputs_shm_handles)
+        .collect();
+    match build(primary) {
+        Ok(mut req) => {
+            req.extra_mm_inputs = extra;
+            Ok(ProtoGenerateRequest::Vllm(Box::new(req)))
+        }
         Err(error) => {
             cleanup_mm_shm_handles(&shm_handles);
             Err(error)
@@ -932,6 +953,66 @@ fn collect_tokenspeed_tensor_shm_handles(
     }
 }
 
+/// The identity of a multimodal batch without its pixels, for the PD decode
+/// leg: hashes, placeholders and the M-RoPE grid tensors (a few ints per item,
+/// inline payloads only, since an SHM segment is unreadable after the prefill
+/// send). A hash-less batch carries no identity worth keeping.
+fn vllm_mm_identity(mm: &vllm::MultimodalInputs) -> Option<vllm::MultimodalInputs> {
+    if mm.mm_hashes.is_empty() {
+        return None;
+    }
+    let inline_tensor = |key: &str| {
+        mm.model_specific_tensors
+            .get(key)
+            .filter(|tensor| matches!(tensor.payload, Some(vllm::tensor_data::Payload::Inline(_))))
+            .cloned()
+    };
+    let mut grid_tensors: HashMap<String, vllm::TensorData> = VLLM_MROPE_GRID_KEYS
+        .iter()
+        .filter_map(|key| inline_tensor(key).map(|tensor| (key.to_string(), tensor)))
+        .collect();
+    // A flat-classified grid key needs its sizes tensor to keep per-item
+    // slicing on the decode leg.
+    let mut flat_keys = HashMap::new();
+    for (key, sizes_key) in &mm.flat_keys {
+        if !grid_tensors.contains_key(key) {
+            continue;
+        }
+        match inline_tensor(sizes_key) {
+            Some(sizes) => {
+                grid_tensors.insert(sizes_key.clone(), sizes);
+                flat_keys.insert(key.clone(), sizes_key.clone());
+            }
+            None => {
+                tracing::warn!(
+                    grid_key = %key,
+                    sizes_key = %sizes_key,
+                    "dropping grid tensor from the PD decode leg: its sizes tensor is not inline"
+                );
+                grid_tensors.remove(key);
+            }
+        }
+    }
+    let retained = |keys: &[String]| {
+        keys.iter()
+            .filter(|key| grid_tensors.contains_key(*key))
+            .cloned()
+            .collect()
+    };
+    Some(vllm::MultimodalInputs {
+        im_token_id: mm.im_token_id,
+        mm_placeholders: mm.mm_placeholders.clone(),
+        mm_hashes: mm.mm_hashes.clone(),
+        modality: mm.modality,
+        batched_keys: retained(&mm.batched_keys),
+        keep_on_cpu_keys: retained(&mm.keep_on_cpu_keys),
+        flat_keys,
+        model_specific_tensors: grid_tensors,
+        encoder_input_key: mm.encoder_input_key.clone(),
+        ..Default::default()
+    })
+}
+
 pub fn collect_vllm_multimodal_inputs_shm_handles(
     inputs: &vllm::MultimodalInputs,
 ) -> Vec<common::ShmHandle> {
@@ -948,9 +1029,10 @@ pub fn collect_vllm_generate_request_shm_handles(
 ) -> Vec<common::ShmHandle> {
     request
         .mm_inputs
-        .as_ref()
-        .map(collect_vllm_multimodal_inputs_shm_handles)
-        .unwrap_or_default()
+        .iter()
+        .chain(&request.extra_mm_inputs)
+        .flat_map(collect_vllm_multimodal_inputs_shm_handles)
+        .collect()
 }
 
 fn collect_optional_vllm_tensor_shm_handles(
@@ -1344,78 +1426,14 @@ impl ProtoGenerateRequest {
             }
             Self::Vllm(req) => {
                 let mm = req.mm_inputs.take();
+                let extra = std::mem::take(&mut req.extra_mm_inputs);
                 let mut clone = Self::Vllm(req.clone());
-                // Rebuild the identity (no pixel tensors) on the clone; a
-                // hash-less payload carries no identity worth keeping.
-                if let (Self::Vllm(clone_req), Some(mm_ref)) = (&mut clone, mm.as_ref()) {
-                    if !mm_ref.mm_hashes.is_empty() {
-                        // M-RoPE models (Qwen-VL) need the grid tensors to
-                        // compute decode-side positions; they are a few ints
-                        // per item, so keep them (inline payloads only — an
-                        // SHM segment is unreadable after the prefill send).
-                        let inline_tensor = |key: &str| {
-                            mm_ref
-                                .model_specific_tensors
-                                .get(key)
-                                .filter(|tensor| {
-                                    matches!(
-                                        tensor.payload,
-                                        Some(vllm::tensor_data::Payload::Inline(_))
-                                    )
-                                })
-                                .cloned()
-                        };
-                        let mut grid_tensors: HashMap<String, vllm::TensorData> =
-                            VLLM_MROPE_GRID_KEYS
-                                .iter()
-                                .filter_map(|key| {
-                                    inline_tensor(key).map(|tensor| (key.to_string(), tensor))
-                                })
-                                .collect();
-                        // A flat-classified grid key needs its sizes tensor to
-                        // keep per-item slicing on the decode leg.
-                        let mut flat_keys = HashMap::new();
-                        for (key, sizes_key) in &mm_ref.flat_keys {
-                            if !grid_tensors.contains_key(key) {
-                                continue;
-                            }
-                            match inline_tensor(sizes_key) {
-                                Some(sizes) => {
-                                    grid_tensors.insert(sizes_key.clone(), sizes);
-                                    flat_keys.insert(key.clone(), sizes_key.clone());
-                                }
-                                None => {
-                                    tracing::warn!(
-                                        grid_key = %key,
-                                        sizes_key = %sizes_key,
-                                        "dropping grid tensor from the PD decode leg: its \
-                                         sizes tensor is not inline"
-                                    );
-                                    grid_tensors.remove(key);
-                                }
-                            }
-                        }
-                        let retained = |keys: &[String]| {
-                            keys.iter()
-                                .filter(|key| grid_tensors.contains_key(*key))
-                                .cloned()
-                                .collect()
-                        };
-                        clone_req.mm_inputs = Some(vllm::MultimodalInputs {
-                            im_token_id: mm_ref.im_token_id,
-                            mm_placeholders: mm_ref.mm_placeholders.clone(),
-                            mm_hashes: mm_ref.mm_hashes.clone(),
-                            modality: mm_ref.modality,
-                            batched_keys: retained(&mm_ref.batched_keys),
-                            keep_on_cpu_keys: retained(&mm_ref.keep_on_cpu_keys),
-                            flat_keys,
-                            model_specific_tensors: grid_tensors,
-                            encoder_input_key: mm_ref.encoder_input_key.clone(),
-                            ..Default::default()
-                        });
-                    }
+                if let Self::Vllm(clone_req) = &mut clone {
+                    clone_req.mm_inputs = mm.as_ref().and_then(vllm_mm_identity);
+                    clone_req.extra_mm_inputs = extra.iter().filter_map(vllm_mm_identity).collect();
                 }
                 req.mm_inputs = mm;
+                req.extra_mm_inputs = extra;
                 clone
             }
             Self::TokenSpeed(req) => {
@@ -1449,7 +1467,10 @@ impl ProtoGenerateRequest {
     pub fn clear_mm_pixel_values(&mut self) {
         match self {
             Self::Sglang(req) => req.mm_inputs = None,
-            Self::Vllm(req) => req.mm_inputs = None,
+            Self::Vllm(req) => {
+                req.mm_inputs = None;
+                req.extra_mm_inputs.clear();
+            }
             Self::TokenSpeed(req) => {
                 if let Some(mm) = req.mm_inputs.as_mut() {
                     for item in &mut mm.items {
@@ -1589,7 +1610,7 @@ impl ProtoGenerateRequest {
     pub fn has_mm_inputs(&self) -> bool {
         match self {
             Self::Sglang(req) => req.mm_inputs.is_some(),
-            Self::Vllm(req) => req.mm_inputs.is_some(),
+            Self::Vllm(req) => req.mm_inputs.is_some() || !req.extra_mm_inputs.is_empty(),
             Self::TokenSpeed(req) => req.mm_inputs.is_some(),
             Self::Trtllm(_) | Self::Mlx(_) => false,
         }
@@ -3171,6 +3192,7 @@ mod tests {
             shm_enabled: false,
             shm_min_bytes: 0,
             rdma_enabled: false,
+            extra_batches: Vec::new(),
         }
     }
 

@@ -53,3 +53,28 @@ def test_other_keys_pass_through_unchanged():
     for key in ["image_grid_thw", "vit_grid", "types", "patches_per_image"]:
         assert mm_keys.modality_key(key, is_video=False) == key
         assert mm_keys.modality_key(key, is_video=True) == key
+
+
+def test_mm_batches_lists_the_primary_batch_then_the_extras():
+    from smg_grpc_proto.generated import common_pb2
+
+    request = vllm_engine_pb2.GenerateRequest(
+        mm_inputs=vllm_engine_pb2.MultimodalInputs(modality=common_pb2.IMAGE),
+        extra_mm_inputs=[vllm_engine_pb2.MultimodalInputs(modality=common_pb2.VIDEO)],
+    )
+    batches = mm_keys.mm_batches(request)
+    assert [mm_keys.modality_name(batch) for batch in batches] == ["image", "video"]
+
+    assert mm_keys.mm_batches(vllm_engine_pb2.GenerateRequest()) == []
+    only_extra = vllm_engine_pb2.GenerateRequest(
+        extra_mm_inputs=[vllm_engine_pb2.MultimodalInputs(modality=common_pb2.VIDEO)]
+    )
+    assert [mm_keys.modality_name(batch) for batch in mm_keys.mm_batches(only_extra)] == ["video"]
+
+
+def test_mm_batches_tolerates_an_older_proto_stub():
+    # A GenerateRequest stub built before `extra_mm_inputs` (field 11) has no
+    # such attribute; the servicer must still see the primary batch.
+    primary = vllm_engine_pb2.MultimodalInputs()
+    stub = SimpleNamespace(mm_inputs=primary, HasField=lambda name: name == "mm_inputs")
+    assert mm_keys.mm_batches(stub) == [primary]
