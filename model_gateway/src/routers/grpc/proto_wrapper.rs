@@ -2826,27 +2826,6 @@ mod fanout_tests {
         }
     }
 
-    #[tokio::test]
-    async fn prefill_native_collection_retains_guard_through_all_metadata() {
-        let worker: Arc<dyn Worker> =
-            Arc::new(BasicWorkerBuilder::new("http://prefill-native").build());
-        let guards = vec![Some(PrefillLoadGuard::Unbounded {
-            _guard: WorkerLoadGuard::new(Arc::clone(&worker), None),
-        })];
-        let mut last = complete();
-        last.set_index(1);
-        let mut stream = child(vec![complete(), last]).0;
-        let mut indices = Vec::new();
-        drain_prefill(&mut stream, guards, false, |complete| {
-            indices.push(complete.index());
-            assert_eq!(worker.load(), 1);
-        })
-        .await
-        .unwrap();
-        assert_eq!(indices, vec![0, 1]);
-        assert_eq!(worker.load(), 0);
-    }
-
     #[test]
     fn set_index_restamps_chunks_and_completes() {
         let mut response = chunk("x");

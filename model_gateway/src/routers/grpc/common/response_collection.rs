@@ -23,7 +23,7 @@ use crate::{
 /// Drain each Prefill sample through its terminal response, releasing only that
 /// sample's guard. A fan-out's first `Complete` does not finish its siblings.
 /// Keep the streams' abort-on-drop armed until Decode succeeds, as before.
-/// Collectors can continue to EOF for metadata from engine-native n>1 streams;
+/// Collectors continue to EOF to preserve their metadata collection behavior;
 /// streaming handlers can stop once all dispatched Prefill samples complete.
 pub(crate) async fn drain_prefill<S: FanoutChild>(
     stream: &mut S,
@@ -35,10 +35,9 @@ pub(crate) async fn drain_prefill<S: FanoutChild>(
     let single_dispatch = remaining == 1;
     while let Some(response) = stream.next_item().await {
         if let ProtoResponseVariant::Complete(complete) = response?.into_response() {
-            // A native n>1 stream is one backend dispatch with one guard;
-            // fan-out responses are restamped with their dispatch positions.
-            // EOF-based collectors must retain a native multi-sample request's
-            // sole guard until the whole stream ends, not its first sample.
+            // Fan-out responses are restamped with their dispatch positions.
+            // For a single dispatch, preserve the collector's existing guard
+            // lifetime: EOF-based collectors release it when the stream ends.
             if !single_dispatch || finish_at_complete {
                 let index = if single_dispatch {
                     0
