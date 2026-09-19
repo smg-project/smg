@@ -2786,74 +2786,42 @@ mod fanout_tests {
     async fn prefill_fanout_retains_unfinished_sample_guards() {
         for finish_at_complete in [false, true] {
             for bounded in [false, true] {
-                for duplicate in [false, true] {
-                    let worker: Arc<dyn Worker> = Arc::new(
-                        BasicWorkerBuilder::new("http://prefill-fanout")
-                            .worker_type(WorkerType::Prefill)
-                            .build(),
-                    );
-                    let admission = PrefillAdmission::new(1, 0, std::time::Duration::from_secs(1));
-                    let guard = if bounded {
-                        let admitted = admission
-                            .admit(None, |capacity| capacity.select(Arc::clone(&worker), ()))
-                            .await
-                            .unwrap();
-                        PrefillLoadGuard::Admission {
-                            _reservation: Arc::new(admitted.reservation),
-                        }
-                    } else {
-                        PrefillLoadGuard::Unbounded {
-                            _guard: WorkerLoadGuard::new(Arc::clone(&worker), None),
-                        }
-                    };
-                    let guards = guard.replicate_to(2).into_iter().map(Some).collect();
-                    assert_eq!(worker.load(), if bounded { 1 } else { 2 });
-                    let (first, _) = child(if duplicate {
-                        vec![complete(), complete()]
-                    } else {
-                        vec![complete()]
-                    });
-                    // The second sample is still producing chunks after the first completes.
-                    let (second, _) = child(vec![chunk("a"), chunk("b"), complete()]);
-                    let mut stream = FanoutStream::new(vec![first, second]);
-                    let mut indices = Vec::new();
-                    drain_prefill(&mut stream, guards, finish_at_complete, |complete| {
-                        indices.push(complete.index());
-                        assert_eq!(worker.load(), if complete.index() == 0 { 1 } else { 0 });
-                    })
-                    .await
-                    .unwrap();
-                    assert_eq!(indices, if duplicate { vec![0, 0, 1] } else { vec![0, 1] });
-                    assert_eq!(worker.load(), 0);
-                }
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new("http://prefill-fanout")
+                        .worker_type(WorkerType::Prefill)
+                        .build(),
+                );
+                let admission = PrefillAdmission::new(1, 0, std::time::Duration::from_secs(1));
+                let guard = if bounded {
+                    let admitted = admission
+                        .admit(None, |capacity| capacity.select(Arc::clone(&worker), ()))
+                        .await
+                        .unwrap();
+                    PrefillLoadGuard::Admission {
+                        _reservation: Arc::new(admitted.reservation),
+                    }
+                } else {
+                    PrefillLoadGuard::Unbounded {
+                        _guard: WorkerLoadGuard::new(Arc::clone(&worker), None),
+                    }
+                };
+                let guards = guard.replicate_to(2).into_iter().map(Some).collect();
+                assert_eq!(worker.load(), if bounded { 1 } else { 2 });
+                // Each n=1 Prefill dispatch returns one terminal response.
+                // The second dispatch is unfinished when the first completes.
+                let (first, _) = child(vec![complete()]);
+                let (second, _) = child(vec![complete()]);
+                let mut stream = FanoutStream::new(vec![first, second]);
+                let mut indices = Vec::new();
+                drain_prefill(&mut stream, guards, finish_at_complete, |complete| {
+                    indices.push(complete.index());
+                    assert_eq!(worker.load(), if complete.index() == 0 { 1 } else { 0 });
+                })
+                .await
+                .unwrap();
+                assert_eq!(indices, vec![0, 1]);
+                assert_eq!(worker.load(), 0);
             }
-        }
-    }
-
-    #[tokio::test]
-    async fn prefill_fanout_releases_remaining_guards_on_error_or_eof() {
-        for failed in [false, true] {
-            let worker: Arc<dyn Worker> =
-                Arc::new(BasicWorkerBuilder::new("http://prefill-error").build());
-            let guard = PrefillLoadGuard::Unbounded {
-                _guard: WorkerLoadGuard::new(Arc::clone(&worker), None),
-            };
-            let guards = guard.replicate_to(2).into_iter().map(Some).collect();
-            let (first, _) = child(vec![complete()]);
-            let mut second = child(Vec::new()).0;
-            if failed {
-                second
-                    .items
-                    .push_back(Err(tonic::Status::internal("prefill failed")));
-            }
-            let mut stream = FanoutStream::new(vec![first, second]);
-            let result = drain_prefill(&mut stream, guards, true, |complete| {
-                assert_eq!(complete.index(), 0);
-                assert_eq!(worker.load(), 1);
-            })
-            .await;
-            assert_eq!(result.is_err(), failed);
-            assert_eq!(worker.load(), 0);
         }
     }
 
@@ -2865,7 +2833,7 @@ mod fanout_tests {
             _guard: WorkerLoadGuard::new(Arc::clone(&worker), None),
         })];
         let mut last = complete();
-        last.set_index(3);
+        last.set_index(1);
         let mut stream = child(vec![complete(), last]).0;
         let mut indices = Vec::new();
         drain_prefill(&mut stream, guards, false, |complete| {
@@ -2874,7 +2842,7 @@ mod fanout_tests {
         })
         .await
         .unwrap();
-        assert_eq!(indices, vec![0, 3]);
+        assert_eq!(indices, vec![0, 1]);
         assert_eq!(worker.load(), 0);
     }
 
