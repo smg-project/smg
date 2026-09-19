@@ -2455,6 +2455,7 @@ pub struct FanoutStream<C = ProtoStream> {
     cursor: usize,
 }
 
+#[cfg(test)]
 impl<C: FanoutChild> FanoutChild for FanoutStream<C> {
     fn next_item(
         &mut self,
