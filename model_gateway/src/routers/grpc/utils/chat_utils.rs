@@ -25,7 +25,7 @@ use openai_protocol::{
 };
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
-use tracing::error;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 use crate::routers::{
@@ -80,21 +80,37 @@ pub(crate) fn resolve_tokenizer(
         .tokenizer_registry
         .get(model_id)
         .ok_or_else(|| {
-            error!(
-                function = %stage_name,
-                model = %model_id,
-                "Tokenizer not found for model"
-            );
-            Box::new(error::internal_error(
-                "tokenizer_not_found",
-                format!("Tokenizer not found for model: {model_id}"),
-            ))
+            let served = ctx.components.worker_registry.contains_model(model_id);
+            if served {
+                error!(
+                    function = %stage_name,
+                    model = %model_id,
+                    "Tokenizer not found for model"
+                );
+            } else {
+                debug!(function = %stage_name, model = %model_id, "Unknown model");
+            }
+            Box::new(missing_tokenizer_response(model_id, served))
         })?;
 
     // Cache tokenizer in context for reuse in response processing stage
     ctx.state.tokenizer = Some(tokenizer.clone());
 
     Ok(tokenizer)
+}
+
+/// The error for a model without a registered tokenizer: a model nobody
+/// serves is the client's mistake (404), a served model with no tokenizer is
+/// a gateway fault (500).
+fn missing_tokenizer_response(model_id: &str, served: bool) -> Response {
+    if served {
+        error::internal_error(
+            "tokenizer_not_found",
+            format!("Tokenizer not found for model: {model_id}"),
+        )
+    } else {
+        error::model_not_found(model_id)
+    }
 }
 
 /// Below this input size (in bytes) the `spawn_blocking` + permit round-trip
@@ -2080,5 +2096,17 @@ mod tests {
         let tokenizer = llm_tokenizer::MockTokenizer::new().with_deferred_chat_ids(vec![7]);
         let processed = process_chat_messages(&prefill_request(), &tokenizer, None).unwrap();
         assert_eq!(processed.text, "user: Hello\nassistant: Sure");
+    }
+
+    #[test]
+    fn missing_tokenizer_is_a_client_error_only_for_unknown_models() {
+        assert_eq!(
+            missing_tokenizer_response("nonexistent-model", false).status(),
+            http::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            missing_tokenizer_response("served-model", true).status(),
+            http::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }
