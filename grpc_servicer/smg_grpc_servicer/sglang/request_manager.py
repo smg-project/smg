@@ -41,6 +41,8 @@ from sglang.srt.utils import get_or_create_event_loop, kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.utils import get_exception_traceback
 
+from smg_grpc_servicer.sglang.request_lifecycle import RequestLifecycle
+
 logger = logging.getLogger(__name__)
 
 
@@ -215,6 +217,7 @@ class GrpcRequestManager:
 
         # State Management (from TokenizerManager)
         self.rid_to_state: dict[str, GrpcReqState] = {}
+        self._request_lifecycle = RequestLifecycle(self.rid_to_state)
         self.asyncio_tasks: set = set()
         self.gracefully_exit = False
         self.no_create_loop = False
@@ -392,8 +395,7 @@ class GrpcRequestManager:
 
         obj.rid = request_id
 
-        self._req_stats_init(obj, grpc_context)
-        state = self.rid_to_state[request_id]
+        state = self._req_stats_init(obj, grpc_context)
         self.record_request_for_crash_dump(obj)
 
         try:
@@ -427,12 +429,11 @@ class GrpcRequestManager:
 
         finally:
             # Always clean up request state when exiting
-            self._cleanup_request_state(request_id)
+            self._cleanup_request_state(request_id, state)
 
-    def _cleanup_request_state(self, request_id: str):
+    def _cleanup_request_state(self, request_id: str, state: GrpcReqState | None = None):
         """Clean up local request state (does not notify scheduler)."""
-        if request_id in self.rid_to_state:
-            del self.rid_to_state[request_id]
+        self._request_lifecycle.remove(request_id, state)
 
     async def embedding_request(
         self,
@@ -449,8 +450,7 @@ class GrpcRequestManager:
 
         obj.rid = request_id
 
-        self._req_stats_init(obj)
-        state = self.rid_to_state[request_id]
+        state = self._req_stats_init(obj)
 
         # Create future for result
         future = asyncio.Future()
@@ -461,7 +461,7 @@ class GrpcRequestManager:
             await self._send_to_scheduler(obj)
             state.time_stats.set_api_server_dispatch_finish_time()
         except Exception as e:
-            del self.rid_to_state[request_id]
+            self._cleanup_request_state(request_id, state)
             future.set_exception(e)
             return future
 
@@ -474,9 +474,7 @@ class GrpcRequestManager:
             except Exception as e:
                 future.set_exception(e)
             finally:
-                # Clean up
-                if request_id in self.rid_to_state:
-                    del self.rid_to_state[request_id]
+                self._cleanup_request_state(request_id, state)
 
         asyncio.create_task(wait_for_result())
         return future
@@ -484,31 +482,33 @@ class GrpcRequestManager:
     async def abort_request(self, request_id: str) -> bool:
         """Abort a running request.
 
-        Sends abort request to scheduler and marks local state as finished
-        to stop processing any further outputs from the scheduler.
+        Claims an active local request, then sends its abort to the scheduler.
+        Unknown, completed, and already-aborted requests are safe no-ops.
         """
         # Skip aborting health check requests (they clean themselves up)
         if request_id.startswith("HEALTH_CHECK"):
             return False
 
-        # Mark state as finished immediately to stop processing scheduler outputs
-        state = self.rid_to_state.get(request_id)
-        if state:
-            state.finished = True
-            state.stream_finished = True
-            logger.debug(f"Marked request {request_id} as aborted locally")
-
-        # Send abort to scheduler - the scheduler will send AbortReq back
-        # which will be handled by _handle_abort_req
-        abort_req = AbortReq(rid=request_id)
-        try:
+        async def forward_abort():
+            # The scheduler sends AbortReq back through _handle_abort_req.
+            abort_req = AbortReq(rid=request_id)
             await self._send_to_scheduler(abort_req)
             logger.debug(f"Sent abort to scheduler for request {request_id}")
+
+        try:
+            # claim_abort() runs synchronously before forward_abort() awaits, so
+            # completion and concurrent abort calls cannot both win.
+            success = await self._request_lifecycle.abort_if_active(request_id, forward_abort)
         except Exception as e:
             logger.error(f"Failed to send abort request to scheduler: {e}")
             return False
 
-        return True
+        if not success:
+            logger.info(
+                "Ignoring abort for request %s because it is unknown or already finished",
+                request_id,
+            )
+        return success
 
     async def handle_loop(self):
         """
@@ -646,10 +646,9 @@ class GrpcRequestManager:
 
         # Process each request in the batch
         for i, rid in enumerate(batch_out.rids):
-            if rid not in self.rid_to_state:
+            state = self._request_lifecycle.get(rid)
+            if state is None:
                 continue
-
-            state = self.rid_to_state[rid]
 
             # Skip if already aborted/finished locally (client cancelled)
             if state.finished:
@@ -747,23 +746,22 @@ class GrpcRequestManager:
             if output_data["token_ids"]:
                 state.output_ids.extend(output_data["token_ids"])
 
-            # Add queue.put() to parallel task list
-            put_tasks.append(state.out_queue.put(output_data))
-
             # Handle completion
             if output_data["finished"]:
-                state.finished = True
+                if not self._request_lifecycle.finish(rid, state, stream_finished=True):
+                    continue
                 state.time_stats.set_finished_time()
-                state.stream_finished = True
                 state.event.set()
 
                 # Remove from tracking after a delay
-                async def cleanup(request_id):
+                async def cleanup(request_id, request_state):
                     await asyncio.sleep(5.0)
-                    if request_id in self.rid_to_state:
-                        del self.rid_to_state[request_id]
+                    self._cleanup_request_state(request_id, request_state)
 
-                cleanup_tasks.append(asyncio.create_task(cleanup(rid)))
+                cleanup_tasks.append(asyncio.create_task(cleanup(rid, state)))
+
+            # Add queue.put() to parallel task list
+            put_tasks.append(state.out_queue.put(output_data))
 
         # Execute all queue.put() operations in parallel
         if put_tasks:
@@ -772,10 +770,9 @@ class GrpcRequestManager:
     async def _handle_embedding_output(self, batch_out: BatchEmbeddingOutput):
         """Handle batch embedding output from scheduler."""
         for i, rid in enumerate(batch_out.rids):
-            if rid not in self.rid_to_state:
+            state = self._request_lifecycle.get(rid)
+            if state is None:
                 continue
-
-            state = self.rid_to_state[rid]
 
             # Create result
             result = {
@@ -787,23 +784,23 @@ class GrpcRequestManager:
                 ),
             }
 
+            # Mark as finished
+            if not self._request_lifecycle.finish(rid, state):
+                continue
+            state.time_stats.set_finished_time()
+
             # Send result
             await state.out_queue.put(result)
-
-            # Mark as finished
-            state.finished = True
-            state.time_stats.set_finished_time()
             state.event.set()
 
     async def _handle_health_check_output(self, health_out: HealthCheckOutput):
         """Handle health check output from scheduler."""
         rid = health_out.rid
 
-        if rid not in self.rid_to_state:
+        state = self._request_lifecycle.get(rid)
+        if state is None:
             logger.warning(f"Health check output for unknown request: {rid}")
             return
-
-        state = self.rid_to_state[rid]
 
         # Create health check result
         result = {
@@ -815,12 +812,13 @@ class GrpcRequestManager:
             ),
         }
 
+        # Mark as finished
+        if not self._request_lifecycle.finish(rid, state):
+            return
+        state.time_stats.set_finished_time()
+
         # Send result
         await state.out_queue.put(result)
-
-        # Mark as finished
-        state.finished = True
-        state.time_stats.set_finished_time()
         state.event.set()
 
     async def _handle_abort_req(self, recv_obj: AbortReq):
@@ -834,18 +832,13 @@ class GrpcRequestManager:
         if recv_obj.rid.startswith("HEALTH_CHECK"):
             return
 
-        # Check if request still exists
-        if recv_obj.rid not in self.rid_to_state:
+        # Check if request still exists and record the scheduler-side abort.
+        state = self._request_lifecycle.accept_scheduler_abort(recv_obj.rid)
+        if state is None:
             logger.debug(
                 f"Abort request for {recv_obj.rid} not in local state (may have already finished or not started yet)"
             )
             return
-
-        state = self.rid_to_state[recv_obj.rid]
-
-        # Mark as finished
-        state.finished = True
-        state.stream_finished = True
 
         # Create abort response
         if recv_obj.finished_reason:
@@ -919,9 +912,8 @@ class GrpcRequestManager:
 
         # Cancel all pending requests
         for rid, state in list(self.rid_to_state.items()):
-            if not state.finished:
+            if self._request_lifecycle.finish(rid, state):
                 await state.out_queue.put({"error": "Server shutting down", "shutdown": True})
-                state.finished = True
                 state.event.set()
 
         # Wait for tasks to complete
@@ -1074,7 +1066,7 @@ class GrpcRequestManager:
         self,
         obj: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
         grpc_context: grpc.ServicerContext | None = None,
-    ):
+    ) -> GrpcReqState:
         calibrate_time_diff()
         # Create and register request state
         # TODO: support log_request
@@ -1095,8 +1087,9 @@ class GrpcRequestManager:
             state.session_id = obj.session_params.session_id
             state.is_session_request = True
 
-        self.rid_to_state[obj.rid] = state
+        self._request_lifecycle.register(state)
         time_stats.set_created_time()
+        return state
 
 
 async def print_exception_wrapper(func):
