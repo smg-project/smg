@@ -1165,3 +1165,290 @@ async fn test_populated_array_still_parses_after_empty_container_fix() {
 
     assert_eq!(args["avoid_aisles"], json!(["dairy", "frozen"]));
 }
+
+/// Reduced from M3 output where Sunday's empty time_blocks omitted its close
+/// before </item>. Keep nested array schema traversal and later parameters.
+#[tokio::test]
+async fn test_m3_missing_empty_container_close_in_nested_array() {
+    let tools = vec![Tool {
+        tool_type: "function".into(),
+        function: Function {
+            name: "plan".into(),
+            description: None,
+            parameters: json!({"type": "object", "properties": {
+                "days": {"type": "array", "items": {
+                    "type": "object", "properties": {
+                        "name": {"type": "string"},
+                        "time_blocks": {"type": "array", "items": {"type": "string"}}
+                    }
+                }},
+                "timezone": {"type": "string"}
+            }}),
+            strict: None,
+        },
+    }];
+    let days = format!(
+        "{}{}{}",
+        element(
+            "item",
+            &format!(
+                "{}{}",
+                element("name", "Saturday"),
+                element("time_blocks", &element("item", "10:00–13:00"))
+            )
+        ),
+        element(
+            "item",
+            &format!("{}{NS}<time_blocks>", element("name", "Sunday"))
+        ),
+        element(
+            "item",
+            &format!(
+                "{}{}",
+                element("name", "Monday"),
+                element("time_blocks", &element("item", "18:30–21:00"))
+            )
+        )
+    );
+    let text = tool_block(&[(
+        "plan",
+        format!(
+            "{}{}",
+            element("days", &days),
+            element("timezone", "Asia/Shanghai")
+        ),
+    )]);
+    let expected = json!({
+        "days": [
+            {"name": "Saturday", "time_blocks": ["10:00–13:00"]},
+            {"name": "Sunday", "time_blocks": []},
+            {"name": "Monday", "time_blocks": ["18:30–21:00"]}
+        ],
+        "timezone": "Asia/Shanghai"
+    });
+    let (normal, calls) = MinimaxM3Parser::new()
+        .parse_complete_with_tools(&text, &tools)
+        .await
+        .unwrap();
+    assert!(normal.is_empty());
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "plan");
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    assert_eq!(args, expected);
+
+    let chars: Vec<char> = text.chars().collect();
+    for size in [1, 2, 7, 29, chars.len()] {
+        let mut parser = MinimaxM3Parser::new();
+        let mut arguments = String::new();
+        let mut names = Vec::new();
+        for chunk in chars.chunks(size) {
+            let result = parser
+                .parse_incremental(&chunk.iter().collect::<String>(), &tools)
+                .await
+                .unwrap();
+            assert!(result.normal_text.is_empty(), "chunk size {size}");
+            for call in result.calls {
+                assert_eq!(call.tool_index, 0);
+                if let Some(name) = call.name {
+                    names.push(name);
+                }
+                arguments.push_str(&call.parameters);
+            }
+        }
+        assert!(parser.take_unstreamed_normal_text().is_empty());
+        assert_eq!(names, ["plan"]);
+        let args: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+        assert_eq!(args, expected, "chunk size {size}");
+    }
+}
+
+#[tokio::test]
+async fn test_m3_empty_container_recovery_requires_schema_and_parent_close() {
+    for (kind, content, close, recover) in [
+        ("array", "", "parent", true),
+        ("object", " \n", "parent", true),
+        ("string", "", "parent", false),
+        ("array", "lost value", "parent", false),
+        ("array", "", "wrong", false),
+        ("array", &element("item", "value"), "parent", false),
+    ] {
+        let tools = vec![Tool {
+            tool_type: "function".into(),
+            function: Function {
+                name: "test".into(),
+                description: None,
+                parameters: json!({"type": "object", "properties": {
+                    "parent": {"type": "object", "properties": {
+                        "empty": {"type": kind}
+                    }}
+                }}),
+                strict: None,
+            },
+        }];
+        let text = tool_block(&[(
+            "test",
+            format!("{NS}<parent>{NS}<empty>{content}{NS}</{close}>"),
+        )]);
+        let (_, calls) = MinimaxM3Parser::new()
+            .parse_complete_with_tools(&text, &tools)
+            .await
+            .unwrap();
+        assert_eq!(calls.len(), usize::from(recover));
+        if recover {
+            let args: serde_json::Value =
+                serde_json::from_str(&calls[0].function.arguments).unwrap();
+            assert_eq!(
+                args["parent"]["empty"],
+                if kind == "array" {
+                    json!([])
+                } else {
+                    json!({})
+                }
+            );
+        }
+        let (_, no_schema_calls) = MinimaxM3Parser::new().parse_complete(&text).await.unwrap();
+        assert!(no_schema_calls.is_empty());
+
+        for supplied_tools in [&tools[..], &[][..]] {
+            let mut parser = MinimaxM3Parser::new();
+            let mut arguments = String::new();
+            let mut normal = String::new();
+            for ch in text.chars() {
+                let result = parser
+                    .parse_incremental(&ch.to_string(), supplied_tools)
+                    .await
+                    .unwrap();
+                normal.push_str(&result.normal_text);
+                for call in result.calls {
+                    arguments.push_str(&call.parameters);
+                }
+            }
+            normal.push_str(&parser.take_unstreamed_normal_text());
+            assert_eq!(
+                normal,
+                if recover && !supplied_tools.is_empty() {
+                    ""
+                } else {
+                    &text
+                }
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&arguments).is_ok(),
+                recover && !supplied_tools.is_empty()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_m3_composed_container_recovery() {
+    for keyword in ["oneOf", "anyOf", "allOf"] {
+        let wrap = |schema: serde_json::Value| {
+            let branches = if keyword == "allOf" {
+                vec![schema]
+            } else {
+                vec![json!({"type": "null"}), schema]
+            };
+            json!({keyword: branches})
+        };
+        let item_schema = wrap(json!({"type": "object", "properties": {
+            "values": wrap(json!({"type": "array", "items": {"type": "string"}})),
+            "options": wrap(json!({"type": "object"}))
+        }}));
+        let tools = vec![Tool {
+            tool_type: "function".into(),
+            function: Function {
+                name: "test".into(),
+                description: None,
+                parameters: json!({"type": "object", "properties": {
+                    "rows": wrap(json!({"type": "array", "items": item_schema}))
+                }}),
+                strict: None,
+            },
+        }];
+        let rows = format!(
+            "{}{}{}",
+            element("item", &format!("{NS}<values>")),
+            element("item", &format!("{NS}<options> \n")),
+            element("item", &element("values", &element("item", "001")))
+        );
+        let text = tool_block(&[("test", element("rows", &rows))]);
+        let expected = json!({"rows": [
+            {"values": []}, {"options": {}}, {"values": ["001"]}
+        ]});
+        let (normal, calls) = MinimaxM3Parser::new()
+            .parse_complete_with_tools(&text, &tools)
+            .await
+            .unwrap();
+        assert!(normal.is_empty(), "{keyword}");
+        assert_eq!(calls.len(), 1, "{keyword}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap(),
+            expected,
+            "{keyword}"
+        );
+
+        let mut parser = MinimaxM3Parser::new();
+        let mut arguments = String::new();
+        for ch in text.chars() {
+            let result = parser
+                .parse_incremental(&ch.to_string(), &tools)
+                .await
+                .unwrap();
+            assert!(result.normal_text.is_empty(), "{keyword}");
+            for call in result.calls {
+                arguments.push_str(&call.parameters);
+            }
+        }
+        assert!(parser.take_unstreamed_normal_text().is_empty());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_m3_composed_container_recovery_rejects_ambiguous_schemas() {
+    for schema in [
+        json!({"anyOf": [{"type": "array"}, {"type": "object"}]}),
+        json!({"oneOf": [{"type": "array"}, {"type": "array", "items": {"type": "string"}}]}),
+        json!({"anyOf": [{"type": "array"}, {"type": "string"}]}),
+        json!({"anyOf": [{"type": "array"}, {}]}),
+        json!({"allOf": [{"type": "array"}, {"type": "null"}]}),
+        json!({"allOf": [{"type": "array"}, {"items": {"type": "string"}}]}),
+        json!({"anyOf": [{"type": "array"}, {"$ref": "#/$defs/other"}]}),
+        json!({"anyOf": [{"type": "array"}], "not": {"type": "array"}}),
+    ] {
+        let tools = vec![Tool {
+            tool_type: "function".into(),
+            function: Function {
+                name: "test".into(),
+                description: None,
+                parameters: json!({"type": "object", "properties": {
+                    "parent": {"type": "object", "properties": {"empty": schema}}
+                }}),
+                strict: None,
+            },
+        }];
+        let text = tool_block(&[("test", format!("{NS}<parent>{NS}<empty>{NS}</parent>"))]);
+        let (normal, calls) = MinimaxM3Parser::new()
+            .parse_complete_with_tools(&text, &tools)
+            .await
+            .unwrap();
+        assert_eq!(normal, text, "{schema}");
+        assert!(calls.is_empty(), "{schema}");
+        let mut parser = MinimaxM3Parser::new();
+        let mut normal = String::new();
+        for ch in text.chars() {
+            let result = parser
+                .parse_incremental(&ch.to_string(), &tools)
+                .await
+                .unwrap();
+            assert!(result.calls.is_empty(), "{schema}");
+            normal.push_str(&result.normal_text);
+        }
+        normal.push_str(&parser.take_unstreamed_normal_text());
+        assert_eq!(normal, text, "{schema}");
+    }
+}

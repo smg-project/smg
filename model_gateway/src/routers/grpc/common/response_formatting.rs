@@ -127,6 +127,22 @@ mod tests {
     }
 
     #[test]
+    fn build_usage_then_unbilled_charges_the_stub_once_for_n_greater_than_1() {
+        let usage =
+            build_usage(&[complete(10, 10, 4), complete(10, 10, 6)]).with_unbilled_prompt_tokens(3);
+        assert_eq!(usage.prompt_tokens, 7);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens),
+            Some(7)
+        );
+        assert_eq!(usage.completion_tokens, 10);
+        assert_eq!(usage.total_tokens, 17);
+    }
+
+    #[test]
     fn completion_token_tracker_follows_chunk_semantics() {
         // Delta stream (the vLLM shape, which the ZMQ lane also emits for
         // TokenSpeed workers): the chunks carry the counts.

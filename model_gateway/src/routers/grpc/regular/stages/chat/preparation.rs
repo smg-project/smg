@@ -262,9 +262,12 @@ pub(crate) async fn prepare_chat_like(
         // parsers like Mistral, KimiK2) and generic JSON schema fallback. When
         // the prompt ends inside the model's thinking block, a parser with a
         // reasoning prefix gets its tag wrapped so a forced call follows the
-        // reasoning instead of preempting it.
-        let tool_call_constraint = if let (Some(tools), Some(tool_choice)) =
-            (body_ref.tools.as_ref(), request.tool_choice.as_ref())
+        // reasoning instead of preempting it. The constraint covers every tool
+        // the choice lets the model call, dynamic tools declared on messages
+        // included (see `ChatCompletionRequest::callable_tools`).
+        let constraint_tools = request.callable_tools();
+        let tool_call_constraint = if let (false, Some(tool_choice)) =
+            (constraint_tools.is_empty(), request.tool_choice.as_ref())
         {
             let reasoning = utils::chat_reasoning_starts_in_prefill(request, tokenizer.as_ref());
             ctx.components
@@ -275,7 +278,7 @@ pub(crate) async fn prepare_chat_like(
                         .parser_resolver
                         .tool_parser(&request.model)
                         .as_deref(),
-                    tools,
+                    &constraint_tools,
                     tool_choice,
                     reasoning,
                 )

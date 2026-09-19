@@ -4,7 +4,9 @@ use serde_json::{json, Value};
 
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
-    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
+    registry::{
+        MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
+    },
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
 };
 
@@ -65,6 +67,11 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
             || metadata
                 .config_model_type()
                 .is_some_and(|mt| mt == "kimi_k3")
+    }
+
+    /// The reference renders content parts positionally.
+    fn media_part_order(&self) -> MediaPartOrder {
+        MediaPartOrder::Authored
     }
 
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
@@ -259,6 +266,16 @@ mod tests {
                 offset: 2 + "image 1024x768".len(),
                 length: 4,
             }])
+        );
+    }
+
+    #[test]
+    fn kimi_k3_uses_authored_media_order() {
+        use crate::registry::{MediaPartOrder, ModelProcessorSpec};
+
+        assert_eq!(
+            super::KimiK3VisionSpec.media_part_order(),
+            MediaPartOrder::Authored
         );
     }
 

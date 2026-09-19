@@ -262,11 +262,18 @@ impl HuggingFaceTokenizer {
             }
         }
 
-        // Load merged EOS token IDs from config.json + generation_config.json
-        let eos_token_ids = tokenizer_path
-            .parent()
-            .map(crate::eos::load_eos_token_ids)
-            .unwrap_or_default();
+        // Load merged EOS token IDs from config.json + generation_config.json,
+        // plus the tokenizer's own eos_token (structured-output grammars end on it).
+        let eos_token_ids = crate::eos::with_tokenizer_eos(
+            tokenizer_path
+                .parent()
+                .map(crate::eos::load_eos_token_ids)
+                .unwrap_or_default(),
+            special_tokens
+                .eos_token
+                .as_deref()
+                .and_then(|token| vocab.get(token).copied()),
+        );
 
         // Detect a custom Python-encoder model from config.json::architectures.
         let renderer = tokenizer_path
@@ -934,8 +941,9 @@ fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_j
 ///    thinking switch, `thinking_from_reasoning_effort`) switch thinking off,
 ///    a native effort name (`low`/`high`/`xhigh`/`max`) switches it on, and
 ///    an integer budget has no opinion;
-/// 3. else `params.thinking` (the gateway's projection of the top-level
-///    `reasoning_effort`: `Some(false)` for `none`/`minimal`);
+/// 3. else `params.thinking` (the gateway's projection of the typed
+///    `thinking.type` toggle, else `Some(false)` for a `none`/`minimal`
+///    effective `reasoning_effort`);
 /// 4. else on ([`ThinkingToggle::DefaultOn`]).
 ///
 /// Deliberate divergence from vLLM's Python: there `reasoning_effort: "none"`

@@ -1,13 +1,20 @@
 //! Kimi/Moonshot contract rules (Kimi-Vendor-Verifier).
 //!
-//! The sampling rules are K3's alone; other Kimi and Moonshot models keep
-//! OpenAI's ranges. Only requests entering through `ValidatedJson` reach
+//! The sampling and thinking rules are K3's alone; other Kimi and Moonshot
+//! models keep OpenAI's ranges. The stream usage default is Kimi-wide, as the
+//! verifier expects. Only requests entering through `ValidatedJson` reach
 //! these rules; the Responses conversion builds its chat request without them.
 
+use std::collections::HashSet;
+
 use crate::{
-    chat::{ChatCompletionRequest, ChatMessage},
+    chat::{ChatCompletionRequest, ChatMessage, MessageContent, ThinkingType},
+    common::Tool,
     ext::kimi::DeclaredTools,
 };
+
+/// Tool names longer than this are rejected (KVV pins 257).
+const MAX_TOOL_NAME_LEN: usize = 256;
 
 /// Sampling defaults the K3 serving requirements fix to the official values;
 /// applied when the client omits the field so a self-hosted engine does not
@@ -23,7 +30,17 @@ const DEFAULT_TOP_P: f32 = TOP_P;
 const TEMPERATURES: [f32; 3] = [0.0, 0.6, 1.0];
 const TOP_P: f32 = 0.95;
 
+/// `thinking.effort` levels the K3 renderer accepts.
+const THINKING_EFFORTS: [&str; 3] = ["low", "high", "max"];
+
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
+    // KVV tests/prompt_tokens reads usage from streams sent without stream_options.
+    if req.stream {
+        req.stream_options
+            .get_or_insert_default()
+            .include_usage
+            .get_or_insert(true);
+    }
     if !is_k3(&req.model) {
         return;
     }
@@ -34,51 +51,145 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
     req.n.get_or_insert(1);
 }
 
-/// K3 dynamic tools may be declared on system messages, and on developer
-/// messages, which the OpenAI spec defines as the successor of `system` and
-/// this crate reads the same way; a declaration that is not a list of tools is
-/// rejected. A `tools` field set on a user or assistant message is rejected,
-/// an empty list included, while null counts as absent: the contract keys on
-/// the field being set, not on its contents (KVV test_dynamic_tools; the
-/// verifier has no developer case, so that role follows `system`). Tool and
-/// function messages capture no such key, so serde drops it there as it
-/// always did.
 pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
     if is_k3(&req.model) {
         validate_sampling(req)?;
+        validate_thinking(req)?;
     }
-    for msg in &req.messages {
-        let (code, role, message) = match msg {
+    validate_message_tools(req)
+}
+
+/// K3 dynamic tools: the tools declared on system and developer messages, in
+/// message order. They stand next to the request-level `tools` everywhere a
+/// tool name is resolved after validation (the response spec, tool-call
+/// parsing, the `tool_choice` constraint). Malformed declarations are
+/// [`validate_message_tools`]'s business and are skipped here.
+pub(super) fn dynamic_tools(req: &ChatCompletionRequest) -> impl Iterator<Item = &Tool> {
+    req.messages.iter().flat_map(|message| match message {
+        ChatMessage::System { ext, .. } => ext
+            .tools
+            .as_ref()
+            .and_then(DeclaredTools::typed)
+            .unwrap_or_default(),
+        ChatMessage::Developer { ext, .. } => ext
+            .tools
+            .as_ref()
+            .and_then(DeclaredTools::typed)
+            .unwrap_or_default(),
+        _ => &[],
+    })
+}
+
+/// K3 dynamic tools (KVV test_dynamic_tools): rejected on user/assistant; on system
+/// and developer they must be unique `function` tools with identifier names and empty content.
+fn validate_message_tools(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
+    // Request-level names only seed the duplicate set; their shape is not judged.
+    let mut seen: HashSet<&str> = req
+        .tools
+        .iter()
+        .flatten()
+        .map(|t| t.function.name.as_str())
+        .collect();
+    for (i, msg) in req.messages.iter().enumerate() {
+        let (role, content, tools) = match msg {
             ChatMessage::User { ext, .. } if ext.tools.is_some() => {
-                ("tools_role_restricted", "user", "is not allowed")
+                return Err(on_role("tools_role_restricted", "user", "is not allowed"));
             }
             ChatMessage::Assistant { ext, .. } if ext.tools.is_some() => {
-                ("tools_role_restricted", "assistant", "is not allowed")
+                return Err(on_role(
+                    "tools_role_restricted",
+                    "assistant",
+                    "is not allowed",
+                ));
             }
-            ChatMessage::System { ext, .. } if is_malformed(ext.tools.as_ref()) => (
-                "tools_malformed",
-                "system",
-                "must be a list of tool declarations",
-            ),
-            ChatMessage::Developer { ext, .. } if is_malformed(ext.tools.as_ref()) => (
-                "tools_malformed",
-                "developer",
-                "must be a list of tool declarations",
-            ),
+            ChatMessage::System { content, ext, .. } => ("system", content, ext.tools.as_ref()),
+            ChatMessage::Developer { content, ext, .. } => {
+                ("developer", content, ext.tools.as_ref())
+            }
             _ => continue,
         };
-        let mut e = validator::ValidationError::new(code);
-        e.message = Some(format!("'tools' on a message with role '{role}' {message}").into());
-        return Err(e);
+        let tools = match tools {
+            None => continue,
+            Some(DeclaredTools::Malformed(_)) => {
+                return Err(on_role(
+                    "tools_malformed",
+                    role,
+                    "must be a list of tool declarations",
+                ));
+            }
+            Some(DeclaredTools::Tools(tools)) => tools,
+        };
+        // An empty list renders as a plain system message, so its content stays legal.
+        if tools.is_empty() {
+            continue;
+        }
+        if has_content(content) {
+            return Err(on_role(
+                "tools_content_conflict",
+                role,
+                "requires empty content",
+            ));
+        }
+        for (j, tool) in tools.iter().enumerate() {
+            let at = || format!("messages[{i}].tools[{j}]");
+            if tool.tool_type != "function" {
+                return Err(error(
+                    "tool_type_unsupported",
+                    format!("{}: tool type must be 'function'", at()),
+                ));
+            }
+            let name = tool.function.name.as_str();
+            if !is_valid_tool_name(name) {
+                return Err(error(
+                    "tool_name_invalid",
+                    format!(
+                        "{}: tool name must match [A-Za-z_][A-Za-z0-9_]* and be at most {MAX_TOOL_NAME_LEN} characters",
+                        at()
+                    ),
+                ));
+            }
+            if !seen.insert(name) {
+                return Err(error(
+                    "tool_name_duplicate",
+                    format!("{}: duplicate tool name '{name}'", at()),
+                ));
+            }
+        }
     }
     Ok(())
 }
 
-fn is_malformed(tools: Option<&DeclaredTools>) -> bool {
-    matches!(tools, Some(DeclaredTools::Malformed(_)))
+fn has_content(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::Text(text) => !text.is_empty(),
+        MessageContent::Parts(parts) => !parts.is_empty(),
+    }
 }
 
-/// Whether a model id names Kimi K3, the only Kimi model with pinned sampling.
+/// `[A-Za-z_][A-Za-z0-9_]*`, at most [`MAX_TOOL_NAME_LEN`] bytes.
+fn is_valid_tool_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= MAX_TOOL_NAME_LEN
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn on_role(code: &'static str, role: &str, rule: &str) -> validator::ValidationError {
+    error(
+        code,
+        format!("'tools' on a message with role '{role}' {rule}"),
+    )
+}
+
+fn error(code: &'static str, message: String) -> validator::ValidationError {
+    let mut e = validator::ValidationError::new(code);
+    e.message = Some(message.into());
+    e
+}
+
+/// Whether a model id names Kimi K3, the only Kimi model with pinned sampling and thinking rules.
 fn is_k3(model: &str) -> bool {
     model.split('/').any(|segment| {
         super::starts_with_ignore_ascii_case(segment, "kimi-k3")
@@ -117,6 +228,32 @@ fn validate_sampling(req: &ChatCompletionRequest) -> Result<(), validator::Valid
     }
     if req.n.is_some_and(|n| n != 1) {
         return Err(pinned("n_not_allowed", "n", "1"));
+    }
+    Ok(())
+}
+
+/// K3 takes `effort` in low/high/max and no `adaptive`; `keep` is left to the renderer.
+fn validate_thinking(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
+    let Some(thinking) = &req.thinking else {
+        return Ok(());
+    };
+    if thinking.r#type == Some(ThinkingType::Adaptive) {
+        return Err(pinned(
+            "thinking_type_not_supported",
+            "thinking.type",
+            "enabled or disabled",
+        ));
+    }
+    if thinking
+        .effort
+        .as_deref()
+        .is_some_and(|effort| !THINKING_EFFORTS.contains(&effort))
+    {
+        return Err(pinned(
+            "thinking_effort_invalid",
+            "thinking.effort",
+            "low, high or max",
+        ));
     }
     Ok(())
 }

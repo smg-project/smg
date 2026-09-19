@@ -1704,6 +1704,32 @@ impl ProtoGenerateResponse {
         }
     }
 
+    /// Whether this is a `Complete` the engine finished with reason `"error"`.
+    pub fn engine_error(&self) -> bool {
+        match self {
+            Self::Sglang(resp) => matches!(
+                &resp.response,
+                Some(sglang::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+            ),
+            Self::Vllm(resp) => matches!(
+                &resp.response,
+                Some(vllm::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+            ),
+            Self::Trtllm(resp) => matches!(
+                &resp.response,
+                Some(trtllm::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+            ),
+            Self::Mlx(resp) => matches!(
+                &resp.response,
+                Some(mlx::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+            ),
+            Self::TokenSpeed(resp) => matches!(
+                &resp.response,
+                Some(tokenspeed::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+            ),
+        }
+    }
+
     /// Get the response variant (chunk, complete, or error)
     ///
     /// Consumes self to avoid cloning large proto messages in hot streaming path
@@ -2294,10 +2320,22 @@ pub enum ProtoStream {
     Fanout(FanoutStream),
 }
 
+/// Surface an engine-side failure (`finish_reason == "error"`) as a stream error, like the ZMQ lane.
+fn reject_engine_error(
+    item: Result<ProtoGenerateResponse, tonic::Status>,
+) -> Result<ProtoGenerateResponse, tonic::Status> {
+    match item {
+        Ok(response) if response.engine_error() => Err(tonic::Status::internal(
+            "engine finished the request with an error (see engine logs)",
+        )),
+        item => item,
+    }
+}
+
 impl ProtoStream {
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
-        match self {
+        let item = match self {
             Self::Sglang(stream) => stream
                 .next()
                 .await
@@ -2331,7 +2369,8 @@ impl ProtoStream {
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
-        }
+        };
+        item.map(reject_engine_error)
     }
 
     /// Mark stream as completed (no abort needed)
@@ -2761,6 +2800,100 @@ mod fanout_tests {
             panic!("runtime changed");
         };
         assert_eq!(req.sampling_params.as_ref().unwrap().sampling_seed, Some(7));
+    }
+}
+
+#[cfg(test)]
+mod engine_error_tests {
+    use super::*;
+
+    /// One `Complete` per backend finishing with `reason`.
+    fn completes(reason: &str) -> Vec<ProtoGenerateResponse> {
+        let reason = reason.to_string();
+        vec![
+            ProtoGenerateResponse::Sglang(Box::new(sglang::GenerateResponse {
+                response: Some(sglang::generate_response::Response::Complete(
+                    sglang::GenerateComplete {
+                        finish_reason: reason.clone(),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            })),
+            ProtoGenerateResponse::Vllm(Box::new(vllm::GenerateResponse {
+                response: Some(vllm::generate_response::Response::Complete(
+                    vllm::GenerateComplete {
+                        finish_reason: reason.clone(),
+                        ..Default::default()
+                    },
+                )),
+            })),
+            ProtoGenerateResponse::Trtllm(Box::new(trtllm::GenerateResponse {
+                response: Some(trtllm::generate_response::Response::Complete(
+                    trtllm::GenerateComplete {
+                        finish_reason: reason.clone(),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            })),
+            ProtoGenerateResponse::Mlx(Box::new(mlx::GenerateResponse {
+                response: Some(mlx::generate_response::Response::Complete(
+                    mlx::GenerateComplete {
+                        finish_reason: reason.clone(),
+                        ..Default::default()
+                    },
+                )),
+            })),
+            ProtoGenerateResponse::TokenSpeed(Box::new(tokenspeed::GenerateResponse {
+                response: Some(tokenspeed::generate_response::Response::Complete(
+                    tokenspeed::GenerateComplete {
+                        finish_reason: reason,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            })),
+        ]
+    }
+
+    #[test]
+    fn engine_error_is_true_only_for_complete_with_error_finish_reason() {
+        assert!(completes("error")
+            .iter()
+            .all(ProtoGenerateResponse::engine_error));
+        for reason in ["stop", "length", "abort", ""] {
+            assert!(!completes(reason)
+                .iter()
+                .any(ProtoGenerateResponse::engine_error));
+        }
+        let chunk = ProtoGenerateResponse::Vllm(Box::new(vllm::GenerateResponse {
+            response: Some(vllm::generate_response::Response::Chunk(
+                vllm::GenerateStreamChunk::default(),
+            )),
+        }));
+        assert!(!chunk.engine_error());
+        let empty = ProtoGenerateResponse::Vllm(Box::default());
+        assert!(!empty.engine_error());
+    }
+
+    #[test]
+    fn reject_engine_error_turns_error_complete_into_internal_status() {
+        for response in completes("error") {
+            let Err(status) = reject_engine_error(Ok(response)) else {
+                panic!("engine error must not pass through as a completion");
+            };
+            assert_eq!(status.code(), tonic::Code::Internal);
+            assert_eq!(
+                status.message(),
+                "engine finished the request with an error (see engine logs)"
+            );
+        }
+        for response in completes("stop") {
+            assert!(reject_engine_error(Ok(response)).is_ok());
+        }
+        let passed = reject_engine_error(Err(tonic::Status::unavailable("leg died")));
+        assert!(matches!(passed, Err(status) if status.code() == tonic::Code::Unavailable));
     }
 }
 

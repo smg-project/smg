@@ -62,7 +62,10 @@ pub(crate) struct ChatResponseSpec {
     pub history_tool_calls_count: usize,
     pub stream_options: Option<StreamOptions>,
     pub chat_template_kwargs: Option<HashMap<String, Value>>,
+    /// The effective effort (`thinking.effort` else `reasoning_effort`).
     pub reasoning_effort: Option<String>,
+    /// The typed `thinking.type` toggle.
+    pub thinking: Option<bool>,
     /// `continue_final_message` on a trailing assistant message.
     pub continues_final_assistant: bool,
     /// `n`, normalized.
@@ -74,6 +77,8 @@ pub(crate) struct ChatResponseSpec {
     pub ignore_eos: bool,
     /// Fallback when preparation derived no override.
     pub skip_special_tokens: bool,
+    /// Rendered prompt tokens the provider does not bill; set by request building.
+    pub unbilled_prompt_tokens: u32,
 }
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
@@ -81,11 +86,17 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
         Self {
             separate_reasoning: request.separate_reasoning,
             tool_choice: request.tool_choice.clone(),
-            tools: request.tools.clone(),
+            // Every tool the model may call, dynamic tools declared on messages
+            // included; `None` only when the request declares no tools anywhere.
+            tools: {
+                let tools: Vec<Tool> = request.effective_tools().cloned().collect();
+                (request.tools.is_some() || !tools.is_empty()).then_some(tools)
+            },
             history_tool_calls_count: utils::get_history_tool_calls_count(request),
             stream_options: request.stream_options.clone(),
             chat_template_kwargs: request.chat_template_kwargs.clone(),
-            reasoning_effort: request.reasoning_effort.clone(),
+            reasoning_effort: request.effective_reasoning_effort().map(str::to_string),
+            thinking: request.thinking_toggle(),
             continues_final_assistant: utils::continues_final_assistant(request),
             expected_choices: request.n.unwrap_or(1).max(1),
             logprobs: request.logprobs,
@@ -94,6 +105,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             no_stop_trim: request.no_stop_trim,
             ignore_eos: request.ignore_eos,
             skip_special_tokens: request.skip_special_tokens,
+            unbilled_prompt_tokens: 0,
         }
     }
 }
@@ -105,6 +117,7 @@ impl ChatResponseSpec {
         utils::reasoning_starts_in_prefill(
             self.chat_template_kwargs.as_ref(),
             self.reasoning_effort.as_deref(),
+            self.thinking,
             self.continues_final_assistant,
             tokenizer,
         )
@@ -216,4 +229,73 @@ impl From<&CompletionRequest> for CompletionResponseSpec {
 pub(crate) enum HarmonyResponseSpec {
     Chat(Arc<ChatCompletionRequest>),
     Responses(Arc<ResponsesRequest>),
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn chat_request(value: Value) -> ChatCompletionRequest {
+        serde_json::from_value(value).expect("request deserializes")
+    }
+
+    fn tool(name: &str) -> Value {
+        json!({
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object", "properties": {}}}
+        })
+    }
+
+    fn tool_names(spec: &ChatResponseSpec) -> Vec<String> {
+        spec.tools
+            .iter()
+            .flatten()
+            .map(|tool| tool.function.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn chat_spec_tools_include_dynamic_tools() {
+        let request = chat_request(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "content": "", "tools": [tool("get_weather")]},
+                {"role": "user", "content": "what is the weather in beijing?"}
+            ],
+            "tool_choice": "required"
+        }));
+
+        let spec = ChatResponseSpec::from(&request);
+
+        assert_eq!(tool_names(&spec), ["get_weather"]);
+    }
+
+    #[test]
+    fn chat_spec_tools_keep_request_tools_first() {
+        let request = chat_request(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "content": "", "tools": [tool("dynamic_a")]},
+                {"role": "user", "content": "hi"},
+                {"role": "developer", "content": "", "tools": [tool("dynamic_b")]}
+            ],
+            "tools": [tool("global")]
+        }));
+
+        let spec = ChatResponseSpec::from(&request);
+
+        assert_eq!(tool_names(&spec), ["global", "dynamic_a", "dynamic_b"]);
+    }
+
+    #[test]
+    fn chat_spec_tools_none_without_any_declaration() {
+        let request = chat_request(json!({
+            "model": "kimi-k3",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+
+        assert!(ChatResponseSpec::from(&request).tools.is_none());
+    }
 }

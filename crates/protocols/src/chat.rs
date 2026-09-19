@@ -6,16 +6,16 @@ use validator::Validate;
 
 use super::{
     common::{
-        default_true, deserialize_null_as_false, is_false, is_true, validate_stop, CachePartition,
-        ChatLogProbs, ContentPart, Function, FunctionCall, FunctionChoice, GenerationRequest,
-        ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice,
-        ToolChoiceValue, ToolReference, Usage,
+        default_true, deserialize_null_as_false, is_false, is_true, validate_json_schema_shape,
+        validate_stop, CachePartition, ChatLogProbs, ContentPart, Function, FunctionCall,
+        FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool,
+        ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
 use crate::{
     builders::{ChatCompletionResponseBuilder, ChatCompletionStreamResponseBuilder},
-    ext::kimi::{DeclaredTools, KimiAssistantExt, KimiDeveloperExt, KimiSystemExt, KimiUserExt},
+    ext::kimi::{KimiAssistantExt, KimiDeveloperExt, KimiSystemExt, KimiUserExt},
     profile::ProviderProfile,
     validated::Normalizable,
 };
@@ -236,6 +236,9 @@ pub struct ChatCompletionRequest {
     #[serde(default, deserialize_with = "deserialize_reasoning_effort")]
     pub reasoning_effort: Option<String>,
 
+    /// Vendor thinking control (Kimi `type`/`keep`/`effort`, MiniMax `type`)
+    pub thinking: Option<ThinkingParam>,
+
     /// An object specifying the format that the model must output
     pub response_format: Option<ResponseFormat>,
 
@@ -358,6 +361,53 @@ pub struct ChatCompletionRequest {
     /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
     #[serde(flatten)]
     pub other: Map<String, Value>,
+}
+
+/// `thinking.type`: the request's thinking toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingType {
+    Enabled,
+    Disabled,
+    Adaptive,
+}
+
+/// The `thinking` object shared by the Kimi and MiniMax chat APIs.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ThinkingParam {
+    #[serde(rename = "type")]
+    pub r#type: Option<ThinkingType>,
+    /// Kimi `keep` mode; accepted and ignored by the renderers.
+    pub keep: Option<String>,
+    /// Vendor effort level; more specific than the top-level `reasoning_effort`.
+    pub effort: Option<String>,
+}
+
+impl ThinkingParam {
+    /// `enabled` → on, `disabled` → off, `adaptive` or omitted → no preference.
+    pub fn toggle(&self) -> Option<bool> {
+        match self.r#type {
+            Some(ThinkingType::Enabled) => Some(true),
+            Some(ThinkingType::Disabled) => Some(false),
+            Some(ThinkingType::Adaptive) | None => None,
+        }
+    }
+}
+
+impl ChatCompletionRequest {
+    /// The thinking preference stated by `thinking.type`, if any.
+    pub fn thinking_toggle(&self) -> Option<bool> {
+        self.thinking.as_ref().and_then(ThinkingParam::toggle)
+    }
+
+    /// `thinking.effort` when present, else the top-level `reasoning_effort`.
+    pub fn effective_reasoning_effort(&self) -> Option<&str> {
+        self.thinking
+            .as_ref()
+            .and_then(|thinking| thinking.effort.as_deref())
+            .or(self.reasoning_effort.as_deref())
+    }
 }
 
 /// Map an OpenAI `reasoning_effort` to a thinking on/off preference.
@@ -486,13 +536,9 @@ fn validate_chat_cross_parameters(
         return Err(e);
     }
 
-    // 6. Validate response format JSON schema name
+    // 6. Validate response format JSON schema name and shape
     if let Some(ResponseFormat::JsonSchema { json_schema }) = &req.response_format {
-        if json_schema.name.is_empty() {
-            let mut e = validator::ValidationError::new("json_schema_name_empty");
-            e.message = Some("JSON schema name cannot be empty".into());
-            return Err(e);
-        }
+        validate_json_schema_shape(&json_schema.name, &json_schema.schema)?;
     }
 
     // 7. Validate tool_choice requires tools — except "none" and "auto", which are valid without tools
@@ -501,23 +547,8 @@ fn validate_chat_cross_parameters(
         // declared on system and developer messages (Kimi K3). Both the
         // "are there tools" decision and the named-choice checks below use
         // it, so a name is resolved against everything the model will see.
-        let dynamic_tools = || {
-            req.messages.iter().flat_map(|m| match m {
-                ChatMessage::System { ext, .. } => ext
-                    .tools
-                    .as_ref()
-                    .and_then(DeclaredTools::typed)
-                    .unwrap_or_default(),
-                ChatMessage::Developer { ext, .. } => ext
-                    .tools
-                    .as_ref()
-                    .and_then(DeclaredTools::typed)
-                    .unwrap_or_default(),
-                _ => &[],
-            })
-        };
         // Lazy on purpose: most tool traffic only needs the emptiness check.
-        let effective_tools = || req.tools.iter().flatten().chain(dynamic_tools());
+        let effective_tools = || req.effective_tools();
         let has_tools = effective_tools().next().is_some();
 
         let requires_tools = !matches!(
@@ -615,6 +646,35 @@ fn validate_chat_cross_parameters(
     ProviderProfile::for_model(&req.model).validate_chat(req)?;
 
     Ok(())
+}
+
+impl ChatCompletionRequest {
+    /// Tools declared on messages rather than at the request level, as the
+    /// request's provider profile defines them (Kimi K3 dynamic tools on
+    /// system and developer messages; see [`ProviderProfile::dynamic_tools`]).
+    pub fn dynamic_tools(&self) -> impl Iterator<Item = &Tool> {
+        ProviderProfile::for_model(&self.model).dynamic_tools(self)
+    }
+
+    /// Every tool the model will see: the request-level `tools` followed by
+    /// the dynamic tools. Anything that resolves a tool name in the response,
+    /// tool-call parsing first of all, must work from this set rather than
+    /// from `tools` alone, or a call to a dynamic tool comes back as text.
+    pub fn effective_tools(&self) -> impl Iterator<Item = &Tool> {
+        self.tools.iter().flatten().chain(self.dynamic_tools())
+    }
+
+    /// The tools a `tool_choice` may force: [`Self::effective_tools`] narrowed
+    /// by the choice (see [`ToolChoice::narrow_tools`]). A `tool_choice`
+    /// grammar must be built from this set; built from `tools` alone, a
+    /// forced call could only ever land on a request-level tool.
+    pub fn callable_tools(&self) -> Vec<Tool> {
+        let tools: Vec<Tool> = self.effective_tools().cloned().collect();
+        self.tool_choice
+            .as_ref()
+            .and_then(|choice| choice.narrow_tools(&tools))
+            .unwrap_or(tools)
+    }
 }
 
 // ============================================================================
@@ -876,7 +936,10 @@ pub struct ChatStreamChoice {
 mod tests {
     use serde_json::{json, Value};
 
-    use super::{thinking_from_reasoning_effort, ChatCompletionRequest, GenerationRequest};
+    use super::{
+        thinking_from_reasoning_effort, ChatCompletionRequest, GenerationRequest, ThinkingParam,
+        ThinkingType,
+    };
 
     fn request_with_output_fields(fields: &[(&str, Value)]) -> ChatCompletionRequest {
         let mut value = json!({
@@ -996,6 +1059,93 @@ mod tests {
             assert!(!request.other.contains_key("return_audio"));
             let serialized = serde_json::to_value(request).expect("request must serialize");
             assert_eq!(serialized.get("return_audio"), Some(&Value::Bool(value)));
+        }
+    }
+
+    #[test]
+    fn thinking_param_is_typed_not_other() {
+        let request = request_with_output_fields(&[(
+            "thinking",
+            json!({"type": "disabled", "keep": "all", "effort": "high"}),
+        )]);
+        assert_eq!(
+            request.thinking,
+            Some(ThinkingParam {
+                r#type: Some(ThinkingType::Disabled),
+                keep: Some("all".to_string()),
+                effort: Some("high".to_string()),
+            })
+        );
+        assert!(!request.other.contains_key("thinking"));
+        let serialized = serde_json::to_value(request).expect("request must serialize");
+        assert_eq!(
+            serialized["thinking"],
+            json!({"type": "disabled", "keep": "all", "effort": "high"})
+        );
+
+        let request = request_with_output_fields(&[("thinking", json!({"type": "adaptive"}))]);
+        assert_eq!(
+            request.thinking.as_ref().and_then(|t| t.r#type),
+            Some(ThinkingType::Adaptive)
+        );
+        let serialized = serde_json::to_value(request).expect("request must serialize");
+        assert_eq!(serialized["thinking"], json!({"type": "adaptive"}));
+
+        // `type` omitted (KVV test_default_type_is_enabled sends `{"keep": "all"}`).
+        let request = request_with_output_fields(&[("thinking", json!({"keep": "all"}))]);
+        let thinking = request.thinking.as_ref().expect("thinking must be typed");
+        assert_eq!(thinking.r#type, None);
+        assert_eq!(thinking.keep.as_deref(), Some("all"));
+
+        for fields in [vec![], vec![("thinking", Value::Null)]] {
+            let request = request_with_output_fields(&fields);
+            assert_eq!(request.thinking, None);
+            assert!(!request.other.contains_key("thinking"));
+            let serialized = serde_json::to_value(request).expect("request must serialize");
+            assert!(serialized.get("thinking").is_none());
+        }
+    }
+
+    #[test]
+    fn thinking_toggle_and_effective_effort() {
+        for (thinking, expected) in [
+            (json!({"type": "enabled"}), Some(true)),
+            (json!({"type": "disabled"}), Some(false)),
+            (json!({"type": "adaptive"}), None),
+            (json!({"keep": "all"}), None),
+        ] {
+            let request = request_with_output_fields(&[("thinking", thinking.clone())]);
+            assert_eq!(request.thinking_toggle(), expected, "{thinking}");
+        }
+        assert_eq!(request_with_output_fields(&[]).thinking_toggle(), None);
+
+        // `thinking.effort` beats the top-level field; absent, the field applies.
+        let request = request_with_output_fields(&[
+            ("thinking", json!({"type": "enabled", "effort": "low"})),
+            ("reasoning_effort", json!("max")),
+        ]);
+        assert_eq!(request.effective_reasoning_effort(), Some("low"));
+        let request = request_with_output_fields(&[
+            ("thinking", json!({"type": "enabled"})),
+            ("reasoning_effort", json!("max")),
+        ]);
+        assert_eq!(request.effective_reasoning_effort(), Some("max"));
+        assert_eq!(
+            request_with_output_fields(&[]).effective_reasoning_effort(),
+            None
+        );
+
+        // Unknown `type` values and non-object shapes fail deserialization.
+        for thinking in [json!({"type": "bogus"}), json!("enabled"), json!(true)] {
+            let mut request = json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            });
+            request["thinking"] = thinking.clone();
+            assert!(
+                serde_json::from_value::<ChatCompletionRequest>(request).is_err(),
+                "{thinking} must be rejected"
+            );
         }
     }
 

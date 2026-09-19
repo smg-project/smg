@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{
     de::{self, value::SeqAccessDeserializer, SeqAccess, Visitor},
@@ -332,6 +332,26 @@ pub struct JsonSchemaFormat {
     pub strict: Option<bool>,
 }
 
+/// Shared shape rules for a json_schema format: name non-empty, schema a JSON object.
+pub fn validate_json_schema_shape(
+    name: &str,
+    schema: &Value,
+) -> Result<(), validator::ValidationError> {
+    let (code, message) = if name.is_empty() {
+        ("json_schema_name_empty", "JSON schema name cannot be empty")
+    } else if !schema.is_object() {
+        (
+            "json_schema_schema_not_object",
+            "JSON schema 'schema' must be a JSON object",
+        )
+    } else {
+        return Ok(());
+    };
+    let mut e = validator::ValidationError::new(code);
+    e.message = Some(message.into());
+    Err(e)
+}
+
 // ============================================================================
 // Streaming
 // ============================================================================
@@ -421,6 +441,36 @@ impl ToolChoice {
         tool_choice
             .map(|tc| serde_json::to_string(tc).unwrap_or_else(|_| "auto".to_string()))
             .unwrap_or_else(|| "auto".to_string())
+    }
+
+    /// The subset of `tools` this choice lets the model call, in the original
+    /// order: the named function for the function form, the listed functions
+    /// for `allowed_tools`. `None` when the choice does not narrow the list
+    /// (`auto`, `none`, `required`).
+    pub fn narrow_tools(&self, tools: &[Tool]) -> Option<Vec<Tool>> {
+        match self {
+            ToolChoice::AllowedTools { tools: allowed, .. } => {
+                let allowed: HashSet<&str> = allowed
+                    .iter()
+                    .filter_map(ToolReference::function_name)
+                    .collect();
+                Some(
+                    tools
+                        .iter()
+                        .filter(|tool| allowed.contains(tool.function.name.as_str()))
+                        .cloned()
+                        .collect(),
+                )
+            }
+            ToolChoice::Function { function, .. } => Some(
+                tools
+                    .iter()
+                    .filter(|tool| tool.function.name == function.name)
+                    .cloned()
+                    .collect(),
+            ),
+            ToolChoice::Value(_) => None,
+        }
     }
 }
 
@@ -679,6 +729,16 @@ impl Usage {
             let details = self.completion_tokens_details.get_or_insert_default();
             details.accepted_prediction_tokens = Some(accepted);
             details.rejected_prediction_tokens = Some(drafted.saturating_sub(accepted));
+        }
+        self
+    }
+
+    /// Drop prompt tokens the provider does not bill (the rendered generation stub).
+    pub fn with_unbilled_prompt_tokens(mut self, unbilled: u32) -> Self {
+        self.prompt_tokens = self.prompt_tokens.saturating_sub(unbilled);
+        self.total_tokens = self.prompt_tokens + self.completion_tokens;
+        if let Some(details) = &mut self.prompt_tokens_details {
+            details.cached_tokens = details.cached_tokens.min(self.prompt_tokens);
         }
         self
     }
@@ -1084,6 +1144,36 @@ mod tests {
     }
 
     #[test]
+    fn unbilled_prompt_tokens_come_off_the_prompt_and_total() {
+        let usage = Usage::from_counts(10, 4)
+            .with_cached_tokens(10)
+            .with_unbilled_prompt_tokens(3);
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (7, 4, 11)
+        );
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens),
+            Some(7),
+            "cached tokens are clamped to the billed prompt"
+        );
+
+        let saturated = Usage::from_counts(2, 4).with_unbilled_prompt_tokens(3);
+        assert_eq!((saturated.prompt_tokens, saturated.total_tokens), (0, 4));
+        assert!(saturated.prompt_tokens_details.is_none());
+
+        let unchanged = Usage::from_counts(10, 4).with_unbilled_prompt_tokens(0);
+        assert_eq!((unchanged.prompt_tokens, unchanged.total_tokens), (10, 14));
+    }
+
+    #[test]
     fn content_part_deserializes_audio_url() {
         let value = json!({
             "type": "audio_url",
@@ -1290,5 +1380,34 @@ mod tests {
     fn zero_speculative_counts_leave_usage_untouched() {
         let usage = Usage::from_counts(10, 20).with_speculative_tokens(0, 0);
         assert!(usage.completion_tokens_details.is_none());
+    }
+
+    #[test]
+    fn json_schema_shape_requires_name_and_object_schema() {
+        let cases = [
+            ("", json!({}), Some("json_schema_name_empty")),
+            ("", json!("x"), Some("json_schema_name_empty")),
+            ("w", json!("x"), Some("json_schema_schema_not_object")),
+            ("w", json!(1), Some("json_schema_schema_not_object")),
+            ("w", json!([]), Some("json_schema_schema_not_object")),
+            ("w", json!(null), Some("json_schema_schema_not_object")),
+            ("w", json!(true), Some("json_schema_schema_not_object")),
+            ("w", json!({}), None),
+            (
+                "w",
+                json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                None,
+            ),
+        ];
+        for (name, schema, expected) in cases {
+            let result = validate_json_schema_shape(name, &schema);
+            match expected {
+                Some(code) => {
+                    let err = result.expect_err(&format!("{name:?}/{schema} should fail"));
+                    assert_eq!(err.code, code, "{name:?}/{schema}");
+                }
+                None => assert!(result.is_ok(), "{name:?}/{schema} should pass"),
+            }
+        }
     }
 }

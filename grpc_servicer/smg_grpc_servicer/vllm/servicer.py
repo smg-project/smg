@@ -40,6 +40,7 @@ from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 from smg_grpc_servicer import mm_shm
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 from smg_grpc_servicer.vllm.admin import flush_cache
+from smg_grpc_servicer.vllm.errors import grpc_code_for
 from smg_grpc_servicer.vllm.kv_events import (
     endpoint_for_rank,
     resolve_kv_events_config,
@@ -304,14 +305,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                             num_prompt_logprobs=num_prompt_logprobs,
                         )
 
-        except ValueError as e:
-            # Invalid request error (equiv to 400).
-            await self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception as e:
-            logger.exception("Error in Generate for request %s", request_id)
+            code = grpc_code_for(e)
+            if code is grpc.StatusCode.INTERNAL:
+                logger.exception("Error in Generate for request %s", request_id)
+            else:
+                logger.warning("Generate request %s rejected (%s): %s", request_id, code.name, e)
             await self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+            await context.abort(code, str(e))
 
     async def _notify_kv_transfer_rejected(
         self,
@@ -396,12 +397,13 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
         except grpc.aio.AbortError:
             raise
-        except ValueError as e:
-            logger.warning("Embed invalid request %s: %s", request_id, e)
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception as e:
-            logger.exception("Embed failed for request %s", request_id)
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+            code = grpc_code_for(e)
+            if code is grpc.StatusCode.INTERNAL:
+                logger.exception("Embed failed for request %s", request_id)
+            else:
+                logger.warning("Embed request %s rejected (%s): %s", request_id, code.name, e)
+            await context.abort(code, str(e))
 
     async def HealthCheck(
         self,

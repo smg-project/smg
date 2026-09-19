@@ -72,6 +72,8 @@ pub struct ChatTemplateOutput {
     /// The flat prompt, for logs, routing, and `original_text`.
     pub text: String,
     pub encoding: PromptEncoding,
+    /// Prompt tokens the provider does not bill (K3's response-channel stub); 0 for flat renderers.
+    pub unbilled_prompt_tokens: u32,
 }
 
 /// Core encoding trait - separate from decoding for modularity
@@ -174,6 +176,7 @@ pub trait Tokenizer: Encoder + Decoder {
         Ok(ChatTemplateOutput {
             text,
             encoding: PromptEncoding::FromText,
+            unbilled_prompt_tokens: 0,
         })
     }
 

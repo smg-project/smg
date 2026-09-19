@@ -228,10 +228,10 @@ const RESPONSE_FORMAT_KEY: &str = "response_format";
 fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
     let kwargs_capacity = 3 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
     let mut combined = HashMap::with_capacity(kwargs_capacity);
-    if let Some(reasoning_effort) = &request.reasoning_effort {
+    if let Some(reasoning_effort) = request.effective_reasoning_effort() {
         combined.insert(
             REASONING_EFFORT_KEY.to_string(),
-            Value::String(reasoning_effort.clone()),
+            Value::String(reasoning_effort.to_string()),
         );
     }
     if let Some(tool_choice) = &request.tool_choice {
@@ -248,6 +248,13 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
         combined.extend(template_kwargs.clone());
     }
     combined
+}
+
+/// Typed `thinking.type` first, else the OpenAI mapping of the effective effort.
+fn resolve_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
+    request.thinking_toggle().or_else(|| {
+        openai_protocol::chat::thinking_from_reasoning_effort(request.effective_reasoning_effort())
+    })
 }
 
 /// gRPC backends require content parts the gateway knows how to render.
@@ -433,6 +440,20 @@ fn transform_content_field(
     Ok(())
 }
 
+/// A popped assistant message's prefill: its string content, or its text parts joined in order.
+fn prefill_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => Some(
+            parts
+                .iter()
+                .filter_map(|part| part.get("text")?.as_str())
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 fn modality_for_chat_part(type_name: &str) -> Option<Modality> {
     match type_name {
         "image_url" | "image" => Some(Modality::Image),
@@ -450,27 +471,7 @@ pub(crate) fn filter_tools_by_tool_choice(
     tools: &[Tool],
     tool_choice: Option<&ToolChoice>,
 ) -> Option<Vec<Tool>> {
-    match tool_choice {
-        Some(ToolChoice::AllowedTools { tools: allowed, .. }) => {
-            let allowed_names: std::collections::HashSet<&str> =
-                allowed.iter().filter_map(|t| t.function_name()).collect();
-            let filtered: Vec<Tool> = tools
-                .iter()
-                .filter(|t| allowed_names.contains(t.function.name.as_str()))
-                .cloned()
-                .collect();
-            Some(filtered)
-        }
-        Some(ToolChoice::Function { function, .. }) => {
-            let filtered: Vec<Tool> = tools
-                .iter()
-                .filter(|t| t.function.name == function.name)
-                .cloned()
-                .collect();
-            Some(filtered)
-        }
-        _ => None, // No filtering needed
-    }
+    tool_choice.and_then(|choice| choice.narrow_tools(tools))
 }
 
 /// Filter ChatCompletionRequest by tool_choice
@@ -602,12 +603,8 @@ pub(crate) fn process_chat_messages_with_placeholders(
             add_generation_prompt: !native_continuation,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
-            // Project OpenAI `reasoning_effort` (none/minimal) onto the model's
-            // thinking toggle; the tokenizer applies it under the correct key.
-            // An explicit chat_template_kwargs toggle still wins (in apply).
-            thinking: openai_protocol::chat::thinking_from_reasoning_effort(
-                request.reasoning_effort.as_deref(),
-            ),
+            // The tokenizer applies the toggle under the template's own key.
+            thinking: resolve_template_thinking(request),
             ..Default::default()
         };
 
@@ -621,14 +618,12 @@ pub(crate) fn process_chat_messages_with_placeholders(
                     ProcessedMessages {
                         text: String::new(),
                         stop_sequences: request.stop.clone(),
+                        unbilled_prompt_tokens: 0,
                     },
                     PromptEncoding::FromText,
                 ));
             };
-            last_msg
-                .get("content")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
+            last_msg.get("content").and_then(prefill_text)
         } else {
             None
         };
@@ -649,6 +644,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
         ProcessedMessages {
             text: rendered.text,
             stop_sequences: request.stop.clone(),
+            unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
         },
         rendered.encoding,
     ))
@@ -1554,6 +1550,61 @@ mod tests {
         assert_eq!(kwargs.get("custom"), Some(&Value::Bool(true)));
     }
 
+    fn thinking_request(thinking: Value, reasoning_effort: Option<&str>) -> ChatCompletionRequest {
+        let mut request = effort_request(reasoning_effort);
+        request.thinking = Some(serde_json::from_value(thinking).expect("thinking param"));
+        request
+    }
+
+    #[test]
+    fn thinking_effort_overrides_top_level_effort_in_kwargs() {
+        // KVV test_reasoning_effort_ignored_when_effort_present: effort=low beats max.
+        let request = thinking_request(json!({"type": "enabled", "effort": "low"}), Some("max"));
+        let kwargs = build_chat_template_kwargs(&request);
+        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
+
+        // Absent `thinking.effort`, the top-level field still applies.
+        let request = thinking_request(json!({"type": "enabled"}), Some("max"));
+        let kwargs = build_chat_template_kwargs(&request);
+        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("max")));
+
+        // An explicit chat_template_kwargs entry outranks both.
+        let mut request = thinking_request(json!({"effort": "low"}), Some("max"));
+        request.chat_template_kwargs = Some(HashMap::from([(
+            REASONING_EFFORT_KEY.to_string(),
+            json!("high"),
+        )]));
+        let kwargs = build_chat_template_kwargs(&request);
+        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("high")));
+    }
+
+    #[test]
+    fn thinking_disabled_projects_params_thinking_false() {
+        let request = thinking_request(json!({"type": "disabled"}), Some("high"));
+        assert_eq!(resolve_template_thinking(&request), Some(false));
+        // `adaptive` and an omitted `type` leave the template default in charge.
+        for thinking in [json!({"type": "adaptive"}), json!({"keep": "all"})] {
+            assert_eq!(
+                resolve_template_thinking(&thinking_request(thinking, None)),
+                None
+            );
+        }
+        assert_eq!(resolve_template_thinking(&effort_request(None)), None);
+        assert_eq!(
+            resolve_template_thinking(&effort_request(Some("none"))),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn thinking_enabled_beats_reasoning_effort_none() {
+        let request = thinking_request(json!({"type": "enabled"}), Some("none"));
+        assert_eq!(resolve_template_thinking(&request), Some(true));
+        // A `none` inside `thinking.effort` is the switch too when no type is given.
+        let request = thinking_request(json!({"effort": "none"}), Some("high"));
+        assert_eq!(resolve_template_thinking(&request), Some(false));
+    }
+
     #[test]
     fn tool_and_output_controls_are_forwarded_to_renderer() {
         let request: ChatCompletionRequest = serde_json::from_value(json!({
@@ -1821,6 +1872,41 @@ mod tests {
         assert_eq!(native["assistant_prefix"], json!(""));
     }
 
+    /// Under the OpenAI content format the popped assistant message keeps its
+    /// parts, so the prefill is their text.
+    #[test]
+    fn parts_valued_prefill_reaches_the_render_call_under_openai_content_format() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "continue_final_message": true,
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Sure"},
+                    {"type": "text", "text": "!"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let tokenizer = llm_tokenizer::MockTokenizer::new()
+            .with_content_format(ChatTemplateContentFormat::OpenAI)
+            .with_json_chat_template();
+        let (processed, _) = process_chat_messages_with_placeholders(
+            &request,
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        let (rendered, prefix) = processed
+            .text
+            .split_at(processed.text.rfind('}').unwrap() + 1);
+        let rendered: Value = serde_json::from_str(rendered).unwrap();
+        assert_eq!(rendered["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(rendered["add_generation_prompt"], json!(true));
+        assert_eq!(prefix, "Sure!");
+    }
+
     /// Without the capability a tool call's `arguments` string is parsed into
     /// an object before rendering (what Transformers templates expect); with
     /// it the string reaches the renderer as written, so a native renderer can
@@ -1858,9 +1944,50 @@ mod tests {
         );
     }
 
+    /// A renderer that parses `arguments` itself (K3) gets a malformed history
+    /// string as written and applies its own tolerance; Transformers templates
+    /// keep the 400.
+    #[test]
+    fn malformed_tool_call_arguments_are_forwarded_when_the_renderer_parses_them() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "北京天气"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"location\":\"北京\""}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "晴"}
+            ]
+        }))
+        .unwrap();
+
+        let err = process_chat_messages_with_placeholders(
+            &request,
+            &llm_tokenizer::MockTokenizer::new(),
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap_err();
+        assert!(err.contains("Failed to parse tool call arguments"), "{err}");
+
+        let raw = render_with(RAW_ARGUMENTS, &request);
+        assert_eq!(
+            raw["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            json!("{\"location\":\"北京\"")
+        );
+    }
+
     #[test]
     fn deferred_renderer_gets_the_prefill_and_its_job_runs_in_the_tokenize_step() {
-        let tokenizer = llm_tokenizer::MockTokenizer::new().with_deferred_chat_ids(vec![7, 8, 9]);
+        let tokenizer = llm_tokenizer::MockTokenizer::new()
+            .with_deferred_chat_ids(vec![7, 8, 9])
+            .with_unbilled_prompt_tokens(3);
         let (processed, encoding) = process_chat_messages_with_placeholders(
             &prefill_request(),
             &tokenizer,
@@ -1873,6 +2000,18 @@ mod tests {
             "the prefill is passed into the render call"
         );
         assert!(matches!(encoding, PromptEncoding::Deferred(_)));
+        assert_eq!(
+            processed.unbilled_prompt_tokens, 3,
+            "the renderer's unbilled count rides along"
+        );
+        let (flat, _) = process_chat_messages_with_placeholders(
+            &prefill_request(),
+            &llm_tokenizer::MockTokenizer::new(),
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        assert_eq!(flat.unbilled_prompt_tokens, 0);
 
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(tokenizer);
         let ids = block_on(encode_prompt_blocking(tokenizer, &processed.text, encoding)).unwrap();

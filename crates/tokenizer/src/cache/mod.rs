@@ -706,7 +706,9 @@ mod tests {
             traits::{PromptEncoding, Tokenizer as _},
         };
 
-        let inner = MockTokenizer::new().with_deferred_chat_ids(vec![7, 8, 9]);
+        let inner = MockTokenizer::new()
+            .with_deferred_chat_ids(vec![7, 8, 9])
+            .with_unbilled_prompt_tokens(3);
         let cached = CachedTokenizer::new(
             Arc::new(inner),
             CacheConfig {
@@ -728,6 +730,7 @@ mod tests {
             "{}",
             rendered.text
         );
+        assert_eq!(rendered.unbilled_prompt_tokens, 3);
         let PromptEncoding::Deferred(job) = rendered.encoding else {
             panic!("the wrapper must hand the inner tokenizer's deferred encode through");
         };

@@ -265,7 +265,7 @@ message GenerateStreamChunk {
 
 message GenerateComplete {
   repeated uint32 output_ids = 1;      // All output tokens
-  string finish_reason = 2;            // "stop", "length", "abort"
+  string finish_reason = 2;            // "stop", "length", "abort", "error"
   uint32 prompt_tokens = 3;
   uint32 completion_tokens = 4;
   uint32 cached_tokens = 5;

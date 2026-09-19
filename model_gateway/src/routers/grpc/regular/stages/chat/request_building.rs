@@ -204,6 +204,7 @@ impl BuildStage for ChatRequestBuildingStage {
             ));
         };
 
+        let unbilled_prompt_tokens = processed_messages.unbilled_prompt_tokens;
         let (plan, stamp) = build_chat_backed_plan(
             ctx,
             &chat_request,
@@ -216,9 +217,14 @@ impl BuildStage for ChatRequestBuildingStage {
         )
         .await?;
 
+        // Only the client-facing usage drops them; settlement keeps the engine's count.
+        ctx.state.response.unbilled_prompt_tokens = unbilled_prompt_tokens;
+        let mut spec = ChatResponseSpec::from(chat_request.as_ref());
+        spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
+
         Ok(BuildOutput {
             plan,
-            spec: ResponseSpec::Chat(Box::new(ChatResponseSpec::from(chat_request.as_ref()))),
+            spec: ResponseSpec::Chat(Box::new(spec)),
             stamp,
         })
     }

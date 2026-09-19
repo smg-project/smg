@@ -87,7 +87,7 @@ where `<DATA_DIR>` is the path you pass to the **required** `--data-dir` flag (t
 
 Mirrors `nightly-bfcl.yml`'s 6-leg matrix. The 2 H100 legs run full task sets; the 4
 Blackwell legs are capped at `num_tasks=30`/domain (tau2 is multi-turn + spends
-gpt-5.2 per turn). `glm-5.2` runs **sequential** (whole 8-GPU node per arm — `run_ab.py
+gpt-5.2 per turn). `deepseek-v4.1` runs **sequential** (whole 8-GPU node per arm — `run_ab.py
 --score-arm` each arm, then `--diff`); the rest run both arms concurrently on opposite
 GPU halves. On PRs **all** legs run on a tiny retail / 1-trial / few-task subset — a
 quick "does each leg launch + parse + score" smoke (the heavy Blackwell legs are
@@ -98,9 +98,9 @@ dominated by model-load time, serialized by a host lock, so a PR run is not fast
 | qwen3.8 | Qwen/Qwen3.8-27B | 4-gpu-h100 (2) | `qwen3_xml` / `qwen3` | `qwen_xml` / `qwen3` |
 | gpt-oss | openai/gpt-oss-120b | 4-gpu-h100 (2) | `openai` / — | — / — (harmony auto) |
 | deepseek-v4.1 | deepseek-ai/DeepSeek-V4.1-Flash | blackwell (8, seq) | `deepseek_v41` / `deepseek_v41` | `deepseek_v41` / `deepseek_v41` |
-| minimax-m2.7 | MiniMaxAI/MiniMax-M2.7 | blackwell (4) | `minimax_m2` / `minimax_m2` | `minimax_m2` / `minimax` |
+| minimax-m3 | MiniMaxAI/MiniMax-M3-MXFP8 | blackwell (4) | `minimax_m3` / `minimax_m3` | `minimax_m3` / `minimax_m3` |
 | kimi-k2.6 | moonshotai/Kimi-K2.6 | blackwell (4) | `kimi_k2` / `kimi_k2` | `kimik2` / `kimi_k25` |
-| glm-5.2 | zai-org/GLM-5.2-FP8 | blackwell (8, seq) | `glm47` / `glm45` | `glm47_moe` / `glm45` |
+| glm-5.3-flash | zai-org/GLM-5.3-Flash | blackwell (4) | `glm47` / `glm45` | `glm47_moe` / `glm45` |
 
 > Dispatch `only=<leg>` runs a single leg; `model=` overrides its weights. SKU ids and
 > vLLM parser names may shift; confirm against the installed vLLM build:

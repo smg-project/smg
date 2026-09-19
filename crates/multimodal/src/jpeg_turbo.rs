@@ -109,6 +109,18 @@ fn turbojpeg() -> Option<&'static TurboJpeg> {
     TJ.get_or_init(load_turbojpeg).as_ref()
 }
 
+/// Cap on the decoded RGB buffer. Matches the `image` crate's default 512 MiB
+/// limit, which the pure-Rust fallback decoder already enforces.
+const MAX_DECODED_BYTES: usize = 512 * 1024 * 1024;
+
+/// Byte length of a `w` x `h` RGB8 buffer, or `None` if it overflows or exceeds
+/// `MAX_DECODED_BYTES`.
+fn rgb_buffer_len(w: usize, h: usize) -> Option<usize> {
+    w.checked_mul(h)?
+        .checked_mul(3)
+        .filter(|&n| n <= MAX_DECODED_BYTES)
+}
+
 /// True if `bytes` start with the JPEG SOI marker.
 pub fn is_jpeg(bytes: &[u8]) -> bool {
     bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
@@ -154,7 +166,7 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
         }
         let (wu, hu) = (w as usize, h as usize);
         // Guard against absurd dimensions before allocating.
-        let nbytes = match wu.checked_mul(hu).and_then(|p| p.checked_mul(3)) {
+        let nbytes = match rgb_buffer_len(wu, hu) {
             Some(n) => n,
             None => {
                 (tj.destroy)(handle);
@@ -178,5 +190,18 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
             return None;
         }
         RgbImage::from_raw(w as u32, h as u32, buf).map(DynamicImage::ImageRgb8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgb_buffer_len_caps_decoded_size() {
+        assert_eq!(rgb_buffer_len(1024, 768), Some(1024 * 768 * 3));
+        // 65500 x 65500 is the largest size libjpeg-turbo accepts: ~12 GiB of RGB.
+        assert_eq!(rgb_buffer_len(65500, 65500), None);
+        assert_eq!(rgb_buffer_len(usize::MAX, 2), None);
     }
 }

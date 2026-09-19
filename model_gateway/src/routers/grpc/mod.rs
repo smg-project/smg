@@ -55,6 +55,8 @@ fn validate_text_only_output(request: &ChatCompletionRequest) -> Result<(), Box<
 pub struct ProcessedMessages {
     pub text: String,
     pub stop_sequences: Option<StringOrArray>,
+    /// Rendered prompt tokens the provider does not bill.
+    pub unbilled_prompt_tokens: u32,
 }
 
 #[cfg(test)]

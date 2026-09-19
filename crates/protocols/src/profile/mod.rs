@@ -19,6 +19,7 @@ mod minimax;
 
 use crate::{
     chat::{ChatCompletionRequest, ChatMessage},
+    common::Tool,
     ext::retain_if,
 };
 
@@ -34,6 +35,20 @@ pub enum ProviderProfile {
 }
 
 impl ProviderProfile {
+    /// Tools the profile lets messages declare on top of the request-level
+    /// `tools`: Kimi K3's dynamic tools on system and developer messages, in
+    /// message order. Empty for profiles without message-declared tools, so
+    /// a foreign `tools` field on a message never widens the tool set.
+    pub fn dynamic_tools<'a>(
+        self,
+        req: &'a ChatCompletionRequest,
+    ) -> Box<dyn Iterator<Item = &'a Tool> + 'a> {
+        match self {
+            ProviderProfile::Kimi => Box::new(kimi::dynamic_tools(req)),
+            ProviderProfile::Minimax | ProviderProfile::OpenAi => Box::new(std::iter::empty()),
+        }
+    }
+
     /// Select the profile from a model id.
     ///
     /// Matches the way the tool and reasoning parser factories do: any
@@ -151,6 +166,43 @@ fn reject_root(req: &ChatCompletionRequest) -> Result<(), validator::ValidationE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_kimi_profile_exposes_message_declared_tools() {
+        let request = |model: &str| -> ChatCompletionRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "", "tools": [
+                        {"type": "function", "function": {"name": "get_weather"}}
+                    ]},
+                    {"role": "developer", "content": "", "tools": [
+                        {"type": "function", "function": {"name": "get_time"}}
+                    ]},
+                    {"role": "user", "content": "hi"}
+                ]
+            }))
+            .expect("request deserializes")
+        };
+
+        let kimi = request("kimi-k3");
+        let names: Vec<&str> = ProviderProfile::for_model(&kimi.model)
+            .dynamic_tools(&kimi)
+            .map(|tool| tool.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["get_weather", "get_time"]);
+
+        for model in ["gpt-4o", "MiniMax-M2"] {
+            let other = request(model);
+            assert_eq!(
+                ProviderProfile::for_model(&other.model)
+                    .dynamic_tools(&other)
+                    .count(),
+                0,
+                "{model} must not pick up message-declared tools"
+            );
+        }
+    }
 
     #[test]
     fn model_id_selects_profile() {

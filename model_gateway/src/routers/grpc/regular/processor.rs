@@ -309,7 +309,8 @@ impl ResponseProcessor {
         }
 
         // Build usage from gRPC response counters.
-        let usage = response_formatting::build_usage(&all_responses);
+        let usage = response_formatting::build_usage(&all_responses)
+            .with_unbilled_prompt_tokens(chat_request.unbilled_prompt_tokens);
 
         // Build final ChatCompletionResponse
         Ok(

@@ -309,8 +309,11 @@ fn kimi_profile_rejects_tools_of_any_shape_on_user_and_assistant() {
 fn kimi_profile_allows_tools_on_developer_like_system() {
     // `developer` supersedes `system` in the OpenAI spec, and the verifier
     // has no case for it, so it follows the system rule.
-    let mut req = request_with_tools_on_role("kimi-k3", "developer");
-    req.normalize();
+    let req = kimi_request(json!([declaring(
+        "developer",
+        json!(""),
+        &[named("get_weather")]
+    )]));
     assert!(req.validate().is_ok(), "{:?}", error_codes(&req));
 }
 
@@ -328,8 +331,12 @@ fn kimi_profile_rejects_an_empty_tools_list_on_user() {
 
 #[test]
 fn kimi_profile_allows_tools_on_system() {
-    let req = request_with_tools_on_role("kimi-k3", "system");
-    assert!(req.validate().is_ok());
+    let req = kimi_request(json!([declaring(
+        "system",
+        json!(""),
+        &[named("get_weather")]
+    )]));
+    assert!(req.validate().is_ok(), "{:?}", error_codes(&req));
 }
 
 #[test]
@@ -519,6 +526,305 @@ fn named_tool_choice_sees_dynamic_tools_beside_request_tools() {
         );
         assert!(req.validate().is_ok(), "{role}: {:?}", error_codes(&req));
     }
+}
+
+#[expect(clippy::expect_used, reason = "test helper")]
+fn normalized_request(value: Value) -> ChatCompletionRequest {
+    let mut req: ChatCompletionRequest =
+        serde_json::from_value(value).expect("request deserializes");
+    req.normalize();
+    req
+}
+
+fn kimi_request(messages: Value) -> ChatCompletionRequest {
+    normalized_request(json!({"model": "kimi-k3", "messages": messages}))
+}
+
+/// A system-like message declaring dynamic tools.
+fn declaring(role: &str, content: Value, tools: &[Value]) -> Value {
+    json!({"role": role, "content": content, "tools": tools})
+}
+
+/// The message of the first validation error carrying `code`.
+fn error_message(req: &ChatCompletionRequest, code: &str) -> String {
+    let Err(errors) = req.validate() else {
+        return String::new();
+    };
+    errors
+        .field_errors()
+        .values()
+        .flat_map(|errs| errs.iter())
+        .find(|e| e.code == code)
+        .and_then(|e| e.message.clone())
+        .map(|m| m.into_owned())
+        .unwrap_or_default()
+}
+
+#[test]
+fn kimi_profile_rejects_content_with_dynamic_tools() {
+    // KVV test_content_and_dynamic_tools_nonempty_rejected.
+    for role in ["system", "developer"] {
+        for content in [json!("not empty"), json!([{"type": "text", "text": "x"}])] {
+            let req = kimi_request(json!([declaring(
+                role,
+                content.clone(),
+                &[named("get_weather")]
+            )]));
+            assert!(
+                has_code(&req, "tools_content_conflict"),
+                "{role}/{content}: {:?}",
+                error_codes(&req)
+            );
+        }
+        let req = kimi_request(json!([declaring(role, json!(""), &[named("get_weather")])]));
+        assert!(req.validate().is_ok(), "{role}: {:?}", error_codes(&req));
+        // An empty list is not a declaration, so content stays legal beside it.
+        let req = kimi_request(json!([declaring(role, json!("hi"), &[])]));
+        assert!(req.validate().is_ok(), "{role}: {:?}", error_codes(&req));
+    }
+    // System content defaults to empty when omitted.
+    let req = kimi_request(json!([{"role": "system", "tools": [named("get_weather")]}]));
+    assert!(req.validate().is_ok(), "{:?}", error_codes(&req));
+}
+
+#[test]
+fn kimi_profile_rejects_unsupported_dynamic_tool_type() {
+    // KVV test_unsupported_tool_type_rejected and test_mixed_valid_and_bogus_type_tools_rejected.
+    let bogus = json!({"type": "bogus", "function": {"name": "x"}});
+    let req = kimi_request(json!([declaring(
+        "system",
+        json!(""),
+        std::slice::from_ref(&bogus)
+    )]));
+    assert!(
+        has_code(&req, "tool_type_unsupported"),
+        "{:?}",
+        error_codes(&req)
+    );
+
+    let req = kimi_request(json!([declaring(
+        "system",
+        json!(""),
+        &[named("good_tool"), bogus]
+    )]));
+    assert!(
+        has_code(&req, "tool_type_unsupported"),
+        "{:?}",
+        error_codes(&req)
+    );
+    let message = error_message(&req, "tool_type_unsupported");
+    assert!(
+        message.starts_with("messages[0].tools[1]"),
+        "must name the bogus tool, got: {message}"
+    );
+}
+
+#[test]
+fn kimi_profile_rejects_invalid_dynamic_tool_names() {
+    // KVV test_invalid_dynamic_tool_name_rejected, plus the characters the
+    // ASCII-identifier grammar excludes and the verifier never sends.
+    let too_long = "a".repeat(257);
+    for name in [
+        "",
+        "1bad_name",
+        "bad@name",
+        too_long.as_str(),
+        "bad-name",
+        "bad.name",
+        "名字",
+    ] {
+        let req = kimi_request(json!([declaring("system", json!(""), &[named(name)])]));
+        assert!(
+            has_code(&req, "tool_name_invalid"),
+            "{name:?}: {:?}",
+            error_codes(&req)
+        );
+        let message = error_message(&req, "tool_name_invalid");
+        assert!(
+            message.starts_with("messages[0].tools[0]")
+                && (name.is_empty() || !message.contains(name)),
+            "must name the position, not echo the name: {message}"
+        );
+    }
+    let longest = "a".repeat(256);
+    for name in [
+        "x",
+        "get_weather",
+        "Calculator",
+        "getWeatherOfToday",
+        "_private",
+        "a1",
+        longest.as_str(),
+    ] {
+        let req = kimi_request(json!([declaring("system", json!(""), &[named(name)])]));
+        assert!(req.validate().is_ok(), "{name:?}: {:?}", error_codes(&req));
+    }
+}
+
+#[test]
+fn kimi_profile_rejects_duplicate_dynamic_tool_names() {
+    // KVV test_duplicate_dynamic_tool_names_rejected,
+    // test_duplicate_tool_names_across_dynamic_messages_rejected and
+    // test_duplicate_tool_name_between_global_and_dynamic_rejected.
+    let dup = || named("dup");
+    for request in [
+        json!({"messages": [declaring("system", json!(""), &[dup(), dup()])]}),
+        json!({"messages": [
+            declaring("system", json!(""), &[dup()]),
+            declaring("system", json!(""), &[dup()])
+        ]}),
+        json!({"messages": [
+            declaring("system", json!(""), &[dup()]),
+            declaring("developer", json!(""), &[dup()])
+        ]}),
+        json!({"tools": [dup()], "messages": [declaring("system", json!(""), &[dup()])]}),
+        // KVV's [stream] variants: the same rule fires on streaming requests.
+        json!({
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "messages": [declaring("system", json!(""), &[dup(), dup()])]
+        }),
+    ] {
+        let mut request = request;
+        request["model"] = json!("kimi-k3");
+        let req = normalized_request(request.clone());
+        assert!(
+            has_code(&req, "tool_name_duplicate"),
+            "{request}: {:?}",
+            error_codes(&req)
+        );
+        let message = error_message(&req, "tool_name_duplicate");
+        assert!(
+            message.contains("'dup'"),
+            "must name the duplicate, got: {message}"
+        );
+    }
+}
+
+#[test]
+fn kimi_profile_accepts_dynamic_tools_at_any_position() {
+    // KVV positive shapes: first, after a plain system prompt and a turn, last,
+    // three in one message, a nested schema, strict=false.
+    let nested = json!({"type": "function", "function": {
+        "name": "nested_tool",
+        "parameters": {"type": "object", "properties": {
+            "location": {"type": "object", "properties": {"lat": {"type": "number"}}}
+        }}
+    }});
+    let relaxed = json!({"type": "function", "function": {"name": "get_weather", "strict": false}});
+    let user = json!({"role": "user", "content": "what is the weather in beijing?"});
+    for messages in [
+        json!([
+            declaring("system", json!(""), &[named("get_weather")]),
+            user
+        ]),
+        json!([
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "Hello!"},
+            declaring("system", json!(""), &[named("get_weather")]),
+            user
+        ]),
+        json!([
+            user,
+            declaring("system", json!(""), &[named("get_weather")])
+        ]),
+        json!([
+            declaring(
+                "system",
+                json!(""),
+                &[named("get_weather"), named("get_time"), named("get_news")]
+            ),
+            user
+        ]),
+        json!([declaring("system", json!(""), &[nested]), user]),
+        json!([declaring("system", json!(""), &[relaxed]), user]),
+    ] {
+        let req = normalized_request(json!({
+            "model": "kimi-k3",
+            "messages": messages,
+            "tool_choice": "required"
+        }));
+        assert!(
+            error_codes(&req).is_empty(),
+            "{messages}: {:?}",
+            error_codes(&req)
+        );
+    }
+}
+
+#[test]
+fn kimi_profile_accepts_distinct_global_and_dynamic_tools() {
+    // KVV test_global_and_dynamic_tools_coexist and
+    // test_two_dynamic_messages_with_distinct_tools.
+    let user = json!({"role": "user", "content": "what is the weather in beijing?"});
+    let req = normalized_request(json!({
+        "model": "kimi-k3",
+        "tools": [named("get_stock_price")],
+        "messages": [declaring("system", json!(""), &[named("get_weather")]), user],
+        "tool_choice": "required"
+    }));
+    assert!(error_codes(&req).is_empty(), "{:?}", error_codes(&req));
+
+    let req = normalized_request(json!({
+        "model": "kimi-k3",
+        "messages": [
+            declaring("system", json!(""), &[named("get_weather")]),
+            declaring("system", json!(""), &[named("get_time")]),
+            user
+        ],
+        "tool_choice": "required"
+    }));
+    assert!(error_codes(&req).is_empty(), "{:?}", error_codes(&req));
+}
+
+#[test]
+fn kimi_profile_leaves_request_level_tools_unjudged() {
+    // Request-level names only seed the duplicate set; their own shape is
+    // not held to the dynamic-tool rules.
+    for tools in [
+        json!([named("bad@name")]),
+        json!([named("dup"), named("dup")]),
+    ] {
+        let req = normalized_request(json!({
+            "model": "kimi-k3",
+            "tools": tools,
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert!(
+            error_codes(&req).is_empty(),
+            "{tools}: {:?}",
+            error_codes(&req)
+        );
+    }
+}
+
+#[test]
+fn non_kimi_models_ignore_dynamic_tool_rules() {
+    let bogus = json!({"type": "bogus", "function": {"name": "x"}});
+    for model in ["gpt-4o-mini", "MiniMax-M3"] {
+        let req = normalized_request(json!({
+            "model": model,
+            "messages": [declaring("system", json!("hi"), &[named("dup"), named("dup"), bogus.clone()])]
+        }));
+        assert!(req.validate().is_ok(), "{model}: {:?}", error_codes(&req));
+        let out = serde_json::to_value(&req).expect("serializes");
+        assert!(out["messages"][0].get("tools").is_none(), "{model}");
+    }
+}
+
+#[test]
+fn non_k3_kimi_models_keep_dynamic_tool_rules() {
+    // Profile-wide, like the role rule in non_k3_kimi_models_keep_openai_sampling.
+    let req = normalized_request(json!({
+        "model": "moonshotai/kimi-k2",
+        "messages": [declaring("system", json!(""), &[named("dup"), named("dup")])]
+    }));
+    assert!(
+        has_code(&req, "tool_name_duplicate"),
+        "{:?}",
+        error_codes(&req)
+    );
 }
 
 #[expect(clippy::expect_used, reason = "test helper")]
@@ -867,6 +1173,70 @@ fn non_kimi_models_get_no_sampling_defaults() {
     }
 }
 
+fn include_usage(req: &ChatCompletionRequest) -> Option<bool> {
+    req.stream_options.as_ref().and_then(|o| o.include_usage)
+}
+
+#[test]
+fn kimi_profile_defaults_stream_usage_on() {
+    let mut req = sampling_request("kimi-k3", json!({"stream": true}));
+    req.normalize();
+    assert_eq!(include_usage(&req), Some(true));
+    assert!(req.validate().is_ok());
+}
+
+#[test]
+fn kimi_profile_keeps_explicit_stream_usage_opt_out() {
+    let mut req = sampling_request(
+        "kimi-k3",
+        json!({"stream": true, "stream_options": {"include_usage": false}}),
+    );
+    req.normalize();
+    assert_eq!(include_usage(&req), Some(false));
+}
+
+#[test]
+fn kimi_profile_stream_usage_default_preserves_other_stream_options() {
+    let mut req = sampling_request(
+        "kimi-k3",
+        json!({"stream": true, "stream_options": {"continuous_usage_stats": true, "include_obfuscation": false, "step_usage_chunks": "all"}}),
+    );
+    req.normalize();
+    let opts = req.stream_options.as_ref().unwrap();
+    assert_eq!(opts.include_usage, Some(true));
+    assert_eq!(opts.continuous_usage_stats, Some(true));
+    assert_eq!(opts.include_obfuscation, Some(false));
+    assert_eq!(opts.other["step_usage_chunks"], json!("all"));
+}
+
+#[test]
+fn kimi_profile_adds_no_stream_options_when_not_streaming() {
+    for fields in [json!({}), json!({"stream": false})] {
+        let mut req = sampling_request("kimi-k3", fields);
+        req.normalize();
+        assert!(req.stream_options.is_none());
+        assert!(!has_code(&req, "stream_options_requires_stream"));
+    }
+}
+
+#[test]
+fn kimi_profile_stream_usage_default_is_kimi_wide() {
+    for model in ["moonshotai/kimi-k2", "kimi-k2.6"] {
+        let mut req = sampling_request(model, json!({"stream": true}));
+        req.normalize();
+        assert_eq!(include_usage(&req), Some(true), "{model}");
+    }
+}
+
+#[test]
+fn non_kimi_models_get_no_stream_usage_default() {
+    for model in ["gpt-4o-mini", "MiniMax-M3"] {
+        let mut req = sampling_request(model, json!({"stream": true}));
+        req.normalize();
+        assert!(req.stream_options.is_none(), "{model}");
+    }
+}
+
 #[test]
 fn kimi_profile_accepts_the_verifier_sampling_set() {
     for temperature in [0.0, 0.6, 1.0] {
@@ -963,4 +1333,177 @@ fn k3_ids_in_paths_and_prefixes_get_the_sampling_pins() {
             "{model}"
         );
     }
+}
+
+#[test]
+fn k3_rejects_invalid_thinking_effort_and_adaptive_type() {
+    for (thinking, code) in [
+        (
+            json!({"type": "enabled", "effort": "medium"}),
+            "thinking_effort_invalid",
+        ),
+        (json!({"effort": "bogus"}), "thinking_effort_invalid"),
+        // Rejected even when thinking is off: the rule keys on the field.
+        (
+            json!({"type": "disabled", "effort": "medium"}),
+            "thinking_effort_invalid",
+        ),
+        (json!({"type": "adaptive"}), "thinking_type_not_supported"),
+    ] {
+        let req = sampling_request("kimi-k3", json!({"thinking": thinking}));
+        assert!(
+            error_codes(&req).iter().any(|c| c == code),
+            "{thinking} must fail with {code}, got {:?}",
+            error_codes(&req)
+        );
+    }
+    // An unknown `type` fails at the parse boundary (400 json_parse_error).
+    assert!(serde_json::from_value::<ChatCompletionRequest>(json!({
+        "model": "kimi-k3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "bogus"}
+    }))
+    .is_err());
+}
+
+#[test]
+fn k3_accepts_disabled_with_any_keep() {
+    // KVV: `keep != "all"` rejection is skipped upstream; the renderer ignores keep.
+    for thinking in [
+        json!({"type": "disabled", "keep": "none"}),
+        json!({"type": "enabled", "keep": "all", "effort": "low"}),
+        json!({"type": "enabled", "effort": "high"}),
+        json!({"effort": "max"}),
+        json!({"keep": "all"}),
+        json!({}),
+    ] {
+        let req = sampling_request("kimi-k3", json!({"thinking": thinking}));
+        assert!(
+            error_codes(&req).is_empty(),
+            "{thinking}: {:?}",
+            error_codes(&req)
+        );
+    }
+}
+
+#[test]
+fn non_k3_models_ignore_thinking_effort_values() {
+    for model in [
+        "kimi-k2.5",
+        "moonshotai/kimi-k2",
+        "gpt-4o-mini",
+        "MiniMax-M3",
+    ] {
+        let req = sampling_request(
+            model,
+            json!({"thinking": {"type": "adaptive", "effort": "bogus"}}),
+        );
+        assert!(
+            error_codes(&req).is_empty(),
+            "{model} must not enforce K3 thinking rules: {:?}",
+            error_codes(&req)
+        );
+    }
+}
+
+#[expect(clippy::expect_used, reason = "test helper")]
+fn effective_tool_names(value: Value) -> Vec<String> {
+    let req: ChatCompletionRequest = serde_json::from_value(value).expect("request deserializes");
+    req.effective_tools()
+        .map(|tool| tool.function.name.clone())
+        .collect()
+}
+
+#[test]
+fn effective_tools_merge_request_and_dynamic_tools() {
+    let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {"type": "object"}}});
+
+    // Request-level tools come first, then dynamic tools in message order.
+    let merged = effective_tool_names(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("dynamic_a")]},
+            {"role": "user", "content": "hi"},
+            {"role": "developer", "content": "", "tools": [tool("dynamic_b")]}
+        ],
+        "tools": [tool("global")]
+    }));
+    assert_eq!(merged, ["global", "dynamic_a", "dynamic_b"]);
+
+    // Dynamic tools alone are still tools.
+    let dynamic_only = effective_tool_names(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("get_weather")]},
+            {"role": "user", "content": "weather?"}
+        ]
+    }));
+    assert_eq!(dynamic_only, ["get_weather"]);
+
+    // Tools on other roles are not part of the set.
+    let none = effective_tool_names(json!({
+        "model": "kimi-k3",
+        "messages": [{"role": "user", "content": "hi"}]
+    }));
+    assert!(none.is_empty());
+}
+
+#[expect(clippy::expect_used, reason = "test helper")]
+fn callable_tool_names(value: Value) -> Vec<String> {
+    let req: ChatCompletionRequest = serde_json::from_value(value).expect("request deserializes");
+    req.callable_tools()
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect()
+}
+
+#[test]
+fn callable_tools_follow_tool_choice_across_request_and_dynamic_tools() {
+    let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {"type": "object"}}});
+
+    // `required` keeps every tool: request-level first, then dynamic.
+    let required = callable_tool_names(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("get_weather")]},
+            {"role": "user", "content": "what is the weather in beijing?"}
+        ],
+        "tools": [tool("get_stock_price")],
+        "tool_choice": "required"
+    }));
+    assert_eq!(required, ["get_stock_price", "get_weather"]);
+
+    // A named choice narrows dynamic tools the same way as request-level ones.
+    let named = callable_tool_names(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("get_weather"), tool("get_time")]},
+            {"role": "user", "content": "what time is it?"}
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "get_time"}}
+    }));
+    assert_eq!(named, ["get_time"]);
+
+    // `allowed_tools` keeps the listed functions from either origin.
+    let allowed = callable_tool_names(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "developer", "content": "", "tools": [tool("get_weather")]},
+            {"role": "user", "content": "hi"}
+        ],
+        "tools": [tool("get_stock_price"), tool("get_news")],
+        "tool_choice": {"type": "allowed_tools", "mode": "required", "tools": [
+            {"type": "function", "name": "get_news"},
+            {"type": "function", "name": "get_weather"}
+        ]}
+    }));
+    assert_eq!(allowed, ["get_news", "get_weather"]);
+
+    // No tools anywhere: nothing the choice could force.
+    let none = callable_tool_names(json!({
+        "model": "kimi-k3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tool_choice": "auto"
+    }));
+    assert!(none.is_empty());
 }

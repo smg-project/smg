@@ -1565,7 +1565,16 @@ impl TokenTree {
             };
             drop(page_key_guard);
 
-            parent.children.remove(&page_key);
+            // Detach only if the parent still holds this exact node under the key.
+            // The children map is concurrent and this walk runs during eviction, so a
+            // store can install a different node under the same page key after the
+            // emptiness check above. Removing the key unconditionally would drop that
+            // live replacement and every descendant it owns, silently shrinking the
+            // index. `remove_if` evaluates the predicate under the shard lock, so the
+            // check and the removal cannot be split.
+            parent
+                .children
+                .remove_if(&page_key, |_, child| Arc::ptr_eq(child, &current));
 
             if parent_leaf_info.is_none() && self.is_tenant_leaf(&parent, tenant_id) {
                 if let Some(ts) = parent.tenant_last_access_time.get(tenant_id.as_ref()) {
@@ -3959,6 +3968,57 @@ mod tests {
             tree.match_prefix_with_counts(&unrelated)
                 .matched_token_count,
             unrelated.len()
+        );
+    }
+
+    /// A node the eviction walk still holds can be replaced under the same page
+    /// key by a concurrent store. Detaching by key alone would delete the
+    /// replacement and every token beneath it, so the walk must check identity.
+    #[test]
+    fn stale_cleanup_keeps_a_replacement_at_the_same_page_key() {
+        let tree = TokenTree::new();
+        let tokens = make_tokens(700, 2);
+        let page_key = page_key_of(&tokens, PAGE_SIZE);
+        let victim: TenantId = Arc::from("victim");
+
+        tree.insert_tokens(&tokens, "victim");
+        let stale = tree
+            .root
+            .children
+            .get(&page_key)
+            .map(|entry| Arc::clone(entry.value()))
+            .expect("inserted child");
+
+        // The walk observed this node empty, and the tree moved on without it.
+        stale.tenant_last_access_time.clear();
+        tree.root.children.remove(&page_key);
+
+        // A concurrent store installs a different node under the same page key.
+        tree.insert_tokens(&tokens, "survivor");
+        let replacement = tree
+            .root
+            .children
+            .get(&page_key)
+            .map(|entry| Arc::clone(entry.value()))
+            .expect("replacement child");
+        assert!(!Arc::ptr_eq(&stale, &replacement));
+
+        // The walk runs late, still holding the node it collected earlier.
+        tree.cleanup_empty_ancestors_with_parent(&stale, &victim);
+
+        let survivor = tree
+            .root
+            .children
+            .get(&page_key)
+            .map(|entry| Arc::clone(entry.value()));
+        assert!(
+            survivor.is_some_and(|node| Arc::ptr_eq(&node, &replacement)),
+            "stale cleanup detached the replacement node"
+        );
+        assert_eq!(
+            tree.match_prefix_with_counts(&tokens).matched_token_count,
+            tokens.len(),
+            "replacement subtree is no longer reachable"
         );
     }
 
