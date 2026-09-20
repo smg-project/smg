@@ -544,7 +544,9 @@ impl RadixTree {
     /// make that sound:
     /// - Contiguity: an inferred (placement-fed) holder's held
     ///   positions are a contiguous prefix per chain (stores add
-    ///   contiguously, truncate cuts the tail, and mid-chain removes
+    ///   contiguously, truncate cuts the tail, `evict_oldest` takes
+    ///   whole chains in reverse topological order and trims its one
+    ///   partial victim deepest-position-first, and mid-chain removes
     ///   only arrive via `Removed`, which pins the holder event-fed —
     ///   and event-fed holders reject every digest). A tip key at
     ///   position p therefore proves p+1 blocks are held.
@@ -623,8 +625,9 @@ impl RadixTree {
     /// chain slots of retired placements are never freed (measured:
     /// chain count 1k -> 14k at a flat block count). Whole-chain
     /// eviction frees the slot the moment the holder was its last
-    /// member. Cost is O(keys + chains x depth) per call — a cold
-    /// capacity path, not a per-apply one.
+    /// member. Cost is O(keys + chains log chains) per call, plus one
+    /// span update per membership removed — a cold capacity path, not
+    /// a per-apply one.
     pub fn evict_oldest(&mut self, id: HolderId, keep: u64) -> u64 {
         if self.live(id).is_none() {
             return 0;
@@ -709,6 +712,19 @@ impl RadixTree {
             .iter()
             .map(|(&c, &(t, d))| (t, std::cmp::Reverse(d), c))
             .collect();
+        // A chain the key map covers but the coverage index does not
+        // list holds keys the walk above can never reach, so the
+        // holder would come back over `keep` however far the loop
+        // runs. Cover those too: the count this returns is exact
+        // whichever way the two indexes disagree. Deliberately quiet,
+        // unlike the mirror case below: this recovery is the one a test
+        // has to be able to reach in a debug build.
+        order.extend(
+            per_chain
+                .keys()
+                .filter(|c| !eff.contains_key(c))
+                .map(|&c| (0, std::cmp::Reverse(u32::MAX), c)),
+        );
         order.sort_unstable();
 
         let mut remaining = total;
@@ -720,8 +736,10 @@ impl RadixTree {
             let Some(mut keys) = per_chain.remove(&chain) else {
                 // `audit()` enforces chains == the set of chains the
                 // key map covers, so this is an invariant break. Loud
-                // in debug; in release, drop the phantom entry so it
-                // cannot come back as a victim on every call.
+                // in debug; in release, drop the entry so it cannot
+                // come back as a victim on every call. It owns no
+                // keys, so skipping it costs the caller nothing: the
+                // loop still reaches `keep`.
                 debug_assert!(
                     false,
                     "chains index lists {chain} but the holder covers no key there"
@@ -1655,5 +1673,33 @@ mod audit_tests {
         t.interner.table.entry(0xDEAD).or_default().push(orphan);
         let err = t.audit().expect_err("an interner orphan must be caught");
         assert!(err.contains("orphan"), "unexpected audit error: {err}");
+    }
+
+    /// The two indexes can only disagree if something upstream is
+    /// already broken, but eviction still owes the caller its ceiling:
+    /// keys under a chain the coverage index has lost must not be
+    /// stranded, or the holder comes back over capacity on every call
+    /// and the memory limit stops meaning anything.
+    #[test]
+    fn evict_oldest_reaches_keep_when_the_coverage_index_loses_a_chain() {
+        let mut t = RadixTree::new(Config::default());
+        let h = t.create_holder("w1");
+        // Three disjoint root chains, two blocks each.
+        for (i, base) in [(0u64, 100u64), (1, 200), (2, 300)] {
+            t.store(h, None, &[(base, i * 10 + 1), (base + 1, i * 10 + 2)])
+                .expect("store");
+        }
+        let holder = h.parts().0;
+        assert_eq!(t.holder_blocks(h), 6);
+
+        let lost = t.state_of(holder).keys[&100].0;
+        t.state_of_mut(holder).chains.remove(&lost);
+
+        // The two still-listed chains cover four of the six blocks, so
+        // a walk driven by the coverage index alone stops two over the
+        // ceiling however far it runs.
+        assert_eq!(t.evict_oldest(h, 1), 5, "eviction reaches the ceiling");
+        assert_eq!(t.state_of(holder).keys.len(), 1);
+        t.audit().expect("recovery erases the disagreement");
     }
 }

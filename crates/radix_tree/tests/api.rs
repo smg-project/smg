@@ -514,42 +514,68 @@ fn evict_oldest_is_exact_and_prefix_closed_under_churn() {
     }
 }
 
-/// A lineage forked at every position: a 6,000-block chain whose
-/// every prefix also has a one-block sibling, so the holder covers
-/// ~6,000 chains at depths up to 6,000. The ancestor walk in
-/// `evict_oldest` must stay linear here (the un-memoized version
-/// visited ~18M parent links; a 65k-position lineage would visit 2
-/// billion) and the result must be exactly the recency order: the
-/// siblings were stored oldest-first, the spine last.
+/// A lineage forked at every position, nested rather than flat.
+///
+/// Each round extends the chain holding the anchor with a tip block,
+/// then forks a sibling off that same anchor. The fork starts a chain
+/// one level deeper and anchors the next round, so the holder ends up
+/// covering ~n chains at depths up to ~n. Hanging every sibling off
+/// one long spine instead would leave depth at 1 and never exercise
+/// the ancestor walk at all.
+///
+/// That walk must stay linear on this shape: summed over the chains,
+/// the un-memoized version climbed ~n^2/2 parent links, 18M here and
+/// 2 billion on a 65k-position lineage.
 #[test]
 fn evict_oldest_is_linear_on_a_lineage_forked_at_every_position() {
     let mut t = chain_tree();
     let h = t.create_holder("h");
     let n = 6_000u64;
-    // Spine keys 1..=n, contents 1..=n, stored one block at a time so
-    // every position is a chain tip when its sibling is stored.
+    assert_eq!(n % 2, 0, "the expected survivor set assumes an even n");
+    // Round i puts key 2i on the anchor's chain (past the tip, so an
+    // in-place extension) and key 2i+1 on a new child of it (the same
+    // position, a different content). Chain i therefore holds exactly
+    // {2i+1, 2i+2}, and the root holds {1, 4}.
     t.store(h, None, &[(1, 1)]).expect("root");
+    let mut anchor = 1u64;
     for i in 2..=n {
-        t.store(h, Some(i - 1), &[(i, i)]).expect("extend");
-        // Sibling fork at position i-1 (a different content), stored
-        // BEFORE the spine grows past it: an older, deeper-forked chain.
-        t.store(h, Some(i - 1), &[(1_000_000 + i, 1_000_000 + i)])
+        t.store(h, Some(anchor), &[(2 * i, 2 * i)]).expect("extend");
+        t.store(h, Some(anchor), &[(2 * i + 1, 2 * i + 1)])
             .expect("fork");
+        anchor = 2 * i + 1;
     }
-    // Refresh the spine as one publish: every spine chain is now the
-    // youngest; the siblings are the oldest in ascending i.
-    let spine: Vec<(u64, u64)> = (1..=n).map(|i| (i, i)).collect();
-    assert_eq!(t.dup_prefix_touch(h, None, &spine), (n as u32, true));
-    let total = t.holder_blocks(h);
-    assert_eq!(total, 2 * n - 1);
+    // The shape the linearity claim rests on: one chain per round, the
+    // last one n-1 levels down.
+    assert_eq!(t.live_chain_count(), n as usize);
+    assert_eq!(t.position_of(h, anchor), Some(n as u32 - 1));
+    assert_eq!(t.holder_blocks(h), 2 * n - 1);
+
+    // Republishing the whole lineage through the shared-lock walk is
+    // the same deep descent, and must see it fully resident.
+    let path: Vec<(u64, u64)> = std::iter::once((1u64, 1u64))
+        .chain((2..=n).map(|i| (2 * i + 1, 2 * i + 1)))
+        .collect();
+    assert_eq!(t.dup_prefix_touch(h, None, &path), (n as u32, true));
+
     let started = std::time::Instant::now();
     assert_eq!(t.evict_oldest(h, n), n - 1);
     let took = started.elapsed();
-    assert_eq!(
-        surviving_keys(&t, h),
-        (1..=n).collect(),
-        "spine kept whole, every sibling gone"
-    );
+
+    // Every chain inherits the deepest chain's tick, so victims go
+    // strictly deepest-first: the far half of the lineage is freed
+    // whole and the near half is kept whole.
+    let alive = surviving_keys(&t, h);
+    assert_eq!(alive, std::iter::once(1).chain(4..=n + 2).collect());
+    assert_eq!(t.live_chain_count(), n as usize / 2, "chain slots freed");
+    let mut seen_gap = false;
+    for (k, _) in &path {
+        let present = alive.contains(k);
+        assert!(
+            !(present && seen_gap),
+            "key {k:#x} survives below an evicted ancestor"
+        );
+        seen_gap |= !present;
+    }
     t.audit().expect("audit");
     assert!(
         took.as_secs() < 5,
