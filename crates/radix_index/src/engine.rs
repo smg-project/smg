@@ -713,16 +713,25 @@ impl Engine {
             }
         }
         if update.dropped {
-            // Downgrade the soft-retire even when `dropped` already
-            // stands: the silence backstop sets BOTH flags, so gating
-            // this on the `dropped` transition would make an operator's
-            // explicit drop a no-op on a soft-retired holder — it would
-            // then sit out `INFERRED_RETIRE_MULTIPLIER` x `event_ttl` of
-            // silence instead of retiring one `inferred_ttl` after the
-            // departure signal, which is the ordering the sweep
-            // promises. `changed` stays gated on the `dropped`
-            // transition alone so a peer's echo still dies in one hop.
-            holder.soft_retired = false; // a real departure signal
+            // The silence backstop sets BOTH flags, so an explicit drop
+            // arriving afterwards has no `dropped` transition to ride:
+            // without the downgrade it is a no-op and the holder sits
+            // out `INFERRED_RETIRE_MULTIPLIER` x `event_ttl` of silence
+            // instead of retiring one `inferred_ttl` after the departure
+            // signal, which is the ordering the sweep promises.
+            //
+            // The downgrade is a transition in its own right, so it
+            // RELAYS. A peer that soft-retired the same holder on its
+            // own clock would otherwise keep the corpse for the whole
+            // backstop window and hand it back the moment our
+            // retirement tombstone expired — the drop undone
+            // fleet-wide. The echo still terminates, one hop later than
+            // the rest: the peer's own downgrade leaves both flags
+            // settled here, so the return trip reports no change.
+            if holder.soft_retired {
+                holder.soft_retired = false; // a real departure signal
+                changed = true;
+            }
             if !holder.dropped {
                 holder.dropped = true;
                 changed = true;
@@ -1342,6 +1351,22 @@ impl Engine {
         let had = space.tree.holder_blocks(holder.id) > 0;
         space.tree.clear(holder.id);
         had
+    }
+
+    /// Drop the whole index: every keyspace, every holder, every block.
+    ///
+    /// For a bootstrap pull that died mid-stream, where the only other
+    /// option is to serve the prefix that landed. Anti-entropy pulls an
+    /// ABSENT holder back through its "we have never held this" arm,
+    /// while a truncated one already carries the peer's watermark and so
+    /// is never re-planned — empty is strictly the safer of the two.
+    ///
+    /// Same lock order as the sweeper's keyspace GC, without its
+    /// liveness check: an apply holding an already-cloned keyspace Arc
+    /// would write into an orphan and be lost. Only sound before the
+    /// serving surface is up.
+    pub fn clear_all(&self) {
+        self.keyspaces.write().expect(LOCK_MSG).clear();
     }
 
     /// The keyspaces a `Pull` walks (a stable set; each is then
@@ -2686,6 +2711,81 @@ mod tests {
             0,
             "a real drop retires after the idle TTL, not the backstop window"
         );
+    }
+
+    /// That downgrade must RELAY. A peer that soft-retired the same
+    /// holder on its own clock keeps the corpse for the whole backstop
+    /// window otherwise, and hands it back the moment the retiring
+    /// replica's anti-entropy tombstone expires — the drop undone
+    /// fleet-wide. Relaying is safe because the echo terminates: the
+    /// peer's own downgrade leaves both flags settled here, so the
+    /// return trip reports no change.
+    #[test]
+    fn an_explicit_drop_relays_the_soft_retire_downgrade_without_looping() {
+        // Margins mirror the tests above: the backstop window is
+        // 2 x event_ttl and `sleep` overshoots on a loaded box.
+        let cfg = || EngineConfig {
+            inferred_ttl: Duration::from_millis(1),
+            event_ttl: Duration::from_millis(200),
+            ..EngineConfig::default()
+        };
+        let local = Engine::new(cfg());
+        let peer = Engine::new(cfg());
+        for engine in [&local, &peer] {
+            engine.apply(&event_batch(
+                "w1",
+                1,
+                vec![WireEvent::Stored {
+                    parent: None,
+                    blocks: placement_chain(&prefix_hashes(57, 4)),
+                }],
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        // Each replica reaches the silence backstop on its own clock.
+        local.sweep_idle();
+        peer.sweep_idle();
+
+        let departure = UpdateMsg {
+            dropped: true,
+            ..event_batch("w1", 0, Vec::new())
+        };
+        assert!(
+            local.apply(&departure).changed,
+            "the downgrade must reach the peer"
+        );
+        assert!(
+            peer.apply(&departure).changed,
+            "the peer downgrades and relays back"
+        );
+        assert!(
+            !local.apply(&departure).changed,
+            "the echo must die on the return trip"
+        );
+        assert!(!peer.apply(&departure).changed, "and stay dead");
+
+        // Both sides now retire one idle TTL after the departure, so
+        // neither outlives the other's retirement tombstone.
+        std::thread::sleep(Duration::from_millis(2));
+        local.sweep_idle();
+        peer.sweep_idle();
+        assert_eq!(local.stats().holders, 0);
+        assert_eq!(peer.stats().holders, 0, "the peer must not keep the corpse");
+    }
+
+    /// A failed bootstrap discards what it applied rather than serving a
+    /// truncated snapshot (see `Engine::clear_all`).
+    #[test]
+    fn clearing_the_index_drops_every_keyspace_and_holder() {
+        let engine = Engine::new(EngineConfig::default());
+        engine.apply(&placement("w1", 58, 4));
+        engine.apply(&placement("w2", 59, 4));
+        assert_eq!(engine.stats().holders, 2);
+        engine.clear_all();
+        let stats = engine.stats();
+        assert_eq!((stats.keyspaces, stats.holders, stats.blocks), (0, 0, 0));
+        assert!(engine.holder_digests().is_empty());
+        assert_eq!(engine.entry_count(), 0);
     }
 
     /// `soft_retired` has no wire representation, so a Pull of a

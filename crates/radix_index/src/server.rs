@@ -931,11 +931,20 @@ const FAILURES_BEFORE_WARN: u32 = 3;
 const FAILURES_BETWEEN_WARNS: u32 = 40;
 
 /// How many anti-entropy periods a local retirement suppresses a pull
-/// for. The peer needs its own sweep (shorter than this period in every
-/// shipped configuration) plus a round of its own to reach the same
-/// decision, and until it does its copy is not evidence that we are
-/// behind.
+/// for. The peer needs its own sweep plus a round of its own to reach
+/// the same decision, and until it does its copy is not evidence that we
+/// are behind.
 const RETIRE_TOMBSTONE_PERIODS: u32 = 3;
+
+/// The window above, floored so the peer's sweep actually fits inside
+/// it. The two intervals are configured independently, so a short
+/// anti-entropy period against the default sweep (1 s against 5 s) gave
+/// a 3 s window against a ~5 s lag: whoever swept first pulled the dead
+/// holder back with a fresh idle clock, and it cycled between the
+/// replicas instead of retiring.
+fn tombstone_window(interval: Duration, sweep_interval: Duration) -> Duration {
+    (interval * RETIRE_TOMBSTONE_PERIODS).max(sweep_interval + interval)
+}
 
 /// Service-lifetime anti-entropy: every `interval`, one round per peer.
 /// `Duration::ZERO` disables it.
@@ -947,6 +956,7 @@ pub fn spawn_anti_entropy(
     engine: Arc<Engine>,
     peers: Vec<String>,
     interval: Duration,
+    sweep_interval: Duration,
     stats: Arc<ServiceStats>,
 ) {
     if interval.is_zero() || peers.is_empty() {
@@ -955,7 +965,7 @@ pub fn spawn_anti_entropy(
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut retired = RetiredHolders::new(interval * RETIRE_TOMBSTONE_PERIODS);
+        let mut retired = RetiredHolders::new(tombstone_window(interval, sweep_interval));
         let mut failures = vec![0u32; peers.len()];
         loop {
             tick.tick().await;
@@ -987,6 +997,16 @@ pub fn spawn_anti_entropy(
 /// Bootstrap: pull the full state from `peer` and apply it before
 /// serving. Returns Ok(applied_count); a connect failure is Ok(0) so a
 /// lone first replica can boot cold.
+///
+/// ALL OR NOTHING: on failure the engine is left empty, so the caller's
+/// choice is between a full snapshot and a cold start, never a truncated
+/// one. Callers go ready either way (the pull is an optimisation, not a
+/// correctness requirement), and a cold replica is repaired by
+/// anti-entropy's "we have never held this" arm — a truncated one is
+/// already stamped with the peer's watermark, so nothing re-plans it and
+/// it under-matches until TTL or the next placement.
+///
+/// The engine must therefore be empty on entry, as it is at startup.
 pub async fn bootstrap_from(engine: &Engine, peer: &str) -> Result<usize, tonic::Status> {
     let Ok(client) = RadixIndexClient::connect(peer.to_string()).await else {
         // Not an error (a lone first replica boots cold by design), but
@@ -998,6 +1018,17 @@ pub async fn bootstrap_from(engine: &Engine, peer: &str) -> Result<usize, tonic:
     let mut client = client
         .max_decoding_message_size(64 * 1024 * 1024)
         .max_encoding_message_size(64 * 1024 * 1024);
+    let outcome = bootstrap_stream(engine, &mut client).await;
+    if outcome.is_err() {
+        engine.clear_all();
+    }
+    outcome
+}
+
+async fn bootstrap_stream(
+    engine: &Engine,
+    client: &mut RadixIndexClient<tonic::transport::Channel>,
+) -> Result<usize, tonic::Status> {
     let mut stream = client
         .pull(Request::new(proto::PullRequest {}))
         .await?
@@ -1009,9 +1040,6 @@ pub async fn bootstrap_from(engine: &Engine, peer: &str) -> Result<usize, tonic:
         // bypasses seq-dedup so a holder spanning several chunks (all
         // carrying the same last_seq) reconstructs in full instead of
         // being truncated to the first chunk.
-        // Bootstrap runs behind the readiness gate, so failing here keeps
-        // a replica that cannot read its peer out of the serving set
-        // instead of letting it answer from a partial snapshot.
         let msg = UpdateMsg::try_from(&update)
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         engine.apply_snapshot(&msg);
@@ -1118,6 +1146,7 @@ pub async fn serve_until(
         Arc::clone(&engine),
         peers.clone(),
         anti_entropy_interval,
+        sweep_interval,
         Arc::clone(&stats),
     );
     let sweeper = Arc::clone(&engine);
@@ -1388,6 +1417,24 @@ mod tests {
         assert_eq!(
             plan_anti_entropy_excluding(&[], &remote, &tombstoned).len(),
             1
+        );
+    }
+
+    #[test]
+    fn the_tombstone_window_outlasts_a_sweep_slower_than_the_round() {
+        // The two intervals are configured independently. Three rounds
+        // of 1 s is 3 s, but the peer needs its own 5 s sweep plus a
+        // round before it can agree — inside that gap the replica that
+        // swept first pulls the dead holder back with a fresh idle
+        // clock and it cycles between the two.
+        assert_eq!(
+            tombstone_window(Duration::from_secs(1), Duration::from_secs(5)),
+            Duration::from_secs(6)
+        );
+        // Where the round already dominates, nothing changes.
+        assert_eq!(
+            tombstone_window(Duration::from_secs(15), Duration::from_secs(5)),
+            Duration::from_secs(45)
         );
     }
 

@@ -7,13 +7,21 @@
 //! the peer applies is offered back, and must die as a no-op instead
 //! of amplifying.
 
-use std::{sync::Arc, time::Duration};
+use std::{pin::Pin, sync::Arc, time::Duration};
 
+use futures::Stream;
 use radix_index::{
-    bridge, engine::placement_chain, proto, proto::radix_index_client::RadixIndexClient, server,
-    ContentHash, Engine, EngineConfig,
+    bridge,
+    engine::placement_chain,
+    proto,
+    proto::{
+        radix_index_client::RadixIndexClient,
+        radix_index_server::{RadixIndex, RadixIndexServer},
+    },
+    server, ContentHash, Engine, EngineConfig, UpdateMsg,
 };
 use tokio::sync::mpsc;
+use tonic::{Request, Response, Status, Streaming};
 
 const MODEL: &str = "conv-model";
 const BLOCK: u32 = 4;
@@ -331,4 +339,100 @@ async fn anti_entropy_repairs_a_replica_the_relay_never_reached() {
         answers(&engine_b, &chain),
     );
     assert_eq!(answers(&engine_b, &chain)[0].1, 4);
+}
+
+/// A peer whose `Pull` hands over one good chunk and then dies. Every
+/// other method is empty: the bootstrap path is the only thing here.
+#[derive(Default)]
+struct TruncatingPeer;
+
+#[tonic::async_trait]
+impl RadixIndex for TruncatingPeer {
+    type PublishStream = Pin<Box<dyn Stream<Item = Result<proto::PublishAck, Status>> + Send>>;
+    type SubscribeStream = Pin<Box<dyn Stream<Item = Result<proto::Match, Status>> + Send>>;
+    type PullStream = Pin<Box<dyn Stream<Item = Result<proto::Update, Status>> + Send>>;
+    type PullHoldersStream = Pin<Box<dyn Stream<Item = Result<proto::Update, Status>> + Send>>;
+
+    async fn publish(
+        &self,
+        _request: Request<Streaming<proto::Update>>,
+    ) -> Result<Response<Self::PublishStream>, Status> {
+        Ok(Response::new(Box::pin(futures::stream::empty())))
+    }
+
+    async fn subscribe(
+        &self,
+        _request: Request<Streaming<proto::Query>>,
+    ) -> Result<Response<Self::SubscribeStream>, Status> {
+        Ok(Response::new(Box::pin(futures::stream::empty())))
+    }
+
+    async fn pull(
+        &self,
+        _request: Request<proto::PullRequest>,
+    ) -> Result<Response<Self::PullStream>, Status> {
+        Ok(Response::new(Box::pin(futures::stream::iter(vec![
+            Ok(stored(1, None, &[(1, 101), (2, 102)])),
+            Err(Status::unavailable("peer died mid-snapshot")),
+        ]))))
+    }
+
+    async fn digests(
+        &self,
+        _request: Request<proto::PullRequest>,
+    ) -> Result<Response<proto::DigestsResponse>, Status> {
+        Ok(Response::new(proto::DigestsResponse::default()))
+    }
+
+    async fn pull_holders(
+        &self,
+        _request: Request<proto::PullHoldersRequest>,
+    ) -> Result<Response<Self::PullHoldersStream>, Status> {
+        Ok(Response::new(Box::pin(futures::stream::empty())))
+    }
+}
+
+/// A bootstrap pull that dies part-way leaves the replica EMPTY, not
+/// holding the prefix that arrived. The caller goes ready either way, so
+/// the choice is between cold and truncated — and anti-entropy re-pulls
+/// an absent holder through its "we have never held this" arm, while a
+/// truncated one already carries the peer's watermark and is never
+/// re-planned.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fixture: fire-and-forget server for the test's lifetime"
+)]
+#[tokio::test]
+async fn a_bootstrap_that_dies_mid_stream_leaves_the_replica_cold() {
+    let port = portpicker::pick_unused_port().expect("port");
+    let url = format!("http://127.0.0.1:{port}");
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(RadixIndexServer::new(TruncatingPeer))
+            .serve(format!("127.0.0.1:{port}").parse().unwrap())
+            .await
+    });
+    // The peer must be UP: an unreachable one is Ok(0) by design and
+    // would make the assertions below vacuous.
+    let mut attempt = 0;
+    while RadixIndexClient::connect(url.clone()).await.is_err() {
+        attempt += 1;
+        assert!(attempt < 50, "fixture peer never came up");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let engine = Engine::new(EngineConfig::default());
+    let error = server::bootstrap_from(&engine, &url)
+        .await
+        .expect_err("a truncated snapshot must not read as success");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert_eq!(engine.entry_count(), 0, "the applied prefix must be gone");
+    assert_eq!(engine.stats().holders, 0);
+    assert_eq!(engine.stats().keyspaces, 0);
+
+    // Control: the chunk the peer did send is real state, so the empty
+    // engine above is the discard and not an inert fixture.
+    let control = Engine::new(EngineConfig::default());
+    control.apply_snapshot(&UpdateMsg::try_from(&stored(1, None, &[(1, 101), (2, 102)])).unwrap());
+    assert_eq!(control.entry_count(), 2);
 }

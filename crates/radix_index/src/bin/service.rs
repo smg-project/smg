@@ -117,7 +117,12 @@ async fn main() {
     if let Some(peer) = bootstrap {
         match server::bootstrap_from(&engine, &peer).await {
             Ok(applied) => tracing::info!(peer, applied, "bootstrap pull complete"),
-            Err(error) => tracing::warn!(peer, %error, "bootstrap pull failed; starting cold"),
+            // `bootstrap_from` discards the prefix it applied, so this
+            // really is cold: anti-entropy re-pulls an absent holder,
+            // but never a truncated one at the peer's watermark.
+            Err(error) => {
+                tracing::warn!(peer, %error, "bootstrap pull failed; partial state discarded, starting cold")
+            }
         }
     }
     stats.ready.store(true, Ordering::Relaxed);

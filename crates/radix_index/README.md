@@ -78,7 +78,7 @@ the engine page size is what SMG uses today; BYTES exists for text-mode
   | `--port` | `40000` | gRPC port |
   | `--metrics-port` | off | admin plane: `/metrics`, `/healthz`, `/readyz` |
   | `--peers` | none | sibling replicas to relay Publishes to (comma-separated URLs) |
-  | `--bootstrap-from` | none | sibling to Pull state from before serving |
+  | `--bootstrap-from` | none | sibling to Pull state from before serving. All or nothing: a pull that dies part-way is discarded and the replica starts cold, because anti-entropy re-pulls a holder it has never held but not a truncated one already stamped with the peer's watermark. The replica goes ready either way — the pull is a warm start, not a correctness requirement |
   | `--anti-entropy-secs` | `15` | divergence backstop: compare per-holder digests with each peer this often and re-pull the ones that disagree. `0` disables it (so does an empty `--peers`) — note the asymmetry with `--sweep-interval-secs` below, where `0` aborts startup instead |
   | `--inferred-ttl-secs` | `180` | idle TTL for placement-fed holders |
   | `--event-ttl-secs` | `1800` | liveness backstop for EVENT-fed holders: silence past this soft-retires the holder (a lost departure signal must not leak it); `0` disables |
