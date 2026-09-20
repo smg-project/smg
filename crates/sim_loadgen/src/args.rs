@@ -193,9 +193,14 @@ impl Args {
 
     /// Parse the configuration from `std::env::args`, falling back to defaults.
     pub fn from_args() -> Result<Self, String> {
+        Self::parse(std::env::args().skip(1))
+    }
+
+    /// The body of [`Self::from_args`], over any sequence of flags.
+    pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut cfg = Self::defaults();
 
-        let mut args = std::env::args().skip(1);
+        let mut args = args.into_iter();
         while let Some(flag) = args.next() {
             match flag.as_str() {
                 "--smg-urls" => {
@@ -466,6 +471,51 @@ mod tests {
         assert_eq!(
             parse_cdf("100:0.5,200:1.0", "--prompt-cdf").unwrap(),
             vec![(100, 0.5), (200, 1.0)]
+        );
+    }
+
+    /// Parse `flags` on top of the one flag that has no default.
+    fn parse(flags: &[&str]) -> Result<Args, String> {
+        let all = ["--smg-urls", "http://127.0.0.1:30000"]
+            .iter()
+            .chain(flags)
+            .map(|f| (*f).to_string())
+            .collect::<Vec<_>>();
+        Args::parse(all)
+    }
+
+    #[test]
+    fn a_flag_the_parser_does_not_know_is_rejected() {
+        // Otherwise the run measures the default instead of the value
+        // the caller asked for, with nothing in the output saying so.
+        assert!(parse(&["--conns-per-orgin", "4"]).is_err());
+        assert!(parse(&["--conns-per-origin"]).is_err(), "value missing");
+        assert!(
+            parse(&["--conns-per-origin", "four"]).is_err(),
+            "not a number"
+        );
+    }
+
+    #[test]
+    fn a_warmup_that_swallows_the_window_is_rejected() {
+        // The steady-state window would be empty and every statistic
+        // would come back null rather than failing.
+        assert!(parse(&["--warmup-secs", "60", "--duration-secs", "60"]).is_err());
+        assert!(parse(&["--warmup-secs", "61", "--duration-secs", "60"]).is_err());
+        let cfg = parse(&["--warmup-secs", "59", "--duration-secs", "60"]).expect("accepted");
+        assert_eq!((cfg.warmup_secs, cfg.duration_secs), (59, 60));
+    }
+
+    #[test]
+    fn a_connection_count_of_zero_is_rejected() {
+        // The client builder would clamp it to one while the summary
+        // still reported zero, so the stated topology would be wrong.
+        assert!(parse(&["--conns-per-origin", "0"]).is_err());
+        assert_eq!(
+            parse(&["--conns-per-origin", "7"])
+                .expect("accepted")
+                .conns_per_origin,
+            7
         );
     }
 
