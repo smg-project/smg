@@ -302,6 +302,10 @@ struct RunningReq {
     rolling_hash: u64,
     /// Block key of the most recently completed block (for parent chaining).
     prev_block_key: Option<u64>,
+    /// Every full block this request holds, released when it leaves the
+    /// batch. Keys repeat across requests sharing a prefix; the state's
+    /// refcount is what turns that into one pinned block.
+    blocks: Vec<u64>,
     /// Tokens accumulated toward the next (not-yet-full) block.
     pending_block: Vec<u32>,
     /// Generated token ids (for the terminal `output_ids`).
@@ -393,6 +397,12 @@ pub(crate) struct SchedulerState {
     kv_event_id: u64,
     gen_tp_ewma: f64,
     cache_hit_ewma: f64,
+    /// How many running requests hold each block, so a block several of
+    /// them share is one entry rather than one per holder. Real engines
+    /// reference-count the same way; summing per request instead would
+    /// charge a warm shared prefix once per concurrent request and read
+    /// as pressure that does not exist.
+    pinned: HashMap<u64, u32>,
 }
 
 /// The result of one scheduler step.
@@ -413,6 +423,24 @@ impl SchedulerState {
             kv_event_id: 0,
             gen_tp_ewma: 0.0,
             cache_hit_ewma: 0.0,
+            pinned: HashMap::new(),
+        }
+    }
+
+    fn pin(&mut self, keys: impl IntoIterator<Item = u64>) {
+        for key in keys {
+            *self.pinned.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    fn unpin(&mut self, keys: impl IntoIterator<Item = u64>) {
+        for key in keys {
+            if let std::collections::hash_map::Entry::Occupied(mut e) = self.pinned.entry(key) {
+                *e.get_mut() -= 1;
+                if *e.get() == 0 {
+                    e.remove();
+                }
+            }
         }
     }
 
@@ -461,24 +489,39 @@ impl SchedulerState {
         }
     }
 
-    /// Tokens pinned by running requests (prompt + generated so far): the
-    /// KV a scheduler cannot evict. This — not physical occupancy — is what
-    /// engines report as `num_used_tokens` / `token_usage` (SGLang: used =
-    /// total − available − evictable), so a warm radix cache that keeps
-    /// KV physically full does not read as an overloaded worker. Reporting
-    /// occupancy instead trips a gateway's token-usage overload gate on
-    /// every warm worker and makes its cache-aware routing avoid exactly
-    /// the workers holding the prefixes (measured: same-worker follow-ups
-    /// fell from 0.87 to 0.15 over a 100 s run at 0.9 threshold).
-    fn pinned_tokens(&self) -> u64 {
-        self.running
+    /// Tokens pinned by running requests: the KV a scheduler cannot evict.
+    /// This — not physical occupancy — is what engines report as
+    /// `num_used_tokens` / `token_usage` (SGLang: used = total − available
+    /// − evictable), so a warm radix cache that keeps KV physically full
+    /// does not read as an overloaded worker. Reporting occupancy instead
+    /// trips a gateway's token-usage overload gate on every warm worker
+    /// and makes its cache-aware routing avoid exactly the workers holding
+    /// the prefixes (measured: same-worker follow-ups fell from 0.87 to
+    /// 0.15 over a 100 s run at 0.9 threshold).
+    ///
+    /// A block held by several running requests counts once, matching the
+    /// engines this mirrors. Charging it per holder would put a batch of
+    /// sessions that share one system prefix over the same gate, for KV
+    /// that is physically held once.
+    fn pinned_tokens(&self, p: &EngineParams) -> u64 {
+        if !p.prefix_cache {
+            // Nothing is shared, so the batch's contexts simply add up.
+            return self
+                .running
+                .iter()
+                .map(|r| u64::from(r.prompt_tokens + r.generated))
+                .sum();
+        }
+        let partial: u64 = self
+            .running
             .iter()
-            .map(|r| u64::from(r.prompt_tokens + r.generated))
-            .sum()
+            .map(|r| r.pending_block.len() as u64)
+            .sum();
+        self.pinned.len() as u64 * u64::from(p.block_size) + partial
     }
 
     fn snapshot(&self, p: &EngineParams) -> LoadSnapshot {
-        let used = self.pinned_tokens().min(p.kv_capacity_tokens);
+        let used = self.pinned_tokens(p).min(p.kv_capacity_tokens);
         let waiting_uncached: i64 = self.waiting.iter().map(|w| w.uncached_tokens as i64).sum();
         LoadSnapshot {
             num_running_reqs: self.running.len() as i32,
@@ -540,6 +583,7 @@ impl SchedulerState {
                 let key = r.rolling_hash;
                 new_blocks.push((key, std::mem::take(&mut r.pending_block), r.prev_block_key));
                 r.prev_block_key = Some(key);
+                r.blocks.push(key);
             }
             sends.push((
                 r.events.clone(),
@@ -553,6 +597,7 @@ impl SchedulerState {
 
         // Commit newly completed decode blocks to the cache (+ stored events).
         for (key, tokens, parent) in new_blocks {
+            self.pin([key]);
             if p.prefix_cache && self.cache.insert(key) {
                 kv.push(self.stored_event(key, tokens, parent, p.block_size));
             }
@@ -560,6 +605,7 @@ impl SchedulerState {
 
         // ---- 4. Completion ----
         let mut still = Vec::with_capacity(self.running.len());
+        let mut released = Vec::new();
         for r in std::mem::take(&mut self.running) {
             let done = r.prefill_remaining == 0 && r.generated >= r.max_new;
             if done || r.events.is_closed() {
@@ -574,11 +620,15 @@ impl SchedulerState {
                         },
                     ));
                 }
+                // The blocks stay in the cache and stay evictable; what
+                // ends here is this request's hold on them.
+                released.extend(r.blocks);
             } else {
                 still.push(r);
             }
         }
         self.running = still;
+        self.unpin(released);
 
         // ---- 5. Eviction under KV pressure ----
         self.evict(p, &mut kv);
@@ -679,6 +729,7 @@ impl SchedulerState {
             };
             self.cache_hit_ewma = ewma(self.cache_hit_ewma, sample, 0.2);
 
+            self.pin(block_keys.iter().copied());
             self.running.push(RunningReq {
                 events,
                 prompt_tokens: w.prompt_tokens,
@@ -688,6 +739,7 @@ impl SchedulerState {
                 prefill_remaining: uncached,
                 rolling_hash: rolling,
                 prev_block_key: prev,
+                blocks: block_keys,
                 pending_block: pending,
                 output_ids: Vec::new(),
                 token_seed: fnv_hash_str(&request_id) as u32,
@@ -928,6 +980,61 @@ mod tests {
         assert_eq!(snap.num_running_reqs, 0);
         assert_eq!(snap.num_used_tokens, 0, "no running request pins KV");
         assert_eq!(snap.token_usage, 0.0);
+    }
+
+    /// A prefix several concurrent requests share is held once, so it must
+    /// be reported once. Charging it per request puts a batch of sessions
+    /// behind one system prefix over the gateway's overload threshold for
+    /// KV the worker is not actually using.
+    #[test]
+    fn a_shared_prefix_is_reported_once_not_once_per_request() {
+        let p = EngineParams {
+            prefix_cache: true,
+            block_size: 4,
+            kv_capacity_tokens: 4096,
+            prefill_chunk_tokens: 1_000_000,
+            max_running: 8,
+            ..Default::default()
+        };
+        let prefix = vec![7u32; 128];
+        let mut st = SchedulerState::new();
+        let mut keep = Vec::new();
+        for i in 0..8 {
+            // Same 128-token prefix, a distinct 4-token tail each.
+            let mut ids = prefix.clone();
+            ids.extend([1000 + i; 4]);
+            let (r, rx) = req(&format!("r{i}"), ids, 64);
+            st.enqueue(r, &p);
+            keep.push(rx);
+        }
+        let _ = st.step(&p);
+        assert_eq!(st.running.len(), 8, "all eight admitted");
+
+        // 32 prefix blocks held in common, plus one distinct tail block each.
+        let distinct = 128 / 4 + 8;
+        assert_eq!(st.pinned.len(), distinct, "distinct blocks held");
+        let per_request_sum: u64 = st
+            .running
+            .iter()
+            .map(|r| u64::from(r.prompt_tokens + r.generated))
+            .sum();
+        assert!(
+            st.pinned_tokens(&p) < (distinct * 4 + 8 * 4) as u64,
+            "the union, plus at most a partial block per request"
+        );
+        assert!(
+            per_request_sum > 6 * st.pinned_tokens(&p),
+            "summing per request would have reported over six times as much"
+        );
+
+        // Releasing one holder must not free a block the others still hold.
+        let dropped: Vec<u64> = std::mem::take(&mut st.running[0].blocks);
+        st.unpin(dropped);
+        assert_eq!(
+            st.pinned.len(),
+            distinct - 1,
+            "only that request's own tail block is freed"
+        );
     }
 
     #[test]

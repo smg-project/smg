@@ -621,9 +621,11 @@ fn extract_input_ids(v: &Value) -> Option<Vec<u32>> {
     // An element that is not a token number means the caller sent
     // something other than a token list, so hand the whole request to
     // the text path. Dropping just the bad element would silently
-    // shorten the prompt and quietly change what is being measured.
+    // shorten the prompt and quietly change what is being measured,
+    // and a value too large to be a token would wrap into a different
+    // one and move where the prefix cache matches.
     seq.iter()
-        .map(|id| id.as_u64().map(|id| id as u32))
+        .map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()))
         .collect()
 }
 
@@ -675,6 +677,10 @@ mod tests {
             json!({"input_ids": [1, null]}),
             json!({"input_ids": [1, -2]}),
             json!({"input_ids": [[4, 5.5]]}),
+            // Too large to be a token. Narrowing it would turn it into
+            // a different, valid one and move where the prefix cache
+            // matches, which is worse than falling back to text.
+            json!({"input_ids": [1, 4_294_967_297u64]}),
         ] {
             assert_eq!(extract_input_ids(&bad), None, "{bad}");
         }
