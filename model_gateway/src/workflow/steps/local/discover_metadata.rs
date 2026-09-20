@@ -10,12 +10,110 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use crate::{
     routers::grpc::client::{flat_labels, GrpcClient},
-    worker::{sampling_defaults::SamplingDefaults, ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL},
+    worker::{
+        sampling_defaults::SamplingDefaults, worker::SMG_ENGINE_TRANSPORT_LABEL, ConnectionMode,
+        RuntimeType, WorkerMode, DEFAULT_SAMPLING_PARAMS_LABEL,
+    },
     workflow::{
-        data::{WorkerKind, WorkerWorkflowData},
+        data::{SmgEngineDiscovery, SmgWorkerDiscovery, WorkerKind, WorkerWorkflowData},
         steps::util::{grpc_base_url, http_base_url},
     },
 };
+
+/// Every model id the SMG Worker's engines advertise, as a JSON array.
+pub(crate) const SMG_MODEL_IDS_LABEL: &str = "smg.model_ids";
+
+/// Whether `key` belongs to the label namespace the WorkerControl handshake
+/// writes. `smg.ai/` is Kubernetes discovery's namespace, not the handshake's.
+pub(crate) fn is_smg_handshake_label(key: &str) -> bool {
+    key.starts_with("smg.") && !key.starts_with("smg.ai/")
+}
+
+/// The engine the Router pins its runtime to: the one advertising `runtime`
+/// when it is configured, else the first.
+fn smg_engine_for_runtime(
+    discovery: &SmgWorkerDiscovery,
+    runtime: RuntimeType,
+) -> Option<&SmgEngineDiscovery> {
+    if runtime.is_specified() {
+        discovery
+            .engines
+            .iter()
+            .find(|engine| engine.engine_type.eq_ignore_ascii_case(runtime.as_str()))
+    } else {
+        discovery.engines.first()
+    }
+}
+
+fn smg_discovery_labels(
+    discovery: &SmgWorkerDiscovery,
+    engine: &SmgEngineDiscovery,
+) -> HashMap<String, String> {
+    let mut labels = discovery.identity_labels.clone();
+    labels.insert("smg.worker_id".to_string(), discovery.worker_id.clone());
+    labels.insert("smg.instance_id".to_string(), discovery.instance_id.clone());
+    labels.insert("smg.hostname".to_string(), discovery.hostname.clone());
+    labels.insert("smg.zone".to_string(), discovery.zone.clone());
+    labels.insert("smg.version".to_string(), discovery.version.clone());
+    labels.insert(
+        "smg.api_version".to_string(),
+        format!("{}.{}", discovery.api_major, discovery.api_minor),
+    );
+    labels.insert(
+        "smg.topology_version".to_string(),
+        discovery.topology_version.to_string(),
+    );
+    labels.insert(
+        "smg.features".to_string(),
+        serde_json::to_string(&discovery.features).unwrap_or_default(),
+    );
+    labels.insert(
+        "smg.max_concurrent_requests".to_string(),
+        discovery.max_concurrent_requests.to_string(),
+    );
+    for (key, value) in &discovery.capability_attributes {
+        labels.insert(format!("smg.capability.{key}"), value.clone());
+    }
+
+    let mut model_ids = discovery
+        .engines
+        .iter()
+        .flat_map(|engine| engine.model_ids.iter().cloned())
+        .filter(|model_id| !model_id.trim().is_empty())
+        .collect::<Vec<_>>();
+    model_ids.sort();
+    model_ids.dedup();
+    if let Some(model_id) = model_ids.first() {
+        labels.insert("served_model_name".to_string(), model_id.clone());
+    }
+    labels.insert(
+        SMG_MODEL_IDS_LABEL.to_string(),
+        serde_json::to_string(&model_ids).unwrap_or_default(),
+    );
+
+    labels.insert("smg.engine_id".to_string(), engine.engine_id.clone());
+    labels.insert("smg.engine_type".to_string(), engine.engine_type.clone());
+    labels.insert(
+        "smg.engine_version".to_string(),
+        engine.engine_version.clone(),
+    );
+    labels.insert("smg.engine_endpoint".to_string(), engine.endpoint.clone());
+    labels.insert(
+        "smg.engine_features".to_string(),
+        serde_json::to_string(&engine.features).unwrap_or_default(),
+    );
+    for (key, value) in &engine.attributes {
+        labels.entry(key.clone()).or_insert_with(|| value.clone());
+        labels.insert(format!("smg.engine.{key}"), value.clone());
+    }
+    // The validated transport, not the raw attribute: the token-only-wire
+    // decision reads this key alone.
+    labels.insert(
+        SMG_ENGINE_TRANSPORT_LABEL.to_string(),
+        engine.engine_transport.clone(),
+    );
+    labels
+}
 
 /// Per-request deadline for metadata fetches.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
@@ -385,43 +483,66 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
             config.url, connection_mode
         );
 
-        let (discovered_labels, detected_runtime) = match connection_mode {
-            ConnectionMode::Http => {
-                let runtime = context
-                    .data
-                    .detected_runtime_type
-                    .as_deref()
-                    .unwrap_or_else(|| {
-                        warn!(
-                            "No detected_runtime_type for {}, defaulting to sglang",
-                            config.url
-                        );
-                        "sglang"
-                    });
-                let client = context.data.http_client("discover_metadata")?;
-                let api_key = config.api_key.as_deref();
-                let labels = match runtime {
-                    "vllm" => fetch_vllm_http_metadata(&client, &config.url, api_key).await,
-                    _ => fetch_sglang_http_metadata(&client, &config.url, api_key).await,
-                };
-                Ok((labels, None))
+        let (discovered_labels, detected_runtime) = if config.worker_mode == WorkerMode::Smg {
+            let discovery = context.data.smg_worker_discovery.as_ref().ok_or_else(|| {
+                WorkflowError::ContextValueNotFound("smg_worker_discovery".to_string())
+            })?;
+            // A configured runtime stays configured; the handshake already
+            // confirmed an engine advertises it.
+            smg_engine_for_runtime(discovery, config.runtime_type)
+                .map(|engine| {
+                    let runtime = if config.runtime_type.is_specified() {
+                        config.runtime_type.as_str().to_string()
+                    } else {
+                        engine.engine_type.clone()
+                    };
+                    (smg_discovery_labels(discovery, engine), Some(runtime))
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "SMG Worker {} does not advertise configured runtime {}",
+                        config.url, config.runtime_type
+                    )
+                })
+        } else {
+            match connection_mode {
+                ConnectionMode::Http => {
+                    let runtime = context
+                        .data
+                        .detected_runtime_type
+                        .as_deref()
+                        .unwrap_or_else(|| {
+                            warn!(
+                                "No detected_runtime_type for {}, defaulting to sglang",
+                                config.url
+                            );
+                            "sglang"
+                        });
+                    let client = context.data.http_client("discover_metadata")?;
+                    let api_key = config.api_key.as_deref();
+                    let labels = match runtime {
+                        "vllm" => fetch_vllm_http_metadata(&client, &config.url, api_key).await,
+                        _ => fetch_sglang_http_metadata(&client, &config.url, api_key).await,
+                    };
+                    Ok((labels, None))
+                }
+                ConnectionMode::Grpc => {
+                    let config_runtime = config.runtime_type.to_string();
+                    let runtime_type = context
+                        .data
+                        .detected_runtime_type
+                        .as_deref()
+                        .unwrap_or(&config_runtime);
+                    fetch_grpc_metadata(&config.url, runtime_type)
+                        .await
+                        .map(|(labels, rt)| (labels, Some(rt)))
+                }
+                // An EngineCore worker does not report model/tokenizer metadata over
+                // ZMQ; it is configured at worker registration. Return `None` for the
+                // runtime so the explicitly configured / detected runtime is preserved
+                // (the handshake is shared across engines, so it cannot be probed here).
+                ConnectionMode::Zmq => Ok((HashMap::new(), None)),
             }
-            ConnectionMode::Grpc => {
-                let config_runtime = config.runtime_type.to_string();
-                let runtime_type = context
-                    .data
-                    .detected_runtime_type
-                    .as_deref()
-                    .unwrap_or(&config_runtime);
-                fetch_grpc_metadata(&config.url, runtime_type)
-                    .await
-                    .map(|(labels, rt)| (labels, Some(rt)))
-            }
-            // An EngineCore worker does not report model/tokenizer metadata over
-            // ZMQ; it is configured at worker registration. Return `None` for the
-            // runtime so the explicitly configured / detected runtime is preserved
-            // (the handshake is shared across engines, so it cannot be probed here).
-            ConnectionMode::Zmq => Ok((HashMap::new(), None)),
         }
         .unwrap_or_else(|e| {
             warn!("Failed to fetch metadata for {}: {}", config.url, e);
@@ -449,6 +570,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow::data::SmgEngineDiscovery;
 
     /// Every engine's spelling of the parallelism widths folds into the
     /// canonical labels, and an existing canonical label is never overwritten.
@@ -500,6 +622,131 @@ mod tests {
         for key in keys {
             eprintln!("  {key}: {}", labels[key]);
         }
+    }
+
+    fn two_engine_discovery() -> SmgWorkerDiscovery {
+        SmgWorkerDiscovery {
+            worker_id: "worker-a".to_string(),
+            instance_id: "instance-a".to_string(),
+            api_major: 1,
+            api_minor: 2,
+            topology_version: 7,
+            features: vec!["generate".to_string()],
+            max_concurrent_requests: 64,
+            engines: vec![
+                SmgEngineDiscovery {
+                    engine_id: "engine-a".to_string(),
+                    engine_type: "vllm".to_string(),
+                    engine_transport: "zmq".to_string(),
+                    endpoint: "grpc://engine:32000".to_string(),
+                    model_ids: vec!["model-b".to_string(), "model-a".to_string()],
+                    attributes: HashMap::from([
+                        ("tokenizer_path".to_string(), "repo/tokenizer".to_string()),
+                        ("engine_transport".to_string(), "ZMQ".to_string()),
+                    ]),
+                    ..Default::default()
+                },
+                SmgEngineDiscovery {
+                    engine_id: "engine-b".to_string(),
+                    engine_type: "tokenspeed".to_string(),
+                    engine_transport: "zmq".to_string(),
+                    endpoint: "grpc://engine:32001".to_string(),
+                    model_ids: vec!["model-c".to_string()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn smg_discovery_preserves_identity_topology_and_all_models() {
+        let discovery = two_engine_discovery();
+
+        let labels = smg_discovery_labels(&discovery, &discovery.engines[0]);
+        assert_eq!(
+            labels.get("smg.worker_id").map(String::as_str),
+            Some("worker-a")
+        );
+        assert_eq!(
+            labels.get("smg.instance_id").map(String::as_str),
+            Some("instance-a")
+        );
+        assert_eq!(
+            labels.get("smg.api_version").map(String::as_str),
+            Some("1.2")
+        );
+        assert_eq!(
+            labels.get("smg.model_ids").map(String::as_str),
+            Some(r#"["model-a","model-b","model-c"]"#)
+        );
+        assert_eq!(
+            labels.get("served_model_name").map(String::as_str),
+            Some("model-a")
+        );
+        assert_eq!(
+            labels.get("smg.engine_type").map(String::as_str),
+            Some("vllm")
+        );
+        assert_eq!(
+            labels.get("tokenizer_path").map(String::as_str),
+            Some("repo/tokenizer")
+        );
+    }
+
+    /// The transport label carries the handshake-validated value, not the raw
+    /// attribute, and an identity label under the same key cannot shadow it.
+    #[test]
+    fn smg_discovery_writes_the_validated_engine_transport() {
+        let mut discovery = two_engine_discovery();
+        discovery
+            .identity_labels
+            .insert(SMG_ENGINE_TRANSPORT_LABEL.to_string(), "grpc".to_string());
+
+        let labels = smg_discovery_labels(&discovery, &discovery.engines[0]);
+        assert_eq!(
+            labels.get(SMG_ENGINE_TRANSPORT_LABEL).map(String::as_str),
+            Some("zmq")
+        );
+        assert_eq!(
+            labels.get("engine_transport").map(String::as_str),
+            Some("ZMQ"),
+            "the raw attribute is promoted as-is; only the validated key is authoritative"
+        );
+    }
+
+    /// A configured runtime selects the engine advertising it; an unspecified
+    /// one takes the first engine.
+    #[test]
+    fn smg_engine_selection_honors_a_configured_runtime() {
+        let discovery = two_engine_discovery();
+
+        let unspecified =
+            smg_engine_for_runtime(&discovery, RuntimeType::Unspecified).expect("first engine");
+        assert_eq!(unspecified.engine_id, "engine-a");
+
+        let tokenspeed = smg_engine_for_runtime(&discovery, RuntimeType::TokenSpeed)
+            .expect("engine advertising tokenspeed");
+        assert_eq!(tokenspeed.engine_id, "engine-b");
+        let labels = smg_discovery_labels(&discovery, tokenspeed);
+        assert_eq!(
+            labels.get("smg.engine_type").map(String::as_str),
+            Some("tokenspeed")
+        );
+        assert_eq!(
+            labels.get("smg.engine_id").map(String::as_str),
+            Some("engine-b")
+        );
+
+        assert!(smg_engine_for_runtime(&discovery, RuntimeType::Sglang).is_none());
+    }
+
+    #[test]
+    fn handshake_label_namespace_excludes_kubernetes_discovery_keys() {
+        assert!(is_smg_handshake_label("smg.engine.engine_transport"));
+        assert!(is_smg_handshake_label("smg.model_ids"));
+        assert!(!is_smg_handshake_label("smg.ai/pod-name"));
+        assert!(!is_smg_handshake_label("tokenizer_path"));
     }
 
     #[tokio::test]

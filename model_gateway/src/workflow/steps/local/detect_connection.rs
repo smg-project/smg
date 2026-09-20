@@ -13,12 +13,17 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use crate::{
     app_context::AppContext,
-    worker::ConnectionMode,
+    worker::{ConnectionMode, WorkerMode},
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
-        steps::util::{try_grpc_reachable, try_http_reachable},
+        steps::util::{
+            contract_violation, is_contract_violation, try_grpc_reachable, try_http_reachable,
+            try_smg_worker_reachable, SmgHandshakeError,
+        },
     },
 };
+
+const STEP_ID: &str = "detect_connection_mode";
 
 /// Step 1: Detect connection mode (HTTP vs gRPC).
 ///
@@ -135,6 +140,82 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
             .timeout_secs
             .unwrap_or(app_context.router_config.health_check.timeout_secs);
 
+        // An SMG Worker is identified by the WorkerControl handshake, never
+        // inferred from engine probes. A Worker that is unreachable or not yet
+        // SERVING is retried at the startup cadence; one whose answer can
+        // never satisfy the Router fails the registration now.
+        if config.worker_mode == WorkerMode::Smg {
+            if let Some(mode) =
+                ConnectionMode::from_url(&url).filter(|mode| *mode != ConnectionMode::Grpc)
+            {
+                return Err(contract_violation(
+                    STEP_ID,
+                    format!(
+                        "SMG Worker {} must use a grpc:// or grpcs:// URL, got {mode}",
+                        config.url
+                    ),
+                ));
+            }
+            let control_url = config.control_url.as_deref().unwrap_or(&url);
+            if let Some(mode) =
+                ConnectionMode::from_url(control_url).filter(|mode| *mode != ConnectionMode::Grpc)
+            {
+                return Err(contract_violation(
+                    STEP_ID,
+                    format!(
+                        "SMG Worker control endpoint {control_url} must use grpc:// or grpcs://, \
+                         got {mode}"
+                    ),
+                ));
+            }
+            let discovery = try_smg_worker_reachable(control_url, timeout)
+                .await
+                .map_err(|error| match error {
+                    SmgHandshakeError::Unavailable(reason) => WorkflowError::StepFailed {
+                        step_id: StepId::new(STEP_ID),
+                        message: format!(
+                            "SMG Worker control-plane handshake failed for {control_url}: {reason}"
+                        ),
+                    },
+                    SmgHandshakeError::Contract(reason) => contract_violation(
+                        STEP_ID,
+                        format!("SMG Worker control-plane handshake with {control_url}: {reason}"),
+                    ),
+                })?;
+            if config.runtime_type.is_specified()
+                && !discovery.engines.iter().any(|engine| {
+                    engine
+                        .engine_type
+                        .eq_ignore_ascii_case(config.runtime_type.as_str())
+                })
+            {
+                return Err(contract_violation(
+                    STEP_ID,
+                    format!(
+                        "SMG Worker {} does not advertise configured runtime {}; engines={:?}",
+                        discovery.worker_id,
+                        config.runtime_type,
+                        discovery
+                            .engines
+                            .iter()
+                            .map(|engine| engine.engine_type.as_str())
+                            .collect::<Vec<_>>()
+                    ),
+                ));
+            }
+            debug!(
+                worker_url = %config.url,
+                control_url,
+                worker_mode = %config.worker_mode,
+                worker_id = %discovery.worker_id,
+                instance_id = %discovery.instance_id,
+                "SMG Worker handshake succeeded"
+            );
+            context.data.connection_mode = Some(ConnectionMode::Grpc);
+            context.data.smg_worker_discovery = Some(discovery);
+            return Ok(StepResult::Success);
+        }
+
         let connection_mode = if let Some(connection_mode) = ConnectionMode::from_url(&url) {
             let result = match connection_mode {
                 ConnectionMode::Http => {
@@ -201,8 +282,8 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
         Ok(StepResult::Success)
     }
 
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true
+    fn is_retryable(&self, error: &WorkflowError) -> bool {
+        !is_contract_violation(error)
     }
 }
 
@@ -211,10 +292,11 @@ mod tests {
     use std::sync::OnceLock;
 
     use llm_tokenizer::registry::TokenizerRegistry;
-    use openai_protocol::worker::{HttpPoolConfig, WorkerSpec};
+    use openai_protocol::worker::{HttpPoolConfig, RuntimeType, WorkerSpec};
     use smg_data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     };
+    use smg_grpc_client::worker_proto::WorkerHealthState;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wfaas::WorkflowInstanceId;
 
@@ -223,7 +305,13 @@ mod tests {
         config::RouterConfig,
         policies::PolicyRegistry,
         worker::WorkerRegistry,
-        workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
+        workflow::{
+            data::WorkerRegistrationMode,
+            steps::{
+                create_worker_workflow_data,
+                util::smg_control_fixture::{engine, serve_control, ScriptedWorkerControl},
+            },
+        },
     };
 
     fn app_context(upstream_http2: bool) -> Arc<AppContext> {
@@ -404,5 +492,98 @@ mod tests {
         assert_eq!(result, StepResult::Success);
         assert_eq!(ctx.data.connection_mode, Some(ConnectionMode::Http));
         assert_eq!(ctx.data.http2, Some(true));
+    }
+
+    fn smg_spec(url: &str) -> WorkerSpec {
+        let mut spec = WorkerSpec::new(url);
+        spec.worker_mode = WorkerMode::Smg;
+        spec.connection_mode = ConnectionMode::Grpc;
+        spec
+    }
+
+    async fn run_smg(
+        spec: WorkerSpec,
+    ) -> Result<WorkflowContext<WorkerWorkflowData>, WorkflowError> {
+        let mut ctx = local_context(app_context(false), spec);
+        DetectConnectionModeStep.execute(&mut ctx).await?;
+        Ok(ctx)
+    }
+
+    /// The control URL is dialed for the handshake; the inference URL is not
+    /// probed at all.
+    #[tokio::test]
+    async fn smg_worker_handshake_records_the_discovery() {
+        let (control_url, server) = serve_control(ScriptedWorkerControl::serving()).await;
+        let mut spec = smg_spec("grpc://127.0.0.1:1");
+        spec.control_url = Some(control_url);
+
+        let ctx = run_smg(spec).await.expect("handshake succeeds");
+        server.abort();
+
+        assert_eq!(ctx.data.connection_mode, Some(ConnectionMode::Grpc));
+        let discovery = ctx.data.smg_worker_discovery.expect("handshake record");
+        assert_eq!(discovery.worker_id, "worker-a");
+        assert_eq!(discovery.engines[0].engine_type, "vllm");
+        assert_eq!(discovery.engines[0].engine_transport, "zmq");
+    }
+
+    /// Answers the Router can never accept fail the registration on the
+    /// first attempt instead of being polled at the startup cadence.
+    #[tokio::test]
+    async fn smg_worker_contract_violations_are_not_retried() {
+        let (url, server) = serve_control(ScriptedWorkerControl::serving().with_api_major(2)).await;
+        let err = run_smg(smg_spec(&url)).await.unwrap_err();
+        server.abort();
+        assert!(!DetectConnectionModeStep.is_retryable(&err), "{err}");
+        assert!(err.to_string().contains("control API 2.3"), "{err}");
+
+        let (url, server) = serve_control(
+            ScriptedWorkerControl::serving().with_engines(vec![engine("engine-0", "vllm", None)]),
+        )
+        .await;
+        let err = run_smg(smg_spec(&url)).await.unwrap_err();
+        server.abort();
+        assert!(!DetectConnectionModeStep.is_retryable(&err), "{err}");
+        assert!(err.to_string().contains("engine_transport"), "{err}");
+
+        let (url, server) = serve_control(ScriptedWorkerControl::serving()).await;
+        let mut spec = smg_spec(&url);
+        spec.runtime_type = RuntimeType::TokenSpeed;
+        let err = run_smg(spec).await.unwrap_err();
+        server.abort();
+        assert!(!DetectConnectionModeStep.is_retryable(&err), "{err}");
+        assert!(
+            err.to_string()
+                .contains("does not advertise configured runtime tokenspeed"),
+            "{err}"
+        );
+
+        let err = run_smg(smg_spec("http://127.0.0.1:1")).await.unwrap_err();
+        assert!(!DetectConnectionModeStep.is_retryable(&err), "{err}");
+        assert!(err.to_string().contains("grpc:// or grpcs://"), "{err}");
+
+        let mut spec = smg_spec("grpc://127.0.0.1:1");
+        spec.control_url = Some("http://127.0.0.1:1".to_string());
+        let err = run_smg(spec).await.unwrap_err();
+        assert!(!DetectConnectionModeStep.is_retryable(&err), "{err}");
+        assert!(err.to_string().contains("control endpoint"), "{err}");
+    }
+
+    /// A Worker that cannot be reached or is still starting is polled at the
+    /// startup cadence, exactly like an engine that is not up yet.
+    #[tokio::test]
+    async fn smg_worker_unavailability_is_retried() {
+        let err = run_smg(smg_spec("grpc://127.0.0.1:0")).await.unwrap_err();
+        assert!(DetectConnectionModeStep.is_retryable(&err), "{err}");
+        assert!(err.to_string().contains("handshake failed"), "{err}");
+
+        let (url, server) = serve_control(
+            ScriptedWorkerControl::serving().with_health(WorkerHealthState::Starting),
+        )
+        .await;
+        let err = run_smg(smg_spec(&url)).await.unwrap_err();
+        server.abort();
+        assert!(DetectConnectionModeStep.is_retryable(&err), "{err}");
+        assert!(err.to_string().contains("not ready"), "{err}");
     }
 }

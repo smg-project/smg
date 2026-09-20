@@ -8,8 +8,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smg-grpc-proto"
-version = "0.4.22"
-description = "SMG gRPC proto definitions for vLLM, TRT-LLM, MLX, TokenSpeed, and SGLang"
+version = "0.4.23"
+description = "SMG gRPC proto definitions for the SMG Worker contract and the vLLM, TRT-LLM, MLX, TokenSpeed, and SGLang engine services"
 requires-python = ">=3.10"
 dependencies = [
     "grpcio>=1.81.1",

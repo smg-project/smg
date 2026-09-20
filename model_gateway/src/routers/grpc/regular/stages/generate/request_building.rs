@@ -63,12 +63,11 @@ impl BuildStage for GenerateRequestBuildingStage {
             ClientSelection::Disaggregated { prefill, .. } => prefill,
         };
 
-        let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
         let (request_id, id_stamp) = helpers::resolve_request_id_stamp(
             &ctx.input.request_type,
             ctx.input.tenant_request_meta.as_ref(),
             "gen-",
-            disaggregated,
+            helpers::fresh_id_per_attempt(clients),
         );
 
         // Build proto request using centralized dispatch

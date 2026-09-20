@@ -41,6 +41,41 @@ use super::{
 };
 use crate::{app_context::AppContext, worker::Worker};
 
+/// One Worker incarnation as the WorkerControl handshake observed it.
+/// Persisted with the workflow state so later steps never mix identity from
+/// before a restart with topology from after it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SmgWorkerDiscovery {
+    pub worker_id: String,
+    pub instance_id: String,
+    pub hostname: String,
+    pub zone: String,
+    pub version: String,
+    pub identity_labels: HashMap<String, String>,
+    pub api_major: u32,
+    pub api_minor: u32,
+    pub features: Vec<String>,
+    pub max_concurrent_requests: u32,
+    pub capability_attributes: HashMap<String, String>,
+    pub topology_version: u64,
+    pub engines: Vec<SmgEngineDiscovery>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SmgEngineDiscovery {
+    pub engine_id: String,
+    /// Canonical `RuntimeType` spelling, one of `SMG_WORKER_ENGINE_TYPES`.
+    pub engine_type: String,
+    /// Handshake-validated wire between Worker and engine: `grpc` or `zmq`.
+    #[serde(default)]
+    pub engine_transport: String,
+    pub engine_version: String,
+    pub endpoint: String,
+    pub model_ids: Vec<String>,
+    pub features: Vec<String>,
+    pub attributes: HashMap<String, String>,
+}
+
 // ============================================================================
 // Shared trait for worker registration workflows
 // ============================================================================
@@ -141,6 +176,8 @@ pub struct WorkerWorkflowData {
     #[serde(skip, default)]
     pub http_client_handle: Option<Arc<reqwest::Client>>,
     pub detected_runtime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smg_worker_discovery: Option<SmgWorkerDiscovery>,
     pub discovered_labels: HashMap<String, String>,
     pub dp_info: Option<super::steps::local::DpInfo>,
     // -- External-only fields --

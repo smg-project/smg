@@ -1,0 +1,29 @@
+{
+  "smg_commit": "67ad87ae2",
+  "tokenspeed_commit": "c3ea3cd883048e4a4a444ec0481d270b19f0103d",
+  "image_digest": "sha256:d6067daeeb1fafecc531d45e282797076e1cd2e2c16eaa90712634dd76a709ca",
+  "model": "Qwen/Qwen3-1.7B",
+  "gpu": "NVIDIA B200",
+  "duration_s": 30,
+  "output_tokens": 128,
+  "runs": [
+    {"label":"grpc-r1-rep1","sent":38,"ok":38,"err":0,"output_tps":160.3,"ttft_ms_p50":18.0,"ttft_ms_p99":45.1,"itl_ms_p99":16.79,"e2e_ms_p50":236.1,"e2e_ms_p99":291.0,"service_cpu_cores_avg":1.188,"service_cpu_s":36.072,"gpu_util_avg":16.9,"gpu_power_w_avg":293.5},
+    {"label":"grpc-r1-rep2","sent":32,"ok":32,"err":0,"output_tps":128.1,"ttft_ms_p50":25.0,"ttft_ms_p99":46.2,"itl_ms_p99":4.61,"e2e_ms_p50":323.8,"e2e_ms_p99":386.0,"service_cpu_cores_avg":1.135,"service_cpu_s":36.347,"gpu_util_avg":19.1,"gpu_power_w_avg":289.0},
+    {"label":"grpc-r1-rep3","sent":34,"ok":34,"err":0,"output_tps":142.5,"ttft_ms_p50":24.1,"ttft_ms_p99":45.1,"itl_ms_p99":3.63,"e2e_ms_p50":320.0,"e2e_ms_p99":377.4,"service_cpu_cores_avg":1.145,"service_cpu_s":35.032,"gpu_util_avg":26.3,"gpu_power_w_avg":298.2},
+    {"label":"zmq-r1-rep1","sent":38,"ok":38,"err":0,"output_tps":160.5,"ttft_ms_p50":21.2,"ttft_ms_p99":50.6,"itl_ms_p99":26.54,"e2e_ms_p50":251.2,"e2e_ms_p99":315.7,"service_cpu_cores_avg":1.157,"service_cpu_s":35.147,"gpu_util_avg":23.1,"gpu_power_w_avg":292.7},
+    {"label":"zmq-r1-rep2","sent":32,"ok":32,"err":0,"output_tps":128.1,"ttft_ms_p50":24.0,"ttft_ms_p99":45.0,"itl_ms_p99":4.4,"e2e_ms_p50":310.8,"e2e_ms_p99":370.5,"service_cpu_cores_avg":1.077,"service_cpu_s":34.493,"gpu_util_avg":19.9,"gpu_power_w_avg":289.5},
+    {"label":"zmq-r1-rep3","sent":34,"ok":34,"err":0,"output_tps":142.6,"ttft_ms_p50":24.1,"ttft_ms_p99":44.7,"itl_ms_p99":4.45,"e2e_ms_p50":314.6,"e2e_ms_p99":378.8,"service_cpu_cores_avg":1.088,"service_cpu_s":33.301,"gpu_util_avg":25.8,"gpu_power_w_avg":296.4},
+    {"label":"grpc-r8-rep1","sent":228,"ok":228,"err":0,"output_tps":965.8,"ttft_ms_p50":29.0,"ttft_ms_p99":46.1,"itl_ms_p99":30.06,"e2e_ms_p50":290.4,"e2e_ms_p99":346.2,"service_cpu_cores_avg":1.705,"service_cpu_s":51.645,"gpu_util_avg":68.4,"gpu_power_w_avg":443.0},
+    {"label":"grpc-r8-rep2","sent":243,"ok":243,"err":0,"output_tps":1032.6,"ttft_ms_p50":34.2,"ttft_ms_p99":50.4,"itl_ms_p99":36.68,"e2e_ms_p50":405.6,"e2e_ms_p99":527.7,"service_cpu_cores_avg":1.516,"service_cpu_s":45.78,"gpu_util_avg":63.3,"gpu_power_w_avg":406.4},
+    {"label":"grpc-r8-rep3","sent":242,"ok":242,"err":0,"output_tps":1027.9,"ttft_ms_p50":35.4,"ttft_ms_p99":52.3,"itl_ms_p99":36.63,"e2e_ms_p50":396.8,"e2e_ms_p99":484.6,"service_cpu_cores_avg":1.529,"service_cpu_s":46.184,"gpu_util_avg":62.4,"gpu_power_w_avg":410.4},
+    {"label":"zmq-r8-rep1","sent":228,"ok":228,"err":0,"output_tps":964.8,"ttft_ms_p50":31.9,"ttft_ms_p99":46.4,"itl_ms_p99":28.35,"e2e_ms_p50":302.9,"e2e_ms_p99":357.6,"service_cpu_cores_avg":1.59,"service_cpu_s":48.2,"gpu_util_avg":74.1,"gpu_power_w_avg":436.8},
+    {"label":"zmq-r8-rep2","sent":243,"ok":243,"err":0,"output_tps":1032.7,"ttft_ms_p50":37.4,"ttft_ms_p99":58.4,"itl_ms_p99":34.33,"e2e_ms_p50":387.6,"e2e_ms_p99":525.0,"service_cpu_cores_avg":1.347,"service_cpu_s":40.67,"gpu_util_avg":66.2,"gpu_power_w_avg":409.5},
+    {"label":"zmq-r8-rep3","sent":242,"ok":242,"err":0,"output_tps":1027.4,"ttft_ms_p50":37.5,"ttft_ms_p99":58.4,"itl_ms_p99":34.47,"e2e_ms_p50":389.9,"e2e_ms_p99":481.0,"service_cpu_cores_avg":1.34,"service_cpu_s":40.507,"gpu_util_avg":66.2,"gpu_power_w_avg":412.8},
+    {"label":"grpc-r16-rep1","sent":470,"ok":463,"err":7,"output_tps":1957.5,"ttft_ms_p50":26.0,"ttft_ms_p99":50.0,"itl_ms_p99":31.9,"e2e_ms_p50":336.4,"e2e_ms_p99":557.5,"service_cpu_cores_avg":1.84,"service_cpu_s":55.827,"gpu_util_avg":81.4,"gpu_power_w_avg":469.1},
+    {"label":"grpc-r16-rep2","sent":455,"ok":453,"err":2,"output_tps":1925.0,"ttft_ms_p50":27.6,"ttft_ms_p99":50.3,"itl_ms_p99":39.47,"e2e_ms_p50":414.0,"e2e_ms_p99":544.1,"service_cpu_cores_avg":1.695,"service_cpu_s":51.199,"gpu_util_avg":67.1,"gpu_power_w_avg":438.1},
+    {"label":"grpc-r16-rep3","sent":508,"ok":497,"err":11,"output_tps":2110.7,"ttft_ms_p50":29.0,"ttft_ms_p99":62.0,"itl_ms_p99":39.94,"e2e_ms_p50":460.4,"e2e_ms_p99":706.7,"service_cpu_cores_avg":1.706,"service_cpu_s":51.564,"gpu_util_avg":62.6,"gpu_power_w_avg":429.6},
+    {"label":"zmq-r16-rep1","sent":469,"ok":462,"err":7,"output_tps":1957.0,"ttft_ms_p50":29.6,"ttft_ms_p99":58.0,"itl_ms_p99":28.41,"e2e_ms_p50":351.1,"e2e_ms_p99":580.7,"service_cpu_cores_avg":1.653,"service_cpu_s":50.062,"gpu_util_avg":79.6,"gpu_power_w_avg":462.2},
+    {"label":"zmq-r16-rep2","sent":455,"ok":453,"err":2,"output_tps":1923.5,"ttft_ms_p50":31.6,"ttft_ms_p99":57.1,"itl_ms_p99":30.78,"e2e_ms_p50":399.5,"e2e_ms_p99":534.3,"service_cpu_cores_avg":1.5,"service_cpu_s":45.337,"gpu_util_avg":73.6,"gpu_power_w_avg":442.8},
+    {"label":"zmq-r16-rep3","sent":508,"ok":499,"err":9,"output_tps":2118.8,"ttft_ms_p50":36.0,"ttft_ms_p99":61.3,"itl_ms_p99":37.3,"e2e_ms_p50":459.2,"e2e_ms_p99":598.6,"service_cpu_cores_avg":1.485,"service_cpu_s":44.9,"gpu_util_avg":65.0,"gpu_power_w_avg":430.1}
+  ]
+}

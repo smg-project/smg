@@ -6,10 +6,13 @@
 Protocol Buffer definitions for [SMG](https://github.com/smg-project/smg) (Shepherd Model Gateway) gRPC services.
 
 This package provides pre-compiled Python gRPC stubs for:
+- **SMG Worker** control plane (`worker_control.proto`) and data plane (`worker_inference.proto`)
 - **SGLang** scheduler service (`sglang_scheduler.proto`)
 - **SGLang** encoder service (`sglang_encoder.proto`)
+- **TokenSpeed** scheduler and encoder services (`tokenspeed_scheduler.proto`, `tokenspeed_encoder.proto`)
 - **vLLM** engine service (`vllm_engine.proto`)
 - **TensorRT-LLM** service (`trtllm_service.proto`)
+- **MLX** engine service (`mlx_engine.proto`)
 
 ## Installation
 
@@ -22,10 +25,14 @@ Requires `grpcio>=1.81.1` and `protobuf>=5.26.0`.
 ## Usage
 
 ```python
+from smg_grpc_proto import worker_control_pb2, worker_control_pb2_grpc
+from smg_grpc_proto import worker_inference_pb2, worker_inference_pb2_grpc
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
+from smg_grpc_proto import tokenspeed_scheduler_pb2, tokenspeed_scheduler_pb2_grpc
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 from smg_grpc_proto import trtllm_service_pb2, trtllm_service_pb2_grpc
+from smg_grpc_proto import mlx_engine_pb2, mlx_engine_pb2_grpc
 ```
 
 ## Proto Source

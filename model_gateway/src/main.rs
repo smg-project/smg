@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use clap::{builder::TypedValueParser, ArgAction, Parser, Subcommand, ValueEnum};
 
 // Jemalloc as the global allocator: glibc malloc retains freed pages badly
 // under the gateway's allocation churn. Prefixed symbols only — vendored C
@@ -12,10 +12,10 @@ use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
-        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PdPairingMode,
-        PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
+        resolve_worker_auto_recovery, startup_worker_runtime_type, validate_mesh_server_name,
+        CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
+        HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig,
+        PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
         RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
         TokenizerCacheConfig, TraceConfig,
     },
@@ -27,7 +27,10 @@ use smg::{
     server::{self, ServerConfig},
     service_discovery::{ModelIdSource, ServiceDiscoveryConfig},
     version,
-    worker::{ConnectionMode, RuntimeType},
+    worker::{
+        worker::{smg_worker_engine_types, SMG_WORKER_ENGINE_TYPES},
+        ConnectionMode, RuntimeType, WorkerMode,
+    },
 };
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::MeshServerConfig;
@@ -92,6 +95,19 @@ pub enum Backend {
     Anthropic,
     #[value(name = "gemini")]
     Gemini,
+}
+
+impl Backend {
+    /// The engine runtime this backend names; `None` for external providers.
+    fn runtime_type(self) -> Option<RuntimeType> {
+        match self {
+            Backend::Sglang => Some(RuntimeType::Sglang),
+            Backend::Vllm => Some(RuntimeType::Vllm),
+            Backend::Trtllm => Some(RuntimeType::Trtllm),
+            Backend::Tokenspeed => Some(RuntimeType::TokenSpeed),
+            Backend::Openai | Backend::Anthropic | Backend::Gemini => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Backend {
@@ -235,6 +251,18 @@ struct CliArgs {
     /// List of worker URLs (supports IPv4 and IPv6)
     #[arg(long, num_args = 0.., help_heading = "Worker Configuration")]
     worker_urls: Vec<String>,
+
+    /// Service identity of the --worker-urls workers: `engine` for inference
+    /// engines, `smg` for SMG Workers (WorkerControl + WorkerInference over
+    /// gRPC)
+    #[arg(
+        long,
+        default_value_t = WorkerMode::Engine,
+        value_parser = clap::builder::PossibleValuesParser::new(["engine", "smg"])
+            .try_map(|value| value.parse::<WorkerMode>()),
+        help_heading = "Worker Configuration"
+    )]
+    worker_mode: WorkerMode,
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
@@ -1837,19 +1865,25 @@ impl CliArgs {
         }
         let connection_mode = Self::determine_connection_mode(&all_urls);
 
-        // `--backend` normally only steers the routing mode. Over ZMQ it
-        // additionally pins the startup workers' runtime: the shared EngineCore
-        // handshake carries no engine identity, so the wire protocol cannot be
-        // probed and must be declared. HTTP/gRPC keep auto-detection (None).
-        let startup_worker_runtime_type = if connection_mode == ConnectionMode::Zmq {
-            match self.backend {
-                Some(Backend::Vllm) => Some(RuntimeType::Vllm),
-                Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        // An explicit `--backend` an SMG Worker cannot front contradicts
+        // `--worker-mode smg`; it is rejected, not left for the handshake.
+        let backend_runtime = self.backend.and_then(Backend::runtime_type);
+        let smg_worker_fronts_backend =
+            backend_runtime.is_some_and(|runtime| SMG_WORKER_ENGINE_TYPES.contains(&runtime));
+        if let Some(backend) = self
+            .backend
+            .filter(|_| self.worker_mode == WorkerMode::Smg && !smg_worker_fronts_backend)
+        {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: format!(
+                    "--worker-mode smg supports only --backend {}: an SMG Worker fronts those \
+                     engines, not {backend}",
+                    smg_worker_engine_types()
+                ),
+            });
+        }
+        let startup_worker_runtime_type =
+            startup_worker_runtime_type(self.worker_mode, connection_mode, backend_runtime);
 
         let history_backend = match self.history_backend.as_str() {
             "none" => HistoryBackend::None,
@@ -1903,6 +1937,7 @@ impl CliArgs {
             .cache_boundaries(self.cache_boundaries.clone())
             .connection_mode(connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
+            .startup_worker_mode(self.worker_mode)
             .zmq_engine_count(self.zmq_engine_count)
             .host(&self.host)
             .port(self.port)
@@ -3131,6 +3166,101 @@ mod tests {
             router_config.startup_worker_runtime_type,
             Some(RuntimeType::Vllm)
         );
+    }
+
+    /// `--worker-mode` parses straight into the protocol enum, defaults to
+    /// `engine`, and rejects anything else at parse time.
+    #[test]
+    fn worker_mode_flag_parses_into_the_protocol_enum() {
+        assert_eq!(cli_args_from(&[]).worker_mode, WorkerMode::Engine);
+        assert_eq!(
+            cli_args_from(&["--worker-mode", "smg"]).worker_mode,
+            WorkerMode::Smg
+        );
+        assert_eq!(
+            cli_args_from(&["--worker-mode", "engine"]).worker_mode,
+            WorkerMode::Engine
+        );
+        assert!(Cli::try_parse_from(["smg", "--worker-mode", "sidecar"]).is_err());
+    }
+
+    /// Under `--worker-mode smg` the startup runtime is pinned only to an
+    /// engine an SMG Worker can front; without `--backend` the handshake
+    /// supplies it, and any other explicit `--backend` is rejected naming the
+    /// supported engines.
+    #[test]
+    fn smg_worker_mode_pins_only_worker_engines_and_rejects_the_rest() {
+        let unpinned = cli_args_from(&[
+            "--worker-mode",
+            "smg",
+            "--worker-urls",
+            "grpc://localhost:50051",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        assert_eq!(unpinned.startup_worker_mode, WorkerMode::Smg);
+        assert_eq!(unpinned.connection_mode, ConnectionMode::Grpc);
+        assert_eq!(unpinned.startup_worker_runtime_type, None);
+
+        for (backend, runtime) in [
+            ("vllm", RuntimeType::Vllm),
+            ("tokenspeed", RuntimeType::TokenSpeed),
+        ] {
+            let pinned = cli_args_from(&[
+                "--worker-mode",
+                "smg",
+                "--backend",
+                backend,
+                "--worker-urls",
+                "grpc://localhost:50051",
+            ])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+            assert_eq!(pinned.startup_worker_mode, WorkerMode::Smg);
+            assert_eq!(pinned.startup_worker_runtime_type, Some(runtime));
+        }
+
+        for backend in ["sglang", "trtllm", "openai"] {
+            let err = cli_args_from(&[
+                "--worker-mode",
+                "smg",
+                "--backend",
+                backend,
+                "--worker-urls",
+                "grpc://localhost:50051",
+            ])
+            .to_router_config(vec![], vec![])
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::IncompatibleConfig { ref reason }
+                        if reason.contains("vllm or tokenspeed") && reason.contains(backend)
+                ),
+                "--backend {backend}: {err}"
+            );
+        }
+    }
+
+    /// The flag describes `--worker-urls` workers: validation rejects it
+    /// without them and with non-gRPC ones, saying which is missing.
+    #[test]
+    fn smg_worker_mode_requires_grpc_worker_urls() {
+        assert!(matches!(
+            cli_args_from(&["--worker-mode", "smg"]).to_router_config(vec![], vec![]),
+            Err(ConfigError::IncompatibleConfig { ref reason }) if reason.contains("none were given")
+        ));
+        assert!(matches!(
+            cli_args_from(&[
+                "--worker-mode",
+                "smg",
+                "--worker-urls",
+                "http://localhost:8000"
+            ])
+            .to_router_config(vec![], vec![]),
+            Err(ConfigError::IncompatibleConfig { ref reason })
+                if reason.contains("grpc:// or grpcs:// --worker-urls")
+        ));
     }
 
     /// The shared `--cache-boundaries` flag must also reach the prefix_hash

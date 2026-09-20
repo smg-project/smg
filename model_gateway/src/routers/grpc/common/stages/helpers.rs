@@ -19,7 +19,10 @@ use crate::{
     routers::{
         error,
         grpc::{
-            context::{AttemptStamp, ExecutionPlan, LoadGuards, RequestType, WorkerSelection},
+            context::{
+                AttemptStamp, ClientSelection, ExecutionPlan, LoadGuards, RequestType,
+                WorkerSelection,
+            },
             proto_wrapper::ProtoGenerateRequest,
         },
     },
@@ -134,16 +137,18 @@ pub(crate) fn middleware_request_id(tenant_meta: Option<&TenantRequestMeta>) -> 
 /// so replays reproduce exactly what a fresh build would have minted.
 ///
 /// Engine ids must be unique per dispatch — a NIXL-tagged prefill keeps the
-/// id alive until the KV lease expires, and responses tool loops re-execute
-/// the pipeline per iteration — so every derived id gets a fresh
-/// per-execution component. A bare `rid` outside PD is the one exception:
-/// its value is the caller's contract (matching /generate's long-standing
-/// behavior) and stays stable across attempts.
+/// id alive until the KV lease expires, an SMG Worker refuses an id it still
+/// holds, and responses tool loops re-execute the pipeline per iteration — so
+/// every derived id gets a fresh per-execution component. A bare `rid` on a
+/// direct engine worker outside PD is the one exception: its value is the
+/// caller's contract (matching /generate's long-standing behavior) and stays
+/// stable across attempts.
 pub(crate) enum IdStamp {
-    /// Bare client `rid` outside PD: stable across attempts.
+    /// Bare client `rid` on a direct engine worker outside PD: stable across
+    /// attempts.
     Exact,
-    /// `{base}-{uuid}` minted fresh per attempt (rid under PD,
-    /// middleware-derived ids).
+    /// `{base}-{uuid}` minted fresh per attempt (rid under PD or on the SMG
+    /// lane, middleware-derived ids).
     Suffixed { base: String },
     /// `{prefix}{uuid}` minted fresh per attempt.
     Minted { prefix: &'static str },
@@ -155,24 +160,35 @@ pub(crate) struct BatchIdStamp {
     /// `None`: the shared id is minted fresh per attempt as `{prefix}{uuid}`.
     pub stable_shared: Option<String>,
     pub prefix: &'static str,
-    /// Sub ids carry a per-execution uuid (PD, or a shared id that is stable
-    /// across executions).
+    /// Sub ids carry a per-execution uuid (fresh ids per attempt, or a shared
+    /// id that is stable across executions).
     pub unique_subs: bool,
+}
+
+/// Whether every attempt must own a fresh engine id even for a bare client
+/// `rid`: disaggregated legs keep an id alive past the attempt, and an SMG
+/// Worker refuses an id it still holds.
+pub(crate) fn fresh_id_per_attempt(clients: &ClientSelection) -> bool {
+    match clients {
+        ClientSelection::Disaggregated { .. } => true,
+        ClientSelection::Single { client } => client.rejects_duplicate_request_ids(),
+    }
 }
 
 /// Backend request id for any single-request endpoint, plus the stamp retry
 /// attempts re-mint it with.
 ///
 /// Priority: the protocol `rid`, else the middleware request id, else a fresh
-/// `{prefix}{uuid}` (see [`IdStamp`] for the uniqueness rules).
+/// `{prefix}{uuid}` (see [`IdStamp`] for the uniqueness rules);
+/// `fresh_id_per_attempt` suffixes even a bare `rid`.
 pub(crate) fn resolve_request_id_stamp(
     request_type: &RequestType,
     tenant_meta: Option<&TenantRequestMeta>,
     prefix: &'static str,
-    disaggregated: bool,
+    fresh_id_per_attempt: bool,
 ) -> (String, IdStamp) {
     if let Some(rid) = request_type.rid() {
-        return if disaggregated {
+        return if fresh_id_per_attempt {
             let stamp = IdStamp::Suffixed {
                 base: rid.to_string(),
             };
@@ -197,22 +213,23 @@ pub(crate) fn resolve_request_id_stamp(
 
 /// Shared id + stamp for the batched completion fan-out. The shared id
 /// (client rid or middleware request id) stays clean for the response;
-/// per-sub engine ids get a uniqueness suffix in PD mode and whenever the
-/// shared id is stable across executions (rid- or middleware-derived).
+/// per-sub engine ids get a uniqueness suffix when every attempt needs fresh
+/// ids and whenever the shared id is stable across executions (rid- or
+/// middleware-derived).
 pub(crate) fn resolve_batch_id_stamp(
     request_type: &RequestType,
     tenant_meta: Option<&TenantRequestMeta>,
     prefix: &'static str,
-    disaggregated: bool,
+    fresh_id_per_attempt: bool,
 ) -> (String, BatchIdStamp) {
     let (shared, stable_shared, unique_subs) = match request_type.rid() {
-        Some(rid) => (rid.to_string(), Some(rid.to_string()), disaggregated),
+        Some(rid) => (rid.to_string(), Some(rid.to_string()), fresh_id_per_attempt),
         None => match middleware_request_id(tenant_meta) {
             Some(request_id) => (request_id.to_string(), Some(request_id.to_string()), true),
             None => (
                 format!("{prefix}{}", uuid::Uuid::now_v7()),
                 None,
-                disaggregated,
+                fresh_id_per_attempt,
             ),
         },
     };
@@ -830,7 +847,14 @@ mod request_id_tests {
     use openai_protocol::chat::ChatCompletionRequest;
 
     use super::*;
-    use crate::tenant::TenantKey;
+    use crate::{
+        routers::grpc::{
+            backend_client::{BackendClient, SmgBackendClient},
+            client::GrpcClient,
+        },
+        tenant::TenantKey,
+        worker::RuntimeType,
+    };
 
     fn chat_request_type(rid: Option<&str>) -> RequestType {
         RequestType::Chat(Arc::new(ChatCompletionRequest {
@@ -909,7 +933,7 @@ mod request_id_tests {
     }
 
     #[test]
-    fn rid_gets_per_attempt_suffix_in_pd() {
+    fn rid_gets_per_attempt_suffix_when_ids_must_be_fresh() {
         let request_type = chat_request_type(Some("client-rid"));
 
         let (id, stamp) = resolve_request_id_stamp(&request_type, None, "chatcmpl-", true);
@@ -920,6 +944,48 @@ mod request_id_tests {
         let restamped = plan.request_id().to_string();
         assert!(restamped.starts_with("client-rid-"));
         assert_ne!(restamped, id, "each attempt gets a fresh engine id");
+    }
+
+    /// An SMG Worker refuses a request id it still holds, so a retry that
+    /// re-selects it needs a fresh engine id even for a bare rid; a direct
+    /// engine worker keeps the rid as the caller's contract.
+    #[tokio::test]
+    async fn smg_lane_mints_a_fresh_engine_id_per_attempt_for_a_rid() {
+        let smg = ClientSelection::Single {
+            client: BackendClient::Smg(Arc::new(
+                SmgBackendClient::unanswered_for_tests(RuntimeType::Vllm, false).await,
+            )),
+        };
+        assert!(fresh_id_per_attempt(&smg));
+
+        let request_type = chat_request_type(Some("client-rid"));
+        let (id, stamp) =
+            resolve_request_id_stamp(&request_type, None, "chatcmpl-", fresh_id_per_attempt(&smg));
+        assert!(id.starts_with("client-rid-") && id != "client-rid");
+        let mut plan = single_plan(&id);
+        stamp.restamp(&mut plan).unwrap();
+        assert!(plan.request_id().starts_with("client-rid-"));
+        assert_ne!(plan.request_id(), id, "each attempt gets a fresh engine id");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let engine = ClientSelection::Single {
+            client: BackendClient::Grpc(
+                GrpcClient::connect(
+                    &format!("grpc://{}", listener.local_addr().unwrap()),
+                    "vllm",
+                )
+                .await
+                .expect("connect vLLM gRPC"),
+            ),
+        };
+        assert!(!fresh_id_per_attempt(&engine));
+        let (id, _) = resolve_request_id_stamp(
+            &request_type,
+            None,
+            "chatcmpl-",
+            fresh_id_per_attempt(&engine),
+        );
+        assert_eq!(id, "client-rid");
     }
 
     #[test]
@@ -1165,7 +1231,7 @@ mod stop_resolution_tests {
     #[test]
     fn tokenspeed_resolved_only_over_zmq() {
         // A gRPC TokenSpeed request is never produced, but guard the gate: the
-        // strings must survive when is_zmq is false.
+        // strings must survive off a token-only wire.
         let mut grpc = tokenspeed_request(vec!["."], vec![]);
         resolve_string_stops(&mut grpc, Some(&mock_tokenizer()), false);
         let params = tokenspeed_params(&grpc);

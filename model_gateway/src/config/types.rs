@@ -12,7 +12,7 @@ use super::{validation::ConfigValidator, ConfigResult};
 use crate::{
     routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
-    worker::{ConnectionMode, RuntimeType},
+    worker::{worker::SMG_WORKER_ENGINE_TYPES, ConnectionMode, RuntimeType, WorkerMode},
 };
 
 /// Main router configuration
@@ -28,6 +28,11 @@ pub struct RouterConfig {
     /// this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_worker_runtime_type: Option<RuntimeType>,
+    /// Service identity for workers supplied through `--worker-urls`.
+    /// `engine` preserves the direct-engine path; `smg` selects the two-tier
+    /// Worker control and inference services.
+    #[serde(default, skip_serializing_if = "WorkerMode::is_engine")]
+    pub startup_worker_mode: WorkerMode,
     /// DP engines per startup ZMQ worker: each `--worker-urls` ZMQ worker
     /// becomes a grouped worker whose handshake awaits this many engines on
     /// one socket set (`dp_size` on the worker spec, no rank). `None`/1 keeps
@@ -1064,6 +1069,26 @@ pub fn resolve_worker_auto_recovery(explicit: Option<bool>, service_discovery: b
     explicit.unwrap_or(service_discovery)
 }
 
+/// Runtime to pin on the `--worker-urls` workers from `--backend`, or `None`
+/// to let registration resolve it. Only the lanes whose wire cannot be probed
+/// pin, and only to an engine the lane serves: ZMQ (the shared EngineCore
+/// handshake names no engine) and SMG Workers (the handshake must confirm the
+/// pin). Any other `--backend` is left to registration.
+pub fn startup_worker_runtime_type(
+    worker_mode: WorkerMode,
+    connection_mode: ConnectionMode,
+    backend_runtime: Option<RuntimeType>,
+) -> Option<RuntimeType> {
+    match worker_mode {
+        WorkerMode::Smg => {
+            backend_runtime.filter(|runtime| SMG_WORKER_ENGINE_TYPES.contains(runtime))
+        }
+        WorkerMode::Engine if connection_mode == ConnectionMode::Zmq => backend_runtime
+            .filter(|runtime| matches!(runtime, RuntimeType::Vllm | RuntimeType::TokenSpeed)),
+        WorkerMode::Engine => None,
+    }
+}
+
 impl Default for HealthCheckConfig {
     fn default() -> Self {
         Self {
@@ -1220,6 +1245,7 @@ impl Default for RouterConfig {
             rl: smg_rl::RlConfig::default(),
             connection_mode: ConnectionMode::Http,
             startup_worker_runtime_type: None,
+            startup_worker_mode: WorkerMode::Engine,
             zmq_engine_count: None,
             model_path: None,
             tokenizer_path: None,
@@ -2511,6 +2537,93 @@ mod tests {
         match regular.get_decode_policy(&main_policy) {
             PolicyConfig::RoundRobin => {}
             _ => panic!("Expected RoundRobin for regular mode"),
+        }
+    }
+
+    /// Only an engine an SMG Worker can front is pinned under `smg` mode;
+    /// every other `--backend` leaves the runtime to the handshake instead of
+    /// pinning one the handshake would reject.
+    #[test]
+    fn smg_worker_mode_pins_only_engines_a_worker_can_front() {
+        for connection_mode in [ConnectionMode::Grpc, ConnectionMode::Http] {
+            assert_eq!(
+                startup_worker_runtime_type(
+                    WorkerMode::Smg,
+                    connection_mode,
+                    Some(RuntimeType::Vllm)
+                ),
+                Some(RuntimeType::Vllm)
+            );
+            assert_eq!(
+                startup_worker_runtime_type(
+                    WorkerMode::Smg,
+                    connection_mode,
+                    Some(RuntimeType::TokenSpeed)
+                ),
+                Some(RuntimeType::TokenSpeed)
+            );
+            for unsupported in [
+                RuntimeType::Sglang,
+                RuntimeType::Trtllm,
+                RuntimeType::Mlx,
+                RuntimeType::Generic,
+                RuntimeType::External,
+                RuntimeType::Unspecified,
+            ] {
+                assert_eq!(
+                    startup_worker_runtime_type(
+                        WorkerMode::Smg,
+                        connection_mode,
+                        Some(unsupported)
+                    ),
+                    None,
+                    "{unsupported} must not be pinned under worker_mode=smg"
+                );
+            }
+            assert_eq!(
+                startup_worker_runtime_type(WorkerMode::Smg, connection_mode, None),
+                None
+            );
+        }
+    }
+
+    /// Engine mode keeps the ZMQ pin for vLLM and TokenSpeed and pins nothing
+    /// anywhere else.
+    #[test]
+    fn engine_worker_mode_pins_only_on_the_zmq_lane() {
+        assert_eq!(
+            startup_worker_runtime_type(
+                WorkerMode::Engine,
+                ConnectionMode::Zmq,
+                Some(RuntimeType::Vllm)
+            ),
+            Some(RuntimeType::Vllm)
+        );
+        assert_eq!(
+            startup_worker_runtime_type(
+                WorkerMode::Engine,
+                ConnectionMode::Zmq,
+                Some(RuntimeType::TokenSpeed)
+            ),
+            Some(RuntimeType::TokenSpeed)
+        );
+        assert_eq!(
+            startup_worker_runtime_type(
+                WorkerMode::Engine,
+                ConnectionMode::Zmq,
+                Some(RuntimeType::Sglang)
+            ),
+            None
+        );
+        for connection_mode in [ConnectionMode::Grpc, ConnectionMode::Http] {
+            assert_eq!(
+                startup_worker_runtime_type(
+                    WorkerMode::Engine,
+                    connection_mode,
+                    Some(RuntimeType::Vllm)
+                ),
+                None
+            );
         }
     }
 }
