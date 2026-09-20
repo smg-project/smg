@@ -9,6 +9,7 @@ branch-log parser. Run with:
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -300,6 +301,85 @@ class DrillValidation(unittest.TestCase):
             sim.validate_profile(
                 {"index_service": {"replicas": 1}, "kill_index_replica": {"at_secs": 1}}
             )
+
+    def test_a_drill_scheduled_past_the_end_of_the_run_fails(self):
+        # A drill that starts at or after duration_secs never fires: the wait
+        # for its start time returns at teardown, nothing is recorded, and the
+        # leg would read as measured with no independent variable in it.
+        for bad in [
+            {"duration_secs": 60, "restart_smgs_at_secs": 60},
+            {"duration_secs": 60, "restart_smgs_at_secs": 90},
+            {
+                "duration_secs": 60,
+                "index_service": {"replicas": 2},
+                "kill_index_replica": {"at_secs": 120, "replica": 1},
+            },
+            # No at_secs: the check has to use the default the drill sleeps for.
+            {
+                "duration_secs": 30,
+                "index_service": {"replicas": 2},
+                "hang_index_replica": {"replica": 1},
+            },
+            {
+                "duration_secs": 40,
+                "index_service": {"replicas": 2},
+                "flap_index_replica": {"replica": 1},
+            },
+        ]:
+            with self.assertRaises(SystemExit, msg=str(bad)):
+                sim.validate_profile(bad)
+        sim.validate_profile({"duration_secs": 61, "restart_smgs_at_secs": 60})
+
+    def test_every_drill_waits_the_time_the_timing_check_cleared(self):
+        # Validation and the drills must agree on when each one fires, or a
+        # profile clears the timing check and then the drill no-ops anyway.
+        profile = {
+            "smg_count": 1,
+            "workers_total": 8,
+            "duration_secs": 300,
+            "index_service": {
+                "replicas": 3,
+                "deferred_replicas": [2],
+                "partitionable": True,
+                "gateway_proxy": True,
+            },
+            "kill_index_replica": {"at_secs": 11, "replica": 1},
+            "hang_index_replica": {"at_secs": 13},
+            "partition_drill": {"at_secs": 15},
+            "remove_workers_drill": {"at_secs": 16, "count": 2},
+            "add_workers_drill": {"at_secs": 17, "count": 2},
+            "restart_one_smg_drill": {"at_secs": 18, "smg": 0},
+            "rolling_replica_restart_drill": {"at_secs": 19},
+            "gateway_partition_drill": {"at_secs": 20},
+            # The two that lean on the defaults.
+            "flap_index_replica": {"replica": 1},
+            "start_deferred_replica": {"replica": 2},
+        }
+        sim.validate_profile(profile)
+        meta = {}
+        drills = sim.Drills(
+            profile,
+            meta,
+            [],
+            threading.Lock(),
+            threading.Event(),
+            Path("/tmp"),
+            "index-bin",
+            [object() for _ in range(5)],
+        )
+        slept = []
+        # Every drill returns right after its first wait, so the run ending
+        # is what each one records instead of touching a process.
+        drills._sleep = lambda secs: bool(slept.append(float(secs)))
+        drills.start_all()
+        drills.join(timeout=10)
+        self.assertEqual(
+            sorted(slept),
+            sorted(
+                sim.drill_at_secs(k, v) for k, v in profile.items() if k in sim.SUPPORTED_DRILLS
+            ),
+        )
+        self.assertEqual([k for k in meta if k.endswith("_error")], [])
 
     def test_every_committed_scenario_leg_validates(self):
         # Every leg's knobs must be ones the harness implements, so no

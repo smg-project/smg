@@ -126,6 +126,13 @@ DRILL_KEY_RE = re.compile(r"(_drill|_replica|_at_secs)$")
 # here cannot leave the bounds check guarding a different replica than
 # the one the drill would act on.
 DEFAULT_DRILL_REPLICA = 1
+# When a drill fires if its config omits `at_secs`. Same reasoning as
+# above: the drills and the timing check read these, so a profile cannot
+# clear validation for one second and then fire at another.
+DEFAULT_DRILL_AT_SECS = 60
+# The flap drill starts earlier — it has several kill/relaunch cycles to fit.
+FLAP_DRILL_AT_SECS = 45
+DRILL_AT_SECS_DEFAULTS = {"flap_index_replica": FLAP_DRILL_AT_SECS}
 
 
 # ---- small helpers ----------------------------------------------------------
@@ -215,6 +222,14 @@ def parse_override_arg(raw):
         return key, val
 
 
+def drill_at_secs(key, cfg):
+    """How many seconds into the run drill `key` fires. `restart_smgs_at_secs`
+    IS that number; every other drill carries it in its config block."""
+    if isinstance(cfg, dict):
+        return float(cfg.get("at_secs", DRILL_AT_SECS_DEFAULTS.get(key, DEFAULT_DRILL_AT_SECS)))
+    return float(cfg)
+
+
 def validate_profile(profile):
     """Reject knobs the harness would silently ignore (see SUPPORTED_*)."""
     unknown_index = set(profile.get("index_service") or {}) - SUPPORTED_INDEX_KEYS
@@ -263,6 +278,21 @@ def validate_profile(profile):
             problems.append(
                 "start_deferred_replica.replica must be in index_service.deferred_replicas"
             )
+    # A drill scheduled at or past the end of the run never fires: its wait
+    # for the start time returns only when the run tears down, so nothing is
+    # recorded and no error is raised — the leg then reads as measured with
+    # no independent variable in it, which is what the drills exist to add.
+    duration = profile.get("duration_secs")
+    if duration is not None:
+        for key in sorted(SUPPORTED_DRILLS):
+            cfg = profile.get(key)
+            if not cfg:
+                continue
+            at_secs = drill_at_secs(key, cfg)
+            if at_secs >= float(duration):
+                problems.append(
+                    f"{key} fires at {at_secs:g}s, at or past duration_secs ({duration})"
+                )
     if problems:
         raise SystemExit("profile invalid; the drill would not fire: " + "; ".join(problems))
 
@@ -1599,7 +1629,7 @@ class Drills:
 
     def _guarded(self, key, target, cfg):
         try:
-            target(cfg)
+            target(cfg, key)
         except Exception as e:  # noqa: BLE001 — the outcome IS the result
             log(f"WARN: drill {key} failed: {e!r}")
             self.meta[f"{key}_error"] = repr(e)
@@ -1638,9 +1668,9 @@ class Drills:
             self.children.append(child)
         return epoch_ms()
 
-    def _kill_index_replica(self, cfg):
+    def _kill_index_replica(self, cfg, key):
         replica = int(cfg.get("replica", DEFAULT_DRILL_REPLICA))
-        if not self._sleep(cfg.get("at_secs", 60)):
+        if not self._sleep(drill_at_secs(key, cfg)):
             return
         log(f"drill: killing index-{replica}")
         self.meta["index_killed_at_ms"] = self._kill(replica)
@@ -1650,11 +1680,11 @@ class Drills:
             log(f"drill: relaunching index-{replica}")
             self.meta["index_relaunched_at_ms"] = self._relaunch(replica, "-relaunch")
 
-    def _flap_index_replica(self, cfg):
+    def _flap_index_replica(self, cfg, key):
         replica = int(cfg.get("replica", DEFAULT_DRILL_REPLICA))
         cycles = int(cfg.get("cycles", 3))
         period = float(cfg.get("period_secs", 20))
-        if not self._sleep(cfg.get("at_secs", 45)):
+        if not self._sleep(drill_at_secs(key, cfg)):
             return
         events = self.meta.setdefault("index_flap_events", [])
         for cycle in range(cycles):
@@ -1668,9 +1698,9 @@ class Drills:
                 return
         self.meta["index_flap_replica"] = replica
 
-    def _hang_index_replica(self, cfg):
+    def _hang_index_replica(self, cfg, key):
         replica = int(cfg.get("replica", DEFAULT_DRILL_REPLICA))
-        if not self._sleep(cfg.get("at_secs", 60)):
+        if not self._sleep(drill_at_secs(key, cfg)):
             return
         victims = self._live_replica(replica)
         if not victims:
@@ -1687,12 +1717,12 @@ class Drills:
                 child["proc"].send_signal(signal.SIGCONT)
             self.meta["index_resumed_at_ms"] = epoch_ms()
 
-    def _start_deferred_replica(self, cfg):
+    def _start_deferred_replica(self, cfg, key):
         replica = int(cfg["replica"])
         deferred = {int(r) for r in self.profile["index_service"].get("deferred_replicas") or []}
         if replica not in deferred:
             raise RuntimeError(f"replica {replica} is not in index_service.deferred_replicas")
-        if not self._sleep(cfg.get("at_secs", 60)):
+        if not self._sleep(drill_at_secs(key, cfg)):
             return
         log(f"drill: starting deferred index-{replica} (bootstrap under load)")
         self.meta["index_deferred_started_at_ms"] = self._relaunch(replica, "-deferred")
@@ -1703,7 +1733,7 @@ class Drills:
     def _smg_ports(self):
         return [SMG_BASE_PORT + i for i in range(int(self.profile["smg_count"]))]
 
-    def _remove_workers(self, cfg):
+    def _remove_workers(self, cfg, key):
         """Deregister the LAST `count` workers from every gateway (DELETE
         /workers/{id}, resolved from each gateway's own listing). The mock
         listeners stay up: this is the control-plane removal a drain or a
@@ -1711,7 +1741,7 @@ class Drills:
         gateways' lifecycle signals, not through the worker dying."""
         count = int(cfg["count"])
         total = int(self.profile["workers_total"])
-        if not self._sleep(cfg.get("at_secs", 60)):
+        if not self._sleep(drill_at_secs(key, cfg)):
             return
         victims = {MOCK_BASE_PORT + total - 1 - k for k in range(count)}
         log(f"drill: removing {count} workers from every gateway")
@@ -1732,12 +1762,12 @@ class Drills:
         self.meta["workers_removed_at_ms"] = epoch_ms()
         self.meta["workers_removed"] = {"ports": sorted(victims), "per_gateway": removed}
 
-    def _add_workers(self, cfg):
+    def _add_workers(self, cfg, key):
         """Bring `count` NEW workers up (a fresh mock process on ports past
         the fleet) and register them with every gateway mid-run."""
         count = int(cfg["count"])
         total = int(self.profile["workers_total"])
-        if not self._sleep(cfg.get("at_secs", 60)):
+        if not self._sleep(drill_at_secs(key, cfg)):
             return
         base = MOCK_BASE_PORT + total
         grpc = self.profile.get("worker_mode", "http") == "grpc"
@@ -1771,13 +1801,13 @@ class Drills:
 
     # ---- gateway churn -------------------------------------------------------
 
-    def _restart_one_smg(self, cfg):
+    def _restart_one_smg(self, cfg, key):
         """Kill ONE gateway and relaunch it cold (no local trees, no sticky
         pins); re-register every worker with it. The shared-index thesis in
         one drill: a cold gateway routes on the fleet's knowledge from its
         first request, or it does not."""
         idx = int(cfg.get("smg", 0))
-        if not self._sleep(cfg.get("at_secs", 60)):
+        if not self._sleep(drill_at_secs(key, cfg)):
             return
         log(f"drill: restarting smg-{idx} cold")
         with self.lock:
@@ -1802,12 +1832,12 @@ class Drills:
 
     # ---- replica churn -------------------------------------------------------
 
-    def _rolling_replica_restart(self, cfg):
+    def _rolling_replica_restart(self, cfg, key):
         """Kill and relaunch every replica in turn, `gap_secs` apart, each
         bootstrapping from a live peer — the rolling-restart a deploy does."""
         replicas = int(self.profile["index_service"].get("replicas", 1))
         gap = float(cfg.get("gap_secs", 20))
-        if not self._sleep(cfg.get("at_secs", 60)):
+        if not self._sleep(drill_at_secs(key, cfg)):
             return
         events = self.meta.setdefault("index_rolling_restart_events", [])
         for replica in range(replicas):
@@ -1824,7 +1854,7 @@ class Drills:
 
     # ---- partitions ----------------------------------------------------------
 
-    def _gateway_partition(self, cfg):
+    def _gateway_partition(self, cfg, key):
         """Sever the gateways' link to the index: `scope: all` cuts every
         gateway (even- and odd-numbered proxies), `scope: half` only the
         even-numbered ones — an asymmetric partition where half the fleet
@@ -1833,7 +1863,7 @@ class Drills:
             raise RuntimeError("gateway_partition_drill needs index_service.gateway_proxy")
         scope = cfg.get("scope", "all")
         targets = self.gateway_proxies if scope == "all" else self.gateway_proxies[:1]
-        if not self._sleep(cfg.get("at_secs", 60)):
+        if not self._sleep(drill_at_secs(key, cfg)):
             return
         log(f"drill: severing gateway→index links ({scope})")
         for proxy in targets:
@@ -1847,10 +1877,10 @@ class Drills:
                 proxy.heal()
             self.meta["gateway_partition_healed_at_ms"] = epoch_ms()
 
-    def _partition(self, cfg):
+    def _partition(self, cfg, key):
         if not self.proxies:
             raise RuntimeError("partition_drill needs index_service.partitionable")
-        if not self._sleep(cfg.get("at_secs", 60)):
+        if not self._sleep(drill_at_secs(key, cfg)):
             return
         log("drill: severing every inter-replica link")
         for proxy in self.proxies:

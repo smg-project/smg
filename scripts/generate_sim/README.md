@@ -93,7 +93,9 @@ Top-level profile keys, each firing once mid-run on its own thread; every
 drill records epoch-ms timestamps of what it did in `meta.json` (surfaced in
 `report.md` under "Drills"), and a drill that fails records `<drill>_error`
 instead of dying silently. Any key that looks like a drill but is not one of
-these fails the run at start, so a leg can never silently measure nothing.
+these fails the run at start — as does a drill scheduled at or past
+`duration_secs`, which would never fire — so a leg can never silently
+measure nothing.
 
 | key | shape | effect |
 |---|---|---|
