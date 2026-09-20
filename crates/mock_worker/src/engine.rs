@@ -378,9 +378,11 @@ impl Cache {
         true
     }
 
-    /// Evict the least-recently-used block; returns its key.
-    fn evict_one(&mut self) -> Option<u64> {
-        let &(t, k) = self.lru.iter().next()?;
+    /// Evict the least-recently-used block that no running request holds;
+    /// `None` once every remaining block is pinned. A real engine's LRU walks
+    /// past locked nodes instead of freeing KV a request is still decoding on.
+    fn evict_one_unpinned(&mut self, pinned: &HashMap<u64, u32>) -> Option<u64> {
+        let &(t, k) = self.lru.iter().find(|(_, key)| !pinned.contains_key(key))?;
         self.lru.remove(&(t, k));
         self.tick_of.remove(&k);
         self.present.remove(&k);
@@ -747,7 +749,12 @@ impl SchedulerState {
         }
     }
 
-    /// Evict LRU blocks once KV usage crosses the high watermark.
+    /// Evict LRU blocks once KV usage crosses the high watermark, stopping
+    /// early when only blocks a running request holds are left. Draining one
+    /// of those would announce KV the worker is still serving on as gone and
+    /// push the reported (pinned) usage above physical occupancy; a prompt
+    /// prefix, touched once at admission, is otherwise among the coldest
+    /// blocks on every pass.
     fn evict(&mut self, p: &EngineParams, kv: &mut Vec<common::KvCacheEvent>) {
         if !p.prefix_cache {
             return;
@@ -766,7 +773,7 @@ impl SchedulerState {
         let low = (p.kv_capacity_tokens as f64 * p.kv_low_watermark) as u64;
         let mut removed: Vec<i64> = Vec::new();
         while blocks * b + partial > low {
-            match self.cache.evict_one() {
+            match self.cache.evict_one_unpinned(&self.pinned) {
                 Some(key) => {
                     removed.push(key as i64);
                     blocks -= 1;
@@ -1219,5 +1226,81 @@ mod tests {
             }
         }
         assert!(saw_removed, "KV pressure should emit a removed event");
+    }
+
+    /// A running request's prompt blocks are touched once, at admission, so
+    /// they sit at the cold end of the LRU for as long as it decodes. Freeing
+    /// them would tell the index the worker dropped a prefix it is still
+    /// serving on, and leave the reported (pinned) usage above the engine's
+    /// own physical occupancy.
+    #[test]
+    fn a_watermark_drain_spares_blocks_a_running_request_holds() {
+        let p = EngineParams {
+            prefix_cache: true,
+            block_size: 4,
+            kv_capacity_tokens: 256, // 64 blocks: drain starts at 32, aims for 16
+            kv_high_watermark: 0.5,
+            kv_low_watermark: 0.25,
+            max_running: 4,
+            prefill_chunk_tokens: 1_000_000,
+            ..Default::default()
+        };
+        // One long-lived request whose four prompt blocks are never re-touched.
+        let held: Vec<u32> = (0..16).collect();
+        let (held_keys, _, _) = prompt_blocks(&held, p.block_size as usize);
+        let mut st = SchedulerState::new();
+        let (holder, _holder_rx) = req("hold", held, 10_000);
+        st.enqueue(holder, &p);
+        let _ = st.step(&p);
+
+        // Churn distinct short requests through the batch until the cache
+        // crosses the high watermark several times over.
+        let mut keep = Vec::new();
+        let mut removed: Vec<i64> = Vec::new();
+        for i in 0..20u32 {
+            let base = 1_000 + i * 100;
+            let (short, rx) = req(&format!("s{i}"), (base..base + 32).collect(), 1);
+            keep.push(rx);
+            st.enqueue(short, &p);
+            for _ in 0..3 {
+                let step = st.step(&p);
+                for (tx, ev) in step.sends {
+                    let _ = tx.send(ev);
+                }
+                if let Some(batch) = step.batch {
+                    for event in batch.events {
+                        if let Some(common::kv_cache_event::Data::Removed(rm)) = event.data {
+                            removed.extend(rm.block_hashes);
+                        }
+                    }
+                }
+                assert!(
+                    st.pinned_tokens(&p) <= st.used_tokens(&p),
+                    "reported usage {} exceeds physical occupancy {}",
+                    st.pinned_tokens(&p),
+                    st.used_tokens(&p)
+                );
+            }
+        }
+
+        assert!(
+            !removed.is_empty(),
+            "the churn should have driven evictions"
+        );
+        assert_eq!(st.running.len(), 1, "only the long-lived request is left");
+        for key in &held_keys {
+            assert!(
+                st.pinned.contains_key(key),
+                "the holder is still running, so its prompt stays pinned"
+            );
+            assert!(
+                st.cache.present.contains(key),
+                "a pinned prompt block was drained out of the cache"
+            );
+            assert!(
+                !removed.contains(&(*key as i64)),
+                "a removed event named a block a running request holds"
+            );
+        }
     }
 }
