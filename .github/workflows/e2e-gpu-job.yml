@@ -185,6 +185,7 @@ jobs:
         if: inputs.servicer_unit_tests
         run: |
           python3 -c "import vllm, msgspec"  # the gates these tests importorskip on
+          pip install pytest-asyncio  # runs the @pytest.mark.asyncio cases; pytest>=8.4 fails them without a plugin
           pytest -q grpc_servicer/tests -p no:cacheprovider -rs
 
       - name: Setup Oracle
