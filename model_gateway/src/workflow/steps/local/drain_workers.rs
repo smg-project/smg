@@ -182,6 +182,7 @@ mod tests {
             kv_event_monitor: None,
             rl: None,
             remote_index: None,
+            unindexed_cache_aware_leg: false,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,

@@ -147,7 +147,7 @@ impl PipelineStage for WorkerSelectionStage {
         let mut remote_overlap: Option<crate::policies::RemoteOverlap> = None;
         if let Some((overlap, prediction)) = self
             .policy_registry
-            .resolve_remote_overlap(model_id, tokens, headers, rid_key)
+            .resolve_remote_overlap(model_id, tokens, cache_namespace, headers, rid_key)
             .await
         {
             remote_overlap = Some(overlap);
@@ -859,6 +859,15 @@ impl WorkerSelectionStage {
         // The prefill worker holds the prompt-prefix KV, so the shared-index
         // overlap steers this leg only; decode (and encode) never hold the
         // prompt prefix and stay on their plain policies.
+        //
+        // Those plain legs are therefore still routed from the local
+        // KV-event feed, which is why UpdatePoliciesStep keeps their event
+        // subscription alive when a remote index is configured (via
+        // `AppContext::unindexed_cache_aware_leg`). The two sites have to
+        // move together: steer another leg through the index here without
+        // updating that gate and it double-indexes, drop the gate there
+        // without steering here and a cache-aware decode leg is left with
+        // neither an index nor a feed.
         let prefill_idx = self.policy_registry.select_worker_with_remote(
             &prefill_policy,
             model_id,
@@ -2008,7 +2017,17 @@ mod tests {
 
         for _ in 0..4 {
             let worker = stage
-                .select_single_worker(model_id, None, None, None, None, None, None, true)
+                .select_single_worker(
+                    model_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    RemoteLookup::NotAttempted,
+                )
                 .expect("advertising worker is selectable");
             assert_eq!(worker.url(), capable_url);
         }
@@ -2028,6 +2047,7 @@ mod tests {
                 None,
                 Some(wire),
                 wire.requires_media_refs,
+                RemoteLookup::NotAttempted,
             )
             .expect("retry re-selection stays on advertising workers");
         assert_eq!(worker.url(), capable_url);
@@ -2035,7 +2055,17 @@ mod tests {
         let mut seen = HashMap::new();
         for _ in 0..4 {
             let worker = stage
-                .select_single_worker(model_id, None, None, None, None, None, None, false)
+                .select_single_worker(
+                    model_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    RemoteLookup::NotAttempted,
+                )
                 .expect("any worker without refs");
             *seen.entry(worker.url().to_string()).or_insert(0) += 1;
         }
@@ -2062,7 +2092,17 @@ mod tests {
         );
 
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None, None, true)
+            .select_single_worker(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                RemoteLookup::NotAttempted,
+            )
             .is_none());
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, true);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -2081,7 +2121,17 @@ mod tests {
             requires_media_refs: true,
         };
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None, Some(wire), false)
+            .select_single_worker(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(wire),
+                false,
+                RemoteLookup::NotAttempted,
+            )
             .is_none());
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], Some(wire), false);
         assert_eq!(
@@ -2121,7 +2171,17 @@ mod tests {
             worker_registry.set_worker_overloaded(worker, true);
         }
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None, None, true)
+            .select_single_worker(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                RemoteLookup::NotAttempted,
+            )
             .is_none());
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, true);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -2160,7 +2220,17 @@ mod tests {
         );
 
         let response = stage
-            .select_pd_pair(model_id, None, None, None, None, None, None, true)
+            .select_pd_pair(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                RemoteLookup::NotAttempted,
+            )
             .expect_err("no prefill worker at all");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_ne!(
@@ -2209,7 +2279,17 @@ mod tests {
         );
 
         let response = stage
-            .select_pd_pair(model_id, None, None, None, None, None, None, true)
+            .select_pd_pair(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                RemoteLookup::NotAttempted,
+            )
             .expect_err("no advertising decode worker yet");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -2227,7 +2307,17 @@ mod tests {
             .unwrap();
         for _ in 0..3 {
             let (prefill, decode, _) = stage
-                .select_pd_pair(model_id, None, None, None, None, None, None, true)
+                .select_pd_pair(
+                    model_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    RemoteLookup::NotAttempted,
+                )
                 .expect("advertising pair");
             assert_eq!(prefill.url(), "grpc://127.0.0.1:8721");
             assert_eq!(decode.url(), "grpc://127.0.0.1:8731");

@@ -12,7 +12,7 @@ use smg_data_connector::{
 };
 use smg_mcp::McpOrchestrator;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::{
     config::RouterConfig,
@@ -31,6 +31,14 @@ use crate::{
     worker::{KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService},
     workflow::{JobQueue, WorkflowEngines},
 };
+
+/// How long the remote radix index's subscribe stream gets to come up
+/// before startup says so. `RemoteIndex::connect` is a lazy client: it
+/// validates nothing and reports no first-connect failure, so a typo'd
+/// `--kv-indexer-url` would otherwise start clean and serve every request
+/// with zero prefix affinity. Long enough to cover a cold DNS lookup plus
+/// a reconnect backoff, short enough to land while startup is watched.
+const REMOTE_INDEX_CONNECT_GRACE: Duration = Duration::from_secs(10);
 
 /// Error type for AppContext builder
 #[derive(Debug)]
@@ -90,6 +98,18 @@ pub struct AppContext {
     /// Remote radix index client (`--kv-indexer-url`); `None` leaves
     /// every routing path on local-index behavior.
     pub remote_index: Option<Arc<RemoteIndexHandle>>,
+    /// `true` when a cache-aware decode or encode leg is configured.
+    ///
+    /// The remote index answers for the prefill and single-worker leg only
+    /// — those are the legs that hold the prompt prefix, so those are the
+    /// only ones steered by the overlap query (see `worker_selection.rs`).
+    /// A cache-aware decode or encode leg is still picked by plain
+    /// `select_worker`, so it routes on the local KV-event feed and its
+    /// per-worker event indexer must stay subscribed even with the index
+    /// wired. Without this flag, `--policy cache_aware --prefill-decode …
+    /// --kv-indexer-url …` leaves decode with neither a feed nor an index
+    /// and silently demotes it to the self-referential approximate tree.
+    pub unindexed_cache_aware_leg: bool,
     pub realtime_registry: Arc<RealtimeRegistry>,
     /// Bind address for WebRTC UDP sockets (`None` = `0.0.0.0`, auto-detect).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -127,6 +147,7 @@ pub struct AppContextBuilder {
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
     remote_index: Option<Arc<RemoteIndexHandle>>,
+    unindexed_cache_aware_leg: bool,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
 }
@@ -182,6 +203,7 @@ impl AppContextBuilder {
             wasm_manager: None,
             kv_event_monitor: None,
             remote_index: None,
+            unindexed_cache_aware_leg: false,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         }
@@ -426,6 +448,7 @@ impl AppContextBuilder {
             kv_event_monitor: self.kv_event_monitor,
             rl,
             remote_index: self.remote_index,
+            unindexed_cache_aware_leg: self.unindexed_cache_aware_leg,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
             webrtc_stun_server: self.webrtc_stun_server,
@@ -458,6 +481,7 @@ impl AppContextBuilder {
             .await?
             .with_wasm_manager(&router_config)
             .with_kv_event_monitor(&router_config)
+            .with_remote_index(&router_config)
             .webrtc_bind_addr(webrtc_bind_addr)
             .webrtc_stun_server(
                 webrtc_stun_server.or_else(|| Some("stun.l.google.com:19302".to_string())),
@@ -716,12 +740,42 @@ impl AppContextBuilder {
     /// DashMaps) and stays dormant until workers are added. The
     /// UpdatePoliciesStep gates subscriptions on `cache_aware && gRPC`, so
     /// HTTP workers are never subscribed.
+    ///
+    /// Also records [`AppContext::unindexed_cache_aware_leg`], since the role
+    /// policies this reads are exactly what decides whether a configured
+    /// remote index can stand in for the local feed.
     fn with_kv_event_monitor(mut self, config: &RouterConfig) -> Self {
         use crate::config::types::{PolicyConfig, RoutingMode};
 
         let role_is_cache_aware =
             |policy: &Option<PolicyConfig>| matches!(policy, Some(PolicyConfig::CacheAware { .. }));
-        let is_cache_aware = matches!(config.policy, PolicyConfig::CacheAware { .. })
+        let global_is_cache_aware = matches!(config.policy, PolicyConfig::CacheAware { .. });
+
+        // Which legs the remote index will NOT answer for. It is queried on
+        // the prefill and single-worker leg only — those hold the prompt
+        // prefix — so a cache-aware decode or encode leg keeps routing from
+        // the local event feed and must keep its subscription. An unset
+        // prefill/decode role is not "no policy": `get_decode_policy()` falls
+        // back to the global default, which is how plain `--policy
+        // cache_aware --prefill-decode …` (no `--decode-policy`) produces a
+        // cache-aware decode leg. Encode does not share that fallback — unset
+        // resolves to consistent_hashing — so only an explicit cache-aware
+        // encode policy counts.
+        let leg_is_cache_aware = |policy: &Option<PolicyConfig>| match policy {
+            Some(policy) => matches!(policy, PolicyConfig::CacheAware { .. }),
+            None => global_is_cache_aware,
+        };
+        let unindexed_cache_aware_leg = match &config.mode {
+            RoutingMode::PrefillDecode { decode_policy, .. } => leg_is_cache_aware(decode_policy),
+            RoutingMode::EncodePrefillDecode {
+                encode_policy,
+                decode_policy,
+                ..
+            } => role_is_cache_aware(encode_policy) || leg_is_cache_aware(decode_policy),
+            _ => false,
+        };
+
+        let is_cache_aware = global_is_cache_aware
             || match &config.mode {
                 RoutingMode::PrefillDecode {
                     prefill_policy,
@@ -761,28 +815,67 @@ impl AppContextBuilder {
             self.kv_event_monitor = Some(monitor);
         }
 
-        // Remote radix index: one client handle per process. Kept on the
-        // context for the worker add/drop lifecycle signals, and injected
-        // into the PolicyRegistry so every router shares the routing-time
-        // overlap query + placement publish through one call. Unset leaves
-        // every code path on its exact prior behavior.
-        if let Some(url) = &config.kv_indexer_url {
-            let handle = RemoteIndexHandle::connect(
-                url,
-                // Default shared with the bridge's --block-size: the
-                // keyspace key includes block size, and divergent
-                // defaults would silently split the fleet's state into
-                // two keyspaces that never answer each other.
-                config
-                    .kv_indexer_block_size
-                    .unwrap_or(radix_index::DEFAULT_BLOCK_SIZE) as usize,
-            );
-            if let Some(ref registry) = self.policy_registry {
-                registry.set_remote_index(Some(Arc::clone(&handle)));
-            }
-            self.remote_index = Some(handle);
+        self.unindexed_cache_aware_leg = unindexed_cache_aware_leg;
+        self
+    }
+
+    /// Connect the remote radix index client (`--kv-indexer-url`).
+    ///
+    /// One client handle per process. Kept on the context for the worker
+    /// add/drop lifecycle signals, and injected into the PolicyRegistry so
+    /// every router shares the routing-time overlap query + placement publish
+    /// through one call. Unset leaves every code path on its exact prior
+    /// behavior.
+    ///
+    /// Its own step rather than a tail on `with_kv_event_monitor`: the two
+    /// lifecycles are independent — the monitor is gated on a policy being
+    /// cache-aware, the index client on the flag alone — and a block riding
+    /// along after that gate reads as if it shared it.
+    fn with_remote_index(mut self, config: &RouterConfig) -> Self {
+        let Some(url) = &config.kv_indexer_url else {
+            return self;
+        };
+
+        // Default shared with the bridge's --block-size: the keyspace key
+        // includes block size, and divergent defaults would silently split
+        // the fleet's state into two keyspaces that never answer each other.
+        let block_size = config
+            .kv_indexer_block_size
+            .unwrap_or(radix_index::DEFAULT_BLOCK_SIZE) as usize;
+        let handle = RemoteIndexHandle::connect(url, block_size);
+        info!(url = %url, block_size, "Created remote radix index client");
+
+        if let Some(ref registry) = self.policy_registry {
+            registry.set_remote_index(Some(Arc::clone(&handle)));
         }
 
+        // `connect` is lazy: it never validates the URL and never reports a
+        // first-connect failure, so one wrong digit in the port starts up
+        // clean and then answers every query `Disconnected` — zero prefix
+        // affinity, strictly worse than not passing the flag at all. Name it
+        // once, after a grace period. One shot, not a health loop: the
+        // drivers reconnect on their own, and this exists to catch the URL
+        // that will never work, not to track a stream that flaps.
+        let probe = Arc::clone(&handle);
+        let probe_url = url.clone();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "one-shot startup probe; nothing awaits it and the gateway may exit first"
+        )]
+        tokio::spawn(async move {
+            tokio::time::sleep(REMOTE_INDEX_CONNECT_GRACE).await;
+            if !probe.client().is_connected() {
+                warn!(
+                    url = %probe_url,
+                    grace_secs = REMOTE_INDEX_CONNECT_GRACE.as_secs(),
+                    "Remote radix index subscribe stream has never come up; cache-aware \
+                     routing is serving with no prefix affinity until it connects — check \
+                     that --kv-indexer-url is reachable"
+                );
+            }
+        });
+
+        self.remote_index = Some(handle);
         self
     }
 
@@ -917,6 +1010,24 @@ mod tests {
         }
     }
 
+    fn cache_aware_policy() -> PolicyConfig {
+        PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 30,
+            max_tree_size: 1000,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
+        }
+    }
+
     /// `with_kv_event_monitor` only creates a monitor for the cache-aware policy.
     /// This run of the builder needs no storage or network, so it exercises the
     /// real gating path rather than the predicate in isolation.
@@ -1046,6 +1157,57 @@ mod tests {
             .kv_event_monitor
             .is_some();
         assert!(!created);
+    }
+
+    /// A cache-aware decode leg keeps its KV-event feed when a remote index
+    /// is configured.
+    ///
+    /// The index is queried on the prefill and single-worker leg only, so
+    /// this flag is what stops UpdatePoliciesStep from dropping the decode
+    /// leg's subscription in exchange for nothing and demoting it to the
+    /// approximate tree it populates from its own decisions. The case that
+    /// matters most names no decode policy at all — it inherits the
+    /// cache-aware global.
+    #[test]
+    fn cache_aware_decode_leg_is_flagged_as_unindexed() {
+        use crate::config::types::RoutingMode;
+
+        let pd_mode = |prefill_policy, decode_policy| RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy,
+            decode_policy,
+        };
+        let flagged = |config: &RouterConfig| {
+            AppContextBuilder::new()
+                .with_policy_registry(config)
+                .with_kv_event_monitor(config)
+                .unindexed_cache_aware_leg
+        };
+
+        // `--policy cache_aware --prefill-decode …` with no role override:
+        // `get_decode_policy()` falls back to the cache-aware default, so the
+        // decode leg is cache-aware without ever being named.
+        let mut config = config_with_policy(cache_aware_policy());
+        config.mode = pd_mode(None, None);
+        assert!(
+            flagged(&config),
+            "decode inheriting the cache-aware default still needs the event feed"
+        );
+
+        // An explicit cache-aware decode leg under a non-cache-aware global.
+        let mut config = config_with_policy(PolicyConfig::Random);
+        config.mode = pd_mode(None, Some(cache_aware_policy()));
+        assert!(flagged(&config));
+
+        // Cache-aware prefill only: the index serves exactly that leg, so
+        // there is nothing left for the local feed to cover.
+        let mut config = config_with_policy(PolicyConfig::RoundRobin);
+        config.mode = pd_mode(Some(cache_aware_policy()), Some(PolicyConfig::RoundRobin));
+        assert!(!flagged(&config));
+
+        // Single-worker routing is served by the index too.
+        assert!(!flagged(&config_with_policy(cache_aware_policy())));
     }
 
     #[test]

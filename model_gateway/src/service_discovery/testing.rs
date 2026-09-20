@@ -64,6 +64,8 @@ pub(super) fn create_test_app_context() -> Arc<AppContext> {
         )),
         inflight_tracker: InFlightRequestTracker::new(),
         kv_event_monitor: None,
+        remote_index: None,
+        unindexed_cache_aware_leg: false,
         rl: None,
         realtime_registry: Arc::new(RealtimeRegistry::new()),
         webrtc_bind_addr: None,

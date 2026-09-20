@@ -48,7 +48,9 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{remote_index::IndexPrediction, CacheNamespace, PolicyRegistry, RemoteLookup},
+    policies::{
+        remote_index::IndexPrediction, CacheNamespace, PolicyRegistry, RemoteLookup, RemoteOverlap,
+    },
     routers::{
         common::{
             attach_sized_body,
@@ -395,6 +397,46 @@ impl Router {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
+        // Remote-index prefetch (--kv-indexer-url): resolve the shared-index
+        // overlap once, here, instead of inside the per-attempt dispatch. The
+        // prompt is identical on every attempt, so the index's answer is too;
+        // querying per attempt would multiply index QPS by the attempt count
+        // and charge each retry the query deadline for an answer already in
+        // hand. gRPC settled this the same way — its selection stage runs
+        // once, ahead of the retry loop. Running before the lease takes
+        // ownership also lets the query borrow the routing derivatives
+        // directly, so a prompt that reaches hundreds of KB on agentic
+        // traffic is never copied to cross the await. The prediction rides
+        // along for the post-dispatch placement publish.
+        let prefetch = if self.policy_registry.remote_index_enabled() {
+            // Prefer the token tree (stronger, token-prefix affinity); fall
+            // back to string mode (raw-byte prefix) only when the request
+            // carries text but no tokens.
+            if routing_tokens.is_some() {
+                self.policy_registry
+                    .resolve_remote_overlap(
+                        model_id,
+                        routing_tokens.as_deref(),
+                        cache_namespace,
+                        headers,
+                        rid_key.as_deref(),
+                    )
+                    .await
+            } else {
+                self.policy_registry
+                    .resolve_remote_overlap_bytes(
+                        model_id,
+                        text.as_deref(),
+                        cache_namespace,
+                        headers,
+                        rid_key.as_deref(),
+                    )
+                    .await
+            }
+        } else {
+            None
+        };
+
         // The lease owns the parsed request and its routing derivatives for
         // the dispatch phase; its release point encodes the retry policy.
         let lease = RequestLease::new(
@@ -419,6 +461,7 @@ impl Router {
                     model_id,
                     canonical_model.as_deref(),
                     is_stream,
+                    prefetch.as_ref(),
                 )
                 .await;
             Metrics::record_router_upstream_response(
@@ -447,6 +490,7 @@ impl Router {
                             model_id,
                             canonical_model.as_deref(),
                             is_stream,
+                            prefetch.as_ref(),
                         )
                         .await;
 
@@ -502,6 +546,13 @@ impl Router {
         response
     }
 
+    /// One dispatch attempt. `prefetch` is the shared-index answer resolved
+    /// once by the caller, before the retry loop: selection steers on its
+    /// overlap and a successful dispatch publishes its prediction.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one attempt threads the lease, route, model and the hoisted index prefetch"
+    )]
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -510,59 +561,8 @@ impl Router {
         model_id: &str,
         canonical_model: Option<&str>,
         is_stream: bool,
+        prefetch: Option<&(RemoteOverlap, IndexPrediction)>,
     ) -> Response {
-        // Remote-index prefetch (--kv-indexer-url): resolve the shared-index
-        // overlap before selection so cache_aware can steer to a worker that
-        // already holds the prompt prefix, and keep the prediction for the
-        // post-dispatch placement publish. The routing inputs are hoisted to
-        // owned copies because the query awaits and the lease view cannot be
-        // borrowed across it; gated on the flag so it is zero-cost when the
-        // shared index is off.
-        let mut remote_overlap: Option<crate::policies::RemoteOverlap> = None;
-        let mut index_prediction: Option<IndexPrediction> = None;
-        if self.policy_registry.remote_index_enabled() {
-            // Only the branch about to be taken is materialized: the
-            // full prompt text (tens to hundreds of KB on agentic
-            // traffic) is copied only when there are no tokens to
-            // route on, since the token path never reads it.
-            let (owned_tokens, owned_text, owned_rid) = lease.with_view(|view| {
-                (
-                    view.tokens.map(<[u32]>::to_vec),
-                    view.tokens
-                        .is_none()
-                        .then(|| view.text.map(str::to_string))
-                        .flatten(),
-                    view.rid_key.map(str::to_string),
-                )
-            });
-            // Prefer the token tree (stronger, token-prefix affinity);
-            // fall back to string mode (raw-byte prefix) only when the
-            // request carries text but no tokens.
-            let resolved = if owned_tokens.is_some() {
-                self.policy_registry
-                    .resolve_remote_overlap(
-                        model_id,
-                        owned_tokens.as_deref(),
-                        headers,
-                        owned_rid.as_deref(),
-                    )
-                    .await
-            } else {
-                self.policy_registry
-                    .resolve_remote_overlap_bytes(
-                        model_id,
-                        owned_text.as_deref(),
-                        headers,
-                        owned_rid.as_deref(),
-                    )
-                    .await
-            };
-            if let Some((overlap, prediction)) = resolved {
-                remote_overlap = Some(overlap);
-                index_prediction = Some(prediction);
-            }
-        }
-
         let worker = match lease.with_view(|view| {
             self.select_worker_for_model(
                 model_id,
@@ -571,7 +571,7 @@ impl Router {
                 headers,
                 view.rid_key,
                 view.cache_namespace,
-                RemoteLookup::from_resolved(remote_overlap.as_ref()),
+                RemoteLookup::from_resolved(prefetch.map(|(overlap, _)| overlap)),
             )
         }) {
             Some(w) => w,
@@ -671,7 +671,7 @@ impl Router {
         // generated output tokens, so there is no prompt (+) output refine —
         // the prompt-only placement is final.
         if status.is_success() {
-            if let Some(prediction) = &index_prediction {
+            if let Some((_, prediction)) = prefetch {
                 self.policy_registry
                     .publish_placement(prediction, worker.url(), None);
             }

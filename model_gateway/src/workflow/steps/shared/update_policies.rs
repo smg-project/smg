@@ -9,7 +9,7 @@ use wfaas::{
 };
 
 use crate::{
-    worker::{ConnectionMode, Worker},
+    worker::{ConnectionMode, Worker, WorkerRegistry},
     workflow::data::WorkerRegistrationData,
 };
 
@@ -154,14 +154,24 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
             }
 
             // Start KV event subscription for gRPC workers with cache_aware
-            // policy — unless a remote radix index is configured, which
-            // REPLACES per-gateway indexing: the per-worker event indexer
-            // is never built (that duplication is the memory cost the
-            // remote index exists to remove), and selection with the index
-            // wired never reads or populates the approximate local trees
-            // either (`select_worker_remote_only`), so a remote miss falls
-            // to load-based selection instead of a partial per-gateway view.
-            if cache_aware && app_context.remote_index.is_none() {
+            // policy. A remote radix index REPLACES per-gateway indexing for
+            // the leg it serves: that leg's selection queries the index and
+            // never reads or populates the approximate local trees
+            // (`select_worker_remote_only`), so a remote miss falls to
+            // load-based selection instead of a partial per-gateway view, and
+            // building its per-worker event indexer would be exactly the
+            // duplicated memory the index exists to remove.
+            //
+            // But the index only answers for the prefill and single-worker
+            // leg. A cache-aware decode or encode leg stays on plain
+            // `select_worker` (see worker_selection.rs), so dropping the
+            // subscription for it replaces nothing — it leaves that leg with
+            // no feed and no index, silently demoted to an approximate tree
+            // it populates from its own decisions. Keep the feed alive
+            // whenever such a leg exists; the index still serves prefill.
+            if cache_aware
+                && (app_context.remote_index.is_none() || app_context.unindexed_cache_aware_leg)
+            {
                 if let Some(ref monitor) = app_context.kv_event_monitor {
                     if *worker.connection_mode() == ConnectionMode::Grpc {
                         monitor.on_worker_added(worker).await;
@@ -172,9 +182,22 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
             // With a remote index, a (re)registering worker may sit under a
             // standing soft-retire from a previous same-URL life; announce
             // it so scoring resumes immediately instead of waiting for its
-            // first event batch.
-            if cache_aware {
-                if let Some(ref handle) = app_context.remote_index {
+            // first event batch — which, for the leg the index serves, never
+            // arrives, leaving only the index's silence backstop to heal it.
+            //
+            // Deliberately ungated on the policy, mirroring the soft-retire
+            // in RemoveFromPolicyRegistryStep: that fires for every worker
+            // whenever the index is configured, so a narrower gate here is
+            // not a missed optimization but a stuck state. Under `--policy
+            // round_robin --prefill-policy cache_aware` the per-model policy
+            // is not cache_aware, so gating on it would retire a worker on
+            // departure and never re-announce it, while the prefill leg keeps
+            // querying an index that still has it retired. Announce under
+            // every advertised model id for the same reason the drop side
+            // retires under every one — a worker serving aliases must not
+            // come back under its primary id alone.
+            if let Some(ref handle) = app_context.remote_index {
+                for model_id in WorkerRegistry::worker_model_ids(worker) {
                     handle
                         .client()
                         .publish_added(&model_id, handle.block_size() as u32, worker.url())

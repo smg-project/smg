@@ -542,6 +542,43 @@ impl CacheAwarePolicy {
         false
     }
 
+    /// Load-only selection over the healthy set, recording `branch`. Shared
+    /// by the two remote-index paths that skip affinity, which are worth
+    /// telling apart on a dashboard: `remote_none` is the index having
+    /// nothing to say, `remote_kv_shed` is the index having answered and
+    /// KV pressure overriding it. The first means the index is not
+    /// helping, the second means it is being ignored, and the fixes are
+    /// different. The local prefix trees are deliberately neither read nor
+    /// written here — with a shared index wired they would accumulate a
+    /// miss-only per-gateway view, which is the state the index removes.
+    fn select_by_load_only(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        branch: &'static str,
+    ) -> Option<usize> {
+        let healthy_indices: Vec<usize> = workers
+            .iter()
+            .enumerate()
+            .filter(|(_, worker)| worker.routing_state().eligible())
+            .map(|(idx, _)| idx)
+            .collect();
+        if healthy_indices.is_empty() {
+            return None;
+        }
+        let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
+        let selected = self.select_expected_wait(workers, &healthy_indices, info)?;
+        Metrics::record_worker_cache_aware_policy_branch(branch);
+        debug!(
+            index = "remote",
+            branch,
+            worker = workers[selected].url(),
+            model_id,
+            "Cache-aware selection"
+        );
+        Some(selected)
+    }
+
     /// Min and max backend KV-cache utilization (0.0–1.0) across healthy workers
     /// that have a `WorkerMonitor` snapshot entry, as `(min, max)`. `None` when
     /// no receiver is wired or no healthy worker has a load entry (→ caller
@@ -1195,21 +1232,42 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let avg_load = load_sum as f64 / healthy_indices.len() as f64;
         let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
 
+        // Shed under KV pressure like the local path, but through the
+        // load-only pick: `select_worker_fallback` inserts the request into
+        // this gateway's token/string tree and hash index, and with a remote
+        // index wired those trees must stay empty. Filling them here rebuilds
+        // exactly the partial, per-gateway prefix view the shared index
+        // exists to remove, and buys nothing back — no remote path ever reads
+        // them (scoring comes from `remote.scores`, the miss paths are
+        // load-only), so the insert is pure cost on every request of a
+        // hot-engine episode once either KV threshold drops below 1.0.
         if self.is_kv_imbalanced(workers, &healthy_indices) {
-            return self.select_worker_fallback(workers, info, &healthy_indices, model_id);
+            return self.select_by_load_only(workers, info, "remote_kv_shed");
         }
 
+        // One pass over the holders, then one probe per worker: the index
+        // caps nothing, so a well-shared prefix answers with the whole fleet
+        // and a per-worker linear scan would cost O(workers × holders) string
+        // compares inside the call that holds up selection. Duplicate holders
+        // keep the largest overlap, which is the entry a scan of the
+        // descending list would have stopped at.
+        let mut by_holder: HashMap<&str, u32> = HashMap::with_capacity(remote.scores.len());
+        for (holder, matched) in &remote.scores {
+            if *matched > 0 {
+                by_holder
+                    .entry(holder.as_str())
+                    .and_modify(|best| *best = (*best).max(*matched))
+                    .or_insert(*matched);
+            }
+        }
         let mut candidates: Vec<OverlapCandidate> = healthy_indices
             .iter()
             .filter_map(|&idx| {
-                let url = workers[idx].url();
-                remote
-                    .scores
-                    .iter()
-                    .find(|(holder, matched)| *matched > 0 && holder == url)
-                    .map(|(_, matched)| OverlapCandidate {
+                by_holder
+                    .get(workers[idx].url())
+                    .map(|&matched| OverlapCandidate {
                         idx,
-                        effective_score: f64::from(*matched),
+                        effective_score: f64::from(matched),
                     })
             })
             .collect();
@@ -1270,39 +1328,22 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         Some(selected)
     }
 
-    /// Remote-only selection: the shared index is wired but this request
-    /// got nothing usable from it (outage, timeout, no hashes). The local
-    /// prefix trees are deliberately NOT consulted or populated: with a
-    /// remote index wired they would accumulate a partial, miss-only
-    /// view that diverges per gateway — exactly the per-gateway state
-    /// the shared index exists to remove — and silently absorb remote
-    /// misses. Load-based (expected-wait) selection only; the branch is
-    /// labeled so the harness can count how often the index was absent.
+    /// Remote-only selection: the shared index is wired but affinity is
+    /// off the table for this request — it got nothing usable back
+    /// (outage, timeout, no hashes), or KV pressure told
+    /// [`Self::select_worker_with_remote`] to shed. The local prefix trees
+    /// are deliberately NOT consulted or populated: with a remote index
+    /// wired they would accumulate a partial, miss-only view that diverges
+    /// per gateway — exactly the per-gateway state the shared index exists
+    /// to remove — and silently absorb remote misses. Load-based
+    /// (expected-wait) selection only; the branch is labeled so the harness
+    /// can count how often affinity was skipped.
     fn select_worker_remote_only(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        let healthy_indices: Vec<usize> = workers
-            .iter()
-            .enumerate()
-            .filter(|(_, worker)| worker.routing_state().eligible())
-            .map(|(idx, _)| idx)
-            .collect();
-        if healthy_indices.is_empty() {
-            return None;
-        }
-        let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
-        let selected = self.select_expected_wait(workers, &healthy_indices, info)?;
-        Metrics::record_worker_cache_aware_policy_branch("remote_none");
-        debug!(
-            index = "remote",
-            branch = "remote_none",
-            worker = workers[selected].url(),
-            model_id,
-            "Cache-aware selection"
-        );
-        Some(selected)
+        self.select_by_load_only(workers, info, "remote_none")
     }
 
     fn on_request_complete(&self, worker_url: &str, success: bool) {
@@ -2631,6 +2672,55 @@ mod tests {
             "remote-only selection must not populate the local tree"
         );
         assert!(LoadBalancingPolicy::select_worker_remote_only(&random, &workers, &info).is_some());
+    }
+
+    /// The same "local trees stay empty" lock for the other way the remote
+    /// path declines affinity: a KV-imbalanced fleet sheds to load, and must
+    /// do it without writing the per-gateway prefix state the shared index
+    /// replaced (nothing on this path would ever read it back).
+    #[test]
+    fn remote_kv_shed_does_not_populate_the_local_tree() {
+        let policy = CacheAwarePolicy::with_config(kv_only_config(0.3, 0.95));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        // One hot engine beside an idle one: spread 0.75 > 0.3 → shed.
+        let _tx = inject_kv(&policy, &workers, &[0.9, 0.15]);
+        let info = SelectWorkerInfo {
+            tokens: Some(&[1, 2, 3, 4]),
+            ..SelectWorkerInfo::default()
+        };
+        // A live holder the balanced path would have picked on affinity.
+        let remote = RemoteOverlap {
+            scores: vec![("http://w1:8000".to_string(), 40)],
+            request_blocks: 40,
+            block_size: 128,
+        };
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            assert!(policy
+                .select_worker_with_remote(&workers, &info, &remote)
+                .is_some());
+        });
+        let model_id = normalize_model_key(workers[0].model_id());
+        let tree_size = policy
+            .token_trees
+            .get(model_id)
+            .map_or(0, |entry| entry.value().total_token_size());
+        assert_eq!(
+            tree_size, 0,
+            "KV-pressure shedding must not populate the local tree"
+        );
+        // Its own label, not `remote_none`: the index answered here and
+        // was overridden, which is a different operational problem from
+        // the index having nothing to say.
+        let rendered = handle.render();
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l == "smg_cache_aware_policy_branch_total{branch=\"remote_kv_shed\"} 1"),
+            "kv shed branch missing; rendered:\n{rendered}"
+        );
     }
 
     /// Every cache-aware decision lands in the one branch counter: the

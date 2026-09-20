@@ -25,6 +25,7 @@ mod power_of_two;
 mod prefix_hash;
 mod random;
 mod registry;
+pub(crate) mod remote_index;
 mod round_robin;
 pub(crate) mod utils;
 
@@ -49,8 +50,6 @@ pub use round_robin::RoundRobinPolicy;
 ///
 /// This trait provides a unified interface for implementing routing algorithms
 /// that can work with both regular single-worker selection and PD dual-worker selection.
-pub(crate) mod remote_index;
-
 pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Select a single worker from the available workers
     ///
@@ -314,7 +313,8 @@ impl WorkerLeg {
 /// async pipeline stage before the (synchronous) policy call.
 #[derive(Debug, Clone, Default)]
 pub struct RemoteOverlap {
-    /// Per-holder (worker url, matched prefix blocks), descending.
+    /// Per-worker (worker url, reusable prefix blocks) as folded by
+    /// `remote_index::fold_answers`, descending, zero scores dropped.
     pub scores: Vec<(String, u32)>,
     /// The request's full prefix depth in blocks (for overlap decay).
     pub request_blocks: usize,
@@ -330,17 +330,19 @@ pub struct RemoteOverlap {
 /// per-gateway view of remote misses.
 #[derive(Clone, Copy, Debug, Default)]
 pub enum RemoteLookup<'a> {
-    /// This path did not query the index — it does not participate
-    /// (retry re-selection, HTTP PD, transcription, the streamed
-    /// pass-through), no index is wired, or the request had nothing to
-    /// hash. Plain `select_worker`.
+    /// This path does not participate: retry re-selection, HTTP PD,
+    /// transcription, the streamed pass-through, no index wired, or a
+    /// sticky override key that wins anyway. Plain `select_worker`,
+    /// local state included.
     #[default]
     NotAttempted,
-    /// The index was queried for this request and answered with no
-    /// usable overlap (empty, timeout, disconnected). cache_aware picks
-    /// on load alone and leaves its local trees untouched.
+    /// A participating path asked and got nothing usable back — empty
+    /// answer, timeout, disconnected, or a prompt too short to hash a
+    /// whole block. cache_aware picks on load alone and leaves its
+    /// local trees untouched, because a tree fed only with remote
+    /// misses is the partial per-gateway view the index removes.
     Missed,
-    /// The index answered with per-holder overlap.
+    /// The index answered with per-worker overlap.
     Hit(&'a RemoteOverlap),
 }
 

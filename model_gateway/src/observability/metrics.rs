@@ -251,6 +251,27 @@ pub(crate) fn init_metrics() {
         "Total generation time by router_type, backend_type, model, endpoint (gRPC only)"
     );
 
+    // Layer 2: Shared prefix-cache index (--kv-indexer-url). `outcome`
+    // separates "the index answered, nobody holds this prefix"
+    // (remote_empty, a normal cold prefix) from "the index could not
+    // answer" (remote_timeout/remote_disconnected, routing degraded to
+    // load-based selection) — a distinction the metric name alone does
+    // not carry, and the one an operator needs to tell a cold cache from
+    // an unreachable indexer. remote_unscorable is a third case again:
+    // the index answered, but nothing it said credits a worker.
+    describe_counter!(
+        "smg_remote_index_query_total",
+        "Routing-time overlap queries by outcome (remote_hit, remote_empty, remote_unscorable, remote_too_short, remote_timeout, remote_disconnected)"
+    );
+    describe_histogram!(
+        "smg_remote_index_query_duration_seconds",
+        "Routing-time overlap query latency by outcome, including the queries that hit the deadline"
+    );
+    describe_counter!(
+        "smg_remote_index_publish_total",
+        "Placements published to the shared index after successful dispatch (fire-and-forget)"
+    );
+
     // Layer 2: PD disaggregation metrics (signals only SMG can measure — it is the
     // only component that observes both the prefill and decode legs of a request).
     describe_histogram!(
@@ -1249,8 +1270,8 @@ impl Metrics {
     }
 
     /// One remote radix-index overlap query on the selection path.
-    /// `outcome`: remote_hit | remote_empty | remote_timeout |
-    /// remote_disconnected.
+    /// `outcome`: remote_hit | remote_empty | remote_unscorable |
+    /// remote_too_short | remote_timeout | remote_disconnected.
     pub fn record_remote_index_query(outcome: &'static str, duration: Duration) {
         counter!("smg_remote_index_query_total", "outcome" => outcome).increment(1);
         histogram!("smg_remote_index_query_duration_seconds", "outcome" => outcome)
