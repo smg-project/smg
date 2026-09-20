@@ -618,12 +618,13 @@ fn extract_input_ids(v: &Value) -> Option<Vec<u32>> {
         Some(Value::Array(inner)) => inner,
         _ => ids,
     };
-    Some(
-        seq.iter()
-            .filter_map(Value::as_u64)
-            .map(|id| id as u32)
-            .collect(),
-    )
+    // An element that is not a token number means the caller sent
+    // something other than a token list, so hand the whole request to
+    // the text path. Dropping just the bad element would silently
+    // shorten the prompt and quietly change what is being measured.
+    seq.iter()
+        .map(|id| id.as_u64().map(|id| id as u32))
+        .collect()
 }
 
 /// Native limit: `sampling_params.max_new_tokens` first, then the top-level
@@ -662,6 +663,21 @@ mod tests {
         assert_eq!(extract_input_ids(&flat), Some(vec![1, 2, 3]));
         assert_eq!(extract_input_ids(&batched), Some(vec![4, 5]));
         assert_eq!(extract_input_ids(&text_only), None);
+    }
+
+    #[test]
+    fn native_input_ids_rejects_a_list_that_is_not_all_tokens() {
+        // Dropping the bad element would hand the engine a shorter
+        // prompt than the caller sent and skew every number measured
+        // off it, so the whole list goes to the text path instead.
+        for bad in [
+            json!({"input_ids": [1, "2", 3]}),
+            json!({"input_ids": [1, null]}),
+            json!({"input_ids": [1, -2]}),
+            json!({"input_ids": [[4, 5.5]]}),
+        ] {
+            assert_eq!(extract_input_ids(&bad), None, "{bad}");
+        }
     }
 
     #[test]

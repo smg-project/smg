@@ -354,8 +354,10 @@ class TcpProxy:
         while not self._closed:
             try:
                 client, _ = self._server.accept()
-            except TimeoutError:
-                # socket.timeout is a distinct class before Python 3.10.
+            except socket.timeout:
+                # Its own class before Python 3.10, where it is not a
+                # TimeoutError and would fall through to the exit below;
+                # an alias of TimeoutError from 3.10 on.
                 continue
             except OSError:
                 return
